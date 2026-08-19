@@ -134,7 +134,7 @@ class ConversationStore:
         for index, line in enumerate(lines):
             try:
                 row = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            except (ValueError, RecursionError) as exc:
                 if index != len(lines) - 1:
                     raise ConversationIntegrityError(
                         f"invalid conversation row {index + 1}: {self.path}"

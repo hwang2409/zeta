@@ -101,6 +101,15 @@ def test_non_utf8_tail_uses_termination_rule(tmp_path: Path, tail: bytes) -> Non
         assert reopened.entries[-1].type == "warning"
 
 
+def test_huge_integer_row_is_rejected_with_typed_error(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    with store.path.open("ab") as handle:
+        handle.write(b'{"seq":' + b"9" * 5000 + b"}\n")
+
+    with pytest.raises(ConversationIntegrityError):
+        ConversationStore(tmp_path, session_id=store.session_id)
+
+
 def test_append_and_replay_use_data_snapshots(tmp_path: Path) -> None:
     arguments = {"nested": {"value": 1}}
     call = ToolCall("call-1", "tool", arguments)

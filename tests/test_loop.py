@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -128,6 +129,27 @@ async def test_wrong_tool_result_id_becomes_expected_error_result(tmp_path: Path
     assert "mismatch" in result.content
 
 
+@pytest.mark.asyncio
+async def test_wrong_typed_tool_result_becomes_valid_error_result(tmp_path: Path) -> None:
+    call = ToolCall("expected", "echo", {})
+    backend = FakeBackend(
+        [ScriptedTurn([], [call]), ScriptedTurn([TextContent("done")])]
+    )
+    store = ConversationStore(tmp_path)
+
+    def echo(arguments: dict[str, object]) -> ToolResult:
+        return ToolResult(call.id, 123)  # type: ignore[arg-type]
+
+    await collect(AgentLoop(backend, store, tools={"echo": echo}).run_turn("start"))
+
+    result = store.messages()[2].tool_result
+    assert result is not None
+    assert result.tool_call_id == call.id
+    assert result.is_error
+    assert "invalid tool result" in result.content
+    assert ConversationStore(tmp_path, session_id=store.session_id).messages()
+
+
 async def close_after(
     events: AsyncIterator[StreamEvent],
     event_type: StreamEventType,
@@ -241,6 +263,65 @@ async def test_cancellation_persists_partial_state(tmp_path: Path) -> None:
     assert backend.completion_close_count == 1
     assert len(store.messages()) == 2
     assert store.messages()[-1].role is MessageRole.ASSISTANT
+
+
+@pytest.mark.asyncio
+async def test_cancellation_keeps_control_error_when_partial_persist_fails(
+    tmp_path: Path,
+) -> None:
+    class WaitingBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.update_seen = asyncio.Event()
+
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=TextContent("partial"),
+            )
+            self.update_seen.set()
+            await asyncio.Event().wait()
+
+    backend = WaitingBackend()
+    store = ConversationStore(tmp_path)
+    task = asyncio.create_task(collect(AgentLoop(backend, store).run_turn("start")))
+    await backend.update_seen.wait()
+
+    with patch.object(
+        store,
+        "append_message",
+        side_effect=OSError("disk full"),
+    ):
+        with pytest.warns(RuntimeWarning, match="partial state"):
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_aclose_keeps_control_error_when_partial_persist_fails(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    stream = AgentLoop(
+        FakeBackend([ScriptedTurn([TextContent("partial")])]),
+        store,
+    ).run_turn("start")
+
+    async for event in stream:
+        if event.type is StreamEventType.MESSAGE_UPDATE:
+            with patch.object(
+                store,
+                "append_message",
+                side_effect=OSError("disk full"),
+            ):
+                with pytest.warns(RuntimeWarning, match="partial state"):
+                    await stream.aclose()
+            break
 
 
 @pytest.mark.asyncio

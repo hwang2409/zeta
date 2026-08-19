@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from typing import Any, Protocol
 
@@ -68,6 +69,24 @@ def _task_is_cancelling() -> bool:
     return task is not None and task.cancelling() > 0
 
 
+def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
+    if not isinstance(result, ToolResult):
+        return ToolResult(expected_id, "invalid tool result: expected ToolResult", True)
+    if type(result.tool_call_id) is not str or not result.tool_call_id:
+        return ToolResult(expected_id, "invalid tool result: call id", True)
+    if type(result.content) is not str:
+        return ToolResult(expected_id, "invalid tool result: content", True)
+    if type(result.is_error) is not bool:
+        return ToolResult(expected_id, "invalid tool result: is_error", True)
+    if result.tool_call_id != expected_id:
+        return ToolResult(
+            expected_id,
+            f"tool result id mismatch: expected {expected_id}, got {result.tool_call_id}",
+            is_error=True,
+        )
+    return result
+
+
 class AgentLoop:
     def __init__(
         self,
@@ -120,16 +139,16 @@ class AgentLoop:
                     yield event
             except asyncio.CancelledError:
                 await _close_completion(completion)
-                self._persist_partial(partial_blocks, assistant_message)
+                self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
             except GeneratorExit:
                 await _close_completion(completion)
-                self._persist_partial(partial_blocks, assistant_message)
+                self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
             except Exception as exc:
                 await _close_completion(completion)
                 if _task_is_cancelling():
-                    self._persist_partial(partial_blocks, assistant_message)
+                    self._persist_partial_for_control(partial_blocks, assistant_message)
                     raise asyncio.CancelledError() from exc
                 self._persist_partial(partial_blocks, assistant_message)
                 yield StreamEvent(
@@ -140,7 +159,7 @@ class AgentLoop:
                 return
             cleanup_error = await _close_completion(completion)
             if _task_is_cancelling():
-                self._persist_partial(partial_blocks, assistant_message)
+                self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise asyncio.CancelledError()
             if cleanup_error is not None:
                 self._persist_partial(partial_blocks, assistant_message)
@@ -181,12 +200,7 @@ class AgentLoop:
                     result = await self.tool_executor.execute(tool_call)
                 except Exception as exc:
                     result = ToolResult(tool_call.id, str(exc), is_error=True)
-                if result.tool_call_id != tool_call.id:
-                    result = ToolResult(
-                        tool_call.id,
-                        f"tool result id mismatch: expected {tool_call.id}, got {result.tool_call_id}",
-                        is_error=True,
-                    )
+                result = _validated_tool_result(result, tool_call.id)
                 self.store.append_message(
                     Message(
                         MessageRole.TOOL_RESULT,
@@ -220,3 +234,17 @@ class AgentLoop:
             self.store.append_message(assistant_message)
         elif partial_blocks:
             self.store.append_message(Message(MessageRole.ASSISTANT, partial_blocks))
+
+    def _persist_partial_for_control(
+        self,
+        partial_blocks: list[ContentBlock],
+        assistant_message: Message | None,
+    ) -> None:
+        try:
+            self._persist_partial(partial_blocks, assistant_message)
+        except Exception as exc:
+            warnings.warn(
+                f"failed to persist partial state: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
