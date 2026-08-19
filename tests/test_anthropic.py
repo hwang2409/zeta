@@ -59,9 +59,6 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 
 event: message_stop
 data: {"type":"message_stop"}
-
-event: message_start
-data: {"type":"message_start","message":{"id":"ignored"}}
 """
 
 
@@ -636,13 +633,15 @@ async def test_cancel_mid_thinking_drops_partial_block_before_resume(
     class Response:
         status_code = 200
 
-        def __init__(self, lines):
+        def __init__(self, lines, *, wait_after=True):
             self.lines = lines
+            self.wait_after = wait_after
 
         async def aiter_lines(self):
             for line in self.lines:
                 yield line
-            await never.wait()
+            if self.wait_after:
+                await never.wait()
 
     class Stream:
         def __init__(self, response):
@@ -684,7 +683,8 @@ async def test_cancel_mid_thinking_drops_partial_block_before_resume(
                         "",
                         'data: {"type":"message_stop"}',
                         "",
-                    ]
+                    ],
+                    wait_after=False,
                 )
             )
 
@@ -742,6 +742,77 @@ async def test_delta_without_block_start_is_rejected(tmp_path: Path) -> None:
                 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"bad"}}',
                 "",
                 'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_stop_without_message_start_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_message_start_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"message_start","message":{}}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_block_before_message_start_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_delta_before_message_start_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"bad"}}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_event_after_message_stop_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+                'data: {"type":"message_start","message":{}}',
                 "",
             ]
         ),

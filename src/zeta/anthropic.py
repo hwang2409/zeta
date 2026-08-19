@@ -582,11 +582,15 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
     usage: dict[str, Any] = {}
     stop_reason: str | None = None
     finished = False
+    message_state = "not-started"
     async for line in response.aiter_lines():
         record = decoder.feed(line)
         if record is None:
             continue
         event, payload = record
+        event_type = payload.get("type", event)
+        if type(event_type) is str:
+            message_state = _advance_message_state(message_state, event_type)
         translated = _translate_event(
             event, payload, blocks, active_blocks, stopped_blocks, usage
         )
@@ -605,10 +609,11 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
             )
             finished = True
         yield translated
-        if finished:
-            return
     record = decoder.finish()
     if record is not None and record[1].get("type") != "done":
+        event_type = record[1].get("type", record[0])
+        if type(event_type) is str:
+            message_state = _advance_message_state(message_state, event_type)
         translated = _translate_event(
             record[0], record[1], blocks, active_blocks, stopped_blocks, usage
         )
@@ -824,6 +829,28 @@ def _translate_event(
             data={},
         )
     return None
+
+
+def _advance_message_state(state: str, event_type: str) -> str:
+    if event_type == "done":
+        return state
+    if state == "stopped":
+        raise AnthropicStreamError(
+            f"Anthropic event follows message_stop: {event_type}"
+        )
+    if event_type == "message_start":
+        if state != "not-started":
+            raise AnthropicStreamError("Anthropic message_start is duplicated")
+        return "started"
+    if state == "not-started":
+        if event_type == "error":
+            return state
+        raise AnthropicStreamError(
+            f"Anthropic event precedes message_start: {event_type}"
+        )
+    if event_type == "message_stop":
+        return "stopped"
+    return state
 
 
 def _index(payload: Mapping[str, Any]) -> int:
