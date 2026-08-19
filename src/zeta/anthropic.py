@@ -7,7 +7,6 @@ import fcntl
 import json
 import os
 import secrets
-import sys
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
@@ -416,6 +415,9 @@ class AnthropicBackend(CompletionBackend):
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
         client = self.client or httpx.AsyncClient(timeout=None)
+        stream_context = None
+        entered = False
+        primary_exception: BaseException | None = None
         try:
             token = await self.token_store.access_token(client)
             payload = build_messages_payload(
@@ -438,39 +440,60 @@ class AnthropicBackend(CompletionBackend):
                 "content-type": "application/json",
                 "user-agent": "zeta/0.1",
             }
-            async with client.stream(
+            stream_context = client.stream(
                 "POST", self.base_url, headers=headers, json=payload
-            ) as response:
+            )
+            response = await stream_context.__aenter__()
+            entered = True
+            try:
                 if response.status_code >= 400:
                     body = await _read_error_body(response)
                     raise _http_error(response.status_code, body)
                 async for event in _decode_response(response):
                     yield event
-        except AnthropicBackendError:
-            raise
-        except httpx.HTTPError as exc:
-            raise AnthropicHTTPError("Anthropic request failed") from exc
+            except AnthropicBackendError as exc:
+                primary_exception = exc
+            except httpx.HTTPError as exc:
+                primary_exception = AnthropicHTTPError("Anthropic request failed")
+                primary_exception.__cause__ = exc
+            except BaseException as exc:
+                if _task_is_cancelling() and not _is_control_exception(exc):
+                    primary_exception = asyncio.CancelledError()
+                    primary_exception.__cause__ = exc
+                else:
+                    primary_exception = exc
         except BaseException as exc:
-            if _task_is_cancelling() and not isinstance(
-                exc, (asyncio.CancelledError, GeneratorExit)
-            ):
-                raise asyncio.CancelledError() from exc
-            raise
+            primary_exception = exc
         finally:
-            active_exception = sys.exc_info()[0]
+            if entered and stream_context is not None:
+                try:
+                    await stream_context.__aexit__(
+                        type(primary_exception) if primary_exception else None,
+                        primary_exception,
+                        primary_exception.__traceback__ if primary_exception else None,
+                    )
+                except BaseException as exc:
+                    if primary_exception is None and _is_control_exception(exc):
+                        primary_exception = exc
             if self.client is None:
                 try:
                     await client.aclose()
-                except BaseException:
-                    if active_exception in (asyncio.CancelledError, GeneratorExit):
-                        pass
-                    elif not _task_is_cancelling():
-                        raise
+                except BaseException as exc:
+                    if primary_exception is None and _is_control_exception(exc):
+                        primary_exception = exc
+            if primary_exception is None and _task_is_cancelling():
+                primary_exception = asyncio.CancelledError()
+            if primary_exception is not None:
+                raise primary_exception
 
 
 def _task_is_cancelling() -> bool:
     task = asyncio.current_task()
     return task is not None and task.cancelling() > 0
+
+
+def _is_control_exception(value: BaseException) -> bool:
+    return isinstance(value, (asyncio.CancelledError, GeneratorExit))
 
 
 async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes:
@@ -583,6 +606,8 @@ def _translate_event(
         raise AnthropicStreamError("Anthropic message_start is invalid")
     if event_type == "content_block_start":
         index = _index(payload)
+        if index in blocks:
+            raise AnthropicStreamError("Anthropic content block index is duplicated")
         block = payload.get("content_block")
         if not isinstance(block, Mapping):
             raise AnthropicStreamError("Anthropic content block is invalid")
@@ -600,10 +625,16 @@ def _translate_event(
             initial_input = block.get("input")
             if initial_input is not None and not isinstance(initial_input, Mapping):
                 raise AnthropicStreamError("Anthropic tool input is invalid")
+            call_id = block.get("id")
+            name = block.get("name")
+            if type(call_id) is not str or not call_id:
+                raise AnthropicStreamError("Anthropic tool call id is invalid")
+            if type(name) is not str or not name:
+                raise AnthropicStreamError("Anthropic tool call name is invalid")
             blocks[index] = _BlockState(
                 "tool_use",
-                call_id=str(block.get("id", "")),
-                name=str(block.get("name", "")),
+                call_id=call_id,
+                name=name,
                 initial_input=(
                     dict(initial_input)
                     if isinstance(initial_input, Mapping)
@@ -615,16 +646,26 @@ def _translate_event(
         return None
     if event_type == "content_block_delta":
         index = _index(payload)
-        block = blocks.setdefault(index, _BlockState("text"))
+        block = blocks.get(index)
+        if block is None:
+            raise AnthropicStreamError(
+                f"Anthropic delta references unknown block index: {index}"
+            )
         delta = payload.get("delta")
         if not isinstance(delta, Mapping):
             raise AnthropicStreamError("Anthropic content delta is invalid")
         kind = delta.get("type")
         if kind == "text_delta":
+            if block.kind != "text":
+                raise AnthropicStreamError("Anthropic text delta has the wrong block type")
             text = _required_string(delta, "text")
             block.text += text
             return StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=text)
         if kind == "thinking_delta":
+            if block.kind != "thinking":
+                raise AnthropicStreamError(
+                    "Anthropic thinking delta has the wrong block type"
+                )
             text = _required_string(delta, "thinking")
             block.text += text
             return StreamEvent(
@@ -641,6 +682,10 @@ def _translate_event(
                 data={"thinking_signature_delta": signature, "index": index},
             )
         if kind == "input_json_delta":
+            if block.kind != "tool_use":
+                raise AnthropicStreamError(
+                    "Anthropic tool delta has the wrong block type"
+                )
             partial = _required_string(delta, "partial_json")
             block.input_json += partial
             arguments = _parse_partial_object(block.input_json)

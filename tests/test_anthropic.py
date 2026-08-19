@@ -15,6 +15,8 @@ from zeta.anthropic import (
     build_authorization_url,
     build_messages_payload,
 )
+from zeta.loop import AgentLoop
+from zeta.store import ConversationStore
 from zeta.types import (
     Message,
     MessageRole,
@@ -380,3 +382,235 @@ async def test_cancellation_survives_failing_owned_client_cleanup(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_owned_client_close_is_not_swallowed(
+    tmp_path: Path,
+) -> None:
+    close_started = asyncio.Event()
+    never = asyncio.Event()
+
+    class Response:
+        status_code = 200
+
+        async def aiter_lines(self):
+            for line in SSE.splitlines():
+                yield line
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            return False
+
+    class Client:
+        def stream(self, method, url, *, headers, json):
+            return Stream()
+
+        async def aclose(self):
+            close_started.set()
+            await never.wait()
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    async def consume() -> list[object]:
+        return [event async for event in AnthropicBackend(token_store=store).complete([], [])]
+
+    with patch("zeta.anthropic.httpx.AsyncClient", return_value=Client()):
+        task = asyncio.create_task(consume())
+        await close_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_consumer_aclose_suppresses_failing_stream_cleanup(
+    tmp_path: Path,
+) -> None:
+    class Response:
+        status_code = 200
+
+        async def aiter_lines(self):
+            yield 'data: {"type":"message_start","message":{}}'
+            yield ""
+            await asyncio.Event().wait()
+            yield ""
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            raise RuntimeError("stream cleanup failed")
+
+    class Client:
+        def stream(self, method, url, *, headers, json):
+            return Stream()
+
+        async def aclose(self):
+            raise RuntimeError("client cleanup failed")
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    with patch("zeta.anthropic.httpx.AsyncClient", return_value=Client()):
+        stream = AnthropicBackend(token_store=store).complete([], [])
+        await anext(stream)
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_mid_thinking_drops_partial_block_before_resume(
+    tmp_path: Path,
+) -> None:
+    thinking_started = asyncio.Event()
+    never = asyncio.Event()
+    calls = 0
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, lines):
+            self.lines = lines
+
+        async def aiter_lines(self):
+            for line in self.lines:
+                yield line
+            await never.wait()
+
+    class Stream:
+        def __init__(self, response):
+            self.response = response
+
+        async def __aenter__(self):
+            return self.response
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            return False
+
+    class Client:
+        def stream(self, method, url, *, headers, json):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return Stream(
+                    Response(
+                        [
+                            'data: {"type":"message_start","message":{}}',
+                            "",
+                            'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+                            "",
+                            'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"partial"}}',
+                            "",
+                        ]
+                    )
+                )
+            return Stream(
+                Response(
+                    [
+                        'data: {"type":"message_start","message":{}}',
+                        "",
+                        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                        "",
+                        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"resumed"}}',
+                        "",
+                        'data: {"type":"message_stop"}',
+                        "",
+                    ]
+                )
+            )
+
+    store = ConversationStore(tmp_path / "sessions")
+    token_store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    token_store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    backend = AnthropicBackend(client=Client(), token_store=token_store)
+    loop = AgentLoop(backend, store)
+
+    task = asyncio.create_task(
+        consume_loop_turn(loop, thinking_started)
+    )
+    await thinking_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    messages = store.messages()
+    assert len(messages) == 1
+    assert calls == 1
+    events = [event async for event in loop.run_turn("resume")]
+    assert events[-1].type.name == "AGENT_END"
+    assert calls == 2
+
+
+async def _assert_malformed_stream_raises(tmp_path: Path, stream: str) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=stream,
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    with pytest.raises(AnthropicStreamError):
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+    await client.aclose()
+
+
+async def consume_loop_turn(loop: AgentLoop, thinking_started: asyncio.Event) -> None:
+    async for event in loop.run_turn("start"):
+        if event.type.name == "MESSAGE_UPDATE" and event.content is not None:
+            thinking_started.set()
+
+
+@pytest.mark.asyncio
+async def test_delta_without_block_start_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"bad"}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_text_delta_inside_thinking_block_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"bad"}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_identifiers_must_be_strings(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":[],"name":{},"input":{}}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
