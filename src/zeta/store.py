@@ -188,6 +188,8 @@ class ConversationStore:
                 f"invalid conversation entry: {self.path}"
             ) from exc
         self._validate_entries()
+        for entry in self._entries:
+            self._validate_entry_payload(entry)
 
         if torn_offset is not None:
             with self.path.open("r+b") as handle:
@@ -223,6 +225,31 @@ class ConversationStore:
                     f"missing prior parent {entry.parent_id} for {entry.id}"
                 )
             ids.add(entry.id)
+
+    def _validate_entry_payload(self, entry: ConversationEntry) -> None:
+        try:
+            if entry.type == "message":
+                message = entry.data.get("message")
+                if type(message) is not dict:
+                    raise ValueError("message entry payload must contain an object")
+                Message.from_dict(message)
+            elif entry.type == "compaction":
+                summary = entry.data.get("summary")
+                source_start = entry.data.get("source_seq_start")
+                source_end = entry.data.get("source_seq_end")
+                if type(summary) is not str:
+                    raise ValueError("compaction summary must be a string")
+                if type(source_start) is not int or type(source_end) is not int:
+                    raise ValueError("compaction source sequence must be integers")
+            elif entry.type == "warning":
+                if type(entry.data.get("message")) is not str:
+                    raise ValueError("warning message must be a string")
+            else:
+                raise ValueError(f"unsupported conversation entry type: {entry.type}")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ConversationIntegrityError(
+                f"invalid payload for conversation entry {entry.id}"
+            ) from exc
 
     def _write_line(self, row: dict[str, Any]) -> None:
         with self.path.open("ab") as handle:

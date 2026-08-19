@@ -121,6 +121,58 @@ def test_append_and_replay_use_data_snapshots(tmp_path: Path) -> None:
     assert fresh[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"]["value"] == 1
 
 
+def test_missing_nested_message_field_is_rejected_on_load(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(message(MessageRole.USER, "hello"))
+    rows = store.path.read_text().splitlines()
+    row = json.loads(rows[-1])
+    del row["data"]["message"]["content"][0]["text"]
+    rows[-1] = json.dumps(row, separators=(",", ":"), sort_keys=True)
+    store.path.write_text("\n".join(rows) + "\n")
+
+    with pytest.raises(ConversationIntegrityError):
+        ConversationStore(tmp_path, session_id=store.session_id)
+
+
+def test_bad_nested_role_is_rejected_on_load(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(message(MessageRole.USER, "hello"))
+    rows = store.path.read_text().splitlines()
+    row = json.loads(rows[-1])
+    row["data"]["message"]["role"] = "not-a-role"
+    rows[-1] = json.dumps(row, separators=(",", ":"), sort_keys=True)
+    store.path.write_text("\n".join(rows) + "\n")
+
+    with pytest.raises(ConversationIntegrityError):
+        ConversationStore(tmp_path, session_id=store.session_id)
+
+
+def test_numeric_nested_text_is_rejected_on_load(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(message(MessageRole.USER, "hello"))
+    rows = store.path.read_text().splitlines()
+    row = json.loads(rows[-1])
+    row["data"]["message"]["content"][0]["text"] = 42
+    rows[-1] = json.dumps(row, separators=(",", ":"), sort_keys=True)
+    store.path.write_text("\n".join(rows) + "\n")
+
+    with pytest.raises(ConversationIntegrityError):
+        ConversationStore(tmp_path, session_id=store.session_id)
+
+
+def test_string_compaction_sequence_is_rejected_on_load(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_compaction_marker("summary", 1, 2)
+    rows = store.path.read_text().splitlines()
+    row = json.loads(rows[-1])
+    row["data"]["source_seq_start"] = "1"
+    rows[-1] = json.dumps(row, separators=(",", ":"), sort_keys=True)
+    store.path.write_text("\n".join(rows) + "\n")
+
+    with pytest.raises(ConversationIntegrityError):
+        ConversationStore(tmp_path, session_id=store.session_id)
+
+
 def test_compaction_marker_persists(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     marker = store.append_compaction_marker("summary", 1, 4)

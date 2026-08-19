@@ -58,10 +58,19 @@ class ToolCall:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ToolCall:
+        call_id = value.get("id")
+        name = value.get("name")
+        arguments = value.get("arguments")
+        if type(call_id) is not str or not call_id:
+            raise ValueError("tool call id must be a nonempty string")
+        if type(name) is not str or not name:
+            raise ValueError("tool call name must be a nonempty string")
+        if type(arguments) is not dict:
+            raise ValueError("tool call arguments must be an object")
         return cls(
-            id=str(value["id"]),
-            name=str(value["name"]),
-            arguments=dict(value.get("arguments", {})),
+            id=call_id,
+            name=name,
+            arguments=arguments,
         )
 
 
@@ -84,12 +93,24 @@ ToolUseBlock = ToolUseContent
 
 
 def content_from_dict(value: Mapping[str, Any]) -> ContentBlock:
-    content_type = ContentType(value["type"])
+    content_type_value = value.get("type")
+    if type(content_type_value) is not str:
+        raise ValueError("content type must be a string")
+    content_type = ContentType(content_type_value)
     if content_type is ContentType.TEXT:
-        return TextContent(str(value["text"]))
+        text = value.get("text")
+        if type(text) is not str:
+            raise ValueError("text content text must be a string")
+        return TextContent(text)
     if content_type is ContentType.THINKING:
-        return ThinkingContent(str(value["text"]))
-    return ToolUseContent(ToolCall.from_dict(value["tool_call"]))
+        text = value.get("text")
+        if type(text) is not str:
+            raise ValueError("thinking content text must be a string")
+        return ThinkingContent(text)
+    tool_call = value.get("tool_call")
+    if type(tool_call) is not dict:
+        raise ValueError("tool-use content tool_call must be an object")
+    return ToolUseContent(ToolCall.from_dict(tool_call))
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,10 +128,19 @@ class ToolResult:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ToolResult:
+        tool_call_id = value.get("tool_call_id")
+        content = value.get("content")
+        is_error = value.get("is_error")
+        if type(tool_call_id) is not str or not tool_call_id:
+            raise ValueError("tool result call id must be a nonempty string")
+        if type(content) is not str:
+            raise ValueError("tool result content must be a string")
+        if type(is_error) is not bool:
+            raise ValueError("tool result is_error must be a boolean")
         return cls(
-            tool_call_id=str(value["tool_call_id"]),
-            content=str(value["content"]),
-            is_error=bool(value.get("is_error", False)),
+            tool_call_id=tool_call_id,
+            content=content,
+            is_error=is_error,
         )
 
 
@@ -131,13 +161,23 @@ class Message:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> Message:
+        role_value = value.get("role")
+        content_value = value.get("content")
+        if type(role_value) is not str:
+            raise ValueError("message role must be a string")
+        if type(content_value) is not list:
+            raise ValueError("message content must be an array")
+        if any(type(block) is not dict for block in content_value):
+            raise ValueError("message content blocks must be objects")
         tool_result_value = value.get("tool_result")
+        if "tool_result" in value and type(tool_result_value) is not dict:
+            raise ValueError("message tool_result must be an object")
         return cls(
-            role=MessageRole(value["role"]),
-            content=[content_from_dict(block) for block in value.get("content", [])],
+            role=MessageRole(role_value),
+            content=[content_from_dict(block) for block in content_value],
             tool_result=(
                 ToolResult.from_dict(tool_result_value)
-                if isinstance(tool_result_value, Mapping)
+                if tool_result_value is not None
                 else None
             ),
         )
