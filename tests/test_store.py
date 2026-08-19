@@ -1,6 +1,9 @@
-import warnings
 import json
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -75,19 +78,20 @@ def test_append_fsyncs_before_return(tmp_path: Path) -> None:
 
 
 def test_sessions_are_isolated(tmp_path: Path) -> None:
-    first = ConversationStore(tmp_path, session_id="first")
-    second = ConversationStore(tmp_path, session_id="second")
+    first = ConversationStore(tmp_path)
+    second = ConversationStore(tmp_path)
     first.append_message(message(MessageRole.USER, "one"))
     second.append_message(message(MessageRole.USER, "two"))
 
-    assert [item.content[0].text for item in ConversationStore(tmp_path, session_id="first").messages()] == ["one"]
-    assert [item.content[0].text for item in ConversationStore(tmp_path, session_id="second").messages()] == ["two"]
+    assert first.path != second.path
+    assert [item.content[0].text for item in first.messages()] == ["one"]
+    assert [item.content[0].text for item in second.messages()] == ["two"]
 
 
 def test_invalid_parent_is_rejected_on_append(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 
-    with pytest.raises(ConversationIntegrityError, match="missing parent"):
+    with pytest.raises(ConversationIntegrityError, match="missing prior parent"):
         store.append_message(message(MessageRole.USER, "bad"), parent_id="missing")
 
 
@@ -102,6 +106,44 @@ def test_invalid_sequence_and_parent_are_rejected_on_load(tmp_path: Path) -> Non
         ConversationStore(tmp_path, session_id=store.session_id)
 
 
+def test_self_parent_is_rejected_on_load(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(message(MessageRole.USER, "self"))
+    rows = store.path.read_text().splitlines()
+    row = json.loads(rows[-1])
+    row["parent_id"] = row["id"]
+    rows[-1] = json.dumps(row, separators=(",", ":"), sort_keys=True)
+    store.path.write_text("\n".join(rows) + "\n")
+
+    with pytest.raises(ConversationIntegrityError, match="prior parent"):
+        ConversationStore(tmp_path, session_id=store.session_id)
+
+
+def test_forward_parent_is_rejected_on_load(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(message(MessageRole.USER, "first"))
+    store.append_message(message(MessageRole.USER, "second"))
+    rows = store.path.read_text().splitlines()
+    first_row = json.loads(rows[-2])
+    second_row = json.loads(rows[-1])
+    first_row["parent_id"] = second_row["id"]
+    rows[-2] = json.dumps(first_row, separators=(",", ":"), sort_keys=True)
+    store.path.write_text("\n".join(rows) + "\n")
+
+    with pytest.raises(ConversationIntegrityError, match="prior parent"):
+        ConversationStore(tmp_path, session_id=store.session_id)
+
+
+def test_replay_detects_a_parent_cycle(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    first = store.append_message(message(MessageRole.USER, "first"))
+    second = store.append_message(message(MessageRole.USER, "second"))
+    store._entries[0] = replace(first, parent_id=second.id)
+
+    with pytest.raises(ConversationIntegrityError, match="cycle"):
+        store.replay()
+
+
 def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     first = store.append_message(message(MessageRole.USER, "one"))
@@ -114,3 +156,46 @@ def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
 
     with pytest.raises(ConversationIntegrityError, match="duplicate"):
         ConversationStore(tmp_path, session_id=store.session_id)
+
+
+def test_live_stores_reload_under_session_lock(tmp_path: Path) -> None:
+    first = ConversationStore(tmp_path, session_id="shared")
+    second = ConversationStore(tmp_path, session_id="shared")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(first.append_message, message(MessageRole.USER, "one")),
+            executor.submit(second.append_message, message(MessageRole.USER, "two")),
+        ]
+        [future.result() for future in futures]
+
+    reopened = ConversationStore(tmp_path, session_id="shared")
+    assert [entry.seq for entry in reopened.entries] == [1, 2]
+    assert len({entry.id for entry in reopened.entries}) == 2
+
+
+def test_duplicate_generated_id_is_rejected_on_append(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="shared")
+    first = store.append_message(message(MessageRole.USER, "one"))
+
+    with patch(
+        "zeta.store.uuid.uuid4",
+        return_value=SimpleNamespace(hex=first.id),
+    ):
+        with pytest.raises(ConversationIntegrityError, match="duplicate"):
+            store.append_message(message(MessageRole.USER, "two"))
+
+
+def test_session_id_path_and_header_mismatches_are_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConversationIntegrityError, match="safe path"):
+        ConversationStore(tmp_path, session_id="../escape")
+
+    store = ConversationStore(tmp_path, session_id="expected")
+    rows = store.path.read_text().splitlines()
+    header = json.loads(rows[0])
+    header["data"]["session_id"] = "other"
+    rows[0] = json.dumps(header, separators=(",", ":"), sort_keys=True)
+    store.path.write_text("\n".join(rows) + "\n")
+
+    with pytest.raises(ConversationIntegrityError, match="mismatch"):
+        ConversationStore(tmp_path, session_id="expected")

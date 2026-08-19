@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -7,14 +8,19 @@ from zeta.fake import FakeBackend, ScriptedTurn
 from zeta.loop import AgentLoop
 from zeta.store import ConversationStore
 from zeta.types import (
+    CompletionBackend,
+    Message,
     MessageRole,
     StreamEventType,
+    StreamEvent,
     TextContent,
     ToolCall,
+    ToolResult,
+    ToolSchema,
 )
 
 
-async def collect(events):
+async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
     return [event async for event in events]
 
 
@@ -103,6 +109,69 @@ async def test_tool_error_is_a_result_and_loop_continues(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_wrong_tool_result_id_becomes_expected_error_result(tmp_path: Path) -> None:
+    call = ToolCall("expected", "echo", {})
+    backend = FakeBackend(
+        [ScriptedTurn([], [call]), ScriptedTurn([TextContent("done")])]
+    )
+    store = ConversationStore(tmp_path)
+
+    def echo(arguments: dict[str, object]) -> ToolResult:
+        return ToolResult("wrong", "bad result")
+
+    await collect(AgentLoop(backend, store, tools={"echo": echo}).run_turn("start"))
+
+    result = store.messages()[2].tool_result
+    assert result is not None
+    assert result.tool_call_id == "expected"
+    assert result.is_error
+    assert "mismatch" in result.content
+
+
+async def close_after(
+    events: AsyncIterator[StreamEvent],
+    event_type: StreamEventType,
+) -> list[StreamEvent]:
+    seen: list[StreamEvent] = []
+    async for event in events:
+        seen.append(event)
+        if event.type is event_type:
+            await events.aclose()
+            break
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_aclose_after_message_update_persists_partial_state(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("partial")])])
+    store = ConversationStore(tmp_path)
+
+    await close_after(
+        AgentLoop(backend, store).run_turn("start"),
+        StreamEventType.MESSAGE_UPDATE,
+    )
+
+    assert [message.role for message in store.messages()] == [
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+    ]
+    assert store.messages()[-1].content[0].text == "partial"
+
+
+@pytest.mark.asyncio
+async def test_aclose_after_message_end_persists_complete_state(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("complete")])])
+    store = ConversationStore(tmp_path)
+
+    await close_after(
+        AgentLoop(backend, store).run_turn("start"),
+        StreamEventType.MESSAGE_END,
+    )
+
+    assert store.messages()[-1].content[0].text == "complete"
+
+
+@pytest.mark.asyncio
 async def test_cancellation_persists_partial_state(tmp_path: Path) -> None:
     backend = FakeBackend(
         [ScriptedTurn([TextContent("partial"), TextContent("more")], delay=0.1)]
@@ -136,8 +205,12 @@ async def test_max_turns_stops(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_backend_error_is_typed_and_user_state_is_persisted(tmp_path: Path) -> None:
-    class BrokenBackend:
-        async def complete(self, messages, tool_schemas):
+    class BrokenBackend(CompletionBackend):
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
             raise RuntimeError("backend broke")
             yield
 

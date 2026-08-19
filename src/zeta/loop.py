@@ -99,6 +99,9 @@ class AgentLoop:
             except asyncio.CancelledError:
                 self._persist_partial(partial_blocks, assistant_message)
                 raise
+            except GeneratorExit:
+                self._persist_partial(partial_blocks, assistant_message)
+                raise
             except Exception as exc:
                 self._persist_partial(partial_blocks, assistant_message)
                 yield StreamEvent(
@@ -138,6 +141,12 @@ class AgentLoop:
                     result = await self.tool_executor.execute(tool_call)
                 except Exception as exc:
                     result = ToolResult(tool_call.id, str(exc), is_error=True)
+                if result.tool_call_id != tool_call.id:
+                    result = ToolResult(
+                        tool_call.id,
+                        f"tool result id mismatch: expected {tool_call.id}, got {result.tool_call_id}",
+                        is_error=True,
+                    )
                 self.store.append_message(
                     Message(
                         MessageRole.TOOL_RESULT,

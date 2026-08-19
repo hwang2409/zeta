@@ -6,10 +6,13 @@ import json
 import os
 import uuid
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
+
+import fcntl
 
 from .types import Message
 
@@ -70,15 +73,26 @@ class ConversationStore:
     ) -> None:
         self.root_dir = Path(session_dir or Path.home() / ".zeta" / "sessions")
         self.session_id = session_id or uuid.uuid4().hex
+        if (
+            not self.session_id
+            or self.session_id in {".", ".."}
+            or "\x00" in self.session_id
+            or Path(self.session_id).parts != (self.session_id,)
+        ):
+            raise ConversationIntegrityError(
+                f"session id must be one safe path component: {self.session_id!r}"
+            )
         self.session_dir = self.root_dir / self.session_id
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.session_dir / "conversation.jsonl"
+        self.lock_path = self.session_dir / ".lock"
         self.cwd = str(cwd or Path.cwd())
         self._entries: list[ConversationEntry] = []
         self._load()
 
     def _load(self) -> None:
         if not self.path.exists():
+            self._entries = []
             header = {
                 "schema": SCHEMA,
                 "session_id": self.session_id,
@@ -121,12 +135,16 @@ class ConversationStore:
         ):
             raise ConversationIntegrityError(f"unsupported conversation schema: {self.path}")
         try:
-            self.session_id = str(header_data["session_id"])
+            header_session_id = str(header_data["session_id"])
             self.cwd = str(header_data["cwd"])
         except KeyError as exc:
             raise ConversationIntegrityError(
                 f"conversation header is incomplete: {self.path}"
             ) from exc
+        if header_session_id != self.session_id:
+            raise ConversationIntegrityError(
+                f"conversation header session id mismatch: {self.path}"
+            )
         try:
             self._entries = [ConversationEntry.from_dict(row) for row in valid_rows[1:]]
         except (KeyError, TypeError, ValueError) as exc:
@@ -140,7 +158,7 @@ class ConversationStore:
                 handle.truncate(torn_offset)
                 handle.flush()
                 os.fsync(handle.fileno())
-            self._append_row(
+            self._append_row_unlocked(
                 "warning",
                 {"message": "dropped torn final conversation line"},
             )
@@ -164,12 +182,11 @@ class ConversationStore:
                 )
             if entry.id in ids:
                 raise ConversationIntegrityError(f"duplicate conversation id: {entry.id}")
-            ids.add(entry.id)
-        for entry in self._entries:
             if entry.parent_id is not None and entry.parent_id not in ids:
                 raise ConversationIntegrityError(
-                    f"missing parent {entry.parent_id} for {entry.id}"
+                    f"missing prior parent {entry.parent_id} for {entry.id}"
                 )
+            ids.add(entry.id)
 
     def _write_line(self, row: dict[str, Any]) -> None:
         with self.path.open("ab") as handle:
@@ -177,12 +194,40 @@ class ConversationStore:
             handle.flush()
             os.fsync(handle.fileno())
 
-    def _append_row(self, entry_type: str, data: dict[str, Any], parent_id: str | None = None) -> ConversationEntry:
-        if parent_id is not None and parent_id not in {entry.id for entry in self._entries}:
-            raise ConversationIntegrityError(f"missing parent {parent_id}")
+    @contextmanager
+    def _append_lock(self) -> Iterator[None]:
+        with self.lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _append_row(
+        self,
+        entry_type: str,
+        data: dict[str, Any],
+        parent_id: str | None = None,
+    ) -> ConversationEntry:
+        with self._append_lock():
+            self._load()
+            return self._append_row_unlocked(entry_type, data, parent_id)
+
+    def _append_row_unlocked(
+        self,
+        entry_type: str,
+        data: dict[str, Any],
+        parent_id: str | None = None,
+    ) -> ConversationEntry:
+        prior_ids = {entry.id for entry in self._entries}
+        if parent_id is not None and parent_id not in prior_ids:
+            raise ConversationIntegrityError(f"missing prior parent {parent_id}")
+        entry_id = uuid.uuid4().hex
+        if entry_id in prior_ids:
+            raise ConversationIntegrityError(f"duplicate conversation id: {entry_id}")
         entry = ConversationEntry(
             seq=(self._entries[-1].seq + 1 if self._entries else 1),
-            id=uuid.uuid4().hex,
+            id=entry_id,
             parent_id=(parent_id if parent_id is not None else (self._entries[-1].id if self._entries else None)),
             lane="main",
             type=entry_type,
@@ -219,7 +264,13 @@ class ConversationStore:
         by_id = {entry.id: entry for entry in self._entries}
         current = self._entries[-1]
         branch: list[ConversationEntry] = []
+        seen: set[str] = set()
         while current is not None:
+            if current.id in seen:
+                raise ConversationIntegrityError(
+                    f"conversation parent cycle at {current.id}"
+                )
+            seen.add(current.id)
             branch.append(current)
             current = by_id.get(current.parent_id) if current.parent_id else None
         return list(reversed(branch))
