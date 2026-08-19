@@ -72,7 +72,7 @@ class ConversationStore:
         cwd: str | Path | None = None,
     ) -> None:
         self.root_dir = Path(session_dir or Path.home() / ".zeta" / "sessions")
-        self.session_id = session_id or uuid.uuid4().hex
+        self.session_id = uuid.uuid4().hex if session_id is None else session_id
         if (
             not self.session_id
             or self.session_id in {".", ".."}
@@ -88,7 +88,8 @@ class ConversationStore:
         self.lock_path = self.session_dir / ".lock"
         self.cwd = str(cwd or Path.cwd())
         self._entries: list[ConversationEntry] = []
-        self._load()
+        with self._append_lock():
+            self._load()
 
     def _load(self) -> None:
         if not self.path.exists():
@@ -114,6 +115,10 @@ class ConversationStore:
                 if index != len(lines) - 1:
                     raise ConversationIntegrityError(
                         f"invalid conversation row {index + 1}: {self.path}"
+                    ) from exc
+                if line.endswith(b"\n"):
+                    raise ConversationIntegrityError(
+                        f"invalid terminated conversation row {index + 1}: {self.path}"
                     ) from exc
                 torn_offset = offset
                 break

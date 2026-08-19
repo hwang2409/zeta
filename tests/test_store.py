@@ -56,6 +56,15 @@ def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     assert reopened_again.path.read_bytes() == reopened.path.read_bytes()
 
 
+def test_terminated_invalid_tail_is_not_repaired(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    with store.path.open("ab") as handle:
+        handle.write(b'{"invalid": }\n')
+
+    with pytest.raises(ConversationIntegrityError, match="terminated"):
+        ConversationStore(tmp_path, session_id=store.session_id)
+
+
 def test_compaction_marker_persists(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     marker = store.append_compaction_marker("summary", 1, 4)
@@ -88,11 +97,46 @@ def test_sessions_are_isolated(tmp_path: Path) -> None:
     assert [item.content[0].text for item in second.messages()] == ["two"]
 
 
+def test_concurrent_constructors_write_one_header(tmp_path: Path) -> None:
+    def construct(_: int) -> ConversationStore:
+        return ConversationStore(tmp_path, session_id="race")
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        stores = list(executor.map(construct, range(8)))
+
+    rows = stores[0].path.read_text().splitlines()
+    assert [json.loads(row)["type"] for row in rows] == ["header"]
+
+
+def test_concurrent_constructors_repair_once(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="repair-race")
+    store.append_message(message(MessageRole.USER, "kept"))
+    with store.path.open("ab") as handle:
+        handle.write(b'{"seq": 3, "id": "torn"')
+
+    def construct(_: int) -> ConversationStore:
+        return ConversationStore(tmp_path, session_id="repair-race")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            stores = list(executor.map(construct, range(8)))
+
+    rows = [json.loads(row) for row in stores[0].path.read_text().splitlines()]
+    assert [row["type"] for row in rows] == ["header", "message", "warning"]
+    assert all(len(store.entries) == 2 for store in stores)
+
+
 def test_invalid_parent_is_rejected_on_append(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 
     with pytest.raises(ConversationIntegrityError, match="missing prior parent"):
         store.append_message(message(MessageRole.USER, "bad"), parent_id="missing")
+
+
+def test_empty_session_id_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConversationIntegrityError, match="safe path"):
+        ConversationStore(tmp_path, session_id="")
 
 
 def test_invalid_sequence_and_parent_are_rejected_on_load(tmp_path: Path) -> None:
