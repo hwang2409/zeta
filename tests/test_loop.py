@@ -1,4 +1,5 @@
 import asyncio
+import warnings
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from unittest.mock import patch
@@ -150,6 +151,30 @@ async def test_wrong_typed_tool_result_becomes_valid_error_result(tmp_path: Path
     assert ConversationStore(tmp_path, session_id=store.session_id).messages()
 
 
+@pytest.mark.parametrize("output", [None, 123, {"value": "bad"}])
+@pytest.mark.asyncio
+async def test_invalid_tool_handler_output_becomes_error_result(
+    tmp_path: Path,
+    output: object,
+) -> None:
+    call = ToolCall("expected", "echo", {})
+    backend = FakeBackend(
+        [ScriptedTurn([], [call]), ScriptedTurn([TextContent("done")])]
+    )
+    store = ConversationStore(tmp_path)
+
+    def echo(arguments: dict[str, object]) -> object:
+        return output
+
+    await collect(AgentLoop(backend, store, tools={"echo": echo}).run_turn("start"))
+
+    result = store.messages()[2].tool_result
+    assert result is not None
+    assert result.tool_call_id == call.id
+    assert result.is_error
+    assert "invalid tool handler result" in result.content
+
+
 async def close_after(
     events: AsyncIterator[StreamEvent],
     event_type: StreamEventType,
@@ -296,7 +321,8 @@ async def test_cancellation_keeps_control_error_when_partial_persist_fails(
         "append_message",
         side_effect=OSError("disk full"),
     ):
-        with pytest.warns(RuntimeWarning, match="partial state"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -319,7 +345,8 @@ async def test_aclose_keeps_control_error_when_partial_persist_fails(
                 "append_message",
                 side_effect=OSError("disk full"),
             ):
-                with pytest.warns(RuntimeWarning, match="partial state"):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
                     await stream.aclose()
             break
 

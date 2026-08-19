@@ -46,7 +46,13 @@ class DictToolExecutor:
             result = await result
         if isinstance(result, ToolResult):
             return result
-        return ToolResult(tool_call.id, str(result))
+        if isinstance(result, str):
+            return ToolResult(tool_call.id, result)
+        return ToolResult(
+            tool_call.id,
+            "invalid tool handler result: expected str or ToolResult",
+            is_error=True,
+        )
 
 
 async def _close_completion(
@@ -243,8 +249,11 @@ class AgentLoop:
         try:
             self._persist_partial(partial_blocks, assistant_message)
         except Exception as exc:
-            warnings.warn(
-                f"failed to persist partial state: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            try:
+                warnings.warn(
+                    f"failed to persist partial state: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            except:
+                pass
