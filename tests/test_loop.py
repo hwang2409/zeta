@@ -146,11 +146,13 @@ async def test_aclose_after_message_update_persists_partial_state(tmp_path: Path
     backend = FakeBackend([ScriptedTurn([TextContent("partial")])])
     store = ConversationStore(tmp_path)
 
+    stream = AgentLoop(backend, store).run_turn("start")
     await close_after(
-        AgentLoop(backend, store).run_turn("start"),
+        stream,
         StreamEventType.MESSAGE_UPDATE,
     )
 
+    assert backend.completion_close_count == 1
     assert [message.role for message in store.messages()] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,

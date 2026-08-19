@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import aclosing
 from typing import Any, Protocol
 
 from .store import ConversationStore
@@ -85,17 +86,19 @@ class AgentLoop:
             partial_blocks: list[ContentBlock] = []
             assistant_message: Message | None = None
             try:
-                async for event in self.backend.complete(
+                completion = self.backend.complete(
                     self.store.messages(), self.tool_schemas
-                ):
-                    if event.type is StreamEventType.MESSAGE_UPDATE:
-                        if event.content is not None:
-                            partial_blocks.append(event.content)
-                        if event.delta is not None:
-                            partial_blocks.append(TextContent(event.delta))
-                    if event.message is not None and event.type is StreamEventType.MESSAGE_END:
-                        assistant_message = event.message
-                    yield event
+                )
+                async with aclosing(completion) as stream:
+                    async for event in stream:
+                        if event.type is StreamEventType.MESSAGE_UPDATE:
+                            if event.content is not None:
+                                partial_blocks.append(event.content)
+                            if event.delta is not None:
+                                partial_blocks.append(TextContent(event.delta))
+                        if event.message is not None and event.type is StreamEventType.MESSAGE_END:
+                            assistant_message = event.message
+                        yield event
             except asyncio.CancelledError:
                 self._persist_partial(partial_blocks, assistant_message)
                 raise

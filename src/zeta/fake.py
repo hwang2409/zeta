@@ -30,6 +30,7 @@ class FakeBackend(CompletionBackend):
     def __init__(self, turns: Sequence[ScriptedTurn]) -> None:
         self.turns = list(turns)
         self.calls: list[tuple[list[Message], list[ToolSchema]]] = []
+        self.completion_close_count = 0
 
     async def complete(
         self,
@@ -40,14 +41,17 @@ class FakeBackend(CompletionBackend):
         self.calls.append((list(messages), list(tool_schemas)))
         turn = self.turns[index]
         blocks = [*turn.content, *(ToolUseContent(call) for call in turn.tool_calls)]
-        yield StreamEvent(StreamEventType.MESSAGE_START)
-        for index, block in enumerate(blocks):
-            if index and turn.delay:
+        try:
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            for index, block in enumerate(blocks):
+                if index and turn.delay:
+                    await asyncio.sleep(turn.delay)
+                yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+            if turn.delay:
                 await asyncio.sleep(turn.delay)
-            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
-        if turn.delay:
-            await asyncio.sleep(turn.delay)
-        yield StreamEvent(
-            StreamEventType.MESSAGE_END,
-            message=Message(role=MessageRole.ASSISTANT, content=blocks),
-        )
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(role=MessageRole.ASSISTANT, content=blocks),
+            )
+        finally:
+            self.completion_close_count += 1
