@@ -1,4 +1,4 @@
-# harness design
+# zeta design
 
 Re-anchor of the WIKI-361 plan (2026-08-19, Henry decision): the harness is a
 standalone project, not a Wiki backend retrofit. It builds its own agent loop
@@ -40,7 +40,7 @@ the harness-native distillation.
   handling, sequential/parallel execution, pre-execution hook.
 - `ApprovalPolicy`: allow / deny / ask with durable pending requests (stronger
   than pi's hook-only model — this we keep from the Wiki design).
-- Sessions: `~/.harness/sessions/` (own home, not ~/.wiki), versioned schema.
+- Sessions: `~/.zeta/sessions/` (own home, not ~/.wiki), versioned schema.
 - TUI later: inline renderer + sticky composer (prompt_toolkit + rich), reuses
   the wk-tui design decisions; lands after the loop is real.
 
@@ -52,18 +52,18 @@ the harness-native distillation.
   credential stores those apps maintain (with consent, documented per
   provider).
 
-## Ticket ladder (HAR prefix)
+## Ticket ladder (ZETA prefix)
 
 | Ticket | Contract | Depends |
 |---|---|---|
-| HAR-1 | Core types + ConversationStore (append-only JSONL, parent links, replay, torn-tail repair) + AgentLoop skeleton driven by a deterministic fake backend + tests | — |
-| HAR-2 | Anthropic backend: subscription OAuth (reuse/refresh existing Claude login), Messages API stream, provider-neutral events; single-completion boundary test | HAR-1 |
-| HAR-3 | Codex backend: ChatGPT plan OAuth, backend-api Responses stream; same boundary test | HAR-1 |
-| HAR-4 | ToolRegistry + first tools (read/list/exec with cwd jail) + pre-execution hook | HAR-1 |
-| HAR-5 | ApprovalPolicy with durable pending requests + resume re-emit | HAR-4 |
-| HAR-6 | ContextAssembler + CompactionPolicy (budget, retained tail, summary completion, digest) | HAR-2 or HAR-3 |
-| HAR-7 | Session resume (--continue/--resume), provider-transport recreation | HAR-6 |
-| HAR-8 | TUI: sticky composer, patch_stdout pump, status bar, commit-on-newline streaming | HAR-2/3 |
+| ZETA-1 | Core types + ConversationStore (append-only JSONL, parent links, replay, torn-tail repair) + AgentLoop skeleton driven by a deterministic fake backend + tests | — |
+| ZETA-2 | Anthropic backend: subscription OAuth (reuse/refresh existing Claude login), Messages API stream, provider-neutral events; single-completion boundary test | ZETA-1 |
+| ZETA-3 | Codex backend: ChatGPT plan OAuth, backend-api Responses stream; same boundary test | ZETA-1 |
+| ZETA-4 | ToolRegistry + first tools (read/list/exec with cwd jail) + pre-execution hook | ZETA-1 |
+| ZETA-5 | ApprovalPolicy with durable pending requests + resume re-emit | ZETA-4 |
+| ZETA-6 | ContextAssembler + CompactionPolicy (budget, retained tail, summary completion, digest) | ZETA-2 or ZETA-3 |
+| ZETA-7 | Session resume (--continue/--resume), provider-transport recreation | ZETA-6 |
+| ZETA-8 | TUI: sticky composer, patch_stdout pump, status bar, commit-on-newline streaming | ZETA-2/3 |
 
 Gate: `uv run pytest -q`. Review flow: same luna implementer -> sol reviewer
 loop as the wiki repo; merges by the orchestrator after a clean pass.

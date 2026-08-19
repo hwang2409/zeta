@@ -1,4 +1,4 @@
-# harness
+# zeta
 
 Custom agent harness. Owns the full agent loop — conversation state, context
 assembly and compaction, tool dispatch, approval policy, streaming, session
@@ -10,7 +10,7 @@ dependency behind a flag.
 
 ## Layout
 
-- `src/harness/` — the package
+- `src/zeta/` — the package
 - `tests/` — pytest suite (`uv run pytest -q`)
 - `docs/design.md` — architecture and ticket ladder
 
