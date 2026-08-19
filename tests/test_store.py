@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from zeta.store import ConversationIntegrityError, ConversationStore
-from zeta.types import Message, MessageRole, TextContent
+from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
 
 
 def message(role: MessageRole, text: str) -> Message:
@@ -63,6 +63,62 @@ def test_terminated_invalid_tail_is_not_repaired(tmp_path: Path) -> None:
 
     with pytest.raises(ConversationIntegrityError, match="terminated"):
         ConversationStore(tmp_path, session_id=store.session_id)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("seq", "1"), ("id", ""), ("parent_id", 0), ("lane", "side")],
+)
+def test_invalid_entry_fields_are_rejected(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(message(MessageRole.USER, "bad"))
+    rows = store.path.read_text().splitlines()
+    row = json.loads(rows[-1])
+    row[field] = value
+    rows[-1] = json.dumps(row, separators=(",", ":"), sort_keys=True)
+    store.path.write_text("\n".join(rows) + "\n")
+
+    with pytest.raises(ConversationIntegrityError):
+        ConversationStore(tmp_path, session_id=store.session_id)
+
+
+@pytest.mark.parametrize("tail", [b"\xff\n", b"\xff"])
+def test_non_utf8_tail_uses_termination_rule(tmp_path: Path, tail: bytes) -> None:
+    store = ConversationStore(tmp_path)
+    with store.path.open("ab") as handle:
+        handle.write(tail)
+
+    if tail.endswith(b"\n"):
+        with pytest.raises(ConversationIntegrityError, match="terminated"):
+            ConversationStore(tmp_path, session_id=store.session_id)
+    else:
+        with pytest.warns(RuntimeWarning, match="torn"):
+            reopened = ConversationStore(tmp_path, session_id=store.session_id)
+        assert reopened.entries[-1].type == "warning"
+
+
+def test_append_and_replay_use_data_snapshots(tmp_path: Path) -> None:
+    arguments = {"nested": {"value": 1}}
+    call = ToolCall("call-1", "tool", arguments)
+    store = ConversationStore(
+        tmp_path,
+        session_id="snapshot",
+    )
+    entry = store.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
+    )
+
+    arguments["nested"]["value"] = 2
+    entry.data["message"]["content"][0]["tool_call"]["arguments"]["nested"]["value"] = 4
+    replay = store.replay()
+    replay[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"]["value"] = 3
+
+    fresh = store.replay()
+    assert fresh[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"]["value"] == 1
 
 
 def test_compaction_marker_persists(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import uuid
@@ -53,13 +54,33 @@ class ConversationEntry:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ConversationEntry:
+        seq = value.get("seq")
+        entry_id = value.get("id")
+        parent_id = value.get("parent_id")
+        lane = value.get("lane")
+        entry_type = value.get("type")
+        data = value.get("data")
+        if type(seq) is not int:
+            raise ConversationIntegrityError("conversation seq must be an integer")
+        if type(entry_id) is not str or not entry_id:
+            raise ConversationIntegrityError("conversation id must be a nonempty string")
+        if parent_id is not None and (type(parent_id) is not str or not parent_id):
+            raise ConversationIntegrityError(
+                "conversation parent_id must be null or a nonempty string"
+            )
+        if type(lane) is not str or lane != "main":
+            raise ConversationIntegrityError("conversation lane must be 'main'")
+        if type(entry_type) is not str or not entry_type:
+            raise ConversationIntegrityError("conversation type must be a nonempty string")
+        if type(data) is not dict:
+            raise ConversationIntegrityError("conversation data must be an object")
         return cls(
-            seq=int(value["seq"]),
-            id=str(value["id"]),
-            parent_id=(str(value["parent_id"]) if value.get("parent_id") else None),
-            lane=str(value["lane"]),
-            type=str(value["type"]),
-            data=dict(value.get("data", {})),
+            seq=seq,
+            id=entry_id,
+            parent_id=parent_id,
+            lane=lane,
+            type=entry_type,
+            data=data,
         )
 
 
@@ -111,7 +132,7 @@ class ConversationStore:
         for index, line in enumerate(lines):
             try:
                 row = json.loads(line)
-            except json.JSONDecodeError as exc:
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 if index != len(lines) - 1:
                     raise ConversationIntegrityError(
                         f"invalid conversation row {index + 1}: {self.path}"
@@ -134,24 +155,34 @@ class ConversationStore:
         header = valid_rows[0]
         header_data = header.get("data")
         if (
-            header.get("type") != "header"
-            or not isinstance(header_data, dict)
+            type(header.get("type")) is not str
+            or header.get("type") != "header"
+            or type(header_data) is not dict
+            or type(header_data.get("schema")) is not str
             or header_data.get("schema") != SCHEMA
         ):
             raise ConversationIntegrityError(f"unsupported conversation schema: {self.path}")
-        try:
-            header_session_id = str(header_data["session_id"])
-            self.cwd = str(header_data["cwd"])
-        except KeyError as exc:
+        header_session_id = header_data.get("session_id")
+        cwd = header_data.get("cwd")
+        created_at = header_data.get("created_at")
+        if (
+            type(header_session_id) is not str
+            or not header_session_id
+            or type(cwd) is not str
+            or type(created_at) is not str
+        ):
             raise ConversationIntegrityError(
                 f"conversation header is incomplete: {self.path}"
-            ) from exc
+            )
+        self.cwd = cwd
         if header_session_id != self.session_id:
             raise ConversationIntegrityError(
                 f"conversation header session id mismatch: {self.path}"
             )
         try:
             self._entries = [ConversationEntry.from_dict(row) for row in valid_rows[1:]]
+        except ConversationIntegrityError:
+            raise
         except (KeyError, TypeError, ValueError) as exc:
             raise ConversationIntegrityError(
                 f"invalid conversation entry: {self.path}"
@@ -216,7 +247,8 @@ class ConversationStore:
     ) -> ConversationEntry:
         with self._append_lock():
             self._load()
-            return self._append_row_unlocked(entry_type, data, parent_id)
+            entry = self._append_row_unlocked(entry_type, data, parent_id)
+            return self._snapshot_entry(entry)
 
     def _append_row_unlocked(
         self,
@@ -236,7 +268,7 @@ class ConversationStore:
             parent_id=(parent_id if parent_id is not None else (self._entries[-1].id if self._entries else None)),
             lane="main",
             type=entry_type,
-            data=data,
+            data=copy.deepcopy(data),
         )
         self._write_line(entry.to_dict())
         self._entries.append(entry)
@@ -278,7 +310,18 @@ class ConversationStore:
             seen.add(current.id)
             branch.append(current)
             current = by_id.get(current.parent_id) if current.parent_id else None
-        return list(reversed(branch))
+        return [self._snapshot_entry(entry) for entry in reversed(branch)]
+
+    @staticmethod
+    def _snapshot_entry(entry: ConversationEntry) -> ConversationEntry:
+        return ConversationEntry(
+            seq=entry.seq,
+            id=entry.id,
+            parent_id=entry.parent_id,
+            lane=entry.lane,
+            type=entry.type,
+            data=copy.deepcopy(entry.data),
+        )
 
     def messages(self) -> list[Message]:
         messages: list[Message] = []
@@ -289,4 +332,4 @@ class ConversationStore:
 
     @property
     def entries(self) -> list[ConversationEntry]:
-        return list(self._entries)
+        return [self._snapshot_entry(entry) for entry in self._entries]
