@@ -474,12 +474,26 @@ class AnthropicBackend(CompletionBackend):
                         primary_exception.__traceback__ if primary_exception else None,
                     )
                 except BaseException as exc:
-                    primary_exception = _merge_exception(primary_exception, exc)
+                    cleanup_exception = (
+                        _request_error(exc)
+                        if isinstance(exc, httpx.HTTPError)
+                        else exc
+                    )
+                    primary_exception = _merge_exception(
+                        primary_exception, cleanup_exception
+                    )
             if self.client is None:
                 try:
                     await client.aclose()
                 except BaseException as exc:
-                    primary_exception = _merge_exception(primary_exception, exc)
+                    cleanup_exception = (
+                        _request_error(exc)
+                        if isinstance(exc, httpx.HTTPError)
+                        else exc
+                    )
+                    primary_exception = _merge_exception(
+                        primary_exception, cleanup_exception
+                    )
             if _task_is_cancelling():
                 primary_exception = _merge_exception(
                     primary_exception, asyncio.CancelledError()
@@ -780,6 +794,8 @@ def _translate_event(
             raise AnthropicStreamError("Anthropic message usage is invalid")
         return None
     if event_type == "message_stop":
+        if active_blocks:
+            raise AnthropicStreamError("Anthropic message stop has open content blocks")
         content: list[ContentBlock] = []
         for index in sorted(blocks):
             block = blocks[index]

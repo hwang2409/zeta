@@ -42,6 +42,9 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-1"}}
 
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
 event: content_block_start
 data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
 
@@ -557,6 +560,72 @@ async def test_client_cleanup_cancellation_wins_over_stream_error(
 
 
 @pytest.mark.asyncio
+async def test_response_cleanup_http_error_is_typed(tmp_path: Path) -> None:
+    class Response:
+        status_code = 200
+
+        async def aiter_lines(self):
+            for line in SSE.splitlines():
+                yield line
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            raise httpx.ConnectError("response cleanup secret")
+
+    class Client:
+        def stream(self, method, url, *, headers, json):
+            return Stream()
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    with pytest.raises(AnthropicHTTPError) as raised:
+        [
+            event
+            async for event in AnthropicBackend(
+                client=Client(), token_store=store
+            ).complete([], [])
+        ]
+    assert "response cleanup secret" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_client_cleanup_http_error_is_typed(tmp_path: Path) -> None:
+    class Response:
+        status_code = 200
+
+        async def aiter_lines(self):
+            for line in SSE.splitlines():
+                yield line
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            return False
+
+    class Client:
+        def stream(self, method, url, *, headers, json):
+            return Stream()
+
+        async def aclose(self):
+            raise httpx.TimeoutException("client cleanup secret")
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    with patch("zeta.anthropic.httpx.AsyncClient", return_value=Client()):
+        with pytest.raises(AnthropicHTTPError) as raised:
+            [
+                event
+                async for event in AnthropicBackend(token_store=store).complete([], [])
+            ]
+    assert "client cleanup secret" not in str(raised.value)
+
+
+@pytest.mark.asyncio
 async def test_cancel_mid_thinking_drops_partial_block_before_resume(
     tmp_path: Path,
 ) -> None:
@@ -610,6 +679,8 @@ async def test_cancel_mid_thinking_drops_partial_block_before_resume(
                         'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
                         "",
                         'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"resumed"}}',
+                        "",
+                        'data: {"type":"content_block_stop","index":0}',
                         "",
                         'data: {"type":"message_stop"}',
                         "",
@@ -688,6 +759,21 @@ async def test_delta_after_block_stop_is_rejected(tmp_path: Path) -> None:
                 'data: {"type":"content_block_stop","index":0}',
                 "",
                 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"bad"}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_stop_with_open_block_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
                 "",
                 'data: {"type":"message_stop"}',
                 "",
