@@ -10,6 +10,7 @@ from zeta.anthropic import (
     AnthropicAuthError,
     AnthropicBackend,
     AnthropicCredentialStore,
+    AnthropicHTTPError,
     AnthropicStreamError,
     OAuthTokens,
     build_authorization_url,
@@ -282,6 +283,20 @@ async def test_http_failure_is_typed(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_request_entry_transport_failure_is_typed(tmp_path: Path) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("secret connection details", request=request)
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    with pytest.raises(AnthropicHTTPError) as raised:
+        await anext(AnthropicBackend(client=client, token_store=store).complete([], []))
+    assert "secret connection details" not in str(raised.value)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_truncated_stream_is_typed(tmp_path: Path) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -462,6 +477,86 @@ async def test_consumer_aclose_suppresses_failing_stream_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_response_cleanup_cancellation_wins_over_stream_error(
+    tmp_path: Path,
+) -> None:
+    cleanup_started = asyncio.Event()
+    never = asyncio.Event()
+
+    class Response:
+        status_code = 200
+
+        async def aiter_lines(self):
+            yield 'data: {"type":"message_delta","delta":"bad"}'
+            yield ""
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            cleanup_started.set()
+            await never.wait()
+
+    class Client:
+        def stream(self, method, url, *, headers, json):
+            return Stream()
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    task = asyncio.create_task(
+        anext(AnthropicBackend(client=Client(), token_store=store).complete([], []))
+    )
+    await cleanup_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+    assert isinstance(raised.value.__cause__, AnthropicStreamError)
+
+
+@pytest.mark.asyncio
+async def test_client_cleanup_cancellation_wins_over_stream_error(
+    tmp_path: Path,
+) -> None:
+    cleanup_started = asyncio.Event()
+    never = asyncio.Event()
+
+    class Response:
+        status_code = 200
+
+        async def aiter_lines(self):
+            yield 'data: {"type":"message_delta","delta":"bad"}'
+            yield ""
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            return False
+
+    class Client:
+        def stream(self, method, url, *, headers, json):
+            return Stream()
+
+        async def aclose(self):
+            cleanup_started.set()
+            await never.wait()
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    with patch("zeta.anthropic.httpx.AsyncClient", return_value=Client()):
+        task = asyncio.create_task(
+            anext(AnthropicBackend(token_store=store).complete([], []))
+        )
+        await cleanup_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+    assert isinstance(raised.value.__cause__, AnthropicStreamError)
+
+
+@pytest.mark.asyncio
 async def test_cancel_mid_thinking_drops_partial_block_before_resume(
     tmp_path: Path,
 ) -> None:
@@ -574,6 +669,108 @@ async def test_delta_without_block_start_is_rejected(tmp_path: Path) -> None:
         "\n".join(
             [
                 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"bad"}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_delta_after_block_stop_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+                'data: {"type":"content_block_stop","index":0}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"bad"}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_without_block_start_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"content_block_stop","index":0}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_block_stop_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+                'data: {"type":"content_block_stop","index":0}',
+                "",
+                'data: {"type":"content_block_stop","index":0}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_block_start_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_delta_type_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"unknown_delta"}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_block_type_is_rejected(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"unknown_block"}}',
                 "",
                 'data: {"type":"message_stop"}',
                 "",

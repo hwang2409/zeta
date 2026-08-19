@@ -454,14 +454,15 @@ class AnthropicBackend(CompletionBackend):
             except AnthropicBackendError as exc:
                 primary_exception = exc
             except httpx.HTTPError as exc:
-                primary_exception = AnthropicHTTPError("Anthropic request failed")
-                primary_exception.__cause__ = exc
+                primary_exception = _request_error(exc)
             except BaseException as exc:
                 if _task_is_cancelling() and not _is_control_exception(exc):
                     primary_exception = asyncio.CancelledError()
                     primary_exception.__cause__ = exc
                 else:
                     primary_exception = exc
+        except httpx.HTTPError as exc:
+            primary_exception = _request_error(exc)
         except BaseException as exc:
             primary_exception = exc
         finally:
@@ -473,16 +474,16 @@ class AnthropicBackend(CompletionBackend):
                         primary_exception.__traceback__ if primary_exception else None,
                     )
                 except BaseException as exc:
-                    if primary_exception is None and _is_control_exception(exc):
-                        primary_exception = exc
+                    primary_exception = _merge_exception(primary_exception, exc)
             if self.client is None:
                 try:
                     await client.aclose()
                 except BaseException as exc:
-                    if primary_exception is None and _is_control_exception(exc):
-                        primary_exception = exc
-            if primary_exception is None and _task_is_cancelling():
-                primary_exception = asyncio.CancelledError()
+                    primary_exception = _merge_exception(primary_exception, exc)
+            if _task_is_cancelling():
+                primary_exception = _merge_exception(
+                    primary_exception, asyncio.CancelledError()
+                )
             if primary_exception is not None:
                 raise primary_exception
 
@@ -494,6 +495,43 @@ def _task_is_cancelling() -> bool:
 
 def _is_control_exception(value: BaseException) -> bool:
     return isinstance(value, (asyncio.CancelledError, GeneratorExit))
+
+
+def _control_priority(value: BaseException) -> int:
+    if isinstance(value, asyncio.CancelledError):
+        return 2
+    if isinstance(value, GeneratorExit):
+        return 1
+    return 0
+
+
+def _request_error(cause: httpx.HTTPError) -> AnthropicHTTPError:
+    error = AnthropicHTTPError("Anthropic request failed")
+    error.__cause__ = cause
+    return error
+
+
+def _merge_exception(
+    primary: BaseException | None,
+    cleanup: BaseException,
+) -> BaseException:
+    if primary is None:
+        return cleanup
+    primary_is_control = _is_control_exception(primary)
+    cleanup_is_control = _is_control_exception(cleanup)
+    if cleanup_is_control and not primary_is_control:
+        cleanup.__cause__ = primary
+        cleanup.__context__ = primary
+        return cleanup
+    if (
+        cleanup_is_control
+        and primary_is_control
+        and _control_priority(cleanup) > _control_priority(primary)
+    ):
+        return cleanup
+    if primary_is_control and not cleanup_is_control:
+        primary.__context__ = cleanup
+    return primary
 
 
 async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes:
@@ -525,6 +563,8 @@ def _http_error(status_code: int, body: bytes) -> AnthropicHTTPError:
 async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEvent]:
     decoder = _SSEDecoder()
     blocks: dict[int, _BlockState] = {}
+    active_blocks: set[int] = set()
+    stopped_blocks: set[int] = set()
     usage: dict[str, Any] = {}
     stop_reason: str | None = None
     finished = False
@@ -533,7 +573,9 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
         if record is None:
             continue
         event, payload = record
-        translated = _translate_event(event, payload, blocks, usage)
+        translated = _translate_event(
+            event, payload, blocks, active_blocks, stopped_blocks, usage
+        )
         if translated is None:
             if payload.get("type") == "message_delta":
                 delta = payload.get("delta")
@@ -553,7 +595,9 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
             return
     record = decoder.finish()
     if record is not None and record[1].get("type") != "done":
-        translated = _translate_event(record[0], record[1], blocks, usage)
+        translated = _translate_event(
+            record[0], record[1], blocks, active_blocks, stopped_blocks, usage
+        )
         if translated is not None:
             if translated.type is StreamEventType.MESSAGE_END:
                 translated = StreamEvent(
@@ -576,6 +620,8 @@ def _translate_event(
     event: str,
     payload: Mapping[str, Any],
     blocks: dict[int, _BlockState],
+    active_blocks: set[int],
+    stopped_blocks: set[int],
     usage: dict[str, Any],
 ) -> StreamEvent | None:
     event_type = payload.get("type", event)
@@ -643,9 +689,18 @@ def _translate_event(
             )
         else:
             raise AnthropicStreamError(f"unsupported Anthropic content block: {kind}")
+        active_blocks.add(index)
         return None
     if event_type == "content_block_delta":
         index = _index(payload)
+        if index in stopped_blocks:
+            raise AnthropicStreamError(
+                f"Anthropic delta references stopped block index: {index}"
+            )
+        if index not in active_blocks:
+            raise AnthropicStreamError(
+                f"Anthropic delta references unknown block index: {index}"
+            )
         block = blocks.get(index)
         if block is None:
             raise AnthropicStreamError(
@@ -695,6 +750,19 @@ def _translate_event(
                 tool_call=call,
                 data={"tool_call_delta": partial, "index": index},
             )
+        raise AnthropicStreamError(f"unsupported Anthropic content delta: {kind}")
+    if event_type == "content_block_stop":
+        index = _index(payload)
+        if index in stopped_blocks:
+            raise AnthropicStreamError(
+                f"Anthropic content block stop is duplicated: {index}"
+            )
+        if index not in active_blocks:
+            raise AnthropicStreamError(
+                f"Anthropic content block stop references unknown index: {index}"
+            )
+        active_blocks.remove(index)
+        stopped_blocks.add(index)
         return None
     if event_type == "message_delta":
         delta = payload.get("delta")
