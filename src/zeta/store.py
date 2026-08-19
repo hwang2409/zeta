@@ -21,6 +21,10 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+class ConversationIntegrityError(ValueError):
+    """Raised when a session file violates the conversation schema."""
+
+
 @dataclass(frozen=True, slots=True)
 class ConversationEntry:
     seq: int
@@ -64,10 +68,11 @@ class ConversationStore:
         session_id: str | None = None,
         cwd: str | Path | None = None,
     ) -> None:
-        self.session_dir = Path(session_dir or Path.home() / ".zeta" / "sessions")
+        self.root_dir = Path(session_dir or Path.home() / ".zeta" / "sessions")
+        self.session_id = session_id or uuid.uuid4().hex
+        self.session_dir = self.root_dir / self.session_id
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.session_dir / "conversation.jsonl"
-        self.session_id = session_id or uuid.uuid4().hex
         self.cwd = str(cwd or Path.cwd())
         self._entries: list[ConversationEntry] = []
         self._load()
@@ -86,33 +91,55 @@ class ConversationStore:
         raw = self.path.read_bytes()
         lines = raw.splitlines(keepends=True)
         valid_rows: list[dict[str, Any]] = []
-        torn = False
+        torn_offset: int | None = None
+        offset = 0
         for index, line in enumerate(lines):
-            is_final = index == len(lines) - 1
-            if is_final and not line.endswith(b"\n"):
-                try:
-                    valid_rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    torn = True
-                continue
-            valid_rows.append(json.loads(line))
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                if index != len(lines) - 1:
+                    raise ConversationIntegrityError(
+                        f"invalid conversation row {index + 1}: {self.path}"
+                    ) from exc
+                torn_offset = offset
+                break
+            if not isinstance(row, dict):
+                raise ConversationIntegrityError(
+                    f"conversation row {index + 1} is not an object: {self.path}"
+                )
+            valid_rows.append(row)
+            offset += len(line)
 
         if not valid_rows:
-            raise ValueError(f"conversation file is empty: {self.path}")
+            raise ConversationIntegrityError(f"conversation file is empty: {self.path}")
         header = valid_rows[0]
-        if header.get("type") != "header" or header.get("data", {}).get("schema") != SCHEMA:
-            raise ValueError(f"unsupported conversation schema: {self.path}")
-        self.session_id = str(header["data"]["session_id"])
-        self.cwd = str(header["data"]["cwd"])
-        self._entries = [ConversationEntry.from_dict(row) for row in valid_rows[1:]]
+        header_data = header.get("data")
+        if (
+            header.get("type") != "header"
+            or not isinstance(header_data, dict)
+            or header_data.get("schema") != SCHEMA
+        ):
+            raise ConversationIntegrityError(f"unsupported conversation schema: {self.path}")
+        try:
+            self.session_id = str(header_data["session_id"])
+            self.cwd = str(header_data["cwd"])
+        except KeyError as exc:
+            raise ConversationIntegrityError(
+                f"conversation header is incomplete: {self.path}"
+            ) from exc
+        try:
+            self._entries = [ConversationEntry.from_dict(row) for row in valid_rows[1:]]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ConversationIntegrityError(
+                f"invalid conversation entry: {self.path}"
+            ) from exc
+        self._validate_entries()
 
-        if torn:
-            self.path.write_bytes(
-                b"".join(
-                    json.dumps(row, separators=(",", ":"), sort_keys=True).encode() + b"\n"
-                    for row in valid_rows
-                )
-            )
+        if torn_offset is not None:
+            with self.path.open("r+b") as handle:
+                handle.truncate(torn_offset)
+                handle.flush()
+                os.fsync(handle.fileno())
             self._append_row(
                 "warning",
                 {"message": "dropped torn final conversation line"},
@@ -122,6 +149,27 @@ class ConversationStore:
                 RuntimeWarning,
                 stacklevel=2,
             )
+        elif not raw.endswith(b"\n"):
+            with self.path.open("ab") as handle:
+                handle.write(b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+
+    def _validate_entries(self) -> None:
+        ids: set[str] = set()
+        for expected_seq, entry in enumerate(self._entries, start=1):
+            if entry.seq != expected_seq:
+                raise ConversationIntegrityError(
+                    f"non-monotonic conversation sequence at {entry.id}"
+                )
+            if entry.id in ids:
+                raise ConversationIntegrityError(f"duplicate conversation id: {entry.id}")
+            ids.add(entry.id)
+        for entry in self._entries:
+            if entry.parent_id is not None and entry.parent_id not in ids:
+                raise ConversationIntegrityError(
+                    f"missing parent {entry.parent_id} for {entry.id}"
+                )
 
     def _write_line(self, row: dict[str, Any]) -> None:
         with self.path.open("ab") as handle:
@@ -130,6 +178,8 @@ class ConversationStore:
             os.fsync(handle.fileno())
 
     def _append_row(self, entry_type: str, data: dict[str, Any], parent_id: str | None = None) -> ConversationEntry:
+        if parent_id is not None and parent_id not in {entry.id for entry in self._entries}:
+            raise ConversationIntegrityError(f"missing parent {parent_id}")
         entry = ConversationEntry(
             seq=(self._entries[-1].seq + 1 if self._entries else 1),
             id=uuid.uuid4().hex,

@@ -29,7 +29,9 @@ class ToolExecutor(Protocol):
         """Execute one call and return its durable result."""
 
 
-ToolHandler = Callable[[dict[str, Any]], Awaitable[str | ToolResult]]
+ToolHandler = Callable[
+    [dict[str, Any]], str | ToolResult | Awaitable[str | ToolResult]
+]
 
 
 class DictToolExecutor:
@@ -116,12 +118,12 @@ class AgentLoop:
                 for block in assistant_message.content
                 if isinstance(block, ToolUseContent)
             ]
-            yield StreamEvent(
-                StreamEventType.TURN_END,
-                message=assistant_message,
-                data={"turn": turn_number, "tool_calls": len(calls)},
-            )
             if not calls:
+                yield StreamEvent(
+                    StreamEventType.TURN_END,
+                    message=assistant_message,
+                    data={"turn": turn_number, "tool_calls": 0},
+                )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
 
@@ -148,6 +150,11 @@ class AgentLoop:
                     tool_call=tool_call,
                     tool_result=result,
                 )
+            yield StreamEvent(
+                StreamEventType.TURN_END,
+                message=assistant_message,
+                data={"turn": turn_number, "tool_calls": len(calls)},
+            )
 
         yield StreamEvent(
             StreamEventType.ERROR,

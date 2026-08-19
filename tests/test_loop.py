@@ -11,7 +11,6 @@ from zeta.types import (
     StreamEventType,
     TextContent,
     ToolCall,
-    ToolUseContent,
 )
 
 
@@ -48,7 +47,28 @@ async def test_tool_call_then_next_completion(tmp_path: Path) -> None:
     async def echo(arguments: dict[str, str]) -> str:
         return arguments["value"]
 
-    await collect(AgentLoop(backend, store, tools={"echo": echo}).run_turn("start"))
+    events = await collect(AgentLoop(backend, store, tools={"echo": echo}).run_turn("start"))
+
+    assert [event.type for event in events] == [
+        StreamEventType.AGENT_START,
+        StreamEventType.TURN_START,
+        StreamEventType.MESSAGE_START,
+        StreamEventType.MESSAGE_UPDATE,
+        StreamEventType.MESSAGE_UPDATE,
+        StreamEventType.MESSAGE_UPDATE,
+        StreamEventType.MESSAGE_END,
+        StreamEventType.TOOL_EXECUTION_START,
+        StreamEventType.TOOL_EXECUTION_END,
+        StreamEventType.TOOL_EXECUTION_START,
+        StreamEventType.TOOL_EXECUTION_END,
+        StreamEventType.TURN_END,
+        StreamEventType.TURN_START,
+        StreamEventType.MESSAGE_START,
+        StreamEventType.MESSAGE_UPDATE,
+        StreamEventType.MESSAGE_END,
+        StreamEventType.TURN_END,
+        StreamEventType.AGENT_END,
+    ]
 
     assert [message.role for message in store.messages()] == [
         MessageRole.USER,

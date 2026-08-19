@@ -1,7 +1,7 @@
 """Custom agent harness."""
 from .fake import FakeBackend, ScriptedTurn
 from .loop import AgentLoop, DictToolExecutor, ToolExecutor
-from .store import ConversationEntry, ConversationStore
+from .store import ConversationEntry, ConversationIntegrityError, ConversationStore
 from .types import *
 
 __all__ = [
@@ -10,6 +10,7 @@ __all__ = [
     "ContentBlock",
     "ContentType",
     "ConversationEntry",
+    "ConversationIntegrityError",
     "ConversationStore",
     "DictToolExecutor",
     "ErrorInfo",

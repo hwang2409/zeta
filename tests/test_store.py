@@ -1,9 +1,11 @@
+import warnings
+import json
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from zeta.store import ConversationStore
+from zeta.store import ConversationIntegrityError, ConversationStore
 from zeta.types import Message, MessageRole, TextContent
 
 
@@ -16,7 +18,7 @@ def test_append_replay_round_trip_and_parent_links(tmp_path: Path) -> None:
     first = store.append_message(message(MessageRole.USER, "hello"))
     second = store.append_message(message(MessageRole.ASSISTANT, "hi"))
 
-    reopened = ConversationStore(tmp_path)
+    reopened = ConversationStore(tmp_path, session_id="session-1")
 
     assert [entry.id for entry in reopened.replay()] == [first.id, second.id]
     assert second.parent_id == first.id
@@ -28,19 +30,33 @@ def test_append_replay_round_trip_and_parent_links(tmp_path: Path) -> None:
 def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(message(MessageRole.USER, "kept"))
-    store.path.open("ab").write(b'{"seq": 3, "id": "torn"')
+    with store.path.open("ab") as handle:
+        handle.write(b'{"seq": 3, "id": "torn"')
 
     with pytest.warns(RuntimeWarning, match="torn"):
-        reopened = ConversationStore(tmp_path)
+        reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
     assert [item.content[0].text for item in reopened.messages()] == ["kept"]
     assert reopened.entries[-1].type == "warning"
+    warning_id = reopened.entries[-1].id
+    warning_seq = reopened.entries[-1].seq
+    assert reopened.path.read_bytes().endswith(b"\n")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        reopened_again = ConversationStore(tmp_path, session_id=reopened.session_id)
+
+    assert caught == []
+    assert reopened_again.entries[-1].id == warning_id
+    assert reopened_again.entries[-1].seq == warning_seq
+    assert reopened_again.entries[-1].parent_id == reopened.entries[-1].parent_id
+    assert reopened_again.path.read_bytes() == reopened.path.read_bytes()
 
 
 def test_compaction_marker_persists(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     marker = store.append_compaction_marker("summary", 1, 4)
-    reopened = ConversationStore(tmp_path)
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
     assert reopened.replay()[-1].id == marker.id
     assert reopened.replay()[-1].data == {
@@ -56,3 +72,45 @@ def test_append_fsyncs_before_return(tmp_path: Path) -> None:
         store.append_message(message(MessageRole.USER, "hello"))
 
     fsync.assert_called_once()
+
+
+def test_sessions_are_isolated(tmp_path: Path) -> None:
+    first = ConversationStore(tmp_path, session_id="first")
+    second = ConversationStore(tmp_path, session_id="second")
+    first.append_message(message(MessageRole.USER, "one"))
+    second.append_message(message(MessageRole.USER, "two"))
+
+    assert [item.content[0].text for item in ConversationStore(tmp_path, session_id="first").messages()] == ["one"]
+    assert [item.content[0].text for item in ConversationStore(tmp_path, session_id="second").messages()] == ["two"]
+
+
+def test_invalid_parent_is_rejected_on_append(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+
+    with pytest.raises(ConversationIntegrityError, match="missing parent"):
+        store.append_message(message(MessageRole.USER, "bad"), parent_id="missing")
+
+
+def test_invalid_sequence_and_parent_are_rejected_on_load(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(message(MessageRole.USER, "kept"))
+    rows = store.path.read_text().splitlines()
+    rows[-1] = rows[-1].replace('"seq":1', '"seq":3').replace('"parent_id":null', '"parent_id":"missing"')
+    store.path.write_text("\n".join(rows) + "\n")
+
+    with pytest.raises(ConversationIntegrityError):
+        ConversationStore(tmp_path, session_id=store.session_id)
+
+
+def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    first = store.append_message(message(MessageRole.USER, "one"))
+    store.append_message(message(MessageRole.USER, "two"))
+    rows = store.path.read_text().splitlines()
+    second_row = json.loads(rows[-1])
+    second_row["id"] = first.id
+    rows[-1] = json.dumps(second_row, separators=(",", ":"), sort_keys=True)
+    store.path.write_text("\n".join(rows) + "\n")
+
+    with pytest.raises(ConversationIntegrityError, match="duplicate"):
+        ConversationStore(tmp_path, session_id=store.session_id)
