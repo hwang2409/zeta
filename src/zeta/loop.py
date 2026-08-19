@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import aclosing
 from typing import Any, Protocol
 
 from .store import ConversationStore
@@ -49,6 +48,26 @@ class DictToolExecutor:
         return ToolResult(tool_call.id, str(result))
 
 
+async def _close_completion(
+    completion: AsyncIterator[StreamEvent] | None,
+) -> BaseException | None:
+    if completion is None:
+        return None
+    close = getattr(completion, "aclose", None)
+    if close is None:
+        return None
+    try:
+        await close()
+    except BaseException as exc:
+        return exc
+    return None
+
+
+def _task_is_cancelling() -> bool:
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
 class AgentLoop:
     def __init__(
         self,
@@ -85,31 +104,49 @@ class AgentLoop:
             )
             partial_blocks: list[ContentBlock] = []
             assistant_message: Message | None = None
+            completion: AsyncIterator[StreamEvent] | None = None
             try:
                 completion = self.backend.complete(
                     self.store.messages(), self.tool_schemas
                 )
-                async with aclosing(completion) as stream:
-                    async for event in stream:
-                        if event.type is StreamEventType.MESSAGE_UPDATE:
-                            if event.content is not None:
-                                partial_blocks.append(event.content)
-                            if event.delta is not None:
-                                partial_blocks.append(TextContent(event.delta))
-                        if event.message is not None and event.type is StreamEventType.MESSAGE_END:
-                            assistant_message = event.message
-                        yield event
+                async for event in completion:
+                    if event.type is StreamEventType.MESSAGE_UPDATE:
+                        if event.content is not None:
+                            partial_blocks.append(event.content)
+                        if event.delta is not None:
+                            partial_blocks.append(TextContent(event.delta))
+                    if event.message is not None and event.type is StreamEventType.MESSAGE_END:
+                        assistant_message = event.message
+                    yield event
             except asyncio.CancelledError:
+                await _close_completion(completion)
                 self._persist_partial(partial_blocks, assistant_message)
                 raise
             except GeneratorExit:
+                await _close_completion(completion)
                 self._persist_partial(partial_blocks, assistant_message)
                 raise
             except Exception as exc:
+                await _close_completion(completion)
+                if _task_is_cancelling():
+                    self._persist_partial(partial_blocks, assistant_message)
+                    raise asyncio.CancelledError() from exc
                 self._persist_partial(partial_blocks, assistant_message)
                 yield StreamEvent(
                     StreamEventType.ERROR,
                     error=ErrorInfo("backend_error", str(exc)),
+                )
+                yield StreamEvent(StreamEventType.AGENT_END)
+                return
+            cleanup_error = await _close_completion(completion)
+            if _task_is_cancelling():
+                self._persist_partial(partial_blocks, assistant_message)
+                raise asyncio.CancelledError()
+            if cleanup_error is not None:
+                self._persist_partial(partial_blocks, assistant_message)
+                yield StreamEvent(
+                    StreamEventType.ERROR,
+                    error=ErrorInfo("backend_error", str(cleanup_error)),
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return

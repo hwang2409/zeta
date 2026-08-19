@@ -94,11 +94,13 @@ class ConversationStore:
     ) -> None:
         self.root_dir = Path(session_dir or Path.home() / ".zeta" / "sessions")
         self.session_id = uuid.uuid4().hex if session_id is None else session_id
+        session_path = Path(self.session_id)
         if (
             not self.session_id
             or self.session_id in {".", ".."}
             or "\x00" in self.session_id
-            or Path(self.session_id).parts != (self.session_id,)
+            or session_path.is_absolute()
+            or session_path.parts != (self.session_id,)
         ):
             raise ConversationIntegrityError(
                 f"session id must be one safe path component: {self.session_id!r}"
@@ -220,6 +222,10 @@ class ConversationStore:
                 )
             if entry.id in ids:
                 raise ConversationIntegrityError(f"duplicate conversation id: {entry.id}")
+            if expected_seq > 1 and entry.parent_id is None:
+                raise ConversationIntegrityError(
+                    f"conversation entry {entry.id} is an orphaned root"
+                )
             if entry.parent_id is not None and entry.parent_id not in ids:
                 raise ConversationIntegrityError(
                     f"missing prior parent {entry.parent_id} for {entry.id}"

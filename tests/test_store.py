@@ -339,8 +339,9 @@ def test_duplicate_generated_id_is_rejected_on_append(tmp_path: Path) -> None:
 
 
 def test_session_id_path_and_header_mismatches_are_rejected(tmp_path: Path) -> None:
-    with pytest.raises(ConversationIntegrityError, match="safe path"):
-        ConversationStore(tmp_path, session_id="../escape")
+    for session_id in ("../escape", "/", "//"):
+        with pytest.raises(ConversationIntegrityError, match="safe path"):
+            ConversationStore(tmp_path, session_id=session_id)
 
     store = ConversationStore(tmp_path, session_id="expected")
     rows = store.path.read_text().splitlines()
@@ -351,3 +352,17 @@ def test_session_id_path_and_header_mismatches_are_rejected(tmp_path: Path) -> N
 
     with pytest.raises(ConversationIntegrityError, match="mismatch"):
         ConversationStore(tmp_path, session_id="expected")
+
+
+def test_later_root_is_rejected_on_load(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(message(MessageRole.USER, "first"))
+    store.append_message(message(MessageRole.USER, "second"))
+    rows = store.path.read_text().splitlines()
+    row = json.loads(rows[-1])
+    row["parent_id"] = None
+    rows[-1] = json.dumps(row, separators=(",", ":"), sort_keys=True)
+    store.path.write_text("\n".join(rows) + "\n")
+
+    with pytest.raises(ConversationIntegrityError, match="orphaned root"):
+        ConversationStore(tmp_path, session_id=store.session_id)

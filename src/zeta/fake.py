@@ -27,10 +27,16 @@ class ScriptedTurn:
 
 
 class FakeBackend(CompletionBackend):
-    def __init__(self, turns: Sequence[ScriptedTurn]) -> None:
+    def __init__(
+        self,
+        turns: Sequence[ScriptedTurn],
+        *,
+        close_error: Exception | None = None,
+    ) -> None:
         self.turns = list(turns)
         self.calls: list[tuple[list[Message], list[ToolSchema]]] = []
         self.completion_close_count = 0
+        self.close_error = close_error
 
     async def complete(
         self,
@@ -55,3 +61,5 @@ class FakeBackend(CompletionBackend):
             )
         finally:
             self.completion_close_count += 1
+            if self.close_error is not None:
+                raise self.close_error

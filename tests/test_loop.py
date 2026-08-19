@@ -143,7 +143,10 @@ async def close_after(
 
 @pytest.mark.asyncio
 async def test_aclose_after_message_update_persists_partial_state(tmp_path: Path) -> None:
-    backend = FakeBackend([ScriptedTurn([TextContent("partial")])])
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("partial")])],
+        close_error=RuntimeError("close failed"),
+    )
     store = ConversationStore(tmp_path)
 
     stream = AgentLoop(backend, store).run_turn("start")
@@ -162,7 +165,10 @@ async def test_aclose_after_message_update_persists_partial_state(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_aclose_after_message_end_persists_complete_state(tmp_path: Path) -> None:
-    backend = FakeBackend([ScriptedTurn([TextContent("complete")])])
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("complete")])],
+        close_error=RuntimeError("close failed"),
+    )
     store = ConversationStore(tmp_path)
 
     await close_after(
@@ -174,9 +180,56 @@ async def test_aclose_after_message_end_persists_complete_state(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_plain_async_iterator_completes_without_aclose(tmp_path: Path) -> None:
+    class PlainCompletion:
+        def __init__(self) -> None:
+            self.events = [
+                StreamEvent(StreamEventType.MESSAGE_START),
+                StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    content=TextContent("plain"),
+                ),
+                StreamEvent(
+                    StreamEventType.MESSAGE_END,
+                    message=Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent("plain")],
+                    ),
+                ),
+            ]
+            self.index = 0
+
+        def __aiter__(self) -> "PlainCompletion":
+            return self
+
+        async def __anext__(self) -> StreamEvent:
+            if self.index == len(self.events):
+                raise StopAsyncIteration
+            event = self.events[self.index]
+            self.index += 1
+            return event
+
+    class PlainBackend(CompletionBackend):
+        def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            return PlainCompletion()
+
+    events = await collect(
+        AgentLoop(PlainBackend(), ConversationStore(tmp_path)).run_turn("start")
+    )
+
+    assert all(event.type is not StreamEventType.ERROR for event in events)
+    assert events[-1].type is StreamEventType.AGENT_END
+
+
+@pytest.mark.asyncio
 async def test_cancellation_persists_partial_state(tmp_path: Path) -> None:
     backend = FakeBackend(
-        [ScriptedTurn([TextContent("partial"), TextContent("more")], delay=0.1)]
+        [ScriptedTurn([TextContent("partial"), TextContent("more")], delay=0.1)],
+        close_error=RuntimeError("close failed"),
     )
     store = ConversationStore(tmp_path)
     task = asyncio.create_task(collect(AgentLoop(backend, store).run_turn("start")))
@@ -185,6 +238,7 @@ async def test_cancellation_persists_partial_state(tmp_path: Path) -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert backend.completion_close_count == 1
     assert len(store.messages()) == 2
     assert store.messages()[-1].role is MessageRole.ASSISTANT
 
