@@ -36,6 +36,7 @@ __all__ = [
     "Message",
     "MessageRole",
     "OAuthTokens",
+    "RedactedThinkingContent",
     "ScriptedTurn",
     "StreamEvent",
     "StreamEventType",

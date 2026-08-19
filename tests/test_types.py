@@ -2,6 +2,7 @@ from zeta.types import (
     ErrorInfo,
     Message,
     MessageRole,
+    RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
     TextContent,
@@ -26,3 +27,12 @@ def test_stream_event_serialization_round_trip() -> None:
     )
 
     assert StreamEvent.from_dict(event.to_dict()) == event
+
+
+def test_signed_and_redacted_thinking_round_trip() -> None:
+    message = Message(
+        MessageRole.ASSISTANT,
+        [ThinkingContent("plan", "sig-1"), RedactedThinkingContent("opaque")],
+    )
+
+    assert Message.from_dict(message.to_dict()) == message

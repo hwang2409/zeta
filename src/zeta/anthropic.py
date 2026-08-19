@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import os
 import secrets
+import sys
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -21,6 +23,7 @@ from .types import (
     ContentBlock,
     Message,
     MessageRole,
+    RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
     TextContent,
@@ -35,6 +38,7 @@ CLIENT_ID = "9d1c250a-e61b-44d9-88ed-594d1962f5e"
 AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 API_URL = "https://api.anthropic.com/v1/messages"
+DEFAULT_REDIRECT_URI = "http://localhost:53692/callback"
 OAUTH_BETA = "oauth-2025-04-20"
 CLAUDE_CODE_BETA = "claude-code-20250219"
 OAUTH_SCOPES = (
@@ -139,6 +143,7 @@ class AnthropicCredentialStore:
             Path(claude_credentials) if claude_credentials is not None else None
         )
         self.token_url = token_url
+        self._async_refresh_lock = asyncio.Lock()
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
@@ -207,24 +212,38 @@ class AnthropicCredentialStore:
             temporary.unlink(missing_ok=True)
 
     async def access_token(self, client: httpx.AsyncClient) -> str:
-        tokens = self.read()
-        if tokens is None:
-            tokens = self.bootstrap()
-            if tokens is None:
-                raise AnthropicAuthError(
-                    "no Claude OAuth login found; log in with Claude first"
-                )
-        if tokens.is_valid():
-            self.save(tokens)
-            return tokens.access_token
+        async with self._async_refresh_lock:
+            async with self._async_refresh_lock_file():
+                tokens = self._read_unlocked()
+                from_claude = tokens is None
+                if tokens is None:
+                    tokens = self.bootstrap()
+                    if tokens is None:
+                        raise AnthropicAuthError(
+                            "no Claude OAuth login found; log in with Claude first"
+                        )
+                if tokens.is_valid():
+                    if from_claude:
+                        self._save_unlocked(tokens)
+                    return tokens.access_token
 
-        refreshed = await self.refresh(tokens.refresh_token, client)
-        with self._lock():
-            current = self._read_unlocked()
-            if current is not None and current.is_valid():
-                return current.access_token
-            self._save_unlocked(refreshed)
-        return refreshed.access_token
+                refreshed = await self.refresh(tokens.refresh_token, client)
+                self._save_unlocked(refreshed)
+                return refreshed.access_token
+
+    @asynccontextmanager
+    async def _async_refresh_lock_file(self) -> AsyncIterator[None]:
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
+        handle = self.lock_path.open("a+")
+        try:
+            await asyncio.to_thread(fcntl.flock, handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                await asyncio.to_thread(fcntl.flock, handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
     async def refresh(self, refresh_token: str, client: httpx.AsyncClient) -> OAuthTokens:
         try:
@@ -249,10 +268,16 @@ class AnthropicCredentialStore:
             raise AnthropicAuthError("Claude OAuth token response is invalid") from exc
 
 
-def build_authorization_url(state: str, code_challenge: str) -> str:
+def build_authorization_url(
+    state: str,
+    code_challenge: str,
+    redirect_uri: str = DEFAULT_REDIRECT_URI,
+) -> str:
     """Build the Claude Pro/Max PKCE authorization URL."""
 
-    return f"{AUTHORIZE_URL}?{urlencode({'code': 'true', 'client_id': CLIENT_ID, 'response_type': 'code', 'scope': OAUTH_SCOPES, 'code_challenge': code_challenge, 'code_challenge_method': 'S256', 'state': state})}"
+    if not state or not code_challenge or not redirect_uri:
+        raise AnthropicAuthError("Claude OAuth PKCE parameters are incomplete")
+    return f"{AUTHORIZE_URL}?{urlencode({'code': 'true', 'client_id': CLIENT_ID, 'response_type': 'code', 'scope': OAUTH_SCOPES, 'code_challenge': code_challenge, 'code_challenge_method': 'S256', 'state': state, 'redirect_uri': redirect_uri})}"
 
 
 async def exchange_authorization_code(
@@ -264,6 +289,8 @@ async def exchange_authorization_code(
     *,
     token_url: str = TOKEN_URL,
 ) -> OAuthTokens:
+    if not code or not state or not code_verifier or not redirect_uri:
+        raise AnthropicAuthError("Claude OAuth code exchange parameters are incomplete")
     try:
         response = await client.post(
             token_url,
@@ -310,10 +337,12 @@ def _tokens_from_response(value: Any, fallback_refresh: str | None) -> OAuthToke
 class _BlockState:
     kind: str
     text: str = ""
+    signature: str = ""
     call_id: str = ""
     name: str = ""
     input_json: str = ""
     initial_input: dict[str, Any] | None = None
+    redacted_data: str = ""
 
 
 class _SSEDecoder:
@@ -362,7 +391,7 @@ class AnthropicBackend(CompletionBackend):
     def __init__(
         self,
         *,
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-sonnet-4-6",
         max_tokens: int = 8192,
         base_url: str = API_URL,
         token_store: AnthropicCredentialStore | None = None,
@@ -395,6 +424,12 @@ class AnthropicBackend(CompletionBackend):
                 model=self.model,
                 max_tokens=self.max_tokens,
             )
+            identity = {
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+                "cache_control": {"type": "ephemeral"},
+            }
+            payload["system"] = [identity, *payload.get("system", [])]
             headers = {
                 "accept": "text/event-stream",
                 "anthropic-beta": f"{CLAUDE_CODE_BETA},{OAUTH_BETA}",
@@ -403,33 +438,65 @@ class AnthropicBackend(CompletionBackend):
                 "content-type": "application/json",
                 "user-agent": "zeta/0.1",
             }
-            try:
-                async with client.stream(
-                    "POST", self.base_url, headers=headers, json=payload
-                ) as response:
-                    if response.status_code >= 400:
-                        raise _http_error(response)
-                    async for event in _decode_response(response):
-                        yield event
-            except AnthropicBackendError:
-                raise
-            except httpx.HTTPError as exc:
-                raise AnthropicHTTPError("Anthropic request failed") from exc
+            async with client.stream(
+                "POST", self.base_url, headers=headers, json=payload
+            ) as response:
+                if response.status_code >= 400:
+                    body = await _read_error_body(response)
+                    raise _http_error(response.status_code, body)
+                async for event in _decode_response(response):
+                    yield event
+        except AnthropicBackendError:
+            raise
+        except httpx.HTTPError as exc:
+            raise AnthropicHTTPError("Anthropic request failed") from exc
+        except BaseException as exc:
+            if _task_is_cancelling() and not isinstance(
+                exc, (asyncio.CancelledError, GeneratorExit)
+            ):
+                raise asyncio.CancelledError() from exc
+            raise
         finally:
+            active_exception = sys.exc_info()[0]
             if self.client is None:
-                await client.aclose()
+                try:
+                    await client.aclose()
+                except BaseException:
+                    if active_exception in (asyncio.CancelledError, GeneratorExit):
+                        pass
+                    elif not _task_is_cancelling():
+                        raise
 
 
-def _http_error(response: httpx.Response) -> AnthropicHTTPError:
+def _task_is_cancelling() -> bool:
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
+async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes:
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        body.extend(chunk[: limit - len(body)])
+        if len(body) >= limit:
+            break
+    return bytes(body)
+
+
+def _http_error(status_code: int, body: bytes) -> AnthropicHTTPError:
+    message = "request failed"
     try:
-        value = response.json()
-        message = value.get("error", {}).get("message")
+        value = json.loads(body)
+        detail = value.get("error") if isinstance(value, Mapping) else None
+        message = detail.get("message") if isinstance(detail, Mapping) else None
         if type(message) is not str:
             message = "request failed"
-    except (ValueError, json.JSONDecodeError):
-        message = "request failed"
-    error_type = AnthropicAuthError if response.status_code in {401, 403} else AnthropicHTTPError
-    return error_type(f"Anthropic HTTP {response.status_code}: {message}")
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    message = "".join(
+        character for character in message if character.isprintable() or character in "\t\n"
+    )[:500]
+    error_type = AnthropicAuthError if status_code in {401, 403} else AnthropicHTTPError
+    return error_type(f"Anthropic HTTP {status_code}: {message}")
 
 
 async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEvent]:
@@ -446,7 +513,10 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
         translated = _translate_event(event, payload, blocks, usage)
         if translated is None:
             if payload.get("type") == "message_delta":
-                stop_reason = payload.get("delta", {}).get("stop_reason")
+                delta = payload.get("delta")
+                if not isinstance(delta, Mapping):
+                    raise AnthropicStreamError("Anthropic message delta is invalid")
+                stop_reason = delta.get("stop_reason")
             continue
         if translated.type is StreamEventType.MESSAGE_END:
             translated = StreamEvent(
@@ -486,16 +556,26 @@ def _translate_event(
     usage: dict[str, Any],
 ) -> StreamEvent | None:
     event_type = payload.get("type", event)
+    if type(event_type) is not str:
+        raise AnthropicStreamError("Anthropic SSE event type is invalid")
     if event_type == "error":
-        detail = payload.get("error", {})
-        message = detail.get("message", "Anthropic stream error")
-        raise AnthropicStreamError(str(message))
+        detail = payload.get("error")
+        if not isinstance(detail, Mapping):
+            raise AnthropicStreamError("Anthropic stream error payload is invalid")
+        message = detail.get("message")
+        if type(message) is not str:
+            raise AnthropicStreamError("Anthropic stream error message is invalid")
+        raise AnthropicStreamError(message)
     if event_type == "message_start":
         message = payload.get("message", {})
         if isinstance(message, Mapping):
             initial_usage = message.get("usage")
-            if isinstance(initial_usage, Mapping):
+            if initial_usage is None:
+                pass
+            elif isinstance(initial_usage, Mapping):
                 usage.update(initial_usage)
+            else:
+                raise AnthropicStreamError("Anthropic message usage is invalid")
             return StreamEvent(
                 StreamEventType.MESSAGE_START,
                 data={key: message[key] for key in ("id", "model", "role") if key in message},
@@ -503,7 +583,7 @@ def _translate_event(
         raise AnthropicStreamError("Anthropic message_start is invalid")
     if event_type == "content_block_start":
         index = _index(payload)
-        block = payload.get("content_block", {})
+        block = payload.get("content_block")
         if not isinstance(block, Mapping):
             raise AnthropicStreamError("Anthropic content block is invalid")
         kind = block.get("type")
@@ -511,8 +591,15 @@ def _translate_event(
             blocks[index] = _BlockState("text")
         elif kind == "thinking":
             blocks[index] = _BlockState("thinking")
+        elif kind == "redacted_thinking":
+            data = block.get("data")
+            if type(data) is not str or not data:
+                raise AnthropicStreamError("Anthropic redacted thinking is invalid")
+            blocks[index] = _BlockState("redacted_thinking", redacted_data=data)
         elif kind == "tool_use":
             initial_input = block.get("input")
+            if initial_input is not None and not isinstance(initial_input, Mapping):
+                raise AnthropicStreamError("Anthropic tool input is invalid")
             blocks[index] = _BlockState(
                 "tool_use",
                 call_id=str(block.get("id", "")),
@@ -529,7 +616,7 @@ def _translate_event(
     if event_type == "content_block_delta":
         index = _index(payload)
         block = blocks.setdefault(index, _BlockState("text"))
-        delta = payload.get("delta", {})
+        delta = payload.get("delta")
         if not isinstance(delta, Mapping):
             raise AnthropicStreamError("Anthropic content delta is invalid")
         kind = delta.get("type")
@@ -544,6 +631,15 @@ def _translate_event(
                 StreamEventType.MESSAGE_UPDATE,
                 content=ThinkingContent(text),
             )
+        if kind == "signature_delta":
+            if block.kind != "thinking":
+                raise AnthropicStreamError("Anthropic signature is outside thinking")
+            signature = _required_string(delta, "signature")
+            block.signature += signature
+            return StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                data={"thinking_signature_delta": signature, "index": index},
+            )
         if kind == "input_json_delta":
             partial = _required_string(delta, "partial_json")
             block.input_json += partial
@@ -556,12 +652,19 @@ def _translate_event(
             )
         return None
     if event_type == "message_delta":
-        delta = payload.get("delta", {})
-        message_usage = payload.get("usage", {})
-        if isinstance(message_usage, Mapping):
+        delta = payload.get("delta")
+        if not isinstance(delta, Mapping):
+            raise AnthropicStreamError("Anthropic message delta is invalid")
+        stop_reason = delta.get("stop_reason")
+        if stop_reason is not None and type(stop_reason) is not str:
+            raise AnthropicStreamError("Anthropic stop reason is invalid")
+        message_usage = payload.get("usage")
+        if message_usage is None:
+            pass
+        elif isinstance(message_usage, Mapping):
             usage.update(message_usage)
-        if isinstance(delta, Mapping) and delta.get("stop_reason") is not None:
-            return None
+        else:
+            raise AnthropicStreamError("Anthropic message usage is invalid")
         return None
     if event_type == "message_stop":
         content: list[ContentBlock] = []
@@ -570,7 +673,13 @@ def _translate_event(
             if block.kind == "text":
                 content.append(TextContent(block.text))
             elif block.kind == "thinking":
-                content.append(ThinkingContent(block.text))
+                if not block.signature:
+                    raise AnthropicStreamError(
+                        "Anthropic thinking block is missing its signature"
+                    )
+                content.append(ThinkingContent(block.text, block.signature))
+            elif block.kind == "redacted_thinking":
+                content.append(RedactedThinkingContent(block.redacted_data))
             else:
                 arguments = (
                     _parse_complete_object(block.input_json)
@@ -626,7 +735,19 @@ def _wire_content(blocks: Sequence[ContentBlock]) -> list[dict[str, Any]]:
         if isinstance(block, TextContent):
             result.append({"type": "text", "text": block.text})
         elif isinstance(block, ThinkingContent):
-            result.append({"type": "text", "text": block.text})
+            if not block.signature:
+                raise AnthropicHTTPError(
+                    "thinking block is missing its Anthropic signature"
+                )
+            result.append(
+                {
+                    "type": "thinking",
+                    "thinking": block.text,
+                    "signature": block.signature,
+                }
+            )
+        elif isinstance(block, RedactedThinkingContent):
+            result.append({"type": "redacted_thinking", "data": block.data})
         elif isinstance(block, ToolUseContent):
             result.append(
                 {
@@ -685,6 +806,15 @@ def build_messages_payload(
         payload["system"] = system
     if tools:
         payload["tools"] = tools
+    for message in reversed(wire_messages):
+        if message["role"] != "user":
+            continue
+        content = message["content"]
+        if isinstance(content, list) and content:
+            last_block = content[-1]
+            if last_block.get("type") in {"text", "tool_result"}:
+                last_block["cache_control"] = {"type": "ephemeral"}
+        break
     return payload
 
 
