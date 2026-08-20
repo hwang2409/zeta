@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import json
-import os
-import secrets
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from urllib.parse import urlencode
 
 import httpx
 
+from .auth import OAuthCredentialStore, OAuthTokens
+from .transport import (
+    cleanup_transport,
+    is_control_exception,
+    request_error,
+    task_is_cancelling,
+)
 from .types import (
     CompletionBackend,
     ContentBlock,
@@ -70,42 +73,6 @@ class AnthropicStreamError(AnthropicBackendError):
     code = "stream_error"
 
 
-@dataclass(frozen=True, slots=True)
-class OAuthTokens:
-    access_token: str
-    refresh_token: str
-    expires_at: float
-
-    @classmethod
-    def from_mapping(
-        cls,
-        value: Mapping[str, Any],
-        *,
-        error_type: type[RuntimeError] = AnthropicAuthError,
-    ) -> OAuthTokens:
-        access_token = _first_string(value, "access_token", "accessToken", "access")
-        refresh_token = _first_string(value, "refresh_token", "refreshToken", "refresh")
-        expires_at = value.get("expires_at", value.get("expiresAt", value.get("expires", 0)))
-        if not access_token or not refresh_token:
-            raise error_type("OAuth credentials are incomplete")
-        if type(expires_at) not in {int, float}:
-            raise error_type("OAuth expiry is invalid")
-        if expires_at > 100_000_000_000:
-            expires_at /= 1000
-        return cls(access_token, refresh_token, float(expires_at))
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "version": 1,
-            "access_token": self.access_token,
-            "refresh_token": self.refresh_token,
-            "expires_at": self.expires_at,
-        }
-
-    def is_valid(self, *, skew: float = 60) -> bool:
-        return self.expires_at > time.time() + skew
-
-
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
     for key in keys:
         candidate = value.get(key)
@@ -124,14 +91,14 @@ def _extract_claude_tokens(value: Any) -> OAuthTokens:
         raise ValueError("Claude credentials are not an object")
     nested = value.get("claudeAiOauth")
     if isinstance(nested, Mapping):
-        return OAuthTokens.from_mapping(nested)
+        return OAuthTokens.from_mapping(nested, error_type=AnthropicAuthError)
     nested = value.get("oauth")
     if isinstance(nested, Mapping):
-        return OAuthTokens.from_mapping(nested)
-    return OAuthTokens.from_mapping(value)
+        return OAuthTokens.from_mapping(nested, error_type=AnthropicAuthError)
+    return OAuthTokens.from_mapping(value, error_type=AnthropicAuthError)
 
 
-class AnthropicCredentialStore:
+class AnthropicCredentialStore(OAuthCredentialStore):
     """Owns zeta's OAuth file and reads Claude credentials only for bootstrap."""
 
     def __init__(
@@ -141,45 +108,17 @@ class AnthropicCredentialStore:
         claude_credentials: str | Path | None = None,
         token_url: str = TOKEN_URL,
     ) -> None:
-        self.path = Path(path or Path.home() / ".zeta" / "anthropic-oauth.json")
-        self.lock_path = self.path.with_name(f".{self.path.name}.lock")
+        super().__init__(
+            path or Path.home() / ".zeta" / "anthropic-oauth.json",
+            token_url=token_url,
+        )
         self.claude_credentials = (
             Path(claude_credentials) if claude_credentials is not None else None
         )
-        self.token_url = token_url
-        self._async_refresh_lock = asyncio.Lock()
 
     auth_error_type = AnthropicAuthError
     http_error_type = AnthropicHTTPError
     provider_label = "Claude"
-
-    @contextmanager
-    def _lock(self) -> Iterator[None]:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
-        with self.lock_path.open("a+") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-    def read(self) -> OAuthTokens | None:
-        with self._lock():
-            return self._read_unlocked()
-
-    def _read_unlocked(self) -> OAuthTokens | None:
-        if not self.path.exists():
-            return None
-        try:
-            with self.path.open() as handle:
-                value = json.load(handle)
-            os.chmod(self.path, 0o600)
-            return OAuthTokens.from_mapping(value, error_type=self.auth_error_type)
-        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise self.auth_error_type(
-                f"zeta's {self.provider_label} OAuth store is invalid"
-            ) from exc
 
     def bootstrap(self) -> OAuthTokens | None:
         candidates = (
@@ -193,67 +132,13 @@ class AnthropicCredentialStore:
             try:
                 with candidate.open() as handle:
                     return _extract_claude_tokens(json.load(handle))
-            except AnthropicBackendError:
+            except self.auth_error_type:
                 raise
             except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 raise self.auth_error_type(
                     f"{self.provider_label} credentials could not be read"
                 ) from exc
         return None
-
-    def save(self, tokens: OAuthTokens) -> None:
-        with self._lock():
-            self._save_unlocked(tokens)
-
-    def _save_unlocked(self, tokens: OAuthTokens) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
-        temporary = self.path.with_name(f".{self.path.name}.{secrets.token_hex(8)}.tmp")
-        try:
-            with temporary.open("w") as handle:
-                json.dump(tokens.to_dict(), handle, separators=(",", ":"))
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, self.path)
-            os.chmod(self.path, 0o600)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-    async def access_token(self, client: httpx.AsyncClient) -> str:
-        async with self._async_refresh_lock:
-            async with self._async_refresh_lock_file():
-                tokens = self._read_unlocked()
-                from_claude = tokens is None
-                if tokens is None:
-                    tokens = self.bootstrap()
-                    if tokens is None:
-                        raise self.auth_error_type(
-                            f"no {self.provider_label} OAuth login found; log in first"
-                        )
-                if tokens.is_valid():
-                    if from_claude:
-                        self._save_unlocked(tokens)
-                    return tokens.access_token
-
-                refreshed = await self.refresh(tokens.refresh_token, client)
-                self._save_unlocked(refreshed)
-                return refreshed.access_token
-
-    @asynccontextmanager
-    async def _async_refresh_lock_file(self) -> AsyncIterator[None]:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
-        handle = self.lock_path.open("a+")
-        try:
-            await asyncio.to_thread(fcntl.flock, handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                await asyncio.to_thread(fcntl.flock, handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            handle.close()
 
     async def refresh(self, refresh_token: str, client: httpx.AsyncClient) -> OAuthTokens:
         try:
@@ -470,98 +355,28 @@ class AnthropicBackend(CompletionBackend):
             except AnthropicBackendError as exc:
                 primary_exception = exc
             except httpx.HTTPError as exc:
-                primary_exception = _request_error(exc)
+                primary_exception = request_error(exc, AnthropicHTTPError)
             except BaseException as exc:
-                if _task_is_cancelling() and not _is_control_exception(exc):
+                if task_is_cancelling() and not is_control_exception(exc):
                     primary_exception = asyncio.CancelledError()
                     primary_exception.__cause__ = exc
                 else:
                     primary_exception = exc
         except httpx.HTTPError as exc:
-            primary_exception = _request_error(exc)
+            primary_exception = request_error(exc, AnthropicHTTPError)
         except BaseException as exc:
             primary_exception = exc
         finally:
-            if entered and stream_context is not None:
-                try:
-                    await stream_context.__aexit__(
-                        type(primary_exception) if primary_exception else None,
-                        primary_exception,
-                        primary_exception.__traceback__ if primary_exception else None,
-                    )
-                except BaseException as exc:
-                    cleanup_exception = (
-                        _request_error(exc)
-                        if isinstance(exc, httpx.HTTPError)
-                        else exc
-                    )
-                    primary_exception = _merge_exception(
-                        primary_exception, cleanup_exception
-                    )
-            if self.client is None:
-                try:
-                    await client.aclose()
-                except BaseException as exc:
-                    cleanup_exception = (
-                        _request_error(exc)
-                        if isinstance(exc, httpx.HTTPError)
-                        else exc
-                    )
-                    primary_exception = _merge_exception(
-                        primary_exception, cleanup_exception
-                    )
-            if _task_is_cancelling():
-                primary_exception = _merge_exception(
-                    primary_exception, asyncio.CancelledError()
-                )
+            primary_exception = await cleanup_transport(
+                stream_context=stream_context,
+                entered=entered,
+                client=client,
+                owns_client=self.client is None,
+                primary_exception=primary_exception,
+                http_error_type=AnthropicHTTPError,
+            )
             if primary_exception is not None:
                 raise primary_exception
-
-
-def _task_is_cancelling() -> bool:
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
-
-
-def _is_control_exception(value: BaseException) -> bool:
-    return isinstance(value, (asyncio.CancelledError, GeneratorExit))
-
-
-def _control_priority(value: BaseException) -> int:
-    if isinstance(value, asyncio.CancelledError):
-        return 2
-    if isinstance(value, GeneratorExit):
-        return 1
-    return 0
-
-
-def _request_error(cause: httpx.HTTPError) -> AnthropicHTTPError:
-    error = AnthropicHTTPError("Anthropic request failed")
-    error.__cause__ = cause
-    return error
-
-
-def _merge_exception(
-    primary: BaseException | None,
-    cleanup: BaseException,
-) -> BaseException:
-    if primary is None:
-        return cleanup
-    primary_is_control = _is_control_exception(primary)
-    cleanup_is_control = _is_control_exception(cleanup)
-    if cleanup_is_control and not primary_is_control:
-        cleanup.__cause__ = primary
-        cleanup.__context__ = primary
-        return cleanup
-    if (
-        cleanup_is_control
-        and primary_is_control
-        and _control_priority(cleanup) > _control_priority(primary)
-    ):
-        return cleanup
-    if primary_is_control and not cleanup_is_control:
-        primary.__context__ = cleanup
-    return primary
 
 
 async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes:

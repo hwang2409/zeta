@@ -1,11 +1,15 @@
 import asyncio
 import base64
+import http.server
 import json
+import multiprocessing
+import threading
 from pathlib import Path
 
 import httpx
 import pytest
 
+import zeta.codex as codex_module
 from zeta.anthropic import OAuthTokens
 from zeta.codex import (
     DEFAULT_CODEX_MODEL,
@@ -36,7 +40,12 @@ def access_token(account_id: str = "account-test") -> str:
     return ".".join(
         (
             encode({"alg": "none"}),
-            encode({"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}),
+            encode(
+                {
+                    "exp": 4_000_000_000,
+                    "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+                }
+            ),
             encode({"signature": "fixture"}),
         )
     )
@@ -100,6 +109,47 @@ def message_stream() -> list[dict[str, object]]:
             },
         ),
     ]
+
+
+def malformed_events(mutation: str) -> list[dict[str, object]]:
+    created = event("response.created", response={"id": "response-test"})
+    item = event(
+        "response.output_item.added",
+        output_index=0,
+        item={"type": "message", "id": "message-test", "role": "assistant"},
+    )
+    part = event(
+        "response.content_part.added",
+        output_index=0,
+        content_index=0,
+        part={"type": "output_text"},
+    )
+    delta = event(
+        "response.output_text.delta", output_index=0, content_index=0, delta="hello"
+    )
+    text_done = event(
+        "response.output_text.done", output_index=0, content_index=0, text="hello"
+    )
+    part_done = event("response.content_part.done", output_index=0, content_index=0)
+    if mutation == "before_start":
+        return [item]
+    if mutation == "duplicate_start":
+        return [created, created.copy()]
+    if mutation == "unknown_event":
+        return [created, event("response.unknown")]
+    if mutation == "unknown_delta_item":
+        return [created, item, part, {**delta, "output_index": 1}]
+    if mutation == "stopped_delta":
+        return [created, item, part, delta, text_done, part_done, delta.copy()]
+    if mutation == "duplicate_stop":
+        return [created, item, part, delta, text_done, part_done, part_done.copy()]
+    if mutation == "unknown_stop":
+        return [created, item, part, delta, text_done, part_done, event(
+            "response.content_part.done", output_index=0, content_index=1
+        )]
+    if mutation == "open_item_at_end":
+        return [created, item, part, delta, text_done, part_done, event("response.completed")]
+    raise AssertionError(mutation)
 
 
 def client_for(stream: str):
@@ -188,6 +238,12 @@ async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Pat
                 text="plan",
             ),
             event(
+                "response.reasoning_summary_part.done",
+                output_index=0,
+                summary_index=0,
+                part={"type": "summary_text", "text": "plan"},
+            ),
+            event(
                 "response.output_item.done",
                 output_index=0,
                 item={"type": "reasoning", "id": "reasoning-test"},
@@ -238,6 +294,67 @@ async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Pat
     assert events[-1].message.content == [
         ThinkingContent("plan"),
         ToolUseContent(ToolCall("call-test", "read", {"path": "README.md"})),
+    ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_summary_stop_only_and_raw_reasoning_text_are_durable(
+    tmp_path: Path,
+) -> None:
+    stream = sse(
+        [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={"type": "reasoning", "id": "reasoning-summary"},
+            ),
+            event(
+                "response.reasoning_summary_part.added",
+                output_index=0,
+                summary_index=0,
+                part={"type": "summary_text"},
+            ),
+            event(
+                "response.reasoning_summary_part.done",
+                output_index=0,
+                summary_index=0,
+                part={"type": "summary_text", "text": "stop-only"},
+            ),
+            event("response.output_item.done", output_index=0),
+            event(
+                "response.output_item.added",
+                output_index=1,
+                item={"type": "reasoning", "id": "reasoning-raw"},
+            ),
+            event(
+                "response.reasoning_text.delta",
+                output_index=1,
+                content_index=0,
+                delta="raw",
+            ),
+            event(
+                "response.reasoning_text.done",
+                output_index=1,
+                content_index=0,
+                text="raw",
+            ),
+            event("response.output_item.done", output_index=1),
+            event("response.completed"),
+        ]
+    )
+    client = client_for(stream)
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "codex.json")
+        ).complete([], [])
+    ]
+    assert events[-1].message is not None
+    assert events[-1].message.content == [
+        ThinkingContent("stop-only"),
+        ThinkingContent("raw"),
     ]
     await client.aclose()
 
@@ -300,6 +417,89 @@ async def test_bootstrap_reads_codex_store_without_writing_codex_auth(
     await client.aclose()
 
 
+def test_bootstrap_requires_refresh_when_jwt_expiry_is_missing_or_past(
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    header, _, signature = access_token().split(".")
+    for name, payload in (
+        ("missing", {"https://api.openai.com/auth": {"chatgpt_account_id": "a"}}),
+        ("expired", {"exp": 1, "https://api.openai.com/auth": {"chatgpt_account_id": "a"}}),
+    ):
+        encoded_payload = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+        token = f"{header}.{encoded_payload}.{signature}"
+        auth_path.write_text(
+            json.dumps({"tokens": {"access_token": token, "refresh_token": "refresh"}})
+        )
+        store = CodexCredentialStore(tmp_path / f"{name}.json", codex_auth=auth_path)
+        assert store.bootstrap() is not None
+        assert store.bootstrap().expires_at <= 1
+
+
+def _refresh_process(path: str, token_url: str, results: object) -> None:
+    async def run() -> None:
+        client = httpx.AsyncClient()
+        try:
+            token = await CodexCredentialStore(path, token_url=token_url).access_token(client)
+            results.put(token)
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_expired_codex_token_refreshes_once_across_two_processes(tmp_path: Path) -> None:
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.server.refresh_count += 1
+            body = json.dumps(
+                {
+                    "access_token": access_token("refreshed-account"),
+                    "refresh_token": "rotated-refresh",
+                    "expires_in": 3600,
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.refresh_count = 0
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        path = tmp_path / "codex.json"
+        CodexCredentialStore(path).save(OAuthTokens(access_token(), "refresh", 1))
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_refresh_process,
+                args=(str(path), f"http://127.0.0.1:{server.server_port}/token", results),
+            )
+            for _ in range(2)
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=5)
+            assert process.exitcode == 0
+        assert [results.get(timeout=1), results.get(timeout=1)] == [
+            access_token("refreshed-account"),
+            access_token("refreshed-account"),
+        ]
+        assert server.refresh_count == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+
 @pytest.mark.asyncio
 async def test_expired_codex_token_refreshes_under_shared_store_lock(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
@@ -330,13 +530,18 @@ async def test_expired_codex_token_refreshes_under_shared_store_lock(tmp_path: P
 @pytest.mark.asyncio
 async def test_http_failure_and_transport_failure_are_typed(tmp_path: Path) -> None:
     async def http_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(401, json={"error": {"message": "expired"}}, request=request)
+        return httpx.Response(
+            401,
+            json={"error": {"message": "access-token-secret-value"}},
+            request=request,
+        )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(http_handler))
-    with pytest.raises(CodexAuthError):
+    with pytest.raises(CodexAuthError) as raised:
         await anext(
             CodexBackend(client=client, token_store=store_for(tmp_path / "codex.json")).complete([], [])
         )
+    assert "access-token-secret-value" not in str(raised.value)
     await client.aclose()
 
     async def transport_handler(request: httpx.Request) -> httpx.Response:
@@ -349,6 +554,110 @@ async def test_http_failure_and_transport_failure_are_typed(tmp_path: Path) -> N
         )
     assert "transport secret" not in str(raised.value)
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_error_does_not_expose_provider_body(tmp_path: Path) -> None:
+    stream = sse([event("response.created", response={"id": "response-test"}), event(
+        "error", error={"message": "access-token-secret-value"}
+    )])
+    client = client_for(stream)
+    with pytest.raises(CodexStreamError) as raised:
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "codex.json")
+            ).complete([], [])
+        ]
+    assert "access-token-secret-value" not in str(raised.value)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_events_after_response_completion_are_rejected(tmp_path: Path) -> None:
+    events = message_stream() + [event("keepalive")]
+    client = client_for(sse(events))
+    with pytest.raises(CodexStreamError, match="follows response completion"):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "codex.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_output_item_done_rejects_open_blocks(tmp_path: Path) -> None:
+    events = message_stream()[:4] + [event("response.output_item.done", output_index=0)]
+    client = client_for(sse(events))
+    with pytest.raises(CodexStreamError, match="open blocks"):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "codex.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_non_http_stream_exception_is_not_remapped(tmp_path: Path) -> None:
+    class Response:
+        status_code = 200
+
+        async def aiter_lines(self):
+            yield 'data: {"type":"response.created","response":{}}'
+            yield ""
+            raise ValueError("stream parser bug")
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            return None
+
+    class Client:
+        def stream(self, method, url, *, headers, json):
+            return Stream()
+
+    with pytest.raises(ValueError, match="stream parser bug"):
+        [
+            item
+            async for item in CodexBackend(
+                client=Client(), token_store=store_for(tmp_path / "codex.json")
+            ).complete([], [])
+        ]
+
+
+@pytest.mark.asyncio
+async def test_non_http_cleanup_exception_is_not_remapped(tmp_path: Path) -> None:
+    class Response:
+        status_code = 200
+
+        async def aiter_lines(self):
+            for line in sse(message_stream()).splitlines():
+                yield line
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            raise ValueError("cleanup bug")
+
+    class Client:
+        def stream(self, method, url, *, headers, json):
+            return Stream()
+
+    with pytest.raises(ValueError, match="cleanup bug"):
+        [
+            item
+            async for item in CodexBackend(
+                client=Client(), token_store=store_for(tmp_path / "codex.json")
+            ).complete([], [])
+        ]
 
 
 @pytest.mark.asyncio
@@ -368,23 +677,7 @@ async def test_http_failure_and_transport_failure_are_typed(tmp_path: Path) -> N
 async def test_each_malformed_stream_fails_at_its_named_gate(
     tmp_path: Path, mutation: str, message: str
 ) -> None:
-    events = message_stream()
-    if mutation == "before_start":
-        events = events[1:]
-    elif mutation == "duplicate_start":
-        events.insert(1, events[0].copy())
-    elif mutation == "unknown_event":
-        events.insert(1, event("response.unknown"))
-    elif mutation == "unknown_delta_item":
-        events[3] = {**events[3], "output_index": 1}
-    elif mutation == "stopped_delta":
-        events.insert(6, events[3].copy())
-    elif mutation == "duplicate_stop":
-        events.insert(6, events[5].copy())
-    elif mutation == "unknown_stop":
-        events.insert(6, event("response.content_part.done", output_index=0, content_index=1))
-    elif mutation == "open_item_at_end":
-        events.pop(6)
+    events = malformed_events(mutation)
     client = client_for(sse(events))
     with pytest.raises(CodexStreamError, match=message):
         [
@@ -394,6 +687,119 @@ async def test_each_malformed_stream_fails_at_its_named_gate(
             ).complete([], [])
         ]
     await client.aclose()
+
+
+class _CleanupStream:
+    def __init__(self, events: list[dict[str, object]], cleanup_error: type[BaseException] | None) -> None:
+        self.events = events
+        self.cleanup_error = cleanup_error
+
+    async def __aenter__(self):
+        events = self.events
+
+        class Response:
+            status_code = 200
+
+            async def aiter_lines(response_self):
+                for line in sse(events).splitlines():
+                    yield line
+
+        return Response()
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        if self.cleanup_error is not None:
+            raise self.cleanup_error()
+
+
+class _CleanupClient:
+    def __init__(
+        self,
+        events: list[dict[str, object]],
+        stream_error: type[BaseException] | None,
+        client_error: type[BaseException] | None,
+    ) -> None:
+        self.events = events
+        self.stream_error = stream_error
+        self.client_error = client_error
+
+    def stream(self, method, url, *, headers, json):
+        return _CleanupStream(self.events, self.stream_error)
+
+    async def aclose(self):
+        if self.client_error is not None:
+            raise self.client_error()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["response", "client"])
+@pytest.mark.parametrize("primary", [False, True])
+@pytest.mark.parametrize("cleanup_error", [asyncio.CancelledError, GeneratorExit])
+async def test_cleanup_control_exception_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scope: str,
+    primary: bool,
+    cleanup_error: type[BaseException],
+) -> None:
+    events = (
+        [
+            event("response.created", response={"id": "response-test"}),
+            event("response.unknown"),
+        ]
+        if primary
+        else message_stream()
+    )
+    stream_cleanup = cleanup_error if scope == "response" else None
+    client_cleanup = cleanup_error if scope == "client" else None
+    client = _CleanupClient(events, stream_cleanup, client_cleanup)
+    if scope == "client":
+        monkeypatch.setattr(codex_module.httpx, "AsyncClient", lambda timeout=None: client)
+        backend = CodexBackend(token_store=store_for(tmp_path / "codex.json"))
+    else:
+        backend = CodexBackend(
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+        )
+    with pytest.raises(cleanup_error) as raised:
+        [item async for item in backend.complete([], [])]
+    if primary:
+        assert isinstance(raised.value.__cause__, CodexStreamError)
+    else:
+        assert raised.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_consumer_aclose_finishes_without_leaking_cleanup(
+    tmp_path: Path,
+) -> None:
+    cleanup_finished = asyncio.Event()
+    never = asyncio.Event()
+
+    class Response:
+        status_code = 200
+
+        async def aiter_lines(self):
+            for line in sse(message_stream()[:1]).splitlines():
+                yield line
+            await never.wait()
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            cleanup_finished.set()
+
+    class Client:
+        def stream(self, method, url, *, headers, json):
+            return Stream()
+
+    iterator = CodexBackend(
+        client=Client(), token_store=store_for(tmp_path / "codex.json")
+    ).complete([], [])
+    assert (await anext(iterator)).type is StreamEventType.MESSAGE_START
+    await asyncio.wait_for(iterator.aclose(), timeout=1)
+    assert cleanup_finished.is_set()
 
 
 @pytest.mark.asyncio

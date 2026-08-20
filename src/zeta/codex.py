@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import json
+import math
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -14,7 +15,13 @@ from typing import Any
 
 import httpx
 
-from .anthropic import AnthropicCredentialStore, OAuthTokens
+from .auth import OAuthCredentialStore, OAuthTokens
+from .transport import (
+    cleanup_transport,
+    is_control_exception,
+    request_error,
+    task_is_cancelling,
+)
 from .types import (
     CompletionBackend,
     ContentBlock,
@@ -78,10 +85,17 @@ def _extract_codex_tokens(value: Any) -> OAuthTokens:
     refresh = _first_string(value, "refresh_token", "refreshToken", "refresh")
     if not access or not refresh:
         raise ValueError("Codex credentials are incomplete")
-    return OAuthTokens(access, refresh, time.time() + 3600)
+    payload = _jwt_payload(access)
+    expiry = payload.get("exp")
+    expires_at = (
+        float(expiry)
+        if type(expiry) in {int, float} and math.isfinite(float(expiry))
+        else 0.0
+    )
+    return OAuthTokens(access, refresh, expires_at)
 
 
-class CodexCredentialStore(AnthropicCredentialStore):
+class CodexCredentialStore(OAuthCredentialStore):
     """Owns zeta's Codex OAuth file and reads ~/.codex/auth.json only to bootstrap."""
 
     auth_error_type = CodexAuthError
@@ -95,11 +109,7 @@ class CodexCredentialStore(AnthropicCredentialStore):
         codex_auth: str | Path | None = None,
         token_url: str = CODEX_TOKEN_URL,
     ) -> None:
-        super().__init__(
-            path or Path.home() / ".zeta" / "codex-oauth.json",
-            claude_credentials=codex_auth or Path.home() / ".codex" / "auth.json",
-            token_url=token_url,
-        )
+        super().__init__(path or Path.home() / ".zeta" / "codex-oauth.json", token_url=token_url)
         self.codex_auth = Path(codex_auth or Path.home() / ".codex" / "auth.json")
 
     def bootstrap(self) -> OAuthTokens | None:
@@ -146,11 +156,7 @@ def extract_account_id(access_token: str) -> str:
     """Derive the ChatGPT account id from the access token claim."""
 
     try:
-        parts = access_token.split(".")
-        if len(parts) != 3:
-            raise ValueError
-        encoded = parts[1] + "=" * (-len(parts[1]) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+        payload = _jwt_payload(access_token)
         account = payload[JWT_AUTH_CLAIM]["chatgpt_account_id"]
     except (
         KeyError,
@@ -164,6 +170,17 @@ def extract_account_id(access_token: str) -> str:
     if type(account) is not str or not account:
         raise CodexAuthError("Codex access token has no ChatGPT account id")
     return account
+
+
+def _jwt_payload(access_token: str) -> Mapping[str, Any]:
+    parts = access_token.split(".")
+    if len(parts) != 3:
+        raise ValueError
+    encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+    if not isinstance(payload, Mapping):
+        raise TypeError
+    return payload
 
 
 def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str, Any]]:
@@ -282,6 +299,7 @@ class _BlockState:
     state: str = "active"
     text: str = ""
     arguments: str = ""
+    text_done: bool = False
 
 
 @dataclass(slots=True)
@@ -404,114 +422,30 @@ class CodexBackend(CompletionBackend):
             except CodexBackendError as exc:
                 primary_exception = exc
             except httpx.HTTPError as exc:
-                primary_exception = _request_error(exc)
+                primary_exception = request_error(exc, CodexHTTPError)
             except BaseException as exc:
-                if _is_control_exception(exc):
-                    primary_exception = exc
-                elif _task_is_cancelling():
+                if task_is_cancelling() and not is_control_exception(exc):
                     primary_exception = asyncio.CancelledError()
-                    primary_exception.__cause__ = _unexpected_stream_error(exc)
+                    primary_exception.__cause__ = exc
                 else:
-                    primary_exception = _unexpected_stream_error(exc)
+                    primary_exception = exc
         except CodexBackendError as exc:
             primary_exception = exc
         except httpx.HTTPError as exc:
-            primary_exception = _request_error(exc)
+            primary_exception = request_error(exc, CodexHTTPError)
         except BaseException as exc:
-            if _is_control_exception(exc):
-                primary_exception = exc
-            elif _task_is_cancelling():
-                primary_exception = asyncio.CancelledError()
-                primary_exception.__cause__ = _unexpected_stream_error(exc)
-            else:
-                primary_exception = _unexpected_stream_error(exc)
+            primary_exception = exc
         finally:
-            if entered and stream_context is not None:
-                try:
-                    await stream_context.__aexit__(
-                        type(primary_exception) if primary_exception else None,
-                        primary_exception,
-                        primary_exception.__traceback__ if primary_exception else None,
-                    )
-                except BaseException as exc:
-                    cleanup_exception = _map_cleanup_exception(exc)
-                    primary_exception = _merge_exception(
-                        primary_exception, cleanup_exception
-                    )
-            if self.client is None:
-                try:
-                    await client.aclose()
-                except BaseException as exc:
-                    cleanup_exception = _map_cleanup_exception(exc)
-                    primary_exception = _merge_exception(
-                        primary_exception, cleanup_exception
-                    )
-            if _task_is_cancelling():
-                primary_exception = _merge_exception(
-                    primary_exception, asyncio.CancelledError()
-                )
+            primary_exception = await cleanup_transport(
+                stream_context=stream_context,
+                entered=entered,
+                client=client,
+                owns_client=self.client is None,
+                primary_exception=primary_exception,
+                http_error_type=CodexHTTPError,
+            )
             if primary_exception is not None:
                 raise primary_exception
-
-
-def _task_is_cancelling() -> bool:
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
-
-
-def _is_control_exception(value: BaseException) -> bool:
-    return isinstance(value, (asyncio.CancelledError, GeneratorExit))
-
-
-def _control_priority(value: BaseException) -> int:
-    if isinstance(value, asyncio.CancelledError):
-        return 2
-    if isinstance(value, GeneratorExit):
-        return 1
-    return 0
-
-
-def _request_error(cause: httpx.HTTPError) -> CodexHTTPError:
-    error = CodexHTTPError("Codex request failed")
-    error.__cause__ = cause
-    return error
-
-
-def _unexpected_stream_error(cause: BaseException) -> CodexStreamError:
-    error = CodexStreamError("Codex stream processing failed")
-    error.__cause__ = cause
-    return error
-
-
-def _map_cleanup_exception(cause: BaseException) -> BaseException:
-    if isinstance(cause, httpx.HTTPError):
-        return _request_error(cause)
-    if _is_control_exception(cause) or isinstance(cause, CodexBackendError):
-        return cause
-    return _unexpected_stream_error(cause)
-
-
-def _merge_exception(
-    primary: BaseException | None,
-    cleanup: BaseException,
-) -> BaseException:
-    if primary is None:
-        return cleanup
-    primary_is_control = _is_control_exception(primary)
-    cleanup_is_control = _is_control_exception(cleanup)
-    if cleanup_is_control and not primary_is_control:
-        cleanup.__cause__ = primary
-        cleanup.__context__ = primary
-        return cleanup
-    if (
-        cleanup_is_control
-        and primary_is_control
-        and _control_priority(cleanup) > _control_priority(primary)
-    ):
-        return cleanup
-    if primary_is_control and not cleanup_is_control:
-        primary.__context__ = cleanup
-    return primary
 
 
 async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes:
@@ -524,20 +458,8 @@ async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes
 
 
 def _http_error(status_code: int, body: bytes) -> CodexBackendError:
-    message = "request failed"
-    try:
-        value = json.loads(body)
-        detail = value.get("error") if isinstance(value, Mapping) else None
-        candidate = detail.get("message") if isinstance(detail, Mapping) else None
-        if type(candidate) is str:
-            message = candidate
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
-        pass
-    message = "".join(
-        character for character in message if character.isprintable() or character in "\t\n"
-    )[:500]
     error_type = CodexAuthError if status_code in {401, 403} else CodexHTTPError
-    return error_type(f"Codex HTTP {status_code}: {message}")
+    return error_type(f"Codex HTTP request failed ({status_code})")
 
 
 async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEvent]:
@@ -584,15 +506,16 @@ def _translate_event(
         return None, response_state
     if event_type in {"keepalive", "response.in_progress", "response.metadata"}:
         _require_response_started(response_state, event_type)
+        if response_state == "stopped":
+            raise CodexStreamError(
+                f"Codex event follows response completion: {event_type}"
+            )
         return None, response_state
     if event_type == "error":
         detail = payload.get("error")
-        message = detail.get("message") if isinstance(detail, Mapping) else None
-        if type(message) is not str:
-            message = payload.get("message")
-        if type(message) is not str:
+        if not isinstance(detail, Mapping) and not isinstance(payload.get("message"), str):
             raise CodexStreamError("Codex stream error payload is invalid")
-        raise CodexStreamError(_sanitize_message(message))
+        raise CodexStreamError("Codex response reported an error")
     if event_type == "response.created":
         if response_state != "not-started":
             raise CodexStreamError("Codex response.created is duplicated")
@@ -611,12 +534,7 @@ def _translate_event(
     if response_state == "stopped":
         raise CodexStreamError(f"Codex event follows response completion: {event_type}")
     if event_type == "response.failed":
-        response = payload.get("response")
-        detail = response.get("error") if isinstance(response, Mapping) else None
-        message = detail.get("message") if isinstance(detail, Mapping) else None
-        if type(message) is not str:
-            message = "Codex response failed"
-        raise CodexStreamError(_sanitize_message(message))
+        raise CodexStreamError("Codex response failed")
     if event_type == "response.incomplete":
         raise CodexStreamError("Codex response was incomplete")
     if event_type in {"response.completed", "response.done"}:
@@ -712,15 +630,20 @@ def _translate_event(
         "response.output_text.delta",
         "response.reasoning_summary_text.delta",
         "response.function_call_arguments.delta",
+        "response.reasoning_text.delta",
     }:
         return _translate_delta(event_type, payload, items, blocks), response_state
     if event_type in {
         "response.output_text.done",
         "response.content_part.done",
         "response.reasoning_summary_text.done",
+        "response.reasoning_text.done",
         "response.function_call_arguments.done",
     }:
         _finish_block(event_type, payload, items, blocks)
+        return None, response_state
+    if event_type == "response.reasoning_summary_part.done":
+        _finish_reasoning_summary_part(payload, items, blocks)
         return None, response_state
     if event_type == "response.output_item.done":
         index = _output_index(payload)
@@ -730,10 +653,8 @@ def _translate_event(
             raise CodexStreamError("Codex completed output item is invalid")
         if isinstance(complete, Mapping):
             _merge_completed_item(item, complete)
-        for key in item.blocks:
-            block = blocks[key]
-            if block.state == "active":
-                block.state = "stopped"
+        if any(blocks[key].state != "stopped" for key in item.blocks):
+            raise CodexStreamError("Codex output item completed with open blocks")
         item.state = "stopped"
         return None, response_state
     raise CodexStreamError(f"unsupported Codex SSE event: {event_type}")
@@ -791,13 +712,39 @@ def _translate_delta(
             tool_call=ToolCall(item.call_id, item.name, arguments),
             data={"tool_call_delta": delta, "index": index},
         )
-    if event_type == "response.reasoning_summary_text.delta":
+    if event_type in {
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_text.delta",
+    }:
+        if event_type == "response.reasoning_text.delta":
+            content_index = _content_index(payload)
+            key = (index, content_index)
+            block = blocks.get(key)
+            if block is None:
+                block = _BlockState("thinking_raw")
+                blocks[key] = block
+                item.blocks.add(key)
+            if item.kind != "reasoning" or block.kind != "thinking_raw":
+                raise CodexStreamError("Codex reasoning delta references an inactive block")
+            if block.state != "active" or block.text_done:
+                raise CodexStreamError("Codex reasoning delta references an inactive block")
+            delta = payload.get("delta")
+            if type(delta) is not str:
+                raise CodexStreamError("Codex reasoning delta is invalid")
+            block.text += delta
+            item.thinking += delta
+            return StreamEvent(StreamEventType.MESSAGE_UPDATE, content=ThinkingContent(delta))
         summary_index = payload.get("summary_index")
         if type(summary_index) is not int or summary_index < 0:
             raise CodexStreamError("Codex reasoning summary index is invalid")
         key = (index, summary_index)
         block = blocks.get(key)
-        if item.kind != "reasoning" or block is None or block.state != "active":
+        if (
+            item.kind != "reasoning"
+            or block is None
+            or block.state != "active"
+            or block.text_done
+        ):
             raise CodexStreamError("Codex reasoning delta references an inactive block")
         delta = payload.get("delta")
         if type(delta) is not str:
@@ -835,6 +782,9 @@ def _finish_block(
             raise CodexStreamError("Codex reasoning summary index is invalid")
         key = (index, summary_index)
         expected_kind = "thinking"
+    elif event_type == "response.reasoning_text.done":
+        key = (index, _content_index(payload))
+        expected_kind = "thinking_raw"
     else:
         key = (index, _content_index(payload))
         expected_kind = "text"
@@ -845,7 +795,7 @@ def _finish_block(
         raise CodexStreamError("Codex block stop is duplicated")
     if event_type.endswith(".done"):
         complete_text = payload.get("text")
-        if type(complete_text) is str and block.kind == "text":
+        if type(complete_text) is str and block.kind in {"text", "thinking_raw"}:
             if block.text and complete_text != block.text:
                 raise CodexStreamError("Codex completed text does not match its deltas")
             block.text = complete_text
@@ -855,8 +805,47 @@ def _finish_block(
                 raise CodexStreamError("Codex completed arguments do not match deltas")
             block.arguments = complete_args
             item.arguments = complete_args
-    if event_type in {"response.content_part.done", "response.function_call_arguments.done"}:
+    if event_type == "response.reasoning_summary_text.done":
+        if block.text_done:
+            raise CodexStreamError("Codex reasoning text stop is duplicated")
+        block.text_done = True
+    elif event_type in {
+        "response.content_part.done",
+        "response.reasoning_text.done",
+        "response.function_call_arguments.done",
+    }:
         block.state = "stopped"
+
+
+def _finish_reasoning_summary_part(
+    payload: Mapping[str, Any],
+    items: Mapping[int, _ItemState],
+    blocks: dict[tuple[int, int], _BlockState],
+) -> None:
+    index = _output_index(payload)
+    item = _active_item(items, index)
+    summary_index = payload.get("summary_index")
+    if type(summary_index) is not int or summary_index < 0:
+        raise CodexStreamError("Codex reasoning summary index is invalid")
+    key = (index, summary_index)
+    block = blocks.get(key)
+    if item.kind != "reasoning" or block is None or block.kind != "thinking":
+        raise CodexStreamError("Codex reasoning summary stop references an unknown block")
+    if block.state != "active":
+        raise CodexStreamError("Codex reasoning summary stop is duplicated")
+    part = payload.get("part")
+    if part is not None and not isinstance(part, Mapping):
+        raise CodexStreamError("Codex reasoning summary part is invalid")
+    complete_text = part.get("text") if isinstance(part, Mapping) else None
+    if complete_text is not None and type(complete_text) is not str:
+        raise CodexStreamError("Codex reasoning summary text is invalid")
+    if isinstance(complete_text, str):
+        if block.text and complete_text != block.text:
+            raise CodexStreamError("Codex completed reasoning does not match its deltas")
+        if not block.text:
+            block.text = complete_text
+            item.thinking += complete_text
+    block.state = "stopped"
 
 
 def _merge_completed_item(item: _ItemState, complete: Mapping[str, Any]) -> None:
@@ -911,9 +900,3 @@ def _parse_complete_object(value: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise CodexStreamError("Codex tool arguments are not an object")
     return parsed
-
-
-def _sanitize_message(value: str) -> str:
-    return "".join(
-        character for character in value if character.isprintable() or character in "\t\n"
-    )[:500]
