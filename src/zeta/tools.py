@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import os
 import signal
@@ -26,6 +27,9 @@ class ToolAbortSignal:
     def is_set(self) -> bool:
         return self._event.is_set()
 
+    async def wait(self) -> None:
+        await self._event.wait()
+
     @property
     def aborted(self) -> bool:
         return self.is_set()
@@ -34,6 +38,10 @@ class ToolAbortSignal:
 AbortSignal = ToolAbortSignal
 ToolHook = Callable[[str, dict[str, Any]], bool | Awaitable[bool] | None]
 ToolHandler = Callable[..., str | ToolResult | Awaitable[str | ToolResult]]
+
+
+class _ToolCanceled(Exception):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +182,8 @@ class ToolRegistry:
             return _canceled_result(tool_call.id)
         try:
             result = await _invoke_handler(definition.handler, arguments, signal_state)
+        except _ToolCanceled:
+            return _canceled_result(tool_call.id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -352,28 +362,50 @@ class ToolRegistry:
                 cwd=self.cwd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout
-                )
-            except TimeoutError:
-                process.send_signal(signal.SIGKILL)
-                stdout, stderr = await process.communicate()
+        except OSError as exc:
+            raise ValueError(f"could not execute command: {exc}") from exc
+
+        communication = asyncio.create_task(process.communicate())
+        abort_wait = asyncio.create_task(_wait_for_abort(abort_signal))
+        timeout_wait = asyncio.create_task(asyncio.sleep(timeout))
+        try:
+            done, _ = await asyncio.wait(
+                {communication, abort_wait, timeout_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if communication in done:
+                stdout, stderr = communication.result()
                 result = _format_exec_result(
-                    -signal.SIGKILL,
+                    process.returncode, stdout, stderr, output_limit
+                )
+                if process.returncode:
+                    raise ValueError(result)
+                return result
+            if abort_wait in done and _signal_is_set(abort_signal):
+                await _kill_and_reap(process, communication)
+                raise _ToolCanceled()
+
+            await _kill_and_reap(process, communication)
+            stdout, stderr = communication.result()
+            raise ValueError(
+                _format_exec_result(
+                    process.returncode,
                     stdout,
                     stderr,
                     output_limit,
                     suffix="command timed out",
                 )
-                raise ValueError(result)
-        except OSError as exc:
-            raise ValueError(f"could not execute command: {exc}") from exc
-        result = _format_exec_result(process.returncode, stdout, stderr, output_limit)
-        if process.returncode:
-            raise ValueError(result)
-        return result
+            )
+        except asyncio.CancelledError:
+            await _kill_and_reap(process, communication)
+            raise
+        finally:
+            for waiter in (abort_wait, timeout_wait):
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(abort_wait, timeout_wait, return_exceptions=True)
 
     def _path(self, raw_path: object) -> Path:
         if type(raw_path) is not str or not raw_path:
@@ -414,7 +446,9 @@ def _normalize_schema(schema: Mapping[str, Any] | None) -> dict[str, Any]:
         return {"type": "object", "properties": {}}
     if not isinstance(schema, Mapping):
         raise TypeError("tool parameter schema must be an object")
-    return dict(schema)
+    normalized = copy.deepcopy(dict(schema))
+    _validate_schema_definition(normalized, "schema")
+    return normalized
 
 
 def _validate_arguments(arguments: object, schema: Mapping[str, Any]) -> dict[str, Any]:
@@ -425,22 +459,6 @@ def _validate_arguments(arguments: object, schema: Mapping[str, Any]) -> dict[st
 
 
 def _validate_schema(value: Any, schema: Mapping[str, Any], path: str) -> None:
-    for alternative_key in ("anyOf", "oneOf"):
-        alternatives = schema.get(alternative_key)
-        if alternatives is not None:
-            matches = 0
-            for alternative in alternatives:
-                try:
-                    _validate_schema(value, alternative, path)
-                except ValueError:
-                    pass
-                else:
-                    matches += 1
-            if (alternative_key == "anyOf" and matches == 0) or (
-                alternative_key == "oneOf" and matches != 1
-            ):
-                raise ValueError(f"{path} does not match {alternative_key}")
-            return
     expected_type = schema.get("type")
     if expected_type is not None and not _matches_type(value, expected_type):
         raise ValueError(f"{path} must be {expected_type}")
@@ -476,6 +494,8 @@ def _validate_schema(value: Any, schema: Mapping[str, Any], path: str) -> None:
     if isinstance(value, list):
         if "minItems" in schema and len(value) < schema["minItems"]:
             raise ValueError(f"{path} has too few items")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            raise ValueError(f"{path} has too many items")
         item_schema = schema.get("items")
         if isinstance(item_schema, Mapping):
             for index, item in enumerate(value):
@@ -497,7 +517,80 @@ def _matches_type(value: Any, expected: object) -> bool:
         return type(value) in {int, float}
     if expected == "null":
         return value is None
-    return True
+    return False
+
+
+_SCHEMA_KEYS = {
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "minLength",
+    "maxLength",
+    "minimum",
+    "exclusiveMinimum",
+    "maximum",
+    "minItems",
+    "maxItems",
+    "enum",
+    "const",
+}
+_SCHEMA_TYPES = {"array", "boolean", "integer", "null", "number", "object", "string"}
+
+
+def _validate_schema_definition(schema: Mapping[str, Any], path: str) -> None:
+    unsupported = set(schema) - _SCHEMA_KEYS
+    if unsupported:
+        names = ", ".join(sorted(unsupported))
+        raise ValueError(f"unsupported schema keywords at {path}: {names}")
+    expected_type = schema.get("type")
+    if expected_type is not None:
+        if type(expected_type) is not str or expected_type not in _SCHEMA_TYPES:
+            raise ValueError(f"unsupported schema type at {path}")
+    properties = schema.get("properties")
+    if properties is not None:
+        if not isinstance(properties, Mapping):
+            raise ValueError(f"schema properties must be an object at {path}")
+        for name, child in properties.items():
+            if type(name) is not str or not isinstance(child, Mapping):
+                raise ValueError(f"invalid schema property at {path}")
+            _validate_schema_definition(child, f"{path}.{name}")
+    required = schema.get("required")
+    if required is not None and (
+        type(required) is not list or any(type(name) is not str for name in required)
+    ):
+        raise ValueError(f"schema required must be a string array at {path}")
+    additional = schema.get("additionalProperties")
+    if additional is not None and type(additional) is not bool:
+        raise ValueError(f"schema additionalProperties must be boolean at {path}")
+    items = schema.get("items")
+    if items is not None:
+        if not isinstance(items, Mapping):
+            raise ValueError(f"schema items must be an object at {path}")
+        _validate_schema_definition(items, f"{path}.items")
+    enum = schema.get("enum")
+    if enum is not None and type(enum) is not list:
+        raise ValueError(f"schema enum must be an array at {path}")
+    for key in (
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+    ):
+        value = schema.get(key)
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError(f"schema {key} must be a nonnegative integer at {path}")
+    for key in ("minimum", "exclusiveMinimum", "maximum"):
+        value = schema.get(key)
+        if value is not None and (type(value) not in {int, float} or type(value) is bool):
+            raise ValueError(f"schema {key} must be numeric at {path}")
+    if expected_type == "object" and schema.get("items") is not None:
+        raise ValueError(f"schema items is not valid for an object at {path}")
+    if expected_type != "object" and schema.get("properties") is not None:
+        raise ValueError(f"schema properties is only valid for an object at {path}")
+    if expected_type != "array" and schema.get("items") is not None:
+        raise ValueError(f"schema items is only valid for an array at {path}")
 
 
 def _signal_is_set(signal_state: object) -> bool:
@@ -505,6 +598,39 @@ def _signal_is_set(signal_state: object) -> bool:
     if callable(is_set):
         return bool(is_set())
     return bool(getattr(signal_state, "aborted", False))
+
+
+async def _wait_for_abort(signal_state: object) -> None:
+    if _signal_is_set(signal_state):
+        return
+    wait = getattr(signal_state, "wait", None)
+    if callable(wait):
+        result = wait()
+        if inspect.isawaitable(result):
+            await result
+        return
+    while not _signal_is_set(signal_state):
+        await asyncio.sleep(0.01)
+
+
+async def _kill_and_reap(
+    process: asyncio.subprocess.Process,
+    communication: asyncio.Task[tuple[bytes, bytes]],
+) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        process.kill()
+    while not communication.done():
+        try:
+            await asyncio.shield(communication)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    communication.result()
 
 
 def _canceled_result(call_id: str) -> ToolResult:
@@ -522,8 +648,7 @@ def _format_exec_result(
     output = f"stdout:\n{stdout.decode(errors='replace')}\nstderr:\n{stderr.decode(errors='replace')}"
     if suffix:
         output = f"{suffix}\n{output}"
-    output = _truncate(output, output_limit)
-    return f"exit_code: {returncode}\n{output}"
+    return _truncate(f"exit_code: {returncode}\n{output}", output_limit)
 
 
 def _truncate(value: str, limit: int) -> str:

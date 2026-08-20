@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from typing import Any, Protocol
+from collections.abc import AsyncIterator, Mapping, Sequence
 
 from .store import ConversationStore
-from .tools import ToolRegistry
+from .tools import ToolHandler, ToolRegistry
 from .types import (
     CompletionBackend,
     ContentBlock,
@@ -25,36 +23,6 @@ from .types import (
     ToolSchema,
     ToolUseContent,
 )
-
-
-class ToolExecutor(Protocol):
-    async def execute(self, tool_call: ToolCall) -> ToolResult:
-        """Execute one call and return its durable result."""
-
-
-ToolHandler = Callable[
-    [dict[str, Any]], str | ToolResult | Awaitable[str | ToolResult]
-]
-
-
-class DictToolExecutor:
-    def __init__(self, handlers: Mapping[str, ToolHandler]) -> None:
-        self.handlers = dict(handlers)
-
-    async def execute(self, tool_call: ToolCall) -> ToolResult:
-        handler = self.handlers[tool_call.name]
-        result = handler(tool_call.arguments)
-        if inspect.isawaitable(result):
-            result = await result
-        if isinstance(result, ToolResult):
-            return result
-        if isinstance(result, str):
-            return ToolResult(tool_call.id, result)
-        return ToolResult(
-            tool_call.id,
-            "invalid tool handler result: expected str or ToolResult",
-            is_error=True,
-        )
 
 
 async def _close_completion(
@@ -101,7 +69,7 @@ class AgentLoop:
         backend: CompletionBackend,
         store: ConversationStore,
         *,
-        tools: Mapping[str, ToolHandler] | ToolExecutor | ToolRegistry | None = None,
+        tools: Mapping[str, ToolHandler] | ToolRegistry | None = None,
         registry: ToolRegistry | None = None,
         tool_schemas: Sequence[ToolSchema] | None = None,
         max_turns: int = 10,
@@ -143,16 +111,10 @@ class AgentLoop:
         elif tools is None:
             self.tool_registry = ToolRegistry(store.cwd)
         else:
-            self.tool_registry = None
-        self.tool_executor = (
-            self.tool_registry
-            if self.tool_registry is not None
-            else (DictToolExecutor(tools) if isinstance(tools, Mapping) else tools)
-        )
+            raise TypeError("tools must be a mapping or ToolRegistry")
         self.tool_schemas = list(
             tool_schemas
-            if tool_schemas is not None
-            else (self.tool_registry.schemas if self.tool_registry is not None else [])
+            if tool_schemas is not None else self.tool_registry.schemas
         )
         self.max_turns = max_turns
 
@@ -279,9 +241,7 @@ class AgentLoop:
                     tool_call=tool_call,
                 )
                 try:
-                    if self.tool_executor is None:
-                        raise KeyError(f"no executor for tool {tool_call.name}")
-                    result = await self.tool_executor.execute(tool_call)
+                    result = await self.tool_registry.execute(tool_call)
                 except Exception as exc:
                     result = ToolResult(tool_call.id, str(exc), is_error=True)
                 result = _validated_tool_result(result, tool_call.id)

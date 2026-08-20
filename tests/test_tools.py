@@ -1,4 +1,6 @@
 import asyncio
+import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -7,7 +9,23 @@ from zeta.fake import FakeBackend, ScriptedTurn
 from zeta.loop import AgentLoop
 from zeta.store import ConversationStore
 from zeta.tools import ToolAbortSignal, ToolRegistry
-from zeta.types import MessageRole, TextContent, ToolCall
+from zeta.types import MessageRole, TextContent, ToolCall, ToolResult
+
+
+def _python_command(source: str) -> str:
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}"
+
+
+def _descendant_command(marker: Path, delay: float = 0.3) -> str:
+    child = (
+        "import pathlib,time; "
+        f"time.sleep({delay}); pathlib.Path({str(marker)!r}).write_text('alive')"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(5)"
+    )
+    return _python_command(parent)
 
 
 @pytest.mark.asyncio
@@ -36,6 +54,26 @@ async def test_registry_validates_arguments_before_running_handler(tmp_path: Pat
     assert result.is_error
     assert "invalid arguments" in result.content
     assert not called
+
+
+def test_registry_rejects_unsupported_schema_constructs(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+
+    with pytest.raises(ValueError, match="unsupported schema type"):
+        registry.register(
+            "union",
+            lambda arguments: "ran",
+            parameters={"type": ["string", "null"]},
+        )
+    with pytest.raises(ValueError, match="unsupported schema keywords"):
+        registry.register(
+            "alternative",
+            lambda arguments: "ran",
+            parameters={
+                "type": "string",
+                "anyOf": [{"minLength": 2}],
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -91,6 +129,86 @@ async def test_builtin_tools_read_list_and_exec_use_session_cwd(tmp_path: Path) 
     assert "nested/note.txt" in list_result.content
     assert str(tmp_path) in exec_result.content
     assert "not a sandbox" in registry.schemas[2]["description"]
+
+
+@pytest.mark.asyncio
+async def test_exec_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
+    marker = tmp_path / "timeout-child-alive"
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "exec-timeout",
+            "exec",
+            {"command": _descendant_command(marker), "timeout": 0.05},
+        )
+    )
+    await asyncio.sleep(0.4)
+
+    assert result.is_error
+    assert "command timed out" in result.content
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_exec_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> None:
+    marker = tmp_path / "cancel-child-alive"
+    registry = ToolRegistry(tmp_path)
+    task = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "exec-cancel",
+                "exec",
+                {"command": _descendant_command(marker), "timeout": 5},
+            )
+        )
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.4)
+
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_exec_abort_kills_process_group_and_returns_canceled_result(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "abort-child-alive"
+    abort_signal = ToolAbortSignal()
+    registry = ToolRegistry(tmp_path, abort_signal=abort_signal)
+    task = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "exec-abort",
+                "exec",
+                {"command": _descendant_command(marker), "timeout": 5},
+            )
+        )
+    )
+    await asyncio.sleep(0.05)
+    abort_signal.abort()
+
+    result = await asyncio.wait_for(task, timeout=0.5)
+    await asyncio.sleep(0.4)
+
+    assert result == ToolResult("exec-abort", "tool execution canceled", True)
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_exec_output_cap_includes_final_content_boundary(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("exec-cap", "exec", {"command": "printf 1234567890", "max_output": 5})
+    )
+
+    assert not result.is_error
+    assert len(result.content) == 5
 
 
 @pytest.mark.asyncio
@@ -209,3 +327,46 @@ async def test_agent_loop_executes_tool_calls_through_registry(tmp_path: Path) -
     assert result_message.tool_result.content == "from registry"
     assert events[-1].type.value == "agent_end"
     assert backend.calls[0][1][0]["name"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_mapping_tools_still_validate_through_registry(
+    tmp_path: Path,
+) -> None:
+    called = False
+
+    def typed(arguments: dict[str, object]) -> str:
+        nonlocal called
+        called = True
+        return "ran"
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("call-1", "typed", {"count": "bad"})]),
+            ScriptedTurn(content=[TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    schema = {
+        "name": "typed",
+        "parameters": {
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"],
+        },
+    }
+
+    [
+        event
+        async for event in AgentLoop(
+            backend,
+            store,
+            tools={"typed": typed},
+            tool_schemas=[schema],
+        ).run_turn("go")
+    ]
+
+    result = store.messages()[2].tool_result
+    assert result is not None and result.is_error
+    assert "invalid arguments" in result.content
+    assert not called
