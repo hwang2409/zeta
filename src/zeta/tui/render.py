@@ -23,19 +23,18 @@ from ..types import (
 )
 from .theme import (
     ACCENT,
-    ACCENT_DIM,
-    ASSISTANT_BODY,
+    BODY,
     CHROME,
     CODE_BG,
+    DIM,
     ERROR,
     OK,
-    THINKING,
-    TOOL_RESULT,
 )
 
 
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
+SPINNER_FRAMES = ("·", "•", "●", "•")
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -49,11 +48,6 @@ def _arguments(arguments: dict[str, Any]) -> str:
     return _truncate(encoded, MAX_ARGUMENTS)
 
 
-def _result_summary(value: str) -> str:
-    first_line = value.strip().splitlines()[0] if value.strip() else "empty"
-    return _truncate(first_line, MAX_RESULT)
-
-
 def render_markdown(value: str) -> RenderableType:
     """Render assistant text with Rich markdown and fenced-code highlighting."""
 
@@ -62,7 +56,7 @@ def render_markdown(value: str) -> RenderableType:
         code_theme="monokai",
         hyperlinks=False,
         inline_code_theme="monokai",
-        style=ASSISTANT_BODY,
+        style=BODY,
     )
 
 
@@ -139,7 +133,7 @@ class MarkdownStream:
         header = self._table_cells(lines[0])
         if header is None:
             return render_lines()
-        table = Table(show_header=True, header_style="bold")
+        table = Table(show_header=True, header_style=ACCENT)
         for cell in header:
             table.add_column(cell)
         for line in lines[separator_index + 1 :]:
@@ -156,7 +150,7 @@ class MarkdownStream:
             self.language = language.strip() or "text"
             self.fence_char = char
             self.fence_length = length
-            return [Text(line, style="dim")]
+            return [Text(line, style=DIM)]
         if self.table_lines is not None:
             if self._table_cells(line) is not None:
                 self.table_lines.append(line)
@@ -178,7 +172,7 @@ class MarkdownStream:
                 and fence[1] >= self.fence_length
                 and not fence[2].strip()
             ):
-                result: list[RenderableType] = [Text(line, style="dim")]
+                result: list[RenderableType] = [Text(line, style=DIM)]
                 self.language = None
                 self.fence_char = None
                 self.fence_length = 0
@@ -202,18 +196,25 @@ def render_event(event: StreamEvent) -> RenderableType | None:
 
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
         return Text.assemble(
-            ("▸ ", ACCENT_DIM),
+            ("▸ ", CHROME),
             (event.tool_call.name, ACCENT),
             (f"({_arguments(event.tool_call.arguments)})", CHROME),
         )
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:
         style = ERROR if event.tool_result.is_error else OK
         marker = "[tool error]" if event.tool_result.is_error else "[tool result]"
-        return Text.assemble(
-            ("  ↳ ", TOOL_RESULT),
-            (f"{marker} ", style),
-            (_result_summary(event.tool_result.content), TOOL_RESULT),
-        )
+        lines = event.tool_result.content.split("\n")
+        if not event.tool_result.content:
+            lines = ["empty"]
+        rendered = Text()
+        for index, line in enumerate(lines):
+            if index:
+                rendered.append("\n")
+            rendered.append("  ↳ ", style=DIM)
+            if index == 0:
+                rendered.append(f"{marker} ", style=style)
+            rendered.append(_truncate(line, MAX_RESULT), style=DIM)
+        return rendered
     if event.type is StreamEventType.ERROR:
         message = event.error.message if event.error else "unknown error"
         return Text(f"[error] {message}", style=ERROR)
@@ -224,9 +225,9 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         return Text(f"[turn {turn}]", style=CHROME)
     if event.type is StreamEventType.MESSAGE_UPDATE:
         if isinstance(event.content, ThinkingContent):
-            return Text(f"[thinking] {event.content.text}", style=THINKING)
+            return Text(f"[thinking] {event.content.text}", style=DIM)
         if isinstance(event.content, RedactedThinkingContent):
-            return Text("[thinking] redacted", style=THINKING)
+            return Text("[thinking] redacted", style=DIM)
         if isinstance(event.content, ToolUseContent):
             return None
         if isinstance(event.content, TextContent) or event.delta is not None:
@@ -245,31 +246,51 @@ def format_status(
     token_count: int | None = None,
     retained_tail: int | None = None,
     streaming: bool = False,
+    width: int | None = None,
+    spinner_frame: int = 0,
 ) -> Text:
     """Format the persistent status line shown beneath the composer."""
 
     usage = usage or {}
     input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
     output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
-    usage_text = ""
-    if token_count is not None:
-        usage_text = f"tokens {token_count}"
-    elif input_tokens is not None or output_tokens is not None:
-        usage_text = f"tokens in={input_tokens or 0} out={output_tokens or 0}"
-
-    if session_id is None and retained_tail is None and token_count is None:
-        line = f" {provider}/{model}  {loop_state}"
-        if usage_text:
-            line += f"  {usage_text}"
+    if input_tokens is not None and output_tokens is not None:
+        token_text = f"tok {input_tokens}/{output_tokens}"
+    elif usage.get("total_tokens") is not None:
+        token_text = f"tok {usage['total_tokens']}"
+    elif token_count is not None:
+        token_text = f"tok ~{token_count}"
     else:
-        session_text = session_id or "--------"
-        tail_text = f"tail {retained_tail}" if retained_tail is not None else "tail ?"
-        line = (
-            f" session {session_text}  |  {provider}/{model}  |  "
-            f"{usage_text or 'tokens ?'}  |  {tail_text}  |  mode {loop_state}"
-        )
-        if streaming:
-            line += "  •"
+        token_text = "tok ?"
+
+    if (
+        session_id is None
+        and retained_tail is None
+        and token_count is None
+        and width is None
+        and not streaming
+    ):
+        line = f" {provider}/{model}  {loop_state}"
+        if input_tokens is not None or output_tokens is not None:
+            line += f"  tokens in={input_tokens or 0} out={output_tokens or 0}"
+        if partial:
+            line += f"  |  {partial}"
+        return Text(line, style=CHROME)
+
+    session_text = f"s:{(session_id or '')[:5]}" if session_id else "s:?"
+    tail_text = f"tail {retained_tail}" if retained_tail is not None else "tail ?"
+    segments = [f"mode {loop_state}", token_text]
+    if streaming:
+        segments.append(SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)])
+    optional = [f"{provider}/{model}", session_text, tail_text]
+    separator = "  |  " if (width or 0) >= 160 else " | "
+    for candidate in optional:
+        proposed = separator.join([*segments, candidate])
+        if width is None or len(proposed) <= max(1, width):
+            segments.append(candidate)
     if partial:
-        line += f"  |  {partial}"
-    return Text(line, style=ACCENT_DIM)
+        partial_text = _truncate(partial.replace("\n", " "), 32)
+        proposed = separator.join([*segments, partial_text])
+        if width is None or len(proposed) <= max(1, width):
+            segments.append(partial_text)
+    return Text(separator.join(segments), style=CHROME)

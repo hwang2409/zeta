@@ -30,7 +30,7 @@ from zeta.tui.render import (
     render_event,
     render_markdown,
 )
-from zeta.tui.theme import ACCENT, ASSISTANT_BODY, CODE_BG
+from zeta.tui.theme import ACCENT, BODY, CODE_BG
 from zeta.types import (
     CompletionBackend,
     ErrorInfo,
@@ -229,7 +229,20 @@ def test_render_event_compacts_tool_call_and_result() -> None:
 
     assert start is not None and start.plain.startswith("▸ read(")
     assert "README.md" in start.plain
-    assert result is not None and result.plain == "  ↳ [tool result] first line"
+    assert result is not None
+    assert result.plain == "  ↳ [tool result] first line\n  ↳ second line"
+
+
+def test_render_event_preserves_multiline_tool_result_formatting() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_result=ToolResult("call-1", "first\n\n  third"),
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.plain == "  ↳ [tool result] first\n  ↳ \n  ↳   third"
 
 
 def test_render_helpers_use_the_zeta_palette() -> None:
@@ -242,7 +255,7 @@ def test_render_helpers_use_the_zeta_palette() -> None:
         )
     )
 
-    assert markdown.style == ASSISTANT_BODY
+    assert markdown.style == BODY
     assert code.background_color == CODE_BG
     assert start is not None
     assert any(span.style == ACCENT for span in start.spans)
@@ -547,16 +560,108 @@ def test_status_bar_includes_session_context_and_streaming_indicator() -> None:
         "codex",
         "gpt-5.4",
         "streaming",
-        session_id="01234567",
+        {"input_tokens": 5, "output_tokens": 121},
+        session_id="abc12345",
         token_count=42,
         retained_tail=8,
         streaming=True,
+        width=120,
+        spinner_frame=1,
     )
 
-    assert status.plain == (
-        " session 01234567  |  codex/gpt-5.4  |  tokens 42  |  "
-        "tail 8  |  mode streaming  •"
+    assert len(status.plain) <= 120
+    assert "mode streaming" in status.plain
+    assert "tok 5/121" in status.plain
+    assert "codex/gpt-5.4" in status.plain
+    assert "s:abc12" in status.plain
+    assert "tail 8" in status.plain
+
+
+def test_status_bar_fits_segments_and_pulses() -> None:
+    statuses = [
+        format_status(
+            "codex",
+            "gpt-5.4",
+            "streaming",
+            {"input_tokens": 5, "output_tokens": 121},
+            session_id="abc12345",
+            retained_tail=8,
+            streaming=True,
+            width=width,
+            spinner_frame=frame,
+        )
+        for width, frame in ((80, 0), (120, 1), (200, 2))
+    ]
+
+    assert all(len(status.plain) <= width for status, width in zip(statuses, (80, 120, 200)))
+    assert all("mode streaming" in status.plain and "tok 5/121" in status.plain for status in statuses)
+    assert all(marker in statuses[index].plain for index, marker in enumerate(("·", "•", "●")))
+    assert all(value in statuses[1].plain for value in ("codex/gpt-5.4", "s:abc12", "tail 8"))
+    assert all(value in statuses[2].plain for value in ("codex/gpt-5.4", "s:abc12", "tail 8"))
+    assert "  |  " in statuses[2].plain
+
+    narrow = format_status(
+        "provider-with-a-long-name",
+        "model-with-a-long-name-that-does-not-fit",
+        "streaming",
+        {"input_tokens": 5, "output_tokens": 121},
+        session_id="abcdef1234567890",
+        retained_tail=8,
+        streaming=True,
+        width=80,
     )
+    assert len(narrow.plain) <= 80
+    assert "mode streaming" in narrow.plain
+    assert "tok 5/121" in narrow.plain
+
+    cleared = format_status(
+        "codex",
+        "gpt-5.4",
+        "idle",
+        session_id="abc12345",
+        retained_tail=8,
+        streaming=False,
+        width=80,
+    )
+    assert not any(marker in cleared.plain for marker in ("·", "•", "●"))
+
+
+def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+        ),
+        provider="fake",
+        model="offline",
+    )
+    app._update_usage(
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            data={"usage": {"input_tokens": 5, "output_tokens": 121}},
+        )
+    )
+
+    toolbar = app._status_toolbar()
+    plain = "".join(value for _, value in toolbar)
+    assert "tok 5/121" in plain
+
+
+@pytest.mark.asyncio
+async def test_spinner_pulses_on_timer(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._streaming = True
+    task = asyncio.create_task(app._pulse_spinner())
+    await asyncio.sleep(0.45)
+    app._streaming = False
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert app._spinner_frame >= 2
 
 
 @pytest.mark.asyncio
