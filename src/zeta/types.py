@@ -20,6 +20,7 @@ class MessageRole(StrEnum):
 class ContentType(StrEnum):
     TEXT = "text"
     THINKING = "thinking"
+    REDACTED_THINKING = "redacted_thinking"
     TOOL_USE = "tool_use"
 
 
@@ -38,13 +39,29 @@ class TextContent:
 @dataclass(frozen=True, slots=True)
 class ThinkingContent:
     text: str
+    signature: str | None = None
 
     @property
     def type(self) -> ContentType:
         return ContentType.THINKING
 
     def to_dict(self) -> dict[str, Any]:
-        return {"type": self.type.value, "text": self.text}
+        result: dict[str, Any] = {"type": self.type.value, "text": self.text}
+        if self.signature is not None:
+            result["signature"] = self.signature
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class RedactedThinkingContent:
+    data: str
+
+    @property
+    def type(self) -> ContentType:
+        return ContentType.REDACTED_THINKING
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"type": self.type.value, "data": self.data}
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,9 +103,10 @@ class ToolUseContent:
         return {"type": self.type.value, "tool_call": self.tool_call.to_dict()}
 
 
-ContentBlock = TextContent | ThinkingContent | ToolUseContent
+ContentBlock = TextContent | ThinkingContent | RedactedThinkingContent | ToolUseContent
 TextBlock = TextContent
 ThinkingBlock = ThinkingContent
+RedactedThinkingBlock = RedactedThinkingContent
 ToolUseBlock = ToolUseContent
 
 
@@ -106,7 +124,15 @@ def content_from_dict(value: Mapping[str, Any]) -> ContentBlock:
         text = value.get("text")
         if type(text) is not str:
             raise ValueError("thinking content text must be a string")
-        return ThinkingContent(text)
+        signature = value.get("signature")
+        if signature is not None and type(signature) is not str:
+            raise ValueError("thinking content signature must be a string")
+        return ThinkingContent(text, signature)
+    if content_type is ContentType.REDACTED_THINKING:
+        data = value.get("data")
+        if type(data) is not str or not data:
+            raise ValueError("redacted thinking data must be a nonempty string")
+        return RedactedThinkingContent(data)
     tool_call = value.get("tool_call")
     if type(tool_call) is not dict:
         raise ValueError("tool-use content tool_call must be an object")

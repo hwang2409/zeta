@@ -18,6 +18,7 @@ from .types import (
     StreamEvent,
     StreamEventType,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolSchema,
@@ -238,8 +239,14 @@ class AgentLoop:
     ) -> None:
         if assistant_message is not None:
             self.store.append_message(assistant_message)
-        elif partial_blocks:
-            self.store.append_message(Message(MessageRole.ASSISTANT, partial_blocks))
+        else:
+            durable_blocks = [
+                block
+                for block in partial_blocks
+                if not isinstance(block, ThinkingContent) or block.signature
+            ]
+            if durable_blocks:
+                self.store.append_message(Message(MessageRole.ASSISTANT, durable_blocks))
 
     def _persist_partial_for_control(
         self,
