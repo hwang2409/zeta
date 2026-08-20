@@ -96,20 +96,23 @@ def test_registry_rejects_unsupported_schema_constructs(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_paths_outside_session_cwd_are_allowed(tmp_path: Path) -> None:
-    outside = tmp_path.parent / "zeta-outside.txt"
+    session_cwd = tmp_path / "session"
+    session_cwd.mkdir()
+    outside = tmp_path / "zeta-outside.txt"
     outside.write_text("outside", encoding="utf-8")
-    outside_dir = tmp_path.parent / "zeta-outside-dir"
+    outside_dir = tmp_path / "zeta-outside-dir"
     outside_dir.mkdir()
     (outside_dir / "nested.txt").write_text("nested", encoding="utf-8")
-    link = tmp_path / "outside-link"
+    link = session_cwd / "outside-link"
     link.symlink_to(outside)
-    dir_link = tmp_path / "outside-dir-link"
+    dir_link = session_cwd / "outside-dir-link"
     dir_link.symlink_to(outside_dir, target_is_directory=True)
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(session_cwd)
 
     absolute_result = await registry.execute(
         ToolCall("read-1", "read", {"path": str(outside)})
     )
+    # See ZETA-P2 for the underlying list-cap fragility this rewrite works around.
     parent_result = await registry.execute(
         ToolCall("list-1", "list", {"path": "../", "depth": 1})
     )
