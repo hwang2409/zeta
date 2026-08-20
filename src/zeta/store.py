@@ -15,7 +15,7 @@ from typing import Any, Iterator, Mapping
 
 import fcntl
 
-from .types import Message, ToolCall
+from .types import Message, ToolCall, ToolUseContent
 
 
 SCHEMA = "zeta.conversation.v1"
@@ -111,6 +111,7 @@ class ConversationStore:
         self.lock_path = self.session_dir / ".lock"
         self.cwd = str(cwd or Path.cwd())
         self._entries: list[ConversationEntry] = []
+        self._local_approval_requests: set[str] = set()
         with self._append_lock():
             self._load()
 
@@ -398,11 +399,13 @@ class ConversationStore:
     ) -> ConversationEntry:
         if type(request_id) is not str or not request_id:
             raise ValueError("approval request id must be a nonempty string")
-        return self._append_row(
+        entry = self._append_row(
             "approval_request",
             {"request_id": request_id, "tool_call": tool_call.to_dict()},
             parent_id,
         )
+        self._local_approval_requests.add(request_id)
+        return entry
 
     def ensure_approval_request(
         self,
@@ -421,6 +424,7 @@ class ConversationStore:
             states = self._approval_states_from_branch(branch)
             existing = states.get(request_id)
             if existing is not None:
+                self._local_approval_requests.add(request_id)
                 if existing[0] != tool_call:
                     raise ConversationIntegrityError(
                         f"approval request tool call mismatch: {request_id}"
@@ -439,6 +443,7 @@ class ConversationStore:
                 {"request_id": request_id, "tool_call": tool_call.to_dict()},
                 parent_id,
             )
+            self._local_approval_requests.add(request_id)
             return self._snapshot_entry(entry)
 
     def append_approval_resolution(
@@ -485,10 +490,37 @@ class ConversationStore:
         decision: str,
         parent_id: str | None = None,
     ) -> ConversationEntry | None:
-        states = self._approval_states_from_branch(self.replay())
+        branch = self.replay()
+        states = self._approval_states_from_branch(branch)
         state = states.get(request_id)
         if state is None or state[1] is not None:
             return None
+        request_entry = next(
+            (
+                entry
+                for entry in branch
+                if entry.type == "approval_request"
+                and entry.data["request_id"] == request_id
+            ),
+            None,
+        )
+        if request_entry is None:
+            return None
+        active_ids = {entry.id for entry in branch}
+        resolved_parent = parent_id or branch[-1].id
+        if resolved_parent not in active_ids:
+            raise ConversationIntegrityError(
+                f"approval resolution parent is not on the active branch: {resolved_parent}"
+            )
+        by_id = {entry.id: entry for entry in branch}
+        if resolved_parent != request_entry.id and not self._is_ancestor(
+            request_entry.id,
+            resolved_parent,
+            by_id,
+        ):
+            raise ConversationIntegrityError(
+                f"approval resolution parent is not descended from request: {request_id}"
+            )
         return self._append_row_unlocked(
             "approval_resolution",
             {"request_id": request_id, "decision": decision},
@@ -500,7 +532,45 @@ class ConversationStore:
 
         with self._append_lock():
             self._load()
-            return self._approval_states_from_branch(self.replay())
+            return self._reconcile_approval_states_unlocked()
+
+    def _reconcile_approval_states_unlocked(
+        self,
+    ) -> dict[str, tuple[ToolCall, str | None]]:
+        branch = self.replay()
+        states = self._approval_states_from_branch(branch)
+        anchored_calls: set[str] = set()
+        completed_calls: set[str] = set()
+        for entry in branch:
+            if entry.type != "message":
+                continue
+            message = Message.from_dict(entry.data["message"])
+            anchored_calls.update(
+                block.tool_call.id
+                for block in message.content
+                if isinstance(block, ToolUseContent)
+            )
+            if message.tool_result is not None:
+                completed_calls.add(message.tool_result.tool_call_id)
+        repaired = False
+        for request_id, (_, decision) in states.items():
+            if decision is None and (
+                request_id in completed_calls
+                or (
+                    request_id not in self._local_approval_requests
+                    and request_id not in anchored_calls
+                )
+            ):
+                self._append_row_unlocked(
+                    "approval_resolution",
+                    {"request_id": request_id, "decision": "abort"},
+                )
+                repaired = True
+        return (
+            self._approval_states_from_branch(self.replay())
+            if repaired
+            else states
+        )
 
     @staticmethod
     def _approval_states_from_branch(

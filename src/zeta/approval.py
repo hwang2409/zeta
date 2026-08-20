@@ -73,6 +73,14 @@ class ApprovalPolicy:
     def deny(self, request_id: str) -> bool:
         return self.resolve(request_id, ApprovalDecision.DENY)
 
+    def abort(self, request_id: str) -> bool:
+        store = self._require_store()
+        return store.resolve_approval(request_id, "abort")
+
+    def durable_decision(self, request_id: str) -> str | None:
+        state = self._require_store().approval_states().get(request_id)
+        return None if state is None else state[1]
+
     def resolve(self, request_id: str, decision: ApprovalDecision | str) -> bool:
         resolved = _decision(decision)
         if resolved is ApprovalDecision.ASK:
@@ -121,9 +129,7 @@ class ApprovalPolicy:
                     return ApprovalDecision.DENY
                 return None
             if abort_signal.is_set():
-                if state is not None and state[1] is None:
-                    store.resolve_approval(tool_call.id, "abort")
-                return None
+                return self._resolve_abort_or_winner(tool_call.id)
             abort_task = asyncio.create_task(abort_signal.wait())
             poll_task = asyncio.create_task(asyncio.sleep(0.05))
             try:
@@ -140,10 +146,22 @@ class ApprovalPolicy:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
             if abort_task in done:
-                state = store.approval_states().get(tool_call.id)
-                if state is not None and state[1] is None:
-                    store.resolve_approval(tool_call.id, "abort")
-                return None
+                return self._resolve_abort_or_winner(tool_call.id)
+
+    def _resolve_abort_or_winner(
+        self,
+        request_id: str,
+    ) -> ApprovalDecision | None:
+        store = self._require_store()
+        store.resolve_approval(request_id, "abort")
+        decision = store.approval_states().get(request_id)
+        if decision is None:
+            return None
+        if decision[1] == ApprovalDecision.ALLOW.value:
+            return ApprovalDecision.ALLOW
+        if decision[1] == ApprovalDecision.DENY.value:
+            return ApprovalDecision.DENY
+        return None
 
     def _require_store(self) -> ConversationStore:
         if self._store is None:

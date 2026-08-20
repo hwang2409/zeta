@@ -251,8 +251,18 @@ class ToolRegistry:
             self.approval_policy.bind_store(store)
 
     def prepare_approval(self, tool_call: ToolCall) -> None:
-        if self.approval_policy is not None:
-            self.approval_policy.prepare(tool_call)
+        if self.approval_policy is None:
+            return
+        definition = self._tools.get(tool_call.name)
+        if definition is None:
+            self._abort_approval(tool_call)
+            return
+        try:
+            _validate_arguments(tool_call.arguments, definition.parameters)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            self._abort_approval(tool_call)
+            return
+        self.approval_policy.prepare(tool_call)
 
     async def execute(
         self,
@@ -262,15 +272,19 @@ class ToolRegistry:
     ) -> ToolResult:
         signal_state = abort_signal or self.abort_signal
         if _signal_is_set(signal_state):
+            self._abort_approval(tool_call)
             return _canceled_result(tool_call.id)
         definition = self._tools.get(tool_call.name)
         if definition is None:
+            self._abort_approval(tool_call)
             return ToolResult(tool_call.id, f"unknown tool: {tool_call.name}", True)
         try:
             arguments = _validate_arguments(tool_call.arguments, definition.parameters)
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            self._abort_approval(tool_call)
             return ToolResult(tool_call.id, f"invalid arguments: {exc}", True)
         if _signal_is_set(signal_state):
+            self._abort_approval(tool_call)
             return _canceled_result(tool_call.id)
         gate_result = await self._run_pre_execute_gate(
             tool_call,
@@ -279,7 +293,7 @@ class ToolRegistry:
         )
         if gate_result is not None:
             return gate_result
-        if _signal_is_set(signal_state):
+        if _signal_is_set(signal_state) and not self._approval_survives_abort(tool_call):
             return _canceled_result(tool_call.id)
         try:
             result = await _invoke_handler(definition.handler, arguments, signal_state)
@@ -321,8 +335,14 @@ class ToolRegistry:
                 )
             except Exception as exc:
                 return ToolResult(tool_call.id, f"approval failed: {exc}", True)
-            if decision is None or _signal_is_set(signal_state):
+            if decision is None:
                 return _canceled_result(tool_call.id)
+            if _signal_is_set(signal_state):
+                durable_decision = self.approval_policy.durable_decision(tool_call.id)
+                if durable_decision == ApprovalDecision.DENY.value:
+                    return ToolResult(tool_call.id, "tool execution denied", True)
+                if durable_decision != ApprovalDecision.ALLOW.value:
+                    return _canceled_result(tool_call.id)
             if decision is ApprovalDecision.DENY:
                 return ToolResult(tool_call.id, "tool execution denied", True)
         if self.pre_execute_hook is None:
@@ -335,7 +355,25 @@ class ToolRegistry:
             return ToolResult(tool_call.id, f"pre-execution hook failed: {exc}", True)
         if allowed is False:
             return ToolResult(tool_call.id, "tool execution denied", True)
+        if _signal_is_set(signal_state) and not self._approval_survives_abort(tool_call):
+            return _canceled_result(tool_call.id)
         return None
+
+    def _abort_approval(self, tool_call: ToolCall) -> None:
+        if self.approval_policy is None:
+            return
+        try:
+            self.approval_policy.abort(tool_call.id)
+        except RuntimeError:
+            pass
+
+    def _approval_survives_abort(self, tool_call: ToolCall) -> bool:
+        if self.approval_policy is None:
+            return False
+        return self.approval_policy.durable_decision(tool_call.id) in {
+            ApprovalDecision.ALLOW.value,
+            ApprovalDecision.DENY.value,
+        }
 
     async def execute_many(
         self,
@@ -351,6 +389,7 @@ class ToolRegistry:
         while index < len(tool_calls):
             if _signal_is_set(signal_state):
                 for remaining in range(index, len(tool_calls)):
+                    self._abort_approval(tool_calls[remaining])
                     results[remaining] = _canceled_result(tool_calls[remaining].id)
                 break
             definition = self._tools.get(tool_calls[index].name)

@@ -8,8 +8,8 @@ import pytest
 from zeta.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from zeta.fake import FakeBackend, ScriptedTurn
 from zeta.loop import AgentLoop
-from zeta.store import ConversationStore
-from zeta.tools import ToolRegistry
+from zeta.store import ConversationIntegrityError, ConversationStore
+from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.types import (
     Message,
     MessageRole,
@@ -50,6 +50,7 @@ async def test_durable_pending_request_is_re_emitted_and_resolves_after_restart(
 ) -> None:
     call = ToolCall("call-1", "echo", {"value": "approved"})
     store = ConversationStore(tmp_path, session_id="session")
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     first_policy = ApprovalPolicy(default="ask")
     first_registry = ToolRegistry(
         tmp_path,
@@ -104,6 +105,7 @@ async def test_ask_resolution_deny_returns_error_result(tmp_path: Path) -> None:
     )
     registry.register("echo", lambda arguments: "must not run")
     call = ToolCall("call-1", "echo", {})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     task = asyncio.create_task(registry.execute(call))
 
     for _ in range(20):
@@ -250,11 +252,142 @@ async def test_torn_request_write_does_not_leave_a_tool_call_or_start_event(
 
 
 @pytest.mark.asyncio
+async def test_request_without_anchor_is_repaired_after_restart(
+    approval_root: Path,
+) -> None:
+    call = ToolCall("orphan-call", "echo", {})
+    store = ConversationStore(approval_root, session_id="orphan-request")
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    policy = ApprovalPolicy(default="ask", store=store)
+    registry = ToolRegistry(approval_root, approval_policy=policy, register_builtin=False)
+    registry.register("echo", lambda arguments: "must not run")
+    original_append = store.append_message
+
+    def fail_tool_anchor(message: Message, *, parent_id: str | None = None):
+        if any(isinstance(block, ToolUseContent) for block in message.content):
+            raise RuntimeError("simulated crash after request")
+        return original_append(message, parent_id=parent_id)
+
+    store.append_message = fail_tool_anchor  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="after request"):
+        async for _ in AgentLoop(
+            backend,
+            store,
+            registry=registry,
+            approval_policy=policy,
+        ).run_turn("start"):
+            pass
+
+    restarted = ConversationStore(approval_root, session_id=store.session_id)
+    restarted_policy = ApprovalPolicy(default="ask", store=restarted)
+    assert restarted_policy.pending_requests() == []
+    assert restarted.approval_states()[call.id][1] == "abort"
+
+
+def test_resolution_rejects_a_parent_outside_the_request_ancestry(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="invalid-resolution-parent")
+    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    request = store.append_approval_request(
+        "call-1",
+        ToolCall("call-1", "echo", {}),
+        parent_id=root.id,
+    )
+
+    with pytest.raises(ConversationIntegrityError, match="parent"):
+        store.append_approval_resolution(
+            request.data["request_id"],
+            "allow",
+            parent_id=root.id,
+        )
+
+    reopened = ConversationStore(approval_root, session_id=store.session_id)
+    assert not any(
+        entry.type == "approval_resolution" for entry in reopened.entries
+    )
+
+
+@pytest.mark.asyncio
+async def test_early_exit_paths_close_pending_requests(approval_root: Path) -> None:
+    cases = ("unknown", "invalid", "pre-aborted")
+    for case in cases:
+        store = ConversationStore(approval_root, session_id=f"early-{case}")
+        policy = ApprovalPolicy(default="ask", store=store)
+        call = ToolCall(f"{case}-call", "echo", {})
+        policy.prepare(call)
+        signal = ToolAbortSignal()
+        registry = ToolRegistry(
+            approval_root,
+            approval_policy=policy,
+            approval_store=store,
+            abort_signal=signal,
+            register_builtin=False,
+        )
+        if case == "invalid":
+            registry.register(
+                "echo",
+                lambda arguments: "must not run",
+                parameters={
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+            )
+        if case == "pre-aborted":
+            signal.abort()
+
+        result = await registry.execute(call)
+
+        assert result.is_error
+        assert policy.pending_requests() == []
+        assert store.approval_states()[call.id][1] == "abort"
+
+
+@pytest.mark.asyncio
+async def test_abort_race_honors_an_approval_that_wins_atomically(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="abort-race")
+    call = ToolCall("race-call", "echo", {})
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
+    )
+    policy = ApprovalPolicy(default="ask", store=store)
+    policy.prepare(call)
+    signal = ToolAbortSignal()
+    registry = ToolRegistry(
+        approval_root,
+        approval_policy=policy,
+        approval_store=store,
+        abort_signal=signal,
+        register_builtin=False,
+    )
+    registry.register("echo", lambda arguments: "ran")
+    original_resolve = store.resolve_approval
+
+    def approve_when_abort_resolves(request_id: str, decision: str) -> bool:
+        if decision == "abort":
+            assert original_resolve(request_id, "allow")
+            return False
+        return original_resolve(request_id, decision)
+
+    store.resolve_approval = approve_when_abort_resolves  # type: ignore[method-assign]
+    task = asyncio.create_task(registry.execute(call))
+    await asyncio.sleep(0.06)
+    signal.abort()
+
+    assert await asyncio.wait_for(task, timeout=1) == ToolResult(call.id, "ran")
+    assert store.approval_states()[call.id][1] == "allow"
+
+
+@pytest.mark.asyncio
 async def test_pending_request_wins_over_policy_change_after_restart(
     approval_root: Path,
 ) -> None:
     call = ToolCall("call-1", "echo", {})
     first_store = ConversationStore(approval_root, session_id="session")
+    first_store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
     ApprovalPolicy(default="ask", store=first_store).prepare(call)
 
     restarted_store = ConversationStore(approval_root, session_id="session")
