@@ -476,17 +476,16 @@ class ConversationStore:
                 if parent_id is not None
                 else (current_branch[-1].id if current_branch else None)
             )
-            current_ids = {entry.id for entry in current_branch}
-            branch = (
-                current_branch
-                if resolved_parent in current_ids
-                else self._branch_to_parent(resolved_parent)
+            branch = self._branch_to_parent(resolved_parent)
+            active_child = next(
+                (
+                    entry
+                    for entry in current_branch
+                    if entry.type == "message" and entry.parent_id == resolved_parent
+                ),
+                None,
             )
-            target_entries = [
-                entry
-                for entry in branch
-                if entry.type == "message" and entry.parent_id == resolved_parent
-            ]
+            target_entries = [active_child] if request_data and active_child else []
             if request_data:
                 for entry in target_entries:
                     if entry.data == data:

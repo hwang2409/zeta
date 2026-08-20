@@ -16,7 +16,7 @@ ApprovalHook = Callable[[str, dict[str, Any]], bool | Awaitable[bool] | None]
 AdvanceGeneration = Callable[[AbortSignal], AbortSignal]
 
 
-def _canceled_result(tool_call_id: str) -> ToolResult:
+def canceled_result(tool_call_id: str) -> ToolResult:
     return ToolResult(tool_call_id, "tool execution canceled", True)
 
 
@@ -41,21 +41,21 @@ class ApprovalGate:
             except Exception as exc:
                 return ToolResult(tool_call.id, f"approval failed: {exc}", True), execution_signal
             if decision is None:
-                return _canceled_result(tool_call.id), execution_signal
+                return canceled_result(tool_call.id), execution_signal
             if signal.is_set():
                 durable_decision = self.policy.durable_decision(tool_call.id)
                 if durable_decision == ApprovalDecision.DENY.value:
                     return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
                 if durable_decision != ApprovalDecision.ALLOW.value:
-                    return _canceled_result(tool_call.id), execution_signal
+                    return canceled_result(tool_call.id), execution_signal
                 execution_signal = advance_generation(signal)
                 if execution_signal.is_set():
-                    return _canceled_result(tool_call.id), execution_signal
+                    return canceled_result(tool_call.id), execution_signal
             if decision is ApprovalDecision.DENY:
                 return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
         if self.hook is None:
             if signal.is_set() and execution_signal is signal:
-                return _canceled_result(tool_call.id), execution_signal
+                return canceled_result(tool_call.id), execution_signal
             return None, execution_signal
         try:
             allowed = self.hook(tool_call.name, arguments)
@@ -66,5 +66,5 @@ class ApprovalGate:
         if allowed is False:
             return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
         if signal.is_set() and execution_signal is signal:
-            return _canceled_result(tool_call.id), execution_signal
+            return canceled_result(tool_call.id), execution_signal
         return None, execution_signal

@@ -627,6 +627,43 @@ async def test_execute_many_pre_aborted_approved_calls_share_one_abort_generatio
 
 
 @pytest.mark.asyncio
+async def test_execute_many_pending_parallel_approval_abort_wakes_every_waiter(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="parallel-pending-abort")
+    calls = [
+        ToolCall("pending-parallel-a", "echo", {}),
+        ToolCall("pending-parallel-b", "echo", {}),
+    ]
+    policy = ApprovalPolicy(default="ask", store=store)
+    registry = ToolRegistry(
+        approval_root,
+        approval_policy=policy,
+        approval_store=store,
+        register_builtin=False,
+    )
+    registry.register("echo", lambda arguments: "must not run", parallel_safe=True)
+
+    task = asyncio.create_task(registry.execute_many(calls))
+    for _ in range(100):
+        if {request.request_id for request in policy.pending_requests()} == {
+            call.id for call in calls
+        }:
+            break
+        await asyncio.sleep(0.01)
+    assert {request.request_id for request in policy.pending_requests()} == {
+        call.id for call in calls
+    }
+
+    registry.abort()
+
+    assert await asyncio.wait_for(task, timeout=1) == [
+        ToolResult(call.id, "tool execution canceled", True) for call in calls
+    ]
+    assert policy.pending_requests() == []
+
+
+@pytest.mark.asyncio
 async def test_pending_request_wins_over_policy_change_after_restart(
     approval_root: Path,
 ) -> None:
@@ -740,6 +777,36 @@ def test_append_uses_the_target_parent_branch(
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)
     assert set(reopened.approval_states()) == {call_a.id, call_b.id}
+
+
+def test_append_target_parent_ignores_active_child_requests(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="approval-active-ancestor")
+    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    call = ToolCall("active-ancestor-call", "echo", {})
+    target = store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("target")]),
+        parent_id=root.id,
+    )
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+        parent_id=target.id,
+    )
+
+    sibling = store.append_message_with_approval_requests(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("retry"), ToolUseContent(call)],
+        ),
+        [(call.id, call)],
+        parent_id=target.id,
+    )
+
+    assert sibling.data["approval_requests"]
+    reopened = ConversationStore(approval_root, session_id=store.session_id)
+    assert set(reopened.approval_states()) == {call.id}
 
 
 def test_abandoned_exact_sibling_is_not_deduped(

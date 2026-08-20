@@ -17,7 +17,7 @@ from typing import Any
 
 from .abort import AbortGenerationRegistry, AbortSignal as ToolAbortSignal
 from .approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
-from .gate import ApprovalGate
+from .gate import ApprovalGate, canceled_result as _canceled_result
 from .store import ConversationStore
 from .types import ToolCall, ToolResult, ToolSchema
 
@@ -253,8 +253,15 @@ class ToolRegistry:
         *,
         abort_signal: ToolAbortSignal | None = None,
         _scope_signal: ToolAbortSignal | None = None,
+        _boundary_signal: ToolAbortSignal | None = None,
     ) -> ToolResult:
         signal_state = abort_signal or self.abort_signal
+        if _boundary_signal is not None and _signal_is_set(_boundary_signal):
+            signal_state, abort_result = self._arbitrate_abort(
+                tool_call, _boundary_signal, _scope_signal
+            )
+            if abort_result is not None:
+                return abort_result
         if _signal_is_set(signal_state):
             signal_state, abort_result = self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
@@ -359,8 +366,9 @@ class ToolRegistry:
     ) -> list[ToolResult]:
         """Execute calls with safe contiguous groups in parallel, preserving order."""
 
-        inherited_signal = abort_signal or self.abort_signal
-        scope_signal = inherited_signal
+        parent_signal = abort_signal or self.abort_signal
+        boundary_signal = parent_signal if _signal_is_set(parent_signal) else None
+        scope_signal = parent_signal
         if abort_signal is None:
             scope_signal = self._abort_registry.new_generation()
             self.abort_signal = scope_signal
@@ -371,8 +379,9 @@ class ToolRegistry:
             if definition is None or not definition.parallel_safe:
                 results[index] = await self.execute(
                     tool_calls[index],
-                    abort_signal=inherited_signal,
+                    abort_signal=scope_signal,
                     _scope_signal=scope_signal,
+                    _boundary_signal=boundary_signal,
                 )
                 index += 1
                 continue
@@ -386,8 +395,9 @@ class ToolRegistry:
                 *(
                     self.execute(
                         call,
-                        abort_signal=inherited_signal,
+                        abort_signal=scope_signal,
                         _scope_signal=scope_signal,
+                        _boundary_signal=boundary_signal,
                     )
                     for call in tool_calls[index:end]
                 )
@@ -885,24 +895,12 @@ def _validate_schema_definition(schema: Mapping[str, Any], path: str) -> None:
         raise ValueError(f"schema items is only valid for an array at {path}")
 
 
-def _signal_is_set(signal_state: object) -> bool:
-    is_set = getattr(signal_state, "is_set", None)
-    if callable(is_set):
-        return bool(is_set())
-    return bool(getattr(signal_state, "aborted", False))
+def _signal_is_set(signal_state: ToolAbortSignal) -> bool:
+    return signal_state.is_set()
 
 
-async def _wait_for_abort(signal_state: object) -> None:
-    if _signal_is_set(signal_state):
-        return
-    wait = getattr(signal_state, "wait", None)
-    if callable(wait):
-        result = wait()
-        if inspect.isawaitable(result):
-            await result
-        return
-    while not _signal_is_set(signal_state):
-        await asyncio.sleep(0.01)
+async def _wait_for_abort(signal_state: ToolAbortSignal) -> None:
+    await signal_state.wait()
 
 
 async def _drain_stream(stream: object, capture: _BoundedOutput) -> None:
@@ -936,10 +934,6 @@ async def _kill_and_reap(
                     current.uncancel()
         if not task.cancelled():
             task.exception()
-
-
-def _canceled_result(call_id: str) -> ToolResult:
-    return ToolResult(call_id, "tool execution canceled", True)
 
 
 def _format_exec_result(
