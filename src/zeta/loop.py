@@ -203,9 +203,15 @@ class AgentLoop:
                 for block in assistant_message.content
                 if isinstance(block, ToolUseContent)
             ]
+            approval_requests: list[tuple[str, ToolCall]] = []
             for tool_call in calls:
-                self.tool_registry.prepare_approval(tool_call)
-            self.store.append_message(assistant_message)
+                request = self.tool_registry.prepare_approval(tool_call)
+                if request is not None:
+                    approval_requests.append((request.request_id, request.tool_call))
+            self.store.append_message_with_approval_requests(
+                assistant_message,
+                approval_requests,
+            )
             if not calls:
                 yield StreamEvent(
                     StreamEventType.TURN_END,

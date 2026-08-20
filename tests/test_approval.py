@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -50,7 +51,10 @@ async def test_durable_pending_request_is_re_emitted_and_resolves_after_restart(
 ) -> None:
     call = ToolCall("call-1", "echo", {"value": "approved"})
     store = ConversationStore(tmp_path, session_id="session")
-    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
     first_policy = ApprovalPolicy(default="ask")
     first_registry = ToolRegistry(
         tmp_path,
@@ -76,7 +80,8 @@ async def test_durable_pending_request_is_re_emitted_and_resolves_after_restart(
     pending = restarted_policy.pending_requests()
 
     assert pending == [ApprovalRequest(call.id, call)]
-    assert [entry.type for entry in restarted_store.entries][-1] == "approval_request"
+    assert restarted_store.entries[-1].type == "message"
+    assert restarted_store.entries[-1].data["approval_requests"]
 
     assert restarted_policy.approve(call.id)
     restarted_registry = ToolRegistry(
@@ -105,7 +110,10 @@ async def test_ask_resolution_deny_returns_error_result(tmp_path: Path) -> None:
     )
     registry.register("echo", lambda arguments: "must not run")
     call = ToolCall("call-1", "echo", {})
-    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
     task = asyncio.create_task(registry.execute(call))
 
     for _ in range(20):
@@ -224,7 +232,9 @@ async def test_torn_request_write_does_not_leave_a_tool_call_or_start_event(
     original_write = store._write_line
 
     def torn_write(row: dict[str, object]) -> None:
-        if row.get("type") == "approval_request":
+        if row.get("type") == "message" and row.get("data", {}).get(
+            "approval_requests"
+        ):
             with store.path.open("ab") as handle:
                 handle.write(b'{"seq":2,"id":"torn"')
                 handle.flush()
@@ -251,45 +261,12 @@ async def test_torn_request_write_does_not_leave_a_tool_call_or_start_event(
     assert ApprovalPolicy(default="ask", store=restarted).pending_requests() == []
 
 
-@pytest.mark.asyncio
-async def test_request_without_anchor_is_repaired_after_restart(
-    approval_root: Path,
-) -> None:
-    call = ToolCall("orphan-call", "echo", {})
-    store = ConversationStore(approval_root, session_id="orphan-request")
-    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
-    policy = ApprovalPolicy(default="ask", store=store)
-    registry = ToolRegistry(approval_root, approval_policy=policy, register_builtin=False)
-    registry.register("echo", lambda arguments: "must not run")
-    original_append = store.append_message
-
-    def fail_tool_anchor(message: Message, *, parent_id: str | None = None):
-        if any(isinstance(block, ToolUseContent) for block in message.content):
-            raise RuntimeError("simulated crash after request")
-        return original_append(message, parent_id=parent_id)
-
-    store.append_message = fail_tool_anchor  # type: ignore[method-assign]
-    with pytest.raises(RuntimeError, match="after request"):
-        async for _ in AgentLoop(
-            backend,
-            store,
-            registry=registry,
-            approval_policy=policy,
-        ).run_turn("start"):
-            pass
-
-    restarted = ConversationStore(approval_root, session_id=store.session_id)
-    restarted_policy = ApprovalPolicy(default="ask", store=restarted)
-    assert restarted_policy.pending_requests() == []
-    assert restarted.approval_states()[call.id][1] == "abort"
-
-
 def test_resolution_rejects_a_parent_outside_the_request_ancestry(
     approval_root: Path,
 ) -> None:
     store = ConversationStore(approval_root, session_id="invalid-resolution-parent")
     root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
-    request = store.append_approval_request(
+    store.append_approval_request(
         "call-1",
         ToolCall("call-1", "echo", {}),
         parent_id=root.id,
@@ -297,7 +274,7 @@ def test_resolution_rejects_a_parent_outside_the_request_ancestry(
 
     with pytest.raises(ConversationIntegrityError, match="parent"):
         store.append_approval_resolution(
-            request.data["request_id"],
+            "call-1",
             "allow",
             parent_id=root.id,
         )
@@ -308,6 +285,39 @@ def test_resolution_rejects_a_parent_outside_the_request_ancestry(
     )
 
 
+def test_two_stores_do_not_abort_a_request_before_atomic_anchor_append(
+    approval_root: Path,
+) -> None:
+    store_a = ConversationStore(approval_root, session_id="cross-store-race")
+    store_b = ConversationStore(approval_root, session_id="cross-store-race")
+    root = store_a.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    call = ToolCall("cross-store-call", "echo", {})
+    original_append = store_a.append_message_with_approval_requests
+    started = Event()
+    release = Event()
+
+    def delayed_append(*args: object, **kwargs: object):
+        started.set()
+        assert release.wait(timeout=1)
+        return original_append(*args, **kwargs)
+
+    store_a.append_message_with_approval_requests = delayed_append  # type: ignore[method-assign]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        append_task = executor.submit(
+            store_a.append_message_with_approval_requests,
+            Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+            [(call.id, call)],
+            parent_id=root.id,
+        )
+        assert started.wait(timeout=1)
+        assert not store_b.resolve_approval(call.id, "abort")
+        release.set()
+        append_task.result(timeout=1)
+
+    assert store_a.approval_states() == store_b.approval_states()
+    assert store_a.approval_states()[call.id] == (call, None)
+
+
 @pytest.mark.asyncio
 async def test_early_exit_paths_close_pending_requests(approval_root: Path) -> None:
     cases = ("unknown", "invalid", "pre-aborted")
@@ -315,7 +325,10 @@ async def test_early_exit_paths_close_pending_requests(approval_root: Path) -> N
         store = ConversationStore(approval_root, session_id=f"early-{case}")
         policy = ApprovalPolicy(default="ask", store=store)
         call = ToolCall(f"{case}-call", "echo", {})
-        policy.prepare(call)
+        store.append_message_with_approval_requests(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+            [(call.id, call)],
+        )
         signal = ToolAbortSignal()
         registry = ToolRegistry(
             approval_root,
@@ -350,11 +363,11 @@ async def test_abort_race_honors_an_approval_that_wins_atomically(
 ) -> None:
     store = ConversationStore(approval_root, session_id="abort-race")
     call = ToolCall("race-call", "echo", {})
-    store.append_message(
-        Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
     )
     policy = ApprovalPolicy(default="ask", store=store)
-    policy.prepare(call)
     signal = ToolAbortSignal()
     registry = ToolRegistry(
         approval_root,
@@ -363,7 +376,14 @@ async def test_abort_race_honors_an_approval_that_wins_atomically(
         abort_signal=signal,
         register_builtin=False,
     )
-    registry.register("echo", lambda arguments: "ran")
+    executed: list[str] = []
+
+    async def echo(arguments: dict[str, object], abort_signal: ToolAbortSignal) -> str:
+        assert not abort_signal.is_set()
+        executed.append("ran")
+        return "ran"
+
+    registry.register("echo", echo)
     original_resolve = store.resolve_approval
 
     def approve_when_abort_resolves(request_id: str, decision: str) -> bool:
@@ -379,6 +399,7 @@ async def test_abort_race_honors_an_approval_that_wins_atomically(
 
     assert await asyncio.wait_for(task, timeout=1) == ToolResult(call.id, "ran")
     assert store.approval_states()[call.id][1] == "allow"
+    assert executed == ["ran"]
 
 
 @pytest.mark.asyncio
@@ -387,8 +408,10 @@ async def test_pending_request_wins_over_policy_change_after_restart(
 ) -> None:
     call = ToolCall("call-1", "echo", {})
     first_store = ConversationStore(approval_root, session_id="session")
-    first_store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
-    ApprovalPolicy(default="ask", store=first_store).prepare(call)
+    first_store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
 
     restarted_store = ConversationStore(approval_root, session_id="session")
     changed_policy = ApprovalPolicy(always_allow={"echo"}, store=restarted_store)
@@ -430,7 +453,10 @@ def test_concurrent_approval_resolution_has_one_winner(approval_root: Path) -> N
     call = ToolCall("call-1", "echo", {})
     store = ConversationStore(approval_root)
     policy = ApprovalPolicy(default="ask", store=store)
-    policy.prepare(call)
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(

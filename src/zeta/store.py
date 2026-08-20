@@ -11,11 +11,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 import fcntl
 
-from .types import Message, ToolCall, ToolUseContent
+from .types import Message, MessageRole, ToolCall, ToolUseContent
 
 
 SCHEMA = "zeta.conversation.v1"
@@ -111,7 +111,6 @@ class ConversationStore:
         self.lock_path = self.session_dir / ".lock"
         self.cwd = str(cwd or Path.cwd())
         self._entries: list[ConversationEntry] = []
-        self._local_approval_requests: set[str] = set()
         with self._append_lock():
             self._load()
 
@@ -234,14 +233,23 @@ class ConversationStore:
                 raise ConversationIntegrityError(
                     f"missing prior parent {entry.parent_id} for {entry.id}"
                 )
-            if entry.type == "approval_request":
-                request_id = entry.data.get("request_id")
-                if type(request_id) is str and request_id:
-                    if request_id in approval_requests:
-                        raise ConversationIntegrityError(
-                            f"duplicate approval request: {request_id}"
-                        )
-                    approval_requests[request_id] = entry
+            if entry.type == "message":
+                requests = entry.data.get("approval_requests", [])
+                if type(requests) is list:
+                    for request in requests:
+                        if type(request) is not dict:
+                            continue
+                        request_id = request.get("request_id")
+                        if type(request_id) is str and request_id:
+                            if request_id in approval_requests:
+                                raise ConversationIntegrityError(
+                                    f"duplicate approval request: {request_id}"
+                                )
+                            approval_requests[request_id] = entry
+            elif entry.type == "approval_request":
+                raise ConversationIntegrityError(
+                    "standalone approval requests are not supported"
+                )
             elif entry.type == "approval_resolution":
                 request_id = entry.data.get("request_id")
                 request = (
@@ -285,7 +293,41 @@ class ConversationStore:
                 message = entry.data.get("message")
                 if type(message) is not dict:
                     raise ValueError("message entry payload must contain an object")
-                Message.from_dict(message)
+                parsed_message = Message.from_dict(message)
+                approval_requests = entry.data.get("approval_requests", [])
+                if type(approval_requests) is not list:
+                    raise ValueError("message approval_requests must be an array")
+                request_ids: set[str] = set()
+                for request in approval_requests:
+                    if type(request) is not dict:
+                        raise ValueError("message approval request must be an object")
+                    request_id = request.get("request_id")
+                    tool_call = request.get("tool_call")
+                    if type(request_id) is not str or not request_id:
+                        raise ValueError(
+                            "approval request id must be a nonempty string"
+                        )
+                    if request_id in request_ids:
+                        raise ValueError(f"duplicate approval request: {request_id}")
+                    request_ids.add(request_id)
+                    if type(tool_call) is not dict:
+                        raise ValueError(
+                            "approval request tool_call must be an object"
+                        )
+                    parsed_tool_call = ToolCall.from_dict(tool_call)
+                    anchored_call = next(
+                        (
+                            block.tool_call
+                            for block in parsed_message.content
+                            if isinstance(block, ToolUseContent)
+                            and block.tool_call.id == parsed_tool_call.id
+                        ),
+                        None,
+                    )
+                    if anchored_call != parsed_tool_call:
+                        raise ValueError(
+                            "approval request must match an anchored tool call"
+                        )
             elif entry.type == "compaction":
                 summary = entry.data.get("summary")
                 source_start = entry.data.get("source_seq_start")
@@ -297,14 +339,6 @@ class ConversationStore:
             elif entry.type == "warning":
                 if type(entry.data.get("message")) is not str:
                     raise ValueError("warning message must be a string")
-            elif entry.type == "approval_request":
-                request_id = entry.data.get("request_id")
-                tool_call = entry.data.get("tool_call")
-                if type(request_id) is not str or not request_id:
-                    raise ValueError("approval request id must be a nonempty string")
-                if type(tool_call) is not dict:
-                    raise ValueError("approval request tool_call must be an object")
-                ToolCall.from_dict(tool_call)
             elif entry.type == "approval_resolution":
                 request_id = entry.data.get("request_id")
                 decision = entry.data.get("decision")
@@ -390,6 +424,42 @@ class ConversationStore:
             parent_id,
         )
 
+    def append_message_with_approval_requests(
+        self,
+        message: Message,
+        approval_requests: Iterable[tuple[str, ToolCall]] = (),
+        *,
+        parent_id: str | None = None,
+    ) -> ConversationEntry:
+        request_data: list[dict[str, Any]] = []
+        request_ids: set[str] = set()
+        anchored_calls = {
+            block.tool_call.id: block.tool_call
+            for block in message.content
+            if isinstance(block, ToolUseContent)
+        }
+        for request_id, tool_call in approval_requests:
+            if type(request_id) is not str or not request_id:
+                raise ValueError("approval request id must be a nonempty string")
+            normalized_tool_call = ToolCall.from_dict(tool_call.to_dict())
+            if request_id in request_ids:
+                raise ValueError(f"duplicate approval request: {request_id}")
+            if anchored_calls.get(request_id) != normalized_tool_call:
+                raise ValueError(
+                    "approval request must match an anchored tool call"
+                )
+            request_ids.add(request_id)
+            request_data.append(
+                {
+                    "request_id": request_id,
+                    "tool_call": normalized_tool_call.to_dict(),
+                }
+            )
+        data: dict[str, Any] = {"message": message.to_dict()}
+        if request_data:
+            data["approval_requests"] = request_data
+        return self._append_row("message", data, parent_id)
+
     def append_approval_request(
         self,
         request_id: str,
@@ -397,54 +467,11 @@ class ConversationStore:
         *,
         parent_id: str | None = None,
     ) -> ConversationEntry:
-        if type(request_id) is not str or not request_id:
-            raise ValueError("approval request id must be a nonempty string")
-        entry = self._append_row(
-            "approval_request",
-            {"request_id": request_id, "tool_call": tool_call.to_dict()},
-            parent_id,
+        return self.append_message_with_approval_requests(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
+            [(request_id, tool_call)],
+            parent_id=parent_id,
         )
-        self._local_approval_requests.add(request_id)
-        return entry
-
-    def ensure_approval_request(
-        self,
-        request_id: str,
-        tool_call: ToolCall,
-        *,
-        parent_id: str | None = None,
-    ) -> ConversationEntry:
-        """Append a request once if it is absent from the active branch."""
-
-        if type(request_id) is not str or not request_id:
-            raise ValueError("approval request id must be a nonempty string")
-        with self._append_lock():
-            self._load()
-            branch = self.replay()
-            states = self._approval_states_from_branch(branch)
-            existing = states.get(request_id)
-            if existing is not None:
-                self._local_approval_requests.add(request_id)
-                if existing[0] != tool_call:
-                    raise ConversationIntegrityError(
-                        f"approval request tool call mismatch: {request_id}"
-                    )
-                for entry in branch:
-                    if (
-                        entry.type == "approval_request"
-                        and entry.data["request_id"] == request_id
-                    ):
-                        return self._snapshot_entry(entry)
-                raise ConversationIntegrityError(
-                    f"approval request is not present on active branch: {request_id}"
-                )
-            entry = self._append_row_unlocked(
-                "approval_request",
-                {"request_id": request_id, "tool_call": tool_call.to_dict()},
-                parent_id,
-            )
-            self._local_approval_requests.add(request_id)
-            return self._snapshot_entry(entry)
 
     def append_approval_resolution(
         self,
@@ -495,15 +522,7 @@ class ConversationStore:
         state = states.get(request_id)
         if state is None or state[1] is not None:
             return None
-        request_entry = next(
-            (
-                entry
-                for entry in branch
-                if entry.type == "approval_request"
-                and entry.data["request_id"] == request_id
-            ),
-            None,
-        )
+        request_entry = self._request_entry(branch, request_id)
         if request_entry is None:
             return None
         active_ids = {entry.id for entry in branch}
@@ -532,45 +551,19 @@ class ConversationStore:
 
         with self._append_lock():
             self._load()
-            return self._reconcile_approval_states_unlocked()
+            return self._approval_states_from_branch(self.replay())
 
-    def _reconcile_approval_states_unlocked(
-        self,
-    ) -> dict[str, tuple[ToolCall, str | None]]:
-        branch = self.replay()
-        states = self._approval_states_from_branch(branch)
-        anchored_calls: set[str] = set()
-        completed_calls: set[str] = set()
+    @staticmethod
+    def _request_entry(
+        branch: list[ConversationEntry],
+        request_id: str,
+    ) -> ConversationEntry | None:
         for entry in branch:
-            if entry.type != "message":
-                continue
-            message = Message.from_dict(entry.data["message"])
-            anchored_calls.update(
-                block.tool_call.id
-                for block in message.content
-                if isinstance(block, ToolUseContent)
-            )
-            if message.tool_result is not None:
-                completed_calls.add(message.tool_result.tool_call_id)
-        repaired = False
-        for request_id, (_, decision) in states.items():
-            if decision is None and (
-                request_id in completed_calls
-                or (
-                    request_id not in self._local_approval_requests
-                    and request_id not in anchored_calls
-                )
-            ):
-                self._append_row_unlocked(
-                    "approval_resolution",
-                    {"request_id": request_id, "decision": "abort"},
-                )
-                repaired = True
-        return (
-            self._approval_states_from_branch(self.replay())
-            if repaired
-            else states
-        )
+            if entry.type == "message":
+                for request in entry.data.get("approval_requests", []):
+                    if request["request_id"] == request_id:
+                        return entry
+        return None
 
     @staticmethod
     def _approval_states_from_branch(
@@ -578,12 +571,14 @@ class ConversationStore:
     ) -> dict[str, tuple[ToolCall, str | None]]:
         states: dict[str, tuple[ToolCall, str | None]] = {}
         for entry in branch:
-            if entry.type == "approval_request":
-                request_id = entry.data["request_id"]
-                states[request_id] = (
-                    ToolCall.from_dict(entry.data["tool_call"]),
-                    None,
-                )
+            if entry.type == "message":
+                requests = entry.data.get("approval_requests", [])
+                for request in requests:
+                    request_id = request["request_id"]
+                    states[request_id] = (
+                        ToolCall.from_dict(request["tool_call"]),
+                        None,
+                    )
             elif entry.type == "approval_resolution":
                 request_id = entry.data["request_id"]
                 if request_id in states:

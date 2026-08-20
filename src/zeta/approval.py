@@ -8,7 +8,7 @@ from enum import StrEnum
 from typing import Iterable, Protocol
 
 from .store import ConversationStore
-from .types import ToolCall
+from .types import Message, MessageRole, ToolCall, ToolUseContent
 
 
 class ApprovalDecision(StrEnum):
@@ -77,6 +77,18 @@ class ApprovalPolicy:
         store = self._require_store()
         return store.resolve_approval(request_id, "abort")
 
+    def abort_or_winner(self, request_id: str) -> ApprovalDecision | None:
+        store = self._require_store()
+        store.resolve_approval(request_id, "abort")
+        state = store.approval_states().get(request_id)
+        if state is None:
+            return None
+        if state[1] == ApprovalDecision.ALLOW.value:
+            return ApprovalDecision.ALLOW
+        if state[1] == ApprovalDecision.DENY.value:
+            return ApprovalDecision.DENY
+        return None
+
     def durable_decision(self, request_id: str) -> str | None:
         state = self._require_store().approval_states().get(request_id)
         return None if state is None else state[1]
@@ -88,17 +100,18 @@ class ApprovalPolicy:
         store = self._require_store()
         return store.resolve_approval(request_id, resolved.value)
 
-    def prepare(self, tool_call: ToolCall) -> None:
-        """Persist an ask request before the tool call becomes executable."""
+    def prepare(self, tool_call: ToolCall) -> ApprovalRequest | None:
+        """Build an ask request for atomic persistence with its assistant anchor."""
 
         store = self._require_store()
         state = store.approval_states().get(tool_call.id)
         if state is not None:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
-            return
+            return None
         if self.decide(tool_call.name, tool_call.arguments) is ApprovalDecision.ASK:
-            store.ensure_approval_request(tool_call.id, tool_call)
+            return ApprovalRequest(tool_call.id, tool_call)
+        return None
 
     async def authorize(
         self,
@@ -118,7 +131,10 @@ class ApprovalPolicy:
             decision = self.decide(tool_call.name, tool_call.arguments)
             if decision is not ApprovalDecision.ASK:
                 return decision
-            store.ensure_approval_request(tool_call.id, tool_call)
+            store.append_message_with_approval_requests(
+                Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
+                [(tool_call.id, tool_call)],
+            )
 
         while True:
             state = store.approval_states().get(tool_call.id)
@@ -152,16 +168,7 @@ class ApprovalPolicy:
         self,
         request_id: str,
     ) -> ApprovalDecision | None:
-        store = self._require_store()
-        store.resolve_approval(request_id, "abort")
-        decision = store.approval_states().get(request_id)
-        if decision is None:
-            return None
-        if decision[1] == ApprovalDecision.ALLOW.value:
-            return ApprovalDecision.ALLOW
-        if decision[1] == ApprovalDecision.DENY.value:
-            return ApprovalDecision.DENY
-        return None
+        return self.abort_or_winner(request_id)
 
     def _require_store(self) -> ConversationStore:
         if self._store is None:

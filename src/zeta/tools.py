@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .approval import ApprovalDecision, ApprovalPolicy
+from .approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from .store import ConversationStore
 from .types import ToolCall, ToolResult, ToolSchema
 
@@ -166,9 +166,8 @@ class ToolRegistry:
         self.pre_execute_hook = pre_execute_hook or hook
         self.abort_signal = abort_signal or ToolAbortSignal()
         self.approval_policy = approval_policy
-        self.approval_store = approval_store
-        if self.approval_policy is not None and self.approval_store is not None:
-            self.approval_policy.bind_store(self.approval_store)
+        if self.approval_policy is not None and approval_store is not None:
+            self.approval_policy.bind_store(approval_store)
         self.max_output_chars = max_output_chars
         self._tools: dict[str, ToolDefinition] = {}
         if register_builtin:
@@ -246,23 +245,22 @@ class ToolRegistry:
         self.abort_signal = ToolAbortSignal()
 
     def bind_approval_store(self, store: ConversationStore) -> None:
-        self.approval_store = store
         if self.approval_policy is not None:
             self.approval_policy.bind_store(store)
 
-    def prepare_approval(self, tool_call: ToolCall) -> None:
+    def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
-            return
+            return None
         definition = self._tools.get(tool_call.name)
         if definition is None:
             self._abort_approval(tool_call)
-            return
+            return None
         try:
             _validate_arguments(tool_call.arguments, definition.parameters)
         except (AttributeError, KeyError, TypeError, ValueError):
             self._abort_approval(tool_call)
-            return
-        self.approval_policy.prepare(tool_call)
+            return None
+        return self.approval_policy.prepare(tool_call)
 
     async def execute(
         self,
@@ -272,8 +270,9 @@ class ToolRegistry:
     ) -> ToolResult:
         signal_state = abort_signal or self.abort_signal
         if _signal_is_set(signal_state):
-            self._abort_approval(tool_call)
-            return _canceled_result(tool_call.id)
+            signal_state, abort_result = self._arbitrate_abort(tool_call, signal_state)
+            if abort_result is not None:
+                return abort_result
         definition = self._tools.get(tool_call.name)
         if definition is None:
             self._abort_approval(tool_call)
@@ -284,19 +283,22 @@ class ToolRegistry:
             self._abort_approval(tool_call)
             return ToolResult(tool_call.id, f"invalid arguments: {exc}", True)
         if _signal_is_set(signal_state):
-            self._abort_approval(tool_call)
-            return _canceled_result(tool_call.id)
-        gate_result = await self._run_pre_execute_gate(
+            signal_state, abort_result = self._arbitrate_abort(tool_call, signal_state)
+            if abort_result is not None:
+                return abort_result
+        gate_result, execution_signal = await self._run_pre_execute_gate(
             tool_call,
             arguments,
             signal_state,
         )
         if gate_result is not None:
             return gate_result
-        if _signal_is_set(signal_state) and not self._approval_survives_abort(tool_call):
-            return _canceled_result(tool_call.id)
         try:
-            result = await _invoke_handler(definition.handler, arguments, signal_state)
+            result = await _invoke_handler(
+                definition.handler,
+                arguments,
+                execution_signal,
+            )
         except _ToolCanceled:
             return _canceled_result(tool_call.id)
         except asyncio.CancelledError:
@@ -324,9 +326,10 @@ class ToolRegistry:
         tool_call: ToolCall,
         arguments: dict[str, Any],
         signal_state: ToolAbortSignal | asyncio.Event,
-    ) -> ToolResult | None:
+    ) -> tuple[ToolResult | None, ToolAbortSignal | asyncio.Event]:
         """Run approval and the user hook through one execution seam."""
 
+        execution_signal: ToolAbortSignal | asyncio.Event = signal_state
         if self.approval_policy is not None:
             try:
                 decision = await self.approval_policy.authorize(
@@ -334,46 +337,53 @@ class ToolRegistry:
                     signal_state,
                 )
             except Exception as exc:
-                return ToolResult(tool_call.id, f"approval failed: {exc}", True)
+                return ToolResult(tool_call.id, f"approval failed: {exc}", True), execution_signal
             if decision is None:
-                return _canceled_result(tool_call.id)
+                return _canceled_result(tool_call.id), execution_signal
             if _signal_is_set(signal_state):
                 durable_decision = self.approval_policy.durable_decision(tool_call.id)
                 if durable_decision == ApprovalDecision.DENY.value:
-                    return ToolResult(tool_call.id, "tool execution denied", True)
+                    return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
                 if durable_decision != ApprovalDecision.ALLOW.value:
-                    return _canceled_result(tool_call.id)
+                    return _canceled_result(tool_call.id), execution_signal
+                execution_signal = ToolAbortSignal()
             if decision is ApprovalDecision.DENY:
-                return ToolResult(tool_call.id, "tool execution denied", True)
+                return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
         if self.pre_execute_hook is None:
-            return None
+            if _signal_is_set(signal_state) and execution_signal is signal_state:
+                return _canceled_result(tool_call.id), execution_signal
+            return None, execution_signal
         try:
             allowed = self.pre_execute_hook(tool_call.name, arguments)
             if inspect.isawaitable(allowed):
                 allowed = await allowed
         except Exception as exc:
-            return ToolResult(tool_call.id, f"pre-execution hook failed: {exc}", True)
+            return ToolResult(tool_call.id, f"pre-execution hook failed: {exc}", True), execution_signal
         if allowed is False:
-            return ToolResult(tool_call.id, "tool execution denied", True)
-        if _signal_is_set(signal_state) and not self._approval_survives_abort(tool_call):
-            return _canceled_result(tool_call.id)
-        return None
+            return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
+        if _signal_is_set(signal_state) and execution_signal is signal_state:
+            return _canceled_result(tool_call.id), execution_signal
+        return None, execution_signal
 
-    def _abort_approval(self, tool_call: ToolCall) -> None:
+    def _abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
         if self.approval_policy is None:
-            return
+            return None
         try:
-            self.approval_policy.abort(tool_call.id)
+            return self.approval_policy.abort_or_winner(tool_call.id)
         except RuntimeError:
-            pass
+            return None
 
-    def _approval_survives_abort(self, tool_call: ToolCall) -> bool:
-        if self.approval_policy is None:
-            return False
-        return self.approval_policy.durable_decision(tool_call.id) in {
-            ApprovalDecision.ALLOW.value,
-            ApprovalDecision.DENY.value,
-        }
+    def _arbitrate_abort(
+        self,
+        tool_call: ToolCall,
+        signal_state: ToolAbortSignal | asyncio.Event,
+    ) -> tuple[ToolAbortSignal | asyncio.Event, ToolResult | None]:
+        winner = self._abort_approval(tool_call)
+        if winner is ApprovalDecision.ALLOW:
+            return ToolAbortSignal(), None
+        if winner is ApprovalDecision.DENY:
+            return signal_state, ToolResult(tool_call.id, "tool execution denied", True)
+        return signal_state, _canceled_result(tool_call.id)
 
     async def execute_many(
         self,
@@ -389,8 +399,18 @@ class ToolRegistry:
         while index < len(tool_calls):
             if _signal_is_set(signal_state):
                 for remaining in range(index, len(tool_calls)):
-                    self._abort_approval(tool_calls[remaining])
-                    results[remaining] = _canceled_result(tool_calls[remaining].id)
+                    execution_signal, abort_result = self._arbitrate_abort(
+                        tool_calls[remaining],
+                        signal_state,
+                    )
+                    results[remaining] = (
+                        abort_result
+                        if abort_result is not None
+                        else await self.execute(
+                            tool_calls[remaining],
+                            abort_signal=execution_signal,
+                        )
+                    )
                 break
             definition = self._tools.get(tool_calls[index].name)
             if definition is None or not definition.parallel_safe:
