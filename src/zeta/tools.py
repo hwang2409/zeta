@@ -46,6 +46,25 @@ class _ToolCanceled(Exception):
     pass
 
 
+class _BoundedOutput:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._data = bytearray()
+
+    @property
+    def data(self) -> bytes:
+        return bytes(self._data)
+
+    @property
+    def retained_bytes(self) -> int:
+        return len(self._data)
+
+    def append(self, chunk: bytes) -> None:
+        remaining = self.limit - len(self._data)
+        if remaining > 0:
+            self._data.extend(chunk[:remaining])
+
+
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
     name: str
@@ -58,8 +77,18 @@ class ToolDefinition:
         return {
             "name": self.name,
             "description": self.description,
-            "parameters": dict(self.parameters),
+            "parameters": copy.deepcopy(self.parameters),
         }
+
+
+def _copy_definition(definition: ToolDefinition) -> ToolDefinition:
+    return ToolDefinition(
+        name=definition.name,
+        description=definition.description,
+        parameters=copy.deepcopy(definition.parameters),
+        handler=definition.handler,
+        parallel_safe=definition.parallel_safe,
+    )
 
 
 class ToolRegistry:
@@ -99,11 +128,14 @@ class ToolRegistry:
 
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
-        return tuple(self._tools.values())
+        return tuple(_copy_definition(definition) for definition in self._tools.values())
 
     @property
     def definitions_by_name(self) -> Mapping[str, ToolDefinition]:
-        return self._tools
+        return {
+            name: _copy_definition(definition)
+            for name, definition in self._tools.items()
+        }
 
     def register(
         self,
@@ -136,7 +168,7 @@ class ToolRegistry:
             parallel_safe=parallel_safe,
         )
         self._tools[name] = definition
-        return definition
+        return _copy_definition(definition)
 
     register_tool = register
 
@@ -379,39 +411,61 @@ class ToolRegistry:
         except OSError as exc:
             raise ValueError(f"could not execute command: {exc}") from exc
 
-        communication = asyncio.create_task(process.communicate())
+        stdout_capture = _BoundedOutput(output_limit)
+        stderr_capture = _BoundedOutput(output_limit)
+        process_wait = asyncio.create_task(process.wait())
+        stdout_drain = asyncio.create_task(
+            _drain_stream(process.stdout, stdout_capture)
+        )
+        stderr_drain = asyncio.create_task(
+            _drain_stream(process.stderr, stderr_capture)
+        )
+        process_tasks = (process_wait, stdout_drain, stderr_drain)
         abort_wait = asyncio.create_task(_wait_for_abort(abort_signal))
         timeout_wait = asyncio.create_task(asyncio.sleep(timeout))
         try:
-            done, _ = await asyncio.wait(
-                {communication, abort_wait, timeout_wait},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if _signal_is_set(abort_signal):
-                await _kill_and_reap(process, communication)
-                raise _ToolCanceled()
-            if communication in done:
-                stdout, stderr = communication.result()
-                result = _format_exec_result(
-                    process.returncode, stdout, stderr, output_limit
+            pending: set[asyncio.Task[Any]] = {
+                *process_tasks,
+                abort_wait,
+                timeout_wait,
+            }
+            while True:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-                if process.returncode:
-                    raise ValueError(result)
-                return result
+                if _signal_is_set(abort_signal):
+                    await _kill_and_reap(process, process_tasks)
+                    raise _ToolCanceled()
+                if all(task.done() for task in process_tasks):
+                    process_wait.result()
+                    result = _format_exec_result(
+                        process.returncode,
+                        stdout_capture.data,
+                        stderr_capture.data,
+                        output_limit,
+                    )
+                    if process.returncode:
+                        raise ValueError(result)
+                    return result
+                if timeout_wait in done:
+                    break
 
-            await _kill_and_reap(process, communication)
-            stdout, stderr = communication.result()
+            await _kill_and_reap(process, process_tasks)
             raise ValueError(
                 _format_exec_result(
                     process.returncode,
-                    stdout,
-                    stderr,
+                    stdout_capture.data,
+                    stderr_capture.data,
                     output_limit,
                     suffix="command timed out",
                 )
             )
         except asyncio.CancelledError:
-            await _kill_and_reap(process, communication)
+            await _kill_and_reap(process, process_tasks)
+            raise
+        except BaseException:
+            await _kill_and_reap(process, process_tasks)
             raise
         finally:
             for waiter in (abort_wait, timeout_wait):
@@ -490,8 +544,20 @@ def _validate_json_data(value: Any, path: str) -> None:
 def _validate_arguments(arguments: object, schema: Mapping[str, Any]) -> dict[str, Any]:
     if type(arguments) is not dict:
         raise ValueError("arguments must be an object")
+    _validate_finite_numbers(arguments, "arguments")
     _validate_schema(arguments, schema, "arguments")
     return dict(arguments)
+
+
+def _validate_finite_numbers(value: Any, path: str) -> None:
+    if type(value) is float and not math.isfinite(value):
+        raise ValueError(f"{path} must contain only finite numbers")
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            _validate_finite_numbers(child, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            _validate_finite_numbers(child, f"{path}[{index}]")
 
 
 def _validate_schema(value: Any, schema: Mapping[str, Any], path: str) -> None:
@@ -671,9 +737,20 @@ async def _wait_for_abort(signal_state: object) -> None:
         await asyncio.sleep(0.01)
 
 
+async def _drain_stream(stream: object, capture: _BoundedOutput) -> None:
+    if stream is None:
+        return
+    read = getattr(stream, "read")
+    while True:
+        chunk = await read(65_536)
+        if not chunk:
+            return
+        capture.append(chunk)
+
+
 async def _kill_and_reap(
     process: asyncio.subprocess.Process,
-    communication: asyncio.Task[tuple[bytes, bytes]],
+    process_tasks: Sequence[asyncio.Task[Any]],
 ) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -681,14 +758,16 @@ async def _kill_and_reap(
         pass
     except OSError:
         process.kill()
-    while not communication.done():
-        try:
-            await asyncio.shield(communication)
-        except asyncio.CancelledError:
-            current = asyncio.current_task()
-            if current is not None:
-                current.uncancel()
-    communication.result()
+    for task in process_tasks:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+        if not task.cancelled():
+            task.exception()
 
 
 def _canceled_result(call_id: str) -> ToolResult:

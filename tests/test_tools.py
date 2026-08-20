@@ -150,6 +150,41 @@ async def test_builtin_tools_read_list_and_exec_use_session_cwd(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_exec_retains_only_bounded_output_from_large_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captures = []
+    real_capture = tools_module._BoundedOutput
+
+    class TrackingCapture(real_capture):
+        def __init__(self, limit: int) -> None:
+            super().__init__(limit)
+            captures.append(self)
+
+    monkeypatch.setattr(tools_module, "_BoundedOutput", TrackingCapture)
+    registry = ToolRegistry(tmp_path)
+    result = await registry.execute(
+        ToolCall(
+            "exec-large",
+            "exec",
+            {
+                "command": _python_command(
+                    "import sys; sys.stdout.write('x' * 2000000)"
+                ),
+                "max_output": 64,
+            },
+        )
+    )
+
+    assert not result.is_error
+    assert len(result.content) == 64
+    assert len(captures) == 2
+    assert all(capture.retained_bytes <= 64 for capture in captures)
+    assert sum(capture.retained_bytes for capture in captures) <= 128
+
+
+@pytest.mark.asyncio
 async def test_list_abort_returns_canceled_result_during_traversal(tmp_path: Path) -> None:
     for index in range(256):
         (tmp_path / f"file-{index:03d}.txt").write_text("x", encoding="utf-8")
@@ -276,6 +311,59 @@ async def test_exec_abort_wins_when_completion_and_abort_are_ready_together(
     )
 
     assert result == ToolResult("exec-race", "tool execution canceled", True)
+
+
+@pytest.mark.asyncio
+async def test_argument_finiteness_covers_undeclared_and_default_fields(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register(
+        "permissive",
+        lambda arguments: "ran",
+        parameters={"type": "object"},
+    )
+    registry.register("default", lambda arguments: "ran")
+
+    undeclared = await registry.execute(
+        ToolCall("undeclared", "permissive", {"extra": math.nan})
+    )
+    default = await registry.execute(
+        ToolCall("default", "default", {"extra": math.inf})
+    )
+
+    assert undeclared.is_error
+    assert default.is_error
+
+
+@pytest.mark.asyncio
+async def test_registered_schema_copies_cannot_disable_validation(tmp_path: Path) -> None:
+    called = False
+
+    def handler(arguments: dict[str, object]) -> str:
+        nonlocal called
+        called = True
+        return "ran"
+
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    definition = registry.register(
+        "typed",
+        handler,
+        parameters={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+        },
+    )
+    definition.parameters.clear()
+    registry.definitions_by_name["typed"].parameters["properties"].clear()
+    registry.schemas[0]["parameters"]["properties"].clear()
+
+    result = await registry.execute(ToolCall("typed", "typed", {}))
+
+    assert result.is_error
+    assert "required" in result.content
+    assert not called
 
 
 @pytest.mark.asyncio
