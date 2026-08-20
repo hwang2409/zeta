@@ -64,6 +64,9 @@ the harness-native distillation.
 | ZETA-6 | ContextAssembler + CompactionPolicy (budget, retained tail, summary completion, digest) | ZETA-2 or ZETA-3 |
 | ZETA-7 | Session resume (--continue/--resume), provider-transport recreation | ZETA-6 |
 | ZETA-8 | TUI: sticky composer, patch_stdout pump, status bar, commit-on-newline streaming | ZETA-2/3 |
+| ZETA-10 | `zeta login` CLI subcommand: wire existing PKCE OAuth machinery (build_authorization_url + exchange_authorization_code, both providers) into a CLI flow with a local redirect server; store tokens via AnthropicCredentialStore / CodexCredentialStore. Motivation: no login surface today; when both stored tokens revoke (session on another machine invalidates them), users have no in-harness recovery path. | ZETA-2/3 |
+| ZETA-11 | Refresh-on-401 in the completion path: when a completion raises AuthError from a 401, attempt a token refresh once and retry the completion; fail loudly on the second 401. Motivation: `access_token()` only refreshes on local expiry — server-side revocation (token invalidated by a Claude/ChatGPT re-login elsewhere) leaves the local file "valid" and the completion 401s with no recovery. | ZETA-2/3 |
+| ZETA-12 | `list` tool output cap fragility: the 10,000-char cap in ZETA-4's `list` truncates the accumulated pytest tmp_path parent after ~195 tests, silently breaking `tests/test_tools.py::test_paths_outside_session_cwd_are_allowed` when suite size grows. Either raise/remove the cap for the assertion path, or restructure the test to assert the invariant against a structured result rather than the truncated listing. Blocks nothing today (worked around in the test itself); this ticket fixes the underlying fragility so the workaround can be removed. | ZETA-4 |
 
 Gate: `uv run pytest -q`. Review flow: same luna implementer -> sol reviewer
 loop as the wiki repo; merges by the orchestrator after a clean pass.
