@@ -39,24 +39,35 @@ async def test_registry_validates_arguments_before_running_handler(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_jail_rejects_parent_absolute_and_symlink_escapes(tmp_path: Path) -> None:
+async def test_paths_outside_session_cwd_are_allowed(tmp_path: Path) -> None:
     outside = tmp_path.parent / "zeta-outside.txt"
     outside.write_text("outside", encoding="utf-8")
+    outside_dir = tmp_path.parent / "zeta-outside-dir"
+    outside_dir.mkdir()
+    (outside_dir / "nested.txt").write_text("nested", encoding="utf-8")
     link = tmp_path / "outside-link"
     link.symlink_to(outside)
+    dir_link = tmp_path / "outside-dir-link"
+    dir_link.symlink_to(outside_dir, target_is_directory=True)
     registry = ToolRegistry(tmp_path)
 
-    for tool_name, arguments in [
-        ("read", {"path": "../zeta-outside.txt"}),
-        ("read", {"path": str(outside)}),
-        ("read", {"path": "outside-link"}),
-        ("list", {"path": "../"}),
-        ("list", {"path": str(tmp_path.parent)}),
-        ("list", {"path": "outside-link"}),
-    ]:
-        result = await registry.execute(ToolCall(tool_name, tool_name, arguments))
-        assert result.is_error
-        assert "escapes session cwd" in result.content
+    absolute_result = await registry.execute(
+        ToolCall("read-1", "read", {"path": str(outside)})
+    )
+    parent_result = await registry.execute(
+        ToolCall("list-1", "list", {"path": "../", "depth": 1})
+    )
+    symlink_result = await registry.execute(
+        ToolCall("read-2", "read", {"path": "outside-link"})
+    )
+    symlink_dir_result = await registry.execute(
+        ToolCall("list-2", "list", {"path": "outside-dir-link"})
+    )
+
+    assert absolute_result.content == "outside"
+    assert "zeta-outside.txt" in parent_result.content
+    assert symlink_result.content == "outside"
+    assert "outside-dir-link/nested.txt" in symlink_dir_result.content
 
 
 @pytest.mark.asyncio

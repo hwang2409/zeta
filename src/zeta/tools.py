@@ -1,4 +1,4 @@
-"""Tool registration, validation, execution, and session-cwd tools."""
+"""Tool registration, validation, execution, and session-cwd defaults."""
 
 from __future__ import annotations
 
@@ -237,7 +237,7 @@ class ToolRegistry:
         self.register(
             "read",
             self._read,
-            description="Read a UTF-8 file inside the session cwd.",
+            description="Read a UTF-8 file. Relative paths use the session cwd.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -252,7 +252,7 @@ class ToolRegistry:
         self.register(
             "list",
             self._list,
-            description="List files and directories inside the session cwd.",
+            description="List a directory. Relative paths use the session cwd.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -286,7 +286,7 @@ class ToolRegistry:
         arguments: dict[str, Any],
         abort_signal: ToolAbortSignal | asyncio.Event,
     ) -> str:
-        path = self._jail_path(arguments["path"])
+        path = self._path(arguments["path"])
         if not path.is_file():
             raise ValueError(f"not a file: {arguments['path']}")
         try:
@@ -305,7 +305,7 @@ class ToolRegistry:
         abort_signal: ToolAbortSignal | asyncio.Event,
     ) -> str:
         relative_path = arguments.get("path", ".")
-        path = self._jail_path(relative_path)
+        path = self._path(relative_path)
         if not path.is_dir():
             raise ValueError(f"not a directory: {relative_path}")
         depth = arguments.get("depth", 1)
@@ -330,11 +330,9 @@ class ToolRegistry:
             if _signal_is_set(abort_signal):
                 return
             try:
-                resolved = entry.resolve()
-                resolved.relative_to(self.cwd)
-            except (OSError, ValueError):
-                continue
-            relative = os.fspath(entry.relative_to(self.cwd))
+                relative = os.fspath(entry.relative_to(self.cwd))
+            except ValueError:
+                relative = os.fspath(entry)
             if entry.is_dir() and not entry.is_symlink():
                 relative += "/"
             found.append(relative)
@@ -377,16 +375,11 @@ class ToolRegistry:
             raise ValueError(result)
         return result
 
-    def _jail_path(self, raw_path: object) -> Path:
+    def _path(self, raw_path: object) -> Path:
         if type(raw_path) is not str or not raw_path:
             raise ValueError("path must be a nonempty string")
-        try:
-            candidate = Path(raw_path)
-            resolved = (candidate if candidate.is_absolute() else self.cwd / candidate).resolve()
-            resolved.relative_to(self.cwd)
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"path escapes session cwd: {raw_path}") from exc
-        return resolved
+        candidate = Path(raw_path)
+        return candidate if candidate.is_absolute() else self.cwd / candidate
 
 
 async def _invoke_handler(

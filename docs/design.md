@@ -59,7 +59,7 @@ the harness-native distillation.
 | ZETA-1 | Core types + ConversationStore (append-only JSONL, parent links, replay, torn-tail repair) + AgentLoop skeleton driven by a deterministic fake backend + tests | — |
 | ZETA-2 | Anthropic backend: subscription OAuth (reuse/refresh existing Claude login), Messages API stream, provider-neutral events; single-completion boundary test | ZETA-1 |
 | ZETA-3 | Codex backend: ChatGPT plan OAuth, backend-api Responses stream; same boundary test | ZETA-1 |
-| ZETA-4 | ToolRegistry + first tools (read/list/exec with cwd jail) + pre-execution hook | ZETA-1 |
+| ZETA-4 | ToolRegistry + first tools (read/list/exec with session cwd defaults) + pre-execution hook | ZETA-1 |
 | ZETA-5 | ApprovalPolicy with durable pending requests + resume re-emit | ZETA-4 |
 | ZETA-6 | ContextAssembler + CompactionPolicy (budget, retained tail, summary completion, digest) | ZETA-2 or ZETA-3 |
 | ZETA-7 | Session resume (--continue/--resume), provider-transport recreation | ZETA-6 |
