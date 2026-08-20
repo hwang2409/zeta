@@ -232,7 +232,10 @@ def _read_headers(lines: list[str], start: int) -> tuple[list[str], int]:
                 try:
                     blank = lines.index("\n", index)
                 except ValueError:
-                    blank = lines.index("\r", index)
+                    try:
+                        blank = lines.index("\r", index)
+                    except ValueError:
+                        blank = len(lines)
             folded = "".join(lines[index:blank])
             if "\n--" not in folded and "\r--" not in folded:
                 fragments.append(
@@ -418,7 +421,7 @@ def error_body_excerpt(body: bytes, *, limit: int = 300) -> str:
         value = _redact_error_value(json.loads(body))
         text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
-        text = body.decode("utf-8", errors="replace")
+        text = body[: max(limit * 4, 4096)].decode("utf-8", errors="replace")
         text = _redact_error_text(text)
     return " ".join(text.split())[:limit]
 
