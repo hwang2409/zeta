@@ -77,14 +77,19 @@ class OAuthTokens:
     expires_at: float
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> OAuthTokens:
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        error_type: type[RuntimeError] = AnthropicAuthError,
+    ) -> OAuthTokens:
         access_token = _first_string(value, "access_token", "accessToken", "access")
         refresh_token = _first_string(value, "refresh_token", "refreshToken", "refresh")
         expires_at = value.get("expires_at", value.get("expiresAt", value.get("expires", 0)))
         if not access_token or not refresh_token:
-            raise AnthropicAuthError("Claude OAuth credentials are incomplete")
+            raise error_type("OAuth credentials are incomplete")
         if type(expires_at) not in {int, float}:
-            raise AnthropicAuthError("Claude OAuth expiry is invalid")
+            raise error_type("OAuth expiry is invalid")
         if expires_at > 100_000_000_000:
             expires_at /= 1000
         return cls(access_token, refresh_token, float(expires_at))
@@ -116,7 +121,7 @@ def _credential_candidates() -> tuple[Path, ...]:
 
 def _extract_claude_tokens(value: Any) -> OAuthTokens:
     if not isinstance(value, Mapping):
-        raise AnthropicAuthError("Claude credentials are not an object")
+        raise ValueError("Claude credentials are not an object")
     nested = value.get("claudeAiOauth")
     if isinstance(nested, Mapping):
         return OAuthTokens.from_mapping(nested)
@@ -144,6 +149,10 @@ class AnthropicCredentialStore:
         self.token_url = token_url
         self._async_refresh_lock = asyncio.Lock()
 
+    auth_error_type = AnthropicAuthError
+    http_error_type = AnthropicHTTPError
+    provider_label = "Claude"
+
     @contextmanager
     def _lock(self) -> Iterator[None]:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -166,11 +175,11 @@ class AnthropicCredentialStore:
             with self.path.open() as handle:
                 value = json.load(handle)
             os.chmod(self.path, 0o600)
-            return OAuthTokens.from_mapping(value)
-        except AnthropicBackendError:
-            raise
+            return OAuthTokens.from_mapping(value, error_type=self.auth_error_type)
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise AnthropicAuthError("zeta's Claude OAuth store is invalid") from exc
+            raise self.auth_error_type(
+                f"zeta's {self.provider_label} OAuth store is invalid"
+            ) from exc
 
     def bootstrap(self) -> OAuthTokens | None:
         candidates = (
@@ -187,7 +196,9 @@ class AnthropicCredentialStore:
             except AnthropicBackendError:
                 raise
             except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-                raise AnthropicAuthError("Claude credentials could not be read") from exc
+                raise self.auth_error_type(
+                    f"{self.provider_label} credentials could not be read"
+                ) from exc
         return None
 
     def save(self, tokens: OAuthTokens) -> None:
@@ -218,8 +229,8 @@ class AnthropicCredentialStore:
                 if tokens is None:
                     tokens = self.bootstrap()
                     if tokens is None:
-                        raise AnthropicAuthError(
-                            "no Claude OAuth login found; log in with Claude first"
+                        raise self.auth_error_type(
+                            f"no {self.provider_label} OAuth login found; log in first"
                         )
                 if tokens.is_valid():
                     if from_claude:
@@ -256,15 +267,20 @@ class AnthropicCredentialStore:
                 headers={"accept": "application/json"},
             )
         except httpx.HTTPError as exc:
-            raise AnthropicAuthError("Claude OAuth token refresh failed") from exc
+            raise self.auth_error_type(
+                f"{self.provider_label} OAuth token refresh failed"
+            ) from exc
         if response.status_code >= 400:
-            raise AnthropicHTTPError(
-                f"Claude OAuth token refresh failed with HTTP {response.status_code}"
+            raise self.http_error_type(
+                f"{self.provider_label} OAuth token refresh failed with HTTP "
+                f"{response.status_code}"
             )
         try:
             return _tokens_from_response(response.json(), refresh_token)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise AnthropicAuthError("Claude OAuth token response is invalid") from exc
+            raise self.auth_error_type(
+                f"{self.provider_label} OAuth token response is invalid"
+            ) from exc
 
 
 def build_authorization_url(

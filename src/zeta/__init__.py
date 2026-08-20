@@ -1,5 +1,4 @@
 """Custom agent harness."""
-from .fake import FakeBackend, ScriptedTurn
 from .anthropic import (
     AnthropicAuthError,
     AnthropicBackend,
@@ -12,11 +11,24 @@ from .anthropic import (
     build_messages_payload,
     exchange_authorization_code,
 )
+from .codex import (
+    DEFAULT_CODEX_MODEL,
+    CodexAuthError,
+    CodexBackend,
+    CodexBackendError,
+    CodexCredentialStore,
+    CodexHTTPError,
+    CodexStreamError,
+    build_responses_payload,
+    extract_account_id,
+)
+from .fake import FakeBackend, ScriptedTurn
 from .loop import AgentLoop, DictToolExecutor, ToolExecutor
 from .store import ConversationEntry, ConversationIntegrityError, ConversationStore
 from .types import *
 
 __all__ = [
+    "DEFAULT_CODEX_MODEL",
     "AgentLoop",
     "AnthropicAuthError",
     "AnthropicBackend",
@@ -24,6 +36,12 @@ __all__ = [
     "AnthropicCredentialStore",
     "AnthropicHTTPError",
     "AnthropicStreamError",
+    "CodexAuthError",
+    "CodexBackend",
+    "CodexBackendError",
+    "CodexCredentialStore",
+    "CodexHTTPError",
+    "CodexStreamError",
     "CompletionBackend",
     "ContentBlock",
     "ContentType",
@@ -48,5 +66,7 @@ __all__ = [
     "ToolUseContent",
     "build_authorization_url",
     "build_messages_payload",
+    "build_responses_payload",
     "exchange_authorization_code",
+    "extract_account_id",
 ]
