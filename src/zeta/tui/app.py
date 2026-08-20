@@ -259,19 +259,29 @@ class TUIApp:
         self._assistant_lines.value = ""
         self._thinking_lines.value = ""
 
+    def _print_user(self, user_text: str) -> None:
+        self.console.print(Text(f"[user] {user_text}", style="bold"))
+
+    def _start_queued_turn(self) -> None:
+        if self._queued:
+            user_text = self._queued.popleft()
+            self._print_user(user_text)
+            self.console.print(Text("[queued]", style="dim"))
+            self._start_turn(user_text)
+
     async def _consume_turn(self, user_text: str) -> None:
         self._loop_state = "streaming"
         try:
             async for event in self.loop.run_turn(user_text):
                 self._update_usage(event)
+                if event.type is StreamEventType.ERROR:
+                    self._flush_pending_stream()
                 if self.verbose:
                     self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style="dim"))
                 if event.type is StreamEventType.MESSAGE_UPDATE:
                     self._consume_text(event)
                     self._invalidate_prompt()
                     continue
-                if event.type is StreamEventType.ERROR:
-                    self._flush_pending_stream()
                 if event.type is StreamEventType.TOOL_EXECUTION_START:
                     self._finish_stream()
                     self._loop_state = "tool-running"
@@ -323,7 +333,7 @@ class TUIApp:
                         pass
                     self._active_task = None
                     if self._queued:
-                        self._start_turn(self._queued.popleft())
+                        self._start_queued_turn()
 
                 if prompt_task in done:
                     value = await prompt_task
@@ -331,11 +341,10 @@ class TUIApp:
                         break
                     parsed = parse_input(value)
                     if parsed is not None and not self._exit_requested:
-                        self.console.print(Text(f"[user] {parsed}", style="bold"))
                         if self.active:
                             self._queued.append(parsed)
-                            self.console.print(Text("[queued]", style="dim"))
                         else:
+                            self._print_user(parsed)
                             self._start_turn(parsed)
                     if self._exit_requested:
                         break

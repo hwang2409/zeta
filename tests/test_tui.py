@@ -64,6 +64,32 @@ class GateBackend(CompletionBackend):
         )
 
 
+class QueueOrderBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls: list[list[Message]] = []
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        index = len(self.calls)
+        self.calls.append(list(messages))
+        if index == 0:
+            yield StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=TextContent("| name | value |\n| --- | --- |"),
+            )
+            self.started.set()
+            await self.release.wait()
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent(f"reply {index}")]),
+        )
+
+
 class ErrorBackend(CompletionBackend):
     async def complete(
         self,
@@ -265,6 +291,66 @@ async def test_error_flushes_assistant_before_error(tmp_path: Path) -> None:
         if getattr(item, "plain", None) == "[error] boom"
     )
     assert table_index < error_index
+
+
+@pytest.mark.asyncio
+async def test_verbose_error_flushes_before_raw_error(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(ErrorBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        verbose=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    rendered = []
+
+    def capture(renderable: object | None) -> None:
+        if renderable is not None:
+            rendered.append(renderable)
+
+    app._print = capture
+
+    await app._consume_turn("prompt")
+
+    table_index = next(
+        index for index, item in enumerate(rendered) if isinstance(item, Table)
+    )
+    raw_error_index = next(
+        index
+        for index, item in enumerate(rendered)
+        if '"type": "error"' in getattr(item, "plain", "")
+    )
+    pretty_error_index = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == "[error] boom"
+    )
+    assert table_index < raw_error_index < pretty_error_index
+
+
+@pytest.mark.asyncio
+async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> None:
+    backend = QueueOrderBackend()
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    with create_pipe_input() as pipe:
+        run_task = asyncio.create_task(app.run(app_session(app, pipe)))
+        pipe.send_text("first\r")
+        await backend.started.wait()
+        pipe.send_text("second\r")
+        await wait_until(lambda: app.queued_messages == ("second",))
+        backend.release.set()
+        await wait_until(lambda: len(backend.calls) == 2)
+        pipe.send_text("\x04")
+        await run_task
+
+    rendered = output.getvalue()
+    assert rendered.index("name") < rendered.index("[user] second")
 
 
 def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:

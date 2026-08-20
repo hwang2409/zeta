@@ -211,6 +211,7 @@ class AgentLoop:
                 return
 
             completed_tool_ids: set[str] = set()
+            parallel_tasks: dict[asyncio.Task[ToolResult], ToolCall] = {}
             try:
                 call_index = 0
                 while call_index < len(calls):
@@ -235,16 +236,26 @@ class AgentLoop:
                                 StreamEventType.TOOL_EXECUTION_START,
                                 tool_call=tool_call,
                             )
-                        results = await self.tool_registry.execute_many(parallel_calls)
-                        for tool_call, result in zip(parallel_calls, results, strict=True):
-                            result = _validated_tool_result(result, tool_call.id)
-                            self._append_tool_result(result)
-                            completed_tool_ids.add(tool_call.id)
-                            yield StreamEvent(
-                                StreamEventType.TOOL_EXECUTION_END,
-                                tool_call=tool_call,
-                                tool_result=result,
+                        parallel_tasks = {
+                            asyncio.create_task(self.tool_registry.execute(tool_call)): tool_call
+                            for tool_call in parallel_calls
+                        }
+                        while parallel_tasks:
+                            done, _ = await asyncio.wait(
+                                parallel_tasks,
+                                return_when=asyncio.FIRST_COMPLETED,
                             )
+                            for task in done:
+                                tool_call = parallel_tasks.pop(task)
+                                result = task.result()
+                                result = _validated_tool_result(result, tool_call.id)
+                                self._append_tool_result(result)
+                                completed_tool_ids.add(tool_call.id)
+                                yield StreamEvent(
+                                    StreamEventType.TOOL_EXECUTION_END,
+                                    tool_call=tool_call,
+                                    tool_result=result,
+                                )
                         call_index += len(parallel_calls)
                         continue
 
@@ -267,6 +278,22 @@ class AgentLoop:
                     )
                     call_index += 1
             except (asyncio.CancelledError, GeneratorExit):
+                pending_tasks: list[asyncio.Task[ToolResult]] = []
+                for task, tool_call in list(parallel_tasks.items()):
+                    parallel_tasks.pop(task)
+                    if task.done():
+                        if task.cancelled():
+                            continue
+                        try:
+                            result = _validated_tool_result(task.result(), tool_call.id)
+                        except BaseException:
+                            continue
+                        self._append_tool_result(result)
+                        completed_tool_ids.add(tool_call.id)
+                    else:
+                        task.cancel()
+                        pending_tasks.append(task)
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
                 self._append_cancelled_tool_results(calls, completed_tool_ids)
                 raise
             yield StreamEvent(
