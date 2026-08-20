@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import heapq
 import inspect
 import json
 import math
@@ -46,6 +47,16 @@ class _ToolCanceled(Exception):
     pass
 
 
+async def _yield_for_abort(
+    abort_signal: ToolAbortSignal | asyncio.Event,
+) -> None:
+    if _signal_is_set(abort_signal):
+        raise _ToolCanceled()
+    await asyncio.sleep(0)
+    if _signal_is_set(abort_signal):
+        raise _ToolCanceled()
+
+
 class _BoundedOutput:
     def __init__(self, limit: int) -> None:
         self.limit = limit
@@ -68,18 +79,21 @@ class _BoundedOutput:
 class _BoundedText:
     def __init__(self, limit: int) -> None:
         self.limit = limit
-        self._text = ""
+        self._parts: list[str] = []
+        self._length = 0
         self._has_line = False
         self.truncated = False
 
     @property
     def retained_chars(self) -> int:
-        return len(self._text)
+        return self._length
 
     def append(self, value: str) -> None:
-        remaining = self.limit - len(self._text)
+        remaining = self.limit - self._length
         if remaining > 0:
-            self._text += value[:remaining]
+            retained = value[:remaining]
+            self._parts.append(retained)
+            self._length += len(retained)
         if len(value) > remaining:
             self.truncated = True
 
@@ -93,9 +107,10 @@ class _BoundedText:
         self.append(value)
 
     def render(self) -> str:
+        text = "".join(self._parts)
         if self.truncated:
-            return _truncate(self._text + _TRUNCATION_MARKER, self.limit)
-        return self._text
+            return _truncate(text + _TRUNCATION_MARKER, self.limit)
+        return text
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,6 +426,7 @@ class ToolRegistry:
                         output.append(character)
                         if output.truncated:
                             return output.render()
+                    await _yield_for_abort(abort_signal)
                 if line_has_data:
                     selected = line_index >= offset and (
                         limit is None or selected_count < limit
@@ -449,16 +465,18 @@ class ToolRegistry:
         if _signal_is_set(abort_signal):
             raise _ToolCanceled()
         try:
-            entries = sorted(path.iterdir(), key=lambda item: item.name)
+            entries = heapq.nsmallest(
+                max(1, self.max_output_chars - output.retained_chars),
+                path.iterdir(),
+                key=lambda item: item.name,
+            )
         except OSError as exc:
             raise ValueError(f"could not list directory: {exc}") from exc
         for index, entry in enumerate(entries):
             if _signal_is_set(abort_signal):
                 raise _ToolCanceled()
             if index % 64 == 0:
-                await asyncio.sleep(0)
-                if _signal_is_set(abort_signal):
-                    raise _ToolCanceled()
+                await _yield_for_abort(abort_signal)
             try:
                 relative = os.fspath(entry.relative_to(self.cwd))
             except ValueError:

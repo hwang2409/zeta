@@ -238,6 +238,31 @@ async def test_list_retains_only_bounded_output_from_large_directory(
 
 
 @pytest.mark.asyncio
+async def test_list_bounds_directory_working_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index in range(5_000):
+        (tmp_path / f"file-{index:04d}.txt").write_text("x", encoding="utf-8")
+    retained: list[tuple[int, int]] = []
+    real_nsmallest = tools_module.heapq.nsmallest
+
+    def tracking_nsmallest(count, iterable, *, key=None):
+        entries = real_nsmallest(count, iterable, key=key)
+        retained.append((count, len(entries)))
+        return entries
+
+    monkeypatch.setattr(tools_module.heapq, "nsmallest", tracking_nsmallest)
+    registry = ToolRegistry(tmp_path, max_output_chars=32)
+
+    result = await registry.execute(ToolCall("list-wide", "list", {"path": "."}))
+
+    assert not result.is_error
+    assert len(result.content) == 32
+    assert retained == [(32, 32)]
+
+
+@pytest.mark.asyncio
 async def test_list_abort_returns_canceled_result_during_traversal(tmp_path: Path) -> None:
     for index in range(256):
         (tmp_path / f"file-{index:03d}.txt").write_text("x", encoding="utf-8")
@@ -253,6 +278,27 @@ async def test_list_abort_returns_canceled_result_during_traversal(tmp_path: Pat
     await abort_task
 
     assert result == ToolResult("list-abort", "tool execution canceled", True)
+
+
+@pytest.mark.asyncio
+async def test_read_abort_returns_canceled_result_during_scan(tmp_path: Path) -> None:
+    (tmp_path / "large.txt").write_text("x\n" * 1_000_000, encoding="utf-8")
+    abort_signal = ToolAbortSignal()
+    registry = ToolRegistry(
+        tmp_path,
+        abort_signal=abort_signal,
+        max_output_chars=3_000_000,
+    )
+
+    async def abort_soon() -> None:
+        await asyncio.sleep(0)
+        abort_signal.abort()
+
+    abort_task = asyncio.create_task(abort_soon())
+    result = await registry.execute(ToolCall("read-abort", "read", {"path": "large.txt"}))
+    await abort_task
+
+    assert result == ToolResult("read-abort", "tool execution canceled", True)
 
 
 @pytest.mark.asyncio
