@@ -226,6 +226,11 @@ class SessionManager:
         model: str | None,
     ) -> None:
         def update(item: SessionMetadata) -> SessionMetadata:
+            if item.override_audit:
+                raise SessionError(
+                    "session override already committed: "
+                    f"{item.override_audit[-1]}"
+                )
             item.override_audit.append(
                 {
                     "at": _now(),

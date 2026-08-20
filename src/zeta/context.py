@@ -102,6 +102,7 @@ class CompactionPolicy:
         backend: CompletionBackend | None = None,
         system_prompt: Message | None = None,
         max_source_tokens: int | None = None,
+        on_success: Callable[[], None] | None = None,
     ) -> str:
         completion_backend = backend or self.backend
         if completion_backend is None:
@@ -147,6 +148,8 @@ class CompactionPolicy:
         summary = _text_from_message(result).strip()
         if not summary or not any(character.isalnum() for character in summary):
             raise SummaryCompletionError("summary completion returned an empty summary")
+        if on_success is not None:
+            on_success()
         return summary
 
     @staticmethod
@@ -167,6 +170,7 @@ class ContextAssembler:
         backend: CompletionBackend | None = None,
         compaction_policy: CompactionPolicy | None = None,
         token_counter: Callable[[Message], int] | None = None,
+        on_completion_success: Callable[[], None] | None = None,
     ) -> None:
         if token_budget <= 0:
             raise ValueError("token budget must be positive")
@@ -178,6 +182,7 @@ class ContextAssembler:
         self.backend = backend
         self.compaction_policy = compaction_policy or CompactionPolicy(backend)
         self.token_counter = token_counter or _message_token_count
+        self.on_completion_success = on_completion_success
         self.system_prompt = (
             system_prompt
             if isinstance(system_prompt, Message)
@@ -277,6 +282,7 @@ class ContextAssembler:
             backend=backend or self.backend,
             system_prompt=system_prompt,
             max_source_tokens=max(1, self.token_budget // 2),
+            on_success=self.on_completion_success,
         )
         if self._branch_id(self.store.replay()) != branch_id:
             raise StaleBranchError("active branch changed during compaction")

@@ -147,7 +147,6 @@ class TUIApp:
         session_manager: SessionManager | None = None,
         session_metadata: SessionMetadata | None = None,
         approval_policy: ApprovalPolicy | None = None,
-        pending_override: tuple[str | None, str | None] | None = None,
     ) -> None:
         self.loop = loop
         self.provider = provider
@@ -169,7 +168,6 @@ class TUIApp:
         self._session_manager = session_manager
         self._session_metadata = session_metadata
         self._approval_policy = approval_policy
-        self._pending_override = pending_override
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
@@ -219,7 +217,18 @@ class TUIApp:
         )
         if resolved:
             self._print(Text(f"[approval] {parts[0]}d {request_id}", style="green"))
-            result = await self.loop.resume_pending_tool(request_id)
+            resume_task = asyncio.create_task(
+                self.loop.resume_pending_tool(request_id)
+            )
+            self._active_task = resume_task
+            try:
+                result = await resume_task
+            except asyncio.CancelledError:
+                self._print(Text("[aborted]", style="yellow"))
+                return True
+            finally:
+                if self._active_task is resume_task:
+                    self._active_task = None
             request = next(
                 request for request in pending if request.request_id == request_id
             )
@@ -235,21 +244,6 @@ class TUIApp:
                 )
         self._present_pending_approvals()
         return True
-
-    def _commit_pending_override(self) -> None:
-        if (
-            self._pending_override is None
-            or self._session_manager is None
-            or self._session_metadata is None
-        ):
-            return
-        provider, model = self._pending_override
-        self._session_manager.record_override(
-            self._session_metadata,
-            provider=provider,
-            model=model,
-        )
-        self._pending_override = None
 
     def _make_session(self) -> PromptSession[str]:
         bindings = build_key_bindings(
@@ -383,14 +377,10 @@ class TUIApp:
 
     async def _consume_turn(self, user_text: str) -> None:
         self._loop_state = "streaming"
-        if self._session_manager is not None and self._session_metadata is not None:
-            self._session_manager.touch(self._session_metadata)
         try:
             async for event in self.loop.run_turn(user_text):
                 self._update_usage(event)
                 self._prepare_stream_event(event)
-                if event.type is StreamEventType.MESSAGE_END:
-                    self._commit_pending_override()
                 if self.verbose:
                     self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style="dim"))
                 if event.type is StreamEventType.MESSAGE_UPDATE:
@@ -417,9 +407,6 @@ class TUIApp:
             self._finish_stream()
             self._loop_state = "idle"
             self._print(Text(f"[error] {exc}", style="bold red"))
-        finally:
-            if self._session_manager is not None and self._session_metadata is not None:
-                self._session_manager.touch(self._session_metadata)
 
     async def _read_prompt(self, session: PromptSession[str]) -> str | None:
         try:
@@ -520,6 +507,11 @@ def create_app(args: argparse.Namespace) -> TUIApp:
                 f"session override rejected: {'; '.join(mismatches)}; "
                 "use --force-provider to override"
             )
+        if mismatches and metadata.override_audit:
+            raise SessionError(
+                "session override already committed by a prior resume: "
+                f"{metadata.override_audit[-1]}"
+            )
         provider = provider_override or metadata.provider
         model = model_override or metadata.model
         store = opened.store
@@ -536,19 +528,33 @@ def create_app(args: argparse.Namespace) -> TUIApp:
     if resuming:
         backend, selected_model = build_backend(provider, model, home=home)
     approval_policy = ApprovalPolicy(store=store)
-    loop = AgentLoop(
-        backend,
-        store,
-        approval_policy=approval_policy,
-        token_budget=metadata.compaction_budget,
-        retained_tail=metadata.retained_tail,
-    )
     pending_override = None
     if resuming and mismatches:
         pending_override = (
             provider if provider != metadata.provider else None,
             model if model != metadata.model else None,
         )
+
+    def completion_success() -> None:
+        nonlocal pending_override
+        if pending_override is not None:
+            manager.record_override(
+                metadata,
+                provider=pending_override[0],
+                model=pending_override[1],
+            )
+            pending_override = None
+            return
+        manager.touch(metadata)
+
+    loop = AgentLoop(
+        backend,
+        store,
+        approval_policy=approval_policy,
+        token_budget=metadata.compaction_budget,
+        retained_tail=metadata.retained_tail,
+        on_completion_success=completion_success,
+    )
     return TUIApp(
         loop,
         provider=provider,
@@ -558,7 +564,6 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         session_manager=manager,
         session_metadata=metadata,
         approval_policy=approval_policy,
-        pending_override=pending_override,
     )
 
 

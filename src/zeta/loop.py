@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import warnings
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 
 from .approval import ApprovalPolicy
 from .context import ContextAssembler
@@ -80,6 +80,7 @@ class AgentLoop:
         system_prompt: str | Message = "",
         token_budget: int = 100_000,
         retained_tail: int = 8,
+        on_completion_success: Callable[[], None] | None = None,
     ) -> None:
         self.backend = backend
         self.store = store
@@ -140,7 +141,9 @@ class AgentLoop:
             retained_tail=retained_tail,
             system_prompt=system_prompt,
             backend=backend,
+            on_completion_success=on_completion_success,
         )
+        self.on_completion_success = on_completion_success
 
     def abort(self) -> None:
         """Signal the active tool batch before the caller cancels the turn."""
@@ -160,6 +163,9 @@ class AgentLoop:
         self.tool_registry.start_batch()
         try:
             result = await self.tool_registry.execute(tool_call)
+        except asyncio.CancelledError:
+            self._finalize_tool_results([tool_call], [None])
+            raise
         except Exception as exc:
             result = ToolResult(tool_call.id, str(exc), is_error=True)
         return self._finalize_tool_results(
@@ -181,6 +187,7 @@ class AgentLoop:
             partial_blocks: list[ContentBlock] = []
             assistant_message: Message | None = None
             completion: AsyncIterator[StreamEvent] | None = None
+            completion_succeeded = False
             context = await self.context_assembler.assemble(backend=self.backend)
             try:
                 completion = self.backend.complete(
@@ -195,6 +202,8 @@ class AgentLoop:
                             partial_blocks.append(TextContent(event.delta))
                     if event.message is not None and event.type is StreamEventType.MESSAGE_END:
                         assistant_message = event.message
+                    if event.type is StreamEventType.MESSAGE_END:
+                        completion_succeeded = True
                     yield event
             except asyncio.CancelledError:
                 await _close_completion(completion)
@@ -232,6 +241,8 @@ class AgentLoop:
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
+            if completion_succeeded and self.on_completion_success is not None:
+                self.on_completion_success()
 
             if assistant_message is None and partial_blocks:
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)

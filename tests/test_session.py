@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import threading
 import uuid
@@ -14,7 +16,7 @@ from zeta.context import ContextAssembler
 from zeta.fake import FakeBackend, ScriptedTurn
 from zeta.loop import AgentLoop
 from zeta.session import SessionError, SessionManager
-from zeta.tui.app import build_parser, create_app, main
+from zeta.tui.app import TUIApp, build_parser, create_app, main
 from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
 
 
@@ -113,7 +115,7 @@ def test_resume_provider_override_requires_force_and_records_audit(
             )
         )
 
-    resumed = create_app(
+    create_app(
         build_parser().parse_args(
             [
                 "--resume",
@@ -132,7 +134,6 @@ def test_resume_provider_override_requires_force_and_records_audit(
     assert metadata["provider"] == "fake"
     assert metadata["model"] == "offline"
     assert metadata["override_audit"] == []
-    assert resumed._pending_override == ("claude", "claude-sonnet-4-6")
 
 
 @pytest.mark.asyncio
@@ -182,6 +183,8 @@ async def test_invalid_model_keeps_forced_override_uncommitted(
     monkeypatch.setenv("ZETA_HOME", str(home))
     first = create_app(_args())
     session_id = first.loop.store.session_id
+    metadata_path = home / "sessions" / session_id / "meta.json"
+    before_digest = hashlib.sha256(metadata_path.read_bytes()).hexdigest()
     backend = FakeBackend([])
 
     def build_backend(*args: object, **kwargs: object) -> tuple[FakeBackend, str]:
@@ -205,9 +208,8 @@ async def test_invalid_model_keeps_forced_override_uncommitted(
     app._invalidate_prompt = lambda: None
     await app._consume_turn("hello")
 
-    metadata = json.loads(
-        (home / "sessions" / session_id / "meta.json").read_text()
-    )
+    metadata = json.loads(metadata_path.read_text())
+    assert hashlib.sha256(metadata_path.read_bytes()).hexdigest() == before_digest
     assert metadata["provider"] == "fake"
     assert metadata["model"] == "offline"
     assert metadata["override_audit"] == []
@@ -339,6 +341,162 @@ async def test_resume_pending_tool_executes_and_persists_result(
     assert result is not None
     assert opened.store.messages()[-1].tool_result == result
     assert executed == (["done"] if decision == "allow" else [])
+
+
+@pytest.mark.asyncio
+async def test_resumed_tool_abort_active_persists_canceled_result(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    policy = ApprovalPolicy(store=opened.store)
+    started = asyncio.Event()
+
+    async def block(arguments: dict[str, str], abort_signal: object) -> str:
+        del arguments
+        started.set()
+        await abort_signal.wait()  # type: ignore[attr-defined]
+        return "unreachable"
+
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        tools={"block": block},
+        approval_policy=policy,
+    )
+    call = ToolCall("approval-abort", "block", {})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    app = TUIApp(
+        loop,
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+    )
+    approval_task = asyncio.create_task(app._handle_approval_input(f"approve {call.id}"))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    app.abort_active()
+    assert await approval_task
+
+    assert opened.store.messages()[-1].tool_result is not None
+    assert opened.store.messages()[-1].tool_result.content == "tool execution canceled"
+
+
+@pytest.mark.asyncio
+async def test_resumed_tool_direct_cancel_persists_canceled_result(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    policy = ApprovalPolicy(store=opened.store)
+    started = asyncio.Event()
+
+    async def block(arguments: dict[str, str]) -> str:
+        del arguments
+        started.set()
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        tools={"block": block},
+        approval_policy=policy,
+    )
+    call = ToolCall("approval-cancel", "block", {})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    policy.approve(call.id)
+    task = asyncio.create_task(loop.resume_pending_tool(call.id))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert opened.store.messages()[-1].tool_result is not None
+    assert opened.store.messages()[-1].tool_result.content == "tool execution canceled"
+
+
+@pytest.mark.asyncio
+async def test_summary_success_commits_override_before_main_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    manager = SessionManager(home)
+    opened = manager.create(
+        provider="fake",
+        model="offline",
+        cwd=tmp_path,
+        retained_tail=35,
+        compaction_budget=600,
+    )
+    for index in range(50):
+        opened.store.append_message(
+            Message(MessageRole.USER, [TextContent(f"message {index}")])
+        )
+    session_id = opened.store.session_id
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("summary")])])
+
+    def build_backend(*args: object, **kwargs: object) -> tuple[FakeBackend, str]:
+        del args, kwargs
+        return backend, "claude-sonnet-4-6"
+
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
+    app = create_app(
+        build_parser().parse_args(
+            [
+                "--resume",
+                session_id,
+                "--provider",
+                "claude",
+                "--model",
+                "claude-sonnet-4-6",
+                "--force-provider",
+            ]
+        )
+    )
+    app._invalidate_prompt = lambda: None
+    await app._consume_turn("new message")
+
+    metadata = manager.open(session_id).metadata
+    assert metadata.provider == "claude"
+    assert metadata.model == "claude-sonnet-4-6"
+    assert metadata.override_audit
+
+
+def test_concurrent_overrides_are_first_writer_wins(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    session_id = opened.store.session_id
+    managers = [SessionManager(manager.home), SessionManager(manager.home)]
+    metadata = [item.open(session_id).metadata for item in managers]
+    barrier = threading.Barrier(2)
+    errors: list[Exception] = []
+
+    def override(index: int) -> None:
+        try:
+            barrier.wait()
+            managers[index].record_override(
+                metadata[index],
+                provider=f"provider-{index}",
+                model=f"model-{index}",
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=override, args=(0,))
+    second = threading.Thread(target=override, args=(1,))
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+
+    current = manager.open(session_id).metadata
+    assert len(errors) == 1
+    assert isinstance(errors[0], SessionError)
+    assert len(current.override_audit) == 1
+    assert current.provider in {"provider-0", "provider-1"}
 
 
 def test_metadata_override_and_touch_are_serialized(tmp_path: Path) -> None:
