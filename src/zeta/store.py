@@ -342,9 +342,14 @@ class ConversationStore:
                 summary = entry.data.get("summary")
                 source_start = entry.data.get("source_seq_start")
                 source_end = entry.data.get("source_seq_end")
-                if type(summary) is not str:
-                    raise ValueError("compaction summary must be a string")
-                if type(source_start) is not int or type(source_end) is not int:
+                if type(summary) is not str or not summary.strip():
+                    raise ValueError("compaction summary must be a nonempty string")
+                if (
+                    type(source_start) is not int
+                    or type(source_end) is not int
+                    or source_start <= 0
+                    or source_end < source_start
+                ):
                     raise ValueError("compaction source sequence must be integers")
             elif entry.type == "warning":
                 if type(entry.data.get("message")) is not str:

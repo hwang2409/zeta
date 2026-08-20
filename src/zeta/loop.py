@@ -7,6 +7,7 @@ import warnings
 from collections.abc import AsyncIterator, Mapping, Sequence
 
 from .approval import ApprovalPolicy
+from .context import ContextAssembler
 from .store import ConversationStore
 from .tools import ToolHandler, ToolRegistry
 from .types import (
@@ -75,6 +76,10 @@ class AgentLoop:
         approval_policy: ApprovalPolicy | None = None,
         tool_schemas: Sequence[ToolSchema] | None = None,
         max_turns: int = 10,
+        context_assembler: ContextAssembler | None = None,
+        system_prompt: str | Message = "",
+        token_budget: int = 100_000,
+        retained_tail: int = 8,
     ) -> None:
         self.backend = backend
         self.store = store
@@ -129,6 +134,13 @@ class AgentLoop:
             if tool_schemas is not None else self.tool_registry.schemas
         )
         self.max_turns = max_turns
+        self.context_assembler = context_assembler or ContextAssembler(
+            store,
+            token_budget=token_budget,
+            retained_tail=retained_tail,
+            system_prompt=system_prompt,
+            backend=backend,
+        )
 
     def abort(self) -> None:
         """Signal the active tool batch before the caller cancels the turn."""
@@ -153,11 +165,13 @@ class AgentLoop:
             partial_blocks: list[ContentBlock] = []
             assistant_message: Message | None = None
             completion: AsyncIterator[StreamEvent] | None = None
+            context = await self.context_assembler.assemble(backend=self.backend)
             try:
                 completion = self.backend.complete(
-                    self.store.messages(), self.tool_schemas
+                    context, self.tool_schemas
                 )
                 async for event in completion:
+                    self.context_assembler.observe_event(event)
                     if event.type is StreamEventType.MESSAGE_UPDATE:
                         if event.content is not None:
                             partial_blocks.append(event.content)

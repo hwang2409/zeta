@@ -24,6 +24,7 @@ class ScriptedTurn:
     content: list[ContentBlock] = field(default_factory=list)
     tool_calls: list[ToolCall] = field(default_factory=list)
     delay: float = 0.0
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 class FakeBackend(CompletionBackend):
@@ -58,6 +59,7 @@ class FakeBackend(CompletionBackend):
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
                 message=Message(role=MessageRole.ASSISTANT, content=blocks),
+                data={"usage": dict(turn.usage)} if turn.usage else {},
             )
         finally:
             self.completion_close_count += 1

@@ -23,6 +23,13 @@ from .codex import (
     build_responses_payload,
     extract_account_id,
 )
+from .context import (
+    AssembledContext,
+    BudgetExceeded,
+    CompactionPolicy,
+    ContextAssembler,
+    SummaryCompletionError,
+)
 from .fake import FakeBackend, ScriptedTurn
 from .loop import AgentLoop
 from .store import ConversationEntry, ConversationIntegrityError, ConversationStore
@@ -35,6 +42,7 @@ __all__ = [
     "ApprovalDecision",
     "ApprovalPolicy",
     "ApprovalRequest",
+    "AssembledContext",
     "AbortSignal",
     "AnthropicAuthError",
     "AnthropicBackend",
@@ -48,12 +56,15 @@ __all__ = [
     "CodexCredentialStore",
     "CodexHTTPError",
     "CodexStreamError",
+    "BudgetExceeded",
+    "CompactionPolicy",
     "CompletionBackend",
     "ContentBlock",
     "ContentType",
     "ConversationEntry",
     "ConversationIntegrityError",
     "ConversationStore",
+    "ContextAssembler",
     "ErrorInfo",
     "FakeBackend",
     "Message",
@@ -61,6 +72,7 @@ __all__ = [
     "OAuthTokens",
     "RedactedThinkingContent",
     "ScriptedTurn",
+    "SummaryCompletionError",
     "StreamEvent",
     "StreamEventType",
     "TextContent",
