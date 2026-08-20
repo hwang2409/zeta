@@ -147,9 +147,17 @@ class CodexCredentialStore(OAuthCredentialStore):
         access = _first_string(value, "access_token", "accessToken", "access")
         refresh = _first_string(value, "refresh_token", "refreshToken", "refresh")
         expires_in = value.get("expires_in", value.get("expiresIn"))
-        if not access or not refresh or type(expires_in) not in {int, float}:
+        refresh_keys = ("refresh_token", "refreshToken", "refresh")
+        refresh_present = any(key in value for key in refresh_keys)
+        if not access or type(expires_in) not in {int, float} or (
+            refresh_present and not refresh
+        ):
             raise CodexAuthError("Codex OAuth token response is invalid")
-        return OAuthTokens(access, refresh, time.time() + float(expires_in) - 300)
+        return OAuthTokens(
+            access,
+            refresh or refresh_token,
+            time.time() + float(expires_in) - 300,
+        )
 
 
 def extract_account_id(access_token: str) -> str:
@@ -634,7 +642,7 @@ def _translate_event(
         kind = part.get("type") if isinstance(part, Mapping) else None
         if item.kind != "message" or kind not in {"output_text", "refusal"}:
             raise CodexStreamError("Codex content part has the wrong item type")
-        blocks[key] = _BlockState("text")
+        blocks[key] = _BlockState(kind)
         item.blocks.add(key)
         return None, response_state
     if event_type == "response.reasoning_summary_part.added":
@@ -683,7 +691,7 @@ def _translate_event(
         complete = payload.get("item")
         if not isinstance(complete, Mapping):
             raise CodexStreamError("Codex completed output item is invalid")
-        _merge_completed_item(item, complete)
+        _merge_completed_item(item, complete, blocks)
         if any(blocks[key].state != "stopped" for key in item.blocks):
             raise CodexStreamError("Codex output item completed with open blocks")
         item.state = "stopped"
@@ -798,7 +806,15 @@ def _translate_delta(
     content_index = _content_index(payload)
     key = (index, content_index)
     block = blocks.get(key)
-    if item.kind != "message" or block is None or block.state != "active":
+    expected_kind = (
+        "refusal" if event_type == "response.refusal.delta" else "output_text"
+    )
+    if (
+        item.kind != "message"
+        or block is None
+        or block.kind != expected_kind
+        or block.state != "active"
+    ):
         raise CodexStreamError("Codex text delta references an inactive block")
     delta = payload.get("delta")
     if type(delta) is not str:
@@ -830,9 +846,13 @@ def _finish_block(
         expected_kind = "thinking_raw"
     else:
         key = (index, _content_index(payload))
-        expected_kind = "text"
+        expected_kind = (
+            "refusal" if event_type == "response.refusal.done" else "output_text"
+        )
     block = blocks.get(key)
-    if block is None or block.kind != expected_kind:
+    if block is None or (
+        event_type != "response.content_part.done" and block.kind != expected_kind
+    ):
         raise CodexStreamError("Codex block stop references an unknown block")
     if block.state != "active":
         raise CodexStreamError("Codex block stop is duplicated")
@@ -840,7 +860,7 @@ def _finish_block(
         part = payload.get("part")
         if part is not None and (
             not isinstance(part, Mapping)
-            or part.get("type") not in {"output_text", "refusal"}
+            or part.get("type") != block.kind
         ):
             raise CodexStreamError("Codex content part has the wrong item type")
     if event_type.endswith(".done"):
@@ -849,7 +869,12 @@ def _finish_block(
             if event_type == "response.refusal.done"
             else payload.get("text")
         )
-        if type(complete_text) is str and block.kind in {"text", "thinking", "thinking_raw"}:
+        if type(complete_text) is str and block.kind in {
+            "output_text",
+            "refusal",
+            "thinking",
+            "thinking_raw",
+        }:
             if block.text and complete_text != block.text:
                 raise CodexStreamError("Codex completed text does not match its deltas")
             if not block.text:
@@ -911,18 +936,25 @@ def _finish_reasoning_summary_part(
     block.state = "stopped"
 
 
-def _merge_completed_item(item: _ItemState, complete: Mapping[str, Any]) -> None:
+def _merge_completed_item(
+    item: _ItemState,
+    complete: Mapping[str, Any],
+    blocks: Mapping[tuple[int, int], _BlockState],
+) -> None:
     if complete.get("id") != item.item_id:
         raise CodexStreamError("Codex completed item id does not match output item")
     if complete.get("type") != item.kind:
         raise CodexStreamError("Codex completed item type does not match output item")
     if item.kind == "message":
+        if complete.get("status") != "completed":
+            raise CodexStreamError("Codex completed message status is invalid")
         if complete.get("role") != "assistant":
             raise CodexStreamError("Codex completed message metadata is invalid")
         content = complete.get("content")
         if not isinstance(content, list) or not content:
             raise CodexStreamError("Codex completed message content is invalid")
         complete_text_parts: list[str] = []
+        complete_part_kinds: list[str] = []
         for part in content:
             if not isinstance(part, Mapping):
                 raise CodexStreamError("Codex completed message part is invalid")
@@ -933,7 +965,13 @@ def _merge_completed_item(item: _ItemState, complete: Mapping[str, Any]) -> None
                 or type(part.get(text_key)) is not str
             ):
                 raise CodexStreamError("Codex completed message part is invalid")
+            complete_part_kinds.append(part_type)
             complete_text_parts.append(part[text_key])
+        expected_part_kinds = [
+            blocks[key].kind for key in sorted(item.blocks) if key[1] >= 0
+        ]
+        if expected_part_kinds and complete_part_kinds != expected_part_kinds:
+            raise CodexStreamError("Codex completed message parts do not match blocks")
         complete_text = "".join(complete_text_parts)
         if complete_text and item.text and complete_text != item.text:
             raise CodexStreamError("Codex completed item does not match its deltas")

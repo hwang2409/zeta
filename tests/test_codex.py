@@ -97,6 +97,7 @@ def message_stream() -> list[dict[str, object]]:
             item={
                 "type": "message",
                 "id": "message-test",
+                "status": "completed",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": "hello"}],
             },
@@ -308,6 +309,7 @@ async def test_responses_stream_maps_refusal_text_and_replays_item(tmp_path: Pat
     completed_item = {
         "type": "message",
         "id": "message-test",
+        "status": "completed",
         "role": "assistant",
         "content": [{"type": "refusal", "refusal": "cannot help"}],
     }
@@ -670,6 +672,32 @@ async def test_stream_rejects_completed_reasoning_summary_mismatch(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["delta", "done", "completed"])
+async def test_stream_rejects_cross_kind_message_parts(
+    tmp_path: Path, mutation: str
+) -> None:
+    events = message_stream()
+    if mutation == "delta":
+        events[3]["type"] = "response.refusal.delta"
+    elif mutation == "done":
+        events[4]["type"] = "response.refusal.done"
+    else:
+        events[6]["item"]["content"] = [  # type: ignore[index]
+            {"type": "refusal", "refusal": "hello"}
+        ]
+
+    client = client_for(sse(events))
+    with pytest.raises(CodexStreamError):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / f"{mutation}.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutation",
     ["delta", "completed_id", "completed_type", "completed_part_type"],
@@ -708,6 +736,21 @@ async def test_stream_rejects_missing_completed_item(tmp_path: Path) -> None:
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "missing-item.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_in_progress_completed_message(tmp_path: Path) -> None:
+    events = message_stream()
+    events[6]["item"]["status"] = "in_progress"  # type: ignore[index]
+    client = client_for(sse(events))
+    with pytest.raises(CodexStreamError, match="completed message status is invalid"):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "in-progress.json")
             ).complete([], [])
         ]
     await client.aclose()
@@ -915,7 +958,9 @@ async def test_expired_codex_token_refreshes_under_shared_store_lock(tmp_path: P
             request=request,
         )
 
-    store = CodexCredentialStore(tmp_path / "codex.json", token_url="https://test.invalid/token")
+    store = CodexCredentialStore(
+        tmp_path / "codex.json", token_url="https://test.invalid/token"
+    )
     store.save(OAuthTokens(access_token(), "rotating-refresh", 1))
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     assert await asyncio.gather(store.access_token(client), store.access_token(client)) == [
@@ -923,6 +968,33 @@ async def test_expired_codex_token_refreshes_under_shared_store_lock(tmp_path: P
         access_token("refreshed-account"),
     ]
     assert len(requests) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_codex_refresh_keeps_existing_token_when_response_does_not_rotate(
+    tmp_path: Path,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "access_token": access_token("refreshed-account"),
+                "expires_in": 3600,
+            },
+            request=request,
+        )
+
+    store = CodexCredentialStore(
+        tmp_path / "codex.json", token_url="https://test.invalid/token"
+    )
+    store.save(OAuthTokens(access_token(), "non-rotating-refresh", 1))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    assert await store.access_token(client) == access_token("refreshed-account")
+    refreshed = store.read()
+    assert refreshed is not None
+    assert refreshed.refresh_token == "non-rotating-refresh"
     await client.aclose()
 
 
@@ -995,6 +1067,7 @@ async def test_output_item_done_rejects_open_blocks(tmp_path: Path) -> None:
             item={
                 "type": "message",
                 "id": "message-test",
+                "status": "completed",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": "hello"}],
             },
