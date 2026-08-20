@@ -418,6 +418,40 @@ async def test_resumed_tool_direct_cancel_persists_canceled_result(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_resumed_tool_immediate_abort_persists_canceled_result(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    policy = ApprovalPolicy(store=opened.store)
+
+    async def never_runs(arguments: dict[str, str]) -> str:
+        del arguments
+        raise AssertionError("the handler must not run")
+
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        tools={"never": never_runs},
+        approval_policy=policy,
+    )
+    call = ToolCall("approval-immediate-abort", "never", {})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    policy.approve(call.id)
+
+    assert loop.prepare_resume_pending_tool(call.id)
+    loop.abort()
+    result = await loop.resume_pending_tool(call.id, prepared=True)
+
+    assert result is not None
+    assert result.content == "tool execution canceled"
+    assert opened.store.messages()[-1].tool_result == result
+
+
+@pytest.mark.asyncio
 async def test_summary_success_commits_override_before_main_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -497,6 +531,32 @@ def test_concurrent_overrides_are_first_writer_wins(tmp_path: Path) -> None:
     assert isinstance(errors[0], SessionError)
     assert len(current.override_audit) == 1
     assert current.provider in {"provider-0", "provider-1"}
+
+
+def test_sequential_overrides_use_latest_snapshot(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    manager = SessionManager(home)
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+
+    manager.record_override(
+        opened.metadata,
+        provider="claude",
+        model="claude-sonnet-4-6",
+    )
+    latest = SessionManager(home).open(opened.store.session_id).metadata
+    manager.record_override(
+        latest,
+        provider="codex",
+        model="gpt-5.4",
+    )
+
+    current = manager.open(opened.store.session_id).metadata
+    assert current.provider == "codex"
+    assert current.model == "gpt-5.4"
+    assert [item["provider"] for item in current.override_audit] == [
+        {"from": "fake", "to": "claude"},
+        {"from": "claude", "to": "codex"},
+    ]
 
 
 def test_metadata_override_and_touch_are_serialized(tmp_path: Path) -> None:

@@ -150,19 +150,36 @@ class AgentLoop:
 
         self.tool_registry.abort()
 
+    def prepare_resume_pending_tool(self, request_id: str) -> bool:
+        """Reserve the abort generation before resuming an approved tool."""
+
+        state = self.store.approval_states().get(request_id)
+        if state is None or state[1] is None:
+            return False
+        self.tool_registry.start_batch()
+        return True
+
     def run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
         return self._run_turn(user_text)
 
-    async def resume_pending_tool(self, request_id: str) -> ToolResult | None:
+    async def resume_pending_tool(
+        self, request_id: str, *, prepared: bool = False
+    ) -> ToolResult | None:
         """Finish a durable approval request before starting another turn."""
 
         state = self.store.approval_states().get(request_id)
         if state is None or state[1] is None:
             return None
         tool_call = state[0]
-        self.tool_registry.start_batch()
+        if not prepared:
+            self.tool_registry.start_batch()
+        abort_signal = self.tool_registry.abort_signal
         try:
-            result = await self.tool_registry.execute(tool_call)
+            result = await self.tool_registry.execute(
+                tool_call,
+                abort_signal=abort_signal,
+                _scope_signal=abort_signal,
+            )
         except asyncio.CancelledError:
             self._finalize_tool_results([tool_call], [None])
             raise

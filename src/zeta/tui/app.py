@@ -24,7 +24,7 @@ from ..anthropic import AnthropicCredentialStore
 from ..codex import CodexBackend
 from ..codex import CodexCredentialStore
 from ..loop import AgentLoop
-from ..session import SessionError, SessionManager, SessionMetadata, env_home
+from ..session import SessionError, SessionManager, env_home
 from ..types import (
     CompletionBackend,
     Message,
@@ -144,8 +144,6 @@ class TUIApp:
         console: Console | None = None,
         session: PromptSession[str] | None = None,
         history_path: str | Path | None = None,
-        session_manager: SessionManager | None = None,
-        session_metadata: SessionMetadata | None = None,
         approval_policy: ApprovalPolicy | None = None,
     ) -> None:
         self.loop = loop
@@ -165,9 +163,8 @@ class TUIApp:
         self._partial = ""
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
-        self._session_manager = session_manager
-        self._session_metadata = session_metadata
         self._approval_policy = approval_policy
+        self._resumed_tool_started: bool | None = None
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
@@ -217,10 +214,22 @@ class TUIApp:
         )
         if resolved:
             self._print(Text(f"[approval] {parts[0]}d {request_id}", style="green"))
+
+            if not self.loop.prepare_resume_pending_tool(request_id):
+                self._present_pending_approvals()
+                return True
+
+            async def resume() -> Any:
+                self._resumed_tool_started = True
+                return await self.loop.resume_pending_tool(
+                    request_id, prepared=True
+                )
+
             resume_task = asyncio.create_task(
-                self.loop.resume_pending_tool(request_id)
+                resume()
             )
             self._active_task = resume_task
+            self._resumed_tool_started = False
             try:
                 result = await resume_task
             except asyncio.CancelledError:
@@ -229,6 +238,7 @@ class TUIApp:
             finally:
                 if self._active_task is resume_task:
                     self._active_task = None
+                self._resumed_tool_started = None
             request = next(
                 request for request in pending if request.request_id == request_id
             )
@@ -269,7 +279,8 @@ class TUIApp:
     def abort_active(self) -> None:
         if self._active_task is not None and not self._active_task.done():
             self.loop.abort()
-            self._active_task.cancel()
+            if self._resumed_tool_started is not False:
+                self._active_task.cancel()
 
     def _status_toolbar(self) -> FormattedText:
         status = format_status(
@@ -469,6 +480,7 @@ class TUIApp:
                 await asyncio.gather(self._active_task, return_exceptions=True)
 
     def _start_turn(self, user_text: str) -> None:
+        self._resumed_tool_started = None
         self._active_task = asyncio.create_task(self._consume_turn(user_text))
 
 
@@ -506,11 +518,6 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             raise SessionError(
                 f"session override rejected: {'; '.join(mismatches)}; "
                 "use --force-provider to override"
-            )
-        if mismatches and metadata.override_audit:
-            raise SessionError(
-                "session override already committed by a prior resume: "
-                f"{metadata.override_audit[-1]}"
             )
         provider = provider_override or metadata.provider
         model = model_override or metadata.model
@@ -561,8 +568,6 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         model=selected_model,
         verbose=args.verbose,
         history_path=home / "history",
-        session_manager=manager,
-        session_metadata=metadata,
         approval_policy=approval_policy,
     )
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import json
 import os
@@ -225,11 +226,20 @@ class SessionManager:
         provider: str | None,
         model: str | None,
     ) -> None:
+        expected_provider = metadata.provider
+        expected_model = metadata.model
+        expected_audit = copy.deepcopy(metadata.override_audit)
+
         def update(item: SessionMetadata) -> SessionMetadata:
-            if item.override_audit:
+            if (
+                item.provider != expected_provider
+                or item.model != expected_model
+                or item.override_audit != expected_audit
+            ):
                 raise SessionError(
-                    "session override already committed: "
-                    f"{item.override_audit[-1]}"
+                    "session override changed before commit; winner: "
+                    f"provider={item.provider!r}, model={item.model!r}, "
+                    f"audit={item.override_audit[-1] if item.override_audit else None}"
                 )
             item.override_audit.append(
                 {
