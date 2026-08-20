@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 from collections import deque
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -20,9 +19,11 @@ from rich.console import Console, RenderableType
 from rich.text import Text
 
 from ..anthropic import AnthropicBackend
+from ..anthropic import AnthropicCredentialStore
 from ..codex import CodexBackend
+from ..codex import CodexCredentialStore
 from ..loop import AgentLoop
-from ..store import ConversationStore
+from ..session import SessionError, SessionManager, SessionMetadata, env_home
 from ..types import (
     CompletionBackend,
     Message,
@@ -41,7 +42,7 @@ DEFAULT_CODEX_MODEL = "gpt-5.4"
 
 
 def _zeta_home() -> Path:
-    return Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
+    return env_home()
 
 
 class FakeInteractiveBackend(CompletionBackend):
@@ -85,17 +86,29 @@ def _chunks(value: str, size: int) -> list[str]:
     return [value[index : index + size] for index in range(0, len(value), size)]
 
 
-def build_backend(provider: str, model: str | None) -> tuple[CompletionBackend, str]:
+def build_backend(
+    provider: str,
+    model: str | None,
+    *,
+    home: str | Path | None = None,
+) -> tuple[CompletionBackend, str]:
     """Build the selected provider without loading network credentials for fake."""
 
+    auth_home = Path(home) if home is not None else _zeta_home()
     if provider == "fake":
         return FakeInteractiveBackend(), model or "offline"
     if provider == "claude":
         selected_model = model or DEFAULT_CLAUDE_MODEL
-        return AnthropicBackend(model=selected_model), selected_model
+        return AnthropicBackend(
+            model=selected_model,
+            token_store=AnthropicCredentialStore(auth_home / "anthropic-oauth.json"),
+        ), selected_model
     if provider == "codex":
         selected_model = model or DEFAULT_CODEX_MODEL
-        return CodexBackend(model=selected_model), selected_model
+        return CodexBackend(
+            model=selected_model,
+            token_store=CodexCredentialStore(auth_home / "codex-oauth.json"),
+        ), selected_model
     raise ValueError(f"unsupported provider: {provider}")
 
 
@@ -130,6 +143,8 @@ class TUIApp:
         console: Console | None = None,
         session: PromptSession[str] | None = None,
         history_path: str | Path | None = None,
+        session_manager: SessionManager | None = None,
+        session_metadata: SessionMetadata | None = None,
     ) -> None:
         self.loop = loop
         self.provider = provider
@@ -148,6 +163,8 @@ class TUIApp:
         self._partial = ""
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
+        self._session_manager = session_manager
+        self._session_metadata = session_metadata
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
@@ -289,6 +306,8 @@ class TUIApp:
 
     async def _consume_turn(self, user_text: str) -> None:
         self._loop_state = "streaming"
+        if self._session_manager is not None and self._session_metadata is not None:
+            self._session_manager.touch(self._session_metadata)
         try:
             async for event in self.loop.run_turn(user_text):
                 self._update_usage(event)
@@ -318,6 +337,9 @@ class TUIApp:
             self._finish_stream()
             self._loop_state = "idle"
             self._print(Text(f"[error] {exc}", style="bold red"))
+        finally:
+            if self._session_manager is not None and self._session_metadata is not None:
+                self._session_manager.touch(self._session_metadata)
 
     async def _read_prompt(self, session: PromptSession[str]) -> str | None:
         try:
@@ -379,15 +401,73 @@ class TUIApp:
 
 
 def create_app(args: argparse.Namespace) -> TUIApp:
-    backend, selected_model = build_backend(args.provider, args.model)
     home = _zeta_home()
-    store = ConversationStore(home / "sessions")
+    manager = SessionManager(home)
+    continue_session = getattr(args, "continue_session", False)
+    resume_id = getattr(args, "resume", None)
+    force_provider = getattr(args, "force_provider", False)
+    resuming = continue_session or resume_id is not None
+    if force_provider and not resuming:
+        raise SessionError("--force-provider requires --continue or --resume")
+
+    if resuming:
+        if resume_id is not None:
+            opened = manager.open(resume_id)
+        else:
+            recent = manager.find_most_recent(cwd=Path.cwd())
+            opened = manager.open(recent.session_id)
+        metadata = opened.metadata
+        provider_override = args.provider
+        model_override = args.model
+        mismatches = []
+        if provider_override is not None and provider_override != metadata.provider:
+            mismatches.append(
+                f"provider {provider_override!r} does not match {metadata.provider!r}"
+            )
+        if model_override is not None and model_override != metadata.model:
+            mismatches.append(
+                f"model {model_override!r} does not match {metadata.model!r}"
+            )
+        if mismatches and not force_provider:
+            raise SessionError(
+                f"session override rejected: {'; '.join(mismatches)}; "
+                "use --force-provider to override"
+            )
+        provider = provider_override or metadata.provider
+        model = model_override or metadata.model
+        if mismatches:
+            manager.record_override(
+                metadata,
+                provider=provider if provider != metadata.provider else None,
+                model=model if model != metadata.model else None,
+            )
+        selected_model = model
+        store = opened.store
+    else:
+        provider = args.provider or "fake"
+        backend, selected_model = build_backend(provider, args.model, home=home)
+        opened = manager.create(
+            provider=provider,
+            model=selected_model,
+            cwd=Path.cwd(),
+        )
+        metadata = opened.metadata
+        store = opened.store
+    if resuming:
+        backend, selected_model = build_backend(provider, model, home=home)
     return TUIApp(
-        AgentLoop(backend, store),
-        provider=args.provider,
+        AgentLoop(
+            backend,
+            store,
+            token_budget=metadata.compaction_budget,
+            retained_tail=metadata.retained_tail,
+        ),
+        provider=provider,
         model=selected_model,
         verbose=args.verbose,
         history_path=home / "history",
+        session_manager=manager,
+        session_metadata=metadata,
     )
 
 
@@ -396,20 +476,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         choices=("fake", "claude", "codex"),
-        default="fake",
         help="completion provider",
     )
     parser.add_argument("--model", help="provider model override")
+    session_group = parser.add_mutually_exclusive_group()
+    session_group.add_argument(
+        "--continue",
+        "-c",
+        dest="continue_session",
+        action="store_true",
+        help="resume the most recent session in this directory",
+    )
+    session_group.add_argument("--resume", help="resume a session by id")
+    parser.add_argument(
+        "--force-provider",
+        action="store_true",
+        help="allow provider or model overrides during resume",
+    )
     parser.add_argument("--verbose", action="store_true", help="show raw stream events")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    app = create_app(args)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        app = create_app(args)
+    except SessionError as exc:
+        parser.error(str(exc))
     with patch_stdout(raw=True):
         asyncio.run(app.run())
     return 0
 
 
-__all__ = ["FakeInteractiveBackend", "TUIApp", "build_parser", "create_app", "main"]
+__all__ = [
+    "FakeInteractiveBackend",
+    "TUIApp",
+    "build_backend",
+    "build_parser",
+    "create_app",
+    "main",
+]
