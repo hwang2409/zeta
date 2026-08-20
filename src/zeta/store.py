@@ -15,7 +15,7 @@ from typing import Any, Iterator, Mapping
 
 import fcntl
 
-from .types import Message
+from .types import Message, ToolCall
 
 
 SCHEMA = "zeta.conversation.v1"
@@ -215,6 +215,7 @@ class ConversationStore:
 
     def _validate_entries(self) -> None:
         ids: set[str] = set()
+        approval_request_ids: set[str] = set()
         for expected_seq, entry in enumerate(self._entries, start=1):
             if entry.seq != expected_seq:
                 raise ConversationIntegrityError(
@@ -230,6 +231,14 @@ class ConversationStore:
                 raise ConversationIntegrityError(
                     f"missing prior parent {entry.parent_id} for {entry.id}"
                 )
+            if entry.type == "approval_request":
+                approval_request_ids.add(entry.data.get("request_id", ""))
+            elif entry.type == "approval_resolution":
+                request_id = entry.data.get("request_id")
+                if request_id not in approval_request_ids:
+                    raise ConversationIntegrityError(
+                        f"approval resolution references unknown request: {request_id}"
+                    )
             ids.add(entry.id)
 
     def _validate_entry_payload(self, entry: ConversationEntry) -> None:
@@ -250,6 +259,21 @@ class ConversationStore:
             elif entry.type == "warning":
                 if type(entry.data.get("message")) is not str:
                     raise ValueError("warning message must be a string")
+            elif entry.type == "approval_request":
+                request_id = entry.data.get("request_id")
+                tool_call = entry.data.get("tool_call")
+                if type(request_id) is not str or not request_id:
+                    raise ValueError("approval request id must be a nonempty string")
+                if type(tool_call) is not dict:
+                    raise ValueError("approval request tool_call must be an object")
+                ToolCall.from_dict(tool_call)
+            elif entry.type == "approval_resolution":
+                request_id = entry.data.get("request_id")
+                decision = entry.data.get("decision")
+                if type(request_id) is not str or not request_id:
+                    raise ValueError("approval resolution id must be a nonempty string")
+                if decision not in {"allow", "deny", "abort"}:
+                    raise ValueError("invalid approval resolution")
             else:
                 raise ValueError(f"unsupported conversation entry type: {entry.type}")
         except (KeyError, TypeError, ValueError) as exc:
@@ -327,6 +351,62 @@ class ConversationStore:
             },
             parent_id,
         )
+
+    def append_approval_request(
+        self,
+        request_id: str,
+        tool_call: ToolCall,
+        *,
+        parent_id: str | None = None,
+    ) -> ConversationEntry:
+        if type(request_id) is not str or not request_id:
+            raise ValueError("approval request id must be a nonempty string")
+        return self._append_row(
+            "approval_request",
+            {"request_id": request_id, "tool_call": tool_call.to_dict()},
+            parent_id,
+        )
+
+    def append_approval_resolution(
+        self,
+        request_id: str,
+        decision: str,
+        *,
+        parent_id: str | None = None,
+    ) -> ConversationEntry:
+        if type(request_id) is not str or not request_id:
+            raise ValueError("approval resolution id must be a nonempty string")
+        if decision not in {"allow", "deny", "abort"}:
+            raise ValueError(f"invalid approval resolution: {decision}")
+        return self._append_row(
+            "approval_resolution",
+            {"request_id": request_id, "decision": decision},
+            parent_id,
+        )
+
+    def approval_states(self) -> dict[str, tuple[ToolCall, str | None]]:
+        """Return the latest durable state for each approval request."""
+
+        with self._append_lock():
+            self._load()
+            states: dict[str, tuple[ToolCall, str | None]] = {}
+            for entry in self._entries:
+                if entry.type == "approval_request":
+                    request_id = entry.data["request_id"]
+                    states[request_id] = (ToolCall.from_dict(entry.data["tool_call"]), None)
+                elif entry.type == "approval_resolution":
+                    request_id = entry.data["request_id"]
+                    if request_id in states:
+                        tool_call, _ = states[request_id]
+                        states[request_id] = (tool_call, entry.data["decision"])
+            return states
+
+    def pending_approvals(self) -> list[tuple[str, ToolCall]]:
+        return [
+            (request_id, tool_call)
+            for request_id, (tool_call, decision) in self.approval_states().items()
+            if decision is None
+        ]
 
     def replay(self) -> list[ConversationEntry]:
         if not self._entries:

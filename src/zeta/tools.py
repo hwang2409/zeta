@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .approval import ApprovalDecision, ApprovalPolicy
+from .store import ConversationStore
 from .types import ToolCall, ToolResult, ToolSchema
 
 
@@ -149,6 +151,8 @@ class ToolRegistry:
         pre_execute_hook: ToolHook | None = None,
         hook: ToolHook | None = None,
         abort_signal: ToolAbortSignal | asyncio.Event | None = None,
+        approval_policy: ApprovalPolicy | None = None,
+        approval_store: ConversationStore | None = None,
         max_output_chars: int = 10_000,
         register_builtin: bool = True,
     ) -> None:
@@ -161,6 +165,10 @@ class ToolRegistry:
             raise ValueError("pass only one pre-execution hook")
         self.pre_execute_hook = pre_execute_hook or hook
         self.abort_signal = abort_signal or ToolAbortSignal()
+        self.approval_policy = approval_policy
+        self.approval_store = approval_store
+        if self.approval_policy is not None and self.approval_store is not None:
+            self.approval_policy.bind_store(self.approval_store)
         self.max_output_chars = max_output_chars
         self._tools: dict[str, ToolDefinition] = {}
         if register_builtin:
@@ -237,6 +245,11 @@ class ToolRegistry:
         """Rotate the active signal before a new tool batch."""
         self.abort_signal = ToolAbortSignal()
 
+    def bind_approval_store(self, store: ConversationStore) -> None:
+        self.approval_store = store
+        if self.approval_policy is not None:
+            self.approval_policy.bind_store(store)
+
     async def execute(
         self,
         tool_call: ToolCall,
@@ -255,6 +268,18 @@ class ToolRegistry:
             return ToolResult(tool_call.id, f"invalid arguments: {exc}", True)
         if _signal_is_set(signal_state):
             return _canceled_result(tool_call.id)
+        if self.approval_policy is not None:
+            try:
+                decision = await self.approval_policy.authorize(
+                    tool_call,
+                    signal_state,
+                )
+            except Exception as exc:
+                return ToolResult(tool_call.id, f"approval failed: {exc}", True)
+            if decision is None or _signal_is_set(signal_state):
+                return _canceled_result(tool_call.id)
+            if decision is ApprovalDecision.DENY:
+                return ToolResult(tool_call.id, "tool execution denied", True)
         if self.pre_execute_hook is not None:
             try:
                 allowed = self.pre_execute_hook(tool_call.name, arguments)

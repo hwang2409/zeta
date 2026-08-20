@@ -1,4 +1,5 @@
 """Custom agent harness."""
+from .approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from .anthropic import (
     AnthropicAuthError,
     AnthropicBackend,
@@ -31,6 +32,9 @@ from .types import *
 __all__ = [
     "DEFAULT_CODEX_MODEL",
     "AgentLoop",
+    "ApprovalDecision",
+    "ApprovalPolicy",
+    "ApprovalRequest",
     "AbortSignal",
     "AnthropicAuthError",
     "AnthropicBackend",
