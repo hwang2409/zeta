@@ -428,16 +428,29 @@ class ConversationStore:
         source_seq_end: int,
         *,
         parent_id: str | None = None,
+        expected_parent_id: str | None = None,
     ) -> ConversationEntry:
-        return self._append_row(
-            "compaction",
-            {
-                "summary": summary,
-                "source_seq_start": source_seq_start,
-                "source_seq_end": source_seq_end,
-            },
-            parent_id,
-        )
+        data = {
+            "summary": summary,
+            "source_seq_start": source_seq_start,
+            "source_seq_end": source_seq_end,
+        }
+        if expected_parent_id is None:
+            return self._append_row("compaction", data, parent_id)
+        with self._append_lock():
+            self._load()
+            branch = self.replay()
+            current_parent_id = branch[-1].id if branch else None
+            if current_parent_id != expected_parent_id:
+                raise ConversationIntegrityError(
+                    "active branch changed while appending compaction"
+                )
+            entry = self._append_row_unlocked(
+                "compaction",
+                data,
+                expected_parent_id,
+            )
+            return self._snapshot_entry(entry)
 
     def append_message_with_approval_requests(
         self,

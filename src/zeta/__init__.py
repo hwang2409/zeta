@@ -28,7 +28,9 @@ from .context import (
     BudgetExceeded,
     CompactionPolicy,
     ContextAssembler,
+    StaleBranchError,
     SummaryCompletionError,
+    SummaryInputTooLarge,
 )
 from .fake import FakeBackend, ScriptedTurn
 from .loop import AgentLoop
@@ -72,7 +74,9 @@ __all__ = [
     "OAuthTokens",
     "RedactedThinkingContent",
     "ScriptedTurn",
+    "StaleBranchError",
     "SummaryCompletionError",
+    "SummaryInputTooLarge",
     "StreamEvent",
     "StreamEventType",
     "TextContent",

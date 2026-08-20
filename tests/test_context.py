@@ -3,7 +3,13 @@ from tempfile import TemporaryDirectory
 
 import pytest
 
-from zeta.context import BudgetExceeded, ContextAssembler
+from zeta.context import (
+    BudgetExceeded,
+    CompactionPolicy,
+    ContextAssembler,
+    StaleBranchError,
+    SummaryInputTooLarge,
+)
 from zeta.fake import FakeBackend, ScriptedTurn
 from zeta.store import ConversationStore
 from zeta.types import (
@@ -13,6 +19,8 @@ from zeta.types import (
     ToolCall,
     ToolResult,
     ToolUseContent,
+    StreamEvent,
+    StreamEventType,
 )
 
 
@@ -35,7 +43,12 @@ def count(message: Message) -> int:
 
 
 def compact_count(message: Message) -> int:
-    return 1 if message.role in {MessageRole.SYSTEM, MessageRole.COMPACTION} or message.metadata.get("compaction_summary") else count(message)
+    if (
+        message.role in {MessageRole.SYSTEM, MessageRole.COMPACTION}
+        or message.metadata.get("compaction_summary")
+    ):
+        return 1
+    return 30
 
 
 @pytest.mark.asyncio
@@ -121,7 +134,7 @@ async def test_summary_completion_has_no_tools(context_root: Path) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
-        token_budget=8,
+        token_budget=40,
         retained_tail=1,
         token_counter=compact_count,
         backend=backend,
@@ -141,7 +154,7 @@ async def test_failed_summary_leaves_store_unchanged(context_root: Path) -> None
     backend = FakeBackend([ScriptedTurn()])
     assembler = ContextAssembler(
         store,
-        token_budget=8,
+        token_budget=40,
         retained_tail=1,
         token_counter=compact_count,
         backend=backend,
@@ -162,7 +175,7 @@ async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> 
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
-        token_budget=8,
+        token_budget=40,
         retained_tail=1,
         token_counter=compact_count,
         backend=backend,
@@ -214,7 +227,7 @@ async def test_compaction_is_idempotent_for_same_store_state(context_root: Path)
     backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
     assembler = ContextAssembler(
         store,
-        token_budget=8,
+        token_budget=40,
         retained_tail=1,
         token_counter=compact_count,
         backend=backend,
@@ -226,3 +239,117 @@ async def test_compaction_is_idempotent_for_same_store_state(context_root: Path)
 
     assert store.path.read_bytes() == before
     assert len([entry for entry in store.entries if entry.type == "compaction"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_over_budget_compaction_does_not_persist_marker(context_root: Path) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(text(MessageRole.USER, "old"))
+    store.append_message(text(MessageRole.USER, "tail"))
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
+
+    def output_count(message: Message) -> int:
+        if message.role in {MessageRole.SYSTEM, MessageRole.COMPACTION}:
+            return 1
+        if message.metadata.get("compaction_summary"):
+            return 100
+        return 30
+
+    assembler = ContextAssembler(
+        store,
+        token_budget=40,
+        retained_tail=1,
+        token_counter=output_count,
+        backend=backend,
+    )
+    before = store.path.read_bytes()
+
+    with pytest.raises(BudgetExceeded, match="compacted context"):
+        await assembler.assemble()
+
+    assert store.path.read_bytes() == before
+    assert not any(entry.type == "compaction" for entry in store.entries)
+
+
+@pytest.mark.asyncio
+async def test_repeated_compaction_replaces_previous_marker(context_root: Path) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(text(MessageRole.USER, "old"))
+    store.append_compaction_marker("first summary", 1, 1)
+    store.append_message(text(MessageRole.USER, "new one"))
+    store.append_message(text(MessageRole.USER, "new tail"))
+    backend = FakeBackend([ScriptedTurn([TextContent("second summary")])])
+
+    def repeat_count(message: Message) -> int:
+        if (
+            message.role in {MessageRole.SYSTEM, MessageRole.COMPACTION}
+            or message.metadata.get("compaction_summary")
+        ):
+            return 1
+        return 200
+
+    assembler = ContextAssembler(
+        store,
+        token_budget=400,
+        retained_tail=1,
+        token_counter=repeat_count,
+        backend=backend,
+    )
+
+    messages = await assembler.assemble()
+
+    assert [message.role for message in messages].count(MessageRole.COMPACTION) == 1
+    assert [
+        message.metadata.get("compaction_summary")
+        for message in messages
+        if message.role is MessageRole.ASSISTANT
+    ] == [True]
+
+
+def test_zero_retained_tail_is_rejected(context_root: Path) -> None:
+    store = ConversationStore(context_root)
+
+    with pytest.raises(ValueError, match="at least one"):
+        ContextAssembler(store, retained_tail=0)
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_discards_summary(context_root: Path) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(text(MessageRole.USER, "old"))
+    store.append_message(text(MessageRole.USER, "tail"))
+
+    class RebranchingBackend:
+        async def complete(self, messages: object, tool_schemas: object):
+            store.append_message(text(MessageRole.USER, "rebranched"))
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=text(MessageRole.ASSISTANT, "summary"),
+            )
+
+    assembler = ContextAssembler(
+        store,
+        token_budget=40,
+        retained_tail=1,
+        token_counter=compact_count,
+        backend=RebranchingBackend(),
+    )
+
+    with pytest.raises(StaleBranchError):
+        await assembler.assemble()
+
+    assert not any(entry.type == "compaction" for entry in store.entries)
+
+
+@pytest.mark.asyncio
+async def test_summary_source_bound_rejects_large_input(context_root: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("unused")])])
+    policy = CompactionPolicy(backend)
+
+    with pytest.raises(SummaryInputTooLarge):
+        await policy.summarize(
+            [text(MessageRole.USER, "x" * 200)],
+            max_source_tokens=10,
+        )
+
+    assert backend.calls == []

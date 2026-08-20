@@ -31,6 +31,14 @@ class SummaryCompletionError(RuntimeError):
     """The no-tools completion did not produce a usable summary."""
 
 
+class SummaryInputTooLarge(SummaryCompletionError):
+    """The source range is too large for a safe summary request."""
+
+
+class StaleBranchError(RuntimeError):
+    """The active branch changed while a summary was in flight."""
+
+
 @dataclass(frozen=True, slots=True)
 class AssembledContext:
     messages: list[Message]
@@ -93,6 +101,7 @@ class CompactionPolicy:
         *,
         backend: CompletionBackend | None = None,
         system_prompt: Message | None = None,
+        max_source_tokens: int | None = None,
     ) -> str:
         completion_backend = backend or self.backend
         if completion_backend is None:
@@ -102,6 +111,12 @@ class CompactionPolicy:
             sort_keys=True,
             separators=(",", ":"),
         )
+        source_tokens = max(1, ceil(len(source) / 4))
+        if max_source_tokens is not None and source_tokens > max_source_tokens:
+            raise SummaryInputTooLarge(
+                f"summary source is too large: {source_tokens} tokens "
+                f"exceeds {max_source_tokens}"
+            )
         prompt = Message(
             MessageRole.USER,
             [TextContent(f"{self.summary_prompt}\n\n{source}")],
@@ -155,8 +170,8 @@ class ContextAssembler:
     ) -> None:
         if token_budget <= 0:
             raise ValueError("token budget must be positive")
-        if retained_tail < 0:
-            raise ValueError("retained tail must not be negative")
+        if retained_tail < 1:
+            raise ValueError("retained tail must be at least one")
         self.store = store
         self.token_budget = token_budget
         self.retained_tail = retained_tail
@@ -209,7 +224,9 @@ class ContextAssembler:
         *,
         backend: CompletionBackend | None = None,
     ) -> AssembledContext:
-        items = self._visible_items(self.store.replay())
+        branch = self.store.replay()
+        branch_id = self._branch_id(branch)
+        items = self._visible_items(branch)
         boundary = self._tail_boundary(items)
         committed = [item for item in items if item.fixed]
         committed.extend(item for item in items[boundary:] if not item.fixed)
@@ -230,39 +247,58 @@ class ContextAssembler:
                 "system prompt and retained tail exceed the token budget"
             )
 
-        candidates = [
-            item
-            for item in items[:boundary]
-            if (
-                item.entry is not None
-                and item.entry.type == "message"
-                and not item.fixed
-            )
-        ]
+        candidates = list(items[:boundary])
         if not candidates:
             raise BudgetExceeded("context exceeds budget and has no compactible range")
-        source_entries = [item.entry for item in candidates if item.entry is not None]
-        source_start = min(entry.seq for entry in source_entries)
-        source_end = max(entry.seq for entry in source_entries)
+        source_entries = {
+            item.entry.id: item.entry
+            for item in candidates
+            if item.entry is not None
+        }
+        source_start = min(entry.seq for entry in source_entries.values())
+        source_end = max(entry.seq for entry in source_entries.values())
         summary = await self.compaction_policy.summarize(
             [item.message for item in candidates],
             backend=backend or self.backend,
             system_prompt=self.system_prompt,
+            max_source_tokens=max(1, self.token_budget // 2),
         )
-        self.store.append_compaction_marker(summary, source_start, source_end)
-        items = self._visible_items(self.store.replay())
-        messages = [self.system_prompt, *(item.message for item in items)]
-        result = self._save(messages, True)
-        self._provider_token_total = None
-        return result
+        if self._branch_id(self.store.replay()) != branch_id:
+            raise StaleBranchError("active branch changed during compaction")
 
-    def _save(self, messages: list[Message], compacted: bool) -> AssembledContext:
-        context = AssembledContext(
+        marker_messages = self._marker_messages(source_start, source_end, summary)
+        proposed_messages = [
+            self.system_prompt,
+            *marker_messages,
+            *(item.message for item in items[boundary:]),
+        ]
+        proposed = self._context(proposed_messages, True)
+        if proposed.token_count > self.token_budget:
+            raise BudgetExceeded("compacted context exceeds the token budget")
+
+        try:
+            self.store.append_compaction_marker(
+                summary,
+                source_start,
+                source_end,
+                expected_parent_id=branch_id,
+            )
+        except ValueError as exc:
+            raise StaleBranchError("active branch changed during compaction") from exc
+        self._provider_token_total = None
+        self.last_context = proposed
+        return proposed
+
+    def _context(self, messages: list[Message], compacted: bool) -> AssembledContext:
+        return AssembledContext(
             messages=messages,
             token_count=self._count(messages),
             digest=_digest(messages),
             compacted=compacted,
         )
+
+    def _save(self, messages: list[Message], compacted: bool) -> AssembledContext:
+        context = self._context(messages, compacted)
         self.last_context = context
         return context
 
@@ -276,7 +312,16 @@ class ContextAssembler:
         return max(estimated, self._provider_token_total)
 
     def _visible_items(self, entries: Sequence[ConversationEntry]) -> list[_ContextItem]:
-        markers = [entry for entry in entries if entry.type == "compaction"]
+        all_markers = [entry for entry in entries if entry.type == "compaction"]
+        markers = [
+            entry
+            for entry in all_markers
+            if not any(
+                other is not entry
+                and other.data["source_seq_start"] <= entry.seq <= other.data["source_seq_end"]
+                for other in all_markers
+            )
+        ]
         compacted_ranges = [
             (entry.data["source_seq_start"], entry.data["source_seq_end"])
             for entry in markers
@@ -303,33 +348,40 @@ class ContextAssembler:
 
     @staticmethod
     def _marker_items(entry: ConversationEntry) -> list[_ContextItem]:
-        source_start = entry.data["source_seq_start"]
-        source_end = entry.data["source_seq_end"]
+        messages = ContextAssembler._marker_messages(
+            entry.data["source_seq_start"],
+            entry.data["source_seq_end"],
+            entry.data["summary"],
+        )
+        return [_ContextItem(entry, message, fixed=True) for message in messages]
+
+    @staticmethod
+    def _marker_messages(
+        source_start: int,
+        source_end: int,
+        summary: str,
+    ) -> list[Message]:
         marker_text = f"[compaction marker: entries {source_start}–{source_end}]"
         metadata = {
             "source_seq_start": source_start,
             "source_seq_end": source_end,
         }
         return [
-            _ContextItem(
-                entry,
-                Message(
-                    MessageRole.COMPACTION,
-                    [TextContent(marker_text)],
-                    metadata=metadata,
-                ),
-                fixed=True,
+            Message(
+                MessageRole.COMPACTION,
+                [TextContent(marker_text)],
+                metadata=metadata,
             ),
-            _ContextItem(
-                entry,
-                Message(
-                    MessageRole.ASSISTANT,
-                    [TextContent(entry.data["summary"])],
-                    metadata={"compaction_summary": True, **metadata},
-                ),
-                fixed=True,
+            Message(
+                MessageRole.ASSISTANT,
+                [TextContent(summary)],
+                metadata={"compaction_summary": True, **metadata},
             ),
         ]
+
+    @staticmethod
+    def _branch_id(entries: Sequence[ConversationEntry]) -> str | None:
+        return entries[-1].id if entries else None
 
     def _tail_boundary(self, items: Sequence[_ContextItem]) -> int:
         tail_start = max(0, len(items) - self.retained_tail)
