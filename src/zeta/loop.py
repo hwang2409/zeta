@@ -7,7 +7,7 @@ import warnings
 from collections.abc import AsyncIterator, Mapping, Sequence
 
 from .store import ConversationStore
-from .tools import ToolHandler, ToolRegistry
+from .tools import ToolAbortSignal, ToolHandler, ToolRegistry
 from .types import (
     CompletionBackend,
     ContentBlock,
@@ -83,7 +83,7 @@ class AgentLoop:
         elif isinstance(tools, ToolRegistry):
             self.tool_registry = tools
         elif isinstance(tools, Mapping):
-            self.tool_registry = ToolRegistry(store.cwd)
+            self.tool_registry = ToolRegistry(store.cwd, register_builtin=False)
             schemas_by_name = {
                 schema.get("name"): schema
                 for schema in (tool_schemas or [])
@@ -200,6 +200,7 @@ class AgentLoop:
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
 
+            batch_abort_signal: ToolAbortSignal = self.tool_registry.new_abort_signal()
             call_index = 0
             while call_index < len(calls):
                 parallel_calls: list[ToolCall] = []
@@ -223,7 +224,10 @@ class AgentLoop:
                             StreamEventType.TOOL_EXECUTION_START,
                             tool_call=tool_call,
                         )
-                    results = await self.tool_registry.execute_many(parallel_calls)
+                    results = await self.tool_registry.execute_many(
+                        parallel_calls,
+                        abort_signal=batch_abort_signal,
+                    )
                     for tool_call, result in zip(parallel_calls, results, strict=True):
                         result = _validated_tool_result(result, tool_call.id)
                         self._append_tool_result(result)
@@ -241,7 +245,10 @@ class AgentLoop:
                     tool_call=tool_call,
                 )
                 try:
-                    result = await self.tool_registry.execute(tool_call)
+                    result = await self.tool_registry.execute(
+                        tool_call,
+                        abort_signal=batch_abort_signal,
+                    )
                 except Exception as exc:
                     result = ToolResult(tool_call.id, str(exc), is_error=True)
                 result = _validated_tool_result(result, tool_call.id)

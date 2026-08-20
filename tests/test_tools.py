@@ -28,6 +28,10 @@ def _descendant_command(marker: Path, delay: float = 0.3) -> str:
     return _python_command(parent)
 
 
+async def _collect_loop(loop: AgentLoop) -> list[object]:
+    return [event async for event in loop.run_turn("go")]
+
+
 @pytest.mark.asyncio
 async def test_registry_validates_arguments_before_running_handler(tmp_path: Path) -> None:
     called = False
@@ -73,6 +77,12 @@ def test_registry_rejects_unsupported_schema_constructs(tmp_path: Path) -> None:
                 "type": "string",
                 "anyOf": [{"minLength": 2}],
             },
+        )
+    with pytest.raises(ValueError, match="schema must contain JSON data"):
+        registry.register(
+            "non-json",
+            lambda arguments: "ran",
+            parameters={"type": "object", "const": object()},
         )
 
 
@@ -129,6 +139,24 @@ async def test_builtin_tools_read_list_and_exec_use_session_cwd(tmp_path: Path) 
     assert "nested/note.txt" in list_result.content
     assert str(tmp_path) in exec_result.content
     assert "not a sandbox" in registry.schemas[2]["description"]
+
+
+@pytest.mark.asyncio
+async def test_list_abort_returns_canceled_result_during_traversal(tmp_path: Path) -> None:
+    for index in range(256):
+        (tmp_path / f"file-{index:03d}.txt").write_text("x", encoding="utf-8")
+    abort_signal = ToolAbortSignal()
+    registry = ToolRegistry(tmp_path, abort_signal=abort_signal)
+
+    async def abort_soon() -> None:
+        await asyncio.sleep(0)
+        abort_signal.abort()
+
+    abort_task = asyncio.create_task(abort_soon())
+    result = await registry.execute(ToolCall("list-abort", "list", {"depth": 1}))
+    await abort_task
+
+    assert result == ToolResult("list-abort", "tool execution canceled", True)
 
 
 @pytest.mark.asyncio
@@ -370,3 +398,68 @@ async def test_agent_loop_mapping_tools_still_validate_through_registry(
     assert result is not None and result.is_error
     assert "invalid arguments" in result.content
     assert not called
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_mapping_tools_do_not_expose_builtins(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall("call-1", "exec", {"command": "printf unsafe"})
+                ]
+            ),
+            ScriptedTurn(content=[TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+
+    await _collect_loop(
+        AgentLoop(
+            backend,
+            store,
+            tools={"safe_only": lambda arguments: "safe"},
+            tool_schemas=[{"name": "safe_only"}],
+        )
+    )
+
+    result = store.messages()[2].tool_result
+    assert result is not None
+    assert result.content == "unknown tool: exec"
+    assert result.is_error
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_refreshes_abort_signal_each_turn(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall("call-1", "step", {"value": "abort"}),
+                    ToolCall("call-2", "step", {"value": "canceled"}),
+                ]
+            ),
+            ScriptedTurn(tool_calls=[ToolCall("call-3", "step", {"value": "next"})]),
+            ScriptedTurn(content=[TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+
+    async def step(
+        arguments: dict[str, str],
+        abort_signal: ToolAbortSignal,
+    ) -> str:
+        if arguments["value"] == "abort":
+            abort_signal.abort()
+        return arguments["value"]
+
+    await _collect_loop(
+        AgentLoop(backend, store, tools={"step": step})
+    )
+
+    results = [message.tool_result for message in store.messages() if message.tool_result]
+    assert [result.content for result in results] == [
+        "abort",
+        "tool execution canceled",
+        "next",
+    ]

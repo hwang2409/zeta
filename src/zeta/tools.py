@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
+import json
 import os
 import signal
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -150,6 +151,10 @@ class ToolRegistry:
             if not callable(set_signal):
                 raise TypeError("abort signal does not support abort or set")
             set_signal()
+
+    def new_abort_signal(self) -> ToolAbortSignal:
+        """Create the signal for one independent execution batch."""
+        return ToolAbortSignal()
 
     async def execute(
         self,
@@ -321,6 +326,8 @@ class ToolRegistry:
         depth = arguments.get("depth", 1)
         found: list[str] = []
         await self._list_children(path, depth, found, abort_signal)
+        if _signal_is_set(abort_signal):
+            raise _ToolCanceled()
         return "\n".join(found)
 
     async def _list_children(
@@ -336,9 +343,13 @@ class ToolRegistry:
             entries = sorted(path.iterdir(), key=lambda item: item.name)
         except OSError as exc:
             raise ValueError(f"could not list directory: {exc}") from exc
-        for entry in entries:
+        for index, entry in enumerate(entries):
             if _signal_is_set(abort_signal):
-                return
+                raise _ToolCanceled()
+            if index % 64 == 0:
+                await asyncio.sleep(0)
+                if _signal_is_set(abort_signal):
+                    raise _ToolCanceled()
             try:
                 relative = os.fspath(entry.relative_to(self.cwd))
             except ValueError:
@@ -446,8 +457,15 @@ def _normalize_schema(schema: Mapping[str, Any] | None) -> dict[str, Any]:
         return {"type": "object", "properties": {}}
     if not isinstance(schema, Mapping):
         raise TypeError("tool parameter schema must be an object")
-    normalized = copy.deepcopy(dict(schema))
+    try:
+        normalized = copy.deepcopy(dict(schema))
+    except Exception as exc:
+        raise ValueError("schema must contain JSON data") from exc
     _validate_schema_definition(normalized, "schema")
+    try:
+        json.dumps(normalized, allow_nan=False)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("schema must contain JSON data") from exc
     return normalized
 
 
