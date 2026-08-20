@@ -4,7 +4,7 @@ from urllib.parse import quote
 
 import pytest
 
-from zeta.auth import error_body_excerpt
+from zeta.auth import _redact_multipart, error_body_excerpt
 
 
 SENSITIVE_NAMES = (
@@ -61,6 +61,15 @@ NEW_NAME_VARIANTS = (
     "x_goog_credential",
     "xGoogSignature",
     "x_goog_signature",
+    "auth_token",
+    "api_secret",
+    "consumer_secret",
+    "signing_key",
+    "credentials",
+    "authToken",
+    "apiSecret",
+    "consumerSecret",
+    "signingKey",
 )
 
 
@@ -292,6 +301,107 @@ def test_error_body_excerpt_joins_folded_multipart_headers() -> None:
     )
 
     assert "folded-marker" not in error_body_excerpt(body)
+
+
+def test_error_body_excerpt_rejects_leading_space_boundary_lookalikes() -> None:
+    body = (
+        b"Content-Type: multipart/form-data; boundary=outer\r\n\r\n"
+        b"--outer\r\n"
+        b"Content-Disposition: form-data; name=password\r\n\r\n"
+        b" --outer\r\n"
+        b"leading-space-boundary-lookalike\r\n"
+        b"--outer--\r\n"
+    )
+
+    assert "leading-space-boundary-lookalike" not in error_body_excerpt(body)
+
+
+def test_error_body_excerpt_recovers_when_inner_boundary_is_not_closed() -> None:
+    body = (
+        b"Content-Type: multipart/mixed; boundary=outer\r\n\r\n"
+        b"--outer\r\n"
+        b"Content-Disposition: form-data; name=container\r\n"
+        b"Content-Type: multipart/mixed; boundary=inner\r\n\r\n"
+        b"--inner\r\n"
+        b"Content-Disposition: form-data; name=ordinary\r\n\r\n"
+        b"ordinary value\r\n"
+        b"--outer\r\n"
+        b"Content-Disposition: form-data; name=password\r\n\r\n"
+        b"missing-inner-close-marker\r\n"
+        b"--outer--\r\n"
+    )
+
+    assert "missing-inner-close-marker" not in error_body_excerpt(body)
+
+
+@pytest.mark.parametrize(
+    "disposition",
+    [
+        "form-data; (nested (comment)) name=password",
+        'form-data; (comment) name="password"',
+        "form-data; name (trailing)=password",
+    ],
+)
+def test_error_body_excerpt_strips_folded_mime_comments(disposition: str) -> None:
+    body = (
+        "Content-Type: multipart/form-data; boundary=outer\r\n\r\n"
+        "--outer\r\n"
+        f"Content-Disposition: {disposition}\r\n\r\n"
+        "folded-comment-marker\r\n"
+        "--outer--\r\n"
+    ).encode()
+
+    assert "folded-comment-marker" not in error_body_excerpt(body)
+
+
+def test_error_body_excerpt_handles_deep_multipart_without_recursion() -> None:
+    depth = 2000
+    lines = [f"Content-Type: multipart/mixed; boundary=b0\r\n", "\r\n"]
+    for index in range(depth):
+        if index + 1 < depth:
+            lines.extend(
+                [
+                    f"--b{index}\r\n",
+                    "Content-Disposition: form-data; name=container\r\n",
+                    f"Content-Type: multipart/mixed; boundary=b{index + 1}\r\n",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"--b{index}\r\n",
+                    "Content-Disposition: form-data; name=password\r\n",
+                ]
+            )
+        lines.append("\r\n")
+    lines.append("deep-nesting-marker\r\n")
+    for index in range(depth - 1, -1, -1):
+        lines.append(f"--b{index}--\r\n")
+
+    depths: list[int] = [1]
+    redacted = _redact_multipart("".join(lines), depth_observer=depths)
+
+    assert "deep-nesting-marker" not in redacted
+    assert max(depths) == depth
+
+
+def test_error_body_excerpt_joins_large_folded_header_once() -> None:
+    folded = " x\r\n" * (792_000 // 3)
+    body = (
+        "Content-Type: multipart/form-data; boundary=outer\r\n\r\n"
+        "--outer\r\n"
+        "Content-Disposition: form-data;\r\n"
+        f"{folded} name=password\r\n\r\n"
+        "folded-header-timing-marker\r\n"
+        "--outer--\r\n"
+    ).encode()
+    started = time.perf_counter()
+
+    excerpt = error_body_excerpt(body)
+
+    elapsed = time.perf_counter() - started
+    assert "folded-header-timing-marker" not in excerpt
+    assert elapsed < 0.2
 
 
 @pytest.mark.parametrize(

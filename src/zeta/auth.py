@@ -53,6 +53,11 @@ _SENSITIVE_ERROR_NAMES = frozenset(
         "xamzcredential",
         "xgoogcredential",
         "xgoogsignature",
+        "authtoken",
+        "apisecret",
+        "consumersecret",
+        "signingkey",
+        "credentials",
         "token",
         "apikey",
         "websocketkey",
@@ -131,7 +136,31 @@ def _header_value(headers: list[str], name: str) -> str | None:
 def _header_parameter(value: str | None, name: str) -> str | None:
     if value is None:
         return None
-    for segment in value.split(";"):
+    clean = _strip_mime_comments(value)
+    if '"' not in clean:
+        segments = clean.split(";")
+    else:
+        segments = []
+        fragment: list[str] = []
+        quoted = False
+        escaped = False
+        for character in clean:
+            if escaped:
+                fragment.append(character)
+                escaped = False
+            elif quoted and character == "\\":
+                fragment.append(character)
+                escaped = True
+            elif character == '"':
+                fragment.append(character)
+                quoted = not quoted
+            elif character == ";" and not quoted:
+                segments.append("".join(fragment))
+                fragment = []
+            else:
+                fragment.append(character)
+        segments.append("".join(fragment))
+    for segment in segments:
         key, separator, parameter = segment.partition("=")
         if separator and key.strip().lower() == name:
             parameter = parameter.strip()
@@ -141,13 +170,44 @@ def _header_parameter(value: str | None, name: str) -> str | None:
     return None
 
 
+def _strip_mime_comments(value: str) -> str:
+    if "(" not in value and ")" not in value:
+        return value
+    result: list[str] = []
+    depth = 0
+    quoted = False
+    escaped = False
+    for character in value:
+        if escaped:
+            if depth == 0:
+                result.append(character)
+            escaped = False
+        elif quoted:
+            result.append(character)
+            if character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+        elif character == '"':
+            quoted = True
+            result.append(character)
+        elif character == "(":
+            depth += 1
+        elif character == ")" and depth:
+            depth -= 1
+        elif depth == 0:
+            result.append(character)
+    return "".join(result)
+
+
 def _multipart_name(headers: list[str]) -> str | None:
     disposition = _header_value(headers, "content-disposition")
     return _header_parameter(disposition, "name")
 
 
 def _boundary_kind(line: str, boundary: str) -> str | None:
-    content = line.strip()
+    content, _ = _line_parts(line)
+    content = content.rstrip(" \t")
     if content == f"--{boundary}":
         return "open"
     if content == f"--{boundary}--":
@@ -157,20 +217,49 @@ def _boundary_kind(line: str, boundary: str) -> str | None:
 
 def _read_headers(lines: list[str], start: int) -> tuple[list[str], int]:
     headers: list[str] = []
+    fragments: list[str] = []
     index = start
     while index < len(lines):
         content, _ = _line_parts(lines[index])
         if not content.strip():
+            if fragments:
+                headers.append(" ".join(fragments))
             return headers, index + 1
-        if content[:1] in " \t" and headers:
-            headers[-1] += " " + content.strip()
+        if content[:1] in " \t" and fragments:
+            try:
+                blank = lines.index("\r\n", index)
+            except ValueError:
+                try:
+                    blank = lines.index("\n", index)
+                except ValueError:
+                    blank = lines.index("\r", index)
+            folded = "".join(lines[index:blank])
+            if "\n--" not in folded and "\r--" not in folded:
+                fragments.append(
+                    folded.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+                )
+                index = blank
+                continue
+            fragments.append(content.strip())
         else:
-            headers.append(content)
+            if fragments:
+                headers.append(" ".join(fragments))
+            fragments = [content]
         index += 1
+    if fragments:
+        headers.append(" ".join(fragments))
     return headers, index
 
 
-def _redact_multipart(text: str) -> str:
+@dataclass(slots=True)
+class _MultipartFrame:
+    boundary: str
+    inherited_sensitive: bool
+    awaiting_boundary: bool = False
+    part_sensitive: bool = False
+
+
+def _redact_multipart(text: str, *, depth_observer: list[int] | None = None) -> str:
     lines = text.splitlines(keepends=True)
     if not lines:
         return text
@@ -183,62 +272,72 @@ def _redact_multipart(text: str) -> str:
             (
                 index
                 for index, line in enumerate(lines)
-                if _line_parts(line)[0].strip().startswith("--")
+                if (
+                    (content := _line_parts(line)[0]).startswith("--")
+                    and not content.startswith("-- ")
+                )
             ),
             len(lines),
         )
         if first_boundary == len(lines):
             return text
-        first_line = _line_parts(lines[first_boundary])[0].strip()
+        first_line = _line_parts(lines[first_boundary])[0].rstrip(" \t")
         boundary = first_line[2:].removesuffix("--")
     if not boundary:
         return text
-    while first_boundary < len(lines) and _boundary_kind(lines[first_boundary], boundary) != "open":
+    while (
+        first_boundary < len(lines)
+        and _boundary_kind(lines[first_boundary], boundary) != "open"
+    ):
         first_boundary += 1
     if first_boundary == len(lines):
         return text
 
-    def redact_parts(index: int, current_boundary: str, inherited_sensitive: bool) -> int:
-        while index < len(lines):
-            kind = _boundary_kind(lines[index], current_boundary)
-            if kind == "close":
-                return index + 1
-            if kind != "open":
+    boundary_stack = [_MultipartFrame(boundary, False)]
+    index = first_boundary
+    while index < len(lines) and boundary_stack:
+        line = lines[index]
+        match_index: int | None = None
+        match_kind: str | None = None
+        if line.startswith("--"):
+            for depth in range(len(boundary_stack) - 1, -1, -1):
+                kind = _boundary_kind(line, boundary_stack[depth].boundary)
+                if kind is not None:
+                    match_index = depth
+                    match_kind = kind
+                    break
+        if match_index is not None:
+            if match_kind == "close":
+                del boundary_stack[match_index:]
                 index += 1
-                continue
-            headers, body_start = _read_headers(lines, index + 1)
-            part_sensitive = inherited_sensitive or _is_sensitive_name(
-                _multipart_name(headers) or ""
-            )
-            nested_boundary = _header_parameter(
-                _header_value(headers, "content-type"), "boundary"
-            )
-            if nested_boundary:
-                nested_end = redact_parts(body_start, nested_boundary, part_sensitive)
-                body_end = nested_end
-                while body_end < len(lines) and _boundary_kind(
-                    lines[body_end], current_boundary
-                ) is None:
-                    body_end += 1
-                if part_sensitive:
-                    for body_line in range(nested_end, body_end):
-                        _, ending = _line_parts(lines[body_line])
-                        lines[body_line] = f"[redacted]{ending}"
-                index = body_end
-                continue
-            body_end = body_start
-            while body_end < len(lines) and _boundary_kind(
-                lines[body_end], current_boundary
-            ) is None:
-                body_end += 1
-            if part_sensitive:
-                for body_line in range(body_start, body_end):
-                    _, ending = _line_parts(lines[body_line])
-                    lines[body_line] = f"[redacted]{ending}"
-            index = body_end
-        return index
+            else:
+                del boundary_stack[match_index + 1 :]
+                frame = boundary_stack[-1]
+                frame.awaiting_boundary = False
+                headers, index = _read_headers(lines, index + 1)
+                frame.part_sensitive = frame.inherited_sensitive or _is_sensitive_name(
+                    _multipart_name(headers) or ""
+                )
+                nested_boundary = _header_parameter(
+                    _header_value(headers, "content-type"), "boundary"
+                )
+                if nested_boundary:
+                    boundary_stack.append(
+                        _MultipartFrame(nested_boundary, frame.part_sensitive, True)
+                    )
+                    if depth_observer is not None:
+                        depth_observer.append(len(boundary_stack))
+            continue
 
-    redact_parts(first_boundary, boundary, False)
+        frame = boundary_stack[-1]
+        if frame.awaiting_boundary:
+            if frame.inherited_sensitive:
+                ending = line[len(line.rstrip("\r\n")) :]
+                lines[index] = f"[redacted]{ending}"
+        elif frame.part_sensitive:
+            ending = line[len(line.rstrip("\r\n")) :]
+            lines[index] = f"[redacted]{ending}"
+        index += 1
     return "".join(lines)
 
 
