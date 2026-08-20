@@ -232,7 +232,6 @@ class AgentLoop:
                                     break
                                 parallel_calls.append(next_call)
                     if len(parallel_calls) > 1:
-                        parallel_results = [None] * len(calls)
                         for tool_call in parallel_calls:
                             yield StreamEvent(
                                 StreamEventType.TOOL_EXECUTION_START,
@@ -256,14 +255,14 @@ class AgentLoop:
                                     task.result(),
                                     tool_call.id,
                                 )
-                        for index in range(call_index, call_index + len(parallel_calls)):
-                            tool_call = calls[index]
-                            result = parallel_results[index]
-                            if result is None:
-                                continue
-                            parallel_results[index] = None
-                            self._append_tool_result(result)
-                            completed_tool_indexes.add(index)
+                        batch_end = call_index + len(parallel_calls)
+                        results = self._finalize_tool_results(
+                            parallel_calls,
+                            parallel_results[call_index:batch_end],
+                        )
+                        parallel_results[call_index:batch_end] = [None] * len(parallel_calls)
+                        completed_tool_indexes.update(range(call_index, batch_end))
+                        for tool_call, result in zip(parallel_calls, results, strict=True):
                             yield StreamEvent(
                                 StreamEventType.TOOL_EXECUTION_END,
                                 tool_call=tool_call,
@@ -282,7 +281,7 @@ class AgentLoop:
                     except Exception as exc:
                         result = ToolResult(tool_call.id, str(exc), is_error=True)
                     result = _validated_tool_result(result, tool_call.id)
-                    self._append_tool_result(result)
+                    result = self._finalize_tool_results([tool_call], [result])[0]
                     completed_tool_indexes.add(call_index)
                     yield StreamEvent(
                         StreamEventType.TOOL_EXECUTION_END,
@@ -306,18 +305,13 @@ class AgentLoop:
                         task.cancel()
                         pending_tasks.append(task)
                 await asyncio.gather(*pending_tasks, return_exceptions=True)
-                for index, tool_call in enumerate(calls):
-                    if index in completed_tool_indexes:
-                        continue
-                    result = parallel_results[index]
-                    parallel_results[index] = None
-                    if result is None:
-                        self._append_tool_result(
-                            ToolResult(tool_call.id, "tool execution canceled", is_error=True)
-                        )
-                    else:
-                        self._append_tool_result(result)
-                    completed_tool_indexes.add(index)
+                pending_indexes = [
+                    index for index in range(len(calls)) if index not in completed_tool_indexes
+                ]
+                self._finalize_tool_results(
+                    [calls[index] for index in pending_indexes],
+                    [parallel_results[index] for index in pending_indexes],
+                )
                 raise
             yield StreamEvent(
                 StreamEventType.TURN_END,
@@ -331,20 +325,24 @@ class AgentLoop:
         )
         yield StreamEvent(StreamEventType.AGENT_END)
 
-    def _append_tool_result(self, result: ToolResult) -> None:
-        self.store.append_message(
-            Message(
-                MessageRole.TOOL_RESULT,
-                [TextContent(result.content)],
-                tool_result=result,
+    def _finalize_tool_results(
+        self,
+        calls: Sequence[ToolCall],
+        slots: Sequence[ToolResult | None],
+    ) -> list[ToolResult]:
+        results = [
+            result or ToolResult(call.id, "tool execution canceled", is_error=True)
+            for call, result in zip(calls, slots, strict=True)
+        ]
+        for result in results:
+            self.store.append_message(
+                Message(
+                    MessageRole.TOOL_RESULT,
+                    [TextContent(result.content)],
+                    tool_result=result,
+                )
             )
-        )
-
-    def _append_cancelled_tool_results(self, calls: Sequence[ToolCall]) -> None:
-        for call in calls:
-            self._append_tool_result(
-                ToolResult(call.id, "tool execution canceled", is_error=True)
-            )
+        return results
 
     def _persist_partial(
         self,
@@ -397,4 +395,4 @@ class AgentLoop:
             for block in blocks
             if isinstance(block, ToolUseContent)
         ]
-        self._append_cancelled_tool_results(calls)
+        self._finalize_tool_results(calls, [None] * len(calls))

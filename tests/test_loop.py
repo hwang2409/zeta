@@ -217,6 +217,84 @@ async def test_parallel_duplicate_ids_use_indexed_results(tmp_path: Path) -> Non
     assert [result.content for result in results] == ["one", "two"]
 
 
+@pytest.fixture(scope="module")
+def finalize_store_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp("finalize-tool-results")
+
+
+def reverse_completion_slots() -> list[ToolResult | None]:
+    slots: list[ToolResult | None] = [None, None]
+    slots[1] = ToolResult("call-2", "two")
+    slots[0] = ToolResult("call-1", "one")
+    return slots
+
+
+@pytest.mark.parametrize(
+    ("calls", "slots", "expected_contents", "expected_errors"),
+    [
+        pytest.param(
+            [ToolCall("call-1", "first", {}), ToolCall("call-2", "second", {})],
+            [ToolResult("call-1", "one"), ToolResult("call-2", "two")],
+            ["one", "two"],
+            [False, False],
+            id="all-resolved-in-order",
+        ),
+        pytest.param(
+            [ToolCall("call-1", "first", {}), ToolCall("call-2", "second", {})],
+            reverse_completion_slots(),
+            ["one", "two"],
+            [False, False],
+            id="all-resolved-reverse-completion",
+        ),
+        pytest.param(
+            [
+                ToolCall("call-1", "first", {}),
+                ToolCall("call-2", "second", {}),
+                ToolCall("call-3", "third", {}),
+            ],
+            [ToolResult("call-1", "one"), None, ToolResult("call-3", "three")],
+            ["one", "tool execution canceled", "three"],
+            [False, True, False],
+            id="mixed-real-and-canceled",
+        ),
+        pytest.param(
+            [ToolCall("same-id", "first", {}), ToolCall("same-id", "second", {})],
+            [ToolResult("same-id", "one"), ToolResult("same-id", "two")],
+            ["one", "two"],
+            [False, False],
+            id="duplicate-ids",
+        ),
+        pytest.param([], [], [], [], id="zero-calls"),
+        pytest.param(
+            [ToolCall("call-1", "first", {})],
+            [None],
+            ["tool execution canceled"],
+            [True],
+            id="one-canceled-call",
+        ),
+    ],
+)
+def test_finalize_tool_results(
+    finalize_store_path: Path,
+    calls: list[ToolCall],
+    slots: list[ToolResult | None],
+    expected_contents: list[str],
+    expected_errors: list[bool],
+) -> None:
+    loop = AgentLoop(FakeBackend([]), ConversationStore(finalize_store_path))
+
+    results = loop._finalize_tool_results(calls, slots)
+
+    assert [result.content for result in results] == expected_contents
+    assert [result.is_error for result in results] == expected_errors
+    persisted = [
+        message.tool_result
+        for message in loop.store.messages()
+        if message.tool_result is not None
+    ]
+    assert [result.content for result in persisted] == expected_contents
+
+
 @pytest.mark.asyncio
 async def test_parallel_results_persist_in_call_order(tmp_path: Path) -> None:
     first_call = ToolCall("call-1", "first", {})
