@@ -537,6 +537,37 @@ async def test_abort_cancels_calls_after_the_signal_is_set(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_abort_signal_stays_set_for_an_active_handler(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    started = asyncio.Event()
+    observed: list[bool] = []
+
+    async def handler(
+        arguments: dict[str, object],
+        abort_signal: ToolAbortSignal,
+    ) -> str:
+        del arguments
+        started.set()
+        await abort_signal.wait()
+        observed.append(abort_signal.is_set())
+        await asyncio.sleep(0)
+        observed.append(abort_signal.is_set())
+        return "canceled"
+
+    registry.register("wait", handler)
+    task = asyncio.create_task(registry.execute(ToolCall("active", "wait", {})))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    registry.abort()
+
+    assert await asyncio.wait_for(task, timeout=1) == ToolResult(
+        "active",
+        "canceled",
+    )
+    assert observed == [True, True]
+
+
+@pytest.mark.asyncio
 async def test_parallel_safe_calls_overlap_and_keep_call_order(tmp_path: Path) -> None:
     finished: list[str] = []
     registry = ToolRegistry(tmp_path, register_builtin=False)
@@ -566,6 +597,41 @@ async def test_parallel_safe_calls_overlap_and_keep_call_order(tmp_path: Path) -
 
     assert finished == ["fast", "slow"]
     assert [result.content for result in results] == ["slow", "fast"]
+
+
+@pytest.mark.asyncio
+async def test_execute_many_abort_cancels_every_parallel_handler(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    calls = [ToolCall("parallel-a", "wait", {}), ToolCall("parallel-b", "wait", {})]
+    started = asyncio.Event()
+    started_count = 0
+    generations: list[int] = []
+
+    async def handler(
+        arguments: dict[str, object],
+        abort_signal: ToolAbortSignal,
+    ) -> str:
+        nonlocal started_count
+        del arguments
+        started_count += 1
+        generations.append(abort_signal.generation)
+        if started_count == len(calls):
+            started.set()
+        await abort_signal.wait()
+        return "canceled"
+
+    registry.register("wait", handler, parallel_safe=True)
+    task = asyncio.create_task(registry.execute_many(calls))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    registry.abort()
+
+    assert await asyncio.wait_for(task, timeout=1) == [
+        ToolResult(call.id, "canceled") for call in calls
+    ]
+    assert generations == [generations[0], generations[0]]
 
 
 @pytest.mark.asyncio

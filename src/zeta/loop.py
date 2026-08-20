@@ -6,6 +6,7 @@ import asyncio
 import warnings
 from collections.abc import AsyncIterator, Mapping, Sequence
 
+from .approval import ApprovalPolicy
 from .store import ConversationStore
 from .tools import ToolHandler, ToolRegistry
 from .types import (
@@ -71,6 +72,7 @@ class AgentLoop:
         *,
         tools: Mapping[str, ToolHandler] | ToolRegistry | None = None,
         registry: ToolRegistry | None = None,
+        approval_policy: ApprovalPolicy | None = None,
         tool_schemas: Sequence[ToolSchema] | None = None,
         max_turns: int = 10,
     ) -> None:
@@ -112,6 +114,16 @@ class AgentLoop:
             self.tool_registry = ToolRegistry(store.cwd)
         else:
             raise TypeError("tools must be a mapping or ToolRegistry")
+        if (
+            approval_policy is not None
+            and self.tool_registry.approval_policy is not None
+            and self.tool_registry.approval_policy is not approval_policy
+        ):
+            raise ValueError("pass only one approval policy")
+        if approval_policy is not None:
+            self.tool_registry.set_approval_policy(approval_policy)
+        if self.tool_registry.approval_policy is not None:
+            self.tool_registry.bind_approval_store(store)
         self.tool_schemas = list(
             tool_schemas
             if tool_schemas is not None else self.tool_registry.schemas
@@ -195,12 +207,20 @@ class AgentLoop:
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)
             if assistant_message is None:
                 assistant_message = Message(MessageRole.ASSISTANT)
-            self.store.append_message(assistant_message)
             calls = [
                 block.tool_call
                 for block in assistant_message.content
                 if isinstance(block, ToolUseContent)
             ]
+            approval_requests: list[tuple[str, ToolCall]] = []
+            for tool_call in calls:
+                request = self.tool_registry.prepare_approval(tool_call)
+                if request is not None:
+                    approval_requests.append((request.request_id, request.tool_call))
+            self.store.append_message_with_approval_requests(
+                assistant_message,
+                approval_requests,
+            )
             if not calls:
                 yield StreamEvent(
                     StreamEventType.TURN_END,
