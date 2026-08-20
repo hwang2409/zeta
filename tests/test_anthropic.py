@@ -449,6 +449,45 @@ async def test_anthropic_sse_error_redacts_multiline_authorization(
     await client.aclose()
 
 
+@pytest.mark.parametrize("probe", ["block", "delta", "follows", "precedes"])
+def test_anthropic_provider_types_do_not_enter_errors(probe: str) -> None:
+    marker = f"anthropic-{probe}-marker"
+    with pytest.raises(AnthropicStreamError) as raised:
+        if probe == "block":
+            anthropic_module._translate_event(
+                "message",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": marker},
+                },
+                {},
+                set(),
+                set(),
+                {},
+            )
+        elif probe == "delta":
+            anthropic_module._translate_event(
+                "message",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": marker},
+                },
+                {0: anthropic_module._BlockState("text")},
+                {0},
+                set(),
+                {},
+            )
+        elif probe == "follows":
+            anthropic_module._advance_message_state("stopped", marker)
+        else:
+            anthropic_module._advance_message_state("not-started", marker)
+
+    assert marker not in str(raised.value)
+    assert marker not in repr(raised.value)
+
+
 def test_signed_thinking_blocks_use_anthropic_wire_types() -> None:
     payload = build_messages_payload(
         [

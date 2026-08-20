@@ -6,7 +6,6 @@ import asyncio
 import fcntl
 import json
 import os
-import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Iterator, Mapping
@@ -14,72 +13,200 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote_plus
 
 import httpx
 
 
-_SENSITIVE_ERROR_KEY = re.compile(
-    r"(?:token|authorization|api[-_]?key|cookie|secret|websocket-key)", re.IGNORECASE
+_SENSITIVE_ERROR_NAMES = frozenset(
+    {
+        "authorization",
+        "proxy_authorization",
+        "www_authenticate",
+        "authentication",
+        "x_api_key",
+        "x_auth_token",
+        "x_amz_security_token",
+        "x_amz_signature",
+        "x_goog_api_key",
+        "anthropic_api_key",
+        "openai_api_key",
+        "sec_websocket_key",
+        "sec_websocket_accept",
+        "cookie",
+        "set_cookie",
+        "password",
+        "passwd",
+        "secret",
+        "client_secret",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "form_id_token",
+        "token",
+        "api_key",
+        "apikey",
+        "websocket_key",
+    }
 )
-_ERROR_SECRET = re.compile(
-    r"""
-    (?:
-        (?P<authorization_prefix>
-            (?<![\w-])["']?(?:authorization|proxy-authorization)["']?\s*[:=]\s*
-        )
-        (?:
-            (?P<authorization_quote>["'])[^"']*(?P=authorization_quote)
-            |
-            (?:
-                [A-Za-z][A-Za-z0-9._~+/-]*[ \t\r\n]+(?:
-                    (?P<authorization_value_quote>["'])[^"']*(?P=authorization_value_quote)
-                    |(?:[^\r\n]|\r?\n(?!\r?\n)(?![!#$%&'*+.^_`|~0-9A-Za-z-]+:[ \t]))*
-                )
-                |[^\s,;}&]+
-            )
-        )
-        |
-        (?P<cookie_prefix>
-            (?<![\w-])["']?(?:cookie|set-cookie)["']?\s*[:=]\s*
-        )
-        (?:
-            (?P<cookie_quote>["'])[^"']*(?P=cookie_quote)
-            |[^\r\n]*
-        )
-        |
-        (?P<field_prefix>
-            (?<![\w-])["']?(?:access[-_]?token|refresh[-_]?token|id[-_]?token|form[-_]?id[-_]?token|x-auth-token|x-api-key|sec-websocket-key|websocket-key|proxy-authorization|api[-_]?key|authorization|token|secret)["']?\s*[:=]\s*
-        )
-        (?:
-            (?P<field_quote>["'])[^"']*(?P=field_quote)
-            |[^\s,;}&]+
-        )
-        |
-        \b(?:access|refresh)[-_]?token[-_][a-z0-9._-]+
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
+_FIELD_NAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.%+-"
 )
+_BARE_TOKEN_PREFIXES = ("access-token-", "access_token-", "refresh-token-", "refresh_token-")
+_TOKEN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def _is_sensitive_name(name: str) -> bool:
+    normalized = unquote_plus(name).strip().strip("\"'").lower().replace("-", "_")
+    return normalized in _SENSITIVE_ERROR_NAMES
+
+
+def _line_parts(line: str) -> tuple[str, str]:
+    if line.endswith("\r\n"):
+        return line[:-2], "\r\n"
+    if line.endswith(("\n", "\r")):
+        return line[:-1], line[-1]
+    return line, ""
+
+
+def _field_name_before(line: str, separator: int) -> str:
+    prefix = line[:separator].rstrip()
+    prefix = prefix.rstrip("\"'")
+    end = len(prefix)
+    start = end
+    while start and prefix[start - 1] in _FIELD_NAME_CHARS:
+        start -= 1
+    return prefix[start:end]
+
+
+def _sensitive_separator(line: str) -> tuple[int, str] | None:
+    for index, character in enumerate(line):
+        if character not in ":=":
+            continue
+        name = _field_name_before(line, index)
+        if _is_sensitive_name(name):
+            return index, character
+    return None
+
+
+def _looks_like_header(line: str) -> bool:
+    separator = line.find(":")
+    if separator <= 0:
+        return False
+    name = line[:separator].strip().strip("\"'")
+    return bool(name) and all(character in _FIELD_NAME_CHARS for character in name)
+
+
+def _multipart_name(line: str) -> str | None:
+    if "content-disposition" not in line.lower():
+        return None
+    for segment in line.split(";"):
+        key, separator, value = segment.partition("=")
+        if separator and key.strip().lower() == "name":
+            return value.strip().strip("\"'")
+    return None
+
+
+def _redact_multipart(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    result: list[str] = []
+    in_headers = True
+    sensitive_part = False
+    for line in lines:
+        content, ending = _line_parts(line)
+        if content.lstrip().startswith("--"):
+            in_headers = True
+            sensitive_part = False
+            result.append(line)
+        elif in_headers:
+            result.append(line)
+            name = _multipart_name(content)
+            if name is not None:
+                sensitive_part = _is_sensitive_name(name)
+            if not content.strip():
+                in_headers = False
+        elif sensitive_part:
+            result.append(f"[redacted]{ending}")
+        else:
+            result.append(line)
+    return "".join(result)
 
 
 def _redact_error_text(text: str) -> str:
-    def replace(match: re.Match[str]) -> str:
-        prefix = (
-            match.group("authorization_prefix")
-            or match.group("cookie_prefix")
-            or match.group("field_prefix")
-            or ""
-        )
-        return f"{prefix}[redacted]"
+    if "content-disposition" in text.lower():
+        text = _redact_multipart(text)
 
-    return _ERROR_SECRET.sub(replace, text)
+    def redact_bare_tokens(line: str) -> str:
+        lower = line.lower()
+        if not any(prefix in lower for prefix in _BARE_TOKEN_PREFIXES):
+            return line
+        result: list[str] = []
+        cursor = 0
+        while cursor < len(line):
+            prefix = next(
+                (
+                    candidate
+                    for candidate in _BARE_TOKEN_PREFIXES
+                    if lower.startswith(candidate, cursor)
+                    and (cursor == 0 or line[cursor - 1] not in _TOKEN_CHARS)
+                ),
+                None,
+            )
+            if prefix is None:
+                result.append(line[cursor])
+                cursor += 1
+                continue
+            end = cursor + len(prefix)
+            while end < len(line) and line[end] in _TOKEN_CHARS:
+                end += 1
+            result.append("[redacted]")
+            cursor = end
+        return "".join(result)
+
+    result: list[str] = []
+    redact_continuation = False
+    position = 0
+    while position < len(text):
+        line_end = text.find("\n", position)
+        if line_end == -1:
+            line_end = len(text)
+        else:
+            line_end += 1
+        line = text[position:line_end]
+        content, ending = _line_parts(line)
+        if redact_continuation:
+            if text.find(":", position) == -1:
+                result.append("[redacted]")
+                break
+            if not content.strip():
+                redact_continuation = False
+                result.append(line)
+                position = line_end
+                continue
+            if _looks_like_header(content):
+                redact_continuation = False
+            else:
+                result.append(f"[redacted]{ending}")
+                position = line_end
+                continue
+        found = _sensitive_separator(content)
+        if found is None:
+            result.append(redact_bare_tokens(line))
+        else:
+            separator, kind = found
+            result.append(f"{content[: separator + 1]}[redacted]{ending}")
+            redact_continuation = kind == ":"
+        position = line_end
+    return "".join(result)
 
 
 def _redact_error_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
             key: "[redacted]"
-            if isinstance(key, str) and _SENSITIVE_ERROR_KEY.search(key)
+            if isinstance(key, str) and _is_sensitive_name(key)
             else _redact_error_value(item)
             for key, item in value.items()
         }

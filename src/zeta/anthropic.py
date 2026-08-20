@@ -560,7 +560,7 @@ def _translate_event(
                 ),
             )
         else:
-            raise AnthropicStreamError(f"unsupported Anthropic content block: {kind}")
+            raise AnthropicStreamError("unsupported Anthropic content block type")
         active_blocks.add(index)
         return None
     if event_type == "content_block_delta":
@@ -622,7 +622,7 @@ def _translate_event(
                 tool_call=call,
                 data={"tool_call_delta": partial, "index": index},
             )
-        raise AnthropicStreamError(f"unsupported Anthropic content delta: {kind}")
+        raise AnthropicStreamError("unsupported Anthropic content delta type")
     if event_type == "content_block_stop":
         index = _index(payload)
         if index in stopped_blocks:
@@ -688,9 +688,7 @@ def _advance_message_state(state: str, event_type: str) -> str:
     if event_type == "done":
         return state
     if state == "stopped":
-        raise AnthropicStreamError(
-            f"Anthropic event follows message_stop: {event_type}"
-        )
+        raise AnthropicStreamError("Anthropic event follows message_stop")
     if event_type == "message_start":
         if state != "not-started":
             raise AnthropicStreamError("Anthropic message_start is duplicated")
@@ -698,9 +696,7 @@ def _advance_message_state(state: str, event_type: str) -> str:
     if state == "not-started":
         if event_type == "error":
             return state
-        raise AnthropicStreamError(
-            f"Anthropic event precedes message_start: {event_type}"
-        )
+        raise AnthropicStreamError("Anthropic event precedes message_start")
     if event_type == "message_stop":
         return "stopped"
     return state

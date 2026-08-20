@@ -1799,6 +1799,24 @@ async def test_each_malformed_stream_fails_at_its_named_gate(
     await client.aclose()
 
 
+@pytest.mark.parametrize("probe", ["unsupported", "before_start"])
+def test_codex_provider_types_do_not_enter_errors(probe: str) -> None:
+    marker = f"codex-{probe}-marker"
+    with pytest.raises(CodexStreamError) as raised:
+        codex_module._translate_event(
+            marker,
+            {"type": marker},
+            "started" if probe == "unsupported" else "not-started",
+            {},
+            {},
+            {},
+            {},
+        )
+
+    assert marker not in str(raised.value)
+    assert marker not in repr(raised.value)
+
+
 class _CleanupStream:
     def __init__(self, events: list[dict[str, object]], cleanup_error: type[BaseException] | None) -> None:
         self.events = events

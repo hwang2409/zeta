@@ -1,8 +1,39 @@
 import json
+import time
+from urllib.parse import quote
 
 import pytest
 
 from zeta.auth import error_body_excerpt
+
+
+SENSITIVE_NAMES = (
+    "authorization",
+    "proxy-authorization",
+    "www-authenticate",
+    "authentication",
+    "x-api-key",
+    "x-auth-token",
+    "x-amz-security-token",
+    "x-amz-signature",
+    "x-goog-api-key",
+    "anthropic-api-key",
+    "openai-api-key",
+    "sec-websocket-key",
+    "sec-websocket-accept",
+    "cookie",
+    "set-cookie",
+    "password",
+    "passwd",
+    "secret",
+    "client_secret",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "token",
+    "api_key",
+    "apikey",
+)
 
 
 @pytest.mark.parametrize(
@@ -112,3 +143,78 @@ def test_error_body_excerpt_redacts_multiline_authorization_record() -> None:
 
     assert "newline-sse-marker" not in excerpt
     assert "Bearer" not in excerpt
+
+
+@pytest.mark.parametrize("scheme", [
+    "Bearer",
+    "Basic",
+    "Digest",
+    "Token",
+    "ApiKey",
+    "Foo",
+    "1FooScheme",
+    "!Bar",
+    "#Baz",
+])
+def test_error_body_excerpt_redacts_any_authorization_scheme(scheme: str) -> None:
+    marker = "scheme-matrix-marker"
+    excerpt = error_body_excerpt(
+        json.dumps({"message": f"authorization: {scheme} {marker}"}).encode()
+    )
+
+    assert marker not in excerpt
+    assert scheme not in excerpt
+
+
+@pytest.mark.parametrize("field", SENSITIVE_NAMES)
+@pytest.mark.parametrize("body_format", ["json", "header", "form", "multipart"])
+def test_error_body_excerpt_redacts_sensitive_names_in_all_formats(
+    field: str, body_format: str
+) -> None:
+    marker = "format-matrix-marker"
+    if body_format == "json":
+        body = json.dumps({field: marker}).encode()
+    elif body_format == "header":
+        body = f"{field}: {marker}".encode()
+    elif body_format == "form":
+        body = f"{quote(field)}={quote(marker)}".encode()
+    else:
+        body = (
+            f'--boundary\r\nContent-Disposition: form-data; name="{field}"\r\n'
+            f"\r\n{marker}\r\n--boundary--\r\n"
+        ).encode()
+
+    excerpt = error_body_excerpt(body)
+
+    assert marker not in excerpt
+
+
+@pytest.mark.parametrize(
+    ("encoded_field", "marker"),
+    [
+        ("id%5Ftoken", "encoded-id-token-marker"),
+        ("refresh%5Ftoken", "encoded-refresh-token-marker"),
+    ],
+)
+def test_error_body_excerpt_percent_decodes_form_field_names(
+    encoded_field: str, marker: str
+) -> None:
+    excerpt = error_body_excerpt(f"{encoded_field}={marker}".encode())
+
+    assert marker not in excerpt
+
+
+@pytest.mark.parametrize(
+    ("size_mib", "budget_seconds"), [(4, 0.2), (16, 0.8)]
+)
+def test_error_body_excerpt_handles_large_multiline_records_quickly(
+    size_mib: int, budget_seconds: float
+) -> None:
+    body = b"authorization: Foo\n" + b"x\n" * ((size_mib * 1024 * 1024 - 19) // 2)
+    started = time.perf_counter()
+
+    excerpt = error_body_excerpt(body)
+
+    elapsed = time.perf_counter() - started
+    assert excerpt.startswith("authorization:")
+    assert elapsed < budget_seconds
