@@ -320,7 +320,7 @@ async def test_malformed_nested_sse_is_typed(tmp_path: Path) -> None:
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text='data: {"type":"message_start","message":{}}\n\ndata: {"type":"message_delta","delta":"bad"}\n\n',
+            text='data: {"type":"message_start","message":{}}\n\ndata: {"type":"message_delta","delta":"bad"}\n\ndata: {"type":"message_stop"}\n\n',
             request=request,
         )
 
@@ -909,6 +909,8 @@ async def test_duplicate_block_start_is_rejected(tmp_path: Path) -> None:
                 "",
                 'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
                 "",
+                'data: {"type":"content_block_stop","index":0}',
+                "",
                 'data: {"type":"message_stop"}',
                 "",
             ]
@@ -928,6 +930,8 @@ async def test_unknown_delta_type_is_rejected(tmp_path: Path) -> None:
                 "",
                 'data: {"type":"content_block_delta","index":0,"delta":{"type":"unknown_delta"}}',
                 "",
+                'data: {"type":"content_block_stop","index":0}',
+                "",
                 'data: {"type":"message_stop"}',
                 "",
             ]
@@ -944,6 +948,8 @@ async def test_unknown_block_type_is_rejected(tmp_path: Path) -> None:
                 'data: {"type":"message_start","message":{}}',
                 "",
                 'data: {"type":"content_block_start","index":0,"content_block":{"type":"unknown_block"}}',
+                "",
+                'data: {"type":"content_block_stop","index":0}',
                 "",
                 'data: {"type":"message_stop"}',
                 "",
@@ -966,6 +972,8 @@ async def test_text_delta_inside_thinking_block_is_rejected(tmp_path: Path) -> N
                 "",
                 'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}',
                 "",
+                'data: {"type":"content_block_stop","index":0}',
+                "",
                 'data: {"type":"message_stop"}',
                 "",
             ]
@@ -981,7 +989,9 @@ async def test_tool_identifiers_must_be_strings(tmp_path: Path) -> None:
             [
                 'data: {"type":"message_start","message":{}}',
                 "",
-                'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":[],"name":{},"input":{}}}',
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":["tool-1"],"name":{"value":"read"},"input":{}}}',
+                "",
+                'data: {"type":"content_block_stop","index":0}',
                 "",
                 'data: {"type":"message_stop"}',
                 "",
