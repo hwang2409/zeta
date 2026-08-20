@@ -468,6 +468,131 @@ async def test_responses_stream_maps_refusal_text_and_replays_item(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_message_parts_allow_refusal_before_output_text(tmp_path: Path) -> None:
+    completed_item = {
+        "type": "message",
+        "id": "message-test",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+            {"type": "refusal", "refusal": "first"},
+            {"type": "output_text", "text": "second"},
+        ],
+    }
+    stream = sse(
+        [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={"type": "message", "id": "message-test", "role": "assistant"},
+            ),
+            event(
+                "response.content_part.added",
+                output_index=0,
+                content_index=0,
+                part={"type": "refusal"},
+            ),
+            event(
+                "response.refusal.delta",
+                output_index=0,
+                content_index=0,
+                delta="first",
+            ),
+            event(
+                "response.refusal.done",
+                output_index=0,
+                content_index=0,
+                refusal="first",
+            ),
+            event(
+                "response.content_part.done",
+                output_index=0,
+                content_index=0,
+                part={"type": "refusal"},
+            ),
+            event(
+                "response.content_part.added",
+                output_index=0,
+                content_index=1,
+                part={"type": "output_text"},
+            ),
+            event(
+                "response.output_text.delta",
+                output_index=0,
+                content_index=1,
+                delta="second",
+            ),
+            event(
+                "response.output_text.done",
+                output_index=0,
+                content_index=1,
+                text="second",
+            ),
+            event(
+                "response.content_part.done",
+                output_index=0,
+                content_index=1,
+                part={"type": "output_text"},
+            ),
+            event("response.output_item.done", output_index=0, item=completed_item),
+            event("response.completed"),
+        ]
+    )
+    client = client_for(stream)
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "ordered-parts.json")
+        ).complete([], [])
+    ]
+
+    assert events[-1].message is not None
+    assert events[-1].message.content == [TextContent("firstsecond")]
+    replayed = Message.from_dict(events[-1].message.to_dict())
+    payload = build_responses_payload(
+        [replayed], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+    )
+    assert payload["input"] == [completed_item]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_message_parts_reject_shared_index_across_kinds(tmp_path: Path) -> None:
+    stream = sse(
+        [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={"type": "message", "id": "message-test", "role": "assistant"},
+            ),
+            event(
+                "response.content_part.added",
+                output_index=0,
+                content_index=0,
+                part={"type": "output_text"},
+            ),
+            event(
+                "response.content_part.added",
+                output_index=0,
+                content_index=0,
+                part={"type": "refusal"},
+            ),
+        ]
+    )
+    client = client_for(stream)
+    with pytest.raises(CodexStreamError, match="content block is duplicated"):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "shared-index.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_reasoning_summary_and_content_parts_decode_together(tmp_path: Path) -> None:
     client = client_for(sse(reasoning_content_stream(summary="plan")))
     events = [

@@ -652,7 +652,7 @@ def _translate_event(
             return None, response_state
         if item.kind != "message" or kind not in {"output_text", "refusal"}:
             raise CodexStreamError("Codex content part has the wrong item type")
-        message_key = (index, kind, content_index)
+        message_key = (index, "message", content_index)
         if message_key in blocks:
             raise CodexStreamError("Codex content block is duplicated")
         blocks[message_key] = _BlockState(kind)
@@ -825,7 +825,7 @@ def _translate_delta(
     expected_kind = (
         "refusal" if event_type == "response.refusal.delta" else "output_text"
     )
-    key = (index, expected_kind, content_index)
+    key = (index, "message", content_index)
     block = blocks.get(key)
     if (
         item.kind != "message"
@@ -871,10 +871,10 @@ def _finish_block(
             expected_kind = (
                 "thinking_raw" if wire_kind == "reasoning_text" else wire_kind or ""
             )
+            message_key = (index, "message", content_index)
             candidates = (
                 (index, expected_kind, content_index),
-                (index, "output_text", content_index),
-                (index, "refusal", content_index),
+                message_key,
                 (index, "thinking_raw", content_index),
             )
             key = next((candidate for candidate in candidates if candidate in blocks), candidates[0])
@@ -882,7 +882,7 @@ def _finish_block(
             expected_kind = (
                 "refusal" if event_type == "response.refusal.done" else "output_text"
             )
-            key = (index, expected_kind, content_index)
+            key = (index, "message", content_index)
     block = blocks.get(key)
     if block is None or (
         event_type != "response.content_part.done" and block.kind != expected_kind
