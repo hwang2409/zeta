@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from typing import Any, Protocol
+from collections.abc import AsyncIterator, Mapping, Sequence
 
 from .store import ConversationStore
+from .tools import ToolHandler, ToolRegistry
 from .types import (
     CompletionBackend,
     ContentBlock,
@@ -24,36 +23,6 @@ from .types import (
     ToolSchema,
     ToolUseContent,
 )
-
-
-class ToolExecutor(Protocol):
-    async def execute(self, tool_call: ToolCall) -> ToolResult:
-        """Execute one call and return its durable result."""
-
-
-ToolHandler = Callable[
-    [dict[str, Any]], str | ToolResult | Awaitable[str | ToolResult]
-]
-
-
-class DictToolExecutor:
-    def __init__(self, handlers: Mapping[str, ToolHandler]) -> None:
-        self.handlers = dict(handlers)
-
-    async def execute(self, tool_call: ToolCall) -> ToolResult:
-        handler = self.handlers[tool_call.name]
-        result = handler(tool_call.arguments)
-        if inspect.isawaitable(result):
-            result = await result
-        if isinstance(result, ToolResult):
-            return result
-        if isinstance(result, str):
-            return ToolResult(tool_call.id, result)
-        return ToolResult(
-            tool_call.id,
-            "invalid tool handler result: expected str or ToolResult",
-            is_error=True,
-        )
 
 
 async def _close_completion(
@@ -100,18 +69,53 @@ class AgentLoop:
         backend: CompletionBackend,
         store: ConversationStore,
         *,
-        tools: Mapping[str, ToolHandler] | ToolExecutor | None = None,
+        tools: Mapping[str, ToolHandler] | ToolRegistry | None = None,
+        registry: ToolRegistry | None = None,
         tool_schemas: Sequence[ToolSchema] | None = None,
         max_turns: int = 10,
     ) -> None:
         self.backend = backend
         self.store = store
-        self.tool_executor = (
-            DictToolExecutor(tools) if isinstance(tools, Mapping) else tools
+        if registry is not None and tools is not None:
+            raise ValueError("pass only one tool registry")
+        if registry is not None:
+            self.tool_registry = registry
+        elif isinstance(tools, ToolRegistry):
+            self.tool_registry = tools
+        elif isinstance(tools, Mapping):
+            self.tool_registry = ToolRegistry(store.cwd, register_builtin=False)
+            schemas_by_name = {
+                schema.get("name"): schema
+                for schema in (tool_schemas or [])
+                if isinstance(schema.get("name"), str)
+            }
+            for name, handler in tools.items():
+                schema = schemas_by_name.get(name, {})
+                parameters = schema.get("parameters", schema.get("input_schema"))
+                if parameters is None:
+                    parameters = {
+                        key: value
+                        for key, value in schema.items()
+                        if key not in {"name", "description", "cache_control"}
+                    }
+                self.tool_registry.register(
+                    name,
+                    handler,
+                    description=(
+                        schema.get("description", "")
+                        if isinstance(schema.get("description", ""), str)
+                        else ""
+                    ),
+                    parameters=parameters,
+                )
+        elif tools is None:
+            self.tool_registry = ToolRegistry(store.cwd)
+        else:
+            raise TypeError("tools must be a mapping or ToolRegistry")
+        self.tool_schemas = list(
+            tool_schemas
+            if tool_schemas is not None else self.tool_registry.schemas
         )
-        self.tool_schemas = list(tool_schemas or [])
-        if not self.tool_schemas and isinstance(tools, Mapping):
-            self.tool_schemas = [{"name": name} for name in tools]
         self.max_turns = max_turns
 
     def run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
@@ -124,6 +128,7 @@ class AgentLoop:
         yield StreamEvent(StreamEventType.AGENT_START)
 
         for turn_number in range(1, self.max_turns + 1):
+            self.tool_registry.start_batch()
             yield StreamEvent(
                 StreamEventType.TURN_START,
                 data={"turn": turn_number},
@@ -196,30 +201,58 @@ class AgentLoop:
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
 
-            for tool_call in calls:
+            call_index = 0
+            while call_index < len(calls):
+                parallel_calls: list[ToolCall] = []
+                if self.tool_registry is not None:
+                    definition = self.tool_registry.definitions_by_name.get(
+                        calls[call_index].name
+                    )
+                    if definition is not None and definition.parallel_safe:
+                        parallel_calls.append(calls[call_index])
+                        while call_index + len(parallel_calls) < len(calls):
+                            next_call = calls[call_index + len(parallel_calls)]
+                            next_definition = self.tool_registry.definitions_by_name.get(
+                                next_call.name
+                            )
+                            if next_definition is None or not next_definition.parallel_safe:
+                                break
+                            parallel_calls.append(next_call)
+                if len(parallel_calls) > 1:
+                    for tool_call in parallel_calls:
+                        yield StreamEvent(
+                            StreamEventType.TOOL_EXECUTION_START,
+                            tool_call=tool_call,
+                        )
+                    results = await self.tool_registry.execute_many(parallel_calls)
+                    for tool_call, result in zip(parallel_calls, results, strict=True):
+                        result = _validated_tool_result(result, tool_call.id)
+                        self._append_tool_result(result)
+                        yield StreamEvent(
+                            StreamEventType.TOOL_EXECUTION_END,
+                            tool_call=tool_call,
+                            tool_result=result,
+                        )
+                    call_index += len(parallel_calls)
+                    continue
+
+                tool_call = calls[call_index]
                 yield StreamEvent(
                     StreamEventType.TOOL_EXECUTION_START,
                     tool_call=tool_call,
                 )
                 try:
-                    if self.tool_executor is None:
-                        raise KeyError(f"no executor for tool {tool_call.name}")
-                    result = await self.tool_executor.execute(tool_call)
+                    result = await self.tool_registry.execute(tool_call)
                 except Exception as exc:
                     result = ToolResult(tool_call.id, str(exc), is_error=True)
                 result = _validated_tool_result(result, tool_call.id)
-                self.store.append_message(
-                    Message(
-                        MessageRole.TOOL_RESULT,
-                        [TextContent(result.content)],
-                        tool_result=result,
-                    )
-                )
+                self._append_tool_result(result)
                 yield StreamEvent(
                     StreamEventType.TOOL_EXECUTION_END,
                     tool_call=tool_call,
                     tool_result=result,
                 )
+                call_index += 1
             yield StreamEvent(
                 StreamEventType.TURN_END,
                 message=assistant_message,
@@ -231,6 +264,15 @@ class AgentLoop:
             error=ErrorInfo("max_turns", f"maximum turns reached: {self.max_turns}"),
         )
         yield StreamEvent(StreamEventType.AGENT_END)
+
+    def _append_tool_result(self, result: ToolResult) -> None:
+        self.store.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [TextContent(result.content)],
+                tool_result=result,
+            )
+        )
 
     def _persist_partial(
         self,

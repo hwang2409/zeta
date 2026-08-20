@@ -23,13 +23,15 @@ from .codex import (
     extract_account_id,
 )
 from .fake import FakeBackend, ScriptedTurn
-from .loop import AgentLoop, DictToolExecutor, ToolExecutor
+from .loop import AgentLoop
 from .store import ConversationEntry, ConversationIntegrityError, ConversationStore
+from .tools import AbortSignal, ToolAbortSignal, ToolDefinition, ToolRegistry
 from .types import *
 
 __all__ = [
     "DEFAULT_CODEX_MODEL",
     "AgentLoop",
+    "AbortSignal",
     "AnthropicAuthError",
     "AnthropicBackend",
     "AnthropicBackendError",
@@ -48,7 +50,6 @@ __all__ = [
     "ConversationEntry",
     "ConversationIntegrityError",
     "ConversationStore",
-    "DictToolExecutor",
     "ErrorInfo",
     "FakeBackend",
     "Message",
@@ -60,8 +61,10 @@ __all__ = [
     "StreamEventType",
     "TextContent",
     "ThinkingContent",
+    "ToolAbortSignal",
     "ToolCall",
-    "ToolExecutor",
+    "ToolDefinition",
+    "ToolRegistry",
     "ToolResult",
     "ToolUseContent",
     "build_authorization_url",
