@@ -304,6 +304,73 @@ async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_responses_stream_maps_refusal_text_and_replays_item(tmp_path: Path) -> None:
+    completed_item = {
+        "type": "message",
+        "id": "message-test",
+        "role": "assistant",
+        "content": [{"type": "refusal", "refusal": "cannot help"}],
+    }
+    stream = sse(
+        [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={"type": "message", "id": "message-test", "role": "assistant"},
+            ),
+            event(
+                "response.content_part.added",
+                output_index=0,
+                content_index=0,
+                part={"type": "refusal"},
+            ),
+            event(
+                "response.refusal.delta",
+                output_index=0,
+                content_index=0,
+                delta="cannot help",
+            ),
+            event(
+                "response.refusal.done",
+                output_index=0,
+                content_index=0,
+                refusal="cannot help",
+            ),
+            event(
+                "response.content_part.done",
+                output_index=0,
+                content_index=0,
+                part={"type": "refusal"},
+            ),
+            event(
+                "response.output_item.done",
+                output_index=0,
+                item=completed_item,
+            ),
+            event("response.completed"),
+        ]
+    )
+    client = client_for(stream)
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "codex.json")
+        ).complete([], [])
+    ]
+
+    message = events[-1].message
+    assert message is not None
+    assert message.content == [TextContent("cannot help")]
+    replayed = Message.from_dict(message.to_dict())
+    payload = build_responses_payload(
+        [replayed], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+    )
+    assert payload["input"] == [completed_item]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_reasoning_summary_stop_only_and_raw_reasoning_text_are_durable(
     tmp_path: Path,
 ) -> None:
@@ -541,6 +608,64 @@ async def test_encrypted_only_reasoning_round_trips_into_payload(tmp_path: Path)
         [message], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
     )
     assert payload["input"] == [completed_item]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_completed_reasoning_summary_mismatch(tmp_path: Path) -> None:
+    stream = sse(
+        [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={"type": "reasoning", "id": "reasoning-test"},
+            ),
+            event(
+                "response.reasoning_summary_part.added",
+                output_index=0,
+                summary_index=0,
+            ),
+            event(
+                "response.reasoning_summary_text.delta",
+                output_index=0,
+                summary_index=0,
+                delta="streamed",
+            ),
+            event(
+                "response.reasoning_summary_text.done",
+                output_index=0,
+                summary_index=0,
+                text="streamed",
+            ),
+            event(
+                "response.reasoning_summary_part.done",
+                output_index=0,
+                summary_index=0,
+                part={"type": "summary_text", "text": "streamed"},
+            ),
+            event(
+                "response.output_item.done",
+                output_index=0,
+                item={
+                    "type": "reasoning",
+                    "id": "reasoning-test",
+                    "summary": [{"type": "summary_text", "text": "replayed"}],
+                },
+            ),
+            event("response.completed"),
+        ]
+    )
+    client = client_for(stream)
+    with pytest.raises(
+        CodexStreamError, match="completed reasoning does not match its deltas"
+    ):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "summary-mismatch.json")
+            ).complete([], [])
+        ]
     await client.aclose()
 
 
