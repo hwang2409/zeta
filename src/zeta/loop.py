@@ -118,6 +118,11 @@ class AgentLoop:
         )
         self.max_turns = max_turns
 
+    def abort(self) -> None:
+        """Signal the active tool batch before the caller cancels the turn."""
+
+        self.tool_registry.abort()
+
     def run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
         return self._run_turn(user_text)
 
@@ -162,7 +167,9 @@ class AgentLoop:
                 if _task_is_cancelling():
                     self._persist_partial_for_control(partial_blocks, assistant_message)
                     raise asyncio.CancelledError() from exc
-                self._persist_partial(partial_blocks, assistant_message)
+                self._persist_partial_with_cancelled_tools(
+                    partial_blocks, assistant_message
+                )
                 yield StreamEvent(
                     StreamEventType.ERROR,
                     error=ErrorInfo("backend_error", str(exc)),
@@ -174,7 +181,9 @@ class AgentLoop:
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise asyncio.CancelledError()
             if cleanup_error is not None:
-                self._persist_partial(partial_blocks, assistant_message)
+                self._persist_partial_with_cancelled_tools(
+                    partial_blocks, assistant_message
+                )
                 yield StreamEvent(
                     StreamEventType.ERROR,
                     error=ErrorInfo("backend_error", str(cleanup_error)),
@@ -201,58 +210,109 @@ class AgentLoop:
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
 
-            call_index = 0
-            while call_index < len(calls):
-                parallel_calls: list[ToolCall] = []
-                if self.tool_registry is not None:
-                    definition = self.tool_registry.definitions_by_name.get(
-                        calls[call_index].name
-                    )
-                    if definition is not None and definition.parallel_safe:
-                        parallel_calls.append(calls[call_index])
-                        while call_index + len(parallel_calls) < len(calls):
-                            next_call = calls[call_index + len(parallel_calls)]
-                            next_definition = self.tool_registry.definitions_by_name.get(
-                                next_call.name
+            completed_tool_indexes: set[int] = set()
+            parallel_tasks: dict[asyncio.Task[ToolResult], tuple[int, ToolCall]] = {}
+            parallel_results: list[ToolResult | None] = [None] * len(calls)
+            try:
+                call_index = 0
+                while call_index < len(calls):
+                    parallel_calls: list[ToolCall] = []
+                    if self.tool_registry is not None:
+                        definition = self.tool_registry.definitions_by_name.get(
+                            calls[call_index].name
+                        )
+                        if definition is not None and definition.parallel_safe:
+                            parallel_calls.append(calls[call_index])
+                            while call_index + len(parallel_calls) < len(calls):
+                                next_call = calls[call_index + len(parallel_calls)]
+                                next_definition = self.tool_registry.definitions_by_name.get(
+                                    next_call.name
+                                )
+                                if next_definition is None or not next_definition.parallel_safe:
+                                    break
+                                parallel_calls.append(next_call)
+                    if len(parallel_calls) > 1:
+                        for tool_call in parallel_calls:
+                            yield StreamEvent(
+                                StreamEventType.TOOL_EXECUTION_START,
+                                tool_call=tool_call,
                             )
-                            if next_definition is None or not next_definition.parallel_safe:
-                                break
-                            parallel_calls.append(next_call)
-                if len(parallel_calls) > 1:
-                    for tool_call in parallel_calls:
-                        yield StreamEvent(
-                            StreamEventType.TOOL_EXECUTION_START,
-                            tool_call=tool_call,
+                        parallel_tasks = {
+                            asyncio.create_task(self.tool_registry.execute(tool_call)): (
+                                call_index + offset,
+                                tool_call,
+                            )
+                            for offset, tool_call in enumerate(parallel_calls)
+                        }
+                        while parallel_tasks:
+                            done, _ = await asyncio.wait(
+                                parallel_tasks,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            for task in done:
+                                index, tool_call = parallel_tasks.pop(task)
+                                parallel_results[index] = _validated_tool_result(
+                                    task.result(),
+                                    tool_call.id,
+                                )
+                        batch_end = call_index + len(parallel_calls)
+                        results = self._finalize_tool_results(
+                            parallel_calls,
+                            parallel_results[call_index:batch_end],
                         )
-                    results = await self.tool_registry.execute_many(parallel_calls)
-                    for tool_call, result in zip(parallel_calls, results, strict=True):
-                        result = _validated_tool_result(result, tool_call.id)
-                        self._append_tool_result(result)
-                        yield StreamEvent(
-                            StreamEventType.TOOL_EXECUTION_END,
-                            tool_call=tool_call,
-                            tool_result=result,
-                        )
-                    call_index += len(parallel_calls)
-                    continue
+                        parallel_results[call_index:batch_end] = [None] * len(parallel_calls)
+                        completed_tool_indexes.update(range(call_index, batch_end))
+                        for tool_call, result in zip(parallel_calls, results, strict=True):
+                            yield StreamEvent(
+                                StreamEventType.TOOL_EXECUTION_END,
+                                tool_call=tool_call,
+                                tool_result=result,
+                            )
+                        call_index += len(parallel_calls)
+                        continue
 
-                tool_call = calls[call_index]
-                yield StreamEvent(
-                    StreamEventType.TOOL_EXECUTION_START,
-                    tool_call=tool_call,
+                    tool_call = calls[call_index]
+                    yield StreamEvent(
+                        StreamEventType.TOOL_EXECUTION_START,
+                        tool_call=tool_call,
+                    )
+                    try:
+                        result = await self.tool_registry.execute(tool_call)
+                    except Exception as exc:
+                        result = ToolResult(tool_call.id, str(exc), is_error=True)
+                    result = _validated_tool_result(result, tool_call.id)
+                    result = self._finalize_tool_results([tool_call], [result])[0]
+                    completed_tool_indexes.add(call_index)
+                    yield StreamEvent(
+                        StreamEventType.TOOL_EXECUTION_END,
+                        tool_call=tool_call,
+                        tool_result=result,
+                    )
+                    call_index += 1
+            except (asyncio.CancelledError, GeneratorExit):
+                pending_tasks: list[asyncio.Task[ToolResult]] = []
+                for task, (index, tool_call) in list(parallel_tasks.items()):
+                    parallel_tasks.pop(task)
+                    if task.done():
+                        if task.cancelled():
+                            continue
+                        try:
+                            result = _validated_tool_result(task.result(), tool_call.id)
+                        except BaseException:
+                            continue
+                        parallel_results[index] = result
+                    else:
+                        task.cancel()
+                        pending_tasks.append(task)
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+                pending_indexes = [
+                    index for index in range(len(calls)) if index not in completed_tool_indexes
+                ]
+                self._finalize_tool_results(
+                    [calls[index] for index in pending_indexes],
+                    [parallel_results[index] for index in pending_indexes],
                 )
-                try:
-                    result = await self.tool_registry.execute(tool_call)
-                except Exception as exc:
-                    result = ToolResult(tool_call.id, str(exc), is_error=True)
-                result = _validated_tool_result(result, tool_call.id)
-                self._append_tool_result(result)
-                yield StreamEvent(
-                    StreamEventType.TOOL_EXECUTION_END,
-                    tool_call=tool_call,
-                    tool_result=result,
-                )
-                call_index += 1
+                raise
             yield StreamEvent(
                 StreamEventType.TURN_END,
                 message=assistant_message,
@@ -265,14 +325,24 @@ class AgentLoop:
         )
         yield StreamEvent(StreamEventType.AGENT_END)
 
-    def _append_tool_result(self, result: ToolResult) -> None:
-        self.store.append_message(
-            Message(
-                MessageRole.TOOL_RESULT,
-                [TextContent(result.content)],
-                tool_result=result,
+    def _finalize_tool_results(
+        self,
+        calls: Sequence[ToolCall],
+        slots: Sequence[ToolResult | None],
+    ) -> list[ToolResult]:
+        results = [
+            result or ToolResult(call.id, "tool execution canceled", is_error=True)
+            for call, result in zip(calls, slots, strict=True)
+        ]
+        for result in results:
+            self.store.append_message(
+                Message(
+                    MessageRole.TOOL_RESULT,
+                    [TextContent(result.content)],
+                    tool_result=result,
+                )
             )
-        )
+        return results
 
     def _persist_partial(
         self,
@@ -296,7 +366,9 @@ class AgentLoop:
         assistant_message: Message | None,
     ) -> None:
         try:
-            self._persist_partial(partial_blocks, assistant_message)
+            self._persist_partial_with_cancelled_tools(
+                partial_blocks, assistant_message
+            )
         except Exception as exc:
             try:
                 warnings.warn(
@@ -306,3 +378,21 @@ class AgentLoop:
                 )
             except:
                 pass
+
+    def _persist_partial_with_cancelled_tools(
+        self,
+        partial_blocks: list[ContentBlock],
+        assistant_message: Message | None,
+    ) -> None:
+        self._persist_partial(partial_blocks, assistant_message)
+        blocks = (
+            assistant_message.content
+            if assistant_message is not None
+            else partial_blocks
+        )
+        calls = [
+            block.tool_call
+            for block in blocks
+            if isinstance(block, ToolUseContent)
+        ]
+        self._finalize_tool_results(calls, [None] * len(calls))

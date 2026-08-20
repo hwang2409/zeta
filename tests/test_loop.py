@@ -9,6 +9,7 @@ import pytest
 from zeta.fake import FakeBackend, ScriptedTurn
 from zeta.loop import AgentLoop
 from zeta.store import ConversationStore
+from zeta.tools import ToolRegistry
 from zeta.types import (
     CompletionBackend,
     Message,
@@ -89,6 +90,254 @@ async def test_tool_call_then_next_completion(tmp_path: Path) -> None:
         "one",
         "two",
     ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -> None:
+    first_call = ToolCall("call-1", "first", {})
+    second_call = ToolCall("call-2", "second", {})
+    backend = FakeBackend([ScriptedTurn([], [first_call, second_call])])
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+
+    async def first(arguments: dict[str, object]) -> str:
+        return "one"
+
+    async def second(arguments: dict[str, object]) -> str:
+        return "two"
+
+    registry.register("first", first, parallel_safe=True)
+    registry.register("second", second, parallel_safe=True)
+    loop = AgentLoop(backend, store, registry=registry)
+
+    async def consume() -> None:
+        async for event in loop.run_turn("start"):
+            if (
+                event.type is StreamEventType.TOOL_EXECUTION_END
+                and event.tool_call is not None
+                and event.tool_call.id == first_call.id
+            ):
+                await asyncio.sleep(0)
+                asyncio.current_task().cancel()
+
+    task = asyncio.create_task(consume())
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    results = {
+        message.tool_result.tool_call_id: message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    }
+    assert results[first_call.id].content == "one"
+    assert results[second_call.id].content == "two"
+    assert not results[first_call.id].is_error
+    assert not results[second_call.id].is_error
+
+
+@pytest.mark.parametrize(
+    "aborted_index",
+    [0, 1],
+    ids=["first-canceled", "second-canceled"],
+)
+@pytest.mark.asyncio
+async def test_parallel_cancellation_keeps_call_order(
+    tmp_path: Path,
+    aborted_index: int,
+) -> None:
+    calls = [
+        ToolCall("call-1", "first", {}),
+        ToolCall("call-2", "second", {}),
+    ]
+    backend = FakeBackend([ScriptedTurn([], calls)])
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    started = [asyncio.Event(), asyncio.Event()]
+    completed = asyncio.Event()
+
+    async def first(arguments: dict[str, object]) -> str:
+        started[0].set()
+        if aborted_index == 0:
+            await asyncio.Event().wait()
+        completed.set()
+        return "one"
+
+    async def second(arguments: dict[str, object]) -> str:
+        started[1].set()
+        if aborted_index == 1:
+            await asyncio.Event().wait()
+        completed.set()
+        return "two"
+
+    registry.register("first", first, parallel_safe=True)
+    registry.register("second", second, parallel_safe=True)
+    loop = AgentLoop(backend, store, registry=registry)
+    task = asyncio.create_task(collect(loop.run_turn("start")))
+    await started[0].wait()
+    await started[1].wait()
+    await completed.wait()
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    results = [
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    ]
+    assert [result.tool_call_id for result in results] == [call.id for call in calls]
+    assert [result.is_error for result in results] == [
+        aborted_index == 0,
+        aborted_index == 1,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_duplicate_ids_use_indexed_results(tmp_path: Path) -> None:
+    calls = [
+        ToolCall("same-id", "first", {}),
+        ToolCall("same-id", "second", {}),
+    ]
+    backend = FakeBackend([ScriptedTurn([], calls)])
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register("first", lambda arguments: "one", parallel_safe=True)
+    registry.register("second", lambda arguments: "two", parallel_safe=True)
+
+    await collect(AgentLoop(backend, store, registry=registry).run_turn("start"))
+
+    results = [
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    ]
+    assert [result.tool_call_id for result in results] == ["same-id", "same-id"]
+    assert [result.content for result in results] == ["one", "two"]
+
+
+@pytest.fixture(scope="module")
+def finalize_store_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp("finalize-tool-results")
+
+
+def reverse_completion_slots() -> list[ToolResult | None]:
+    slots: list[ToolResult | None] = [None, None]
+    slots[1] = ToolResult("call-2", "two")
+    slots[0] = ToolResult("call-1", "one")
+    return slots
+
+
+@pytest.mark.parametrize(
+    ("calls", "slots", "expected_contents", "expected_errors"),
+    [
+        pytest.param(
+            [ToolCall("call-1", "first", {}), ToolCall("call-2", "second", {})],
+            [ToolResult("call-1", "one"), ToolResult("call-2", "two")],
+            ["one", "two"],
+            [False, False],
+            id="all-resolved-in-order",
+        ),
+        pytest.param(
+            [ToolCall("call-1", "first", {}), ToolCall("call-2", "second", {})],
+            reverse_completion_slots(),
+            ["one", "two"],
+            [False, False],
+            id="all-resolved-reverse-completion",
+        ),
+        pytest.param(
+            [
+                ToolCall("call-1", "first", {}),
+                ToolCall("call-2", "second", {}),
+                ToolCall("call-3", "third", {}),
+            ],
+            [ToolResult("call-1", "one"), None, ToolResult("call-3", "three")],
+            ["one", "tool execution canceled", "three"],
+            [False, True, False],
+            id="mixed-real-and-canceled",
+        ),
+        pytest.param(
+            [ToolCall("same-id", "first", {}), ToolCall("same-id", "second", {})],
+            [ToolResult("same-id", "one"), ToolResult("same-id", "two")],
+            ["one", "two"],
+            [False, False],
+            id="duplicate-ids",
+        ),
+        pytest.param([], [], [], [], id="zero-calls"),
+        pytest.param(
+            [ToolCall("call-1", "first", {})],
+            [None],
+            ["tool execution canceled"],
+            [True],
+            id="one-canceled-call",
+        ),
+    ],
+)
+def test_finalize_tool_results(
+    finalize_store_path: Path,
+    calls: list[ToolCall],
+    slots: list[ToolResult | None],
+    expected_contents: list[str],
+    expected_errors: list[bool],
+) -> None:
+    loop = AgentLoop(FakeBackend([]), ConversationStore(finalize_store_path))
+
+    results = loop._finalize_tool_results(calls, slots)
+
+    assert [result.content for result in results] == expected_contents
+    assert [result.is_error for result in results] == expected_errors
+    persisted = [
+        message.tool_result
+        for message in loop.store.messages()
+        if message.tool_result is not None
+    ]
+    assert [result.content for result in persisted] == expected_contents
+
+
+@pytest.mark.asyncio
+async def test_parallel_results_persist_in_call_order(tmp_path: Path) -> None:
+    first_call = ToolCall("call-1", "first", {})
+    second_call = ToolCall("call-2", "second", {})
+    backend = FakeBackend([ScriptedTurn([], [first_call, second_call])])
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    first_release = asyncio.Event()
+    second_release = asyncio.Event()
+
+    async def first(arguments: dict[str, object]) -> str:
+        first_started.set()
+        await first_release.wait()
+        return "one"
+
+    async def second(arguments: dict[str, object]) -> str:
+        second_started.set()
+        await second_release.wait()
+        return "two"
+
+    registry.register("first", first, parallel_safe=True)
+    registry.register("second", second, parallel_safe=True)
+    loop = AgentLoop(backend, store, registry=registry)
+
+    task = asyncio.create_task(collect(loop.run_turn("start")))
+    await first_started.wait()
+    await second_started.wait()
+    second_release.set()
+    first_release.set()
+    await task
+
+    results = [
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    ]
+    assert [result.tool_call_id for result in results] == [
+        first_call.id,
+        second_call.id,
+    ]
+    assert [result.content for result in results] == ["one", "two"]
 
 
 @pytest.mark.asyncio
