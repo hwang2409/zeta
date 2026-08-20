@@ -18,7 +18,6 @@ from urllib.parse import unquote_plus
 
 import httpx
 
-
 _SENSITIVE_ERROR_NAMES = frozenset(
     {
         "authorization",
@@ -58,6 +57,11 @@ _SENSITIVE_ERROR_NAMES = frozenset(
         "consumersecret",
         "signingkey",
         "credentials",
+        "personalaccesstoken",
+        "bearertoken",
+        "signingsecret",
+        "webhooksecret",
+        "secretkey",
         "token",
         "apikey",
         "websocketkey",
@@ -221,28 +225,11 @@ def _read_headers(lines: list[str], start: int) -> tuple[list[str], int]:
     index = start
     while index < len(lines):
         content, _ = _line_parts(lines[index])
-        if not content.strip():
+        if not content:
             if fragments:
                 headers.append(" ".join(fragments))
             return headers, index + 1
         if content[:1] in " \t" and fragments:
-            try:
-                blank = lines.index("\r\n", index)
-            except ValueError:
-                try:
-                    blank = lines.index("\n", index)
-                except ValueError:
-                    try:
-                        blank = lines.index("\r", index)
-                    except ValueError:
-                        blank = len(lines)
-            folded = "".join(lines[index:blank])
-            if "\n--" not in folded and "\r--" not in folded:
-                fragments.append(
-                    folded.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
-                )
-                index = blank
-                continue
             fragments.append(content.strip())
         else:
             if fragments:
@@ -285,7 +272,7 @@ def _redact_multipart(text: str, *, depth_observer: list[int] | None = None) -> 
         if first_boundary == len(lines):
             return text
         first_line = _line_parts(lines[first_boundary])[0].rstrip(" \t")
-        boundary = first_line[2:].removesuffix("--")
+        boundary = first_line[2:]
     if not boundary:
         return text
     while (

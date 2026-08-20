@@ -6,7 +6,6 @@ import pytest
 
 from zeta.auth import _redact_multipart, error_body_excerpt
 
-
 SENSITIVE_NAMES = (
     "authorization",
     "proxy-authorization",
@@ -33,6 +32,11 @@ SENSITIVE_NAMES = (
     "token",
     "api_key",
     "apikey",
+    "personal_access_token",
+    "bearer_token",
+    "signing_secret",
+    "webhook_secret",
+    "secret_key",
 )
 NEW_NAME_VARIANTS = (
     "accessToken",
@@ -290,7 +294,7 @@ def test_error_body_excerpt_redacts_dashed_multipart_value() -> None:
     assert "dash-marker" not in error_body_excerpt(body)
 
 
-def test_error_body_excerpt_joins_folded_multipart_headers() -> None:
+def test_redact_multipart_joins_folded_multipart_headers() -> None:
     body = (
         b"Content-Type: multipart/form-data; boundary=outer\r\n\r\n"
         b"--outer\r\n"
@@ -300,7 +304,52 @@ def test_error_body_excerpt_joins_folded_multipart_headers() -> None:
         b"--outer--\r\n"
     )
 
-    assert "folded-marker" not in error_body_excerpt(body)
+    redacted = _redact_multipart(body.decode())
+
+    assert "folded-marker" not in redacted
+
+
+def test_redact_multipart_emits_folded_header_before_next_header() -> None:
+    body = (
+        b"Content-Type: multipart/form-data; boundary=outer\r\n\r\n"
+        b"--outer\r\n"
+        b"Content-Disposition: form-data;\r\n"
+        b" name=password\r\n"
+        b"X-Next-Header: ordinary\r\n\r\n"
+        b"folded-then-next-header-marker\r\n"
+        b"--outer--\r\n"
+    )
+
+    assert "folded-then-next-header-marker" not in _redact_multipart(body.decode())
+
+
+@pytest.mark.parametrize("continuation", [b" \r\n", b"\t\r\n"])
+def test_redact_multipart_keeps_whitespace_only_continuations(
+    continuation: bytes,
+) -> None:
+    body = (
+        b"Content-Type: multipart/form-data; boundary=outer\r\n\r\n"
+        b"--outer\r\n"
+        b"Content-Disposition: form-data;\r\n"
+        + continuation
+        + b" name=password\r\n\r\n"
+        + b"empty-continuation-marker\r\n"
+        + b"--outer--\r\n"
+    )
+
+    assert "empty-continuation-marker" not in _redact_multipart(body.decode())
+
+
+@pytest.mark.parametrize("boundary", ["outer--", "out--er"])
+def test_redact_multipart_preserves_inferred_boundary_hyphens(boundary: str) -> None:
+    body = (
+        f"--{boundary}\r\n"
+        "Content-Disposition: form-data; name=password\r\n\r\n"
+        "inferred-boundary-ending-double-hyphen-marker\r\n"
+        f"--{boundary}--\r\n"
+    )
+
+    assert "inferred-boundary-ending-double-hyphen-marker" not in _redact_multipart(body)
 
 
 def test_error_body_excerpt_rejects_leading_space_boundary_lookalikes() -> None:
@@ -356,7 +405,7 @@ def test_error_body_excerpt_strips_folded_mime_comments(disposition: str) -> Non
 
 def test_error_body_excerpt_handles_deep_multipart_without_recursion() -> None:
     depth = 2000
-    lines = [f"Content-Type: multipart/mixed; boundary=b0\r\n", "\r\n"]
+    lines = ["Content-Type: multipart/mixed; boundary=b0\r\n", "\r\n"]
     for index in range(depth):
         if index + 1 < depth:
             lines.extend(
@@ -386,7 +435,7 @@ def test_error_body_excerpt_handles_deep_multipart_without_recursion() -> None:
 
 
 def test_error_body_excerpt_joins_large_folded_header_once() -> None:
-    folded = " x\r\n" * (792_000 // 3)
+    folded = " ;\r\n" * (792_000 // 3)
     body = (
         "Content-Type: multipart/form-data; boundary=outer\r\n\r\n"
         "--outer\r\n"
@@ -397,10 +446,10 @@ def test_error_body_excerpt_joins_large_folded_header_once() -> None:
     ).encode()
     started = time.perf_counter()
 
-    excerpt = error_body_excerpt(body)
+    redacted = _redact_multipart(body.decode())
 
     elapsed = time.perf_counter() - started
-    assert "folded-header-timing-marker" not in excerpt
+    assert "folded-header-timing-marker" not in redacted
     assert elapsed < 0.2
 
 
