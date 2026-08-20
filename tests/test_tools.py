@@ -1,10 +1,12 @@
 import asyncio
+import math
 import shlex
 import sys
 from pathlib import Path
 
 import pytest
 
+import zeta.tools as tools_module
 from zeta.fake import FakeBackend, ScriptedTurn
 from zeta.loop import AgentLoop
 from zeta.store import ConversationStore
@@ -237,6 +239,75 @@ async def test_exec_output_cap_includes_final_content_boundary(tmp_path: Path) -
 
     assert not result.is_error
     assert len(result.content) == 5
+
+
+@pytest.mark.asyncio
+async def test_exec_abort_wins_when_completion_and_abort_are_ready_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    abort_signal = ToolAbortSignal()
+    registry = ToolRegistry(tmp_path, abort_signal=abort_signal)
+    real_wait = tools_module.asyncio.wait
+
+    async def forced_tie(tasks, *, return_when):
+        await asyncio.sleep(0.1)
+        abort_signal.abort()
+        await asyncio.sleep(0)
+        task_set = set(tasks)
+        done = {task for task in task_set if task.done()}
+        if len(done) < 2:
+            return await real_wait(task_set, return_when=return_when)
+        return done, task_set - done
+
+    monkeypatch.setattr(tools_module.asyncio, "wait", forced_tie)
+    result = await registry.execute(
+        ToolCall(
+            "exec-race",
+            "exec",
+            {"command": _python_command("import time; time.sleep(0.01)")},
+        )
+    )
+
+    assert result == ToolResult("exec-race", "tool execution canceled", True)
+
+
+@pytest.mark.asyncio
+async def test_numeric_validation_rejects_nonfinite_and_bool_enum_values(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register(
+        "number",
+        lambda arguments: "number",
+        parameters={
+            "type": "object",
+            "properties": {
+                "value": {"type": "number", "minimum": 0, "maximum": 10}
+            },
+        },
+    )
+    registry.register(
+        "enum",
+        lambda arguments: "enum",
+        parameters={
+            "type": "object",
+            "properties": {"value": {"enum": [0, 1]}},
+        },
+    )
+
+    nan_result = await registry.execute(
+        ToolCall("nan", "number", {"value": math.nan})
+    )
+    bool_result = await registry.execute(
+        ToolCall("bool", "enum", {"value": True})
+    )
+    int_result = await registry.execute(
+        ToolCall("int", "enum", {"value": 1})
+    )
+    assert nan_result.is_error
+    assert bool_result.is_error
+    assert int_result.content == "enum"
 
 
 @pytest.mark.asyncio

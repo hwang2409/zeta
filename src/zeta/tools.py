@@ -6,6 +6,7 @@ import asyncio
 import copy
 import inspect
 import json
+import math
 import os
 import signal
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -386,6 +387,9 @@ class ToolRegistry:
                 {communication, abort_wait, timeout_wait},
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if _signal_is_set(abort_signal):
+                await _kill_and_reap(process, communication)
+                raise _ToolCanceled()
             if communication in done:
                 stdout, stderr = communication.result()
                 result = _format_exec_result(
@@ -394,9 +398,6 @@ class ToolRegistry:
                 if process.returncode:
                     raise ValueError(result)
                 return result
-            if abort_wait in done and _signal_is_set(abort_signal):
-                await _kill_and_reap(process, communication)
-                raise _ToolCanceled()
 
             await _kill_and_reap(process, communication)
             stdout, stderr = communication.result()
@@ -480,9 +481,13 @@ def _validate_schema(value: Any, schema: Mapping[str, Any], path: str) -> None:
     expected_type = schema.get("type")
     if expected_type is not None and not _matches_type(value, expected_type):
         raise ValueError(f"{path} must be {expected_type}")
-    if "const" in schema and value != schema["const"]:
+    if type(value) is float and not math.isfinite(value):
+        raise ValueError(f"{path} must be finite")
+    if "const" in schema and not _schema_equal(value, schema["const"]):
         raise ValueError(f"{path} must equal the declared constant")
-    if "enum" in schema and value not in schema["enum"]:
+    if "enum" in schema and not any(
+        _schema_equal(value, option) for option in schema["enum"]
+    ):
         raise ValueError(f"{path} is not an allowed value")
     if isinstance(value, str):
         if len(value) < schema.get("minLength", 0):
@@ -536,6 +541,24 @@ def _matches_type(value: Any, expected: object) -> bool:
     if expected == "null":
         return value is None
     return False
+
+
+def _schema_equal(left: Any, right: Any) -> bool:
+    if type(left) is bool or type(right) is bool:
+        return type(left) is type(right) and left == right
+    if type(left) in {int, float} and type(right) in {int, float}:
+        return left == right
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        return (
+            set(left) == set(right)
+            and all(_schema_equal(left[key], right[key]) for key in left)
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _schema_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    return type(left) is type(right) and left == right
 
 
 _SCHEMA_KEYS = {
