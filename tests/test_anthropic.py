@@ -242,6 +242,20 @@ def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
     }
 
 
+def test_empty_system_prompt_is_omitted_from_payload() -> None:
+    payload = build_messages_payload(
+        [
+            Message(MessageRole.SYSTEM, [TextContent("  ")]),
+            Message(MessageRole.USER, [TextContent("run")]),
+        ],
+        [],
+        model="claude-test",
+        max_tokens=100,
+    )
+
+    assert "system" not in payload
+
+
 def test_authorization_url_contains_validated_redirect_uri() -> None:
     url = build_authorization_url("state", "challenge", "http://localhost/callback")
     assert "redirect_uri=http%3A%2F%2Flocalhost%2Fcallback" in url

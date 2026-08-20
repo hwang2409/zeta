@@ -42,6 +42,18 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_system_prompt_is_not_sent_to_backend(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
+    store = ConversationStore(tmp_path)
+
+    await collect(AgentLoop(backend, store, system_prompt="").run_turn("hi"))
+
+    assert all(
+        message.role is not MessageRole.SYSTEM for message in backend.calls[0][0]
+    )
+
+
+@pytest.mark.asyncio
 async def test_tool_call_then_next_completion(tmp_path: Path) -> None:
     first_call = ToolCall("call-1", "echo", {"value": "one"})
     second_call = ToolCall("call-2", "echo", {"value": "two"})

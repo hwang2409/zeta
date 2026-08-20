@@ -228,18 +228,19 @@ class ContextAssembler:
         branch_id = self._branch_id(branch)
         items = self._visible_items(branch)
         boundary = self._tail_boundary(items)
+        system_prompt = self._system_prompt_message()
+        system_messages = [] if system_prompt is None else [system_prompt]
         committed = [item for item in items if item.fixed]
         committed.extend(item for item in items[boundary:] if not item.fixed)
-        committed_messages = [self.system_prompt, *(item.message for item in committed)]
+        committed_messages = [*system_messages, *(item.message for item in committed)]
         committed_tokens = self._count(committed_messages)
-        total_tokens = self._total_tokens(
-            [self.system_prompt, *(item.message for item in items)]
-        )
+        all_messages = [*system_messages, *(item.message for item in items)]
+        total_tokens = self._total_tokens(all_messages)
         if not self.compaction_policy.should_compact(
             total_tokens, self.token_budget
         ):
             return self._save(
-                [self.system_prompt, *(item.message for item in items)],
+                all_messages,
                 False,
             )
         if committed_tokens > self.token_budget:
@@ -255,12 +256,21 @@ class ContextAssembler:
             for item in candidates
             if item.entry is not None
         }
-        source_start = min(entry.seq for entry in source_entries.values())
-        source_end = max(entry.seq for entry in source_entries.values())
+        source_ranges = [
+            (
+                entry.data["source_seq_start"],
+                entry.data["source_seq_end"],
+            )
+            if entry.type == "compaction"
+            else (entry.seq, entry.seq)
+            for entry in source_entries.values()
+        ]
+        source_start = min(start for start, _ in source_ranges)
+        source_end = max(end for _, end in source_ranges)
         summary = await self.compaction_policy.summarize(
             [item.message for item in candidates],
             backend=backend or self.backend,
-            system_prompt=self.system_prompt,
+            system_prompt=system_prompt,
             max_source_tokens=max(1, self.token_budget // 2),
         )
         if self._branch_id(self.store.replay()) != branch_id:
@@ -268,7 +278,7 @@ class ContextAssembler:
 
         marker_messages = self._marker_messages(source_start, source_end, summary)
         proposed_messages = [
-            self.system_prompt,
+            *system_messages,
             *marker_messages,
             *(item.message for item in items[boundary:]),
         ]
@@ -304,6 +314,11 @@ class ContextAssembler:
 
     def _count(self, messages: Sequence[Message]) -> int:
         return sum(self.token_counter(message) for message in messages)
+
+    def _system_prompt_message(self) -> Message | None:
+        if not _text_from_message(self.system_prompt).strip():
+            return None
+        return self.system_prompt
 
     def _total_tokens(self, messages: Sequence[Message]) -> int:
         estimated = self._count(messages)

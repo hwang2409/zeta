@@ -79,7 +79,7 @@ async def test_compaction_requires_non_tail_content(context_root: Path) -> None:
     store.append_message(text(MessageRole.USER, "tail"))
     assembler = ContextAssembler(
         store,
-        token_budget=2,
+        token_budget=1,
         retained_tail=1,
         token_counter=lambda _: 2,
     )
@@ -186,7 +186,6 @@ async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> 
 
     assert [entry.type for entry in store.replay()] == ["message", "message", "compaction"]
     assert [message.role for message in replayed] == [
-        MessageRole.SYSTEM,
         MessageRole.COMPACTION,
         MessageRole.ASSISTANT,
         MessageRole.ASSISTANT,
@@ -272,13 +271,19 @@ async def test_over_budget_compaction_does_not_persist_marker(context_root: Path
 
 
 @pytest.mark.asyncio
-async def test_repeated_compaction_replaces_previous_marker(context_root: Path) -> None:
+async def test_repeated_compaction_replays_flattened_marker_range(
+    context_root: Path,
+) -> None:
     store = ConversationStore(context_root)
-    store.append_message(text(MessageRole.USER, "old"))
-    store.append_compaction_marker("first summary", 1, 1)
-    store.append_message(text(MessageRole.USER, "new one"))
-    store.append_message(text(MessageRole.USER, "new tail"))
-    backend = FakeBackend([ScriptedTurn([TextContent("second summary")])])
+    for index in range(5):
+        store.append_message(text(MessageRole.USER, f"old {index}"))
+    store.append_message(text(MessageRole.USER, "first tail"))
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first summary")]),
+            ScriptedTurn([TextContent("second summary")]),
+        ]
+    )
 
     def repeat_count(message: Message) -> int:
         if (
@@ -290,13 +295,31 @@ async def test_repeated_compaction_replaces_previous_marker(context_root: Path) 
 
     assembler = ContextAssembler(
         store,
-        token_budget=400,
+        token_budget=500,
         retained_tail=1,
         token_counter=repeat_count,
         backend=backend,
     )
 
-    messages = await assembler.assemble()
+    await assembler.assemble()
+    for value in ("new one", "new two", "new tail"):
+        store.append_message(text(MessageRole.USER, value))
+    await assembler.assemble()
+
+    markers = [entry for entry in store.entries if entry.type == "compaction"]
+    assert [(entry.data["source_seq_start"], entry.data["source_seq_end"]) for entry in markers] == [
+        (1, 5),
+        (1, 9),
+    ]
+
+    reopened = ConversationStore(context_root, session_id=store.session_id)
+    fresh = ContextAssembler(
+        reopened,
+        token_budget=500,
+        retained_tail=1,
+        token_counter=repeat_count,
+    )
+    messages = await fresh.assemble()
 
     assert [message.role for message in messages].count(MessageRole.COMPACTION) == 1
     assert [
@@ -304,6 +327,33 @@ async def test_repeated_compaction_replaces_previous_marker(context_root: Path) 
         for message in messages
         if message.role is MessageRole.ASSISTANT
     ] == [True]
+    assert all(
+        value not in (block.text if isinstance(block, TextContent) else "")
+        for message in messages
+        for block in message.content
+        for value in ("old 0", "old 4")
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_compaction_replacement_is_idempotent(context_root: Path) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(text(MessageRole.USER, "old"))
+    store.append_compaction_marker("summary", 1, 1)
+    store.append_message(text(MessageRole.USER, "tail"))
+    assembler = ContextAssembler(
+        store,
+        token_budget=10_000,
+        retained_tail=1,
+        token_counter=compact_count,
+    )
+
+    first = [message.to_dict() for message in await assembler.assemble()]
+    before = store.path.read_bytes()
+    second = [message.to_dict() for message in await assembler.assemble()]
+
+    assert second == first
+    assert store.path.read_bytes() == before
 
 
 def test_zero_retained_tail_is_rejected(context_root: Path) -> None:
