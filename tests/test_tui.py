@@ -103,6 +103,22 @@ class ErrorBackend(CompletionBackend):
         raise RuntimeError("boom")
 
 
+class EventBackend(CompletionBackend):
+    def __init__(self, event: StreamEvent) -> None:
+        self.event = event
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("| name | value |\n| --- | --- |"),
+        )
+        yield self.event
+
+
 class BlockingToolBackend(CompletionBackend):
     def __init__(self, call: ToolCall) -> None:
         self.call = call
@@ -326,6 +342,68 @@ async def test_verbose_error_flushes_before_raw_error(tmp_path: Path) -> None:
         if getattr(item, "plain", None) == "[error] boom"
     )
     assert table_index < raw_error_index < pretty_error_index
+
+
+@pytest.mark.parametrize(
+    ("event", "raw_marker"),
+    [
+        (
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_START,
+                tool_call=ToolCall("call-1", "read", {}),
+            ),
+            "tool_execution_start",
+        ),
+        (
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=ToolCall("call-1", "read", {}),
+                tool_result=ToolResult("call-1", "done"),
+            ),
+            "tool_execution_end",
+        ),
+        (
+            StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=ThinkingContent("plan\n"),
+            ),
+            "plan",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_verbose_transition_flushes_before_raw_event(
+    tmp_path: Path,
+    event: StreamEvent,
+    raw_marker: str,
+) -> None:
+    app = TUIApp(
+        AgentLoop(EventBackend(event), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        verbose=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    rendered = []
+
+    def capture(renderable: object | None) -> None:
+        if renderable is not None:
+            rendered.append(renderable)
+
+    app._print = capture
+
+    await app._consume_turn("prompt")
+
+    table_index = next(
+        index for index, item in enumerate(rendered) if isinstance(item, Table)
+    )
+    raw_index = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", "").startswith("{")
+        and raw_marker in item.plain
+    )
+    assert table_index < raw_index
 
 
 @pytest.mark.asyncio

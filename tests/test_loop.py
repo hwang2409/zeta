@@ -99,13 +99,11 @@ async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -
     backend = FakeBackend([ScriptedTurn([], [first_call, second_call])])
     store = ConversationStore(tmp_path)
     registry = ToolRegistry(tmp_path, register_builtin=False)
-    second_release = asyncio.Event()
 
     async def first(arguments: dict[str, object]) -> str:
         return "one"
 
     async def second(arguments: dict[str, object]) -> str:
-        await second_release.wait()
         return "two"
 
     registry.register("first", first, parallel_safe=True)
@@ -119,12 +117,12 @@ async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -
                 and event.tool_call is not None
                 and event.tool_call.id == first_call.id
             ):
-                second_release.set()
                 await asyncio.sleep(0)
                 asyncio.current_task().cancel()
 
+    task = asyncio.create_task(consume())
     with pytest.raises(asyncio.CancelledError):
-        await consume()
+        await task
 
     results = {
         message.tool_result.tool_call_id: message.tool_result
@@ -135,6 +133,51 @@ async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -
     assert results[second_call.id].content == "two"
     assert not results[first_call.id].is_error
     assert not results[second_call.id].is_error
+
+
+@pytest.mark.asyncio
+async def test_parallel_results_persist_in_call_order(tmp_path: Path) -> None:
+    first_call = ToolCall("call-1", "first", {})
+    second_call = ToolCall("call-2", "second", {})
+    backend = FakeBackend([ScriptedTurn([], [first_call, second_call])])
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    first_release = asyncio.Event()
+    second_release = asyncio.Event()
+
+    async def first(arguments: dict[str, object]) -> str:
+        first_started.set()
+        await first_release.wait()
+        return "one"
+
+    async def second(arguments: dict[str, object]) -> str:
+        second_started.set()
+        await second_release.wait()
+        return "two"
+
+    registry.register("first", first, parallel_safe=True)
+    registry.register("second", second, parallel_safe=True)
+    loop = AgentLoop(backend, store, registry=registry)
+
+    task = asyncio.create_task(collect(loop.run_turn("start")))
+    await first_started.wait()
+    await second_started.wait()
+    second_release.set()
+    first_release.set()
+    await task
+
+    results = [
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    ]
+    assert [result.tool_call_id for result in results] == [
+        first_call.id,
+        second_call.id,
+    ]
+    assert [result.content for result in results] == ["one", "two"]
 
 
 @pytest.mark.asyncio

@@ -212,6 +212,7 @@ class AgentLoop:
 
             completed_tool_ids: set[str] = set()
             parallel_tasks: dict[asyncio.Task[ToolResult], ToolCall] = {}
+            parallel_results: dict[str, ToolResult] = {}
             try:
                 call_index = 0
                 while call_index < len(calls):
@@ -231,6 +232,7 @@ class AgentLoop:
                                     break
                                 parallel_calls.append(next_call)
                     if len(parallel_calls) > 1:
+                        parallel_results = {}
                         for tool_call in parallel_calls:
                             yield StreamEvent(
                                 StreamEventType.TOOL_EXECUTION_START,
@@ -247,15 +249,18 @@ class AgentLoop:
                             )
                             for task in done:
                                 tool_call = parallel_tasks.pop(task)
-                                result = task.result()
-                                result = _validated_tool_result(result, tool_call.id)
-                                self._append_tool_result(result)
-                                completed_tool_ids.add(tool_call.id)
-                                yield StreamEvent(
-                                    StreamEventType.TOOL_EXECUTION_END,
-                                    tool_call=tool_call,
-                                    tool_result=result,
+                                parallel_results[tool_call.id] = _validated_tool_result(
+                                    task.result(), tool_call.id
                                 )
+                        for tool_call in parallel_calls:
+                            result = parallel_results.pop(tool_call.id)
+                            self._append_tool_result(result)
+                            completed_tool_ids.add(tool_call.id)
+                            yield StreamEvent(
+                                StreamEventType.TOOL_EXECUTION_END,
+                                tool_call=tool_call,
+                                tool_result=result,
+                            )
                         call_index += len(parallel_calls)
                         continue
 
@@ -288,12 +293,19 @@ class AgentLoop:
                             result = _validated_tool_result(task.result(), tool_call.id)
                         except BaseException:
                             continue
-                        self._append_tool_result(result)
-                        completed_tool_ids.add(tool_call.id)
+                        parallel_results[tool_call.id] = result
                     else:
                         task.cancel()
                         pending_tasks.append(task)
                 await asyncio.gather(*pending_tasks, return_exceptions=True)
+                for tool_call in calls:
+                    if tool_call.id in completed_tool_ids:
+                        continue
+                    result = parallel_results.pop(tool_call.id, None)
+                    if result is None:
+                        continue
+                    self._append_tool_result(result)
+                    completed_tool_ids.add(tool_call.id)
                 self._append_cancelled_tool_results(calls, completed_tool_ids)
                 raise
             yield StreamEvent(

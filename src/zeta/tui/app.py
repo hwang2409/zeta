@@ -252,6 +252,9 @@ class TUIApp:
 
     def _finish_stream(self) -> None:
         self._flush_pending_stream()
+        self._reset_stream_state()
+
+    def _reset_stream_state(self) -> None:
         self._reset_stream_buffers()
         self._partial = ""
 
@@ -269,13 +272,27 @@ class TUIApp:
             self.console.print(Text("[queued]", style="dim"))
             self._start_turn(user_text)
 
+    def _prepare_stream_event(self, event: StreamEvent) -> None:
+        if event.type is not StreamEventType.MESSAGE_UPDATE:
+            self._flush_pending_stream()
+            return
+        if isinstance(event.content, ThinkingContent):
+            incoming_kind = "thinking"
+        elif isinstance(event.content, TextContent) or event.delta is not None:
+            incoming_kind = "assistant"
+        else:
+            incoming_kind = None
+        if incoming_kind != self._stream_kind and (
+            incoming_kind is not None or self._stream_kind is not None
+        ):
+            self._flush_pending_stream()
+
     async def _consume_turn(self, user_text: str) -> None:
         self._loop_state = "streaming"
         try:
             async for event in self.loop.run_turn(user_text):
                 self._update_usage(event)
-                if event.type is StreamEventType.ERROR:
-                    self._flush_pending_stream()
+                self._prepare_stream_event(event)
                 if self.verbose:
                     self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style="dim"))
                 if event.type is StreamEventType.MESSAGE_UPDATE:
@@ -283,12 +300,12 @@ class TUIApp:
                     self._invalidate_prompt()
                     continue
                 if event.type is StreamEventType.TOOL_EXECUTION_START:
-                    self._finish_stream()
+                    self._reset_stream_state()
                     self._loop_state = "tool-running"
                 elif event.type is StreamEventType.TOOL_EXECUTION_END:
                     self._loop_state = "streaming"
                 elif event.type is StreamEventType.AGENT_END:
-                    self._finish_stream()
+                    self._reset_stream_state()
                     self._loop_state = "idle"
                 self._print(render_event(event))
                 self._invalidate_prompt()
