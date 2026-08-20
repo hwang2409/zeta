@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -42,10 +41,6 @@ def build_key_bindings(
 
     @bindings.add("c-d")
     def exit_prompt(event: KeyPressEvent) -> None:
-        buffer: Buffer = event.current_buffer
-        if buffer.text:
-            buffer.delete()
-            return
         on_exit()
         event.app.exit(exception=EOFError())
 

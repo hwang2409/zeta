@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from rich.console import RenderableType
@@ -57,26 +57,21 @@ def render_code(value: str, language: str = "text") -> Syntax:
 class MarkdownStream:
     """Turn committed lines into scrollback renderables.
 
-    Fenced code is held until its closing fence so Rich can highlight it as one
-    block. Ordinary lines commit immediately.
+    Fenced code switches to a syntax-aware line renderer as soon as its opener
+    arrives. Every completed line reaches scrollback without waiting for the
+    closing fence.
     """
 
     language: str | None = None
-    code_lines: list[str] = field(default_factory=list)
 
     def consume(self, line: str) -> list[RenderableType]:
         stripped = line.strip()
         if self.language is not None:
             if stripped.startswith("```"):
-                result: list[RenderableType] = [
-                    render_code("\n".join(self.code_lines), self.language),
-                    Text(line, style="dim"),
-                ]
+                result: list[RenderableType] = [Text(line, style="dim")]
                 self.language = None
-                self.code_lines.clear()
                 return result
-            self.code_lines.append(line)
-            return []
+            return [render_code(line, self.language)]
 
         if stripped.startswith("```"):
             self.language = stripped[3:].strip() or "text"
@@ -84,12 +79,8 @@ class MarkdownStream:
         return [render_markdown(line) if line else Text("")]
 
     def flush(self) -> list[RenderableType]:
-        if self.language is None or not self.code_lines:
-            return []
-        result = [render_code("\n".join(self.code_lines), self.language)]
         self.language = None
-        self.code_lines.clear()
-        return result
+        return []
 
 
 def render_event(event: StreamEvent) -> RenderableType | None:

@@ -144,6 +144,7 @@ class TUIApp:
         self._assistant_lines = _LineBuffer()
         self._thinking_lines = _LineBuffer()
         self._markdown_stream = MarkdownStream()
+        self._stream_kind: str | None = None
         self._partial = ""
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
@@ -179,6 +180,7 @@ class TUIApp:
 
     def abort_active(self) -> None:
         if self._active_task is not None and not self._active_task.done():
+            self.loop.abort()
             self._active_task.cancel()
 
     def _status_toolbar(self) -> FormattedText:
@@ -213,6 +215,14 @@ class TUIApp:
     def _invalidate_prompt() -> None:
         get_app().invalidate()
 
+    def _flush_stream_kind(self) -> None:
+        if self._stream_kind == "thinking":
+            self._print_committed(self._thinking_lines.flush(), thinking=True)
+        elif self._stream_kind == "assistant":
+            self._print_committed(self._assistant_lines.flush())
+        self._stream_kind = None
+        self._partial = ""
+
     def _consume_text(self, event: StreamEvent) -> None:
         value = event.delta
         thinking = False
@@ -223,12 +233,17 @@ class TUIApp:
             thinking = True
         if not value:
             return
+        stream_kind = "thinking" if thinking else "assistant"
+        if self._stream_kind is not None and self._stream_kind != stream_kind:
+            self._flush_stream_kind()
+        self._stream_kind = stream_kind
         buffer = self._thinking_lines if thinking else self._assistant_lines
         committed = buffer.feed(value)
         self._partial = buffer.value
         self._print_committed(committed, thinking=thinking)
 
     def _finish_stream(self) -> None:
+        self._flush_stream_kind()
         self._print_committed(self._assistant_lines.flush())
         self._print_committed(self._thinking_lines.flush(), thinking=True)
         for renderable in self._markdown_stream.flush():
@@ -276,10 +291,10 @@ class TUIApp:
             return None
         return parse_input(value)
 
-    async def run(self) -> None:
+    async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run until Ctrl-D or an exit request."""
 
-        session = self._session or self._make_session()
+        session = session or self._session or self._make_session()
         prompt_task: asyncio.Task[str | None] | None = asyncio.create_task(
             self._read_prompt(session)
         )
