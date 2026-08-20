@@ -34,6 +34,34 @@ SENSITIVE_NAMES = (
     "api_key",
     "apikey",
 )
+NEW_NAME_VARIANTS = (
+    "accessToken",
+    "access_token",
+    "refreshToken",
+    "refresh_token",
+    "idToken",
+    "id_token",
+    "clientSecret",
+    "client_secret",
+    "sessionToken",
+    "session_token",
+    "privateKey",
+    "private_key",
+    "clientAssertion",
+    "client_assertion",
+    "deviceCode",
+    "device_code",
+    "awsAccessKeyId",
+    "aws_access_key_id",
+    "awsSecretAccessKey",
+    "aws_secret_access_key",
+    "xAmzCredential",
+    "x_amz_credential",
+    "xGoogCredential",
+    "x_goog_credential",
+    "xGoogSignature",
+    "x_goog_signature",
+)
 
 
 @pytest.mark.parametrize(
@@ -204,13 +232,77 @@ def test_error_body_excerpt_percent_decodes_form_field_names(
     assert marker not in excerpt
 
 
-@pytest.mark.parametrize(
-    ("size_mib", "budget_seconds"), [(4, 0.2), (16, 0.8)]
-)
-def test_error_body_excerpt_handles_large_multiline_records_quickly(
-    size_mib: int, budget_seconds: float
+@pytest.mark.parametrize("field", NEW_NAME_VARIANTS)
+@pytest.mark.parametrize("body_format", ["json", "header", "form", "multipart"])
+def test_error_body_excerpt_redacts_camel_and_snake_names(
+    field: str, body_format: str
 ) -> None:
-    body = b"authorization: Foo\n" + b"x\n" * ((size_mib * 1024 * 1024 - 19) // 2)
+    marker = "expanded-name-marker"
+    if body_format == "json":
+        body = json.dumps({field: marker}).encode()
+    elif body_format == "header":
+        body = f"{field}: {marker}".encode()
+    elif body_format == "form":
+        body = f"{quote(field)}={quote(marker)}".encode()
+    else:
+        body = (
+            f'--boundary\r\nContent-Disposition: form-data; name="{field}"\r\n'
+            f"\r\n{marker}\r\n--boundary--\r\n"
+        ).encode()
+
+    assert marker not in error_body_excerpt(body)
+
+
+def test_error_body_excerpt_tracks_nested_multipart_boundary() -> None:
+    body = (
+        b"Content-Type: multipart/mixed; boundary=outer\r\n\r\n"
+        b"--outer\r\n"
+        b"Content-Disposition: form-data; name=container\r\n"
+        b"Content-Type: multipart/mixed; boundary=inner\r\n\r\n"
+        b"--inner\r\n"
+        b"Content-Disposition: form-data; name=password\r\n\r\n"
+        b"nested-marker\r\n"
+        b"--inner--\r\n"
+        b"--outer--\r\n"
+    )
+
+    assert "nested-marker" not in error_body_excerpt(body)
+
+
+def test_error_body_excerpt_redacts_dashed_multipart_value() -> None:
+    body = (
+        b"Content-Type: multipart/form-data; boundary=outer\r\n\r\n"
+        b"--outer\r\n"
+        b"Content-Disposition: form-data; name=password\r\n\r\n"
+        b"--dash-marker\r\n"
+        b"--outer--\r\n"
+    )
+
+    assert "dash-marker" not in error_body_excerpt(body)
+
+
+def test_error_body_excerpt_joins_folded_multipart_headers() -> None:
+    body = (
+        b"Content-Type: multipart/form-data; boundary=outer\r\n\r\n"
+        b"--outer\r\n"
+        b"Content-Disposition: form-data;\r\n"
+        b" name=password\r\n\r\n"
+        b"folded-marker\r\n"
+        b"--outer--\r\n"
+    )
+
+    assert "folded-marker" not in error_body_excerpt(body)
+
+
+@pytest.mark.parametrize(
+    ("size_kib", "budget_seconds"),
+    [(512, 0.01), (4096, 0.1), (16384, 0.4)],
+)
+def test_error_body_excerpt_handles_later_colon_records_quickly(
+    size_kib: int, budget_seconds: float
+) -> None:
+    body = b"authorization: Foo\n" + b"x\n" * ((size_kib * 1024 - 19) // 2)
+    body += b"later: safe-value"
     started = time.perf_counter()
 
     excerpt = error_body_excerpt(body)

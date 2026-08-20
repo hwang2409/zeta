@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import io
 import json
 import os
 import secrets
@@ -21,32 +22,40 @@ import httpx
 _SENSITIVE_ERROR_NAMES = frozenset(
     {
         "authorization",
-        "proxy_authorization",
-        "www_authenticate",
+        "proxyauthorization",
+        "wwwauthenticate",
         "authentication",
-        "x_api_key",
-        "x_auth_token",
-        "x_amz_security_token",
-        "x_amz_signature",
-        "x_goog_api_key",
-        "anthropic_api_key",
-        "openai_api_key",
-        "sec_websocket_key",
-        "sec_websocket_accept",
+        "xapikey",
+        "xauthtoken",
+        "xamzsecuritytoken",
+        "xamzsignature",
+        "xgoogapikey",
+        "anthropicapikey",
+        "openaiapikey",
+        "secwebsocketkey",
+        "secwebsocketaccept",
         "cookie",
-        "set_cookie",
+        "setcookie",
         "password",
         "passwd",
         "secret",
-        "client_secret",
-        "access_token",
-        "refresh_token",
-        "id_token",
-        "form_id_token",
+        "clientsecret",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "formidtoken",
+        "sessiontoken",
+        "privatekey",
+        "clientassertion",
+        "devicecode",
+        "awsaccesskeyid",
+        "awssecretaccesskey",
+        "xamzcredential",
+        "xgoogcredential",
+        "xgoogsignature",
         "token",
-        "api_key",
         "apikey",
-        "websocket_key",
+        "websocketkey",
     }
 )
 _FIELD_NAME_CHARS = frozenset(
@@ -59,8 +68,20 @@ _TOKEN_CHARS = frozenset(
 
 
 def _is_sensitive_name(name: str) -> bool:
-    normalized = unquote_plus(name).strip().strip("\"'").lower().replace("-", "_")
-    return normalized in _SENSITIVE_ERROR_NAMES
+    decoded = unquote_plus(name).strip().strip("\"'")
+    normalized: list[str] = []
+    for index, character in enumerate(decoded):
+        if not character.isalnum():
+            continue
+        if character.isupper() and index:
+            previous = decoded[index - 1]
+            following = decoded[index + 1] if index + 1 < len(decoded) else ""
+            if previous.islower() or previous.isdigit() or (
+                previous.isupper() and following.islower()
+            ):
+                normalized.append("_")
+        normalized.append(character.lower())
+    return "".join(normalized).replace("_", "") in _SENSITIVE_ERROR_NAMES
 
 
 def _line_parts(line: str) -> tuple[str, str]:
@@ -99,39 +120,126 @@ def _looks_like_header(line: str) -> bool:
     return bool(name) and all(character in _FIELD_NAME_CHARS for character in name)
 
 
-def _multipart_name(line: str) -> str | None:
-    if "content-disposition" not in line.lower():
-        return None
-    for segment in line.split(";"):
-        key, separator, value = segment.partition("=")
-        if separator and key.strip().lower() == "name":
-            return value.strip().strip("\"'")
+def _header_value(headers: list[str], name: str) -> str | None:
+    for header in headers:
+        separator = header.find(":")
+        if separator > 0 and header[:separator].strip().lower() == name:
+            return header[separator + 1 :].strip()
     return None
+
+
+def _header_parameter(value: str | None, name: str) -> str | None:
+    if value is None:
+        return None
+    for segment in value.split(";"):
+        key, separator, parameter = segment.partition("=")
+        if separator and key.strip().lower() == name:
+            parameter = parameter.strip()
+            if len(parameter) >= 2 and parameter[0] == parameter[-1] == '"':
+                return parameter[1:-1]
+            return parameter
+    return None
+
+
+def _multipart_name(headers: list[str]) -> str | None:
+    disposition = _header_value(headers, "content-disposition")
+    return _header_parameter(disposition, "name")
+
+
+def _boundary_kind(line: str, boundary: str) -> str | None:
+    content = line.strip()
+    if content == f"--{boundary}":
+        return "open"
+    if content == f"--{boundary}--":
+        return "close"
+    return None
+
+
+def _read_headers(lines: list[str], start: int) -> tuple[list[str], int]:
+    headers: list[str] = []
+    index = start
+    while index < len(lines):
+        content, _ = _line_parts(lines[index])
+        if not content.strip():
+            return headers, index + 1
+        if content[:1] in " \t" and headers:
+            headers[-1] += " " + content.strip()
+        else:
+            headers.append(content)
+        index += 1
+    return headers, index
 
 
 def _redact_multipart(text: str) -> str:
     lines = text.splitlines(keepends=True)
-    result: list[str] = []
-    in_headers = True
-    sensitive_part = False
-    for line in lines:
-        content, ending = _line_parts(line)
-        if content.lstrip().startswith("--"):
-            in_headers = True
-            sensitive_part = False
-            result.append(line)
-        elif in_headers:
-            result.append(line)
-            name = _multipart_name(content)
-            if name is not None:
-                sensitive_part = _is_sensitive_name(name)
-            if not content.strip():
-                in_headers = False
-        elif sensitive_part:
-            result.append(f"[redacted]{ending}")
-        else:
-            result.append(line)
-    return "".join(result)
+    if not lines:
+        return text
+
+    headers, header_end = _read_headers(lines, 0)
+    boundary = _header_parameter(_header_value(headers, "content-type"), "boundary")
+    first_boundary = header_end
+    if boundary is None:
+        first_boundary = next(
+            (
+                index
+                for index, line in enumerate(lines)
+                if _line_parts(line)[0].strip().startswith("--")
+            ),
+            len(lines),
+        )
+        if first_boundary == len(lines):
+            return text
+        first_line = _line_parts(lines[first_boundary])[0].strip()
+        boundary = first_line[2:].removesuffix("--")
+    if not boundary:
+        return text
+    while first_boundary < len(lines) and _boundary_kind(lines[first_boundary], boundary) != "open":
+        first_boundary += 1
+    if first_boundary == len(lines):
+        return text
+
+    def redact_parts(index: int, current_boundary: str, inherited_sensitive: bool) -> int:
+        while index < len(lines):
+            kind = _boundary_kind(lines[index], current_boundary)
+            if kind == "close":
+                return index + 1
+            if kind != "open":
+                index += 1
+                continue
+            headers, body_start = _read_headers(lines, index + 1)
+            part_sensitive = inherited_sensitive or _is_sensitive_name(
+                _multipart_name(headers) or ""
+            )
+            nested_boundary = _header_parameter(
+                _header_value(headers, "content-type"), "boundary"
+            )
+            if nested_boundary:
+                nested_end = redact_parts(body_start, nested_boundary, part_sensitive)
+                body_end = nested_end
+                while body_end < len(lines) and _boundary_kind(
+                    lines[body_end], current_boundary
+                ) is None:
+                    body_end += 1
+                if part_sensitive:
+                    for body_line in range(nested_end, body_end):
+                        _, ending = _line_parts(lines[body_line])
+                        lines[body_line] = f"[redacted]{ending}"
+                index = body_end
+                continue
+            body_end = body_start
+            while body_end < len(lines) and _boundary_kind(
+                lines[body_end], current_boundary
+            ) is None:
+                body_end += 1
+            if part_sensitive:
+                for body_line in range(body_start, body_end):
+                    _, ending = _line_parts(lines[body_line])
+                    lines[body_line] = f"[redacted]{ending}"
+            index = body_end
+        return index
+
+    redact_parts(first_boundary, boundary, False)
+    return "".join(lines)
 
 
 def _redact_error_text(text: str) -> str:
@@ -167,30 +275,18 @@ def _redact_error_text(text: str) -> str:
 
     result: list[str] = []
     redact_continuation = False
-    position = 0
-    while position < len(text):
-        line_end = text.find("\n", position)
-        if line_end == -1:
-            line_end = len(text)
-        else:
-            line_end += 1
-        line = text[position:line_end]
+    for line in io.StringIO(text):
         content, ending = _line_parts(line)
         if redact_continuation:
-            if text.find(":", position) == -1:
-                result.append("[redacted]")
-                break
             if not content.strip():
                 redact_continuation = False
                 result.append(line)
-                position = line_end
                 continue
             if _looks_like_header(content):
                 redact_continuation = False
             else:
                 result.append(f"[redacted]{ending}")
-                position = line_end
-                continue
+                break
         found = _sensitive_separator(content)
         if found is None:
             result.append(redact_bare_tokens(line))
@@ -198,7 +294,6 @@ def _redact_error_text(text: str) -> str:
             separator, kind = found
             result.append(f"{content[: separator + 1]}[redacted]{ending}")
             redact_continuation = kind == ":"
-        position = line_end
     return "".join(result)
 
 
