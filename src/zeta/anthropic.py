@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -13,7 +15,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .auth import OAuthCredentialStore, OAuthTokens
+from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
 from .transport import (
     cleanup_transport,
     is_control_exception,
@@ -86,6 +88,33 @@ def _credential_candidates() -> tuple[Path, ...]:
     return (claude_dir / ".credentials.json", claude_dir / "credentials.json")
 
 
+def _keychain_claude_tokens() -> OAuthTokens | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not isinstance(result.stdout, str) or not result.stdout.strip():
+        return None
+    try:
+        return _extract_claude_tokens(json.loads(result.stdout))
+    except (AnthropicAuthError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
 def _extract_claude_tokens(value: Any) -> OAuthTokens:
     if not isinstance(value, Mapping):
         raise ValueError("Claude credentials are not an object")
@@ -138,7 +167,7 @@ class AnthropicCredentialStore(OAuthCredentialStore):
                 raise self.auth_error_type(
                     f"{self.provider_label} credentials could not be read"
                 ) from exc
-        return None
+        return _keychain_claude_tokens()
 
     async def refresh(self, refresh_token: str, client: httpx.AsyncClient) -> OAuthTokens:
         try:
@@ -389,18 +418,7 @@ async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes
 
 
 def _http_error(status_code: int, body: bytes) -> AnthropicHTTPError:
-    message = "request failed"
-    try:
-        value = json.loads(body)
-        detail = value.get("error") if isinstance(value, Mapping) else None
-        message = detail.get("message") if isinstance(detail, Mapping) else None
-        if type(message) is not str:
-            message = "request failed"
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
-        pass
-    message = "".join(
-        character for character in message if character.isprintable() or character in "\t\n"
-    )[:500]
+    message = error_body_excerpt(body) or "request failed"
     error_type = AnthropicAuthError if status_code in {401, 403} else AnthropicHTTPError
     return error_type(f"Anthropic HTTP {status_code}: {message}")
 

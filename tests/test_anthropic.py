@@ -6,6 +6,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+import zeta.anthropic as anthropic_module
 from zeta.anthropic import (
     AnthropicAuthError,
     AnthropicBackend,
@@ -245,6 +246,89 @@ def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
 def test_authorization_url_contains_validated_redirect_uri() -> None:
     url = build_authorization_url("state", "challenge", "http://localhost/callback")
     assert "redirect_uri=http%3A%2F%2Flocalhost%2Fcallback" in url
+
+
+def test_claude_keychain_bootstrap_reads_oauth_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    def run(*args: object, **kwargs: object) -> object:
+        calls.append(args)
+        return type("Result", (), {"returncode": 0, "stdout": json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "keychain-access",
+                "refreshToken": "keychain-refresh",
+                "expiresAt": 4_000_000_000,
+            }
+        })})()
+
+    monkeypatch.setattr(anthropic_module.sys, "platform", "darwin")
+    monkeypatch.setattr(anthropic_module.subprocess, "run", run)
+    tokens = AnthropicCredentialStore(tmp_path / "zeta.json").bootstrap()
+
+    assert tokens == OAuthTokens("keychain-access", "keychain-refresh", 4_000_000_000)
+    assert calls == [
+        (["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],)
+    ]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        type("Result", (), {"returncode": 1, "stdout": ""})(),
+        type("Result", (), {"returncode": 0, "stdout": "not json"})(),
+    ],
+)
+def test_claude_keychain_bootstrap_treats_invalid_output_as_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, result: object
+) -> None:
+    monkeypatch.setattr(anthropic_module.sys, "platform", "darwin")
+    monkeypatch.setattr(anthropic_module.subprocess, "run", lambda *args, **kwargs: result)
+
+    assert AnthropicCredentialStore(tmp_path / "zeta.json").bootstrap() is None
+
+
+def test_claude_file_bootstrap_wins_over_keychain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "file-access",
+            "refreshToken": "file-refresh",
+            "expiresAt": 4_000_000_000,
+        }
+    }))
+    monkeypatch.setattr(anthropic_module.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(anthropic_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        anthropic_module.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("keychain should not be queried"),
+    )
+
+    assert AnthropicCredentialStore(tmp_path / "zeta.json").bootstrap() == OAuthTokens(
+        "file-access", "file-refresh", 4_000_000_000
+    )
+
+
+def test_anthropic_http_error_includes_safe_truncated_body() -> None:
+    body = json.dumps(
+        {
+            "error": {
+                "message": "unsupported request " + "x" * 400,
+                "access_token": "anthropic-secret",
+            }
+        }
+    ).encode()
+
+    error = anthropic_module._http_error(400, body)
+
+    assert "unsupported request" in str(error)
+    assert "anthropic-secret" not in str(error)
+    assert len(anthropic_module.error_body_excerpt(body)) == 300
 
 
 def test_signed_thinking_blocks_use_anthropic_wire_types() -> None:

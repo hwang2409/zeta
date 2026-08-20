@@ -933,13 +933,30 @@ def test_payload_maps_plan_messages_and_tools() -> None:
         max_output_tokens=100,
     )
     assert payload["model"] == DEFAULT_CODEX_MODEL
+    assert DEFAULT_CODEX_MODEL == "gpt-5.6-luna"
     assert payload["stream"] is True
     assert payload["store"] is False
+    assert "max_output_tokens" not in payload
     assert payload["instructions"] == "system"
     assert payload["input"] == [
         {"role": "user", "content": [{"type": "input_text", "text": "run"}]},
         {"type": "function_call_output", "call_id": "call-test", "output": "done"},
     ]
+
+
+def test_codex_http_error_includes_safe_truncated_body() -> None:
+    body = json.dumps(
+        {
+            "detail": "unsupported request " + "x" * 400,
+            "refresh_token": "codex-secret",
+        }
+    ).encode()
+
+    error = codex_module._http_error(400, body)
+
+    assert "unsupported request" in str(error)
+    assert "codex-secret" not in str(error)
+    assert len(codex_module.error_body_excerpt(body)) == 300
 
 
 def test_payload_maps_name_only_tool_schema() -> None:

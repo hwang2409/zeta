@@ -6,6 +6,7 @@ import asyncio
 import fcntl
 import json
 import os
+import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Iterator, Mapping
@@ -15,6 +16,43 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+
+_SENSITIVE_ERROR_KEY = re.compile(
+    r"(?:token|authorization|api[-_]?key|cookie|secret)", re.IGNORECASE
+)
+_SENSITIVE_ERROR_FIELD = re.compile(
+    r"(?i)([\"']?(?:access[-_]?token|refresh[-_]?token|authorization|x-api-key|api[-_]?key|token|secret)[\"']?\s*[:=]\s*)([\"'][^\"']*[\"']|[^\s,;}]+)"
+)
+_BEARER_VALUE = re.compile(r"(?i)(\bbearer\s+)[^\s,;}]+")
+_TOKEN_LIKE_VALUE = re.compile(r"(?i)\b(?:access|refresh)[-_]?token[-_][a-z0-9._-]+")
+
+
+def _redact_error_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: "[redacted]"
+            if isinstance(key, str) and _SENSITIVE_ERROR_KEY.search(key)
+            else _redact_error_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_error_value(item) for item in value]
+    return value
+
+
+def error_body_excerpt(body: bytes, *, limit: int = 300) -> str:
+    """Return a short, whitespace-collapsed provider error without secrets."""
+
+    try:
+        value = _redact_error_value(json.loads(body))
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        text = body.decode("utf-8", errors="replace")
+        text = _SENSITIVE_ERROR_FIELD.sub(r"\1[redacted]", text)
+    text = _BEARER_VALUE.sub(r"\1[redacted]", text)
+    text = _TOKEN_LIKE_VALUE.sub("[redacted]", text)
+    return " ".join(text.split())[:limit]
 
 
 @dataclass(frozen=True, slots=True)

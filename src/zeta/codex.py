@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from .auth import OAuthCredentialStore, OAuthTokens
+from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
 from .transport import (
     cleanup_transport,
     is_control_exception,
@@ -39,7 +39,7 @@ from .types import (
 CODEX_API_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-DEFAULT_CODEX_MODEL = "gpt-5.4"
+DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
 JWT_AUTH_CLAIM = "https://api.openai.com/auth"
 
 
@@ -302,7 +302,7 @@ def build_responses_payload(
         "model": model,
         "store": False,
         "stream": True,
-        "max_output_tokens": max_output_tokens,
+        # The ChatGPT backend rejects max_output_tokens on this endpoint.
         "instructions": "\n\n".join(instructions) or "You are a helpful assistant.",
         "input": input_items,
         "tool_choice": "auto",
@@ -487,7 +487,9 @@ async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes
 
 def _http_error(status_code: int, body: bytes) -> CodexBackendError:
     error_type = CodexAuthError if status_code in {401, 403} else CodexHTTPError
-    return error_type(f"Codex HTTP request failed ({status_code})")
+    excerpt = error_body_excerpt(body)
+    detail = f": {excerpt}" if excerpt else ""
+    return error_type(f"Codex HTTP request failed ({status_code}){detail}")
 
 
 async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEvent]:
