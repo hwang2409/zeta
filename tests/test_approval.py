@@ -318,6 +318,30 @@ def test_two_stores_do_not_abort_a_request_before_atomic_anchor_append(
     assert store_a.approval_states()[call.id] == (call, None)
 
 
+def test_two_stores_dedupe_concurrent_duplicate_request_append(
+    approval_root: Path,
+) -> None:
+    session_id = "cross-store-duplicate"
+    store_a = ConversationStore(approval_root, session_id=session_id)
+    root = store_a.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store_b = ConversationStore(approval_root, session_id=session_id)
+    call = ToolCall("duplicate-call", "echo", {})
+
+    def append(store: ConversationStore) -> object:
+        return store.append_message_with_approval_requests(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+            [(call.id, call)],
+            parent_id=root.id,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        entries = list(executor.map(append, (store_a, store_b)))
+
+    reopened = ConversationStore(approval_root, session_id=session_id)
+    assert entries[0].id == entries[1].id
+    assert reopened.approval_states() == {call.id: (call, None)}
+
+
 @pytest.mark.asyncio
 async def test_early_exit_paths_close_pending_requests(approval_root: Path) -> None:
     cases = ("unknown", "invalid", "pre-aborted")
@@ -400,6 +424,62 @@ async def test_abort_race_honors_an_approval_that_wins_atomically(
     assert await asyncio.wait_for(task, timeout=1) == ToolResult(call.id, "ran")
     assert store.approval_states()[call.id][1] == "allow"
     assert executed == ["ran"]
+
+
+@pytest.mark.asyncio
+async def test_second_abort_reaches_handler_after_approval_wins(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="second-abort")
+    call = ToolCall("second-abort-call", "echo", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    policy = ApprovalPolicy(default="ask", store=store)
+    registry = ToolRegistry(
+        approval_root,
+        approval_policy=policy,
+        approval_store=store,
+        register_builtin=False,
+    )
+    started = asyncio.Event()
+    observed_cancellation = asyncio.Event()
+
+    async def echo(
+        arguments: dict[str, object],
+        abort_signal: ToolAbortSignal,
+    ) -> str:
+        del arguments
+        started.set()
+        await abort_signal.wait()
+        observed_cancellation.set()
+        return "canceled"
+
+    registry.register("echo", echo)
+    original_resolve = store.resolve_approval
+
+    def approve_when_abort_resolves(request_id: str, decision: str) -> bool:
+        if decision == "abort":
+            assert original_resolve(request_id, "allow")
+            return False
+        return original_resolve(request_id, decision)
+
+    store.resolve_approval = approve_when_abort_resolves  # type: ignore[method-assign]
+    task = asyncio.create_task(registry.execute(call))
+    await asyncio.sleep(0.06)
+    registry.abort()
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert not task.done()
+
+    registry.abort()
+
+    assert await asyncio.wait_for(task, timeout=1) == ToolResult(
+        call.id,
+        "canceled",
+    )
+    assert observed_cancellation.is_set()
+    assert store.approval_states()[call.id][1] == "allow"
 
 
 @pytest.mark.asyncio

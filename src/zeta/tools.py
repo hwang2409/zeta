@@ -347,6 +347,7 @@ class ToolRegistry:
                 if durable_decision != ApprovalDecision.ALLOW.value:
                     return _canceled_result(tool_call.id), execution_signal
                 execution_signal = ToolAbortSignal()
+                self.abort_signal = execution_signal
             if decision is ApprovalDecision.DENY:
                 return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
         if self.pre_execute_hook is None:

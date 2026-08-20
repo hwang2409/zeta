@@ -458,7 +458,25 @@ class ConversationStore:
         data: dict[str, Any] = {"message": message.to_dict()}
         if request_data:
             data["approval_requests"] = request_data
-        return self._append_row("message", data, parent_id)
+        with self._append_lock():
+            self._load()
+            persisted_requests = self._approval_request_entries(self._entries)
+            for request in request_data:
+                existing = persisted_requests.get(request["request_id"])
+                if existing is None:
+                    continue
+                existing_request = next(
+                    candidate
+                    for candidate in existing.data["approval_requests"]
+                    if candidate["request_id"] == request["request_id"]
+                )
+                if existing_request["tool_call"] != request["tool_call"]:
+                    raise ConversationIntegrityError(
+                        f"approval request tool call mismatch: {request['request_id']}"
+                    )
+                return self._snapshot_entry(existing)
+            entry = self._append_row_unlocked("message", data, parent_id)
+            return self._snapshot_entry(entry)
 
     def append_approval_request(
         self,
@@ -564,6 +582,17 @@ class ConversationStore:
                     if request["request_id"] == request_id:
                         return entry
         return None
+
+    @staticmethod
+    def _approval_request_entries(
+        entries: Iterable[ConversationEntry],
+    ) -> dict[str, ConversationEntry]:
+        return {
+            request["request_id"]: entry
+            for entry in entries
+            if entry.type == "message"
+            for request in entry.data.get("approval_requests", [])
+        }
 
     @staticmethod
     def _approval_states_from_branch(
