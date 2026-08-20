@@ -470,13 +470,21 @@ class ConversationStore:
             data["approval_requests"] = request_data
         with self._append_lock():
             self._load()
-            branch = self.replay()
+            current_branch = self.replay()
             resolved_parent = (
-                parent_id if parent_id is not None else (branch[-1].id if branch else None)
+                parent_id
+                if parent_id is not None
+                else (current_branch[-1].id if current_branch else None)
+            )
+            current_ids = {entry.id for entry in current_branch}
+            branch = (
+                current_branch
+                if resolved_parent in current_ids
+                else self._branch_to_parent(resolved_parent)
             )
             target_entries = [
                 entry
-                for entry in self._entries
+                for entry in branch
                 if entry.type == "message" and entry.parent_id == resolved_parent
             ]
             if request_data:
@@ -516,6 +524,23 @@ class ConversationStore:
                 append_data.pop("approval_requests", None)
             entry = self._append_row_unlocked("message", append_data, parent_id)
             return self._snapshot_entry(entry)
+
+    def _branch_to_parent(self, parent_id: str | None) -> list[ConversationEntry]:
+        if parent_id is None:
+            return []
+        by_id = {entry.id: entry for entry in self._entries}
+        current = by_id.get(parent_id)
+        branch: list[ConversationEntry] = []
+        seen: set[str] = set()
+        while current is not None:
+            if current.id in seen:
+                raise ConversationIntegrityError(
+                    f"conversation parent cycle at {current.id}"
+                )
+            seen.add(current.id)
+            branch.append(current)
+            current = by_id.get(current.parent_id) if current.parent_id else None
+        return [self._snapshot_entry(entry) for entry in reversed(branch)]
 
     def append_approval_request(
         self,

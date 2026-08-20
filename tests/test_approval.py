@@ -6,8 +6,10 @@ from threading import Event
 
 import pytest
 
+from zeta.abort import AbortGenerationRegistry
 from zeta.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from zeta.fake import FakeBackend, ScriptedTurn
+from zeta.gate import ApprovalGate
 from zeta.loop import AgentLoop
 from zeta.store import ConversationIntegrityError, ConversationStore
 from zeta.tools import ToolAbortSignal, ToolRegistry
@@ -25,6 +27,48 @@ from zeta.types import (
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
     return [event async for event in events]
+
+
+def test_abort_generation_registry_is_monotonic_and_sticky() -> None:
+    registry = AbortGenerationRegistry()
+    first = registry.new_generation()
+    second = registry.new_generation()
+
+    assert (first.generation, second.generation) == (1, 2)
+    first.abort()
+    first.abort()
+
+    assert first.is_set()
+    assert not second.is_set()
+
+
+@pytest.mark.asyncio
+async def test_approval_gate_is_directly_testable(tmp_path: Path) -> None:
+    called = False
+
+    def hook(name: str, arguments: dict[str, object]) -> bool:
+        nonlocal called
+        del name, arguments
+        called = True
+        return True
+
+    gate = ApprovalGate(
+        ApprovalPolicy(always_deny={"danger"}, store=ConversationStore(tmp_path)),
+        hook,
+    )
+    signal = AbortGenerationRegistry().new_generation()
+    call = ToolCall("gate-call", "danger", {})
+
+    result, execution_signal = await gate.run(
+        call,
+        {},
+        signal,
+        lambda current: current,
+    )
+
+    assert result == ToolResult(call.id, "tool execution denied", True)
+    assert execution_signal is signal
+    assert not called
 
 
 @pytest.fixture(scope="module")
@@ -673,6 +717,48 @@ def test_same_parent_superset_keeps_the_prior_request(
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)
     assert set(reopened.approval_states()) == {call_a.id, call_b.id}
+
+
+def test_append_uses_the_target_parent_branch(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="approval-target-branch")
+    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    call_a = ToolCall("target-a", "echo", {})
+    call_b = ToolCall("target-b", "echo", {})
+    target = store.append_approval_request(call_a.id, call_a, parent_id=root.id)
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("active")]),
+        parent_id=root.id,
+    )
+
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call_a), ToolUseContent(call_b)]),
+        [(call_a.id, call_a), (call_b.id, call_b)],
+        parent_id=target.id,
+    )
+
+    reopened = ConversationStore(approval_root, session_id=store.session_id)
+    assert set(reopened.approval_states()) == {call_a.id, call_b.id}
+
+
+def test_abandoned_exact_sibling_is_not_deduped(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="approval-exact-sibling")
+    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    call = ToolCall("exact-sibling-call", "echo", {})
+    abandoned = store.append_approval_request(call.id, call, parent_id=root.id)
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("active")]),
+        parent_id=root.id,
+    )
+
+    current = store.append_approval_request(call.id, call, parent_id=root.id)
+
+    assert current.id != abandoned.id
+    reopened = ConversationStore(approval_root, session_id=store.session_id)
+    assert reopened.approval_states() == {call.id: (call, None)}
 
 
 def test_off_branch_duplicate_request_is_not_reused(

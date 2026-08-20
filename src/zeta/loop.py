@@ -121,7 +121,7 @@ class AgentLoop:
         ):
             raise ValueError("pass only one approval policy")
         if approval_policy is not None:
-            self.tool_registry.approval_policy = approval_policy
+            self.tool_registry.set_approval_policy(approval_policy)
         if self.tool_registry.approval_policy is not None:
             self.tool_registry.bind_approval_store(store)
         self.tool_schemas = list(

@@ -607,6 +607,7 @@ async def test_execute_many_abort_cancels_every_parallel_handler(
     calls = [ToolCall("parallel-a", "wait", {}), ToolCall("parallel-b", "wait", {})]
     started = asyncio.Event()
     started_count = 0
+    generations: list[int] = []
 
     async def handler(
         arguments: dict[str, object],
@@ -615,6 +616,7 @@ async def test_execute_many_abort_cancels_every_parallel_handler(
         nonlocal started_count
         del arguments
         started_count += 1
+        generations.append(abort_signal.generation)
         if started_count == len(calls):
             started.set()
         await abort_signal.wait()
@@ -629,6 +631,7 @@ async def test_execute_many_abort_cancels_every_parallel_handler(
     assert await asyncio.wait_for(task, timeout=1) == [
         ToolResult(call.id, "canceled") for call in calls
     ]
+    assert generations == [generations[0], generations[0]]
 
 
 @pytest.mark.asyncio
