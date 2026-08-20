@@ -164,7 +164,6 @@ class TUIApp:
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
         self._approval_policy = approval_policy
-        self._resumed_tool_started: bool | None = None
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
@@ -216,7 +215,6 @@ class TUIApp:
             self._print(Text(f"[approval] {parts[0]}d {request_id}", style="green"))
 
             async def resume() -> Any:
-                self._resumed_tool_started = True
                 return await self.loop.resume_pending_tool(
                     request_id, prepared=True
                 )
@@ -226,7 +224,6 @@ class TUIApp:
                 if not self.loop.prepare_resume_pending_tool(request_id):
                     self._present_pending_approvals()
                     return True
-                self._resumed_tool_started = False
                 resume_task = asyncio.create_task(resume())
                 self._active_task = resume_task
                 result = await asyncio.shield(resume_task)
@@ -237,7 +234,7 @@ class TUIApp:
                 )
                 self.loop.abort()
                 self.loop.finalize_canceled(request_id)
-                if resume_task is not None and self._resumed_tool_started:
+                if resume_task is not None:
                     resume_task.cancel()
                 if resume_task is not None:
                     await asyncio.gather(resume_task, return_exceptions=True)
@@ -248,7 +245,6 @@ class TUIApp:
             finally:
                 if resume_task is not None and self._active_task is resume_task:
                     self._active_task = None
-                self._resumed_tool_started = None
             request = next(
                 request for request in pending if request.request_id == request_id
             )
@@ -289,8 +285,7 @@ class TUIApp:
     def abort_active(self) -> None:
         if self._active_task is not None and not self._active_task.done():
             self.loop.abort()
-            if self._resumed_tool_started is not False:
-                self._active_task.cancel()
+            self._active_task.cancel()
 
     def _status_toolbar(self) -> FormattedText:
         status = format_status(
@@ -490,7 +485,6 @@ class TUIApp:
                 await asyncio.gather(self._active_task, return_exceptions=True)
 
     def _start_turn(self, user_text: str) -> None:
-        self._resumed_tool_started = None
         self._active_task = asyncio.create_task(self._consume_turn(user_text))
 
 

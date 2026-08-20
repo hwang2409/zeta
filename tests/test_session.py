@@ -17,7 +17,14 @@ from zeta.fake import FakeBackend, ScriptedTurn
 from zeta.loop import AgentLoop
 from zeta.session import SessionError, SessionManager
 from zeta.tui.app import TUIApp, build_parser, create_app, main
-from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
+from zeta.types import (
+    Message,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    ToolResult,
+    ToolUseContent,
+)
 
 
 def _args(*values: str):
@@ -472,6 +479,35 @@ def test_finalize_canceled_is_idempotent(tmp_path: Path) -> None:
     assert first is not None
     assert second == first
     assert results == [first]
+
+
+def test_completion_edge_idempotence_preserves_success(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    loop = AgentLoop(FakeBackend([]), opened.store)
+    call = ToolCall("approval-completion-edge", "never", {})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    success = ToolResult(call.id, "completed")
+    opened.store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent(success.content)],
+            tool_result=success,
+        )
+    )
+
+    result = loop.finalize_canceled(call.id)
+    results = [
+        message.tool_result
+        for message in opened.store.messages()
+        if message.tool_result is not None
+    ]
+
+    assert result == success
+    assert results == [success]
 
 
 @pytest.mark.asyncio

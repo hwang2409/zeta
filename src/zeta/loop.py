@@ -200,9 +200,7 @@ class AgentLoop:
         for message in reversed(self.store.messages()):
             result = message.tool_result
             if result is not None and result.tool_call_id == tool_call.id:
-                if result.content == "tool execution canceled" and result.is_error:
-                    return result
-                break
+                return result
         return self._finalize_tool_results([tool_call], [None])[0]
 
     async def _run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
