@@ -147,6 +147,7 @@ class TUIApp:
         session_manager: SessionManager | None = None,
         session_metadata: SessionMetadata | None = None,
         approval_policy: ApprovalPolicy | None = None,
+        pending_override: tuple[str | None, str | None] | None = None,
     ) -> None:
         self.loop = loop
         self.provider = provider
@@ -168,6 +169,7 @@ class TUIApp:
         self._session_manager = session_manager
         self._session_metadata = session_metadata
         self._approval_policy = approval_policy
+        self._pending_override = pending_override
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
@@ -195,7 +197,7 @@ class TUIApp:
                 )
             )
 
-    def _handle_approval_input(self, value: str) -> bool:
+    async def _handle_approval_input(self, value: str) -> bool:
         parts = value.split(maxsplit=1)
         if not parts or parts[0] not in {"approve", "deny"}:
             return False
@@ -217,8 +219,37 @@ class TUIApp:
         )
         if resolved:
             self._print(Text(f"[approval] {parts[0]}d {request_id}", style="green"))
+            result = await self.loop.resume_pending_tool(request_id)
+            request = next(
+                request for request in pending if request.request_id == request_id
+            )
+            if result is not None:
+                self._print(
+                    render_event(
+                        StreamEvent(
+                            StreamEventType.TOOL_EXECUTION_END,
+                            tool_call=request.tool_call,
+                            tool_result=result,
+                        )
+                    )
+                )
         self._present_pending_approvals()
         return True
+
+    def _commit_pending_override(self) -> None:
+        if (
+            self._pending_override is None
+            or self._session_manager is None
+            or self._session_metadata is None
+        ):
+            return
+        provider, model = self._pending_override
+        self._session_manager.record_override(
+            self._session_metadata,
+            provider=provider,
+            model=model,
+        )
+        self._pending_override = None
 
     def _make_session(self) -> PromptSession[str]:
         bindings = build_key_bindings(
@@ -358,6 +389,8 @@ class TUIApp:
             async for event in self.loop.run_turn(user_text):
                 self._update_usage(event)
                 self._prepare_stream_event(event)
+                if event.type is StreamEventType.MESSAGE_END:
+                    self._commit_pending_override()
                 if self.verbose:
                     self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style="dim"))
                 if event.type is StreamEventType.MESSAGE_UPDATE:
@@ -428,7 +461,7 @@ class TUIApp:
                         break
                     parsed = parse_input(value)
                     if parsed is not None and not self._exit_requested:
-                        if self._handle_approval_input(parsed):
+                        if await self._handle_approval_input(parsed):
                             pass
                         elif self.pending_approvals:
                             self._present_pending_approvals()
@@ -510,11 +543,11 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         token_budget=metadata.compaction_budget,
         retained_tail=metadata.retained_tail,
     )
+    pending_override = None
     if resuming and mismatches:
-        manager.record_override(
-            metadata,
-            provider=provider if provider != metadata.provider else None,
-            model=model if model != metadata.model else None,
+        pending_override = (
+            provider if provider != metadata.provider else None,
+            model if model != metadata.model else None,
         )
     return TUIApp(
         loop,
@@ -525,6 +558,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         session_manager=manager,
         session_metadata=metadata,
         approval_policy=approval_policy,
+        pending_override=pending_override,
     )
 
 
@@ -557,6 +591,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.force_provider and args.model is None:
+        parser.error("--force-provider requires --model")
     try:
         app = create_app(args)
     except SessionError as exc:

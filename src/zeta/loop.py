@@ -150,6 +150,22 @@ class AgentLoop:
     def run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
         return self._run_turn(user_text)
 
+    async def resume_pending_tool(self, request_id: str) -> ToolResult | None:
+        """Finish a durable approval request before starting another turn."""
+
+        state = self.store.approval_states().get(request_id)
+        if state is None or state[1] is None:
+            return None
+        tool_call = state[0]
+        self.tool_registry.start_batch()
+        try:
+            result = await self.tool_registry.execute(tool_call)
+        except Exception as exc:
+            result = ToolResult(tool_call.id, str(exc), is_error=True)
+        return self._finalize_tool_results(
+            [tool_call], [_validated_tool_result(result, tool_call.id)]
+        )[0]
+
     async def _run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
         self.store.append_message(
             Message(MessageRole.USER, [TextContent(user_text)])

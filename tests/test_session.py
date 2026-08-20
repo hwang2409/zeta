@@ -9,11 +9,12 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+from zeta.approval import ApprovalPolicy
 from zeta.context import ContextAssembler
 from zeta.fake import FakeBackend, ScriptedTurn
 from zeta.loop import AgentLoop
 from zeta.session import SessionError, SessionManager
-from zeta.tui.app import build_parser, create_app
+from zeta.tui.app import build_parser, create_app, main
 from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
 
 
@@ -112,7 +113,7 @@ def test_resume_provider_override_requires_force_and_records_audit(
             )
         )
 
-    create_app(
+    resumed = create_app(
         build_parser().parse_args(
             [
                 "--resume",
@@ -128,16 +129,88 @@ def test_resume_provider_override_requires_force_and_records_audit(
     metadata = json.loads(
         (home / "sessions" / session_id / "meta.json").read_text()
     )
+    assert metadata["provider"] == "fake"
+    assert metadata["model"] == "offline"
+    assert metadata["override_audit"] == []
+    assert resumed._pending_override == ("claude", "claude-sonnet-4-6")
+
+
+@pytest.mark.asyncio
+async def test_forced_override_commits_after_first_successful_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
+
+    def build_backend(*args: object, **kwargs: object) -> tuple[FakeBackend, str]:
+        del args, kwargs
+        return backend, "claude-sonnet-4-6"
+
+    monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
+    app = create_app(
+        build_parser().parse_args(
+            [
+                "--resume",
+                session_id,
+                "--provider",
+                "claude",
+                "--model",
+                "claude-sonnet-4-6",
+                "--force-provider",
+            ]
+        )
+    )
+    app._invalidate_prompt = lambda: None
+    await app._consume_turn("hello")
+
+    metadata = json.loads(
+        (home / "sessions" / session_id / "meta.json").read_text()
+    )
     assert metadata["provider"] == "claude"
     assert metadata["model"] == "claude-sonnet-4-6"
-    assert metadata["override_audit"][-1]["provider"] == {
-        "from": "fake",
-        "to": "claude",
-    }
-    assert metadata["override_audit"][-1]["model"] == {
-        "from": "offline",
-        "to": "claude-sonnet-4-6",
-    }
+    assert metadata["override_audit"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_model_keeps_forced_override_uncommitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    backend = FakeBackend([])
+
+    def build_backend(*args: object, **kwargs: object) -> tuple[FakeBackend, str]:
+        del args, kwargs
+        return backend, "definitely-not-a-claude-model"
+
+    monkeypatch.setattr("zeta.tui.app.build_backend", build_backend)
+    app = create_app(
+        build_parser().parse_args(
+            [
+                "--resume",
+                session_id,
+                "--provider",
+                "claude",
+                "--model",
+                "definitely-not-a-claude-model",
+                "--force-provider",
+            ]
+        )
+    )
+    app._invalidate_prompt = lambda: None
+    await app._consume_turn("hello")
+
+    metadata = json.loads(
+        (home / "sessions" / session_id / "meta.json").read_text()
+    )
+    assert metadata["provider"] == "fake"
+    assert metadata["model"] == "offline"
+    assert metadata["override_audit"] == []
 
 
 def test_force_provider_requires_a_model(
@@ -158,6 +231,19 @@ def test_force_provider_requires_a_model(
                 ]
             )
         )
+
+
+def test_main_rejects_force_provider_without_model(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as error:
+        main(["--resume", "session", "--provider", "claude", "--force-provider"])
+
+    assert error.value.code == 2
+    captured = capsys.readouterr()
+    assert "usage:" in captured.err
+    assert "--force-provider requires --model" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_forced_backend_failure_leaves_metadata_unchanged(
@@ -192,7 +278,8 @@ def test_forced_backend_failure_leaves_metadata_unchanged(
     assert metadata_path.read_text() == before
 
 
-def test_resumed_pending_approval_is_presented_and_resolvable(
+@pytest.mark.asyncio
+async def test_resumed_pending_approval_is_presented_and_resolvable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -213,8 +300,45 @@ def test_resumed_pending_approval_is_presented_and_resolvable(
     app._present_pending_approvals()
 
     assert call.id in app.console.file.getvalue()
-    assert app._handle_approval_input(f"approve {call.id}")
+    assert await app._handle_approval_input(f"approve {call.id}")
     assert app.loop.store.pending_approvals() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["allow", "deny"])
+async def test_resume_pending_tool_executes_and_persists_result(
+    tmp_path: Path, decision: str
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    policy = ApprovalPolicy(store=opened.store)
+    executed: list[str] = []
+
+    async def echo(arguments: dict[str, str]) -> str:
+        executed.append(arguments["value"])
+        return arguments["value"]
+
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        tools={"echo": echo},
+        approval_policy=policy,
+    )
+    call = ToolCall("approval-tool", "echo", {"value": "done"})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    if decision == "allow":
+        assert policy.approve(call.id)
+    else:
+        assert policy.deny(call.id)
+
+    result = await loop.resume_pending_tool(call.id)
+
+    assert result is not None
+    assert opened.store.messages()[-1].tool_result == result
+    assert executed == (["done"] if decision == "allow" else [])
 
 
 def test_metadata_override_and_touch_are_serialized(tmp_path: Path) -> None:
