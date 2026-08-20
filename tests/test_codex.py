@@ -205,6 +205,167 @@ def reasoning_content_stream(
     return events
 
 
+def message_parts_stream(completed_item: dict[str, object]) -> list[dict[str, object]]:
+    return [
+        event("response.created", response={"id": "response-test"}),
+        event(
+            "response.output_item.added",
+            output_index=0,
+            item={"type": "message", "id": "message-test", "role": "assistant"},
+        ),
+        event(
+            "response.content_part.added",
+            output_index=0,
+            content_index=0,
+            part={"type": "refusal"},
+        ),
+        event(
+            "response.refusal.delta",
+            output_index=0,
+            content_index=0,
+            delta="first",
+        ),
+        event(
+            "response.refusal.done",
+            output_index=0,
+            content_index=0,
+            refusal="first",
+        ),
+        event(
+            "response.content_part.done",
+            output_index=0,
+            content_index=0,
+            part={"type": "refusal"},
+        ),
+        event(
+            "response.content_part.added",
+            output_index=0,
+            content_index=1,
+            part={"type": "output_text"},
+        ),
+        event(
+            "response.output_text.delta",
+            output_index=0,
+            content_index=1,
+            delta="second",
+        ),
+        event(
+            "response.output_text.done",
+            output_index=0,
+            content_index=1,
+            text="second",
+        ),
+        event(
+            "response.content_part.done",
+            output_index=0,
+            content_index=1,
+            part={"type": "output_text"},
+        ),
+        event("response.output_item.done", output_index=0, item=completed_item),
+        event("response.completed"),
+    ]
+
+
+def reasoning_two_part_stream(
+    *,
+    summary_stream: tuple[str, ...] = (),
+    summary_complete: tuple[str, ...] | None = None,
+    raw_stream: tuple[str, ...] = (),
+    raw_complete: tuple[str, ...] | None = None,
+) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = [
+        event("response.created", response={"id": "response-test"}),
+        event(
+            "response.output_item.added",
+            output_index=0,
+            item={"type": "reasoning", "id": "reasoning-test"},
+        ),
+    ]
+    for index, text in enumerate(summary_stream):
+        events.extend(
+            [
+                event(
+                    "response.reasoning_summary_part.added",
+                    output_index=0,
+                    summary_index=index,
+                    part={"type": "summary_text"},
+                ),
+                event(
+                    "response.reasoning_summary_text.delta",
+                    output_index=0,
+                    summary_index=index,
+                    delta=text,
+                ),
+                event(
+                    "response.reasoning_summary_text.done",
+                    output_index=0,
+                    summary_index=index,
+                    text=text,
+                ),
+                event(
+                    "response.reasoning_summary_part.done",
+                    output_index=0,
+                    summary_index=index,
+                    part={"type": "summary_text", "text": text},
+                ),
+            ]
+        )
+    for index, text in enumerate(raw_stream):
+        events.extend(
+            [
+                event(
+                    "response.content_part.added",
+                    output_index=0,
+                    content_index=index,
+                    part={"type": "reasoning_text"},
+                ),
+                event(
+                    "response.reasoning_text.delta",
+                    output_index=0,
+                    content_index=index,
+                    delta=text,
+                ),
+                event(
+                    "response.reasoning_text.done",
+                    output_index=0,
+                    content_index=index,
+                    text=text,
+                ),
+                event(
+                    "response.content_part.done",
+                    output_index=0,
+                    content_index=index,
+                    part={"type": "reasoning_text"},
+                ),
+            ]
+        )
+    complete_summary = summary_stream if summary_complete is None else summary_complete
+    complete_raw = raw_stream if raw_complete is None else raw_complete
+    events.extend(
+        [
+            event(
+                "response.output_item.done",
+                output_index=0,
+                item={
+                    "type": "reasoning",
+                    "id": "reasoning-test",
+                    "status": "completed",
+                    "summary": [
+                        {"type": "summary_text", "text": text}
+                        for text in complete_summary
+                    ],
+                    "content": [
+                        {"type": "reasoning_text", "text": text}
+                        for text in complete_raw
+                    ],
+                },
+            ),
+            event("response.completed"),
+        ]
+    )
+    return events
+
+
 def malformed_events(mutation: str) -> list[dict[str, object]]:
     created = event("response.created", response={"id": "response-test"})
     item = event(
@@ -593,6 +754,29 @@ async def test_message_parts_reject_shared_index_across_kinds(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_stream_rejects_message_text_moved_between_parts(tmp_path: Path) -> None:
+    completed_item = {
+        "type": "message",
+        "id": "message-test",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+            {"type": "refusal", "refusal": "firstsecond"},
+            {"type": "output_text", "text": ""},
+        ],
+    }
+    client = client_for(sse(message_parts_stream(completed_item)))
+    with pytest.raises(CodexStreamError, match="message parts do not match deltas"):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "moved-message.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_reasoning_summary_and_content_parts_decode_together(tmp_path: Path) -> None:
     client = client_for(sse(reasoning_content_stream(summary="plan")))
     events = [
@@ -952,6 +1136,48 @@ async def test_stream_rejects_completed_reasoning_summary_mismatch(tmp_path: Pat
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "summary-mismatch.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_summary_text_moved_between_parts(tmp_path: Path) -> None:
+    client = client_for(
+        sse(
+            reasoning_two_part_stream(
+                summary_stream=("a", "b"), summary_complete=("ab", "")
+            )
+        )
+    )
+    with pytest.raises(
+        CodexStreamError, match="completed reasoning does not match its deltas"
+    ):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "moved-summary.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_raw_text_moved_between_parts(tmp_path: Path) -> None:
+    client = client_for(
+        sse(
+            reasoning_two_part_stream(
+                raw_stream=("a", "b"), raw_complete=("ab", "")
+            )
+        )
+    )
+    with pytest.raises(
+        CodexStreamError, match="completed reasoning does not match its deltas"
+    ):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "moved-raw.json")
             ).complete([], [])
         ]
     await client.aclose()

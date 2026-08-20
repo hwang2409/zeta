@@ -954,6 +954,11 @@ def _reconcile_completed_text(
     return True
 
 
+def _require_completed_match(actual: Any, streamed: Any, error: str) -> None:
+    if actual != streamed:
+        raise CodexStreamError(error)
+
+
 def _finish_reasoning_summary_part(
     payload: Mapping[str, Any],
     items: Mapping[int, _ItemState],
@@ -1006,9 +1011,17 @@ def _merge_completed_item(
         content = complete.get("content")
         if not isinstance(content, list) or not content:
             raise CodexStreamError("Codex completed message content is invalid")
-        complete_text_parts: list[str] = []
-        complete_part_kinds: list[str] = []
-        for part in content:
+        streamed_parts = sorted(
+            (key[2], blocks[key])
+            for key in item.blocks
+            if key[1] == "message"
+        )
+        if len(content) != len(streamed_parts) or any(
+            index != position
+            for position, (index, _) in enumerate(streamed_parts)
+        ):
+            raise CodexStreamError("Codex completed message parts do not match blocks")
+        for position, part in enumerate(content):
             if not isinstance(part, Mapping):
                 raise CodexStreamError("Codex completed message part is invalid")
             part_type = part.get("type")
@@ -1018,18 +1031,21 @@ def _merge_completed_item(
                 or type(part.get(text_key)) is not str
             ):
                 raise CodexStreamError("Codex completed message part is invalid")
-            complete_part_kinds.append(part_type)
-            complete_text_parts.append(part[text_key])
-        expected_part_kinds = [
-            blocks[key].kind for key in sorted(item.blocks) if key[2] >= 0
-        ]
-        if expected_part_kinds and complete_part_kinds != expected_part_kinds:
-            raise CodexStreamError("Codex completed message parts do not match blocks")
-        complete_text = "".join(complete_text_parts)
-        if complete_text and item.text and complete_text != item.text:
-            raise CodexStreamError("Codex completed item does not match its deltas")
-        if complete_text:
-            item.text = complete_text
+            block = streamed_parts[position][1]
+            _require_completed_match(
+                part_type,
+                block.kind,
+                "Codex completed message parts do not match blocks",
+            )
+            _require_completed_match(
+                part[text_key],
+                block.text,
+                "Codex completed message parts do not match deltas",
+            )
+        item.text = "".join(
+            part["text"] if part.get("type") == "output_text" else part["refusal"]
+            for part in content
+        )
     elif item.kind == "reasoning":
         summary = complete.get("summary")
         if not isinstance(summary, list):
@@ -1041,14 +1057,33 @@ def _merge_completed_item(
                 or type(part.get("text")) is not str
             ):
                 raise CodexStreamError("Codex completed reasoning summary is invalid")
-        complete_summary = "".join(part["text"] for part in summary)
-        if complete_summary != item.summary_text:
+        streamed_summary = sorted(
+            (key[2], blocks[key])
+            for key in item.blocks
+            if key[1] == "thinking"
+        )
+        if len(summary) != len(streamed_summary) or any(
+            index != position
+            for position, (index, _) in enumerate(streamed_summary)
+        ):
             raise CodexStreamError("Codex completed reasoning does not match its deltas")
+        for position, part in enumerate(summary):
+            block = streamed_summary[position][1]
+            _require_completed_match(
+                part["type"],
+                "summary_text",
+                "Codex completed reasoning does not match its deltas",
+            )
+            _require_completed_match(
+                part["text"],
+                block.text,
+                "Codex completed reasoning does not match its deltas",
+            )
         content = complete.get("content")
+        complete_raw_parts: list[str] = []
         if content is not None:
             if not isinstance(content, list):
                 raise CodexStreamError("Codex completed reasoning content is invalid")
-            complete_raw_parts: list[str] = []
             for part in content:
                 if (
                     not isinstance(part, Mapping)
@@ -1057,27 +1092,43 @@ def _merge_completed_item(
                 ):
                     raise CodexStreamError("Codex completed reasoning content is invalid")
                 complete_raw_parts.append(part["text"])
-            complete_raw = "".join(complete_raw_parts)
-        else:
-            complete_raw = ""
-        if complete_raw != item.raw_text:
+        streamed_raw = sorted(
+            (key[2], blocks[key])
+            for key in item.blocks
+            if key[1] == "thinking_raw"
+        )
+        if len(complete_raw_parts) != len(streamed_raw) or any(
+            index != position for position, (index, _) in enumerate(streamed_raw)
+        ):
             raise CodexStreamError("Codex completed reasoning does not match its deltas")
+        for position, part in enumerate(complete_raw_parts):
+            _require_completed_match(
+                part,
+                streamed_raw[position][1].text,
+                "Codex completed reasoning does not match its deltas",
+            )
         encrypted = complete.get("encrypted_content")
         if encrypted is not None and (type(encrypted) is not str or not encrypted):
             raise CodexStreamError("Codex completed reasoning metadata is invalid")
         if type(encrypted) is str:
             item.encrypted_content = encrypted
     else:
-        if (
-            complete.get("call_id") != item.call_id
-            or complete.get("name") != item.name
-        ):
-            raise CodexStreamError("Codex completed tool metadata is invalid")
+        _require_completed_match(
+            complete.get("call_id"),
+            item.call_id,
+            "Codex completed tool metadata is invalid",
+        )
+        _require_completed_match(
+            complete.get("name"), item.name, "Codex completed tool metadata is invalid"
+        )
         arguments = complete.get("arguments")
         if type(arguments) is not str:
             raise CodexStreamError("Codex completed tool arguments are invalid")
-        if item.arguments and arguments != item.arguments:
-            raise CodexStreamError("Codex completed tool does not match its deltas")
+        _require_completed_match(
+            arguments,
+            item.arguments,
+            "Codex completed tool does not match its deltas",
+        )
         item.arguments = arguments
     item.completed_item = dict(complete)
 
