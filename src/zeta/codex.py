@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from .auth import OAuthCredentialStore, OAuthTokens
+from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
 from .transport import (
     cleanup_transport,
     is_control_exception,
@@ -39,7 +39,7 @@ from .types import (
 CODEX_API_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-DEFAULT_CODEX_MODEL = "gpt-5.4"
+DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
 JWT_AUTH_CLAIM = "https://api.openai.com/auth"
 
 
@@ -229,7 +229,6 @@ def build_responses_payload(
     tool_schemas: Sequence[ToolSchema],
     *,
     model: str,
-    max_output_tokens: int,
 ) -> dict[str, Any]:
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
@@ -302,7 +301,6 @@ def build_responses_payload(
         "model": model,
         "store": False,
         "stream": True,
-        "max_output_tokens": max_output_tokens,
         "instructions": "\n\n".join(instructions) or "You are a helpful assistant.",
         "input": input_items,
         "tool_choice": "auto",
@@ -391,13 +389,11 @@ class CodexBackend(CompletionBackend):
         self,
         *,
         model: str = DEFAULT_CODEX_MODEL,
-        max_output_tokens: int = 8192,
         base_url: str = CODEX_API_URL,
         token_store: CodexCredentialStore | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.model = model
-        self.max_output_tokens = max_output_tokens
         self.base_url = base_url.rstrip("/")
         self.token_store = token_store or CodexCredentialStore()
         self.client = client
@@ -425,7 +421,6 @@ class CodexBackend(CompletionBackend):
                 messages,
                 tool_schemas,
                 model=self.model,
-                max_output_tokens=self.max_output_tokens,
             )
             headers = {
                 "accept": "text/event-stream",
@@ -487,7 +482,9 @@ async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes
 
 def _http_error(status_code: int, body: bytes) -> CodexBackendError:
     error_type = CodexAuthError if status_code in {401, 403} else CodexHTTPError
-    return error_type(f"Codex HTTP request failed ({status_code})")
+    excerpt = error_body_excerpt(body)
+    detail = f": {excerpt}" if excerpt else ""
+    return error_type(f"Codex HTTP request failed ({status_code}){detail}")
 
 
 async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEvent]:
@@ -535,9 +532,7 @@ def _translate_event(
     if event_type in {"keepalive", "response.in_progress", "response.metadata"}:
         _require_response_started(response_state, event_type)
         if response_state == "stopped":
-            raise CodexStreamError(
-                f"Codex event follows response completion: {event_type}"
-            )
+            raise CodexStreamError("Codex event follows response completion")
         return None, response_state
     if event_type == "error":
         detail = payload.get("error")
@@ -560,7 +555,7 @@ def _translate_event(
         return StreamEvent(StreamEventType.MESSAGE_START, data=dict(response_data)), "started"
     _require_response_started(response_state, event_type)
     if response_state == "stopped":
-        raise CodexStreamError(f"Codex event follows response completion: {event_type}")
+        raise CodexStreamError("Codex event follows response completion")
     if event_type == "response.failed":
         raise CodexStreamError("Codex response failed")
     if event_type == "response.incomplete":
@@ -616,7 +611,7 @@ def _translate_event(
         kind = item.get("type")
         item_id = item.get("id")
         if kind not in {"message", "reasoning", "function_call"}:
-            raise CodexStreamError(f"unsupported Codex output item: {kind}")
+            raise CodexStreamError("unsupported Codex output item type")
         if type(item_id) is not str or not item_id:
             raise CodexStreamError("Codex output item id is invalid")
         item_state = _ItemState(
@@ -713,12 +708,12 @@ def _translate_event(
             raise CodexStreamError("Codex output item completed with open blocks")
         item.state = "stopped"
         return None, response_state
-    raise CodexStreamError(f"unsupported Codex SSE event: {event_type}")
+    raise CodexStreamError("unsupported Codex SSE event type")
 
 
 def _require_response_started(state: str, event_type: str) -> None:
     if state == "not-started":
-        raise CodexStreamError(f"Codex event precedes response.created: {event_type}")
+        raise CodexStreamError("Codex event precedes response.created")
 
 
 def _output_index(payload: Mapping[str, Any]) -> int:

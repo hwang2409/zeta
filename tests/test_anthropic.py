@@ -1,11 +1,13 @@
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 import pytest
 
+import zeta.anthropic as anthropic_module
 from zeta.anthropic import (
     AnthropicAuthError,
     AnthropicBackend,
@@ -245,6 +247,245 @@ def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
 def test_authorization_url_contains_validated_redirect_uri() -> None:
     url = build_authorization_url("state", "challenge", "http://localhost/callback")
     assert "redirect_uri=http%3A%2F%2Flocalhost%2Fcallback" in url
+
+
+def test_claude_keychain_bootstrap_reads_oauth_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def run(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        return type("Result", (), {"returncode": 0, "stdout": json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "keychain-access",
+                "refreshToken": "keychain-refresh",
+                "expiresAt": 4_000_000_000,
+            }
+        })})()
+
+    monkeypatch.setattr(anthropic_module.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(anthropic_module.sys, "platform", "darwin")
+    monkeypatch.setattr(anthropic_module.subprocess, "run", run)
+    tokens = AnthropicCredentialStore(tmp_path / "zeta.json").bootstrap()
+
+    assert tokens == OAuthTokens("keychain-access", "keychain-refresh", 4_000_000_000)
+    assert calls == [
+        (
+            (["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],),
+            {
+                "capture_output": True,
+                "check": False,
+                "env": {"PATH": anthropic_module.os.defpath},
+                "text": True,
+                "timeout": 2,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        type("Result", (), {"returncode": 1, "stdout": ""})(),
+        type("Result", (), {"returncode": 0, "stdout": "not json"})(),
+    ],
+)
+def test_claude_keychain_bootstrap_treats_invalid_output_as_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, result: object
+) -> None:
+    monkeypatch.setattr(anthropic_module.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(anthropic_module.sys, "platform", "darwin")
+    monkeypatch.setattr(anthropic_module.subprocess, "run", lambda *args, **kwargs: result)
+
+    assert AnthropicCredentialStore(tmp_path / "zeta.json").bootstrap() is None
+
+
+def test_claude_keychain_bootstrap_treats_timeout_as_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def run(*args: object, **kwargs: object) -> object:
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(anthropic_module.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(anthropic_module.sys, "platform", "darwin")
+    monkeypatch.setattr(anthropic_module.subprocess, "run", run)
+
+    assert AnthropicCredentialStore(tmp_path / "zeta.json").bootstrap() is None
+
+
+def test_claude_file_bootstrap_wins_over_keychain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / ".credentials.json").write_text(json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "file-access",
+            "refreshToken": "file-refresh",
+            "expiresAt": 4_000_000_000,
+        }
+    }))
+    monkeypatch.setattr(anthropic_module.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(anthropic_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        anthropic_module.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("keychain should not be queried"),
+    )
+
+    assert AnthropicCredentialStore(tmp_path / "zeta.json").bootstrap() == OAuthTokens(
+        "file-access", "file-refresh", 4_000_000_000
+    )
+
+
+def test_anthropic_http_error_includes_safe_truncated_body() -> None:
+    body = json.dumps(
+        {
+            "error": {
+                "message": "unsupported request " + "x" * 400,
+                "access_token": "anthropic-secret",
+            }
+        }
+    ).encode()
+
+    error = anthropic_module._http_error(400, body)
+
+    assert "unsupported request" in str(error)
+    assert "anthropic-secret" not in str(error)
+    assert len(anthropic_module.error_body_excerpt(body)) == 300
+
+
+def test_anthropic_http_error_redacts_markers_in_valid_json_values() -> None:
+    body = json.dumps(
+        {
+            "error": {
+                "message": (
+                    "access-token=access-secret refresh-token=refresh-secret "
+                    "authorization=authorization-secret"
+                )
+            }
+        }
+    ).encode()
+
+    error = anthropic_module._http_error(400, body)
+
+    assert "access-secret" not in str(error)
+    assert "refresh-secret" not in str(error)
+    assert "authorization-secret" not in str(error)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sse_error_redacts_authorization_marker(tmp_path: Path) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'data: {"type":"error","error":{"type":"api_error",'
+                '"message":"authorization=authorization-secret"}}\n\n'
+            ),
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    with pytest.raises(AnthropicStreamError) as raised:
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+
+    assert "authorization-secret" not in str(raised.value)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sse_error_redacts_bearer_authorization(tmp_path: Path) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'data: {"type":"error","error":{"type":"api_error",'
+                '"message":"authorization: Bearer sse-authorization-secret"}}\n\n'
+            ),
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    with pytest.raises(AnthropicStreamError) as raised:
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+
+    assert "sse-authorization-secret" not in str(raised.value)
+    assert "Bearer" not in str(raised.value)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sse_error_redacts_multiline_authorization(
+    tmp_path: Path,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'data: {"type":"error","error":\n'
+                'data: {"type":"api_error","message":"authorization: Bearer\\n'
+                'newline-sse-marker"}}\n\n'
+            ),
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    with pytest.raises(AnthropicStreamError) as raised:
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+
+    assert "newline-sse-marker" not in str(raised.value)
+    assert "Bearer" not in str(raised.value)
+    await client.aclose()
+
+
+@pytest.mark.parametrize("probe", ["block", "delta", "follows", "precedes"])
+def test_anthropic_provider_types_do_not_enter_errors(probe: str) -> None:
+    marker = f"anthropic-{probe}-marker"
+    with pytest.raises(AnthropicStreamError) as raised:
+        if probe == "block":
+            anthropic_module._translate_event(
+                "message",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": marker},
+                },
+                {},
+                set(),
+                set(),
+                {},
+            )
+        elif probe == "delta":
+            anthropic_module._translate_event(
+                "message",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": marker},
+                },
+                {0: anthropic_module._BlockState("text")},
+                {0},
+                set(),
+                {},
+            )
+        elif probe == "follows":
+            anthropic_module._advance_message_state("stopped", marker)
+        else:
+            anthropic_module._advance_message_state("not-started", marker)
+
+    assert marker not in str(raised.value)
+    assert marker not in repr(raised.value)
 
 
 def test_signed_thinking_blocks_use_anthropic_wire_types() -> None:

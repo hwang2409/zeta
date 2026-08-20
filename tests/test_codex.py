@@ -622,7 +622,7 @@ async def test_responses_stream_maps_refusal_text_and_replays_item(tmp_path: Pat
     assert message.content == [TextContent("cannot help")]
     replayed = Message.from_dict(message.to_dict())
     payload = build_responses_payload(
-        [replayed], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+        [replayed], [], model=DEFAULT_CODEX_MODEL
     )
     assert payload["input"] == [completed_item]
     await client.aclose()
@@ -712,7 +712,7 @@ async def test_message_parts_allow_refusal_before_output_text(tmp_path: Path) ->
     assert events[-1].message.content == [TextContent("firstsecond")]
     replayed = Message.from_dict(events[-1].message.to_dict())
     payload = build_responses_payload(
-        [replayed], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+        [replayed], [], model=DEFAULT_CODEX_MODEL
     )
     assert payload["input"] == [completed_item]
     await client.aclose()
@@ -807,7 +807,6 @@ async def test_reasoning_text_round_trips_into_payload(tmp_path: Path) -> None:
         [Message.from_dict(message.to_dict())],
         [],
         model=DEFAULT_CODEX_MODEL,
-        max_output_tokens=100,
     )
     assert payload["input"] == [
         {
@@ -930,9 +929,9 @@ def test_payload_maps_plan_messages_and_tools() -> None:
         ],
         [],
         model=DEFAULT_CODEX_MODEL,
-        max_output_tokens=100,
     )
     assert payload["model"] == DEFAULT_CODEX_MODEL
+    assert DEFAULT_CODEX_MODEL == "gpt-5.6-luna"
     assert payload["stream"] is True
     assert payload["store"] is False
     assert payload["instructions"] == "system"
@@ -942,12 +941,45 @@ def test_payload_maps_plan_messages_and_tools() -> None:
     ]
 
 
+def test_codex_http_error_includes_safe_truncated_body() -> None:
+    body = json.dumps(
+        {
+            "detail": "unsupported request " + "x" * 400,
+            "refresh_token": "codex-secret",
+        }
+    ).encode()
+
+    error = codex_module._http_error(400, body)
+
+    assert "unsupported request" in str(error)
+    assert "codex-secret" not in str(error)
+    assert len(codex_module.error_body_excerpt(body)) == 300
+
+
+def test_codex_http_error_redacts_markers_in_valid_json_values() -> None:
+    body = json.dumps(
+        {
+            "error": {
+                "message": (
+                    "access-token=access-secret refresh-token=refresh-secret "
+                    "authorization=authorization-secret"
+                )
+            }
+        }
+    ).encode()
+
+    error = codex_module._http_error(400, body)
+
+    assert "access-secret" not in str(error)
+    assert "refresh-secret" not in str(error)
+    assert "authorization-secret" not in str(error)
+
+
 def test_payload_maps_name_only_tool_schema() -> None:
     payload = build_responses_payload(
         [Message(MessageRole.USER, [TextContent("run")])],
         [{"name": "read"}],
         model=DEFAULT_CODEX_MODEL,
-        max_output_tokens=100,
     )
 
     assert payload["tools"] == [
@@ -966,7 +998,7 @@ def test_payload_maps_name_only_tool_schema() -> None:
 def test_payload_rejects_malformed_tool_schema(schema: dict[str, object]) -> None:
     with pytest.raises(CodexHTTPError, match="parameters must be an object"):
         build_responses_payload(
-            [], [schema], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+            [], [schema], model=DEFAULT_CODEX_MODEL
         )
 
 
@@ -984,7 +1016,6 @@ def test_payload_preserves_assistant_output_item_order() -> None:
         ],
         [],
         model=DEFAULT_CODEX_MODEL,
-        max_output_tokens=100,
     )
 
     assert [item.get("type", item.get("role")) for item in payload["input"]] == [
@@ -1028,7 +1059,7 @@ def test_payload_replays_completed_codex_items_verbatim() -> None:
 
     persisted = Message.from_dict(message.to_dict())
     payload = build_responses_payload(
-        [persisted], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+        [persisted], [], model=DEFAULT_CODEX_MODEL
     )
 
     assert payload["input"] == output_items
@@ -1076,7 +1107,7 @@ async def test_encrypted_only_reasoning_round_trips_into_payload(tmp_path: Path)
     assert message.content == [ThinkingContent("", "opaque")]
     message = Message.from_dict(message.to_dict())
     payload = build_responses_payload(
-        [message], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+        [message], [], model=DEFAULT_CODEX_MODEL
     )
     assert payload["input"] == [completed_item]
     await client.aclose()
@@ -1766,6 +1797,24 @@ async def test_each_malformed_stream_fails_at_its_named_gate(
             ).complete([], [])
         ]
     await client.aclose()
+
+
+@pytest.mark.parametrize("probe", ["unsupported", "before_start"])
+def test_codex_provider_types_do_not_enter_errors(probe: str) -> None:
+    marker = f"codex-{probe}-marker"
+    with pytest.raises(CodexStreamError) as raised:
+        codex_module._translate_event(
+            marker,
+            {"type": marker},
+            "started" if probe == "unsupported" else "not-started",
+            {},
+            {},
+            {},
+            {},
+        )
+
+    assert marker not in str(raised.value)
+    assert marker not in repr(raised.value)
 
 
 class _CleanupStream:
