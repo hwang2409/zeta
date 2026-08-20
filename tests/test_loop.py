@@ -135,6 +135,88 @@ async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -
     assert not results[second_call.id].is_error
 
 
+@pytest.mark.parametrize(
+    "aborted_index",
+    [0, 1],
+    ids=["first-canceled", "second-canceled"],
+)
+@pytest.mark.asyncio
+async def test_parallel_cancellation_keeps_call_order(
+    tmp_path: Path,
+    aborted_index: int,
+) -> None:
+    calls = [
+        ToolCall("call-1", "first", {}),
+        ToolCall("call-2", "second", {}),
+    ]
+    backend = FakeBackend([ScriptedTurn([], calls)])
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    started = [asyncio.Event(), asyncio.Event()]
+    completed = asyncio.Event()
+
+    async def first(arguments: dict[str, object]) -> str:
+        started[0].set()
+        if aborted_index == 0:
+            await asyncio.Event().wait()
+        completed.set()
+        return "one"
+
+    async def second(arguments: dict[str, object]) -> str:
+        started[1].set()
+        if aborted_index == 1:
+            await asyncio.Event().wait()
+        completed.set()
+        return "two"
+
+    registry.register("first", first, parallel_safe=True)
+    registry.register("second", second, parallel_safe=True)
+    loop = AgentLoop(backend, store, registry=registry)
+    task = asyncio.create_task(collect(loop.run_turn("start")))
+    await started[0].wait()
+    await started[1].wait()
+    await completed.wait()
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    results = [
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    ]
+    assert [result.tool_call_id for result in results] == [call.id for call in calls]
+    assert [result.is_error for result in results] == [
+        aborted_index == 0,
+        aborted_index == 1,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_duplicate_ids_use_indexed_results(tmp_path: Path) -> None:
+    calls = [
+        ToolCall("same-id", "first", {}),
+        ToolCall("same-id", "second", {}),
+    ]
+    backend = FakeBackend([ScriptedTurn([], calls)])
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register("first", lambda arguments: "one", parallel_safe=True)
+    registry.register("second", lambda arguments: "two", parallel_safe=True)
+
+    await collect(AgentLoop(backend, store, registry=registry).run_turn("start"))
+
+    results = [
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    ]
+    assert [result.tool_call_id for result in results] == ["same-id", "same-id"]
+    assert [result.content for result in results] == ["one", "two"]
+
+
 @pytest.mark.asyncio
 async def test_parallel_results_persist_in_call_order(tmp_path: Path) -> None:
     first_call = ToolCall("call-1", "first", {})
