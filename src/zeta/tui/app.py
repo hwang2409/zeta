@@ -18,6 +18,7 @@ from prompt_toolkit.styles import Style
 from rich.console import Console, RenderableType
 from rich.text import Text
 
+from ..approval import ApprovalPolicy, ApprovalRequest
 from ..anthropic import AnthropicBackend
 from ..anthropic import AnthropicCredentialStore
 from ..codex import CodexBackend
@@ -145,6 +146,7 @@ class TUIApp:
         history_path: str | Path | None = None,
         session_manager: SessionManager | None = None,
         session_metadata: SessionMetadata | None = None,
+        approval_policy: ApprovalPolicy | None = None,
     ) -> None:
         self.loop = loop
         self.provider = provider
@@ -165,6 +167,7 @@ class TUIApp:
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
         self._session_manager = session_manager
         self._session_metadata = session_metadata
+        self._approval_policy = approval_policy
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
@@ -173,6 +176,49 @@ class TUIApp:
     @property
     def active(self) -> bool:
         return self._active_task is not None and not self._active_task.done()
+
+    @property
+    def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
+        if self._approval_policy is None:
+            return ()
+        return tuple(self._approval_policy.pending_requests())
+
+    def _present_pending_approvals(self) -> None:
+        for request in self.pending_approvals:
+            arguments = json.dumps(request.tool_call.arguments, sort_keys=True)
+            self._print(
+                Text(
+                    f"[approval pending] {request.request_id}: "
+                    f"{request.tool_call.name} {arguments}; "
+                    f"type approve {request.request_id} or deny {request.request_id}",
+                    style="yellow",
+                )
+            )
+
+    def _handle_approval_input(self, value: str) -> bool:
+        parts = value.split(maxsplit=1)
+        if not parts or parts[0] not in {"approve", "deny"}:
+            return False
+        pending = self.pending_approvals
+        if not pending:
+            self._print(Text("[approval] no pending requests", style="dim"))
+            return True
+        if len(parts) != 2:
+            self._print(Text(f"[approval] use {parts[0]} <request-id>", style="yellow"))
+            return True
+        request_id = parts[1].strip()
+        if request_id not in {request.request_id for request in pending}:
+            self._print(Text(f"[approval] unknown request: {request_id}", style="yellow"))
+            return True
+        resolved = (
+            self._approval_policy.approve(request_id)
+            if parts[0] == "approve"
+            else self._approval_policy.deny(request_id)
+        )
+        if resolved:
+            self._print(Text(f"[approval] {parts[0]}d {request_id}", style="green"))
+        self._present_pending_approvals()
+        return True
 
     def _make_session(self) -> PromptSession[str]:
         bindings = build_key_bindings(
@@ -321,6 +367,7 @@ class TUIApp:
                 if event.type is StreamEventType.TOOL_EXECUTION_START:
                     self._reset_stream_state()
                     self._loop_state = "tool-running"
+                    self._present_pending_approvals()
                 elif event.type is StreamEventType.TOOL_EXECUTION_END:
                     self._loop_state = "streaming"
                 elif event.type is StreamEventType.AGENT_END:
@@ -355,6 +402,7 @@ class TUIApp:
         """Run until Ctrl-D or an exit request."""
 
         session = session or self._session or self._make_session()
+        self._present_pending_approvals()
         prompt_task: asyncio.Task[str | None] | None = asyncio.create_task(
             self._read_prompt(session)
         )
@@ -380,7 +428,11 @@ class TUIApp:
                         break
                     parsed = parse_input(value)
                     if parsed is not None and not self._exit_requested:
-                        if self.active:
+                        if self._handle_approval_input(parsed):
+                            pass
+                        elif self.pending_approvals:
+                            self._present_pending_approvals()
+                        elif self.active:
                             self._queued.append(parsed)
                         else:
                             self._print_user(parsed)
@@ -409,6 +461,8 @@ def create_app(args: argparse.Namespace) -> TUIApp:
     resuming = continue_session or resume_id is not None
     if force_provider and not resuming:
         raise SessionError("--force-provider requires --continue or --resume")
+    if force_provider and args.model is None:
+        raise SessionError("--force-provider requires --model")
 
     if resuming:
         if resume_id is not None:
@@ -435,13 +489,6 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             )
         provider = provider_override or metadata.provider
         model = model_override or metadata.model
-        if mismatches:
-            manager.record_override(
-                metadata,
-                provider=provider if provider != metadata.provider else None,
-                model=model if model != metadata.model else None,
-            )
-        selected_model = model
         store = opened.store
     else:
         provider = args.provider or "fake"
@@ -455,19 +502,29 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         store = opened.store
     if resuming:
         backend, selected_model = build_backend(provider, model, home=home)
+    approval_policy = ApprovalPolicy(store=store)
+    loop = AgentLoop(
+        backend,
+        store,
+        approval_policy=approval_policy,
+        token_budget=metadata.compaction_budget,
+        retained_tail=metadata.retained_tail,
+    )
+    if resuming and mismatches:
+        manager.record_override(
+            metadata,
+            provider=provider if provider != metadata.provider else None,
+            model=model if model != metadata.model else None,
+        )
     return TUIApp(
-        AgentLoop(
-            backend,
-            store,
-            token_budget=metadata.compaction_budget,
-            retained_tail=metadata.retained_tail,
-        ),
+        loop,
         provider=provider,
         model=selected_model,
         verbose=args.verbose,
         history_path=home / "history",
         session_manager=manager,
         session_metadata=metadata,
+        approval_policy=approval_policy,
     )
 
 

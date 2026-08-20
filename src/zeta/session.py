@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import uuid
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -148,23 +151,31 @@ class SessionManager:
         retained_tail: int = 8,
         compaction_budget: int = 100_000,
     ) -> OpenedSession:
-        session_id = uuid.uuid4().hex
-        resolved_cwd = str(cwd or Path.cwd())
-        metadata = SessionMetadata.new(
-            session_id=session_id,
-            provider=provider,
-            model=model,
-            cwd=resolved_cwd,
-            retained_tail=retained_tail,
-            compaction_budget=compaction_budget,
-        )
-        store = ConversationStore(
-            self.sessions_dir,
-            session_id=session_id,
-            cwd=resolved_cwd,
-        )
-        self._write(metadata)
-        return OpenedSession(metadata, store)
+        resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        for _ in range(8):
+            session_id = uuid.uuid4().hex
+            session_dir = self.sessions_dir / session_id
+            try:
+                session_dir.mkdir()
+            except FileExistsError:
+                continue
+            metadata = SessionMetadata.new(
+                session_id=session_id,
+                provider=provider,
+                model=model,
+                cwd=resolved_cwd,
+                retained_tail=retained_tail,
+                compaction_budget=compaction_budget,
+            )
+            store = ConversationStore(
+                self.sessions_dir,
+                session_id=session_id,
+                cwd=resolved_cwd,
+            )
+            self._write(metadata)
+            return OpenedSession(metadata, store)
+        raise SessionError("could not allocate a unique session id")
 
     def open(self, session_id: str) -> OpenedSession:
         self._validate_id(session_id)
@@ -197,15 +208,15 @@ class SessionManager:
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
 
     def find_most_recent(self, *, cwd: str | Path | None = None) -> SessionMetadata:
-        resolved_cwd = str(cwd or Path.cwd())
+        resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         matches = [item for item in self.list_sessions() if item.cwd == resolved_cwd]
         if not matches:
             raise SessionError(f"no prior zeta session found in {resolved_cwd}")
         return matches[0]
 
     def touch(self, metadata: SessionMetadata) -> None:
-        metadata.updated_at = _now()
-        self._write(metadata)
+        current = self._mutate(metadata.session_id, lambda item: self._touch(item))
+        self._copy_metadata(metadata, current)
 
     def record_override(
         self,
@@ -214,21 +225,55 @@ class SessionManager:
         provider: str | None,
         model: str | None,
     ) -> None:
-        audit: dict[str, Any] = {
-            "at": _now(),
-            "provider": {"from": metadata.provider, "to": provider}
-            if provider is not None and provider != metadata.provider
-            else None,
-            "model": {"from": metadata.model, "to": model}
-            if model is not None and model != metadata.model
-            else None,
-        }
-        metadata.override_audit.append(audit)
-        if provider is not None:
-            metadata.provider = provider
-        if model is not None:
-            metadata.model = model
-        self.touch(metadata)
+        def update(item: SessionMetadata) -> SessionMetadata:
+            item.override_audit.append(
+                {
+                    "at": _now(),
+                    "provider": {"from": item.provider, "to": provider}
+                    if provider is not None and provider != item.provider
+                    else None,
+                    "model": {"from": item.model, "to": model}
+                    if model is not None and model != item.model
+                    else None,
+                }
+            )
+            if provider is not None:
+                item.provider = provider
+            if model is not None:
+                item.model = model
+            return self._touch(item)
+
+        current = self._mutate(metadata.session_id, update)
+        self._copy_metadata(metadata, current)
+
+    @staticmethod
+    def _touch(metadata: SessionMetadata) -> SessionMetadata:
+        metadata.updated_at = _now()
+        return metadata
+
+    def _mutate(
+        self,
+        session_id: str,
+        update: Callable[[SessionMetadata], SessionMetadata],
+    ) -> SessionMetadata:
+        with self._metadata_lock(session_id):
+            current = self._read(session_id)
+            updated = update(current)
+            self._write_unlocked(updated)
+            return updated
+
+    @staticmethod
+    def _copy_metadata(target: SessionMetadata, source: SessionMetadata) -> None:
+        target.version = source.version
+        target.session_id = source.session_id
+        target.created_at = source.created_at
+        target.updated_at = source.updated_at
+        target.provider = source.provider
+        target.model = source.model
+        target.cwd = source.cwd
+        target.retained_tail = source.retained_tail
+        target.compaction_budget = source.compaction_budget
+        target.override_audit = [dict(item) for item in source.override_audit]
 
     def _read(self, session_id: str) -> SessionMetadata:
         path = self.sessions_dir / session_id / "meta.json"
@@ -244,6 +289,10 @@ class SessionManager:
         return SessionMetadata.from_dict(value, path=path)
 
     def _write(self, metadata: SessionMetadata) -> None:
+        with self._metadata_lock(metadata.session_id):
+            self._write_unlocked(metadata)
+
+    def _write_unlocked(self, metadata: SessionMetadata) -> None:
         path = self.sessions_dir / metadata.session_id / "meta.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -256,6 +305,17 @@ class SessionManager:
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
+
+    @contextmanager
+    def _metadata_lock(self, session_id: str):
+        session_dir = self.sessions_dir / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        with (session_dir / ".meta.lock").open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
     def _validate_id(session_id: str) -> None:

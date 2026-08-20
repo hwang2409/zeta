@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import threading
+import uuid
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 from zeta.context import ContextAssembler
 from zeta.fake import FakeBackend, ScriptedTurn
@@ -110,17 +114,175 @@ def test_resume_provider_override_requires_force_and_records_audit(
 
     create_app(
         build_parser().parse_args(
-            ["--resume", session_id, "--provider", "claude", "--force-provider"]
+            [
+                "--resume",
+                session_id,
+                "--provider",
+                "claude",
+                "--model",
+                "claude-sonnet-4-6",
+                "--force-provider",
+            ]
         )
     )
     metadata = json.loads(
         (home / "sessions" / session_id / "meta.json").read_text()
     )
     assert metadata["provider"] == "claude"
+    assert metadata["model"] == "claude-sonnet-4-6"
     assert metadata["override_audit"][-1]["provider"] == {
         "from": "fake",
         "to": "claude",
     }
+    assert metadata["override_audit"][-1]["model"] == {
+        "from": "offline",
+        "to": "claude-sonnet-4-6",
+    }
+
+
+def test_force_provider_requires_a_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
+    first = create_app(_args())
+
+    with pytest.raises(SessionError, match="requires --model"):
+        create_app(
+            build_parser().parse_args(
+                [
+                    "--resume",
+                    first.loop.store.session_id,
+                    "--provider",
+                    "claude",
+                    "--force-provider",
+                ]
+            )
+        )
+
+
+def test_forced_backend_failure_leaves_metadata_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    metadata_path = home / "sessions" / session_id / "meta.json"
+    before = metadata_path.read_text()
+
+    def fail_backend(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("backend construction failed")
+
+    monkeypatch.setattr("zeta.tui.app.build_backend", fail_backend)
+    with pytest.raises(RuntimeError, match="backend construction failed"):
+        create_app(
+            build_parser().parse_args(
+                [
+                    "--resume",
+                    session_id,
+                    "--provider",
+                    "claude",
+                    "--model",
+                    "claude-sonnet-4-6",
+                    "--force-provider",
+                ]
+            )
+        )
+
+    assert metadata_path.read_text() == before
+
+
+def test_resumed_pending_approval_is_presented_and_resolvable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    call = ToolCall("approval-resume", "exec", {"command": "danger"})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+
+    app = create_app(
+        build_parser().parse_args(
+            ["--resume", opened.store.session_id, "--provider", "fake"]
+        )
+    )
+    app.console = Console(file=StringIO(), force_terminal=False)
+    app._present_pending_approvals()
+
+    assert call.id in app.console.file.getvalue()
+    assert app._handle_approval_input(f"approve {call.id}")
+    assert app.loop.store.pending_approvals() == []
+
+
+def test_metadata_override_and_touch_are_serialized(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    manager = SessionManager(home)
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    session_id = opened.store.session_id
+    override_manager = SessionManager(home)
+    touch_manager = SessionManager(home)
+    override_metadata = override_manager.open(session_id).metadata
+    touch_metadata = touch_manager.open(session_id).metadata
+    barrier = threading.Barrier(2)
+
+    def override() -> None:
+        barrier.wait()
+        override_manager.record_override(
+            override_metadata,
+            provider="claude",
+            model="claude-sonnet-4-6",
+        )
+
+    def touch() -> None:
+        barrier.wait()
+        touch_manager.touch(touch_metadata)
+
+    first = threading.Thread(target=override)
+    second = threading.Thread(target=touch)
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+
+    current = manager.open(session_id).metadata
+    assert current.provider == "claude"
+    assert current.model == "claude-sonnet-4-6"
+    assert len(current.override_audit) == 1
+
+
+def test_session_id_collision_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    collision = uuid.UUID("00000000000000000000000000000001")
+    unique = uuid.UUID("00000000000000000000000000000002")
+    calls = iter(
+        [
+            collision,
+            uuid.UUID("00000000000000000000000000000003"),
+            collision,
+            unique,
+            uuid.UUID("00000000000000000000000000000004"),
+        ]
+    )
+    monkeypatch.setattr("zeta.session.uuid.uuid4", lambda: next(calls))
+    manager.create(provider="fake", model="offline", cwd=tmp_path)
+    created = manager.create(provider="fake", model="offline", cwd=tmp_path)
+
+    assert created.store.session_id == unique.hex
+
+
+def test_session_cwd_is_normalized_for_continue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=Path("."))
+
+    assert manager.find_most_recent(cwd=Path.cwd()).session_id == opened.store.session_id
 
 
 @pytest.mark.asyncio
