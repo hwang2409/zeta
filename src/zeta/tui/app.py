@@ -244,11 +244,14 @@ class TUIApp:
 
     def _finish_stream(self) -> None:
         self._flush_stream_kind()
-        self._print_committed(self._assistant_lines.flush())
-        self._print_committed(self._thinking_lines.flush(), thinking=True)
+        self._reset_stream_buffers()
         for renderable in self._markdown_stream.flush():
             self._print(renderable)
         self._partial = ""
+
+    def _reset_stream_buffers(self) -> None:
+        self._assistant_lines.value = ""
+        self._thinking_lines.value = ""
 
     async def _consume_turn(self, user_text: str) -> None:
         self._loop_state = "streaming"

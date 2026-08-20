@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from rich.console import RenderableType
 from rich.markdown import Markdown
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 
 from ..types import (
@@ -63,24 +65,109 @@ class MarkdownStream:
     """
 
     language: str | None = None
+    fence_char: str | None = None
+    fence_length: int = 0
+    table_lines: list[str] | None = None
+
+    @staticmethod
+    def _fence(line: str) -> tuple[str, int, str] | None:
+        stripped = line.strip()
+        if not stripped or stripped[0] not in "`~":
+            return None
+        char = stripped[0]
+        length = len(stripped) - len(stripped.lstrip(char))
+        if length < 3:
+            return None
+        return char, length, stripped[length:]
+
+    @staticmethod
+    def _table_cells(line: str) -> list[str] | None:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            return None
+        body = stripped[1:]
+        if body.endswith("|"):
+            body = body[:-1]
+        return [cell.strip() for cell in body.split("|")]
+
+    @classmethod
+    def _is_table_separator(cls, line: str) -> bool:
+        cells = cls._table_cells(line)
+        return bool(cells) and all(
+            re.fullmatch(r":?-{3,}:?", cell.replace(" ", ""))
+            for cell in cells
+        )
+
+    def _render_table(self) -> list[RenderableType]:
+        lines = self.table_lines
+        self.table_lines = None
+        if lines is None:
+            return []
+
+        def render_lines() -> list[RenderableType]:
+            return [render_markdown(line) if line else Text("") for line in lines]
+
+        separator_index = next(
+            (index for index, line in enumerate(lines) if self._is_table_separator(line)),
+            None,
+        )
+        if separator_index != 1:
+            return render_lines()
+        header = self._table_cells(lines[0])
+        if header is None:
+            return render_lines()
+        table = Table(show_header=True, header_style="bold")
+        for cell in header:
+            table.add_column(cell)
+        for line in lines[separator_index + 1 :]:
+            cells = self._table_cells(line)
+            if cells is None:
+                return render_lines()
+            table.add_row(*(cells + [""] * len(header))[: len(header)])
+        return [table]
+
+    def _consume_plain(self, line: str) -> list[RenderableType]:
+        fence = self._fence(line)
+        if fence is not None:
+            char, length, language = fence
+            self.language = language.strip() or "text"
+            self.fence_char = char
+            self.fence_length = length
+            return [Text(line, style="dim")]
+        if self.table_lines is not None:
+            if self._table_cells(line) is not None:
+                self.table_lines.append(line)
+                return []
+            result = self._render_table()
+            result.extend(self._consume_plain(line))
+            return result
+        if self._table_cells(line) is not None:
+            self.table_lines = [line]
+            return []
+        return [render_markdown(line) if line else Text("")]
 
     def consume(self, line: str) -> list[RenderableType]:
-        stripped = line.strip()
         if self.language is not None:
-            if stripped.startswith("```"):
+            fence = self._fence(line)
+            if (
+                fence is not None
+                and fence[0] == self.fence_char
+                and fence[1] >= self.fence_length
+            ):
                 result: list[RenderableType] = [Text(line, style="dim")]
                 self.language = None
+                self.fence_char = None
+                self.fence_length = 0
                 return result
             return [render_code(line, self.language)]
 
-        if stripped.startswith("```"):
-            self.language = stripped[3:].strip() or "text"
-            return [Text(line, style="dim")]
-        return [render_markdown(line) if line else Text("")]
+        return self._consume_plain(line)
 
     def flush(self) -> list[RenderableType]:
         self.language = None
-        return []
+        self.fence_char = None
+        self.fence_length = 0
+        return self._render_table()
 
 
 def render_event(event: StreamEvent) -> RenderableType | None:

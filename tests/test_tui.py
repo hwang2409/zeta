@@ -10,6 +10,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.input import PipeInput, create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
+from rich.table import Table
 
 from zeta.loop import AgentLoop
 from zeta.store import ConversationStore
@@ -72,6 +73,32 @@ class BlockingToolBackend(CompletionBackend):
         )
 
 
+class StreamingToolBackend(CompletionBackend):
+    def __init__(self, call: ToolCall) -> None:
+        self.call = call
+        self.tool_update = asyncio.Event()
+        self.allow_message_end = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=ToolUseContent(self.call),
+        )
+        self.tool_update.set()
+        await self.allow_message_end.wait()
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(
+                MessageRole.ASSISTANT,
+                [ToolUseContent(self.call)],
+            ),
+        )
+
+
 async def wait_until(check: Callable[[], bool]) -> None:
     for _ in range(100):
         if check():
@@ -130,6 +157,34 @@ def test_markdown_stream_highlights_complete_fence() -> None:
     output.extend(stream.consume("```"))
 
     assert len(output) == 3
+
+
+def test_markdown_stream_requires_matching_four_backtick_fence() -> None:
+    stream = MarkdownStream()
+
+    assert stream.consume("````python")
+    inner = stream.consume("```")
+    assert type(inner[0]).__name__ == "Syntax"
+    assert stream.language == "python"
+
+    closing = stream.consume("````")
+    assert closing[0].plain == "````"
+    assert stream.language is None
+
+
+def test_markdown_stream_renders_complete_table() -> None:
+    stream = MarkdownStream()
+
+    assert stream.consume("| name | value |") == []
+    assert stream.consume("| --- | --- |") == []
+    assert stream.consume("| one | two |") == []
+
+    output = stream.consume("after")
+    assert len(output) == 2
+    assert isinstance(output[0], Table)
+    assert output[0].columns[0].header == "name"
+    assert output[0].columns[1].header == "value"
+    assert output[1].__class__.__name__ == "Markdown"
 
 
 def test_status_includes_provider_state_and_usage() -> None:
@@ -211,6 +266,41 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
     assert result.tool_call_id == call.id
     assert result.content == "tool execution canceled"
     assert result.is_error
+
+
+@pytest.mark.asyncio
+async def test_run_abort_during_streamed_tool_call_pairs_result(tmp_path: Path) -> None:
+    call = ToolCall("partial-call", "block", {})
+    backend = StreamingToolBackend(call)
+    store = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(backend, store, tools={"block": lambda _: "unused"})
+    with create_pipe_input() as pipe:
+        app = TUIApp(
+            loop,
+            provider="fake",
+            model="offline",
+            console=Console(file=StringIO(), force_terminal=False),
+        )
+        run_task = asyncio.create_task(app.run(app_session(app, pipe)))
+        pipe.send_text("run\r")
+        await backend.tool_update.wait()
+        pipe.send_text("\x03")
+        await wait_until(
+            lambda: len(store.messages()) == 3
+            and store.messages()[-1].tool_result is not None
+        )
+        pipe.send_text("\x04")
+        await run_task
+
+    messages = store.messages()
+    calls = [
+        block.tool_call
+        for block in messages[1].content
+        if isinstance(block, ToolUseContent)
+    ]
+    results = [message.tool_result for message in messages if message.tool_result]
+    assert [call.id for call in calls] == [result.tool_call_id for result in results]
+    assert all(result.content == "tool execution canceled" for result in results)
 
 
 @pytest.mark.asyncio

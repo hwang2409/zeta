@@ -167,7 +167,9 @@ class AgentLoop:
                 if _task_is_cancelling():
                     self._persist_partial_for_control(partial_blocks, assistant_message)
                     raise asyncio.CancelledError() from exc
-                self._persist_partial(partial_blocks, assistant_message)
+                self._persist_partial_with_cancelled_tools(
+                    partial_blocks, assistant_message
+                )
                 yield StreamEvent(
                     StreamEventType.ERROR,
                     error=ErrorInfo("backend_error", str(exc)),
@@ -179,7 +181,9 @@ class AgentLoop:
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise asyncio.CancelledError()
             if cleanup_error is not None:
-                self._persist_partial(partial_blocks, assistant_message)
+                self._persist_partial_with_cancelled_tools(
+                    partial_blocks, assistant_message
+                )
                 yield StreamEvent(
                     StreamEventType.ERROR,
                     error=ErrorInfo("backend_error", str(cleanup_error)),
@@ -320,7 +324,9 @@ class AgentLoop:
         assistant_message: Message | None,
     ) -> None:
         try:
-            self._persist_partial(partial_blocks, assistant_message)
+            self._persist_partial_with_cancelled_tools(
+                partial_blocks, assistant_message
+            )
         except Exception as exc:
             try:
                 warnings.warn(
@@ -330,3 +336,21 @@ class AgentLoop:
                 )
             except:
                 pass
+
+    def _persist_partial_with_cancelled_tools(
+        self,
+        partial_blocks: list[ContentBlock],
+        assistant_message: Message | None,
+    ) -> None:
+        self._persist_partial(partial_blocks, assistant_message)
+        blocks = (
+            assistant_message.content
+            if assistant_message is not None
+            else partial_blocks
+        )
+        calls = [
+            block.tool_call
+            for block in blocks
+            if isinstance(block, ToolUseContent)
+        ]
+        self._append_cancelled_tool_results(calls, set())
