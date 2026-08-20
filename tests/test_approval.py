@@ -483,6 +483,109 @@ async def test_second_abort_reaches_handler_after_approval_wins(
 
 
 @pytest.mark.asyncio
+async def test_pre_aborted_approved_call_accepts_a_second_abort(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="pre-aborted-approved")
+    call = ToolCall("pre-aborted-approved-call", "echo", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    policy = ApprovalPolicy(default="ask", store=store)
+    assert policy.approve(call.id)
+    signal = ToolAbortSignal()
+    signal.abort()
+    registry = ToolRegistry(
+        approval_root,
+        approval_policy=policy,
+        approval_store=store,
+        abort_signal=signal,
+        register_builtin=False,
+    )
+    started = asyncio.Event()
+    canceled = asyncio.Event()
+
+    async def echo(
+        arguments: dict[str, object],
+        abort_signal: ToolAbortSignal,
+    ) -> str:
+        del arguments
+        started.set()
+        await abort_signal.wait()
+        canceled.set()
+        return "canceled"
+
+    registry.register("echo", echo)
+    task = asyncio.create_task(registry.execute(call))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert not task.done()
+
+    registry.abort()
+
+    assert await asyncio.wait_for(task, timeout=1) == ToolResult(
+        call.id,
+        "canceled",
+    )
+    assert canceled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_parallel_pre_aborted_approved_calls_share_second_abort_signal(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="parallel-pre-aborted")
+    calls = [
+        ToolCall("parallel-approved-a", "echo", {"call_id": "parallel-approved-a"}),
+        ToolCall("parallel-approved-b", "echo", {"call_id": "parallel-approved-b"}),
+    ]
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [*(ToolUseContent(call) for call in calls)]),
+        [(call.id, call) for call in calls],
+    )
+    policy = ApprovalPolicy(default="ask", store=store)
+    assert all(policy.approve(call.id) for call in calls)
+    signal = ToolAbortSignal()
+    signal.abort()
+    registry = ToolRegistry(
+        approval_root,
+        approval_policy=policy,
+        approval_store=store,
+        abort_signal=signal,
+        register_builtin=False,
+    )
+    started = asyncio.Event()
+    started_count = 0
+    canceled: set[str] = set()
+
+    async def echo(
+        arguments: dict[str, object],
+        abort_signal: ToolAbortSignal,
+    ) -> str:
+        nonlocal started_count
+        call_id = str(arguments["call_id"])
+        started_count += 1
+        if started_count == len(calls):
+            started.set()
+        await abort_signal.wait()
+        canceled.add(call_id)
+        return "canceled"
+
+    registry.register("echo", echo)
+    tasks = [
+        asyncio.create_task(registry.execute(call))
+        for call in calls
+    ]
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    registry.abort()
+
+    results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+    assert results == [ToolResult(call.id, "canceled") for call in calls]
+    assert canceled == {call.id for call in calls}
+
+
+@pytest.mark.asyncio
 async def test_pending_request_wins_over_policy_change_after_restart(
     approval_root: Path,
 ) -> None:
@@ -527,6 +630,67 @@ def test_abandoned_branch_approval_does_not_leak_into_active_branch(
     reopened = ConversationStore(approval_root, session_id=store.session_id)
     assert reopened.pending_approvals() == []
     assert ApprovalPolicy(default="ask", store=reopened).pending_requests() == []
+
+
+def test_append_superset_preserves_all_approval_requests(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="approval-superset")
+    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    call_a = ToolCall("superset-a", "echo", {})
+    call_b = ToolCall("superset-b", "echo", {})
+    first = store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call_a)]),
+        [(call_a.id, call_a)],
+        parent_id=root.id,
+    )
+
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call_a), ToolUseContent(call_b)]),
+        [(call_a.id, call_a), (call_b.id, call_b)],
+        parent_id=first.id,
+    )
+
+    reopened = ConversationStore(approval_root, session_id=store.session_id)
+    assert set(reopened.approval_states()) == {call_a.id, call_b.id}
+
+
+def test_off_branch_duplicate_request_is_not_reused(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="approval-off-branch")
+    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    call = ToolCall("off-branch-call", "echo", {})
+    abandoned = store.append_approval_request(call.id, call, parent_id=root.id)
+    active = store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("active")]),
+        parent_id=root.id,
+    )
+
+    current = store.append_approval_request(call.id, call, parent_id=active.id)
+
+    assert current.id != abandoned.id
+    reopened = ConversationStore(approval_root, session_id=store.session_id)
+    assert reopened.approval_states() == {call.id: (call, None)}
+
+
+def test_rewound_resolution_reopens_with_active_branch_scope(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="approval-rewind")
+    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    call = ToolCall("rewound-call", "echo", {})
+    request = store.append_approval_request(call.id, call, parent_id=root.id)
+    store.append_approval_resolution(call.id, "allow", parent_id=request.id)
+    rewind = store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("rewound")]),
+        parent_id=request.id,
+    )
+
+    store.append_approval_resolution(call.id, "deny", parent_id=rewind.id)
+
+    reopened = ConversationStore(approval_root, session_id=store.session_id)
+    assert reopened.approval_states() == {call.id: (call, "deny")}
 
 
 def test_concurrent_approval_resolution_has_one_winner(approval_root: Path) -> None:

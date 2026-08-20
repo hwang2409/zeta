@@ -29,6 +29,9 @@ class ToolAbortSignal:
     def abort(self) -> None:
         self._event.set()
 
+    def clear(self) -> None:
+        self._event.clear()
+
     def is_set(self) -> bool:
         return self._event.is_set()
 
@@ -346,8 +349,7 @@ class ToolRegistry:
                     return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
                 if durable_decision != ApprovalDecision.ALLOW.value:
                     return _canceled_result(tool_call.id), execution_signal
-                execution_signal = ToolAbortSignal()
-                self.abort_signal = execution_signal
+                signal_state.clear()
             if decision is ApprovalDecision.DENY:
                 return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
         if self.pre_execute_hook is None:
@@ -381,7 +383,8 @@ class ToolRegistry:
     ) -> tuple[ToolAbortSignal | asyncio.Event, ToolResult | None]:
         winner = self._abort_approval(tool_call)
         if winner is ApprovalDecision.ALLOW:
-            return ToolAbortSignal(), None
+            signal_state.clear()
+            return signal_state, None
         if winner is ApprovalDecision.DENY:
             return signal_state, ToolResult(tool_call.id, "tool execution denied", True)
         return signal_state, _canceled_result(tool_call.id)

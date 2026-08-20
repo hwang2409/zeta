@@ -218,6 +218,13 @@ class ConversationStore:
         approval_requests: dict[str, ConversationEntry] = {}
         approval_resolutions: set[str] = set()
         by_id = {entry.id: entry for entry in self._entries}
+        active_ids: set[str] = set()
+        current = self._entries[-1] if self._entries else None
+        while current is not None:
+            if current.id in active_ids:
+                break
+            active_ids.add(current.id)
+            current = by_id.get(current.parent_id) if current.parent_id else None
         for expected_seq, entry in enumerate(self._entries, start=1):
             if entry.seq != expected_seq:
                 raise ConversationIntegrityError(
@@ -233,6 +240,9 @@ class ConversationStore:
                 raise ConversationIntegrityError(
                     f"missing prior parent {entry.parent_id} for {entry.id}"
                 )
+            if entry.id not in active_ids:
+                ids.add(entry.id)
+                continue
             if entry.type == "message":
                 requests = entry.data.get("approval_requests", [])
                 if type(requests) is list:
@@ -460,10 +470,24 @@ class ConversationStore:
             data["approval_requests"] = request_data
         with self._append_lock():
             self._load()
-            persisted_requests = self._approval_request_entries(self._entries)
+            branch = self.replay()
+            resolved_parent = (
+                parent_id if parent_id is not None else (branch[-1].id if branch else None)
+            )
+            for entry in branch:
+                if (
+                    entry.type == "message"
+                    and entry.parent_id == resolved_parent
+                    and entry.data == data
+                ):
+                    return self._snapshot_entry(entry)
+
+            persisted_requests = self._approval_request_entries(branch)
+            missing_requests: list[dict[str, Any]] = []
             for request in request_data:
                 existing = persisted_requests.get(request["request_id"])
                 if existing is None:
+                    missing_requests.append(request)
                     continue
                 existing_request = next(
                     candidate
@@ -474,8 +498,12 @@ class ConversationStore:
                     raise ConversationIntegrityError(
                         f"approval request tool call mismatch: {request['request_id']}"
                     )
-                return self._snapshot_entry(existing)
-            entry = self._append_row_unlocked("message", data, parent_id)
+            append_data = copy.deepcopy(data)
+            if missing_requests:
+                append_data["approval_requests"] = missing_requests
+            else:
+                append_data.pop("approval_requests", None)
+            entry = self._append_row_unlocked("message", append_data, parent_id)
             return self._snapshot_entry(entry)
 
     def append_approval_request(
