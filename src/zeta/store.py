@@ -342,10 +342,22 @@ class ConversationStore:
                 summary = entry.data.get("summary")
                 source_start = entry.data.get("source_seq_start")
                 source_end = entry.data.get("source_seq_end")
-                if type(summary) is not str:
-                    raise ValueError("compaction summary must be a string")
-                if type(source_start) is not int or type(source_end) is not int:
+                replaces = entry.data.get("replaces", [])
+                if type(summary) is not str or not summary.strip():
+                    raise ValueError("compaction summary must be a nonempty string")
+                if (
+                    type(source_start) is not int
+                    or type(source_end) is not int
+                    or source_start <= 0
+                    or source_end < source_start
+                ):
                     raise ValueError("compaction source sequence must be integers")
+                if (
+                    type(replaces) is not list
+                    or any(type(entry_id) is not str or not entry_id for entry_id in replaces)
+                    or len(replaces) != len(set(replaces))
+                ):
+                    raise ValueError("compaction replaces must be unique string IDs")
             elif entry.type == "warning":
                 if type(entry.data.get("message")) is not str:
                     raise ValueError("warning message must be a string")
@@ -422,17 +434,32 @@ class ConversationStore:
         source_seq_start: int,
         source_seq_end: int,
         *,
+        replaces: Iterable[str] = (),
         parent_id: str | None = None,
+        expected_parent_id: str | None = None,
     ) -> ConversationEntry:
-        return self._append_row(
-            "compaction",
-            {
-                "summary": summary,
-                "source_seq_start": source_seq_start,
-                "source_seq_end": source_seq_end,
-            },
-            parent_id,
-        )
+        data = {
+            "summary": summary,
+            "source_seq_start": source_seq_start,
+            "source_seq_end": source_seq_end,
+            "replaces": list(replaces),
+        }
+        if expected_parent_id is None:
+            return self._append_row("compaction", data, parent_id)
+        with self._append_lock():
+            self._load()
+            branch = self.replay()
+            current_parent_id = branch[-1].id if branch else None
+            if current_parent_id != expected_parent_id:
+                raise ConversationIntegrityError(
+                    "active branch changed while appending compaction"
+                )
+            entry = self._append_row_unlocked(
+                "compaction",
+                data,
+                expected_parent_id,
+            )
+            return self._snapshot_entry(entry)
 
     def append_message_with_approval_requests(
         self,

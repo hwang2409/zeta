@@ -778,7 +778,12 @@ def build_messages_payload(
     wire_messages: list[dict[str, Any]] = []
     for message in messages:
         if message.role is MessageRole.SYSTEM:
-            system.extend(_wire_content(message.content))
+            content = _wire_content(message.content)
+            if content and any(
+                block.get("type") != "text" or block.get("text", "").strip()
+                for block in content
+            ):
+                system.extend(content)
             continue
         if message.role is MessageRole.TOOL_RESULT:
             if message.tool_result is None:
