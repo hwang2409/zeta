@@ -34,6 +34,13 @@ from ..types import (
 )
 from .composer import build_key_bindings, history_for, parse_input
 from .render import MarkdownStream, format_status, render_event
+from .theme import (
+    ASSISTANT_BODY,
+    PROMPT_ACCENT,
+    PROMPT_CHROME,
+    RICH_THEME,
+    USER_PREFIX,
+)
 
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -135,7 +142,7 @@ class TUIApp:
         self.provider = provider
         self.model = model
         self.verbose = verbose
-        self.console = console or Console()
+        self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
         self._queued: deque[str] = deque()
         self._exit_requested = False
@@ -146,6 +153,7 @@ class TUIApp:
         self._markdown_stream = MarkdownStream()
         self._stream_kind: str | None = None
         self._partial = ""
+        self._streaming = False
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
 
@@ -168,8 +176,8 @@ class TUIApp:
             multiline=True,
             style=Style.from_dict(
                 {
-                    "prompt": "#c6ff4a bold",
-                    "bottom-toolbar": "#0b0c0a #c6ff4a",
+                    "prompt": PROMPT_ACCENT,
+                    "bottom-toolbar": PROMPT_CHROME,
                 }
             ),
         )
@@ -190,6 +198,10 @@ class TUIApp:
             self._loop_state,
             self._usage,
             self._partial,
+            session_id=self.loop.store.session_id[:8],
+            token_count=self.loop.context_assembler.token_count,
+            retained_tail=self.loop.context_assembler.retained_tail,
+            streaming=self._streaming,
         )
         return FormattedText([("class:bottom-toolbar", status.plain)])
 
@@ -241,6 +253,7 @@ class TUIApp:
             thinking = True
         if not value:
             return
+        self._streaming = True
         stream_kind = "thinking" if thinking else "assistant"
         if self._stream_kind is not None and self._stream_kind != stream_kind:
             self._flush_pending_stream()
@@ -257,13 +270,16 @@ class TUIApp:
     def _reset_stream_state(self) -> None:
         self._reset_stream_buffers()
         self._partial = ""
+        self._streaming = False
 
     def _reset_stream_buffers(self) -> None:
         self._assistant_lines.value = ""
         self._thinking_lines.value = ""
 
     def _print_user(self, user_text: str) -> None:
-        self.console.print(Text(f"[user] {user_text}", style="bold"))
+        self.console.print(
+            Text.assemble(("[user] ", USER_PREFIX), (user_text, ASSISTANT_BODY))
+        )
 
     def _start_queued_turn(self) -> None:
         if self._queued:
@@ -289,6 +305,7 @@ class TUIApp:
 
     async def _consume_turn(self, user_text: str) -> None:
         self._loop_state = "streaming"
+        self._streaming = True
         try:
             async for event in self.loop.run_turn(user_text):
                 self._update_usage(event)
@@ -304,6 +321,8 @@ class TUIApp:
                     self._loop_state = "tool-running"
                 elif event.type is StreamEventType.TOOL_EXECUTION_END:
                     self._loop_state = "streaming"
+                elif event.type is StreamEventType.MESSAGE_END:
+                    self._streaming = False
                 elif event.type is StreamEventType.AGENT_END:
                     self._reset_stream_state()
                     self._loop_state = "idle"

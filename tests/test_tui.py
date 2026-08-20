@@ -23,7 +23,14 @@ from zeta.loop import AgentLoop
 from zeta.store import ConversationStore
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings, parse_input
-from zeta.tui.render import MarkdownStream, format_status, render_event
+from zeta.tui.render import (
+    MarkdownStream,
+    format_status,
+    render_code,
+    render_event,
+    render_markdown,
+)
+from zeta.tui.theme import ACCENT, ASSISTANT_BODY, CODE_BG
 from zeta.types import (
     CompletionBackend,
     ErrorInfo,
@@ -162,6 +169,33 @@ class StreamingToolBackend(CompletionBackend):
         )
 
 
+class OrderedToolBackend(CompletionBackend):
+    def __init__(self, calls: list[ToolCall]) -> None:
+        self.calls = calls
+        self.index = 0
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        call_index = self.index
+        self.index += 1
+        if call_index in {0, 2}:
+            call = self.calls[call_index // 2]
+            text = f"assistant {call_index // 2 + 1}\n"
+            blocks = [TextContent(text), ToolUseContent(call)]
+        else:
+            blocks = [TextContent(f"assistant after tool {call_index}\n")]
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[0])
+        if len(blocks) > 1:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[1])
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 async def wait_until(check: Callable[[], bool]) -> None:
     for _ in range(100):
         if check():
@@ -193,9 +227,25 @@ def test_render_event_compacts_tool_call_and_result() -> None:
         )
     )
 
-    assert start is not None and "[tool] read" in start.plain
+    assert start is not None and start.plain.startswith("▸ read(")
     assert "README.md" in start.plain
-    assert result is not None and result.plain == "[tool result] first line"
+    assert result is not None and result.plain == "  ↳ [tool result] first line"
+
+
+def test_render_helpers_use_the_zeta_palette() -> None:
+    markdown = render_markdown("# heading")
+    code = render_code("print('hi')", "python")
+    start = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=ToolCall("call-1", "read", {}),
+        )
+    )
+
+    assert markdown.style == ASSISTANT_BODY
+    assert code.background_color == CODE_BG
+    assert start is not None
+    assert any(span.style == ACCENT for span in start.spans)
 
 
 def test_render_event_error_is_visible() -> None:
@@ -490,6 +540,60 @@ def test_status_includes_provider_state_and_usage() -> None:
     status = format_status("fake", "offline", "streaming", {"input_tokens": 2}, "partial")
 
     assert status.plain == " fake/offline  streaming  tokens in=2 out=0  |  partial"
+
+
+def test_status_bar_includes_session_context_and_streaming_indicator() -> None:
+    status = format_status(
+        "codex",
+        "gpt-5.4",
+        "streaming",
+        session_id="01234567",
+        token_count=42,
+        retained_tail=8,
+        streaming=True,
+    )
+
+    assert status.plain == (
+        " session 01234567  |  codex/gpt-5.4  |  tokens 42  |  "
+        "tail 8  |  mode streaming  •"
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_session_preserves_assistant_tool_user_order(tmp_path: Path) -> None:
+    calls = [ToolCall("call-1", "read", {}), ToolCall("call-2", "read", {})]
+    backend = OrderedToolBackend(calls)
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            tools={"read": lambda _: "tool result"},
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    app._print_user("first user")
+    await app._consume_turn("first user")
+    app._print_user("second user")
+    await app._consume_turn("second user")
+
+    rendered = output.getvalue()
+    first_result = rendered.index("[tool result] tool result")
+    second_result = rendered.rindex("[tool result] tool result")
+    markers = [
+        rendered.index("[user] first user"),
+        rendered.index("assistant 1"),
+        rendered.index("▸ read("),
+        first_result,
+        rendered.index("assistant after tool 1"),
+        rendered.index("[user] second user"),
+        rendered.index("assistant 2"),
+        second_result,
+    ]
+    assert markers == sorted(markers)
 
 
 @pytest.mark.asyncio

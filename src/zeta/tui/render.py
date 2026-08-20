@@ -21,6 +21,17 @@ from ..types import (
     ThinkingContent,
     ToolUseContent,
 )
+from .theme import (
+    ACCENT,
+    ACCENT_DIM,
+    ASSISTANT_BODY,
+    CHROME,
+    CODE_BG,
+    ERROR,
+    OK,
+    THINKING,
+    TOOL_RESULT,
+)
 
 
 MAX_ARGUMENTS = 140
@@ -46,13 +57,25 @@ def _result_summary(value: str) -> str:
 def render_markdown(value: str) -> RenderableType:
     """Render assistant text with Rich markdown and fenced-code highlighting."""
 
-    return Markdown(value, code_theme="monokai", hyperlinks=False)
+    return Markdown(
+        value,
+        code_theme="monokai",
+        hyperlinks=False,
+        inline_code_theme="monokai",
+        style=ASSISTANT_BODY,
+    )
 
 
 def render_code(value: str, language: str = "text") -> Syntax:
     """Render a complete code block with syntax highlighting."""
 
-    return Syntax(value, language or "text", theme="monokai", word_wrap=True)
+    return Syntax(
+        value,
+        language or "text",
+        theme="monokai",
+        word_wrap=True,
+        background_color=CODE_BG,
+    )
 
 
 @dataclass(slots=True)
@@ -178,30 +201,32 @@ def render_event(event: StreamEvent) -> RenderableType | None:
     """
 
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
-        return Text(
-            f"[tool] {event.tool_call.name} {_arguments(event.tool_call.arguments)}",
-            style="yellow",
+        return Text.assemble(
+            ("▸ ", ACCENT_DIM),
+            (event.tool_call.name, ACCENT),
+            (f"({_arguments(event.tool_call.arguments)})", CHROME),
         )
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:
-        style = "red" if event.tool_result.is_error else "green"
+        style = ERROR if event.tool_result.is_error else OK
         marker = "[tool error]" if event.tool_result.is_error else "[tool result]"
-        return Text(
-            f"{marker} {_result_summary(event.tool_result.content)}",
-            style=style,
+        return Text.assemble(
+            ("  ↳ ", TOOL_RESULT),
+            (f"{marker} ", style),
+            (_result_summary(event.tool_result.content), TOOL_RESULT),
         )
     if event.type is StreamEventType.ERROR:
         message = event.error.message if event.error else "unknown error"
-        return Text(f"[error] {message}", style="bold red")
+        return Text(f"[error] {message}", style=ERROR)
     if event.type is StreamEventType.AGENT_END:
-        return Text("[done]", style="green")
+        return Text("[done]", style=OK)
     if event.type is StreamEventType.TURN_START:
         turn = event.data.get("turn", "?")
-        return Text(f"[turn {turn}]", style="dim")
+        return Text(f"[turn {turn}]", style=CHROME)
     if event.type is StreamEventType.MESSAGE_UPDATE:
         if isinstance(event.content, ThinkingContent):
-            return Text(f"[thinking] {event.content.text}", style="dim italic")
+            return Text(f"[thinking] {event.content.text}", style=THINKING)
         if isinstance(event.content, RedactedThinkingContent):
-            return Text("[thinking] redacted", style="dim italic")
+            return Text("[thinking] redacted", style=THINKING)
         if isinstance(event.content, ToolUseContent):
             return None
         if isinstance(event.content, TextContent) or event.delta is not None:
@@ -215,6 +240,11 @@ def format_status(
     loop_state: str,
     usage: dict[str, Any] | None = None,
     partial: str = "",
+    *,
+    session_id: str | None = None,
+    token_count: int | None = None,
+    retained_tail: int | None = None,
+    streaming: bool = False,
 ) -> Text:
     """Format the persistent status line shown beneath the composer."""
 
@@ -222,9 +252,24 @@ def format_status(
     input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
     output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
     usage_text = ""
-    if input_tokens is not None or output_tokens is not None:
-        usage_text = f"  tokens in={input_tokens or 0} out={output_tokens or 0}"
-    line = f" {provider}/{model}  {loop_state}{usage_text}"
+    if token_count is not None:
+        usage_text = f"tokens {token_count}"
+    elif input_tokens is not None or output_tokens is not None:
+        usage_text = f"tokens in={input_tokens or 0} out={output_tokens or 0}"
+
+    if session_id is None and retained_tail is None and token_count is None:
+        line = f" {provider}/{model}  {loop_state}"
+        if usage_text:
+            line += f"  {usage_text}"
+    else:
+        session_text = session_id or "--------"
+        tail_text = f"tail {retained_tail}" if retained_tail is not None else "tail ?"
+        line = (
+            f" session {session_text}  |  {provider}/{model}  |  "
+            f"{usage_text or 'tokens ?'}  |  {tail_text}  |  mode {loop_state}"
+        )
+        if streaming:
+            line += "  •"
     if partial:
         line += f"  |  {partial}"
-    return Text(line, style="green")
+    return Text(line, style=ACCENT_DIM)
