@@ -267,6 +267,11 @@ class ContextAssembler:
         ]
         source_start = min(start for start, _ in source_ranges)
         source_end = max(end for _, end in source_ranges)
+        replaces = [
+            entry.id
+            for entry in source_entries.values()
+            if entry.type == "compaction"
+        ]
         summary = await self.compaction_policy.summarize(
             [item.message for item in candidates],
             backend=backend or self.backend,
@@ -291,6 +296,7 @@ class ContextAssembler:
                 summary,
                 source_start,
                 source_end,
+                replaces=replaces,
                 expected_parent_id=branch_id,
             )
         except ValueError as exc:
@@ -328,15 +334,10 @@ class ContextAssembler:
 
     def _visible_items(self, entries: Sequence[ConversationEntry]) -> list[_ContextItem]:
         all_markers = [entry for entry in entries if entry.type == "compaction"]
-        markers = [
-            entry
-            for entry in all_markers
-            if not any(
-                other is not entry
-                and other.data["source_seq_start"] <= entry.seq <= other.data["source_seq_end"]
-                for other in all_markers
-            )
-        ]
+        superseded_ids: set[str] = set()
+        for marker in all_markers:
+            superseded_ids.update(marker.data.get("replaces", []))
+        markers = [entry for entry in all_markers if entry.id not in superseded_ids]
         compacted_ranges = [
             (entry.data["source_seq_start"], entry.data["source_seq_end"])
             for entry in markers
@@ -345,10 +346,12 @@ class ContextAssembler:
             entry.data["source_seq_start"]: entry for entry in markers
         }
         items: list[_ContextItem] = []
+        emitted_marker_ids: set[str] = set()
         for entry in entries:
             marker = markers_by_start.get(entry.seq)
             if marker is not None:
                 items.extend(self._marker_items(marker))
+                emitted_marker_ids.add(marker.id)
             if entry.type == "compaction":
                 continue
             if entry.type != "message":
@@ -357,7 +360,7 @@ class ContextAssembler:
                 continue
             items.append(_ContextItem(entry, Message.from_dict(entry.data["message"])))
         for marker in markers:
-            if not any(item.entry is marker for item in items):
+            if marker.id not in emitted_marker_ids:
                 items.extend(self._marker_items(marker))
         return items
 

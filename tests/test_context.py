@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import perf_counter
 
 import pytest
 
@@ -311,6 +312,8 @@ async def test_repeated_compaction_replays_flattened_marker_range(
         (1, 5),
         (1, 9),
     ]
+    assert markers[0].data["replaces"] == []
+    assert markers[1].data["replaces"] == [markers[0].id]
 
     reopened = ConversationStore(context_root, session_id=store.session_id)
     fresh = ContextAssembler(
@@ -321,7 +324,11 @@ async def test_repeated_compaction_replays_flattened_marker_range(
     )
     messages = await fresh.assemble()
 
-    assert [message.role for message in messages].count(MessageRole.COMPACTION) == 1
+    assert [message.role for message in messages] == [
+        MessageRole.COMPACTION,
+        MessageRole.ASSISTANT,
+        MessageRole.USER,
+    ]
     assert [
         message.metadata.get("compaction_summary")
         for message in messages
@@ -354,6 +361,84 @@ async def test_repeated_compaction_replacement_is_idempotent(context_root: Path)
 
     assert second == first
     assert store.path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_same_state_recompaction_survives_cold_reload(context_root: Path) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(text(MessageRole.USER, "old"))
+    store.append_message(text(MessageRole.USER, "tail"))
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first summary")]),
+            ScriptedTurn([TextContent("second summary")]),
+        ]
+    )
+
+    def same_state_count(message: Message) -> int:
+        if (
+            message.role in {MessageRole.SYSTEM, MessageRole.COMPACTION}
+            or message.metadata.get("compaction_summary")
+        ):
+            return 1
+        return 100
+
+    assembler = ContextAssembler(
+        store,
+        token_budget=160,
+        retained_tail=1,
+        token_counter=same_state_count,
+        backend=backend,
+    )
+
+    await assembler.assemble()
+    first_marker = next(entry for entry in store.entries if entry.type == "compaction")
+    assembler.record_usage({"total_tokens": 300})
+    await assembler.assemble()
+    markers = [entry for entry in store.entries if entry.type == "compaction"]
+
+    assert markers[1].data["replaces"] == [first_marker.id]
+    reopened = ConversationStore(context_root, session_id=store.session_id)
+    fresh = ContextAssembler(
+        reopened,
+        token_budget=160,
+        retained_tail=1,
+        token_counter=same_state_count,
+    )
+
+    messages = await fresh.assemble()
+
+    assert [message.role for message in messages] == [
+        MessageRole.COMPACTION,
+        MessageRole.ASSISTANT,
+        MessageRole.USER,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_marker_replay_chain_scales_linearly(context_root: Path) -> None:
+    store = ConversationStore(context_root)
+    previous_id: str | None = None
+    chain_length = 100
+    for index in range(chain_length):
+        marker = store.append_compaction_marker(
+            f"summary {index}",
+            1,
+            1,
+            replaces=[] if previous_id is None else [previous_id],
+        )
+        previous_id = marker.id
+
+    assembler = ContextAssembler(store, token_budget=10_000, retained_tail=1)
+    started = perf_counter()
+    messages = await assembler.assemble()
+    elapsed = perf_counter() - started
+
+    assert elapsed < chain_length / 100
+    assert [message.role for message in messages] == [
+        MessageRole.COMPACTION,
+        MessageRole.ASSISTANT,
+    ]
 
 
 def test_zero_retained_tail_is_rejected(context_root: Path) -> None:

@@ -342,6 +342,7 @@ class ConversationStore:
                 summary = entry.data.get("summary")
                 source_start = entry.data.get("source_seq_start")
                 source_end = entry.data.get("source_seq_end")
+                replaces = entry.data.get("replaces", [])
                 if type(summary) is not str or not summary.strip():
                     raise ValueError("compaction summary must be a nonempty string")
                 if (
@@ -351,6 +352,12 @@ class ConversationStore:
                     or source_end < source_start
                 ):
                     raise ValueError("compaction source sequence must be integers")
+                if (
+                    type(replaces) is not list
+                    or any(type(entry_id) is not str or not entry_id for entry_id in replaces)
+                    or len(replaces) != len(set(replaces))
+                ):
+                    raise ValueError("compaction replaces must be unique string IDs")
             elif entry.type == "warning":
                 if type(entry.data.get("message")) is not str:
                     raise ValueError("warning message must be a string")
@@ -427,6 +434,7 @@ class ConversationStore:
         source_seq_start: int,
         source_seq_end: int,
         *,
+        replaces: Iterable[str] = (),
         parent_id: str | None = None,
         expected_parent_id: str | None = None,
     ) -> ConversationEntry:
@@ -434,6 +442,7 @@ class ConversationStore:
             "summary": summary,
             "source_seq_start": source_seq_start,
             "source_seq_end": source_seq_end,
+            "replaces": list(replaces),
         }
         if expected_parent_id is None:
             return self._append_row("compaction", data, parent_id)

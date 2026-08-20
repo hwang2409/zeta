@@ -192,6 +192,7 @@ def test_compaction_marker_persists(tmp_path: Path) -> None:
         "summary": "summary",
         "source_seq_start": 1,
         "source_seq_end": 4,
+        "replaces": [],
     }
 
 
