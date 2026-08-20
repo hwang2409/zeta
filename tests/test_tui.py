@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import pty
+import select
+import subprocess
+import sys
+import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from io import StringIO
 from pathlib import Path
@@ -10,6 +16,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.input import PipeInput, create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
+from rich.syntax import Syntax
 from rich.table import Table
 
 from zeta.loop import AgentLoop
@@ -29,6 +36,7 @@ from zeta.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    ThinkingContent,
 )
 
 
@@ -170,6 +178,91 @@ def test_markdown_stream_requires_matching_four_backtick_fence() -> None:
     closing = stream.consume("````")
     assert closing[0].plain == "````"
     assert stream.language is None
+
+
+def test_markdown_stream_keeps_text_after_fence_inside_code_block() -> None:
+    stream = MarkdownStream()
+    stream.consume("```python")
+
+    output = stream.consume("```still code")
+
+    assert len(output) == 1
+    assert isinstance(output[0], Syntax)
+    assert output[0].code == "```still code"
+    assert stream.language == "python"
+
+
+def test_stream_kind_switch_flushes_assistant_before_thinking(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    rendered = []
+    app._print = rendered.append
+
+    app._consume_text(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("| name | value |\n| --- | --- |"),
+        )
+    )
+    app._consume_text(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=ThinkingContent("plan\n"),
+        )
+    )
+    app._consume_text(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("after\n"),
+        )
+    )
+
+    assert isinstance(rendered[0], Table)
+    assert rendered[1].plain == "[thinking] plan"
+
+
+def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
+    master_fd, slave_fd = pty.openpty()
+    env = os.environ.copy()
+    env["ZETA_HOME"] = str(tmp_path / "zeta-home")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'fake']))",
+        ],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    try:
+        output = bytearray()
+        deadline = time.monotonic() + 5
+        while b"you > " not in output and time.monotonic() < deadline:
+            ready, _, _ = select.select(
+                [master_fd],
+                [],
+                [],
+                max(0, deadline - time.monotonic()),
+            )
+            if ready:
+                output.extend(os.read(master_fd, 4096))
+        assert b"you > " in output
+
+        os.write(master_fd, b"\x04")
+        assert process.wait(timeout=5) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master_fd)
 
 
 def test_markdown_stream_renders_complete_table() -> None:

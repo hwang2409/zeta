@@ -223,6 +223,10 @@ class TUIApp:
         self._stream_kind = None
         self._partial = ""
 
+    def _flush_markdown(self) -> None:
+        for renderable in self._markdown_stream.flush():
+            self._print(renderable)
+
     def _consume_text(self, event: StreamEvent) -> None:
         value = event.delta
         thinking = False
@@ -236,6 +240,7 @@ class TUIApp:
         stream_kind = "thinking" if thinking else "assistant"
         if self._stream_kind is not None and self._stream_kind != stream_kind:
             self._flush_stream_kind()
+            self._flush_markdown()
         self._stream_kind = stream_kind
         buffer = self._thinking_lines if thinking else self._assistant_lines
         committed = buffer.feed(value)
@@ -245,8 +250,7 @@ class TUIApp:
     def _finish_stream(self) -> None:
         self._flush_stream_kind()
         self._reset_stream_buffers()
-        for renderable in self._markdown_stream.flush():
-            self._print(renderable)
+        self._flush_markdown()
         self._partial = ""
 
     def _reset_stream_buffers(self) -> None:
@@ -292,7 +296,7 @@ class TUIApp:
             )
         except EOFError:
             return None
-        return parse_input(value)
+        return value
 
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run until Ctrl-D or an exit request."""
@@ -319,13 +323,16 @@ class TUIApp:
 
                 if prompt_task in done:
                     value = await prompt_task
-                    if value is not None and not self._exit_requested:
-                        self.console.print(Text(f"[user] {value}", style="bold"))
+                    if value is None:
+                        break
+                    parsed = parse_input(value)
+                    if parsed is not None and not self._exit_requested:
+                        self.console.print(Text(f"[user] {parsed}", style="bold"))
                         if self.active:
-                            self._queued.append(value)
+                            self._queued.append(parsed)
                             self.console.print(Text("[queued]", style="dim"))
                         else:
-                            self._start_turn(value)
+                            self._start_turn(parsed)
                     if self._exit_requested:
                         break
                     prompt_task = asyncio.create_task(self._read_prompt(session))

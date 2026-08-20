@@ -153,6 +153,7 @@ class MarkdownStream:
                 fence is not None
                 and fence[0] == self.fence_char
                 and fence[1] >= self.fence_length
+                and not fence[2].strip()
             ):
                 result: list[RenderableType] = [Text(line, style="dim")]
                 self.language = None
