@@ -181,13 +181,29 @@ class AgentLoop:
                 _scope_signal=abort_signal,
             )
         except asyncio.CancelledError:
-            self._finalize_tool_results([tool_call], [None])
+            self.finalize_canceled(request_id)
             raise
         except Exception as exc:
             result = ToolResult(tool_call.id, str(exc), is_error=True)
-        return self._finalize_tool_results(
-            [tool_call], [_validated_tool_result(result, tool_call.id)]
-        )[0]
+        result = _validated_tool_result(result, tool_call.id)
+        if result.content == "tool execution canceled" and result.is_error:
+            return self.finalize_canceled(request_id)
+        return self._finalize_tool_results([tool_call], [result])[0]
+
+    def finalize_canceled(self, request_id: str) -> ToolResult | None:
+        """Persist one canceled result for a durable approval request."""
+
+        state = self.store.approval_states().get(request_id)
+        if state is None:
+            return None
+        tool_call = state[0]
+        for message in reversed(self.store.messages()):
+            result = message.tool_result
+            if result is not None and result.tool_call_id == tool_call.id:
+                if result.content == "tool execution canceled" and result.is_error:
+                    return result
+                break
+        return self._finalize_tool_results([tool_call], [None])[0]
 
     async def _run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
         self.store.append_message(

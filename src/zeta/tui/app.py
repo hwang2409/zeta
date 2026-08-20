@@ -215,22 +215,20 @@ class TUIApp:
         if resolved:
             self._print(Text(f"[approval] {parts[0]}d {request_id}", style="green"))
 
-            if not self.loop.prepare_resume_pending_tool(request_id):
-                self._present_pending_approvals()
-                return True
-
             async def resume() -> Any:
                 self._resumed_tool_started = True
                 return await self.loop.resume_pending_tool(
                     request_id, prepared=True
                 )
 
-            resume_task = asyncio.create_task(
-                resume()
-            )
-            self._active_task = resume_task
-            self._resumed_tool_started = False
+            resume_task: asyncio.Task[Any] | None = None
             try:
+                if not self.loop.prepare_resume_pending_tool(request_id):
+                    self._present_pending_approvals()
+                    return True
+                self._resumed_tool_started = False
+                resume_task = asyncio.create_task(resume())
+                self._active_task = resume_task
                 result = await asyncio.shield(resume_task)
             except asyncio.CancelledError:
                 parent_cancelled = (
@@ -238,15 +236,17 @@ class TUIApp:
                     and asyncio.current_task().cancelling() > 0
                 )
                 self.loop.abort()
-                if self._resumed_tool_started:
+                self.loop.finalize_canceled(request_id)
+                if resume_task is not None and self._resumed_tool_started:
                     resume_task.cancel()
-                await asyncio.gather(resume_task, return_exceptions=True)
+                if resume_task is not None:
+                    await asyncio.gather(resume_task, return_exceptions=True)
                 self._print(Text("[aborted]", style="yellow"))
                 if parent_cancelled:
                     raise
                 return True
             finally:
-                if self._active_task is resume_task:
+                if resume_task is not None and self._active_task is resume_task:
                     self._active_task = None
                 self._resumed_tool_started = None
             request = next(

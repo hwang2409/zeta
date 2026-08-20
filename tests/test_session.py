@@ -451,8 +451,31 @@ async def test_resumed_tool_immediate_abort_persists_canceled_result(
     assert opened.store.messages()[-1].tool_result == result
 
 
+def test_finalize_canceled_is_idempotent(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    loop = AgentLoop(FakeBackend([]), opened.store)
+    call = ToolCall("approval-idempotent-cancel", "never", {})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+
+    first = loop.finalize_canceled(call.id)
+    second = loop.finalize_canceled(call.id)
+
+    results = [
+        message.tool_result
+        for message in opened.store.messages()
+        if message.tool_result is not None
+    ]
+    assert first is not None
+    assert second == first
+    assert results == [first]
+
+
 @pytest.mark.asyncio
-async def test_parent_approval_cancellation_persists_canceled_result(
+async def test_strict_pre_start_parent_cancellation_persists_canceled_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
@@ -484,9 +507,17 @@ async def test_parent_approval_cancellation_persists_canceled_result(
     original_prepare = loop.prepare_resume_pending_tool
     parent_task: asyncio.Task[bool]
 
+    def cancel_create(coro: object) -> asyncio.Task[object]:
+        close = getattr(coro, "close")
+        close()
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel()
+        raise asyncio.CancelledError
+
     def prepare(request_id: str) -> bool:
         prepared = original_prepare(request_id)
-        asyncio.get_running_loop().call_soon(parent_task.cancel)
+        monkeypatch.setattr(asyncio, "create_task", cancel_create)
         return prepared
 
     monkeypatch.setattr(loop, "prepare_resume_pending_tool", prepare)
