@@ -452,6 +452,105 @@ async def test_resumed_tool_immediate_abort_persists_canceled_result(
 
 
 @pytest.mark.asyncio
+async def test_parent_approval_cancellation_persists_canceled_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    policy = ApprovalPolicy(store=opened.store)
+
+    async def never_runs(arguments: dict[str, str]) -> str:
+        del arguments
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        tools={"never": never_runs},
+        approval_policy=policy,
+    )
+    call = ToolCall("approval-parent-cancel", "never", {})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    app = TUIApp(
+        loop,
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+    )
+    original_prepare = loop.prepare_resume_pending_tool
+    parent_task: asyncio.Task[bool]
+
+    def prepare(request_id: str) -> bool:
+        prepared = original_prepare(request_id)
+        asyncio.get_running_loop().call_soon(parent_task.cancel)
+        return prepared
+
+    monkeypatch.setattr(loop, "prepare_resume_pending_tool", prepare)
+    parent_task = asyncio.create_task(
+        app._handle_approval_input(f"approve {call.id}")
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await parent_task
+
+    assert opened.store.messages()[-1].tool_result is not None
+    assert opened.store.messages()[-1].tool_result.content == (
+        "tool execution canceled"
+    )
+
+
+@pytest.mark.asyncio
+async def test_parent_cancellation_after_child_start_persists_result(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    policy = ApprovalPolicy(store=opened.store)
+    handler_started = asyncio.Event()
+
+    async def blocks(arguments: dict[str, str]) -> str:
+        del arguments
+        handler_started.set()
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        tools={"block": blocks},
+        approval_policy=policy,
+    )
+    call = ToolCall("approval-parent-after-start", "block", {})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    app = TUIApp(
+        loop,
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+    )
+    parent_task = asyncio.create_task(
+        app._handle_approval_input(f"approve {call.id}")
+    )
+    await handler_started.wait()
+    parent_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await parent_task
+
+    assert opened.store.messages()[-1].tool_result is not None
+    assert opened.store.messages()[-1].tool_result.content == (
+        "tool execution canceled"
+    )
+
+
+@pytest.mark.asyncio
 async def test_summary_success_commits_override_before_main_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

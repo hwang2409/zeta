@@ -231,9 +231,19 @@ class TUIApp:
             self._active_task = resume_task
             self._resumed_tool_started = False
             try:
-                result = await resume_task
+                result = await asyncio.shield(resume_task)
             except asyncio.CancelledError:
+                parent_cancelled = (
+                    asyncio.current_task() is not None
+                    and asyncio.current_task().cancelling() > 0
+                )
+                self.loop.abort()
+                if self._resumed_tool_started:
+                    resume_task.cancel()
+                await asyncio.gather(resume_task, return_exceptions=True)
                 self._print(Text("[aborted]", style="yellow"))
+                if parent_cancelled:
+                    raise
                 return True
             finally:
                 if self._active_task is resume_task:
