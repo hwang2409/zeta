@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import time
@@ -102,6 +103,7 @@ def _keychain_claude_tokens() -> OAuthTokens | None:
             ],
             capture_output=True,
             check=False,
+            env={"PATH": os.defpath},
             text=True,
             timeout=2,
         )
