@@ -64,6 +64,19 @@ class GateBackend(CompletionBackend):
         )
 
 
+class ErrorBackend(CompletionBackend):
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("| name | value |\n| --- | --- |"),
+        )
+        raise RuntimeError("boom")
+
+
 class BlockingToolBackend(CompletionBackend):
     def __init__(self, call: ToolCall) -> None:
         self.call = call
@@ -223,6 +236,35 @@ def test_stream_kind_switch_flushes_assistant_before_thinking(tmp_path: Path) ->
 
     assert isinstance(rendered[0], Table)
     assert rendered[1].plain == "[thinking] plan"
+
+
+@pytest.mark.asyncio
+async def test_error_flushes_assistant_before_error(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(ErrorBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    rendered = []
+
+    def capture(renderable: object | None) -> None:
+        if renderable is not None:
+            rendered.append(renderable)
+
+    app._print = capture
+
+    await app._consume_turn("prompt")
+
+    table_index = next(
+        index for index, item in enumerate(rendered) if isinstance(item, Table)
+    )
+    error_index = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == "[error] boom"
+    )
+    assert table_index < error_index
 
 
 def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:

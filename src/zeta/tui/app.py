@@ -227,6 +227,10 @@ class TUIApp:
         for renderable in self._markdown_stream.flush():
             self._print(renderable)
 
+    def _flush_pending_stream(self) -> None:
+        self._flush_stream_kind()
+        self._flush_markdown()
+
     def _consume_text(self, event: StreamEvent) -> None:
         value = event.delta
         thinking = False
@@ -239,8 +243,7 @@ class TUIApp:
             return
         stream_kind = "thinking" if thinking else "assistant"
         if self._stream_kind is not None and self._stream_kind != stream_kind:
-            self._flush_stream_kind()
-            self._flush_markdown()
+            self._flush_pending_stream()
         self._stream_kind = stream_kind
         buffer = self._thinking_lines if thinking else self._assistant_lines
         committed = buffer.feed(value)
@@ -248,9 +251,8 @@ class TUIApp:
         self._print_committed(committed, thinking=thinking)
 
     def _finish_stream(self) -> None:
-        self._flush_stream_kind()
+        self._flush_pending_stream()
         self._reset_stream_buffers()
-        self._flush_markdown()
         self._partial = ""
 
     def _reset_stream_buffers(self) -> None:
@@ -268,6 +270,8 @@ class TUIApp:
                     self._consume_text(event)
                     self._invalidate_prompt()
                     continue
+                if event.type is StreamEventType.ERROR:
+                    self._flush_pending_stream()
                 if event.type is StreamEventType.TOOL_EXECUTION_START:
                     self._finish_stream()
                     self._loop_state = "tool-running"
