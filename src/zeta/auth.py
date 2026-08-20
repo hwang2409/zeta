@@ -19,7 +19,7 @@ import httpx
 
 
 _SENSITIVE_ERROR_KEY = re.compile(
-    r"(?:token|authorization|api[-_]?key|cookie|secret)", re.IGNORECASE
+    r"(?:token|authorization|api[-_]?key|cookie|secret|websocket-key)", re.IGNORECASE
 )
 _ERROR_SECRET = re.compile(
     r"""
@@ -31,12 +31,11 @@ _ERROR_SECRET = re.compile(
             (?P<authorization_quote>["'])[^"']*(?P=authorization_quote)
             |
             (?:
-                digest\b[^\r\n;}]*
-                |(?:bearer|basic)\b[ \t]+(?:
+                [A-Za-z][A-Za-z0-9._~+/-]*[ \t\r\n]+(?:
                     (?P<authorization_value_quote>["'])[^"']*(?P=authorization_value_quote)
-                    |[^\s,;}]+
+                    |(?:[^\r\n]|\r?\n(?!\r?\n)(?![!#$%&'*+.^_`|~0-9A-Za-z-]+:[ \t]))*
                 )
-                |[^\s,;}]+
+                |[^\s,;}&]+
             )
         )
         |
@@ -49,11 +48,11 @@ _ERROR_SECRET = re.compile(
         )
         |
         (?P<field_prefix>
-            (?<![\w-])["']?(?:access[-_]?token|refresh[-_]?token|authorization|x-api-key|api[-_]?key|token|secret)["']?\s*[:=]\s*
+            (?<![\w-])["']?(?:access[-_]?token|refresh[-_]?token|id[-_]?token|form[-_]?id[-_]?token|x-auth-token|x-api-key|sec-websocket-key|websocket-key|proxy-authorization|api[-_]?key|authorization|token|secret)["']?\s*[:=]\s*
         )
         (?:
             (?P<field_quote>["'])[^"']*(?P=field_quote)
-            |[^\s,;}]+
+            |[^\s,;}&]+
         )
         |
         \b(?:access|refresh)[-_]?token[-_][a-z0-9._-]+

@@ -622,7 +622,7 @@ async def test_responses_stream_maps_refusal_text_and_replays_item(tmp_path: Pat
     assert message.content == [TextContent("cannot help")]
     replayed = Message.from_dict(message.to_dict())
     payload = build_responses_payload(
-        [replayed], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+        [replayed], [], model=DEFAULT_CODEX_MODEL
     )
     assert payload["input"] == [completed_item]
     await client.aclose()
@@ -712,7 +712,7 @@ async def test_message_parts_allow_refusal_before_output_text(tmp_path: Path) ->
     assert events[-1].message.content == [TextContent("firstsecond")]
     replayed = Message.from_dict(events[-1].message.to_dict())
     payload = build_responses_payload(
-        [replayed], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+        [replayed], [], model=DEFAULT_CODEX_MODEL
     )
     assert payload["input"] == [completed_item]
     await client.aclose()
@@ -807,7 +807,6 @@ async def test_reasoning_text_round_trips_into_payload(tmp_path: Path) -> None:
         [Message.from_dict(message.to_dict())],
         [],
         model=DEFAULT_CODEX_MODEL,
-        max_output_tokens=100,
     )
     assert payload["input"] == [
         {
@@ -930,13 +929,11 @@ def test_payload_maps_plan_messages_and_tools() -> None:
         ],
         [],
         model=DEFAULT_CODEX_MODEL,
-        max_output_tokens=100,
     )
     assert payload["model"] == DEFAULT_CODEX_MODEL
     assert DEFAULT_CODEX_MODEL == "gpt-5.6-luna"
     assert payload["stream"] is True
     assert payload["store"] is False
-    assert "max_output_tokens" not in payload
     assert payload["instructions"] == "system"
     assert payload["input"] == [
         {"role": "user", "content": [{"type": "input_text", "text": "run"}]},
@@ -983,7 +980,6 @@ def test_payload_maps_name_only_tool_schema() -> None:
         [Message(MessageRole.USER, [TextContent("run")])],
         [{"name": "read"}],
         model=DEFAULT_CODEX_MODEL,
-        max_output_tokens=100,
     )
 
     assert payload["tools"] == [
@@ -1002,7 +998,7 @@ def test_payload_maps_name_only_tool_schema() -> None:
 def test_payload_rejects_malformed_tool_schema(schema: dict[str, object]) -> None:
     with pytest.raises(CodexHTTPError, match="parameters must be an object"):
         build_responses_payload(
-            [], [schema], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+            [], [schema], model=DEFAULT_CODEX_MODEL
         )
 
 
@@ -1020,7 +1016,6 @@ def test_payload_preserves_assistant_output_item_order() -> None:
         ],
         [],
         model=DEFAULT_CODEX_MODEL,
-        max_output_tokens=100,
     )
 
     assert [item.get("type", item.get("role")) for item in payload["input"]] == [
@@ -1064,7 +1059,7 @@ def test_payload_replays_completed_codex_items_verbatim() -> None:
 
     persisted = Message.from_dict(message.to_dict())
     payload = build_responses_payload(
-        [persisted], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+        [persisted], [], model=DEFAULT_CODEX_MODEL
     )
 
     assert payload["input"] == output_items
@@ -1112,7 +1107,7 @@ async def test_encrypted_only_reasoning_round_trips_into_payload(tmp_path: Path)
     assert message.content == [ThinkingContent("", "opaque")]
     message = Message.from_dict(message.to_dict())
     payload = build_responses_payload(
-        [message], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+        [message], [], model=DEFAULT_CODEX_MODEL
     )
     assert payload["input"] == [completed_item]
     await client.aclose()

@@ -229,7 +229,6 @@ def build_responses_payload(
     tool_schemas: Sequence[ToolSchema],
     *,
     model: str,
-    max_output_tokens: int,
 ) -> dict[str, Any]:
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
@@ -302,7 +301,6 @@ def build_responses_payload(
         "model": model,
         "store": False,
         "stream": True,
-        # The ChatGPT backend rejects max_output_tokens on this endpoint.
         "instructions": "\n\n".join(instructions) or "You are a helpful assistant.",
         "input": input_items,
         "tool_choice": "auto",
@@ -391,13 +389,11 @@ class CodexBackend(CompletionBackend):
         self,
         *,
         model: str = DEFAULT_CODEX_MODEL,
-        max_output_tokens: int = 8192,
         base_url: str = CODEX_API_URL,
         token_store: CodexCredentialStore | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.model = model
-        self.max_output_tokens = max_output_tokens
         self.base_url = base_url.rstrip("/")
         self.token_store = token_store or CodexCredentialStore()
         self.client = client
@@ -425,7 +421,6 @@ class CodexBackend(CompletionBackend):
                 messages,
                 tool_schemas,
                 model=self.model,
-                max_output_tokens=self.max_output_tokens,
             )
             headers = {
                 "accept": "text/event-stream",
