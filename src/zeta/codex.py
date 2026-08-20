@@ -242,6 +242,14 @@ def build_responses_payload(
             )
         else:
             output = message.role is MessageRole.ASSISTANT
+            if output and "codex_output_items" in message.metadata:
+                replayed = message.metadata["codex_output_items"]
+                if type(replayed) is not list or any(
+                    not isinstance(item, Mapping) for item in replayed
+                ):
+                    raise CodexHTTPError("Codex replay output items are invalid")
+                input_items.extend(dict(item) for item in replayed)
+                continue
             wire_blocks = _wire_text(message.content, output=output)
             if not output:
                 input_items.append({"role": "user", "content": wire_blocks})
@@ -249,7 +257,7 @@ def build_responses_payload(
             text_blocks: list[dict[str, Any]] = []
             for block in wire_blocks:
                 if block.get("type") == "output_text":
-                    text_blocks.append(block)
+                    text_blocks.append({"type": "input_text", "text": block["text"]})
                     continue
                 if text_blocks:
                     input_items.append({"role": "assistant", "content": text_blocks})
@@ -314,6 +322,7 @@ class _ItemState:
     arguments: str = ""
     thinking: str = ""
     encrypted_content: str | None = None
+    completed_item: dict[str, Any] | None = None
     blocks: set[tuple[int, int]] = field(default_factory=set)
 
 
@@ -558,12 +567,21 @@ def _translate_event(
             if isinstance(response_usage, Mapping):
                 usage.update(response_usage)
         content: list[ContentBlock] = []
+        output_items: list[dict[str, Any]] = []
         for index in sorted(items):
-            content.extend(_complete_item(items[index]))
+            item = items[index]
+            content.extend(_complete_item(item))
+            if item.completed_item is None:
+                raise CodexStreamError("Codex output item has no completed item")
+            output_items.append(dict(item.completed_item))
         return (
             StreamEvent(
                 StreamEventType.MESSAGE_END,
-                message=Message(MessageRole.ASSISTANT, content),
+                message=Message(
+                    MessageRole.ASSISTANT,
+                    content,
+                    metadata={"codex_output_items": output_items},
+                ),
                 data={"usage": dict(usage), **response_data},
             ),
             "stopped",
@@ -655,10 +673,9 @@ def _translate_event(
         index = _output_index(payload)
         item = _active_item(items, index, payload)
         complete = payload.get("item")
-        if complete is not None and not isinstance(complete, Mapping):
+        if not isinstance(complete, Mapping):
             raise CodexStreamError("Codex completed output item is invalid")
-        if isinstance(complete, Mapping):
-            _merge_completed_item(item, complete)
+        _merge_completed_item(item, complete)
         if any(blocks[key].state != "stopped" for key in item.blocks):
             raise CodexStreamError("Codex output item completed with open blocks")
         item.state = "stopped"
@@ -878,6 +895,7 @@ def _merge_completed_item(item: _ItemState, complete: Mapping[str, Any]) -> None
         raise CodexStreamError("Codex completed item id does not match output item")
     if complete.get("type") != item.kind:
         raise CodexStreamError("Codex completed item type does not match output item")
+    item.completed_item = dict(complete)
     if item.kind == "message":
         content = complete.get("content")
         if content is not None and not isinstance(content, list):

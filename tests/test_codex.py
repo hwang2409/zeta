@@ -322,7 +322,11 @@ async def test_reasoning_summary_stop_only_and_raw_reasoning_text_are_durable(
                 summary_index=0,
                 part={"type": "summary_text", "text": "stop-only"},
             ),
-            event("response.output_item.done", output_index=0),
+            event(
+                "response.output_item.done",
+                output_index=0,
+                item={"type": "reasoning", "id": "reasoning-summary"},
+            ),
             event(
                 "response.output_item.added",
                 output_index=1,
@@ -340,7 +344,11 @@ async def test_reasoning_summary_stop_only_and_raw_reasoning_text_are_durable(
                 content_index=0,
                 text="raw",
             ),
-            event("response.output_item.done", output_index=1),
+            event(
+                "response.output_item.done",
+                output_index=1,
+                item={"type": "reasoning", "id": "reasoning-raw"},
+            ),
             event("response.completed"),
         ]
     )
@@ -405,10 +413,57 @@ def test_payload_preserves_assistant_output_item_order() -> None:
         "assistant",
         "function_call",
     ]
+    assert payload["input"][1]["content"][0]["type"] == "input_text"
+
+
+def test_payload_replays_completed_codex_items_verbatim() -> None:
+    output_items = [
+        {
+            "type": "reasoning",
+            "id": "reasoning-test",
+            "status": "completed",
+            "summary": [],
+            "encrypted_content": "opaque",
+        },
+        {
+            "type": "message",
+            "id": "message-test",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer"}],
+        },
+        {
+            "type": "function_call",
+            "id": "function-test",
+            "status": "completed",
+            "call_id": "call-test",
+            "name": "read",
+            "arguments": "{}",
+        },
+    ]
+    message = Message(
+        MessageRole.ASSISTANT,
+        [ThinkingContent("", "opaque"), TextContent("answer")],
+        metadata={"codex_output_items": output_items},
+    )
+
+    persisted = Message.from_dict(message.to_dict())
+    payload = build_responses_payload(
+        [persisted], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+    )
+
+    assert payload["input"] == output_items
 
 
 @pytest.mark.asyncio
 async def test_encrypted_only_reasoning_round_trips_into_payload(tmp_path: Path) -> None:
+    completed_item = {
+        "type": "reasoning",
+        "id": "reasoning-test",
+        "status": "completed",
+        "summary": [],
+        "encrypted_content": "opaque",
+    }
     stream = sse(
         [
             event("response.created", response={"id": "response-test"}),
@@ -424,7 +479,7 @@ async def test_encrypted_only_reasoning_round_trips_into_payload(tmp_path: Path)
             event(
                 "response.output_item.done",
                 output_index=0,
-                item={"type": "reasoning", "id": "reasoning-test"},
+                item=completed_item,
             ),
             event("response.completed"),
         ]
@@ -440,18 +495,20 @@ async def test_encrypted_only_reasoning_round_trips_into_payload(tmp_path: Path)
     message = events[-1].message
     assert message is not None
     assert message.content == [ThinkingContent("", "opaque")]
+    message = Message.from_dict(message.to_dict())
     payload = build_responses_payload(
         [message], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
     )
-    assert payload["input"][0]["encrypted_content"] == "opaque"
+    assert payload["input"] == [completed_item]
     await client.aclose()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mutation", ["delta", "completed_id", "completed_type", "completed_part_type"]
+    "mutation",
+    ["delta", "completed_id", "completed_type", "completed_part_type"],
 )
-async def test_stream_rejects_mismatched_item_identity(
+async def test_stream_rejects_invalid_item_identity(
     tmp_path: Path, mutation: str
 ) -> None:
     events = message_stream()
@@ -461,7 +518,7 @@ async def test_stream_rejects_mismatched_item_identity(
         events[6]["item"]["id"] = "other-item"  # type: ignore[index]
     elif mutation == "completed_type":
         events[6]["item"]["type"] = "reasoning"  # type: ignore[index]
-    else:
+    elif mutation == "completed_part_type":
         events[5]["part"] = {"type": "input_text"}
 
     client = client_for(sse(events))
@@ -470,6 +527,21 @@ async def test_stream_rejects_mismatched_item_identity(
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / f"{mutation}.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_missing_completed_item(tmp_path: Path) -> None:
+    events = message_stream()
+    events[6].pop("item")
+    client = client_for(sse(events))
+    with pytest.raises(CodexStreamError, match="completed output item is invalid"):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "missing-item.json")
             ).complete([], [])
         ]
     await client.aclose()
@@ -681,7 +753,13 @@ async def test_events_after_response_completion_are_rejected(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_output_item_done_rejects_open_blocks(tmp_path: Path) -> None:
-    events = message_stream()[:4] + [event("response.output_item.done", output_index=0)]
+    events = message_stream()[:4] + [
+        event(
+            "response.output_item.done",
+            output_index=0,
+            item={"type": "message", "id": "message-test"},
+        )
+    ]
     client = client_for(sse(events))
     with pytest.raises(CodexStreamError, match="open blocks"):
         [

@@ -175,6 +175,7 @@ class Message:
     role: MessageRole
     content: list[ContentBlock] = field(default_factory=list)
     tool_result: ToolResult | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -183,6 +184,8 @@ class Message:
         }
         if self.tool_result is not None:
             result["tool_result"] = self.tool_result.to_dict()
+        if self.metadata:
+            result["metadata"] = self.metadata
         return result
 
     @classmethod
@@ -198,6 +201,9 @@ class Message:
         tool_result_value = value.get("tool_result")
         if "tool_result" in value and type(tool_result_value) is not dict:
             raise ValueError("message tool_result must be an object")
+        metadata_value = value.get("metadata", {})
+        if type(metadata_value) is not dict:
+            raise ValueError("message metadata must be an object")
         return cls(
             role=MessageRole(role_value),
             content=[content_from_dict(block) for block in content_value],
@@ -206,6 +212,7 @@ class Message:
                 if tool_result_value is not None
                 else None
             ),
+            metadata=dict(metadata_value),
         )
 
 
