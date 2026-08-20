@@ -531,7 +531,7 @@ async def test_pre_aborted_approved_call_accepts_a_second_abort(
 
 
 @pytest.mark.asyncio
-async def test_parallel_pre_aborted_approved_calls_share_second_abort_signal(
+async def test_execute_many_pre_aborted_approved_calls_share_one_abort_generation(
     approval_root: Path,
 ) -> None:
     store = ConversationStore(approval_root, session_id="parallel-pre-aborted")
@@ -571,16 +571,13 @@ async def test_parallel_pre_aborted_approved_calls_share_second_abort_signal(
         canceled.add(call_id)
         return "canceled"
 
-    registry.register("echo", echo)
-    tasks = [
-        asyncio.create_task(registry.execute(call))
-        for call in calls
-    ]
+    registry.register("echo", echo, parallel_safe=True)
+    task = asyncio.create_task(registry.execute_many(calls))
     await asyncio.wait_for(started.wait(), timeout=1)
 
     registry.abort()
 
-    results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+    results = await asyncio.wait_for(task, timeout=1)
     assert results == [ToolResult(call.id, "canceled") for call in calls]
     assert canceled == {call.id for call in calls}
 
@@ -649,6 +646,29 @@ def test_append_superset_preserves_all_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call_a), ToolUseContent(call_b)]),
         [(call_a.id, call_a), (call_b.id, call_b)],
         parent_id=first.id,
+    )
+
+    reopened = ConversationStore(approval_root, session_id=store.session_id)
+    assert set(reopened.approval_states()) == {call_a.id, call_b.id}
+
+
+def test_same_parent_superset_keeps_the_prior_request(
+    approval_root: Path,
+) -> None:
+    store = ConversationStore(approval_root, session_id="approval-same-parent")
+    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    call_a = ToolCall("same-parent-a", "echo", {})
+    call_b = ToolCall("same-parent-b", "echo", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call_a)]),
+        [(call_a.id, call_a)],
+        parent_id=root.id,
+    )
+
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call_a), ToolUseContent(call_b)]),
+        [(call_a.id, call_a), (call_b.id, call_b)],
+        parent_id=root.id,
     )
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)

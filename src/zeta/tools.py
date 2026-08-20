@@ -29,9 +29,6 @@ class ToolAbortSignal:
     def abort(self) -> None:
         self._event.set()
 
-    def clear(self) -> None:
-        self._event.clear()
-
     def is_set(self) -> bool:
         return self._event.is_set()
 
@@ -349,7 +346,9 @@ class ToolRegistry:
                     return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
                 if durable_decision != ApprovalDecision.ALLOW.value:
                     return _canceled_result(tool_call.id), execution_signal
-                signal_state.clear()
+                execution_signal = self._next_abort_generation(signal_state)
+                if _signal_is_set(execution_signal):
+                    return _canceled_result(tool_call.id), execution_signal
             if decision is ApprovalDecision.DENY:
                 return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
         if self.pre_execute_hook is None:
@@ -383,11 +382,18 @@ class ToolRegistry:
     ) -> tuple[ToolAbortSignal | asyncio.Event, ToolResult | None]:
         winner = self._abort_approval(tool_call)
         if winner is ApprovalDecision.ALLOW:
-            signal_state.clear()
+            signal_state = self._next_abort_generation(signal_state)
+            if _signal_is_set(signal_state):
+                return signal_state, _canceled_result(tool_call.id)
             return signal_state, None
         if winner is ApprovalDecision.DENY:
             return signal_state, ToolResult(tool_call.id, "tool execution denied", True)
         return signal_state, _canceled_result(tool_call.id)
+
+    def _next_abort_generation(self, signal_state: ToolAbortSignal | asyncio.Event) -> ToolAbortSignal | asyncio.Event:
+        if self.abort_signal is signal_state:
+            self.abort_signal = ToolAbortSignal()
+        return self.abort_signal
 
     async def execute_many(
         self,
@@ -401,25 +407,11 @@ class ToolRegistry:
         results: list[ToolResult | None] = [None] * len(tool_calls)
         index = 0
         while index < len(tool_calls):
-            if _signal_is_set(signal_state):
-                for remaining in range(index, len(tool_calls)):
-                    execution_signal, abort_result = self._arbitrate_abort(
-                        tool_calls[remaining],
-                        signal_state,
-                    )
-                    results[remaining] = (
-                        abort_result
-                        if abort_result is not None
-                        else await self.execute(
-                            tool_calls[remaining],
-                            abort_signal=execution_signal,
-                        )
-                    )
-                break
             definition = self._tools.get(tool_calls[index].name)
             if definition is None or not definition.parallel_safe:
                 results[index] = await self.execute(
-                    tool_calls[index], abort_signal=signal_state
+                    tool_calls[index],
+                    abort_signal=signal_state,
                 )
                 index += 1
                 continue
@@ -431,7 +423,10 @@ class ToolRegistry:
                 end += 1
             group = await asyncio.gather(
                 *(
-                    self.execute(call, abort_signal=signal_state)
+                    self.execute(
+                        call,
+                        abort_signal=signal_state,
+                    )
                     for call in tool_calls[index:end]
                 )
             )

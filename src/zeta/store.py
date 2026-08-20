@@ -474,13 +474,24 @@ class ConversationStore:
             resolved_parent = (
                 parent_id if parent_id is not None else (branch[-1].id if branch else None)
             )
-            for entry in branch:
-                if (
-                    entry.type == "message"
-                    and entry.parent_id == resolved_parent
-                    and entry.data == data
-                ):
-                    return self._snapshot_entry(entry)
+            target_entries = [
+                entry
+                for entry in self._entries
+                if entry.type == "message" and entry.parent_id == resolved_parent
+            ]
+            if request_data:
+                for entry in target_entries:
+                    if entry.data == data:
+                        return self._snapshot_entry(entry)
+                request_ids = {request["request_id"] for request in request_data}
+                for entry in target_entries:
+                    existing_ids = {
+                        request["request_id"]
+                        for request in entry.data.get("approval_requests", [])
+                    }
+                    if existing_ids and existing_ids < request_ids:
+                        entry = self._append_row_unlocked("message", data, parent_id)
+                        return self._snapshot_entry(entry)
 
             persisted_requests = self._approval_request_entries(branch)
             missing_requests: list[dict[str, Any]] = []
