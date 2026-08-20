@@ -215,7 +215,9 @@ class ConversationStore:
 
     def _validate_entries(self) -> None:
         ids: set[str] = set()
-        approval_request_ids: set[str] = set()
+        approval_requests: dict[str, ConversationEntry] = {}
+        approval_resolutions: set[str] = set()
+        by_id = {entry.id: entry for entry in self._entries}
         for expected_seq, entry in enumerate(self._entries, start=1):
             if entry.seq != expected_seq:
                 raise ConversationIntegrityError(
@@ -232,14 +234,49 @@ class ConversationStore:
                     f"missing prior parent {entry.parent_id} for {entry.id}"
                 )
             if entry.type == "approval_request":
-                approval_request_ids.add(entry.data.get("request_id", ""))
+                request_id = entry.data.get("request_id")
+                if type(request_id) is str and request_id:
+                    if request_id in approval_requests:
+                        raise ConversationIntegrityError(
+                            f"duplicate approval request: {request_id}"
+                        )
+                    approval_requests[request_id] = entry
             elif entry.type == "approval_resolution":
                 request_id = entry.data.get("request_id")
-                if request_id not in approval_request_ids:
+                request = (
+                    approval_requests.get(request_id)
+                    if type(request_id) is str
+                    else None
+                )
+                if request is None or not self._is_ancestor(
+                    request.id, entry.id, by_id
+                ):
                     raise ConversationIntegrityError(
-                        f"approval resolution references unknown request: {request_id}"
+                        f"approval resolution is not linked to request: {request_id}"
                     )
+                if request_id in approval_resolutions:
+                    raise ConversationIntegrityError(
+                        f"duplicate approval resolution: {request_id}"
+                    )
+                approval_resolutions.add(request_id)
             ids.add(entry.id)
+
+    @staticmethod
+    def _is_ancestor(
+        ancestor_id: str,
+        descendant_id: str,
+        by_id: Mapping[str, ConversationEntry],
+    ) -> bool:
+        current = by_id.get(descendant_id)
+        seen: set[str] = set()
+        while current is not None and current.parent_id is not None:
+            if current.id in seen:
+                return False
+            seen.add(current.id)
+            if current.parent_id == ancestor_id:
+                return True
+            current = by_id.get(current.parent_id)
+        return False
 
     def _validate_entry_payload(self, entry: ConversationEntry) -> None:
         try:
@@ -367,6 +404,43 @@ class ConversationStore:
             parent_id,
         )
 
+    def ensure_approval_request(
+        self,
+        request_id: str,
+        tool_call: ToolCall,
+        *,
+        parent_id: str | None = None,
+    ) -> ConversationEntry:
+        """Append a request once if it is absent from the active branch."""
+
+        if type(request_id) is not str or not request_id:
+            raise ValueError("approval request id must be a nonempty string")
+        with self._append_lock():
+            self._load()
+            branch = self.replay()
+            states = self._approval_states_from_branch(branch)
+            existing = states.get(request_id)
+            if existing is not None:
+                if existing[0] != tool_call:
+                    raise ConversationIntegrityError(
+                        f"approval request tool call mismatch: {request_id}"
+                    )
+                for entry in branch:
+                    if (
+                        entry.type == "approval_request"
+                        and entry.data["request_id"] == request_id
+                    ):
+                        return self._snapshot_entry(entry)
+                raise ConversationIntegrityError(
+                    f"approval request is not present on active branch: {request_id}"
+                )
+            entry = self._append_row_unlocked(
+                "approval_request",
+                {"request_id": request_id, "tool_call": tool_call.to_dict()},
+                parent_id,
+            )
+            return self._snapshot_entry(entry)
+
     def append_approval_resolution(
         self,
         request_id: str,
@@ -378,7 +452,44 @@ class ConversationStore:
             raise ValueError("approval resolution id must be a nonempty string")
         if decision not in {"allow", "deny", "abort"}:
             raise ValueError(f"invalid approval resolution: {decision}")
-        return self._append_row(
+        with self._append_lock():
+            self._load()
+            entry = self._resolve_approval_unlocked(
+                request_id,
+                decision,
+                parent_id,
+            )
+            if entry is None:
+                raise ConversationIntegrityError(
+                    f"approval request is already resolved or unknown: {request_id}"
+                )
+            return self._snapshot_entry(entry)
+
+    def resolve_approval(self, request_id: str, decision: str) -> bool:
+        """Resolve one pending request atomically.
+
+        The state check and resolution append share one file lock.
+        """
+
+        if type(request_id) is not str or not request_id:
+            raise ValueError("approval resolution id must be a nonempty string")
+        if decision not in {"allow", "deny", "abort"}:
+            raise ValueError(f"invalid approval resolution: {decision}")
+        with self._append_lock():
+            self._load()
+            return self._resolve_approval_unlocked(request_id, decision) is not None
+
+    def _resolve_approval_unlocked(
+        self,
+        request_id: str,
+        decision: str,
+        parent_id: str | None = None,
+    ) -> ConversationEntry | None:
+        states = self._approval_states_from_branch(self.replay())
+        state = states.get(request_id)
+        if state is None or state[1] is not None:
+            return None
+        return self._append_row_unlocked(
             "approval_resolution",
             {"request_id": request_id, "decision": decision},
             parent_id,
@@ -389,17 +500,26 @@ class ConversationStore:
 
         with self._append_lock():
             self._load()
-            states: dict[str, tuple[ToolCall, str | None]] = {}
-            for entry in self._entries:
-                if entry.type == "approval_request":
-                    request_id = entry.data["request_id"]
-                    states[request_id] = (ToolCall.from_dict(entry.data["tool_call"]), None)
-                elif entry.type == "approval_resolution":
-                    request_id = entry.data["request_id"]
-                    if request_id in states:
-                        tool_call, _ = states[request_id]
-                        states[request_id] = (tool_call, entry.data["decision"])
-            return states
+            return self._approval_states_from_branch(self.replay())
+
+    @staticmethod
+    def _approval_states_from_branch(
+        branch: list[ConversationEntry],
+    ) -> dict[str, tuple[ToolCall, str | None]]:
+        states: dict[str, tuple[ToolCall, str | None]] = {}
+        for entry in branch:
+            if entry.type == "approval_request":
+                request_id = entry.data["request_id"]
+                states[request_id] = (
+                    ToolCall.from_dict(entry.data["tool_call"]),
+                    None,
+                )
+            elif entry.type == "approval_resolution":
+                request_id = entry.data["request_id"]
+                if request_id in states:
+                    tool_call, _ = states[request_id]
+                    states[request_id] = (tool_call, entry.data["decision"])
+        return states
 
     def pending_approvals(self) -> list[tuple[str, ToolCall]]:
         return [

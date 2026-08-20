@@ -250,6 +250,10 @@ class ToolRegistry:
         if self.approval_policy is not None:
             self.approval_policy.bind_store(store)
 
+    def prepare_approval(self, tool_call: ToolCall) -> None:
+        if self.approval_policy is not None:
+            self.approval_policy.prepare(tool_call)
+
     async def execute(
         self,
         tool_call: ToolCall,
@@ -268,27 +272,13 @@ class ToolRegistry:
             return ToolResult(tool_call.id, f"invalid arguments: {exc}", True)
         if _signal_is_set(signal_state):
             return _canceled_result(tool_call.id)
-        if self.approval_policy is not None:
-            try:
-                decision = await self.approval_policy.authorize(
-                    tool_call,
-                    signal_state,
-                )
-            except Exception as exc:
-                return ToolResult(tool_call.id, f"approval failed: {exc}", True)
-            if decision is None or _signal_is_set(signal_state):
-                return _canceled_result(tool_call.id)
-            if decision is ApprovalDecision.DENY:
-                return ToolResult(tool_call.id, "tool execution denied", True)
-        if self.pre_execute_hook is not None:
-            try:
-                allowed = self.pre_execute_hook(tool_call.name, arguments)
-                if inspect.isawaitable(allowed):
-                    allowed = await allowed
-            except Exception as exc:
-                return ToolResult(tool_call.id, f"pre-execution hook failed: {exc}", True)
-            if allowed is False:
-                return ToolResult(tool_call.id, "tool execution denied", True)
+        gate_result = await self._run_pre_execute_gate(
+            tool_call,
+            arguments,
+            signal_state,
+        )
+        if gate_result is not None:
+            return gate_result
         if _signal_is_set(signal_state):
             return _canceled_result(tool_call.id)
         try:
@@ -314,6 +304,38 @@ class ToolRegistry:
             "invalid tool handler result: expected str or ToolResult",
             True,
         )
+
+    async def _run_pre_execute_gate(
+        self,
+        tool_call: ToolCall,
+        arguments: dict[str, Any],
+        signal_state: ToolAbortSignal | asyncio.Event,
+    ) -> ToolResult | None:
+        """Run approval and the user hook through one execution seam."""
+
+        if self.approval_policy is not None:
+            try:
+                decision = await self.approval_policy.authorize(
+                    tool_call,
+                    signal_state,
+                )
+            except Exception as exc:
+                return ToolResult(tool_call.id, f"approval failed: {exc}", True)
+            if decision is None or _signal_is_set(signal_state):
+                return _canceled_result(tool_call.id)
+            if decision is ApprovalDecision.DENY:
+                return ToolResult(tool_call.id, "tool execution denied", True)
+        if self.pre_execute_hook is None:
+            return None
+        try:
+            allowed = self.pre_execute_hook(tool_call.name, arguments)
+            if inspect.isawaitable(allowed):
+                allowed = await allowed
+        except Exception as exc:
+            return ToolResult(tool_call.id, f"pre-execution hook failed: {exc}", True)
+        if allowed is False:
+            return ToolResult(tool_call.id, "tool execution denied", True)
+        return None
 
     async def execute_many(
         self,

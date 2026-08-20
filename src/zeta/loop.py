@@ -198,12 +198,14 @@ class AgentLoop:
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)
             if assistant_message is None:
                 assistant_message = Message(MessageRole.ASSISTANT)
-            self.store.append_message(assistant_message)
             calls = [
                 block.tool_call
                 for block in assistant_message.content
                 if isinstance(block, ToolUseContent)
             ]
+            for tool_call in calls:
+                self.tool_registry.prepare_approval(tool_call)
+            self.store.append_message(assistant_message)
             if not calls:
                 yield StreamEvent(
                     StreamEventType.TURN_END,

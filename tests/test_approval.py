@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -9,11 +10,25 @@ from zeta.fake import FakeBackend, ScriptedTurn
 from zeta.loop import AgentLoop
 from zeta.store import ConversationStore
 from zeta.tools import ToolRegistry
-from zeta.types import MessageRole, StreamEvent, TextContent, ToolCall, ToolResult
+from zeta.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolResult,
+    ToolUseContent,
+)
 
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
     return [event async for event in events]
+
+
+@pytest.fixture(scope="module")
+def approval_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp("approval")
 
 
 def test_policy_rules_and_default_decision() -> None:
@@ -192,3 +207,111 @@ async def test_approval_and_pre_execution_hook_compose(tmp_path: Path) -> None:
 
     assert result == ToolResult("call-1", "tool execution denied", True)
     assert seen == ["echo"]
+
+
+@pytest.mark.asyncio
+async def test_torn_request_write_does_not_leave_a_tool_call_or_start_event(
+    approval_root: Path,
+) -> None:
+    call = ToolCall("call-1", "echo", {})
+    store = ConversationStore(approval_root)
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    policy = ApprovalPolicy(default="ask", store=store)
+    registry = ToolRegistry(approval_root, approval_policy=policy, register_builtin=False)
+    registry.register("echo", lambda arguments: "must not run")
+    original_write = store._write_line
+
+    def torn_write(row: dict[str, object]) -> None:
+        if row.get("type") == "approval_request":
+            with store.path.open("ab") as handle:
+                handle.write(b'{"seq":2,"id":"torn"')
+                handle.flush()
+            raise RuntimeError("simulated crash")
+        original_write(row)
+
+    store._write_line = torn_write  # type: ignore[method-assign]
+    events: list[StreamEvent] = []
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        async for event in AgentLoop(
+            backend,
+            store,
+            registry=registry,
+            approval_policy=policy,
+        ).run_turn("start"):
+            events.append(event)
+
+    restarted = ConversationStore(approval_root, session_id=store.session_id)
+    assert not any(event.type is StreamEventType.TOOL_EXECUTION_START for event in events)
+    assert all(
+        not any(isinstance(block, ToolUseContent) for block in message.content)
+        for message in restarted.messages()
+    )
+    assert ApprovalPolicy(default="ask", store=restarted).pending_requests() == []
+
+
+@pytest.mark.asyncio
+async def test_pending_request_wins_over_policy_change_after_restart(
+    approval_root: Path,
+) -> None:
+    call = ToolCall("call-1", "echo", {})
+    first_store = ConversationStore(approval_root, session_id="session")
+    ApprovalPolicy(default="ask", store=first_store).prepare(call)
+
+    restarted_store = ConversationStore(approval_root, session_id="session")
+    changed_policy = ApprovalPolicy(always_allow={"echo"}, store=restarted_store)
+    registry = ToolRegistry(
+        approval_root,
+        approval_policy=changed_policy,
+        approval_store=restarted_store,
+        register_builtin=False,
+    )
+    executed: list[bool] = []
+    registry.register("echo", lambda arguments: executed.append(True) or "ran")
+    task = asyncio.create_task(registry.execute(call))
+
+    await asyncio.sleep(0.1)
+    assert not task.done()
+    assert executed == []
+    assert changed_policy.pending_requests()
+
+    assert changed_policy.approve(call.id)
+    assert await asyncio.wait_for(task, timeout=1) == ToolResult(call.id, "ran")
+    assert executed == [True]
+
+
+def test_abandoned_branch_approval_does_not_leak_into_active_branch(
+    approval_root: Path,
+) -> None:
+    call = ToolCall("dead-call", "echo", {})
+    store = ConversationStore(approval_root)
+    root = store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_approval_request(call.id, call, parent_id=root.id)
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("active")]), parent_id=root.id)
+
+    reopened = ConversationStore(approval_root, session_id=store.session_id)
+    assert reopened.pending_approvals() == []
+    assert ApprovalPolicy(default="ask", store=reopened).pending_requests() == []
+
+
+def test_concurrent_approval_resolution_has_one_winner(approval_root: Path) -> None:
+    call = ToolCall("call-1", "echo", {})
+    store = ConversationStore(approval_root)
+    policy = ApprovalPolicy(default="ask", store=store)
+    policy.prepare(call)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda decision: policy.resolve(call.id, decision),
+                ("allow", "deny"),
+            )
+        )
+
+    assert sorted(results) == [False, True]
+    resolutions = [
+        entry
+        for entry in store.entries
+        if entry.type == "approval_resolution"
+    ]
+    assert len(resolutions) == 1
+    assert resolutions[0].data["decision"] in {"allow", "deny"}

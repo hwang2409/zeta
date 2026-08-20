@@ -78,24 +78,39 @@ class ApprovalPolicy:
         if resolved is ApprovalDecision.ASK:
             raise ValueError("approval resolution must allow or deny")
         store = self._require_store()
-        state = store.approval_states().get(request_id)
-        if state is None or state[1] is not None:
-            return False
-        store.append_approval_resolution(request_id, resolved.value)
-        return True
+        return store.resolve_approval(request_id, resolved.value)
+
+    def prepare(self, tool_call: ToolCall) -> None:
+        """Persist an ask request before the tool call becomes executable."""
+
+        store = self._require_store()
+        state = store.approval_states().get(tool_call.id)
+        if state is not None:
+            if state[0] != tool_call:
+                raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
+            return
+        if self.decide(tool_call.name, tool_call.arguments) is ApprovalDecision.ASK:
+            store.ensure_approval_request(tool_call.id, tool_call)
 
     async def authorize(
         self,
         tool_call: ToolCall,
         abort_signal: _AbortSignal,
     ) -> ApprovalDecision | None:
-        decision = self.decide(tool_call.name, tool_call.arguments)
-        if decision is not ApprovalDecision.ASK:
-            return decision
         store = self._require_store()
         state = store.approval_states().get(tool_call.id)
-        if state is None or state[0] != tool_call:
-            store.append_approval_request(tool_call.id, tool_call)
+        if state is not None:
+            if state[0] != tool_call:
+                raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
+            if state[1] == ApprovalDecision.ALLOW.value:
+                return ApprovalDecision.ALLOW
+            if state[1] == ApprovalDecision.DENY.value:
+                return ApprovalDecision.DENY
+        else:
+            decision = self.decide(tool_call.name, tool_call.arguments)
+            if decision is not ApprovalDecision.ASK:
+                return decision
+            store.ensure_approval_request(tool_call.id, tool_call)
 
         while True:
             state = store.approval_states().get(tool_call.id)
@@ -107,7 +122,7 @@ class ApprovalPolicy:
                 return None
             if abort_signal.is_set():
                 if state is not None and state[1] is None:
-                    store.append_approval_resolution(tool_call.id, "abort")
+                    store.resolve_approval(tool_call.id, "abort")
                 return None
             abort_task = asyncio.create_task(abort_signal.wait())
             poll_task = asyncio.create_task(asyncio.sleep(0.05))
@@ -127,7 +142,7 @@ class ApprovalPolicy:
             if abort_task in done:
                 state = store.approval_states().get(tool_call.id)
                 if state is not None and state[1] is None:
-                    store.append_approval_resolution(tool_call.id, "abort")
+                    store.resolve_approval(tool_call.id, "abort")
                 return None
 
     def _require_store(self) -> ConversationStore:
