@@ -113,6 +113,98 @@ def message_stream() -> list[dict[str, object]]:
     ]
 
 
+def reasoning_content_stream(
+    *, summary: str = "", raw: str = "raw", completed_raw: str | None = None
+) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = [
+        event("response.created", response={"id": "response-test"}),
+        event(
+            "response.output_item.added",
+            output_index=0,
+            item={"type": "reasoning", "id": "reasoning-test"},
+        ),
+    ]
+    if summary:
+        events.extend(
+            [
+                event(
+                    "response.reasoning_summary_part.added",
+                    output_index=0,
+                    summary_index=0,
+                    part={"type": "summary_text"},
+                ),
+                event(
+                    "response.reasoning_summary_text.delta",
+                    output_index=0,
+                    summary_index=0,
+                    delta=summary,
+                ),
+                event(
+                    "response.reasoning_summary_text.done",
+                    output_index=0,
+                    summary_index=0,
+                    text=summary,
+                ),
+                event(
+                    "response.reasoning_summary_part.done",
+                    output_index=0,
+                    summary_index=0,
+                    part={"type": "summary_text", "text": summary},
+                ),
+            ]
+        )
+    events.extend(
+        [
+            event(
+                "response.content_part.added",
+                output_index=0,
+                content_index=0,
+                part={"type": "reasoning_text"},
+            ),
+            event(
+                "response.reasoning_text.delta",
+                output_index=0,
+                content_index=0,
+                delta=raw,
+            ),
+            event(
+                "response.reasoning_text.done",
+                output_index=0,
+                content_index=0,
+                text=raw,
+            ),
+            event(
+                "response.content_part.done",
+                output_index=0,
+                content_index=0,
+                part={"type": "reasoning_text"},
+            ),
+            event(
+                "response.output_item.done",
+                output_index=0,
+                item={
+                    "type": "reasoning",
+                    "id": "reasoning-test",
+                    "status": "completed",
+                    "summary": (
+                        [{"type": "summary_text", "text": summary}]
+                        if summary
+                        else []
+                    ),
+                    "content": [
+                        {
+                            "type": "reasoning_text",
+                            "text": raw if completed_raw is None else completed_raw,
+                        }
+                    ],
+                },
+            ),
+            event("response.completed"),
+        ]
+    )
+    return events
+
+
 def malformed_events(mutation: str) -> list[dict[str, object]]:
     created = event("response.created", response={"id": "response-test"})
     item = event(
@@ -376,6 +468,68 @@ async def test_responses_stream_maps_refusal_text_and_replays_item(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_reasoning_summary_and_content_parts_decode_together(tmp_path: Path) -> None:
+    client = client_for(sse(reasoning_content_stream(summary="plan")))
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "combined.json")
+        ).complete([], [])
+    ]
+
+    assert events[-1].message is not None
+    assert events[-1].message.content == [ThinkingContent("planraw")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_text_round_trips_into_payload(tmp_path: Path) -> None:
+    client = client_for(sse(reasoning_content_stream()))
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "raw.json")
+        ).complete([], [])
+    ]
+
+    message = events[-1].message
+    assert message is not None
+    payload = build_responses_payload(
+        [Message.from_dict(message.to_dict())],
+        [],
+        model=DEFAULT_CODEX_MODEL,
+        max_output_tokens=100,
+    )
+    assert payload["input"] == [
+        {
+            "type": "reasoning",
+            "id": "reasoning-test",
+            "status": "completed",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "raw"}],
+        }
+    ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_completed_raw_reasoning_mismatch(tmp_path: Path) -> None:
+    client = client_for(
+        sse(reasoning_content_stream(raw="streamed", completed_raw="replayed"))
+    )
+    with pytest.raises(
+        CodexStreamError, match="completed reasoning does not match its deltas"
+    ):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "raw-mismatch.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_reasoning_summary_stop_only_and_raw_reasoning_text_are_durable(
     tmp_path: Path,
 ) -> None:
@@ -434,6 +588,7 @@ async def test_reasoning_summary_stop_only_and_raw_reasoning_text_are_durable(
                     "id": "reasoning-raw",
                     "status": "completed",
                     "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "raw"}],
                 },
             ),
             event("response.completed"),

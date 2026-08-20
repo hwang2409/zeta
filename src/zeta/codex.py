@@ -315,6 +315,9 @@ def build_responses_payload(
     return payload
 
 
+BlockKey = tuple[int, str, int]
+
+
 @dataclass(slots=True)
 class _BlockState:
     kind: str
@@ -335,9 +338,10 @@ class _ItemState:
     arguments: str = ""
     thinking: str = ""
     summary_text: str = ""
+    raw_text: str = ""
     encrypted_content: str | None = None
     completed_item: dict[str, Any] | None = None
-    blocks: set[tuple[int, int]] = field(default_factory=set)
+    blocks: set[BlockKey] = field(default_factory=set)
 
 
 class _SSEDecoder:
@@ -490,7 +494,7 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
     decoder = _SSEDecoder()
     response_state = "not-started"
     items: dict[int, _ItemState] = {}
-    blocks: dict[tuple[int, int], _BlockState] = {}
+    blocks: dict[BlockKey, _BlockState] = {}
     usage: dict[str, Any] = {}
     response_data: dict[str, Any] = {}
     async for line in response.aiter_lines():
@@ -519,7 +523,7 @@ def _translate_event(
     payload: Mapping[str, Any],
     response_state: str,
     items: dict[int, _ItemState],
-    blocks: dict[tuple[int, int], _BlockState],
+    blocks: dict[BlockKey, _BlockState],
     usage: dict[str, Any],
     response_data: dict[str, Any],
 ) -> tuple[StreamEvent | None, str]:
@@ -630,22 +634,29 @@ def _translate_event(
             raise CodexStreamError("Codex function call metadata is incomplete")
         items[index] = item_state
         if kind == "function_call":
-            blocks[(index, -1)] = _BlockState("tool_call")
-            item_state.blocks.add((index, -1))
+            blocks[(index, "tool_call", -1)] = _BlockState("tool_call")
+            item_state.blocks.add((index, "tool_call", -1))
         return None, response_state
     if event_type == "response.content_part.added":
         index = _output_index(payload)
         item = _active_item(items, index, payload)
         content_index = _content_index(payload)
-        key = (index, content_index)
-        if key in blocks:
-            raise CodexStreamError("Codex content block is duplicated")
         part = payload.get("part")
         kind = part.get("type") if isinstance(part, Mapping) else None
+        if item.kind == "reasoning" and kind == "reasoning_text":
+            raw_key = (index, "thinking_raw", content_index)
+            if raw_key in blocks:
+                raise CodexStreamError("Codex content block is duplicated")
+            blocks[raw_key] = _BlockState("thinking_raw")
+            item.blocks.add(raw_key)
+            return None, response_state
         if item.kind != "message" or kind not in {"output_text", "refusal"}:
             raise CodexStreamError("Codex content part has the wrong item type")
-        blocks[key] = _BlockState(kind)
-        item.blocks.add(key)
+        message_key = (index, kind, content_index)
+        if message_key in blocks:
+            raise CodexStreamError("Codex content block is duplicated")
+        blocks[message_key] = _BlockState(kind)
+        item.blocks.add(message_key)
         return None, response_state
     if event_type == "response.reasoning_summary_part.added":
         index = _output_index(payload)
@@ -660,7 +671,7 @@ def _translate_event(
         summary_index = payload.get("summary_index")
         if type(summary_index) is not int or summary_index < 0:
             raise CodexStreamError("Codex reasoning summary index is invalid")
-        key = (index, summary_index)
+        key = (index, "thinking", summary_index)
         if key in blocks:
             raise CodexStreamError("Codex reasoning block is duplicated")
         blocks[key] = _BlockState("thinking")
@@ -694,6 +705,10 @@ def _translate_event(
         if not isinstance(complete, Mapping):
             raise CodexStreamError("Codex completed output item is invalid")
         _merge_completed_item(item, complete, blocks)
+        for key in item.blocks:
+            block = blocks[key]
+            if block.kind == "thinking_raw" and block.text_done:
+                block.state = "stopped"
         if any(blocks[key].state != "stopped" for key in item.blocks):
             raise CodexStreamError("Codex output item completed with open blocks")
         item.state = "stopped"
@@ -744,12 +759,12 @@ def _translate_delta(
     event_type: str,
     payload: Mapping[str, Any],
     items: Mapping[int, _ItemState],
-    blocks: dict[tuple[int, int], _BlockState],
+    blocks: dict[BlockKey, _BlockState],
 ) -> StreamEvent:
     index = _output_index(payload)
     item = _active_item(items, index, payload)
     if event_type == "response.function_call_arguments.delta":
-        key = (index, -1)
+        key = (index, "tool_call", -1)
         block = blocks.get(key)
         if item.kind != "function_call" or block is None or block.state != "active":
             raise CodexStreamError("Codex tool delta references an inactive block")
@@ -770,7 +785,7 @@ def _translate_delta(
     }:
         if event_type == "response.reasoning_text.delta":
             content_index = _content_index(payload)
-            key = (index, content_index)
+            key = (index, "thinking_raw", content_index)
             block = blocks.get(key)
             if block is None:
                 block = _BlockState("thinking_raw")
@@ -784,12 +799,13 @@ def _translate_delta(
             if type(delta) is not str:
                 raise CodexStreamError("Codex reasoning delta is invalid")
             block.text += delta
+            item.raw_text += delta
             item.thinking += delta
             return StreamEvent(StreamEventType.MESSAGE_UPDATE, content=ThinkingContent(delta))
         summary_index = payload.get("summary_index")
         if type(summary_index) is not int or summary_index < 0:
             raise CodexStreamError("Codex reasoning summary index is invalid")
-        key = (index, summary_index)
+        key = (index, "thinking", summary_index)
         block = blocks.get(key)
         if (
             item.kind != "reasoning"
@@ -806,11 +822,11 @@ def _translate_delta(
         item.thinking += delta
         return StreamEvent(StreamEventType.MESSAGE_UPDATE, content=ThinkingContent(delta))
     content_index = _content_index(payload)
-    key = (index, content_index)
-    block = blocks.get(key)
     expected_kind = (
         "refusal" if event_type == "response.refusal.delta" else "output_text"
     )
+    key = (index, expected_kind, content_index)
+    block = blocks.get(key)
     if (
         item.kind != "message"
         or block is None
@@ -830,27 +846,43 @@ def _finish_block(
     event_type: str,
     payload: Mapping[str, Any],
     items: Mapping[int, _ItemState],
-    blocks: dict[tuple[int, int], _BlockState],
+    blocks: dict[BlockKey, _BlockState],
 ) -> None:
     index = _output_index(payload)
     item = _active_item(items, index, payload)
     if event_type == "response.function_call_arguments.done":
-        key = (index, -1)
+        key = (index, "tool_call", -1)
         expected_kind = "tool_call"
     elif event_type == "response.reasoning_summary_text.done":
         summary_index = payload.get("summary_index")
         if type(summary_index) is not int or summary_index < 0:
             raise CodexStreamError("Codex reasoning summary index is invalid")
-        key = (index, summary_index)
+        key = (index, "thinking", summary_index)
         expected_kind = "thinking"
     elif event_type == "response.reasoning_text.done":
-        key = (index, _content_index(payload))
+        key = (index, "thinking_raw", _content_index(payload))
         expected_kind = "thinking_raw"
     else:
-        key = (index, _content_index(payload))
-        expected_kind = (
-            "refusal" if event_type == "response.refusal.done" else "output_text"
-        )
+        content_index = _content_index(payload)
+        expected_kind = ""
+        if event_type == "response.content_part.done":
+            part = payload.get("part")
+            wire_kind = part.get("type") if isinstance(part, Mapping) else None
+            expected_kind = (
+                "thinking_raw" if wire_kind == "reasoning_text" else wire_kind or ""
+            )
+            candidates = (
+                (index, expected_kind, content_index),
+                (index, "output_text", content_index),
+                (index, "refusal", content_index),
+                (index, "thinking_raw", content_index),
+            )
+            key = next((candidate for candidate in candidates if candidate in blocks), candidates[0])
+        else:
+            expected_kind = (
+                "refusal" if event_type == "response.refusal.done" else "output_text"
+            )
+            key = (index, expected_kind, content_index)
     block = blocks.get(key)
     if block is None or (
         event_type != "response.content_part.done" and block.kind != expected_kind
@@ -860,9 +892,10 @@ def _finish_block(
         raise CodexStreamError("Codex block stop is duplicated")
     if event_type == "response.content_part.done":
         part = payload.get("part")
+        wire_kind = "reasoning_text" if block.kind == "thinking_raw" else block.kind
         if part is not None and (
             not isinstance(part, Mapping)
-            or part.get("type") != block.kind
+            or part.get("type") != wire_kind
         ):
             raise CodexStreamError("Codex content part has the wrong item type")
     if event_type.endswith(".done"):
@@ -877,14 +910,17 @@ def _finish_block(
             "thinking",
             "thinking_raw",
         }:
-            if block.text and complete_text != block.text:
-                raise CodexStreamError("Codex completed text does not match its deltas")
-            if not block.text:
-                block.text = complete_text
+            error = (
+                "Codex completed reasoning does not match its deltas"
+                if block.kind in {"thinking", "thinking_raw"}
+                else "Codex completed text does not match its deltas"
+            )
+            if _reconcile_completed_text(block, complete_text, error):
                 if block.kind == "thinking":
                     item.summary_text += complete_text
                     item.thinking += complete_text
                 elif block.kind == "thinking_raw":
+                    item.raw_text += complete_text
                     item.thinking += complete_text
         complete_args = payload.get("arguments")
         if type(complete_args) is str and block.kind == "tool_call":
@@ -896,25 +932,39 @@ def _finish_block(
         if block.text_done:
             raise CodexStreamError("Codex reasoning text stop is duplicated")
         block.text_done = True
+    elif event_type == "response.reasoning_text.done":
+        if block.text_done:
+            raise CodexStreamError("Codex reasoning text stop is duplicated")
+        block.text_done = True
     elif event_type in {
         "response.content_part.done",
-        "response.reasoning_text.done",
         "response.function_call_arguments.done",
     }:
         block.state = "stopped"
 
 
+def _reconcile_completed_text(
+    block: _BlockState, complete_text: str, error: str
+) -> bool:
+    if block.text and complete_text != block.text:
+        raise CodexStreamError(error)
+    if block.text:
+        return False
+    block.text = complete_text
+    return True
+
+
 def _finish_reasoning_summary_part(
     payload: Mapping[str, Any],
     items: Mapping[int, _ItemState],
-    blocks: dict[tuple[int, int], _BlockState],
+    blocks: dict[BlockKey, _BlockState],
 ) -> None:
     index = _output_index(payload)
     item = _active_item(items, index, payload)
     summary_index = payload.get("summary_index")
     if type(summary_index) is not int or summary_index < 0:
         raise CodexStreamError("Codex reasoning summary index is invalid")
-    key = (index, summary_index)
+    key = (index, "thinking", summary_index)
     block = blocks.get(key)
     if item.kind != "reasoning" or block is None or block.kind != "thinking":
         raise CodexStreamError("Codex reasoning summary stop references an unknown block")
@@ -929,10 +979,11 @@ def _finish_reasoning_summary_part(
     if complete_text is not None and type(complete_text) is not str:
         raise CodexStreamError("Codex reasoning summary text is invalid")
     if isinstance(complete_text, str):
-        if block.text and complete_text != block.text:
-            raise CodexStreamError("Codex completed reasoning does not match its deltas")
-        if not block.text:
-            block.text = complete_text
+        if _reconcile_completed_text(
+            block,
+            complete_text,
+            "Codex completed reasoning does not match its deltas",
+        ):
             item.summary_text += complete_text
             item.thinking += complete_text
     block.state = "stopped"
@@ -941,7 +992,7 @@ def _finish_reasoning_summary_part(
 def _merge_completed_item(
     item: _ItemState,
     complete: Mapping[str, Any],
-    blocks: Mapping[tuple[int, int], _BlockState],
+    blocks: Mapping[BlockKey, _BlockState],
 ) -> None:
     if complete.get("id") != item.item_id:
         raise CodexStreamError("Codex completed item id does not match output item")
@@ -970,7 +1021,7 @@ def _merge_completed_item(
             complete_part_kinds.append(part_type)
             complete_text_parts.append(part[text_key])
         expected_part_kinds = [
-            blocks[key].kind for key in sorted(item.blocks) if key[1] >= 0
+            blocks[key].kind for key in sorted(item.blocks) if key[2] >= 0
         ]
         if expected_part_kinds and complete_part_kinds != expected_part_kinds:
             raise CodexStreamError("Codex completed message parts do not match blocks")
@@ -992,6 +1043,24 @@ def _merge_completed_item(
                 raise CodexStreamError("Codex completed reasoning summary is invalid")
         complete_summary = "".join(part["text"] for part in summary)
         if complete_summary != item.summary_text:
+            raise CodexStreamError("Codex completed reasoning does not match its deltas")
+        content = complete.get("content")
+        if content is not None:
+            if not isinstance(content, list):
+                raise CodexStreamError("Codex completed reasoning content is invalid")
+            complete_raw_parts: list[str] = []
+            for part in content:
+                if (
+                    not isinstance(part, Mapping)
+                    or part.get("type") != "reasoning_text"
+                    or type(part.get("text")) is not str
+                ):
+                    raise CodexStreamError("Codex completed reasoning content is invalid")
+                complete_raw_parts.append(part["text"])
+            complete_raw = "".join(complete_raw_parts)
+        else:
+            complete_raw = ""
+        if complete_raw != item.raw_text:
             raise CodexStreamError("Codex completed reasoning does not match its deltas")
         encrypted = complete.get("encrypted_content")
         if encrypted is not None and (type(encrypted) is not str or not encrypted):
