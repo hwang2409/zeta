@@ -271,7 +271,12 @@ def build_responses_payload(
         name = schema.get("name")
         if type(name) is not str or not name:
             raise CodexHTTPError("tool schema name must be a nonempty string")
-        parameters = schema.get("parameters", schema.get("input_schema"))
+        if "parameters" in schema:
+            parameters = schema["parameters"]
+        elif "input_schema" in schema:
+            parameters = schema["input_schema"]
+        else:
+            parameters = {"type": "object", "properties": {}}
         if not isinstance(parameters, Mapping):
             raise CodexHTTPError("tool schema parameters must be an object")
         tool: dict[str, Any] = {
@@ -895,36 +900,55 @@ def _merge_completed_item(item: _ItemState, complete: Mapping[str, Any]) -> None
         raise CodexStreamError("Codex completed item id does not match output item")
     if complete.get("type") != item.kind:
         raise CodexStreamError("Codex completed item type does not match output item")
-    item.completed_item = dict(complete)
     if item.kind == "message":
+        if complete.get("role") != "assistant":
+            raise CodexStreamError("Codex completed message metadata is invalid")
         content = complete.get("content")
-        if content is not None and not isinstance(content, list):
+        if not isinstance(content, list) or not content:
             raise CodexStreamError("Codex completed message content is invalid")
-        if isinstance(content, list):
-            complete_text_parts: list[str] = []
-            for part in content:
-                if (
-                    not isinstance(part, Mapping)
-                    or part.get("type") != "output_text"
-                    or type(part.get("text")) is not str
-                ):
-                    raise CodexStreamError("Codex completed message part is invalid")
-                complete_text_parts.append(part["text"])
-            complete_text = "".join(complete_text_parts)
-            if complete_text and item.text and complete_text != item.text:
-                raise CodexStreamError("Codex completed item does not match its deltas")
-            if complete_text:
-                item.text = complete_text
+        complete_text_parts: list[str] = []
+        for part in content:
+            if (
+                not isinstance(part, Mapping)
+                or part.get("type") != "output_text"
+                or type(part.get("text")) is not str
+            ):
+                raise CodexStreamError("Codex completed message part is invalid")
+            complete_text_parts.append(part["text"])
+        complete_text = "".join(complete_text_parts)
+        if complete_text and item.text and complete_text != item.text:
+            raise CodexStreamError("Codex completed item does not match its deltas")
+        if complete_text:
+            item.text = complete_text
     elif item.kind == "reasoning":
+        summary = complete.get("summary")
+        if not isinstance(summary, list):
+            raise CodexStreamError("Codex completed reasoning metadata is invalid")
+        for part in summary:
+            if (
+                not isinstance(part, Mapping)
+                or part.get("type") != "summary_text"
+                or type(part.get("text")) is not str
+            ):
+                raise CodexStreamError("Codex completed reasoning summary is invalid")
         encrypted = complete.get("encrypted_content")
+        if encrypted is not None and (type(encrypted) is not str or not encrypted):
+            raise CodexStreamError("Codex completed reasoning metadata is invalid")
         if type(encrypted) is str:
             item.encrypted_content = encrypted
     else:
+        if (
+            complete.get("call_id") != item.call_id
+            or complete.get("name") != item.name
+        ):
+            raise CodexStreamError("Codex completed tool metadata is invalid")
         arguments = complete.get("arguments")
-        if type(arguments) is str:
-            if item.arguments and arguments != item.arguments:
-                raise CodexStreamError("Codex completed tool does not match its deltas")
-            item.arguments = arguments
+        if type(arguments) is not str:
+            raise CodexStreamError("Codex completed tool arguments are invalid")
+        if item.arguments and arguments != item.arguments:
+            raise CodexStreamError("Codex completed tool does not match its deltas")
+        item.arguments = arguments
+    item.completed_item = dict(complete)
 
 
 def _complete_item(item: _ItemState) -> list[ContentBlock]:

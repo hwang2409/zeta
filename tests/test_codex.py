@@ -97,6 +97,7 @@ def message_stream() -> list[dict[str, object]]:
             item={
                 "type": "message",
                 "id": "message-test",
+                "role": "assistant",
                 "content": [{"type": "output_text", "text": "hello"}],
             },
         ),
@@ -246,7 +247,11 @@ async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Pat
             event(
                 "response.output_item.done",
                 output_index=0,
-                item={"type": "reasoning", "id": "reasoning-test"},
+                item={
+                    "type": "reasoning",
+                    "id": "reasoning-test",
+                    "summary": [{"type": "summary_text", "text": "plan"}],
+                },
             ),
             event(
                 "response.output_item.added",
@@ -325,7 +330,11 @@ async def test_reasoning_summary_stop_only_and_raw_reasoning_text_are_durable(
             event(
                 "response.output_item.done",
                 output_index=0,
-                item={"type": "reasoning", "id": "reasoning-summary"},
+                item={
+                    "type": "reasoning",
+                    "id": "reasoning-summary",
+                    "summary": [{"type": "summary_text", "text": "stop-only"}],
+                },
             ),
             event(
                 "response.output_item.added",
@@ -347,7 +356,11 @@ async def test_reasoning_summary_stop_only_and_raw_reasoning_text_are_durable(
             event(
                 "response.output_item.done",
                 output_index=1,
-                item={"type": "reasoning", "id": "reasoning-raw"},
+                item={
+                    "type": "reasoning",
+                    "id": "reasoning-raw",
+                    "summary": [],
+                },
             ),
             event("response.completed"),
         ]
@@ -389,6 +402,34 @@ def test_payload_maps_plan_messages_and_tools() -> None:
         {"role": "user", "content": [{"type": "input_text", "text": "run"}]},
         {"type": "function_call_output", "call_id": "call-test", "output": "done"},
     ]
+
+
+def test_payload_maps_name_only_tool_schema() -> None:
+    payload = build_responses_payload(
+        [Message(MessageRole.USER, [TextContent("run")])],
+        [{"name": "read"}],
+        model=DEFAULT_CODEX_MODEL,
+        max_output_tokens=100,
+    )
+
+    assert payload["tools"] == [
+        {
+            "type": "function",
+            "name": "read",
+            "parameters": {"type": "object", "properties": {}},
+            "strict": False,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "schema", [{"name": "read", "parameters": []}, {"name": "read", "input_schema": "bad"}]
+)
+def test_payload_rejects_malformed_tool_schema(schema: dict[str, object]) -> None:
+    with pytest.raises(CodexHTTPError, match="parameters must be an object"):
+        build_responses_payload(
+            [], [schema], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+        )
 
 
 def test_payload_preserves_assistant_output_item_order() -> None:
@@ -542,6 +583,75 @@ async def test_stream_rejects_missing_completed_item(tmp_path: Path) -> None:
             item
             async for item in CodexBackend(
                 client=client, token_store=store_for(tmp_path / "missing-item.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["message", "reasoning", "tool"])
+async def test_stream_rejects_incomplete_completed_items(tmp_path: Path, kind: str) -> None:
+    if kind == "message":
+        events = message_stream()
+        events[6]["item"] = {"type": "message", "id": "message-test"}
+    elif kind == "reasoning":
+        events = [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={"type": "reasoning", "id": "reasoning-test"},
+            ),
+            event(
+                "response.output_item.done",
+                output_index=0,
+                item={"type": "reasoning", "id": "reasoning-test"},
+            ),
+            event("response.completed"),
+        ]
+    else:
+        events = [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={
+                    "type": "function_call",
+                    "id": "function-test",
+                    "call_id": "call-a",
+                    "name": "read",
+                },
+            ),
+            event(
+                "response.function_call_arguments.delta",
+                output_index=0,
+                delta="{}",
+            ),
+            event(
+                "response.function_call_arguments.done",
+                output_index=0,
+                arguments="{}",
+            ),
+            event(
+                "response.output_item.done",
+                output_index=0,
+                item={
+                    "type": "function_call",
+                    "id": "function-test",
+                    "call_id": "call-b",
+                    "name": "write",
+                    "arguments": "{}",
+                },
+            ),
+            event("response.completed"),
+        ]
+
+    client = client_for(sse(events))
+    with pytest.raises(CodexStreamError):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / f"{kind}.json")
             ).complete([], [])
         ]
     await client.aclose()
@@ -757,7 +867,12 @@ async def test_output_item_done_rejects_open_blocks(tmp_path: Path) -> None:
         event(
             "response.output_item.done",
             output_index=0,
-            item={"type": "message", "id": "message-test"},
+            item={
+                "type": "message",
+                "id": "message-test",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello"}],
+            },
         )
     ]
     client = client_for(sse(events))
