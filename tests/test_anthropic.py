@@ -398,6 +398,30 @@ async def test_anthropic_sse_error_redacts_authorization_marker(tmp_path: Path) 
     await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_anthropic_sse_error_redacts_bearer_authorization(tmp_path: Path) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'data: {"type":"error","error":{"type":"api_error",'
+                '"message":"authorization: Bearer sse-authorization-secret"}}\n\n'
+            ),
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    with pytest.raises(AnthropicStreamError) as raised:
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+
+    assert "sse-authorization-secret" not in str(raised.value)
+    assert "Bearer" not in str(raised.value)
+    await client.aclose()
+
+
 def test_signed_thinking_blocks_use_anthropic_wire_types() -> None:
     payload = build_messages_payload(
         [

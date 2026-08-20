@@ -21,11 +21,59 @@ import httpx
 _SENSITIVE_ERROR_KEY = re.compile(
     r"(?:token|authorization|api[-_]?key|cookie|secret)", re.IGNORECASE
 )
-_SENSITIVE_ERROR_FIELD = re.compile(
-    r"(?i)([\"']?(?:access[-_]?token|refresh[-_]?token|authorization|x-api-key|api[-_]?key|token|secret)[\"']?\s*[:=]\s*)([\"'][^\"']*[\"']|[^\s,;}]+)"
+_ERROR_SECRET = re.compile(
+    r"""
+    (?:
+        (?P<authorization_prefix>
+            (?<![\w-])["']?(?:authorization|proxy-authorization)["']?\s*[:=]\s*
+        )
+        (?:
+            (?P<authorization_quote>["'])[^"']*(?P=authorization_quote)
+            |
+            (?:
+                digest\b[^\r\n;}]*
+                |(?:bearer|basic)\b[ \t]+(?:
+                    (?P<authorization_value_quote>["'])[^"']*(?P=authorization_value_quote)
+                    |[^\s,;}]+
+                )
+                |[^\s,;}]+
+            )
+        )
+        |
+        (?P<cookie_prefix>
+            (?<![\w-])["']?(?:cookie|set-cookie)["']?\s*[:=]\s*
+        )
+        (?:
+            (?P<cookie_quote>["'])[^"']*(?P=cookie_quote)
+            |[^\r\n]*
+        )
+        |
+        (?P<field_prefix>
+            (?<![\w-])["']?(?:access[-_]?token|refresh[-_]?token|authorization|x-api-key|api[-_]?key|token|secret)["']?\s*[:=]\s*
+        )
+        (?:
+            (?P<field_quote>["'])[^"']*(?P=field_quote)
+            |[^\s,;}]+
+        )
+        |
+        \b(?:access|refresh)[-_]?token[-_][a-z0-9._-]+
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
-_BEARER_VALUE = re.compile(r"(?i)(\bbearer\s+)[^\s,;}]+")
-_TOKEN_LIKE_VALUE = re.compile(r"(?i)\b(?:access|refresh)[-_]?token[-_][a-z0-9._-]+")
+
+
+def _redact_error_text(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        prefix = (
+            match.group("authorization_prefix")
+            or match.group("cookie_prefix")
+            or match.group("field_prefix")
+            or ""
+        )
+        return f"{prefix}[redacted]"
+
+    return _ERROR_SECRET.sub(replace, text)
 
 
 def _redact_error_value(value: Any) -> Any:
@@ -38,6 +86,8 @@ def _redact_error_value(value: Any) -> Any:
         }
     if isinstance(value, list):
         return [_redact_error_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_error_text(value)
     return value
 
 
@@ -49,9 +99,7 @@ def error_body_excerpt(body: bytes, *, limit: int = 300) -> str:
         text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         text = body.decode("utf-8", errors="replace")
-    text = _SENSITIVE_ERROR_FIELD.sub(r"\1[redacted]", text)
-    text = _BEARER_VALUE.sub(r"\1[redacted]", text)
-    text = _TOKEN_LIKE_VALUE.sub("[redacted]", text)
+        text = _redact_error_text(text)
     return " ".join(text.split())[:limit]
 
 
