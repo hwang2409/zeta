@@ -572,6 +572,8 @@ def _translate_event(
         if response is not None and not isinstance(response, Mapping):
             raise CodexStreamError("Codex response completion is invalid")
         if isinstance(response, Mapping):
+            if "status" in response and response["status"] != "completed":
+                raise CodexStreamError("Codex response completion status is invalid")
             response_data.update(
                 {key: response[key] for key in ("id", "status") if key in response}
             )
@@ -945,9 +947,9 @@ def _merge_completed_item(
         raise CodexStreamError("Codex completed item id does not match output item")
     if complete.get("type") != item.kind:
         raise CodexStreamError("Codex completed item type does not match output item")
+    if complete.get("status") != "completed":
+        raise CodexStreamError(f"Codex completed {item.kind} status is invalid")
     if item.kind == "message":
-        if complete.get("status") != "completed":
-            raise CodexStreamError("Codex completed message status is invalid")
         if complete.get("role") != "assistant":
             raise CodexStreamError("Codex completed message metadata is invalid")
         content = complete.get("content")

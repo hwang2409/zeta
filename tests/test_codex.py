@@ -251,6 +251,7 @@ async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Pat
                 item={
                     "type": "reasoning",
                     "id": "reasoning-test",
+                    "status": "completed",
                     "summary": [{"type": "summary_text", "text": "plan"}],
                 },
             ),
@@ -260,6 +261,7 @@ async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Pat
                 item={
                     "type": "function_call",
                     "id": "function-test",
+                    "status": "completed",
                     "call_id": "call-test",
                     "name": "read",
                 },
@@ -280,6 +282,7 @@ async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Pat
                 item={
                     "type": "function_call",
                     "id": "function-test",
+                    "status": "completed",
                     "call_id": "call-test",
                     "name": "read",
                     "arguments": '{"path":"README.md"}',
@@ -402,6 +405,7 @@ async def test_reasoning_summary_stop_only_and_raw_reasoning_text_are_durable(
                 item={
                     "type": "reasoning",
                     "id": "reasoning-summary",
+                    "status": "completed",
                     "summary": [{"type": "summary_text", "text": "stop-only"}],
                 },
             ),
@@ -428,6 +432,7 @@ async def test_reasoning_summary_stop_only_and_raw_reasoning_text_are_durable(
                 item={
                     "type": "reasoning",
                     "id": "reasoning-raw",
+                    "status": "completed",
                     "summary": [],
                 },
             ),
@@ -652,6 +657,7 @@ async def test_stream_rejects_completed_reasoning_summary_mismatch(tmp_path: Pat
                 item={
                     "type": "reasoning",
                     "id": "reasoning-test",
+                    "status": "completed",
                     "summary": [{"type": "summary_text", "text": "replayed"}],
                 },
             ),
@@ -757,6 +763,89 @@ async def test_stream_rejects_in_progress_completed_message(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["reasoning", "function_call"])
+async def test_stream_rejects_in_progress_completed_items(
+    tmp_path: Path, kind: str
+) -> None:
+    if kind == "reasoning":
+        item = {
+            "type": "reasoning",
+            "id": "reasoning-test",
+            "status": "in_progress",
+            "summary": [],
+        }
+        events = [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={"type": "reasoning", "id": "reasoning-test"},
+            ),
+            event("response.output_item.done", output_index=0, item=item),
+            event("response.completed"),
+        ]
+    else:
+        item = {
+            "type": "function_call",
+            "id": "function-test",
+            "status": "in_progress",
+            "call_id": "call-test",
+            "name": "read",
+            "arguments": "{}",
+        }
+        events = [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={
+                    "type": "function_call",
+                    "id": "function-test",
+                    "call_id": "call-test",
+                    "name": "read",
+                },
+            ),
+            event(
+                "response.function_call_arguments.delta",
+                output_index=0,
+                delta="{}",
+            ),
+            event(
+                "response.function_call_arguments.done",
+                output_index=0,
+                arguments="{}",
+            ),
+            event("response.output_item.done", output_index=0, item=item),
+            event("response.completed"),
+        ]
+
+    client = client_for(sse(events))
+    with pytest.raises(CodexStreamError, match="completed .* status is invalid"):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / f"{kind}.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_non_completed_response_status(tmp_path: Path) -> None:
+    events = message_stream()
+    events[7]["response"]["status"] = "in_progress"  # type: ignore[index]
+    client = client_for(sse(events))
+    with pytest.raises(CodexStreamError, match="response completion status is invalid"):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "response-status.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["message", "reasoning", "tool"])
 async def test_stream_rejects_incomplete_completed_items(tmp_path: Path, kind: str) -> None:
     if kind == "message":
@@ -806,6 +895,7 @@ async def test_stream_rejects_incomplete_completed_items(tmp_path: Path, kind: s
                 item={
                     "type": "function_call",
                     "id": "function-test",
+                    "status": "completed",
                     "call_id": "call-b",
                     "name": "write",
                     "arguments": "{}",
