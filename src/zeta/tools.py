@@ -153,9 +153,9 @@ class ToolRegistry:
                 raise TypeError("abort signal does not support abort or set")
             set_signal()
 
-    def new_abort_signal(self) -> ToolAbortSignal:
-        """Create the signal for one independent execution batch."""
-        return ToolAbortSignal()
+    def start_batch(self) -> None:
+        """Rotate the active signal before a new tool batch."""
+        self.abort_signal = ToolAbortSignal()
 
     async def execute(
         self,
@@ -463,11 +463,28 @@ def _normalize_schema(schema: Mapping[str, Any] | None) -> dict[str, Any]:
     except Exception as exc:
         raise ValueError("schema must contain JSON data") from exc
     _validate_schema_definition(normalized, "schema")
+    _validate_json_data(normalized, "schema")
     try:
         json.dumps(normalized, allow_nan=False)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("schema must contain JSON data") from exc
     return normalized
+
+
+def _validate_json_data(value: Any, path: str) -> None:
+    if value is None or type(value) in {bool, float, int, str}:
+        return
+    if type(value) is list:
+        for index, item in enumerate(value):
+            _validate_json_data(item, f"{path}[{index}]")
+        return
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ValueError(f"schema must contain JSON data at {path}")
+            _validate_json_data(item, f"{path}.{key}")
+        return
+    raise ValueError(f"schema must contain JSON data at {path}")
 
 
 def _validate_arguments(arguments: object, schema: Mapping[str, Any]) -> dict[str, Any]:

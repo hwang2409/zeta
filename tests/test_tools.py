@@ -86,6 +86,12 @@ def test_registry_rejects_unsupported_schema_constructs(tmp_path: Path) -> None:
             lambda arguments: "ran",
             parameters={"type": "object", "const": object()},
         )
+    with pytest.raises(ValueError, match="schema must contain JSON data"):
+        registry.register(
+            "tuple",
+            lambda arguments: "ran",
+            parameters={"type": "object", "properties": {"value": {"enum": [("x",)]}}},
+        )
 
 
 @pytest.mark.asyncio
@@ -533,4 +539,39 @@ async def test_agent_loop_refreshes_abort_signal_each_turn(tmp_path: Path) -> No
         "abort",
         "tool execution canceled",
         "next",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_registry_abort_cancels_loop_batch_and_next_tool(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall("call-1", "exec", {"command": "sleep 5"}),
+                    ToolCall("call-2", "read", {"path": "missing.txt"}),
+                ]
+            ),
+            ScriptedTurn(content=[TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    started = asyncio.Event()
+
+    def hook(name: str, arguments: dict[str, object]) -> bool:
+        if name == "exec":
+            started.set()
+        return True
+
+    registry = ToolRegistry(tmp_path, pre_execute_hook=hook)
+    task = asyncio.create_task(_collect_loop(AgentLoop(backend, store, registry=registry)))
+    await started.wait()
+    await asyncio.sleep(0.05)
+    registry.abort()
+    await task
+
+    results = [message.tool_result for message in store.messages() if message.tool_result]
+    assert [result.content for result in results] == [
+        "tool execution canceled",
+        "tool execution canceled",
     ]
