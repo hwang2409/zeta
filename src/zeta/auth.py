@@ -49,7 +49,7 @@ def error_body_excerpt(body: bytes, *, limit: int = 300) -> str:
         text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         text = body.decode("utf-8", errors="replace")
-        text = _SENSITIVE_ERROR_FIELD.sub(r"\1[redacted]", text)
+    text = _SENSITIVE_ERROR_FIELD.sub(r"\1[redacted]", text)
     text = _BEARER_VALUE.sub(r"\1[redacted]", text)
     text = _TOKEN_LIKE_VALUE.sub("[redacted]", text)
     return " ".join(text.split())[:limit]

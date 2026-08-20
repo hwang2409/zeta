@@ -959,6 +959,25 @@ def test_codex_http_error_includes_safe_truncated_body() -> None:
     assert len(codex_module.error_body_excerpt(body)) == 300
 
 
+def test_codex_http_error_redacts_markers_in_valid_json_values() -> None:
+    body = json.dumps(
+        {
+            "error": {
+                "message": (
+                    "access-token=access-secret refresh-token=refresh-secret "
+                    "authorization=authorization-secret"
+                )
+            }
+        }
+    ).encode()
+
+    error = codex_module._http_error(400, body)
+
+    assert "access-secret" not in str(error)
+    assert "refresh-secret" not in str(error)
+    assert "authorization-secret" not in str(error)
+
+
 def test_payload_maps_name_only_tool_schema() -> None:
     payload = build_responses_payload(
         [Message(MessageRole.USER, [TextContent("run")])],

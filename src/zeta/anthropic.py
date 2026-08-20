@@ -502,7 +502,9 @@ def _translate_event(
         message = detail.get("message")
         if type(message) is not str:
             raise AnthropicStreamError("Anthropic stream error message is invalid")
-        raise AnthropicStreamError(message)
+        raise AnthropicStreamError(
+            error_body_excerpt(message.encode()) or "Anthropic stream error"
+        )
     if event_type == "message_start":
         message = payload.get("message", {})
         if isinstance(message, Mapping):
