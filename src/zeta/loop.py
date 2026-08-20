@@ -128,6 +128,7 @@ class AgentLoop:
         yield StreamEvent(StreamEventType.AGENT_START)
 
         for turn_number in range(1, self.max_turns + 1):
+            self.tool_registry.start_batch()
             yield StreamEvent(
                 StreamEventType.TURN_START,
                 data={"turn": turn_number},
@@ -200,7 +201,6 @@ class AgentLoop:
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
 
-            self.tool_registry.start_batch()
             call_index = 0
             while call_index < len(calls):
                 parallel_calls: list[ToolCall] = []

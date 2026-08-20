@@ -65,6 +65,39 @@ class _BoundedOutput:
             self._data.extend(chunk[:remaining])
 
 
+class _BoundedText:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._text = ""
+        self._has_line = False
+        self.truncated = False
+
+    @property
+    def retained_chars(self) -> int:
+        return len(self._text)
+
+    def append(self, value: str) -> None:
+        remaining = self.limit - len(self._text)
+        if remaining > 0:
+            self._text += value[:remaining]
+        if len(value) > remaining:
+            self.truncated = True
+
+    def begin_line(self) -> None:
+        if self._has_line:
+            self.append("\n")
+        self._has_line = True
+
+    def append_line(self, value: str) -> None:
+        self.begin_line()
+        self.append(value)
+
+    def render(self) -> str:
+        if self.truncated:
+            return _truncate(self._text + _TRUNCATION_MARKER, self.limit)
+        return self._text
+
+
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
     name: str
@@ -337,15 +370,58 @@ class ToolRegistry:
         path = self._path(arguments["path"])
         if not path.is_file():
             raise ValueError(f"not a file: {arguments['path']}")
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ValueError(f"could not read file: {exc}") from exc
-        lines = text.splitlines()
         offset = arguments.get("offset", 0)
         limit = arguments.get("limit")
-        selected = lines[offset:] if limit is None else lines[offset : offset + limit]
-        return "\n".join(selected)
+        output = _BoundedText(self.max_output_chars)
+        line_index = 0
+        selected_count = 0
+        line_has_data = False
+        line_started = False
+        try:
+            with path.open("r", encoding="utf-8", newline=None) as handle:
+                while True:
+                    chunk = handle.read(64 * 1024)
+                    if not chunk:
+                        break
+                    for character in chunk:
+                        if character == "\n":
+                            selected = line_index >= offset and (
+                                limit is None or selected_count < limit
+                            )
+                            if selected:
+                                if not line_started:
+                                    output.begin_line()
+                                selected_count += 1
+                                if output.truncated:
+                                    return output.render()
+                            line_index += 1
+                            line_has_data = False
+                            line_started = False
+                            if limit is not None and selected_count >= limit:
+                                return output.render()
+                            continue
+                        line_has_data = True
+                        if line_index < offset or (
+                            limit is not None and selected_count >= limit
+                        ):
+                            continue
+                        if not line_started:
+                            output.begin_line()
+                            line_started = True
+                        output.append(character)
+                        if output.truncated:
+                            return output.render()
+                if line_has_data:
+                    selected = line_index >= offset and (
+                        limit is None or selected_count < limit
+                    )
+                    if selected:
+                        if not line_started:
+                            output.begin_line()
+                        selected_count += 1
+        except OSError as exc:
+            raise ValueError(f"could not read file: {exc}") from exc
+        return output.render()
 
     async def _list(
         self,
@@ -357,21 +433,21 @@ class ToolRegistry:
         if not path.is_dir():
             raise ValueError(f"not a directory: {relative_path}")
         depth = arguments.get("depth", 1)
-        found: list[str] = []
-        await self._list_children(path, depth, found, abort_signal)
+        output = _BoundedText(self.max_output_chars)
+        await self._list_children(path, depth, output, abort_signal)
         if _signal_is_set(abort_signal):
             raise _ToolCanceled()
-        return "\n".join(found)
+        return output.render()
 
     async def _list_children(
         self,
         path: Path,
         depth: int,
-        found: list[str],
+        output: _BoundedText,
         abort_signal: ToolAbortSignal | asyncio.Event,
-    ) -> None:
+    ) -> bool:
         if _signal_is_set(abort_signal):
-            return
+            raise _ToolCanceled()
         try:
             entries = sorted(path.iterdir(), key=lambda item: item.name)
         except OSError as exc:
@@ -389,9 +465,13 @@ class ToolRegistry:
                 relative = os.fspath(entry)
             if entry.is_dir() and not entry.is_symlink():
                 relative += "/"
-            found.append(relative)
+            output.append_line(relative)
+            if output.truncated:
+                return True
             if depth > 1 and entry.is_dir() and not entry.is_symlink():
-                await self._list_children(entry, depth - 1, found, abort_signal)
+                if await self._list_children(entry, depth - 1, output, abort_signal):
+                    return True
+        return False
 
     async def _exec(
         self,
@@ -644,6 +724,9 @@ def _schema_equal(left: Any, right: Any) -> bool:
     return type(left) is type(right) and left == right
 
 
+_TRUNCATION_MARKER = "\n...[output truncated]"
+
+
 _SCHEMA_KEYS = {
     "type",
     "properties",
@@ -791,7 +874,7 @@ def _format_exec_result(
 def _truncate(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
-    marker = "\n...[output truncated]"
+    marker = _TRUNCATION_MARKER
     if limit <= len(marker):
         return marker[:limit]
     return value[: limit - len(marker)] + marker

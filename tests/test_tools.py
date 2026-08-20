@@ -11,7 +11,7 @@ from zeta.fake import FakeBackend, ScriptedTurn
 from zeta.loop import AgentLoop
 from zeta.store import ConversationStore
 from zeta.tools import ToolAbortSignal, ToolRegistry
-from zeta.types import MessageRole, TextContent, ToolCall, ToolResult
+from zeta.types import MessageRole, StreamEventType, TextContent, ToolCall, ToolResult
 
 
 def _python_command(source: str) -> str:
@@ -182,6 +182,59 @@ async def test_exec_retains_only_bounded_output_from_large_command(
     assert len(captures) == 2
     assert all(capture.retained_bytes <= 64 for capture in captures)
     assert sum(capture.retained_bytes for capture in captures) <= 128
+
+
+@pytest.mark.asyncio
+async def test_read_retains_only_bounded_output_from_large_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captures = []
+    real_capture = tools_module._BoundedText
+
+    class TrackingCapture(real_capture):
+        def __init__(self, limit: int) -> None:
+            super().__init__(limit)
+            captures.append(self)
+
+    monkeypatch.setattr(tools_module, "_BoundedText", TrackingCapture)
+    (tmp_path / "large.txt").write_text("x\n" * 1_000_000, encoding="utf-8")
+    registry = ToolRegistry(tmp_path, max_output_chars=64)
+
+    result = await registry.execute(
+        ToolCall("read-large", "read", {"path": "large.txt"})
+    )
+
+    assert not result.is_error
+    assert len(result.content) == 64
+    assert len(captures) == 1
+    assert captures[0].retained_chars <= 64
+
+
+@pytest.mark.asyncio
+async def test_list_retains_only_bounded_output_from_large_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captures = []
+    real_capture = tools_module._BoundedText
+
+    class TrackingCapture(real_capture):
+        def __init__(self, limit: int) -> None:
+            super().__init__(limit)
+            captures.append(self)
+
+    monkeypatch.setattr(tools_module, "_BoundedText", TrackingCapture)
+    for index in range(1_000):
+        (tmp_path / f"file-{index:04d}.txt").write_text("x", encoding="utf-8")
+    registry = ToolRegistry(tmp_path, max_output_chars=64)
+
+    result = await registry.execute(ToolCall("list-large", "list", {"path": "."}))
+
+    assert not result.is_error
+    assert len(result.content) == 64
+    assert len(captures) == 1
+    assert captures[0].retained_chars <= 64
 
 
 @pytest.mark.asyncio
@@ -592,6 +645,29 @@ async def test_agent_loop_mapping_tools_do_not_expose_builtins(tmp_path: Path) -
     assert result is not None
     assert result.content == "unknown tool: exec"
     assert result.is_error
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_keeps_boundary_abort_for_pending_tools(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("call-1", "step", {})]),
+            ScriptedTurn(content=[TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register("step", lambda arguments: "ran")
+    aborted = False
+
+    async for event in AgentLoop(backend, store, registry=registry).run_turn("go"):
+        if event.type is StreamEventType.MESSAGE_END and not aborted:
+            registry.abort()
+            aborted = True
+
+    result = store.messages()[2].tool_result
+    assert result is not None
+    assert result == ToolResult("call-1", "tool execution canceled", True)
 
 
 @pytest.mark.asyncio
