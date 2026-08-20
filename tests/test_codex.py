@@ -383,6 +383,98 @@ def test_payload_maps_plan_messages_and_tools() -> None:
     ]
 
 
+def test_payload_preserves_assistant_output_item_order() -> None:
+    payload = build_responses_payload(
+        [
+            Message(
+                MessageRole.ASSISTANT,
+                [
+                    ThinkingContent("plan", "opaque"),
+                    TextContent("answer"),
+                    ToolUseContent(ToolCall("call-test", "read", {"path": "README.md"})),
+                ],
+            )
+        ],
+        [],
+        model=DEFAULT_CODEX_MODEL,
+        max_output_tokens=100,
+    )
+
+    assert [item.get("type", item.get("role")) for item in payload["input"]] == [
+        "reasoning",
+        "assistant",
+        "function_call",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_encrypted_only_reasoning_round_trips_into_payload(tmp_path: Path) -> None:
+    stream = sse(
+        [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={
+                    "type": "reasoning",
+                    "id": "reasoning-test",
+                    "encrypted_content": "opaque",
+                },
+            ),
+            event(
+                "response.output_item.done",
+                output_index=0,
+                item={"type": "reasoning", "id": "reasoning-test"},
+            ),
+            event("response.completed"),
+        ]
+    )
+    client = client_for(stream)
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store_for(tmp_path / "codex.json")
+        ).complete([], [])
+    ]
+
+    message = events[-1].message
+    assert message is not None
+    assert message.content == [ThinkingContent("", "opaque")]
+    payload = build_responses_payload(
+        [message], [], model=DEFAULT_CODEX_MODEL, max_output_tokens=100
+    )
+    assert payload["input"][0]["encrypted_content"] == "opaque"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation", ["delta", "completed_id", "completed_type", "completed_part_type"]
+)
+async def test_stream_rejects_mismatched_item_identity(
+    tmp_path: Path, mutation: str
+) -> None:
+    events = message_stream()
+    if mutation == "delta":
+        events[3]["item_id"] = "other-item"
+    elif mutation == "completed_id":
+        events[6]["item"]["id"] = "other-item"  # type: ignore[index]
+    elif mutation == "completed_type":
+        events[6]["item"]["type"] = "reasoning"  # type: ignore[index]
+    else:
+        events[5]["part"] = {"type": "input_text"}
+
+    client = client_for(sse(events))
+    with pytest.raises(CodexStreamError):
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / f"{mutation}.json")
+            ).complete([], [])
+        ]
+    await client.aclose()
+
+
 def test_extract_account_id_ignores_account_id_outside_access_claim() -> None:
     assert extract_account_id(access_token("derived-account")) == "derived-account"
     with pytest.raises(CodexAuthError):
