@@ -9,6 +9,7 @@ state for the next call.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import os
 import shlex
 import uuid
@@ -100,10 +101,16 @@ async def _bash(
         stream: ToolStream,
     ) -> bytes:
         chunks: list[bytes] = []
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         while chunk := await pipe.read(65_536):
             chunks.append(chunk)
+            text = decoder.decode(chunk)
             if stream_publisher is not None and not abort_signal.is_set():
-                stream_publisher.publish(chunk.decode(errors="replace"), stream)
+                if text:
+                    stream_publisher.publish(text, stream)
+        text = decoder.decode(b"", final=True)
+        if stream_publisher is not None and not abort_signal.is_set() and text:
+            stream_publisher.publish(text, stream)
         return b"".join(chunks)
 
     try:

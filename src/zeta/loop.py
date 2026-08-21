@@ -333,7 +333,17 @@ class AgentLoop:
                 return
 
             completed_tool_indexes: set[int] = set()
-            stream_updates: asyncio.Queue[StreamEvent] = asyncio.Queue()
+            # cap advisory output at 128 events; drop the oldest update when full.
+            # final tool results stay in separate byte-complete handler buffers.
+            stream_updates: asyncio.Queue[StreamEvent] = asyncio.Queue(maxsize=128)
+
+            def enqueue_tool_update(event: StreamEvent) -> None:
+                try:
+                    stream_updates.put_nowait(event)
+                except asyncio.QueueFull:
+                    stream_updates.get_nowait()
+                    stream_updates.put_nowait(event)
+
             active_task: asyncio.Task[StructuredToolResult] | None = None
             parallel_tasks: dict[
                 asyncio.Task[StructuredToolResult], tuple[int, ToolCall]
@@ -367,7 +377,7 @@ class AgentLoop:
                             asyncio.create_task(
                                 self.tool_registry.execute(
                                     tool_call,
-                                    _stream_sink=stream_updates.put_nowait,
+                                    _stream_sink=enqueue_tool_update,
                                 )
                             ): (call_index + offset, tool_call)
                             for offset, tool_call in enumerate(parallel_calls)
@@ -420,7 +430,7 @@ class AgentLoop:
                     active_task = asyncio.create_task(
                         self.tool_registry.execute(
                             tool_call,
-                            _stream_sink=stream_updates.put_nowait,
+                            _stream_sink=enqueue_tool_update,
                         )
                     )
                     try:
@@ -457,6 +467,7 @@ class AgentLoop:
                     call_index += 1
             except (asyncio.CancelledError, GeneratorExit):
                 pending_tasks: list[asyncio.Task[StructuredToolResult]] = []
+                await asyncio.sleep(0)
                 if active_task is not None and not active_task.done():
                     active_task.cancel()
                     pending_tasks.append(active_task)

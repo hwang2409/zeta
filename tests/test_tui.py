@@ -19,6 +19,7 @@ from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
 
+from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.tui.app import TUIApp
@@ -273,6 +274,31 @@ def test_render_event_shows_tool_output_update() -> None:
 
     assert rendered is not None
     assert rendered.plain == "  ↳ [stdout] hello\n"
+
+
+@pytest.mark.asyncio
+async def test_streamed_tool_output_is_not_repeated_at_end(tmp_path: Path) -> None:
+    call = ToolCall("call-1", "bash", {"cmd": "printf chunk"})
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend(
+                [
+                    ScriptedTurn(tool_calls=[call]),
+                    ScriptedTurn([TextContent("done")]),
+                ]
+            ),
+            ConversationStore(tmp_path),
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    await app._consume_turn("prompt")
+
+    output = app.console.file.getvalue()
+    assert output.count("[stdout] chunk") == 1
+    assert "[tool result]" not in output
 
 
 def test_render_event_preserves_multiline_tool_result_formatting() -> None:

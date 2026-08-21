@@ -59,16 +59,17 @@ class ToolStreamPublisher(Protocol):
 ToolStreamSink = Callable[[StreamEvent], None]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _ToolCallStreamPublisher:
     """Adapt handler chunks into non-blocking events for the agent loop."""
 
     tool_call: ToolCall
     abort_signal: ToolAbortSignal
     sink: ToolStreamSink
+    closed: bool = False
 
     def publish(self, text: str, stream: ToolStream) -> None:
-        if _signal_is_set(self.abort_signal):
+        if self.closed or _signal_is_set(self.abort_signal):
             return
         self.sink(
             StreamEvent(
@@ -78,6 +79,9 @@ class _ToolCallStreamPublisher:
                 data={"stream": stream},
             )
         )
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _ToolCanceled(Exception):
@@ -443,19 +447,27 @@ class ToolRegistry:
             if _stream_sink is not None
             else None
         )
-        try:
-            result = await _invoke_handler(
+        if stream_publisher is None:
+            try:
+                result = await _invoke_handler(
+                    definition.handler,
+                    arguments,
+                    execution_signal,
+                )
+            except _ToolCanceled:
+                return _legacy_result(_canceled_result(tool_call.id))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
+                return _error_result(str(exc))
+        else:
+            result = await self._invoke_streaming_handler(
                 definition.handler,
                 arguments,
                 execution_signal,
                 stream_publisher,
+                tool_call.id,
             )
-        except _ToolCanceled:
-            return _legacy_result(_canceled_result(tool_call.id))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
-            return _error_result(str(exc))
         if isinstance(result, ToolResult):
             if result.tool_call_id != tool_call.id:
                 return _error_result(
@@ -473,6 +485,45 @@ class ToolRegistry:
         return _error_result(
             "invalid tool handler result: expected str or structured tool result"
         )
+
+    async def _invoke_streaming_handler(
+        self,
+        handler: ToolHandler,
+        arguments: dict[str, Any],
+        execution_signal: ToolAbortSignal,
+        stream_publisher: ToolStreamPublisher,
+        tool_call_id: str,
+    ) -> ToolHandlerResult:
+        current = asyncio.current_task()
+
+        async def cancel_on_abort() -> None:
+            await execution_signal.wait()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            if current is not None and not current.done():
+                current.cancel()
+
+        abort_wait = asyncio.create_task(cancel_on_abort())
+        try:
+            return await _invoke_handler(
+                handler,
+                arguments,
+                execution_signal,
+                stream_publisher,
+            )
+        except _ToolCanceled:
+            return _legacy_result(_canceled_result(tool_call_id))
+        except asyncio.CancelledError:
+            if execution_signal.is_set():
+                return _legacy_result(_canceled_result(tool_call_id))
+            raise
+        except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
+            return _error_result(str(exc))
+        finally:
+            if not abort_wait.done():
+                abort_wait.cancel()
+                await asyncio.gather(abort_wait, return_exceptions=True)
+            stream_publisher.close()
 
     def _abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
         if self.approval_policy is None:

@@ -167,6 +167,8 @@ class TUIApp:
         self._spinner_active = False
         self._spinner_frame = 0
         self._spinner_reset = asyncio.Event()
+        self._active_tool_updates: dict[str, bool] = {}
+        self._abort_requested = False
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
         self._approval_policy = approval_policy
@@ -310,7 +312,10 @@ class TUIApp:
     def abort_active(self) -> None:
         if self._active_task is not None and not self._active_task.done():
             self.loop.abort()
-            self._active_task.cancel()
+            if self._loop_state == "tool-running":
+                self._abort_requested = True
+            else:
+                self._active_task.cancel()
 
     def _status_toolbar(self) -> FormattedText:
         width = get_app().output.get_size().columns
@@ -445,6 +450,7 @@ class TUIApp:
                 self._spinner_reset.clear()
 
     async def _consume_turn(self, user_text: str) -> None:
+        self._abort_requested = False
         self._loop_state = "streaming"
         self._streaming = True
         self._spinner_active = True
@@ -453,6 +459,8 @@ class TUIApp:
             async for event in self.loop.run_turn(user_text):
                 self._update_usage(event)
                 self._prepare_stream_event(event)
+                streamed = False
+                stop_after_tool = False
                 if self.verbose:
                     self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style=DIM))
                 if event.type is StreamEventType.MESSAGE_UPDATE:
@@ -462,9 +470,24 @@ class TUIApp:
                 if event.type is StreamEventType.TOOL_EXECUTION_START:
                     self._reset_stream_state()
                     self._loop_state = "tool-running"
+                    if event.tool_call is not None:
+                        self._active_tool_updates[event.tool_call.id] = False
                     self._present_pending_approvals()
+                elif event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
+                    if event.tool_call is not None:
+                        self._active_tool_updates[event.tool_call.id] = True
                 elif event.type is StreamEventType.TOOL_EXECUTION_END:
                     self._loop_state = "streaming"
+                    streamed = (
+                        self._active_tool_updates.pop(event.tool_call.id, False)
+                        if event.tool_call is not None
+                        else False
+                    )
+                    if self._abort_requested:
+                        self._abort_requested = False
+                        stop_after_tool = True
+                    else:
+                        stop_after_tool = False
                 elif event.type is StreamEventType.TURN_START:
                     self._spinner_frame = 0
                     self._spinner_reset.set()
@@ -474,8 +497,13 @@ class TUIApp:
                 elif event.type is StreamEventType.AGENT_END:
                     self._reset_stream_state()
                     self._loop_state = "idle"
-                self._print(render_event(event))
+                if not (
+                    event.type is StreamEventType.TOOL_EXECUTION_END and streamed
+                ):
+                    self._print(render_event(event))
                 self._invalidate_prompt()
+                if event.type is StreamEventType.TOOL_EXECUTION_END and stop_after_tool:
+                    break
         except asyncio.CancelledError:
             self._finish_stream()
             self._loop_state = "idle"
@@ -486,6 +514,8 @@ class TUIApp:
             self._loop_state = "idle"
             self._print(Text(f"[error] {exc}", style=ERROR))
         finally:
+            self._active_tool_updates.clear()
+            self._abort_requested = False
             self._streaming = False
             self._spinner_active = False
             spinner_task.cancel()
