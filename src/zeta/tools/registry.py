@@ -220,6 +220,7 @@ class ToolDefinition:
     parameters: dict[str, Any]
     handler: ToolHandler
     parallel_safe: bool = False
+    validate_arguments: bool = True
 
     def schema(self) -> ToolSchema:
         return {
@@ -236,6 +237,7 @@ def _copy_definition(definition: ToolDefinition) -> ToolDefinition:
         parameters=copy.deepcopy(definition.parameters),
         handler=definition.handler,
         parallel_safe=definition.parallel_safe,
+        validate_arguments=definition.validate_arguments,
     )
 
 
@@ -327,6 +329,7 @@ class ToolRegistry:
         input_schema: Mapping[str, Any] | None = None,
         schema: Mapping[str, Any] | None = None,
         parallel_safe: bool = False,
+        validate_arguments: bool = True,
     ) -> ToolDefinition:
         if type(name) is not str or not name:
             raise ValueError("tool name must be a nonempty string")
@@ -339,13 +342,17 @@ class ToolRegistry:
         ]
         if len(supplied_schemas) > 1:
             raise ValueError("pass only one tool parameter schema")
-        normalized = _normalize_schema(supplied_schemas[0] if supplied_schemas else None)
+        normalized = _normalize_schema(
+            supplied_schemas[0] if supplied_schemas else None,
+            validate_definition=validate_arguments,
+        )
         definition = ToolDefinition(
             name=name,
             description=description,
             parameters=normalized,
             handler=handler,
             parallel_safe=parallel_safe,
+            validate_arguments=validate_arguments,
         )
         self._tools[name] = definition
         return _copy_definition(definition)
@@ -386,11 +393,12 @@ class ToolRegistry:
         if definition is None:
             self._abort_approval(tool_call)
             return None
-        try:
-            _validate_arguments(tool_call.arguments, definition.parameters)
-        except (AttributeError, KeyError, TypeError, ValueError):
-            self._abort_approval(tool_call)
-            return None
+        if definition.validate_arguments:
+            try:
+                _validate_arguments(tool_call.arguments, definition.parameters)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                self._abort_approval(tool_call)
+                return None
         return self.approval_policy.prepare(tool_call)
 
     async def execute(
@@ -420,7 +428,11 @@ class ToolRegistry:
             self._abort_approval(tool_call)
             return _error_result(f"unknown tool: {tool_call.name}")
         try:
-            arguments = _validate_arguments(tool_call.arguments, definition.parameters)
+            arguments = (
+                _validate_arguments(tool_call.arguments, definition.parameters)
+                if definition.validate_arguments
+                else _coerce_arguments(tool_call.arguments)
+            )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             self._abort_approval(tool_call)
             return _error_result(f"invalid arguments: {exc}")
@@ -770,6 +782,10 @@ def _validate_structured_content(value: object) -> None:
             )
         if current is None or type(current) in {str, int, bool}:
             continue
+        if type(current) is float:
+            if not math.isfinite(current):
+                raise ValueError("structuredContent must contain finite numbers")
+            continue
         if type(current) not in {list, dict}:
             raise ValueError("structuredContent must contain JSON values")
         current_id = id(current)
@@ -788,7 +804,11 @@ def _validate_structured_content(value: object) -> None:
             pending.append((item, depth + 1, False))
 
 
-def _normalize_schema(schema: Mapping[str, Any] | None) -> dict[str, Any]:
+def _normalize_schema(
+    schema: Mapping[str, Any] | None,
+    *,
+    validate_definition: bool = True,
+) -> dict[str, Any]:
     if schema is None:
         return {"type": "object", "properties": {}}
     if not isinstance(schema, Mapping):
@@ -797,7 +817,8 @@ def _normalize_schema(schema: Mapping[str, Any] | None) -> dict[str, Any]:
         normalized = copy.deepcopy(dict(schema))
     except Exception as exc:
         raise ValueError("schema must contain JSON data") from exc
-    _validate_schema_definition(normalized, "schema")
+    if validate_definition:
+        _validate_schema_definition(normalized, "schema")
     _validate_json_data(normalized, "schema")
     try:
         json.dumps(normalized, allow_nan=False)
@@ -827,6 +848,13 @@ def _validate_arguments(arguments: object, schema: Mapping[str, Any]) -> dict[st
         raise ValueError("arguments must be an object")
     _validate_finite_numbers(arguments, "arguments")
     _validate_schema(arguments, schema, "arguments")
+    return dict(arguments)
+
+
+def _coerce_arguments(arguments: object) -> dict[str, Any]:
+    if type(arguments) is not dict:
+        raise ValueError("arguments must be an object")
+    _validate_finite_numbers(arguments, "arguments")
     return dict(arguments)
 
 

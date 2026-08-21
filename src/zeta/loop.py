@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from .core.approval import ApprovalPolicy
 from .core.context import ContextAssembler
 from .core.store import ConversationStore
+from .mcp import MCPMount, mount_mcp_servers
 from .tools import ToolHandler, ToolRegistry
 from .tools.registry import validate_tool_result
 from .types import (
@@ -149,6 +150,9 @@ class AgentLoop:
             self.tool_registry = ToolRegistry(store.cwd)
         else:
             raise TypeError("tools must be a mapping or ToolRegistry")
+        self._mcp_mount: MCPMount | None = None
+        self._mcp_mount_attempted = False
+        self._provided_tool_schemas = tool_schemas is not None
         self.tool_registry.bind_session_store(store)
         if (
             approval_policy is not None
@@ -192,11 +196,37 @@ class AgentLoop:
     def run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
         return self._run_turn(user_text)
 
+    async def close(self) -> None:
+        """Close session-owned MCP transports."""
+
+        if self._mcp_mount is not None:
+            await self._mcp_mount.close()
+            self._mcp_mount = None
+
+    async def _ensure_mcp_servers(self) -> None:
+        if self._mcp_mount_attempted:
+            return
+        self._mcp_mount_attempted = True
+        self._mcp_mount = await mount_mcp_servers(self.tool_registry)
+        if self._provided_tool_schemas:
+            existing = {schema.get("name") for schema in self.tool_schemas}
+            self.tool_schemas.extend(
+                schema for schema in self.tool_registry.schemas if schema.get("name") not in existing
+            )
+        else:
+            self.tool_schemas = list(self.tool_registry.schemas)
+
+    async def ensure_mcp_servers(self) -> None:
+        """Connect MCP servers before a direct tool resume."""
+
+        await self._ensure_mcp_servers()
+
     async def resume_pending_tool(
         self, request_id: str, *, prepared: bool = False
     ) -> ToolResult | None:
         """Finish a durable approval request before starting another turn."""
 
+        await self._ensure_mcp_servers()
         state = self.store.approval_states().get(request_id)
         if state is None or state[1] is None:
             return None
@@ -234,6 +264,7 @@ class AgentLoop:
         return self._finalize_tool_results([tool_call], [None])[0]
 
     async def _run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
+        await self._ensure_mcp_servers()
         self.store.append_message(
             Message(MessageRole.USER, [TextContent(user_text)])
         )
