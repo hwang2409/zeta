@@ -12,9 +12,9 @@ from typing import Any
 from ..core.abort import AbortSignal
 from ..types import StructuredToolResult, ToolTextBlock
 from .registry import (
+    ToolRegistry,
     _BoundedText,
     _success_result,
-    ToolRegistry,
     _ToolCanceled,
 )
 
@@ -56,7 +56,7 @@ class _BoundedOutput:
 async def _drain_stream(stream: object, capture: _BoundedOutput) -> None:
     if stream is None:
         return
-    read = getattr(stream, "read")
+    read = getattr(stream, "read")  # noqa: B009 - process pipe interface
     while True:
         chunk = await read(65_536)
         if not chunk:

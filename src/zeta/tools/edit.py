@@ -15,7 +15,7 @@ import os
 from typing import TypedDict
 
 from ..types import StructuredToolResult
-from ._sandbox import open_anchored
+from ._sandbox import _path_from_fd, _path_open_error, open_parent
 from .registry import (
     AbortSignal,
     ToolRegistry,
@@ -38,21 +38,6 @@ class EditStructuredContent(TypedDict):
     sha256_after: str
 
 
-def _open_existing(
-    registry: ToolRegistry,
-    raw_path: str,
-) -> tuple[int, str]:
-    file_descriptor, _was_created, path = open_anchored(
-        registry,
-        raw_path,
-        create_parents=False,
-        open_flags=os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
-        create_file=False,
-        truncate_existing=False,
-    )
-    return file_descriptor, path
-
-
 def _count_overlapping(content: str, old_string: str) -> int:
     count = 0
     start = 0
@@ -73,43 +58,60 @@ async def _edit(
     except UnicodeEncodeError as exc:
         raise ValueError("old_string and new_string must be valid UTF-8") from exc
 
-    file_descriptor, path = _open_existing(registry, arguments["path"])
-    try:
-        with os.fdopen(file_descriptor, "r+b") as handle:
-            file_descriptor = -1
-            content_bytes = handle.read()
+    with open_parent(registry, arguments["path"], create_parents=False) as parent:
+        components, parent_fd, fallback_path = parent
+        file_descriptor: int | None = None
+        try:
             try:
-                content = content_bytes.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValueError(f"file is not valid UTF-8: {path}") from exc
-
-            match_count = _count_overlapping(content, arguments["old_string"])
-            if match_count == 0:
-                return _error_result(
-                    f"old_string not found in {arguments['path']}"
+                file_descriptor = os.open(
+                    components[-1],
+                    os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent_fd,
                 )
-            if match_count > 1:
-                return _error_result(
-                    f"old_string found {match_count} times in {arguments['path']}; "
-                    "must be unique"
-                )
-
-            updated_content = content.replace(
-                arguments["old_string"], arguments["new_string"], 1
-            )
-            updated_bytes = updated_content.encode("utf-8")
+            except OSError as open_error:
+                raise _path_open_error(fallback_path, open_error) from open_error
             try:
-                handle.seek(0)
-                handle.truncate()
-                handle.write(updated_bytes)
-                handle.flush()
+                path = _path_from_fd(file_descriptor)
             except OSError as exc:
-                raise ValueError(f"could not write file: {path}: {exc}") from exc
+                raise ValueError(
+                    f"could not resolve path: {fallback_path}: {exc}"
+                ) from exc
 
-    except (OSError, ValueError):
-        if file_descriptor >= 0:
-            os.close(file_descriptor)
-        raise
+            with os.fdopen(file_descriptor, "r+b") as handle:
+                file_descriptor = None
+                content_bytes = handle.read()
+                try:
+                    content = content_bytes.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(f"file is not valid UTF-8: {path}") from exc
+
+                match_count = _count_overlapping(content, arguments["old_string"])
+                if match_count == 0:
+                    return _error_result(
+                        f"old_string not found in {arguments['path']}"
+                    )
+                if match_count > 1:
+                    return _error_result(
+                        f"old_string found {match_count} times in {arguments['path']}; "
+                        "must be unique"
+                    )
+
+                updated_content = content.replace(
+                    arguments["old_string"], arguments["new_string"], 1
+                )
+                updated_bytes = updated_content.encode("utf-8")
+                try:
+                    handle.seek(0)
+                    handle.truncate()
+                    handle.write(updated_bytes)
+                    handle.flush()
+                except OSError as exc:
+                    raise ValueError(f"could not write file: {path}: {exc}") from exc
+
+        except (OSError, ValueError):
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+            raise
 
     structured_content: EditStructuredContent = {
         "path": path,

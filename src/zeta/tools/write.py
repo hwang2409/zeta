@@ -16,7 +16,7 @@ from typing import NotRequired, TypedDict
 
 from ..types import StructuredToolResult
 from ._sandbox import _path_from_fd as _sandbox_path_from_fd
-from ._sandbox import open_anchored
+from ._sandbox import _path_open_error, open_parent
 from .registry import AbortSignal, ToolRegistry, _success_result, text_block
 
 
@@ -43,15 +43,44 @@ def _open_anchored(
     raw_path: str,
     create_parents: bool,
 ) -> tuple[int, bool, str]:
-    return open_anchored(
-        registry,
-        raw_path,
-        create_parents=create_parents,
-        open_flags=os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-        create_file=True,
-        truncate_existing=True,
-        path_from_fd=_path_from_fd,
-    )
+    with open_parent(registry, raw_path, create_parents=create_parents) as parent:
+        components, parent_fd, fallback_path = parent
+        file_descriptor: int | None = None
+        try:
+            try:
+                file_descriptor = os.open(
+                    components[-1],
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    0o666,
+                    dir_fd=parent_fd,
+                )
+                was_created = True
+            except FileExistsError:
+                try:
+                    file_descriptor = os.open(
+                        components[-1],
+                        os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=parent_fd,
+                    )
+                except OSError as open_error:
+                    raise _path_open_error(fallback_path, open_error) from open_error
+                was_created = False
+            except OSError as open_error:
+                raise _path_open_error(fallback_path, open_error) from open_error
+
+            actual_path = _path_from_fd(file_descriptor)
+            if not was_created:
+                os.ftruncate(file_descriptor, 0)
+            result = file_descriptor, was_created, actual_path
+            file_descriptor = None
+            return result
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
 
 
 async def _write(

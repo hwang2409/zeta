@@ -18,14 +18,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from ..core.abort import AbortGenerationRegistry, AbortSignal as ToolAbortSignal
+from ..core.abort import AbortGenerationRegistry
+from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.approval import (
     ApprovalDecision,
     ApprovalGate,
     ApprovalPolicy,
     ApprovalRequest,
-    canceled_result as _canceled_result,
 )
+from ..core.approval import canceled_result as _canceled_result
 from ..core.store import ConversationStore
 from ..types import (
     StructuredContentValue,
@@ -35,7 +36,6 @@ from ..types import (
     ToolSchema,
     ToolTextBlock,
 )
-
 
 AbortSignal = ToolAbortSignal
 MAX_STRUCTURED_CONTENT_DEPTH = 32
@@ -399,7 +399,7 @@ class ToolRegistry:
             return _legacy_result(_canceled_result(tool_call.id))
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
             return _error_result(str(exc))
         if isinstance(result, ToolResult):
             if result.tool_call_id != tool_call.id:
@@ -798,9 +798,10 @@ def _validate_schema_definition(schema: Mapping[str, Any], path: str) -> None:
         names = ", ".join(sorted(unsupported))
         raise ValueError(f"unsupported schema keywords at {path}: {names}")
     expected_type = schema.get("type")
-    if expected_type is not None:
-        if type(expected_type) is not str or expected_type not in _SCHEMA_TYPES:
-            raise ValueError(f"unsupported schema type at {path}")
+    if expected_type is not None and (
+        type(expected_type) is not str or expected_type not in _SCHEMA_TYPES
+    ):
+        raise ValueError(f"unsupported schema type at {path}")
     properties = schema.get("properties")
     if properties is not None:
         if not isinstance(properties, Mapping):
