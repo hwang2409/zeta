@@ -91,6 +91,7 @@ class ConversationStore:
         *,
         session_id: str | None = None,
         cwd: str | Path | None = None,
+        bash_cwd: str | Path | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -111,6 +112,7 @@ class ConversationStore:
         self.path = self.session_dir / "conversation.jsonl"
         self.lock_path = self.session_dir / ".lock"
         self.cwd = str(cwd or Path.cwd())
+        self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
         with self._append_lock():
             self._load()
@@ -122,6 +124,7 @@ class ConversationStore:
                 "schema": SCHEMA,
                 "session_id": self.session_id,
                 "cwd": self.cwd,
+                "bash_cwd": self.bash_cwd,
                 "created_at": _now(),
             }
             self._write_line({"type": "header", "data": header})
@@ -167,17 +170,22 @@ class ConversationStore:
             raise ConversationIntegrityError(f"unsupported conversation schema: {self.path}")
         header_session_id = header_data.get("session_id")
         cwd = header_data.get("cwd")
+        bash_cwd = header_data.get("bash_cwd", cwd)
         created_at = header_data.get("created_at")
         if (
             type(header_session_id) is not str
             or not header_session_id
             or type(cwd) is not str
+            or not cwd
+            or type(bash_cwd) is not str
+            or not bash_cwd
             or type(created_at) is not str
         ):
             raise ConversationIntegrityError(
                 f"conversation header is incomplete: {self.path}"
             )
         self.cwd = cwd
+        self.bash_cwd = bash_cwd
         if header_session_id != self.session_id:
             raise ConversationIntegrityError(
                 f"conversation header session id mismatch: {self.path}"
@@ -213,6 +221,28 @@ class ConversationStore:
                 handle.write(b"\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+
+    def set_bash_cwd(self, cwd: str | Path) -> None:
+        """Persist the shell's current directory in the session header."""
+
+        resolved = str(cwd)
+        if not resolved:
+            raise ValueError("bash cwd must be a nonempty string")
+        with self._append_lock():
+            self._load()
+            rows = self.path.read_bytes().splitlines(keepends=True)
+            header = json.loads(rows[0])
+            header["data"]["bash_cwd"] = resolved
+            rows[0] = json.dumps(
+                header,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode() + b"\n"
+            with self.path.open("wb") as handle:
+                handle.writelines(rows)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.bash_cwd = resolved
 
     def _validate_entries(self) -> None:
         ids: set[str] = set()

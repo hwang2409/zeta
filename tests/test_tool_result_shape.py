@@ -198,8 +198,8 @@ async def test_builtin_tools_populate_structured_content(tmp_path: Path) -> None
     read_result = await registry.execute(
         ToolCall("read-1", "read", {"path": "note.txt"})
     )
-    list_result = await registry.execute(
-        ToolCall("list-1", "list", {"path": "."})
+    bash_result = await registry.execute(
+        ToolCall("bash-1", "bash", {"cmd": "printf bash"})
     )
     exec_result = await registry.execute(
         ToolCall("exec-1", "exec", {"command": "true"})
@@ -210,12 +210,11 @@ async def test_builtin_tools_populate_structured_content(tmp_path: Path) -> None
         "sha256": hashlib.sha256(file_path.read_bytes()).hexdigest(),
         "line_count": 2,
     }
-    assert list_result["structuredContent"] == {
-        "root": str(tmp_path),
-        "entries": [{"name": "note.txt"}],
-        "entry_count": 1,
-        "full_size": 8,
-        "truncated": False,
+    assert bash_result["structuredContent"] == {
+        "stdout": "bash",
+        "stderr": "",
+        "exit_code": 0,
+        "cwd_after": str(tmp_path),
     }
     assert exec_result["structuredContent"] == {
         "exit_code": 0,

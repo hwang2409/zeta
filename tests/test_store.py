@@ -30,6 +30,17 @@ def test_append_replay_round_trip_and_parent_links(tmp_path: Path) -> None:
     assert reopened.cwd == "/work"
 
 
+def test_bash_cwd_serializes_in_store_header(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, cwd=tmp_path, bash_cwd="/tmp")
+
+    store.set_bash_cwd("/var/tmp")
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    assert reopened.bash_cwd == "/var/tmp"
+    header = json.loads(reopened.path.read_text().splitlines()[0])
+    assert header["data"]["bash_cwd"] == "/var/tmp"
+
+
 def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(message(MessageRole.USER, "kept"))
