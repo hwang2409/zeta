@@ -14,7 +14,8 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import get_app
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
-from rich.console import Console, RenderableType
+from rich.console import Console, Group, RenderableType
+from rich.live import Live
 from rich.text import Text
 
 from ..core.approval import ApprovalPolicy, ApprovalRequest
@@ -167,6 +168,11 @@ class TUIApp:
         self._spinner_active = False
         self._spinner_frame = 0
         self._spinner_reset = asyncio.Event()
+        self._active_tool_calls: set[str] = set()
+        self._pending_tool_renders: list[RenderableType] = []
+        self._tool_region: Live | None = None
+        self._tool_region_text: Text | None = None
+        self._abort_requested = False
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
         self._approval_policy = approval_policy
@@ -310,7 +316,10 @@ class TUIApp:
     def abort_active(self) -> None:
         if self._active_task is not None and not self._active_task.done():
             self.loop.abort()
-            self._active_task.cancel()
+            if self._loop_state == "tool-running":
+                self._abort_requested = True
+            else:
+                self._active_task.cancel()
 
     def _status_toolbar(self) -> FormattedText:
         width = get_app().output.get_size().columns
@@ -333,6 +342,45 @@ class TUIApp:
     def _print(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
             self.console.print(renderable)
+
+    def _update_tool_region(self, event: StreamEvent) -> None:
+        rendered = render_event(event)
+        if not isinstance(rendered, Text):
+            return
+        if self._tool_region is None:
+            self._tool_region_text = Text()
+            self._tool_region = Live(
+                self._tool_region_text,
+                console=self.console,
+                transient=True,
+                refresh_per_second=20,
+            )
+            self._tool_region.start()
+        if self._tool_region_text is None:
+            return
+        if self._tool_region_text:
+            self._tool_region_text.append("\n")
+        self._tool_region_text.append(rendered)
+        self._tool_region.update(self._tool_region_text)
+
+    def _commit_tool_region(self) -> None:
+        final_renders = self._pending_tool_renders
+        self._pending_tool_renders = []
+        if self._tool_region is not None:
+            if final_renders:
+                self._tool_region.update(Group(*final_renders))
+            self._tool_region.stop()
+            self._tool_region = None
+            self._tool_region_text = None
+        for rendered in final_renders:
+            self._print(rendered)
+
+    def _discard_tool_region(self) -> None:
+        self._pending_tool_renders.clear()
+        if self._tool_region is not None:
+            self._tool_region.stop()
+            self._tool_region = None
+            self._tool_region_text = None
 
     def _print_committed(self, lines: list[str], *, thinking: bool = False) -> None:
         if thinking:
@@ -445,6 +493,7 @@ class TUIApp:
                 self._spinner_reset.clear()
 
     async def _consume_turn(self, user_text: str) -> None:
+        self._abort_requested = False
         self._loop_state = "streaming"
         self._streaming = True
         self._spinner_active = True
@@ -453,6 +502,7 @@ class TUIApp:
             async for event in self.loop.run_turn(user_text):
                 self._update_usage(event)
                 self._prepare_stream_event(event)
+                stop_after_tool = False
                 if self.verbose:
                     self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style=DIM))
                 if event.type is StreamEventType.MESSAGE_UPDATE:
@@ -462,9 +512,26 @@ class TUIApp:
                 if event.type is StreamEventType.TOOL_EXECUTION_START:
                     self._reset_stream_state()
                     self._loop_state = "tool-running"
+                    if event.tool_call is not None:
+                        self._active_tool_calls.add(event.tool_call.id)
                     self._present_pending_approvals()
+                elif event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
+                    self._update_tool_region(event)
                 elif event.type is StreamEventType.TOOL_EXECUTION_END:
                     self._loop_state = "streaming"
+                    if event.tool_call is not None:
+                        self._active_tool_calls.discard(event.tool_call.id)
+                    rendered = render_event(event)
+                    if rendered is not None:
+                        self._pending_tool_renders.append(rendered)
+                    if self._abort_requested:
+                        self._abort_requested = False
+                        stop_after_tool = True
+                        self._loop_state = "idle"
+                    else:
+                        stop_after_tool = False
+                    if not self._active_tool_calls:
+                        self._commit_tool_region()
                 elif event.type is StreamEventType.TURN_START:
                     self._spinner_frame = 0
                     self._spinner_reset.set()
@@ -474,8 +541,14 @@ class TUIApp:
                 elif event.type is StreamEventType.AGENT_END:
                     self._reset_stream_state()
                     self._loop_state = "idle"
-                self._print(render_event(event))
+                if event.type not in {
+                    StreamEventType.TOOL_EXECUTION_UPDATE,
+                    StreamEventType.TOOL_EXECUTION_END,
+                }:
+                    self._print(render_event(event))
                 self._invalidate_prompt()
+                if event.type is StreamEventType.TOOL_EXECUTION_END and stop_after_tool:
+                    break
         except asyncio.CancelledError:
             self._finish_stream()
             self._loop_state = "idle"
@@ -486,6 +559,9 @@ class TUIApp:
             self._loop_state = "idle"
             self._print(Text(f"[error] {exc}", style=ERROR))
         finally:
+            self._active_tool_calls.clear()
+            self._discard_tool_region()
+            self._abort_requested = False
             self._streaming = False
             self._spinner_active = False
             spinner_task.cancel()

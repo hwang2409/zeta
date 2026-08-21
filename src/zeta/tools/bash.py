@@ -9,6 +9,7 @@ state for the next call.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import os
 import shlex
 import uuid
@@ -18,7 +19,13 @@ from typing import TypedDict
 from ..core.abort import AbortSignal
 from ..types import StructuredToolResult
 from ._process import _kill_and_reap
-from .registry import ToolRegistry, _error_result, text_block
+from .registry import (
+    ToolRegistry,
+    ToolStream,
+    ToolStreamPublisher,
+    _error_result,
+    text_block,
+)
 
 
 class BashArguments(TypedDict, total=False):
@@ -56,6 +63,7 @@ async def _bash(
     registry: ToolRegistry,
     arguments: BashArguments,
     abort_signal: AbortSignal,
+    stream_publisher: ToolStreamPublisher | None = None,
 ) -> StructuredToolResult:
     start_cwd = _start_cwd(registry, arguments)
     read_fd, write_fd = os.pipe()
@@ -80,9 +88,31 @@ async def _bash(
         ]
     )
     process: asyncio.subprocess.Process | None = None
-    communicate: asyncio.Task[tuple[bytes, bytes]] | None = None
+    stdout_reader: asyncio.Task[bytes] | None = None
+    stderr_reader: asyncio.Task[bytes] | None = None
+    process_wait: asyncio.Task[int] | None = None
     abort_wait: asyncio.Task[None] | None = None
+    stdout_bytes = b""
+    stderr_bytes = b""
     reported_cwd = ""
+
+    async def read_pipe(
+        pipe: asyncio.StreamReader,
+        stream: ToolStream,
+    ) -> bytes:
+        chunks: list[bytes] = []
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        while chunk := await pipe.read(65_536):
+            chunks.append(chunk)
+            text = decoder.decode(chunk)
+            if stream_publisher is not None and not abort_signal.is_set():
+                if text:
+                    stream_publisher.publish(text, stream)
+        text = decoder.decode(b"", final=True)
+        if stream_publisher is not None and not abort_signal.is_set() and text:
+            stream_publisher.publish(text, stream)
+        return b"".join(chunks)
+
     try:
         process = await asyncio.create_subprocess_shell(
             command,
@@ -94,16 +124,26 @@ async def _bash(
         )
         os.close(write_fd)
         write_fd = -1
-        communicate = asyncio.create_task(process.communicate())
+        if process.stdout is None or process.stderr is None:
+            raise OSError("command output pipes were not created")
+        stdout_reader = asyncio.create_task(read_pipe(process.stdout, "stdout"))
+        stderr_reader = asyncio.create_task(read_pipe(process.stderr, "stderr"))
+        process_wait = asyncio.create_task(process.wait())
         abort_wait = asyncio.create_task(abort_signal.wait())
         done, _ = await asyncio.wait(
-            (communicate, abort_wait),
+            (process_wait, abort_wait),
             return_when=asyncio.FIRST_COMPLETED,
         )
-        if abort_wait in done and communicate not in done:
-            await _kill_and_reap(process, (communicate,))
+        if abort_wait in done and process_wait not in done:
+            await _kill_and_reap(
+                process,
+                (stdout_reader, stderr_reader, process_wait),
+            )
             return _error_result("tool execution canceled")
-        stdout_bytes, stderr_bytes = await communicate
+        stdout_bytes, stderr_bytes = await asyncio.gather(
+            stdout_reader,
+            stderr_reader,
+        )
         os.set_blocking(read_fd, False)
         channel_data = bytearray()
         while True:
@@ -121,8 +161,16 @@ async def _bash(
                 if Path(candidate).is_absolute():
                     reported_cwd = candidate
     except asyncio.CancelledError:
-        if process is not None and communicate is not None:
-            await _kill_and_reap(process, (communicate,))
+        if (
+            process is not None
+            and stdout_reader is not None
+            and stderr_reader is not None
+            and process_wait is not None
+        ):
+            await _kill_and_reap(
+                process,
+                (stdout_reader, stderr_reader, process_wait),
+            )
         raise
     except OSError as exc:
         raise ValueError(f"could not execute command: {exc}") from exc
@@ -159,7 +207,12 @@ async def _bash(
 def register(registry: ToolRegistry) -> None:
     registry.register(
         "bash",
-        lambda arguments, abort_signal: _bash(registry, arguments, abort_signal),
+        lambda arguments, abort_signal, stream_publisher=None: _bash(
+            registry,
+            arguments,
+            abort_signal,
+            stream_publisher,
+        ),
         description=(
             "Run a shell command. Session cwd persists after cd. "
             "Sandboxing is truly best-effort."

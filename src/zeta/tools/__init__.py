@@ -6,6 +6,7 @@ from .registry import (
     ToolDefinition,
     ToolHandler,
     ToolRegistry,
+    ToolStreamPublisher,
 )
 
 
@@ -25,5 +26,6 @@ __all__ = [
     "ToolDefinition",
     "ToolHandler",
     "ToolRegistry",
+    "ToolStreamPublisher",
     "register_default_tools",
 ]

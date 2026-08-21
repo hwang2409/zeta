@@ -19,8 +19,10 @@ from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
 
+from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
+from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings, parse_input
 from zeta.tui.render import (
@@ -260,6 +262,211 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert "README.md" in start.plain
     assert result is not None
     assert result.plain == "  ↳ [tool result] first line\n  ↳ second line"
+
+
+def test_render_event_shows_tool_output_update() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            delta="hello\n",
+            data={"stream": "stdout"},
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.plain == "  ↳ [stdout] hello\n"
+
+
+@pytest.mark.asyncio
+async def test_streamed_tool_output_is_not_repeated_at_end(tmp_path: Path) -> None:
+    call = ToolCall("call-1", "bash", {"cmd": "printf chunk"})
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend(
+                [
+                    ScriptedTurn(tool_calls=[call]),
+                    ScriptedTurn([TextContent("done")]),
+                ]
+            ),
+            ConversationStore(tmp_path),
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    rendered: list[object] = []
+    app._print = rendered.append
+
+    await app._consume_turn("prompt")
+
+    expected_start = render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    expected_end = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "stdout:\nchunk\nstderr:\n"),
+        )
+    )
+    assert expected_start is not None
+    assert expected_end is not None
+    start_idx = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == expected_start.plain
+    )
+    end_idx = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == expected_end.plain
+    )
+    tool_region = "\n".join(
+        item.plain for item in rendered[start_idx : end_idx + 1]
+    )
+    assert tool_region == f"{expected_start.plain}\n{expected_end.plain}"
+    assert "  ↳ [stdout] chunk" not in tool_region
+
+
+@pytest.mark.asyncio
+async def test_tui_overflow_final_render_is_authoritative(tmp_path: Path) -> None:
+    call = ToolCall("burst-1", "stream", {})
+    final_text = "".join(f"chunk-{index}\n" for index in range(200))
+
+    async def stream(
+        arguments: dict[str, object],
+        abort_signal: object,
+        publisher: ToolStreamPublisher,
+    ) -> str:
+        del arguments, abort_signal
+        for index in range(200):
+            publisher.publish(f"chunk-{index}\n", "stdout")
+        return final_text
+
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn(tool_calls=[call])]),
+            ConversationStore(tmp_path),
+            tools={"stream": stream},
+            max_turns=1,
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    rendered: list[object] = []
+    app._print = rendered.append
+
+    await app._consume_turn("prompt")
+
+    expected = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, final_text),
+        )
+    )
+    assert expected is not None
+    expected_start = render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    assert expected_start is not None
+    start_idx = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == expected_start.plain
+    )
+    end_idx = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == expected.plain
+    )
+    tool_region = "\n".join(
+        item.plain for item in rendered[start_idx : end_idx + 1]
+    )
+    assert tool_region == f"{expected_start.plain}\n{expected.plain}"
+    for index in range(200):
+        assert f"  ↳ [stdout] chunk-{index}" not in tool_region
+
+
+@pytest.mark.asyncio
+async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("cancel-tui", "stream", {})
+
+    async def stream(
+        arguments: dict[str, object],
+        abort_signal: object,
+        publisher: ToolStreamPublisher,
+    ) -> str:
+        del arguments, abort_signal
+        publisher.publish("first\n", "stdout")
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    store = ConversationStore(tmp_path)
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn(tool_calls=[call])]),
+            store,
+            tools={"stream": stream},
+            max_turns=1,
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    rendered: list[object] = []
+    app._print = rendered.append
+    task = asyncio.create_task(app._consume_turn("prompt"))
+    app._active_task = task
+
+    await wait_until(lambda: app._tool_region is not None)
+    app.abort_active()
+    await task
+
+    expected = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "tool execution canceled",
+                is_error=True,
+            ),
+        )
+    )
+    assert expected is not None
+    expected_start = render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    assert expected_start is not None
+    start_idx = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == expected_start.plain
+    )
+    end_idx = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == expected.plain
+    )
+    tool_region = "\n".join(
+        item.plain for item in rendered[start_idx : end_idx + 1]
+    )
+    assert tool_region == f"{expected_start.plain}\n{expected.plain}"
+    assert "  ↳ [stdout] first" not in tool_region
+    assert app._loop_state == "idle"
+    results = [
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result
+    ]
+    assert len(results) == 1
+    assert results[0] is not None
+    assert results[0].content == "tool execution canceled"
 
 
 def test_render_event_preserves_multiline_tool_result_formatting() -> None:

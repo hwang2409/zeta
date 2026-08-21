@@ -333,6 +333,18 @@ class AgentLoop:
                 return
 
             completed_tool_indexes: set[int] = set()
+            # cap advisory output at 128 events; drop the oldest update when full.
+            # final tool results stay in separate byte-complete handler buffers.
+            stream_updates: asyncio.Queue[StreamEvent] = asyncio.Queue(maxsize=128)
+
+            def enqueue_tool_update(event: StreamEvent) -> None:
+                try:
+                    stream_updates.put_nowait(event)
+                except asyncio.QueueFull:
+                    stream_updates.get_nowait()
+                    stream_updates.put_nowait(event)
+
+            active_task: asyncio.Task[StructuredToolResult] | None = None
             parallel_tasks: dict[
                 asyncio.Task[StructuredToolResult], tuple[int, ToolCall]
             ] = {}
@@ -362,23 +374,38 @@ class AgentLoop:
                                 tool_call=tool_call,
                             )
                         parallel_tasks = {
-                            asyncio.create_task(self.tool_registry.execute(tool_call)): (
-                                call_index + offset,
-                                tool_call,
-                            )
+                            asyncio.create_task(
+                                self.tool_registry.execute(
+                                    tool_call,
+                                    _stream_sink=enqueue_tool_update,
+                                )
+                            ): (call_index + offset, tool_call)
                             for offset, tool_call in enumerate(parallel_calls)
                         }
                         while parallel_tasks:
+                            update_task = asyncio.create_task(stream_updates.get())
                             done, _ = await asyncio.wait(
-                                parallel_tasks,
+                                (*parallel_tasks, update_task),
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
+                            if update_task in done:
+                                yield update_task.result()
+                            else:
+                                update_task.cancel()
+                                await asyncio.gather(
+                                    update_task,
+                                    return_exceptions=True,
+                                )
                             for task in done:
+                                if task is update_task:
+                                    continue
                                 index, tool_call = parallel_tasks.pop(task)
                                 parallel_results[index] = _validated_tool_result(
                                     task.result(),
                                     tool_call.id,
                                 )
+                        while not stream_updates.empty():
+                            yield stream_updates.get_nowait()
                         batch_end = call_index + len(parallel_calls)
                         results = self._finalize_tool_results(
                             parallel_calls,
@@ -400,8 +427,33 @@ class AgentLoop:
                         StreamEventType.TOOL_EXECUTION_START,
                         tool_call=tool_call,
                     )
+                    active_task = asyncio.create_task(
+                        self.tool_registry.execute(
+                            tool_call,
+                            _stream_sink=enqueue_tool_update,
+                        )
+                    )
                     try:
-                        result = await self.tool_registry.execute(tool_call)
+                        while True:
+                            update_task = asyncio.create_task(stream_updates.get())
+                            done, _ = await asyncio.wait(
+                                (active_task, update_task),
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if update_task in done:
+                                yield update_task.result()
+                            else:
+                                update_task.cancel()
+                                await asyncio.gather(
+                                    update_task,
+                                    return_exceptions=True,
+                                )
+                            if active_task in done:
+                                while not stream_updates.empty():
+                                    yield stream_updates.get_nowait()
+                                break
+                        result = active_task.result()
+                        active_task = None
                     except Exception as exc:
                         result = ToolResult(tool_call.id, str(exc), is_error=True)
                     result = _validated_tool_result(result, tool_call.id)
@@ -415,6 +467,10 @@ class AgentLoop:
                     call_index += 1
             except (asyncio.CancelledError, GeneratorExit):
                 pending_tasks: list[asyncio.Task[StructuredToolResult]] = []
+                await asyncio.sleep(0)
+                if active_task is not None and not active_task.done():
+                    active_task.cancel()
+                    pending_tasks.append(active_task)
                 for task, (index, tool_call) in list(parallel_tasks.items()):
                     parallel_tasks.pop(task)
                     if task.done():

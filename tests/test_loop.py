@@ -1,4 +1,5 @@
 import asyncio
+import json
 import warnings
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -7,10 +8,11 @@ from unittest.mock import patch
 import pytest
 
 from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.loop import _validated_tool_result
-from zeta.tools import ToolRegistry
+from zeta.tools import ToolRegistry, ToolStreamPublisher
 from zeta.types import (
     CompletionBackend,
     Message,
@@ -149,6 +151,288 @@ async def test_tool_call_then_next_completion(tmp_path: Path) -> None:
         "one",
         "two",
     ]
+
+
+@pytest.mark.asyncio
+async def test_bash_streams_in_order_and_persists_one_result(tmp_path: Path) -> None:
+    call = ToolCall(
+        "stream-1",
+        "bash",
+        {
+            "cmd": (
+                "printf 'one\\n'; sleep 0.05; "
+                "printf 'two\\n'; sleep 0.05; printf 'three\\n'"
+            )
+        },
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await collect(AgentLoop(backend, store).run_turn("start"))
+
+    tool_events = [
+        event
+        for event in events
+        if event.tool_call is not None and event.tool_call.id == call.id
+    ]
+    assert [event.type for event in tool_events] == [
+        StreamEventType.TOOL_EXECUTION_START,
+        StreamEventType.TOOL_EXECUTION_UPDATE,
+        StreamEventType.TOOL_EXECUTION_UPDATE,
+        StreamEventType.TOOL_EXECUTION_UPDATE,
+        StreamEventType.TOOL_EXECUTION_END,
+    ]
+    assert [event.delta for event in tool_events[1:-1]] == [
+        "one\n",
+        "two\n",
+        "three\n",
+    ]
+
+    results = [
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    ]
+    assert len(results) == 1
+    assert results[0].content == tool_events[-1].tool_result.content
+    persisted_context = backend.calls[1][0]
+    assert sum(message.tool_result is not None for message in persisted_context) == 1
+    assert all(entry.type == "message" for entry in store.entries)
+    assert "tool_execution_update" not in json.dumps(
+        [entry.to_dict() for entry in store.entries]
+    )
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+    replayed_context = await ContextAssembler(reopened).assemble()
+    assert sum(message.tool_result is not None for message in replayed_context) == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_publisher_closes_before_delayed_output(tmp_path: Path) -> None:
+    calls = [
+        ToolCall("late-1", "stream", {}),
+        ToolCall("late-2", "stream", {}),
+    ]
+    late_tasks: list[asyncio.Task[None]] = []
+    backend = FakeBackend([ScriptedTurn(tool_calls=calls)])
+
+    async def stream(
+        arguments: dict[str, object],
+        abort_signal: object,
+        publisher: ToolStreamPublisher,
+    ) -> str:
+        del arguments, abort_signal
+        publisher.publish("now", "stdout")
+
+        async def publish_late() -> None:
+            await asyncio.sleep(0)
+            publisher.publish("late", "stdout")
+
+        late_tasks.append(asyncio.create_task(publish_late()))
+        return "final"
+
+    loop = AgentLoop(
+        backend,
+        ConversationStore(tmp_path),
+        tools={"stream": stream},
+        max_turns=1,
+    )
+    events = await collect(loop.run_turn("start"))
+    await asyncio.gather(*late_tasks)
+
+    for call in calls:
+        tool_events = [event for event in events if event.tool_call == call]
+        assert [event.type for event in tool_events] == [
+            StreamEventType.TOOL_EXECUTION_START,
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            StreamEventType.TOOL_EXECUTION_END,
+        ]
+        assert tool_events[1].delta == "now"
+
+
+@pytest.mark.asyncio
+async def test_bash_streams_stdout_and_stderr_labels(tmp_path: Path) -> None:
+    call = ToolCall(
+        "split-1",
+        "bash",
+        {"cmd": "printf out; printf err >&2"},
+    )
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    events = await collect(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path),
+            max_turns=1,
+        ).run_turn("start")
+    )
+
+    updates = [
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE
+    ]
+    assert {event.data["stream"] for event in updates} == {"stdout", "stderr"}
+    assert {event.delta for event in updates} == {"out", "err"}
+
+
+@pytest.mark.asyncio
+async def test_bash_stream_preserves_split_utf8_code_points(tmp_path: Path) -> None:
+    call = ToolCall(
+        "utf8-1",
+        "bash",
+        {"cmd": "printf '\\303'; sleep 0.03; printf '\\251'"},
+    )
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    events = await collect(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path),
+            max_turns=1,
+        ).run_turn("start")
+    )
+
+    updates = [
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE
+    ]
+    assert "".join(event.delta or "" for event in updates) == "é"
+    assert all("�" not in (event.delta or "") for event in updates)
+
+
+@pytest.mark.asyncio
+async def test_bash_cancel_stops_updates_before_terminal_event(tmp_path: Path) -> None:
+    call = ToolCall(
+        "cancel-1",
+        "bash",
+        {"cmd": "printf first; sleep 5; printf second"},
+    )
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+    events: list[StreamEvent] = []
+
+    async for event in loop.run_turn("start"):
+        events.append(event)
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
+            loop.abort()
+
+    tool_events = [
+        event
+        for event in events
+        if event.tool_call is not None and event.tool_call.id == call.id
+    ]
+    end_index = next(
+        index
+        for index, event in enumerate(tool_events)
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+    assert all(
+        event.type is not StreamEventType.TOOL_EXECUTION_UPDATE
+        for event in tool_events[end_index + 1 :]
+    )
+    assert tool_events[end_index].tool_result.is_error is True
+    assert tool_events[end_index].tool_result.content == "tool execution canceled"
+    results = [message.tool_result for message in store.messages() if message.tool_result]
+    assert len(results) == 1
+    assert results[0].content == "tool execution canceled"
+    assert "tool_execution_update" not in json.dumps(
+        [entry.to_dict() for entry in store.entries]
+    )
+
+
+@pytest.mark.asyncio
+async def test_streamed_message_log_is_cadence_stable(tmp_path: Path) -> None:
+    async def run(cadence: str, root: Path) -> str:
+        call = ToolCall("stable-1", "stream", {})
+
+        async def stream(
+            arguments: dict[str, object],
+            abort_signal: object,
+            publisher: ToolStreamPublisher,
+        ) -> str:
+            del arguments, abort_signal
+            if cadence == "small":
+                publisher.publish("a", "stdout")
+                await asyncio.sleep(0.01)
+                publisher.publish("b", "stdout")
+            else:
+                publisher.publish("ab", "stdout")
+            return "ab"
+
+        backend = FakeBackend(
+            [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+        )
+        store = ConversationStore(root)
+        await collect(
+            AgentLoop(backend, store, tools={"stream": stream}).run_turn("start")
+        )
+        messages = [
+            entry.data["message"]
+            for entry in store.entries
+            if entry.type == "message"
+        ]
+        return json.dumps(messages, sort_keys=True, separators=(",", ":"))
+
+    small_chunks = await run("small", tmp_path / "small")
+    large_chunks = await run("large", tmp_path / "large")
+    assert small_chunks == large_chunks
+
+
+@pytest.mark.asyncio
+async def test_stream_update_queue_drops_oldest_without_truncating_result(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("burst-1", "stream", {})
+    chunks = [f"chunk-{index}\n" for index in range(200)]
+    final_text = "".join(chunks)
+    publish_duration = 0.0
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+
+    async def stream(
+        arguments: dict[str, object],
+        abort_signal: object,
+        publisher: ToolStreamPublisher,
+    ) -> str:
+        nonlocal publish_duration
+        del arguments, abort_signal
+        started = asyncio.get_running_loop().time()
+        for chunk in chunks:
+            publisher.publish(chunk, "stdout")
+        publish_duration = asyncio.get_running_loop().time() - started
+        return final_text
+
+    events: list[StreamEvent] = []
+    loop = AgentLoop(
+        backend,
+        ConversationStore(tmp_path),
+        tools={"stream": stream},
+        max_turns=1,
+    )
+    async for event in loop.run_turn("start"):
+        events.append(event)
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
+            await asyncio.sleep(0.001)
+
+    updates = [
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE
+    ]
+    end = next(
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+    assert publish_duration < 0.1
+    assert len(updates) == 128
+    assert updates[0].delta == "chunk-72\n"
+    assert updates[-1].delta == "chunk-199\n"
+    assert end.tool_result.content == final_text
 
 
 @pytest.mark.asyncio
