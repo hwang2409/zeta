@@ -229,7 +229,7 @@ async def test_stream_publisher_closes_before_delayed_output(tmp_path: Path) -> 
         publisher.publish("now", "stdout")
 
         async def publish_late() -> None:
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0)
             publisher.publish("late", "stdout")
 
         late_tasks.append(asyncio.create_task(publish_late()))

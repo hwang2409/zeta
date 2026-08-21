@@ -295,11 +295,30 @@ async def test_streamed_tool_output_is_not_repeated_at_end(tmp_path: Path) -> No
         console=Console(file=StringIO(), force_terminal=False),
     )
 
+    rendered: list[object] = []
+    app._print = rendered.append
+
     await app._consume_turn("prompt")
 
-    output = app.console.file.getvalue()
-    assert output.count("[stdout] chunk") == 1
-    assert "[tool result]" not in output
+    expected_start = render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    expected_end = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "stdout:\nchunk\nstderr:\n"),
+        )
+    )
+    assert expected_start is not None
+    assert expected_end is not None
+    tool_region = "\n".join(
+        item.plain
+        for item in rendered
+        if getattr(item, "plain", "").startswith(("▸ bash(", "  ↳ [tool result]"))
+    )
+    assert tool_region == f"{expected_start.plain}\n{expected_end.plain}"
+    assert "  ↳ [stdout] chunk" not in tool_region
 
 
 @pytest.mark.asyncio
@@ -341,7 +360,91 @@ async def test_tui_overflow_final_render_is_authoritative(tmp_path: Path) -> Non
         )
     )
     assert expected is not None
-    assert any(getattr(item, "plain", None) == expected.plain for item in rendered)
+    tool_region = "\n".join(
+        item.plain
+        for item in rendered
+        if getattr(item, "plain", "").startswith(("▸ stream(", "  ↳ [tool result]"))
+    )
+    expected_start = render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    assert expected_start is not None
+    assert tool_region == f"{expected_start.plain}\n{expected.plain}"
+    for index in range(200):
+        assert f"  ↳ [stdout] chunk-{index}" not in tool_region
+
+
+@pytest.mark.asyncio
+async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("cancel-tui", "stream", {})
+
+    async def stream(
+        arguments: dict[str, object],
+        abort_signal: object,
+        publisher: ToolStreamPublisher,
+    ) -> str:
+        del arguments, abort_signal
+        publisher.publish("first\n", "stdout")
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    store = ConversationStore(tmp_path)
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn(tool_calls=[call])]),
+            store,
+            tools={"stream": stream},
+            max_turns=1,
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    rendered: list[object] = []
+    app._print = rendered.append
+    task = asyncio.create_task(app._consume_turn("prompt"))
+    app._active_task = task
+
+    await wait_until(lambda: app._tool_region is not None)
+    app.abort_active()
+    await task
+
+    expected = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "tool execution canceled",
+                is_error=True,
+            ),
+        )
+    )
+    assert expected is not None
+    tool_region = "\n".join(
+        item.plain
+        for item in rendered
+        if getattr(item, "plain", "").startswith(
+            ("▸ stream(", "  ↳ [tool error]")
+        )
+    )
+    expected_start = render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    assert expected_start is not None
+    assert tool_region == f"{expected_start.plain}\n{expected.plain}"
+    assert "  ↳ [stdout] first" not in tool_region
+    assert app._loop_state == "idle"
+    results = [
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result
+    ]
+    assert len(results) == 1
+    assert results[0] is not None
+    assert results[0].content == "tool execution canceled"
 
 
 def test_render_event_preserves_multiline_tool_result_formatting() -> None:
