@@ -18,7 +18,6 @@ from .registry import (
     _yield_for_abort,
 )
 
-
 MAX_ENTRIES_SHOWN = 1_024
 
 

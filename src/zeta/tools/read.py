@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import codecs
 import hashlib
-from pathlib import Path
 from typing import Any
 
 from ..core.abort import AbortSignal

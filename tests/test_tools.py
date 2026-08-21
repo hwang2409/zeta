@@ -211,6 +211,164 @@ async def test_write_reports_overwrite(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_edit_replaces_unique_string_with_structured_result(tmp_path: Path) -> None:
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("before: old\n", encoding="utf-8")
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "edit-unique",
+            "edit",
+            {"path": "note.txt", "old_string": "old", "new_string": "new"},
+        )
+    )
+
+    updated = b"before: new\n"
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == (
+        f"edited {file_path}: 12 bytes → 12 bytes"
+    )
+    assert result["structuredContent"] == {
+        "path": str(file_path),
+        "bytes_before": 12,
+        "bytes_after": 12,
+        "sha256_after": hashlib.sha256(updated).hexdigest(),
+    }
+    assert file_path.read_bytes() == updated
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "old_string", "message"),
+    [
+        ("one", "missing", "old_string not found in note.txt"),
+        (
+            "old and old",
+            "old",
+            "old_string found 2 times in note.txt; must be unique",
+        ),
+    ],
+)
+async def test_edit_requires_one_match(
+    tmp_path: Path,
+    content: str,
+    old_string: str,
+    message: str,
+) -> None:
+    file_path = tmp_path / "note.txt"
+    file_path.write_text(content, encoding="utf-8")
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "edit-match-count",
+            "edit",
+            {"path": "note.txt", "old_string": old_string, "new_string": "new"},
+        )
+    )
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == message
+    assert result["structuredContent"] is None
+    assert file_path.read_text(encoding="utf-8") == content
+
+
+@pytest.mark.asyncio
+async def test_edit_rejects_overlapping_matches(tmp_path: Path) -> None:
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("aaa", encoding="utf-8")
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "edit-overlap",
+            "edit",
+            {"path": "note.txt", "old_string": "aa", "new_string": "X"},
+        )
+    )
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == (
+        "old_string found 2 times in note.txt; must be unique"
+    )
+    assert file_path.read_text(encoding="utf-8") == "aaa"
+
+
+@pytest.mark.asyncio
+async def test_edit_preserves_utf8_and_reports_byte_lengths(tmp_path: Path) -> None:
+    file_path = tmp_path / "unicode.txt"
+    file_path.write_text("café: 世界\n", encoding="utf-8")
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "edit-unicode",
+            "edit",
+            {"path": "unicode.txt", "old_string": "世界", "new_string": "мир"},
+        )
+    )
+
+    updated = "café: мир\n".encode()
+    assert result["isError"] is False
+    assert result["structuredContent"] == {
+        "path": str(file_path),
+        "bytes_before": len("café: 世界\n".encode()),
+        "bytes_after": len(updated),
+        "sha256_after": hashlib.sha256(updated).hexdigest(),
+    }
+    assert file_path.read_bytes() == updated
+
+
+@pytest.mark.asyncio
+async def test_edit_rejects_path_outside_session_cwd(tmp_path: Path) -> None:
+    session_cwd = tmp_path / "session"
+    session_cwd.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("old", encoding="utf-8")
+    registry = ToolRegistry(session_cwd)
+
+    result = await registry.execute(
+        ToolCall(
+            "edit-outside",
+            "edit",
+            {"path": str(outside), "old_string": "old", "new_string": "new"},
+        )
+    )
+
+    assert result["isError"] is True
+    assert "escaped sandbox" in result["content"][0]["text"]
+    assert outside.read_text(encoding="utf-8") == "old"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"path": "note.txt", "old_string": "old"},
+        {"path": "note.txt", "new_string": "new"},
+        {
+            "path": "note.txt",
+            "old_string": "old",
+            "new_string": "new",
+            "extra": True,
+        },
+        {"path": "note.txt", "old_string": 1, "new_string": "new"},
+    ],
+)
+async def test_registry_rejects_malformed_edit_arguments(
+    tmp_path: Path,
+    arguments: dict[str, object],
+) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(ToolCall("edit-invalid", "edit", arguments))
+
+    assert result["isError"] is True
+    assert "invalid arguments" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_write_getpath_failure_does_not_truncate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "getpath-failure.txt"
     target.write_text("original", encoding="utf-8")
