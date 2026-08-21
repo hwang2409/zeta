@@ -64,11 +64,8 @@ def _path_open_error(path: Path, error: OSError) -> ValueError:
     return ValueError(f"could not open path: {path}: {error}")
 
 
-def _path_from_fd(file_descriptor: int, fallback: Path) -> str:
-    get_path = getattr(fcntl, "F_GETPATH", None)
-    if get_path is None:
-        return str(fallback)
-    encoded_path = fcntl.fcntl(file_descriptor, get_path, b"\0" * 1024)
+def _path_from_fd(file_descriptor: int) -> str:
+    encoded_path = fcntl.fcntl(file_descriptor, fcntl.F_GETPATH, b"\0" * 1024)
     return bytes(encoded_path).split(b"\0", 1)[0].decode("utf-8")
 
 
@@ -143,7 +140,7 @@ def _open_anchored(
         except OSError as open_error:
             raise _path_open_error(fallback_path, open_error) from open_error
 
-        actual_path = _path_from_fd(file_descriptor, fallback_path)
+        actual_path = _path_from_fd(file_descriptor)
         result = file_descriptor, was_created, actual_path
         file_descriptor = None
         return result
