@@ -35,10 +35,12 @@ from ..types import (
 )
 from .composer import build_key_bindings, history_for, parse_input
 from .render import MarkdownStream, format_status, render_event
+from .theme import BODY, CHROME, DIM, ERROR, RICH_THEME, USER_PREFIX
 
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
+SPINNER_INTERVAL = 0.2
 
 
 def _zeta_home() -> Path:
@@ -149,7 +151,7 @@ class TUIApp:
         self.provider = provider
         self.model = model
         self.verbose = verbose
-        self.console = console or Console()
+        self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
         self._queued: deque[str] = deque()
         self._exit_requested = False
@@ -160,6 +162,10 @@ class TUIApp:
         self._markdown_stream = MarkdownStream()
         self._stream_kind: str | None = None
         self._partial = ""
+        self._streaming = False
+        self._spinner_active = False
+        self._spinner_frame = 0
+        self._spinner_reset = asyncio.Event()
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
         self._approval_policy = approval_policy
@@ -271,8 +277,8 @@ class TUIApp:
             multiline=True,
             style=Style.from_dict(
                 {
-                    "prompt": "#c6ff4a bold",
-                    "bottom-toolbar": "#0b0c0a #c6ff4a",
+                    "prompt": USER_PREFIX,
+                    "bottom-toolbar": CHROME,
                 }
             ),
         )
@@ -287,12 +293,20 @@ class TUIApp:
             self._active_task.cancel()
 
     def _status_toolbar(self) -> FormattedText:
+        width = get_app().output.get_size().columns
         status = format_status(
             self.provider,
             self.model,
             self._loop_state,
             self._usage,
             self._partial,
+            session_id=self.loop.store.session_id[:8],
+            token_count=self.loop.context_assembler.token_count,
+            retained_tail=self.loop.context_assembler.retained_tail,
+            streaming=self._streaming,
+            width=width,
+            spinner_frame=self._spinner_frame,
+            spinner_active=self._spinner_active,
         )
         return FormattedText([("class:bottom-toolbar", status.plain)])
 
@@ -303,7 +317,7 @@ class TUIApp:
     def _print_committed(self, lines: list[str], *, thinking: bool = False) -> None:
         if thinking:
             for line in lines:
-                self._print(Text(f"[thinking] {line}", style="dim italic"))
+                self._print(Text(f"[thinking] {line}", style=DIM))
             return
         for line in lines:
             for renderable in self._markdown_stream.consume(line):
@@ -344,6 +358,7 @@ class TUIApp:
             thinking = True
         if not value:
             return
+        self._streaming = True
         stream_kind = "thinking" if thinking else "assistant"
         if self._stream_kind is not None and self._stream_kind != stream_kind:
             self._flush_pending_stream()
@@ -360,19 +375,22 @@ class TUIApp:
     def _reset_stream_state(self) -> None:
         self._reset_stream_buffers()
         self._partial = ""
+        self._streaming = False
 
     def _reset_stream_buffers(self) -> None:
         self._assistant_lines.value = ""
         self._thinking_lines.value = ""
 
     def _print_user(self, user_text: str) -> None:
-        self.console.print(Text(f"[user] {user_text}", style="bold"))
+        self.console.print(
+            Text.assemble(("[user] ", USER_PREFIX), (user_text, BODY))
+        )
 
     def _start_queued_turn(self) -> None:
         if self._queued:
             user_text = self._queued.popleft()
             self._print_user(user_text)
-            self.console.print(Text("[queued]", style="dim"))
+            self.console.print(Text("[queued]", style=DIM))
             self._start_turn(user_text)
 
     def _prepare_stream_event(self, event: StreamEvent) -> None:
@@ -390,14 +408,30 @@ class TUIApp:
         ):
             self._flush_pending_stream()
 
+    async def _pulse_spinner(self) -> None:
+        while True:
+            try:
+                await asyncio.wait_for(
+                    self._spinner_reset.wait(), timeout=SPINNER_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                if self._spinner_active:
+                    self._spinner_frame += 1
+                    self._invalidate_prompt()
+            else:
+                self._spinner_reset.clear()
+
     async def _consume_turn(self, user_text: str) -> None:
         self._loop_state = "streaming"
+        self._streaming = True
+        self._spinner_active = True
+        spinner_task = asyncio.create_task(self._pulse_spinner())
         try:
             async for event in self.loop.run_turn(user_text):
                 self._update_usage(event)
                 self._prepare_stream_event(event)
                 if self.verbose:
-                    self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style="dim"))
+                    self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style=DIM))
                 if event.type is StreamEventType.MESSAGE_UPDATE:
                     self._consume_text(event)
                     self._invalidate_prompt()
@@ -408,6 +442,12 @@ class TUIApp:
                     self._present_pending_approvals()
                 elif event.type is StreamEventType.TOOL_EXECUTION_END:
                     self._loop_state = "streaming"
+                elif event.type is StreamEventType.TURN_START:
+                    self._spinner_frame = 0
+                    self._spinner_reset.set()
+                    self._streaming = True
+                elif event.type is StreamEventType.MESSAGE_END:
+                    self._streaming = False
                 elif event.type is StreamEventType.AGENT_END:
                     self._reset_stream_state()
                     self._loop_state = "idle"
@@ -416,12 +456,17 @@ class TUIApp:
         except asyncio.CancelledError:
             self._finish_stream()
             self._loop_state = "idle"
-            self._print(Text("[aborted]", style="yellow"))
+            self._print(Text("[aborted]", style=ERROR))
             raise
         except Exception as exc:
             self._finish_stream()
             self._loop_state = "idle"
-            self._print(Text(f"[error] {exc}", style="bold red"))
+            self._print(Text(f"[error] {exc}", style=ERROR))
+        finally:
+            self._streaming = False
+            self._spinner_active = False
+            spinner_task.cancel()
+            await asyncio.gather(spinner_task, return_exceptions=True)
 
     async def _read_prompt(self, session: PromptSession[str]) -> str | None:
         try:

@@ -23,7 +23,14 @@ from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings, parse_input
-from zeta.tui.render import MarkdownStream, format_status, render_event
+from zeta.tui.render import (
+    MarkdownStream,
+    format_status,
+    render_code,
+    render_event,
+    render_markdown,
+)
+from zeta.tui.theme import ACCENT, BODY, CODE_BG
 from zeta.types import (
     CompletionBackend,
     ErrorInfo,
@@ -162,6 +169,62 @@ class StreamingToolBackend(CompletionBackend):
         )
 
 
+class OrderedToolBackend(CompletionBackend):
+    def __init__(self, calls: list[ToolCall]) -> None:
+        self.calls = calls
+        self.index = 0
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        call_index = self.index
+        self.index += 1
+        if call_index in {0, 2}:
+            call = self.calls[call_index // 2]
+            text = f"assistant {call_index // 2 + 1}\n"
+            blocks = [TextContent(text), ToolUseContent(call)]
+        else:
+            blocks = [TextContent(f"assistant after tool {call_index}\n")]
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[0])
+        if len(blocks) > 1:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[1])
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+class SlowSecondCompletionBackend(CompletionBackend):
+    def __init__(self, call: ToolCall) -> None:
+        self.call = call
+        self.second_started = asyncio.Event()
+        self.release_second = asyncio.Event()
+        self.index = 0
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        index = self.index
+        self.index += 1
+        if index == 0:
+            blocks = [TextContent("before tool\n"), ToolUseContent(self.call)]
+        else:
+            blocks = [TextContent("after tool")]
+            self.second_started.set()
+            await self.release_second.wait()
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[0])
+        if len(blocks) > 1:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[1])
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 async def wait_until(check: Callable[[], bool]) -> None:
     for _ in range(100):
         if check():
@@ -193,9 +256,38 @@ def test_render_event_compacts_tool_call_and_result() -> None:
         )
     )
 
-    assert start is not None and "[tool] read" in start.plain
+    assert start is not None and start.plain.startswith("▸ read(")
     assert "README.md" in start.plain
-    assert result is not None and result.plain == "[tool result] first line"
+    assert result is not None
+    assert result.plain == "  ↳ [tool result] first line\n  ↳ second line"
+
+
+def test_render_event_preserves_multiline_tool_result_formatting() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_result=ToolResult("call-1", "first\n\n  third"),
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.plain == "  ↳ [tool result] first\n  ↳ \n  ↳   third"
+
+
+def test_render_helpers_use_the_zeta_palette() -> None:
+    markdown = render_markdown("# heading")
+    code = render_code("print('hi')", "python")
+    start = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=ToolCall("call-1", "read", {}),
+        )
+    )
+
+    assert markdown.style == BODY
+    assert code.background_color == CODE_BG
+    assert start is not None
+    assert any(span.style == ACCENT for span in start.spans)
 
 
 def test_render_event_error_is_visible() -> None:
@@ -513,6 +605,222 @@ def test_status_includes_provider_state_and_usage() -> None:
     status = format_status("fake", "offline", "streaming", {"input_tokens": 2}, "partial")
 
     assert status.plain == " fake/offline  streaming  tokens in=2 out=0  |  partial"
+
+
+def test_status_bar_includes_session_context_and_streaming_indicator() -> None:
+    status = format_status(
+        "codex",
+        "gpt-5.4",
+        "streaming",
+        {"input_tokens": 5, "output_tokens": 121},
+        session_id="abc12345",
+        token_count=42,
+        retained_tail=8,
+        streaming=True,
+        width=120,
+        spinner_frame=1,
+    )
+
+    assert len(status.plain) <= 120
+    assert "mode streaming" in status.plain
+    assert "tok 5/121" in status.plain
+    assert "codex/gpt-5.4" in status.plain
+    assert "s:abc12" in status.plain
+    assert "tail 8" in status.plain
+
+
+def test_status_bar_fits_segments_and_pulses() -> None:
+    statuses = [
+        format_status(
+            "codex",
+            "gpt-5.4",
+            "streaming",
+            {"input_tokens": 5, "output_tokens": 121},
+            session_id="abc12345",
+            retained_tail=8,
+            streaming=True,
+            width=width,
+            spinner_frame=frame,
+        )
+        for width, frame in ((80, 0), (120, 1), (200, 2))
+    ]
+
+    assert all(len(status.plain) <= width for status, width in zip(statuses, (80, 120, 200)))
+    assert all("mode streaming" in status.plain and "tok 5/121" in status.plain for status in statuses)
+    assert all(marker in statuses[index].plain for index, marker in enumerate(("·", "•", "●")))
+    assert all(value in statuses[1].plain for value in ("codex/gpt-5.4", "s:abc12", "tail 8"))
+    assert all(value in statuses[2].plain for value in ("codex/gpt-5.4", "s:abc12", "tail 8"))
+    assert "  |  " in statuses[2].plain
+
+    narrow = format_status(
+        "provider-with-a-long-name",
+        "model-with-a-long-name-that-does-not-fit",
+        "streaming",
+        {"input_tokens": 5, "output_tokens": 121},
+        session_id="abcdef1234567890",
+        retained_tail=8,
+        streaming=True,
+        width=80,
+    )
+    assert len(narrow.plain) <= 80
+    assert "mode streaming" in narrow.plain
+    assert "tok 5/121" in narrow.plain
+
+    cleared = format_status(
+        "codex",
+        "gpt-5.4",
+        "idle",
+        session_id="abc12345",
+        retained_tail=8,
+        streaming=False,
+        width=80,
+    )
+    assert not any(marker in cleared.plain for marker in ("·", "•", "●"))
+
+
+def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+        ),
+        provider="fake",
+        model="offline",
+    )
+    app._update_usage(
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            data={"usage": {"input_tokens": 5, "output_tokens": 121}},
+        )
+    )
+
+    toolbar = app._status_toolbar()
+    plain = "".join(value for _, value in toolbar)
+    assert "tok 5/121" in plain
+
+
+def test_status_toolbar_does_not_advance_spinner_frame(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._spinner_frame = 0
+    app._streaming = False
+    app._status_toolbar()
+    assert app._spinner_frame == 0
+
+    app._streaming = True
+    app._status_toolbar()
+    assert app._spinner_frame == 0
+
+
+@pytest.mark.asyncio
+async def test_spinner_pulses_on_timer(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._streaming = True
+    app._spinner_active = True
+    task = asyncio.create_task(app._pulse_spinner())
+    await asyncio.sleep(0.45)
+    app._streaming = False
+    app._spinner_active = False
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert app._spinner_frame >= 2
+
+
+@pytest.mark.asyncio
+async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> None:
+    call = ToolCall("call-1", "read", {})
+    backend = SlowSecondCompletionBackend(call)
+    tool_started = asyncio.Event()
+
+    async def slow_tool(_: dict[str, object]) -> str:
+        tool_started.set()
+        await asyncio.sleep(0.8)
+        return "tool result"
+
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            tools={"read": slow_tool},
+        ),
+        provider="fake",
+        model="offline",
+    )
+
+    turn = asyncio.create_task(app._consume_turn("prompt"))
+
+    async def observe_tool_spinner() -> tuple[int, int, str]:
+        await tool_started.wait()
+        frame_before = app._spinner_frame
+        await asyncio.sleep(0.75)
+        frame_after = app._spinner_frame
+        toolbar = "".join(value for _, value in app._status_toolbar())
+        return frame_before, frame_after, toolbar
+
+    frame_before, frame_after, during_tool_toolbar = await asyncio.wait_for(
+        observe_tool_spinner(), timeout=2.0
+    )
+    await backend.second_started.wait()
+    starting_frame = app._spinner_frame
+    await asyncio.sleep(0.06)
+    first_provider_frame = app._spinner_frame
+    await asyncio.sleep(0.39)
+    ending_frame = app._spinner_frame
+    backend.release_second.set()
+    await turn
+
+    assert app._streaming is False
+    assert frame_after > frame_before, "spinner did not advance during tool execution"
+    assert any(marker in during_tool_toolbar for marker in ("·", "•", "●"))
+    assert starting_frame == 0
+    assert first_provider_frame == 0
+    assert app._spinner_frame >= 1
+    assert ending_frame - starting_frame >= 2
+
+
+@pytest.mark.asyncio
+async def test_full_session_preserves_assistant_tool_user_order(tmp_path: Path) -> None:
+    calls = [ToolCall("call-1", "read", {}), ToolCall("call-2", "read", {})]
+    backend = OrderedToolBackend(calls)
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            tools={"read": lambda _: "tool result"},
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    app._print_user("first user")
+    await app._consume_turn("first user")
+    app._print_user("second user")
+    await app._consume_turn("second user")
+
+    rendered = output.getvalue()
+    first_result = rendered.index("[tool result] tool result")
+    second_result = rendered.rindex("[tool result] tool result")
+    markers = [
+        rendered.index("[user] first user"),
+        rendered.index("assistant 1"),
+        rendered.index("▸ read("),
+        first_result,
+        rendered.index("assistant after tool 1"),
+        rendered.index("[user] second user"),
+        rendered.index("assistant 2"),
+        second_result,
+    ]
+    assert markers == sorted(markers)
 
 
 @pytest.mark.asyncio
