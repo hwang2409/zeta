@@ -18,7 +18,7 @@ from rich.console import Console, RenderableType
 from rich.text import Text
 
 from ..core.approval import ApprovalPolicy, ApprovalRequest
-from ..core.loop import AgentLoop
+from ..loop import AgentLoop
 from ..core.session import SessionError, SessionManager, env_home
 from ..providers.anthropic import AnthropicBackend
 from ..providers.anthropic import AnthropicCredentialStore
@@ -580,4 +580,13 @@ __all__ = [
     "TUIApp",
     "create_app",
     "build_backend",
+    "main",
 ]
+
+
+def __getattr__(name: str) -> object:
+    if name == "main":
+        from ..cli import main
+
+        return main
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

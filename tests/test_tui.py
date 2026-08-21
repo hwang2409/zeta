@@ -439,7 +439,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
         [
             sys.executable,
             "-c",
-            "from zeta.cli import main; raise SystemExit(main(['--provider', 'fake']))",
+            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'fake']))",
         ],
         stdin=slave_fd,
         stdout=slave_fd,
@@ -469,6 +469,29 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
             process.kill()
             process.wait()
         os.close(master_fd)
+
+
+def test_main_import_compatibility() -> None:
+    from zeta.cli import main as cli_main
+    from zeta.tui import main as tui_main
+    from zeta.tui.app import main as app_main
+
+    assert tui_main is cli_main
+    assert app_main is cli_main
+
+
+def test_tui_import_does_not_load_cli() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import zeta.tui; raise SystemExit('zeta.cli' in sys.modules)",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_markdown_stream_renders_complete_table() -> None:

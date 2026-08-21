@@ -33,7 +33,7 @@ from .core.context import (
     SummaryInputTooLarge,
 )
 from .core.fake import FakeBackend, ScriptedTurn
-from .core.loop import AgentLoop
+from .loop import AgentLoop
 from .core.session import (
     META_VERSION,
     OpenedSession,

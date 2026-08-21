@@ -7,8 +7,6 @@ import copy
 import inspect
 import json
 import math
-import os
-import signal
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,25 +41,6 @@ async def _yield_for_abort(
     await asyncio.sleep(0)
     if _signal_is_set(abort_signal):
         raise _ToolCanceled()
-
-
-class _BoundedOutput:
-    def __init__(self, limit: int) -> None:
-        self.limit = limit
-        self._data = bytearray()
-
-    @property
-    def data(self) -> bytes:
-        return bytes(self._data)
-
-    @property
-    def retained_bytes(self) -> int:
-        return len(self._data)
-
-    def append(self, chunk: bytes) -> None:
-        remaining = self.limit - len(self._data)
-        if remaining > 0:
-            self._data.extend(chunk[:remaining])
 
 
 class _BoundedText:
@@ -660,57 +639,6 @@ def _validate_schema_definition(schema: Mapping[str, Any], path: str) -> None:
 
 def _signal_is_set(signal_state: ToolAbortSignal) -> bool:
     return signal_state.is_set()
-
-
-async def _wait_for_abort(signal_state: ToolAbortSignal) -> None:
-    await signal_state.wait()
-
-
-async def _drain_stream(stream: object, capture: _BoundedOutput) -> None:
-    if stream is None:
-        return
-    read = getattr(stream, "read")
-    while True:
-        chunk = await read(65_536)
-        if not chunk:
-            return
-        capture.append(chunk)
-
-
-async def _kill_and_reap(
-    process: asyncio.subprocess.Process,
-    process_tasks: Sequence[asyncio.Task[Any]],
-) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        process.kill()
-    for task in process_tasks:
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                current = asyncio.current_task()
-                if current is not None:
-                    current.uncancel()
-        if not task.cancelled():
-            task.exception()
-
-
-def _format_exec_result(
-    returncode: int | None,
-    stdout: bytes,
-    stderr: bytes,
-    output_limit: int,
-    *,
-    suffix: str | None = None,
-) -> str:
-    output = f"stdout:\n{stdout.decode(errors='replace')}\nstderr:\n{stderr.decode(errors='replace')}"
-    if suffix:
-        output = f"{suffix}\n{output}"
-    return _truncate(f"exit_code: {returncode}\n{output}", output_limit)
 
 
 def _truncate(value: str, limit: int) -> str:
