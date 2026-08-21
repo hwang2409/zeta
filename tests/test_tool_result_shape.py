@@ -122,6 +122,29 @@ async def test_dispatch_rejects_cyclic_structured_content(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_dispatch_accepts_aliased_structured_content(tmp_path: Path) -> None:
+    shared: list[StructuredContentValue] = []
+    structured_content: dict[str, StructuredContentValue] = {
+        "left": shared,
+        "right": shared,
+    }
+    handler_result: StructuredToolResult = {
+        "content": [
+            {"type": "text", "text": "good", "truncated": False, "full_size": 4}
+        ],
+        "isError": False,
+        "structuredContent": structured_content,
+    }
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register("alias", lambda arguments: handler_result)
+
+    result = await registry.execute(ToolCall("alias-1", "alias", {}))
+
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "good"
+
+
+@pytest.mark.asyncio
 async def test_dispatch_rejects_deep_structured_content(tmp_path: Path) -> None:
     structured_content: dict[str, StructuredContentValue] = {}
     current = structured_content

@@ -605,10 +605,13 @@ def validate_tool_result(result: object) -> StructuredToolResult:
 
 
 def _validate_structured_content(value: object) -> None:
-    pending: list[tuple[object, int]] = [(value, 0)]
-    seen: set[int] = set()
+    pending: list[tuple[object, int, bool]] = [(value, 0, False)]
+    active: set[int] = set()
     while pending:
-        current, depth = pending.pop()
+        current, depth, leaving = pending.pop()
+        if leaving:
+            active.remove(id(current))
+            continue
         if depth > MAX_STRUCTURED_CONTENT_DEPTH:
             raise ValueError(
                 f"structuredContent depth > {MAX_STRUCTURED_CONTENT_DEPTH}"
@@ -618,16 +621,19 @@ def _validate_structured_content(value: object) -> None:
         if type(current) not in {list, dict}:
             raise ValueError("structuredContent must contain JSON values")
         current_id = id(current)
-        if current_id in seen:
+        if current_id in active:
             raise ValueError("cyclic structuredContent")
-        seen.add(current_id)
+        active.add(current_id)
         if type(current) is list:
-            pending.extend((item, depth + 1) for item in current)
+            pending.append((current, depth, True))
+            pending.extend((item, depth + 1, False) for item in reversed(current))
             continue
-        for key, item in current.items():
+        items = list(current.items())
+        pending.append((current, depth, True))
+        for key, item in reversed(items):
             if type(key) is not str:
                 raise ValueError("structuredContent object keys must be strings")
-            pending.append((item, depth + 1))
+            pending.append((item, depth + 1, False))
 
 
 def _normalize_schema(schema: Mapping[str, Any] | None) -> dict[str, Any]:
