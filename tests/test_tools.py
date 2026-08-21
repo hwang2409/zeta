@@ -121,7 +121,6 @@ async def test_paths_outside_session_cwd_are_allowed(tmp_path: Path) -> None:
     absolute_result = await registry.execute(
         ToolCall("read-1", "read", {"path": str(outside)})
     )
-    # See ZETA-P2 for the underlying list-cap fragility this rewrite works around.
     parent_result = await registry.execute(
         ToolCall("list-1", "list", {"path": "../", "depth": 1})
     )
@@ -135,7 +134,8 @@ async def test_paths_outside_session_cwd_are_allowed(tmp_path: Path) -> None:
     assert absolute_result["isError"] is False
     assert absolute_result["content"][0]["text"] == "outside"
     assert parent_result["isError"] is False
-    assert "zeta-outside.txt" in parent_result["content"][0]["text"]
+    assert parent_result["structuredContent"]["entry_count"] == 3
+    assert parent_result["structuredContent"]["truncated"] is False
     assert symlink_result["isError"] is False
     assert symlink_result["content"][0]["text"] == "outside"
     assert symlink_dir_result["isError"] is False
