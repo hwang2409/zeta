@@ -1,4 +1,6 @@
 import asyncio
+import errno
+import fcntl
 import hashlib
 import math
 import os
@@ -207,6 +209,49 @@ async def test_write_reports_overwrite(tmp_path: Path) -> None:
         "was_overwritten": True,
     }
     assert file_path.read_text(encoding="utf-8") == "new"
+
+
+@pytest.mark.asyncio
+async def test_write_getpath_failure_does_not_truncate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "getpath-failure.txt"
+    target.write_text("original", encoding="utf-8")
+    registry = ToolRegistry(tmp_path)
+
+    def fail_getpath(file_descriptor: int) -> str:
+        raise OSError("injected F_GETPATH failure")
+
+    monkeypatch.setattr(write_module, "_path_from_fd", fail_getpath)
+    result = await registry.execute(
+        ToolCall("write-getpath-failure", "write", {"path": target.name, "content": "new"})
+    )
+
+    assert result["isError"] is True
+    assert target.read_text(encoding="utf-8") == "original"
+
+
+@pytest.mark.asyncio
+async def test_write_fdopen_failure_closes_raw_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "fdopen-failure.txt"
+    registry = ToolRegistry(tmp_path)
+    raw_fds: list[int] = []
+
+    def fail_fdopen(file_descriptor: int, mode: str) -> object:
+        raw_fds.append(file_descriptor)
+        raise OSError("injected fdopen failure")
+
+    monkeypatch.setattr(write_module.os, "fdopen", fail_fdopen)
+    result = await registry.execute(
+        ToolCall("write-fdopen-failure", "write", {"path": target.name, "content": "x"})
+    )
+
+    assert result["isError"] is True
+    assert len(raw_fds) == 1
+    with pytest.raises(OSError) as error:
+        fcntl.fcntl(raw_fds[0], fcntl.F_GETFD)
+    assert error.value.errno == errno.EBADF
 
 
 @pytest.mark.asyncio

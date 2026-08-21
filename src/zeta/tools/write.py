@@ -1,4 +1,12 @@
-"""The built-in file writing tool."""
+"""The built-in file writing tool.
+
+Sandbox
+-------
+Layer A rejects lexical paths outside the session cwd. The anchored openat
+walk, O_EXCL/O_TRUNC selection, and O_NOFOLLOW checks are best effort.
+TOCTOU races, hard-link writes, and ancestor-symlink swaps are out of scope
+for ZETA-15 and tracked in ZETA-22.
+"""
 
 from __future__ import annotations
 
@@ -127,7 +135,7 @@ def _open_anchored(
             try:
                 file_descriptor = os.open(
                     basename,
-                    os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                     dir_fd=parent_fd,
                 )
             except OSError as open_error:
@@ -137,6 +145,8 @@ def _open_anchored(
             raise _path_open_error(fallback_path, open_error) from open_error
 
         actual_path = _path_from_fd(file_descriptor)
+        if not was_created:
+            os.ftruncate(file_descriptor, 0)
         result = file_descriptor, was_created, actual_path
         file_descriptor = None
         return result
@@ -165,7 +175,13 @@ async def _write(
     )
 
     try:
-        with os.fdopen(file_descriptor, "wb") as handle:
+        handle = os.fdopen(file_descriptor, "wb")
+    except (OSError, ValueError):
+        os.close(file_descriptor)
+        raise
+
+    try:
+        with handle:
             handle.write(encoded_content)
     except OSError as exc:
         raise ValueError(f"could not write file: {path}: {exc}") from exc
