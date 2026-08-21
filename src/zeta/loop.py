@@ -18,11 +18,13 @@ from .types import (
     MessageRole,
     StreamEvent,
     StreamEventType,
+    StructuredToolResult,
     TextContent,
     ThinkingContent,
     ToolCall,
     ToolResult,
     ToolSchema,
+    ToolTextBlock,
     ToolUseContent,
 )
 
@@ -48,21 +50,59 @@ def _task_is_cancelling() -> bool:
 
 
 def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
-    if not isinstance(result, ToolResult):
-        return ToolResult(expected_id, "invalid tool result: expected ToolResult", True)
-    if type(result.tool_call_id) is not str or not result.tool_call_id:
-        return ToolResult(expected_id, "invalid tool result: call id", True)
-    if type(result.content) is not str:
-        return ToolResult(expected_id, "invalid tool result: content", True)
-    if type(result.is_error) is not bool:
-        return ToolResult(expected_id, "invalid tool result: is_error", True)
-    if result.tool_call_id != expected_id:
+    if isinstance(result, ToolResult):
+        if type(result.tool_call_id) is not str or not result.tool_call_id:
+            return ToolResult(expected_id, "invalid tool result: call id", True)
+        if type(result.content) is not str:
+            return ToolResult(expected_id, "invalid tool result: content", True)
+        if type(result.is_error) is not bool:
+            return ToolResult(expected_id, "invalid tool result: is_error", True)
+        if result.tool_call_id != expected_id:
+            return ToolResult(
+                expected_id,
+                f"tool result id mismatch: expected {expected_id}, got {result.tool_call_id}",
+                is_error=True,
+            )
+        return result
+    if not isinstance(result, Mapping):
         return ToolResult(
             expected_id,
-            f"tool result id mismatch: expected {expected_id}, got {result.tool_call_id}",
-            is_error=True,
+            "invalid tool result: expected structured result",
+            True,
         )
-    return result
+    content = result.get("content")
+    is_error = result.get("isError")
+    if type(content) is not list:
+        return ToolResult(expected_id, "invalid tool result: content", True)
+    if type(is_error) is not bool:
+        return ToolResult(expected_id, "invalid tool result: isError", True)
+    blocks: list[ToolTextBlock] = []
+    for block in content:
+        if type(block) is not dict:
+            return ToolResult(expected_id, "invalid tool result: content block", True)
+        if (
+            block.get("type") != "text"
+            or type(block.get("text")) is not str
+            or type(block.get("truncated")) is not bool
+            or type(block.get("full_size")) is not int
+        ):
+            return ToolResult(expected_id, "invalid tool result: text block", True)
+        blocks.append(block)
+    text_values = []
+    for block in blocks:
+        text = block["text"]
+        if block["truncated"]:
+            text = (
+                f"{text}\n[truncated: {len(text)} of "
+                f"{block['full_size']} chars shown]"
+            )
+        text_values.append(text)
+    return ToolResult(
+        expected_id,
+        "\n".join(text_values),
+        is_error,
+        content_blocks=blocks,
+    )
 
 
 class AgentLoop:
@@ -303,7 +343,9 @@ class AgentLoop:
                 return
 
             completed_tool_indexes: set[int] = set()
-            parallel_tasks: dict[asyncio.Task[ToolResult], tuple[int, ToolCall]] = {}
+            parallel_tasks: dict[
+                asyncio.Task[StructuredToolResult], tuple[int, ToolCall]
+            ] = {}
             parallel_results: list[ToolResult | None] = [None] * len(calls)
             try:
                 call_index = 0
@@ -382,7 +424,7 @@ class AgentLoop:
                     )
                     call_index += 1
             except (asyncio.CancelledError, GeneratorExit):
-                pending_tasks: list[asyncio.Task[ToolResult]] = []
+                pending_tasks: list[asyncio.Task[StructuredToolResult]] = []
                 for task, (index, tool_call) in list(parallel_tasks.items()):
                     parallel_tasks.pop(task)
                     if task.done():

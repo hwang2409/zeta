@@ -203,6 +203,13 @@ def render_event(event: StreamEvent) -> RenderableType | None:
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:
         style = ERROR if event.tool_result.is_error else OK
         marker = "[tool error]" if event.tool_result.is_error else "[tool result]"
+        truncated_sizes = [
+            block["full_size"]
+            for block in (event.tool_result.content_blocks or [])
+            if block["truncated"]
+        ]
+        if truncated_sizes:
+            marker = f"{marker} [truncated; full_size={max(truncated_sizes)}]"
         lines = event.tool_result.content.split("\n")
         if not event.tool_result.content:
             lines = ["empty"]

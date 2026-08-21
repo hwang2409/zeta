@@ -136,7 +136,8 @@ async def test_durable_pending_request_is_re_emitted_and_resolves_after_restart(
     restarted_registry.register("echo", echo)
     result = await restarted_registry.execute(call)
 
-    assert result == ToolResult(call.id, "approved")
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "approved"
     assert executed == ["approved"]
     assert restarted_policy.pending_requests() == []
 
@@ -166,7 +167,9 @@ async def test_ask_resolution_deny_returns_error_result(tmp_path: Path) -> None:
     assert policy.pending_requests()
     assert policy.deny(call.id)
 
-    assert await task == ToolResult(call.id, "tool execution denied", True)
+    result = await task
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "tool execution denied"
 
 
 @pytest.mark.asyncio
@@ -258,7 +261,8 @@ async def test_approval_and_pre_execution_hook_compose(tmp_path: Path) -> None:
 
     result = await registry.execute(ToolCall("call-1", "echo", {}))
 
-    assert result == ToolResult("call-1", "tool execution denied", True)
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "tool execution denied"
     assert seen == ["echo"]
 
 
@@ -419,7 +423,7 @@ async def test_early_exit_paths_close_pending_requests(approval_root: Path) -> N
 
         result = await registry.execute(call)
 
-        assert result.is_error
+        assert result["isError"] is True
         assert policy.pending_requests() == []
         assert store.approval_states()[call.id][1] == "abort"
 
@@ -464,7 +468,9 @@ async def test_abort_race_honors_an_approval_that_wins_atomically(
     await asyncio.sleep(0.06)
     signal.abort()
 
-    assert await asyncio.wait_for(task, timeout=1) == ToolResult(call.id, "ran")
+    result = await asyncio.wait_for(task, timeout=1)
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "ran"
     assert store.approval_states()[call.id][1] == "allow"
     assert executed == ["ran"]
 
@@ -517,10 +523,9 @@ async def test_second_abort_reaches_handler_after_approval_wins(
 
     registry.abort()
 
-    assert await asyncio.wait_for(task, timeout=1) == ToolResult(
-        call.id,
-        "canceled",
-    )
+    result = await asyncio.wait_for(task, timeout=1)
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "canceled"
     assert observed_cancellation.is_set()
     assert store.approval_states()[call.id][1] == "allow"
 
@@ -566,10 +571,9 @@ async def test_pre_aborted_approved_call_accepts_a_second_abort(
 
     registry.abort()
 
-    assert await asyncio.wait_for(task, timeout=1) == ToolResult(
-        call.id,
-        "canceled",
-    )
+    result = await asyncio.wait_for(task, timeout=1)
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "canceled"
     assert canceled.is_set()
 
 
@@ -621,7 +625,11 @@ async def test_execute_many_pre_aborted_approved_calls_share_one_abort_generatio
     registry.abort()
 
     results = await asyncio.wait_for(task, timeout=1)
-    assert results == [ToolResult(call.id, "canceled") for call in calls]
+    assert [result["content"][0]["text"] for result in results] == [
+        "canceled",
+        "canceled",
+    ]
+    assert all(result["isError"] is False for result in results)
     assert canceled == {call.id for call in calls}
 
 
@@ -656,9 +664,12 @@ async def test_execute_many_pending_parallel_approval_abort_wakes_every_waiter(
 
     registry.abort()
 
-    assert await asyncio.wait_for(task, timeout=1) == [
-        ToolResult(call.id, "tool execution canceled", True) for call in calls
+    results = await asyncio.wait_for(task, timeout=1)
+    assert [result["content"][0]["text"] for result in results] == [
+        "tool execution canceled",
+        "tool execution canceled",
     ]
+    assert all(result["isError"] is True for result in results)
     assert policy.pending_requests() == []
 
 
@@ -691,7 +702,9 @@ async def test_pending_request_wins_over_policy_change_after_restart(
     assert changed_policy.pending_requests()
 
     assert changed_policy.approve(call.id)
-    assert await asyncio.wait_for(task, timeout=1) == ToolResult(call.id, "ran")
+    result = await asyncio.wait_for(task, timeout=1)
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "ran"
     assert executed == [True]
 
 
