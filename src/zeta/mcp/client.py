@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
@@ -47,6 +48,7 @@ class MCPTool:
 
 class MCPClient(Protocol):
     config: MCPServerConfig
+    protocol_version: str | None
 
     async def connect(self) -> None:
         """Open the transport and complete initialize."""
@@ -116,8 +118,8 @@ def translate_call_result(value: object) -> StructuredToolResult:
 
 def _validate_json_value(value: object) -> None:
     if value is None or type(value) in {str, int, bool, float}:
-        if type(value) is float:
-            raise ValueError("floating point values are not supported")
+        if type(value) is float and not math.isfinite(value):
+            raise ValueError("floating point values must be finite")
         return
     if type(value) is list:
         for item in value:

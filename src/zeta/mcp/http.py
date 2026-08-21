@@ -26,21 +26,27 @@ from .client import (
 from .config import MCPServerConfig
 
 logger = logging.getLogger(__name__)
+HTTP_TIMEOUT_SECONDS = 10.0
 
 
 class StreamableHTTPMCPClient(MCPClient):
     def __init__(self, config: MCPServerConfig, *, client: httpx.AsyncClient | None = None) -> None:
         self.config = config
-        self._client = client or httpx.AsyncClient(timeout=None)
+        self._client = client or httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS)
         self._owns_client = client is None
         self._session_id: str | None = None
+        self.protocol_version: str | None = None
         self._next_id = 0
         self._closed = False
 
     async def connect(self) -> None:
         if self._closed:
             raise MCPHTTPError(0, "MCP HTTP client is closed")
-        await self._request("initialize", initialize_params())
+        result = await self._request("initialize", initialize_params())
+        protocol_version = result.get("protocolVersion")
+        if type(protocol_version) is not str or not protocol_version:
+            raise MCPProtocolError("MCP initialize response omitted protocolVersion")
+        self.protocol_version = protocol_version
         await self._send_notification("notifications/initialized", {})
 
     async def list_tools(self) -> list[MCPTool]:
@@ -103,6 +109,8 @@ class StreamableHTTPMCPClient(MCPClient):
             headers["authorization"] = f"Bearer {self.config.auth_token}"
         if self._session_id is not None:
             headers["mcp-session-id"] = self._session_id
+        if self.protocol_version is not None:
+            headers["mcp-protocol-version"] = self.protocol_version
         try:
             async with self._client.stream("POST", self.config.url, headers=headers, json=dict(payload)) as response:
                 session_id = response.headers.get("mcp-session-id")
@@ -130,6 +138,8 @@ class StreamableHTTPMCPClient(MCPClient):
             headers["authorization"] = f"Bearer {self.config.auth_token}"
         if self._session_id is not None:
             headers["mcp-session-id"] = self._session_id
+        if self.protocol_version is not None:
+            headers["mcp-protocol-version"] = self.protocol_version
         payload = {"jsonrpc": "2.0", "method": method, "params": dict(params)}
         async with self._client.stream("POST", self.config.url, headers=headers, json=payload) as response:
             if response.status_code >= 400:

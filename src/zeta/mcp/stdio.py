@@ -9,6 +9,7 @@ import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
+from typing import BinaryIO
 
 from ..core.abort import AbortSignal
 from ..tools._process import _kill_and_reap
@@ -34,8 +35,9 @@ _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 class StdioMCPClient(MCPClient):
     def __init__(self, config: MCPServerConfig) -> None:
         self.config = config
+        self.protocol_version: str | None = None
         self._process: asyncio.subprocess.Process | None = None
-        self._stderr: object | None = None
+        self._stderr: BinaryIO | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
         self._next_id = 0
@@ -63,7 +65,11 @@ class StdioMCPClient(MCPClient):
         self._stderr = log_handle
         self._reader_task = asyncio.create_task(self._read_stdout())
         try:
-            await self._request("initialize", initialize_params())
+            result = await self._request("initialize", initialize_params())
+            protocol_version = result.get("protocolVersion")
+            if type(protocol_version) is not str or not protocol_version:
+                raise MCPProtocolError("MCP initialize response omitted protocolVersion")
+            self.protocol_version = protocol_version
             await self._notify("notifications/initialized", {})
         except BaseException:
             await self.close()
@@ -112,7 +118,7 @@ class StdioMCPClient(MCPClient):
         stderr = self._stderr
         self._stderr = None
         if stderr is not None:
-            stderr.close()  # type: ignore[attr-defined]
+            stderr.close()
 
     async def _request(self, method: str, params: Mapping[str, object], abort_signal: AbortSignal | None = None) -> dict[str, object]:
         process = self._process
@@ -137,7 +143,17 @@ class StdioMCPClient(MCPClient):
                     done, _ = await asyncio.wait((response, abort_task), return_when=asyncio.FIRST_COMPLETED)
                     if abort_task in done and response not in done:
                         self._pending.pop(request_id, None)
-                        await self._notify("notifications/cancelled", {"requestId": request_id, "reason": "client canceled"})
+                        try:
+                            await asyncio.wait_for(
+                                self._notify(
+                                    "notifications/cancelled",
+                                    {"requestId": request_id, "reason": "client canceled"},
+                                ),
+                                timeout=0.05,
+                            )
+                        except Exception:  # noqa: BLE001 - cancellation must continue to cleanup
+                            logger.debug("MCP %s did not accept cancellation", self.config.name)
+                        await self._terminate_process()
                         raise MCPCanceled()
                     raw_response = await response
                 finally:
@@ -147,6 +163,11 @@ class StdioMCPClient(MCPClient):
             return parse_rpc_response(raw_response, request_id)
         except asyncio.CancelledError:
             self._pending.pop(request_id, None)
+            if abort_signal is not None and abort_signal.is_set():
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+                await self._terminate_process()
             raise
         finally:
             self._pending.pop(request_id, None)
@@ -159,6 +180,29 @@ class StdioMCPClient(MCPClient):
         async with self._write_lock:
             process.stdin.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
             await process.stdin.drain()
+
+    async def _terminate_process(self) -> None:
+        process = self._process
+        reader_task = self._reader_task
+        if process is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(process.wait()), timeout=0.25)
+        except TimeoutError:
+            await _kill_and_reap(
+                process,
+                [reader_task] if reader_task is not None else [],
+            )
+            await process.wait()
+        if reader_task is not None and not reader_task.done():
+            await asyncio.gather(reader_task, return_exceptions=True)
+        self._fail_pending(MCPError("MCP stdio server terminated after cancellation"))
+        self._process = None
+        self._reader_task = None
+        stderr = self._stderr
+        self._stderr = None
+        if stderr is not None:
+            stderr.close()
 
     async def _read_stdout(self) -> None:
         process = self._process

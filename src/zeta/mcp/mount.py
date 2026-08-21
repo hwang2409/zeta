@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -14,6 +15,8 @@ from .http import StreamableHTTPMCPClient
 from .stdio import StdioMCPClient
 
 logger = logging.getLogger(__name__)
+# One quiet server cannot hold session startup longer than this bound.
+SERVER_SETUP_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass(slots=True)
@@ -39,16 +42,34 @@ async def mount_mcp_servers(registry: ToolRegistry, config: MCPConfig | None = N
         except MCPConfigError as exc:
             logger.error("%s", exc)
             return MCPMount(())
-    connected: list[MCPClient] = []
-    for server_config in config.servers.values():
+    async def setup(server_config: MCPServerConfig) -> tuple[MCPClient, list[MCPTool]] | None:
         client = _build_client(server_config)
         try:
-            await client.connect()
-            tools = await client.list_tools()
+            tools = await asyncio.wait_for(
+                _connect_and_list(client), timeout=SERVER_SETUP_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            logger.warning(
+                "timed out connecting to MCP server %s after %.1fs",
+                server_config.name,
+                SERVER_SETUP_TIMEOUT_SECONDS,
+            )
+            await client.close()
+            return None
         except Exception as exc:  # noqa: BLE001 - isolate one bad server
             logger.warning("skipping MCP server %s: %s", server_config.name, exc)
             await client.close()
+            return None
+        return client, tools
+
+    results = await asyncio.gather(
+        *(setup(server_config) for server_config in config.servers.values())
+    )
+    connected: list[MCPClient] = []
+    for result in results:
+        if result is None:
             continue
+        client, tools = result
         connected.append(client)
         for tool in tools:
             _register_tool(registry, client, tool)
@@ -61,6 +82,11 @@ def _build_client(config: MCPServerConfig) -> MCPClient:
     return StreamableHTTPMCPClient(config)
 
 
+async def _connect_and_list(client: MCPClient) -> list[MCPTool]:
+    await client.connect()
+    return await client.list_tools()
+
+
 def _register_tool(registry: ToolRegistry, client: MCPClient, tool: MCPTool) -> None:
     name = f"{client.config.name}:{tool.name}"
 
@@ -68,7 +94,13 @@ def _register_tool(registry: ToolRegistry, client: MCPClient, tool: MCPTool) -> 
         return await client.call_tool(tool.name, arguments, abort_signal)
 
     try:
-        registry.register(name, handler, description=tool.description, parameters=tool.input_schema)
+        registry.register(
+            name,
+            handler,
+            description=tool.description,
+            parameters=tool.input_schema,
+            validate_arguments=False,
+        )
     except (TypeError, ValueError) as exc:
         logger.warning("skipping MCP tool %s: invalid input schema: %s", name, exc)
 

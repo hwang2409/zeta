@@ -32,9 +32,9 @@ for line in sys.stdin:
     if method == "initialize":
         result = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "fake", "version": "1"}}
     elif method == "tools/list":
-        result = {"tools": [{"name": "echo", "description": "echo text", "inputSchema": {"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]}}]}
+        result = {"tools": [{"name": "echo", "description": "echo text", "inputSchema": {"type": "object", "title": "EchoInput", "$defs": {"value": {"type": "string"}}, "properties": {"value": {"type": "string", "default": "hello"}}, "required": ["value"]}}]}
     elif method == "tools/call":
-        result = {"content": [{"type": "text", "text": request["params"]["arguments"]["value"]}], "isError": False, "structuredContent": {"ok": True}}
+        result = {"content": [{"type": "text", "text": request["params"]["arguments"]["value"]}], "isError": False, "structuredContent": {"ok": True, "latency": 1.5}}
     else:
         result = {"content": [], "isError": False}
     print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
@@ -43,6 +43,14 @@ for line in sys.stdin:
 
 def _stdio_config(name: str = "fake") -> MCPServerConfig:
     return MCPServerConfig(name, "stdio", sys.executable, ("-u", "-c", _stdio_source()))
+
+
+def _failing_stdio_config(name: str = "fail") -> MCPServerConfig:
+    source = _stdio_source().replace(
+        '    elif method == "tools/call":\n        result = {"content": [{"type": "text", "text": request["params"]["arguments"]["value"]}], "isError": False, "structuredContent": {"ok": True, "latency": 1.5}}\n',
+        '    elif method == "tools/call":\n        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -1, "message": "tool failed"}}), flush=True)\n        continue\n',
+    )
+    return MCPServerConfig(name, "stdio", sys.executable, ("-u", "-c", source))
 
 
 def test_config_interpolates_and_skips_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -72,6 +80,15 @@ def test_config_override_and_malformed_json(tmp_path: Path, monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
+async def test_missing_config_mount_is_a_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZETA_MCP_CONFIG", str(tmp_path / "missing.json"))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(registry)
+    assert registry.schemas == []
+    await mount.close()
+
+
+@pytest.mark.asyncio
 async def test_stdio_handshake_list_call_and_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     client = StdioMCPClient(_stdio_config())
@@ -81,14 +98,14 @@ async def test_stdio_handshake_list_call_and_close(tmp_path: Path, monkeypatch: 
 
     assert [tool.name for tool in tools] == ["echo"]
     assert result["content"][0]["text"] == "hello"
-    assert result["structuredContent"] == {"ok": True}
+    assert result["structuredContent"] == {"ok": True, "latency": 1.5}
     await client.close()
 
 
 @pytest.mark.asyncio
 async def test_stdio_abort_returns_canceled_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     source = _stdio_source().replace(
-        'result = {"content": [{"type": "text", "text": request["params"]["arguments"]["value"]}], "isError": False, "structuredContent": {"ok": True}}',
+        'result = {"content": [{"type": "text", "text": request["params"]["arguments"]["value"]}], "isError": False, "structuredContent": {"ok": True, "latency": 1.5}}',
         'import time; time.sleep(5); result = {"content": [], "isError": False}',
     )
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
@@ -133,17 +150,25 @@ async def test_http_auth_list_call_and_401() -> None:
             result = {"protocolVersion": "2025-06-18", "capabilities": {}}
         elif body["method"] == "tools/list":
             result = {"tools": []}
+        elif body["method"] == "tools/call":
+            return httpx.Response(401, text="expired", request=request)
         else:
-            result = {"content": [{"type": "text", "text": "ok"}], "isError": True}
+            result = {"content": [{"type": "text", "text": "unexpected"}], "isError": True}
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": result}, request=request)
 
     config = MCPServerConfig("http", "streamable-http", url="https://mcp.test", auth_type="bearer", auth_token="token")
     client = StreamableHTTPMCPClient(config, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     await client.connect()
+    assert client.protocol_version == "2025-06-18"
     await client.list_tools()
     result = await client.call_tool("echo", {}, AbortSignal())
     assert result["isError"] is True
+    assert "MCP HTTP 401" in result["content"][0]["text"]
     assert requests[0].headers["authorization"] == "Bearer token"
+    assert all(
+        request.headers["mcp-protocol-version"] == "2025-06-18"
+        for request in requests[1:]
+    )
     await client.close()
 
 
@@ -177,6 +202,13 @@ async def test_http_abort_closes_request() -> None:
         body = json.loads(request.content)
         if "id" not in body:
             return httpx.Response(202, request=request)
+        if body.get("method") == "initialize":
+            result = {"protocolVersion": "2025-06-18", "capabilities": {}}
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": body["id"], "result": result},
+                request=request,
+            )
         if body.get("method") == "tools/call":
             await asyncio.sleep(5)
         result = {"content": [], "isError": False}
@@ -201,4 +233,37 @@ async def test_mount_registers_prefixed_tool(tmp_path: Path, monkeypatch: pytest
     mount = await mount_mcp_servers(registry, MCPConfig(tmp_path / "mcp.json", {"fake": _stdio_config()}))
     result = await registry.execute(ToolCall("call", "fake:echo", {"value": "mounted"}))
     assert result["content"][0]["text"] == "mounted"
+    assert registry.schemas[0]["parameters"]["$defs"] == {"value": {"type": "string"}}
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mount_isolates_bad_server_from_good_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    bad = MCPServerConfig("bad", "stdio", str(tmp_path / "does-not-exist"))
+    config = MCPConfig(tmp_path / "mcp.json", {"bad": bad, "good": _stdio_config("good")})
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(registry, config)
+    assert "good:echo" in {schema["name"] for schema in registry.schemas}
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_call_failure_does_not_affect_other_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    config = MCPConfig(
+        tmp_path / "mcp.json",
+        {"fail": _failing_stdio_config(), "good": _stdio_config("good")},
+    )
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(registry, config)
+    failed = await registry.execute(ToolCall("failed", "fail:echo", {"value": "x"}))
+    healthy = await registry.execute(ToolCall("healthy", "good:echo", {"value": "ok"}))
+    assert failed["isError"] is True
+    assert healthy["isError"] is False
+    assert healthy["content"][0]["text"] == "ok"
     await mount.close()
