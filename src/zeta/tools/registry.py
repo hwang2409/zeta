@@ -129,12 +129,20 @@ def text_block(
 def _success_result(
     block: ToolTextBlock,
     *,
-    structured_content: dict[str, str | int | bool | None] | None = None,
+    structured_content: Mapping[str, object] | None = None,
 ) -> StructuredToolResult:
+    normalized_content = (
+        None
+        if structured_content is None
+        else cast(
+            dict[str, str | int | bool | None],
+            dict(structured_content),
+        )
+    )
     return {
         "content": [block],
         "isError": False,
-        "structuredContent": structured_content,
+        "structuredContent": normalized_content,
     }
 
 

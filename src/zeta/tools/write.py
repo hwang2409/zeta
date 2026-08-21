@@ -58,9 +58,23 @@ async def _write(
             raise ValueError(f"parent directory does not exist: {parent}")
         raise ValueError(f"parent is not a directory: {parent}")
 
-    was_created = not path.exists()
     try:
-        path.write_bytes(encoded_content)
+        file_descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o666,
+        )
+        was_created = True
+    except FileExistsError:
+        try:
+            file_descriptor = os.open(path, os.O_WRONLY | os.O_TRUNC)
+        except OSError as exc:
+            raise ValueError(f"could not open file: {path}: {exc}") from exc
+        was_created = False
+
+    try:
+        with os.fdopen(file_descriptor, "wb") as handle:
+            handle.write(encoded_content)
     except OSError as exc:
         raise ValueError(f"could not write file: {path}: {exc}") from exc
 

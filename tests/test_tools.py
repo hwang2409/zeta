@@ -3,6 +3,7 @@ import hashlib
 import math
 import shlex
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 import zeta.tools.exec as exec_module
 import zeta.tools.list as list_module
 import zeta.tools.read as read_module
+import zeta.tools.write as write_module
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
@@ -234,8 +236,72 @@ async def test_write_can_create_missing_parents(tmp_path: Path) -> None:
     )
 
     assert result["isError"] is False
+    assert result["structuredContent"] == {
+        "path": str(target),
+        "bytes_written": 1,
+        "sha256": hashlib.sha256(b"x").hexdigest(),
+        "was_created": True,
+        "was_overwritten": False,
+    }
     assert target.read_text(encoding="utf-8") == "x"
     assert target.parent.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_write_race_reports_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "raced.txt"
+    registry = ToolRegistry(tmp_path)
+    creator_started = threading.Event()
+
+    def create_target() -> None:
+        target.write_bytes(b"concurrent")
+
+    def trigger_creator() -> None:
+        if creator_started.is_set():
+            return
+        creator_started.set()
+        creator = threading.Thread(target=create_target)
+        creator.start()
+        creator.join()
+
+    original_exists = Path.exists
+
+    def racing_exists(path: Path) -> bool:
+        if path == target:
+            trigger_creator()
+            return False
+        return original_exists(path)
+
+    original_open = write_module.os.open
+
+    def racing_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        if Path(path) == target and flags & write_module.os.O_EXCL:
+            trigger_creator()
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(Path, "exists", racing_exists)
+    monkeypatch.setattr(write_module.os, "open", racing_open)
+
+    result = await registry.execute(
+        ToolCall("write-race", "write", {"path": "raced.txt", "content": "x"})
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"] == {
+        "path": str(target),
+        "bytes_written": 1,
+        "sha256": hashlib.sha256(b"x").hexdigest(),
+        "was_created": False,
+        "was_overwritten": True,
+    }
+    assert target.read_bytes() == b"x"
 
 
 @pytest.mark.asyncio
