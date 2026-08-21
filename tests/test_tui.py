@@ -676,6 +676,22 @@ def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
     assert "tok 5/121" in plain
 
 
+def test_status_toolbar_does_not_advance_spinner_frame(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._spinner_frame = 0
+    app._streaming = False
+    app._status_toolbar()
+    assert app._spinner_frame == 0
+
+    app._streaming = True
+    app._status_toolbar()
+    assert app._spinner_frame == 0
+
+
 @pytest.mark.asyncio
 async def test_spinner_pulses_on_timer(tmp_path: Path) -> None:
     app = TUIApp(
@@ -697,17 +713,29 @@ async def test_spinner_pulses_on_timer(tmp_path: Path) -> None:
 async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> None:
     call = ToolCall("call-1", "read", {})
     backend = SlowSecondCompletionBackend(call)
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+
+    async def slow_tool(_: dict[str, object]) -> str:
+        tool_started.set()
+        await release_tool.wait()
+        return "tool result"
+
     app = TUIApp(
         AgentLoop(
             backend,
             ConversationStore(tmp_path / "sessions"),
-            tools={"read": lambda _: "tool result"},
+            tools={"read": slow_tool},
         ),
         provider="fake",
         model="offline",
     )
 
     turn = asyncio.create_task(app._consume_turn("prompt"))
+    await tool_started.wait()
+    await asyncio.sleep(0.45)
+    during_tool_frame = app._spinner_frame
+    release_tool.set()
     await backend.second_started.wait()
     starting_frame = app._spinner_frame
     await asyncio.sleep(0.45)
@@ -716,6 +744,8 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
     await turn
 
     assert app._streaming is False
+    assert during_tool_frame == 0
+    assert starting_frame == 0
     assert ending_frame - starting_frame >= 2
 
 

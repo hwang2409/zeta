@@ -187,10 +187,6 @@ class TUIApp:
             self._active_task.cancel()
 
     def _status_toolbar(self) -> FormattedText:
-        if self._streaming:
-            self._spinner_frame += 1
-        else:
-            self._spinner_frame = 0
         width = get_app().output.get_size().columns
         status = format_status(
             self.provider,
@@ -309,8 +305,8 @@ class TUIApp:
     async def _pulse_spinner(self) -> None:
         while True:
             await asyncio.sleep(0.2)
-            self._spinner_frame += 1
             if self._streaming:
+                self._spinner_frame += 1
                 self._invalidate_prompt()
 
     async def _consume_turn(self, user_text: str) -> None:
@@ -333,6 +329,7 @@ class TUIApp:
                 elif event.type is StreamEventType.TOOL_EXECUTION_END:
                     self._loop_state = "streaming"
                 elif event.type is StreamEventType.TURN_START:
+                    self._spinner_frame = 0
                     self._streaming = True
                 elif event.type is StreamEventType.MESSAGE_END:
                     self._streaming = False
