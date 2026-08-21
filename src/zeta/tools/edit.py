@@ -2,19 +2,20 @@
 
 Sandbox
 -------
-The sandbox is best effort per the peer-tool convention. Lexical path checks,
-anchored openat walks, and O_NOFOLLOW checks defer race hardening to ZETA-22.
+Sandbox is best-effort per peer-tool convention: lexical outside-cwd rejection
+plus O_NOFOLLOW anchored walk. Direct-truncate write means a partial-failure
+mid-write can leave a corrupt file. TOCTOU races (parent rename, hard-link,
+ancestor symlink swaps) are out of scope, tracked as ZETA-22.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
-from pathlib import Path
 from typing import TypedDict
 
 from ..types import StructuredToolResult
-from . import write
+from ._sandbox import open_anchored
 from .registry import (
     AbortSignal,
     ToolRegistry,
@@ -41,49 +42,24 @@ def _open_existing(
     registry: ToolRegistry,
     raw_path: str,
 ) -> tuple[int, str]:
-    components = write._anchored_components(registry, raw_path)
-    fallback_path = write._path_for_components(registry, components)
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    sandbox_fd = registry._open_cwd()
+    file_descriptor, _was_created, path = open_anchored(
+        registry,
+        raw_path,
+        create_parents=False,
+        open_flags=os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+        create_file=False,
+        truncate_existing=False,
+    )
+    return file_descriptor, path
 
-    parent_fd = sandbox_fd
-    file_descriptor: int | None = None
-    try:
-        for index, component in enumerate(components[:-1]):
-            component_path = write._path_for_components(
-                registry, components[: index + 1]
-            )
-            try:
-                child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
-            except OSError as exc:
-                raise write._path_open_error(component_path, exc) from exc
-            if parent_fd != sandbox_fd:
-                os.close(parent_fd)
-            parent_fd = child_fd
 
-        try:
-            file_descriptor = os.open(
-                components[-1],
-                os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=parent_fd,
-            )
-        except OSError as exc:
-            raise write._path_open_error(fallback_path, exc) from exc
-        try:
-            actual_path = write._path_from_fd(file_descriptor)
-        except OSError as exc:
-            raise ValueError(
-                f"could not resolve path: {fallback_path}: {exc}"
-            ) from exc
-        result = file_descriptor, actual_path
-        file_descriptor = None
-        return result
-    finally:
-        if file_descriptor is not None:
-            os.close(file_descriptor)
-        if parent_fd != sandbox_fd:
-            os.close(parent_fd)
-        os.close(sandbox_fd)
+def _count_overlapping(content: str, old_string: str) -> int:
+    count = 0
+    start = 0
+    while (match := content.find(old_string, start)) != -1:
+        count += 1
+        start = match + 1
+    return count
 
 
 async def _edit(
@@ -107,7 +83,7 @@ async def _edit(
             except UnicodeDecodeError as exc:
                 raise ValueError(f"file is not valid UTF-8: {path}") from exc
 
-            match_count = content.count(arguments["old_string"])
+            match_count = _count_overlapping(content, arguments["old_string"])
             if match_count == 0:
                 return _error_result(
                     f"old_string not found in {arguments['path']}"

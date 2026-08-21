@@ -275,6 +275,27 @@ async def test_edit_requires_one_match(
 
 
 @pytest.mark.asyncio
+async def test_edit_rejects_overlapping_matches(tmp_path: Path) -> None:
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("aaa", encoding="utf-8")
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "edit-overlap",
+            "edit",
+            {"path": "note.txt", "old_string": "aa", "new_string": "X"},
+        )
+    )
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == (
+        "old_string found 2 times in note.txt; must be unique"
+    )
+    assert file_path.read_text(encoding="utf-8") == "aaa"
+
+
+@pytest.mark.asyncio
 async def test_edit_preserves_utf8_and_reports_byte_lengths(tmp_path: Path) -> None:
     file_path = tmp_path / "unicode.txt"
     file_path.write_text("café: 世界\n", encoding="utf-8")
@@ -288,11 +309,11 @@ async def test_edit_preserves_utf8_and_reports_byte_lengths(tmp_path: Path) -> N
         )
     )
 
-    updated = "café: мир\n".encode("utf-8")
+    updated = "café: мир\n".encode()
     assert result["isError"] is False
     assert result["structuredContent"] == {
         "path": str(file_path),
-        "bytes_before": len("café: 世界\n".encode("utf-8")),
+        "bytes_before": len("café: 世界\n".encode()),
         "bytes_after": len(updated),
         "sha256_after": hashlib.sha256(updated).hexdigest(),
     }
