@@ -307,10 +307,11 @@ class TUIApp:
             self._flush_pending_stream()
 
     async def _pulse_spinner(self) -> None:
-        while self._streaming:
+        while True:
             await asyncio.sleep(0.2)
             self._spinner_frame += 1
-            self._invalidate_prompt()
+            if self._streaming:
+                self._invalidate_prompt()
 
     async def _consume_turn(self, user_text: str) -> None:
         self._loop_state = "streaming"
@@ -331,6 +332,8 @@ class TUIApp:
                     self._loop_state = "tool-running"
                 elif event.type is StreamEventType.TOOL_EXECUTION_END:
                     self._loop_state = "streaming"
+                elif event.type is StreamEventType.TURN_START:
+                    self._streaming = True
                 elif event.type is StreamEventType.MESSAGE_END:
                     self._streaming = False
                 elif event.type is StreamEventType.AGENT_END:

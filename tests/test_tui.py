@@ -196,6 +196,35 @@ class OrderedToolBackend(CompletionBackend):
         )
 
 
+class SlowSecondCompletionBackend(CompletionBackend):
+    def __init__(self, call: ToolCall) -> None:
+        self.call = call
+        self.second_started = asyncio.Event()
+        self.release_second = asyncio.Event()
+        self.index = 0
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        index = self.index
+        self.index += 1
+        if index == 0:
+            blocks = [TextContent("before tool\n"), ToolUseContent(self.call)]
+        else:
+            blocks = [TextContent("after tool")]
+            self.second_started.set()
+            await self.release_second.wait()
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[0])
+        if len(blocks) > 1:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=blocks[1])
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 async def wait_until(check: Callable[[], bool]) -> None:
     for _ in range(100):
         if check():
@@ -662,6 +691,32 @@ async def test_spinner_pulses_on_timer(tmp_path: Path) -> None:
     await asyncio.gather(task, return_exceptions=True)
 
     assert app._spinner_frame >= 2
+
+
+@pytest.mark.asyncio
+async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> None:
+    call = ToolCall("call-1", "read", {})
+    backend = SlowSecondCompletionBackend(call)
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            tools={"read": lambda _: "tool result"},
+        ),
+        provider="fake",
+        model="offline",
+    )
+
+    turn = asyncio.create_task(app._consume_turn("prompt"))
+    await backend.second_started.wait()
+    starting_frame = app._spinner_frame
+    await asyncio.sleep(0.45)
+    ending_frame = app._spinner_frame
+    backend.release_second.set()
+    await turn
+
+    assert app._streaming is False
+    assert ending_frame - starting_frame >= 2
 
 
 @pytest.mark.asyncio
