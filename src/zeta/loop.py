@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import warnings
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 
 from .approval import ApprovalPolicy
 from .context import ContextAssembler
@@ -80,6 +80,7 @@ class AgentLoop:
         system_prompt: str | Message = "",
         token_budget: int = 100_000,
         retained_tail: int = 8,
+        on_completion_success: Callable[[], None] | None = None,
     ) -> None:
         self.backend = backend
         self.store = store
@@ -140,15 +141,67 @@ class AgentLoop:
             retained_tail=retained_tail,
             system_prompt=system_prompt,
             backend=backend,
+            on_completion_success=on_completion_success,
         )
+        self.on_completion_success = on_completion_success
 
     def abort(self) -> None:
         """Signal the active tool batch before the caller cancels the turn."""
 
         self.tool_registry.abort()
 
+    def prepare_resume_pending_tool(self, request_id: str) -> bool:
+        """Reserve the abort generation before resuming an approved tool."""
+
+        state = self.store.approval_states().get(request_id)
+        if state is None or state[1] is None:
+            return False
+        self.tool_registry.start_batch()
+        return True
+
     def run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
         return self._run_turn(user_text)
+
+    async def resume_pending_tool(
+        self, request_id: str, *, prepared: bool = False
+    ) -> ToolResult | None:
+        """Finish a durable approval request before starting another turn."""
+
+        state = self.store.approval_states().get(request_id)
+        if state is None or state[1] is None:
+            return None
+        tool_call = state[0]
+        if not prepared:
+            self.tool_registry.start_batch()
+        abort_signal = self.tool_registry.abort_signal
+        try:
+            result = await self.tool_registry.execute(
+                tool_call,
+                abort_signal=abort_signal,
+                _scope_signal=abort_signal,
+            )
+        except asyncio.CancelledError:
+            self.finalize_canceled(request_id)
+            raise
+        except Exception as exc:
+            result = ToolResult(tool_call.id, str(exc), is_error=True)
+        result = _validated_tool_result(result, tool_call.id)
+        if result.content == "tool execution canceled" and result.is_error:
+            return self.finalize_canceled(request_id)
+        return self._finalize_tool_results([tool_call], [result])[0]
+
+    def finalize_canceled(self, request_id: str) -> ToolResult | None:
+        """Persist one canceled result for a durable approval request."""
+
+        state = self.store.approval_states().get(request_id)
+        if state is None:
+            return None
+        tool_call = state[0]
+        for message in reversed(self.store.messages()):
+            result = message.tool_result
+            if result is not None and result.tool_call_id == tool_call.id:
+                return result
+        return self._finalize_tool_results([tool_call], [None])[0]
 
     async def _run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
         self.store.append_message(
@@ -165,6 +218,7 @@ class AgentLoop:
             partial_blocks: list[ContentBlock] = []
             assistant_message: Message | None = None
             completion: AsyncIterator[StreamEvent] | None = None
+            completion_succeeded = False
             context = await self.context_assembler.assemble(backend=self.backend)
             try:
                 completion = self.backend.complete(
@@ -179,6 +233,8 @@ class AgentLoop:
                             partial_blocks.append(TextContent(event.delta))
                     if event.message is not None and event.type is StreamEventType.MESSAGE_END:
                         assistant_message = event.message
+                    if event.type is StreamEventType.MESSAGE_END:
+                        completion_succeeded = True
                     yield event
             except asyncio.CancelledError:
                 await _close_completion(completion)
@@ -216,6 +272,8 @@ class AgentLoop:
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
+            if completion_succeeded and self.on_completion_success is not None:
+                self.on_completion_success()
 
             if assistant_message is None and partial_blocks:
                 assistant_message = Message(MessageRole.ASSISTANT, partial_blocks)

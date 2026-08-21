@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 from collections import deque
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -19,10 +18,13 @@ from prompt_toolkit.styles import Style
 from rich.console import Console, RenderableType
 from rich.text import Text
 
+from ..approval import ApprovalPolicy, ApprovalRequest
 from ..anthropic import AnthropicBackend
+from ..anthropic import AnthropicCredentialStore
 from ..codex import CodexBackend
+from ..codex import CodexCredentialStore
 from ..loop import AgentLoop
-from ..store import ConversationStore
+from ..session import SessionError, SessionManager, env_home
 from ..types import (
     CompletionBackend,
     Message,
@@ -41,7 +43,7 @@ DEFAULT_CODEX_MODEL = "gpt-5.4"
 
 
 def _zeta_home() -> Path:
-    return Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
+    return env_home()
 
 
 class FakeInteractiveBackend(CompletionBackend):
@@ -85,17 +87,29 @@ def _chunks(value: str, size: int) -> list[str]:
     return [value[index : index + size] for index in range(0, len(value), size)]
 
 
-def build_backend(provider: str, model: str | None) -> tuple[CompletionBackend, str]:
+def build_backend(
+    provider: str,
+    model: str | None,
+    *,
+    home: str | Path | None = None,
+) -> tuple[CompletionBackend, str]:
     """Build the selected provider without loading network credentials for fake."""
 
+    auth_home = Path(home) if home is not None else _zeta_home()
     if provider == "fake":
         return FakeInteractiveBackend(), model or "offline"
     if provider == "claude":
         selected_model = model or DEFAULT_CLAUDE_MODEL
-        return AnthropicBackend(model=selected_model), selected_model
+        return AnthropicBackend(
+            model=selected_model,
+            token_store=AnthropicCredentialStore(auth_home / "anthropic-oauth.json"),
+        ), selected_model
     if provider == "codex":
         selected_model = model or DEFAULT_CODEX_MODEL
-        return CodexBackend(model=selected_model), selected_model
+        return CodexBackend(
+            model=selected_model,
+            token_store=CodexCredentialStore(auth_home / "codex-oauth.json"),
+        ), selected_model
     raise ValueError(f"unsupported provider: {provider}")
 
 
@@ -130,6 +144,7 @@ class TUIApp:
         console: Console | None = None,
         session: PromptSession[str] | None = None,
         history_path: str | Path | None = None,
+        approval_policy: ApprovalPolicy | None = None,
     ) -> None:
         self.loop = loop
         self.provider = provider
@@ -148,6 +163,7 @@ class TUIApp:
         self._partial = ""
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
+        self._approval_policy = approval_policy
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
@@ -156,6 +172,94 @@ class TUIApp:
     @property
     def active(self) -> bool:
         return self._active_task is not None and not self._active_task.done()
+
+    @property
+    def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
+        if self._approval_policy is None:
+            return ()
+        return tuple(self._approval_policy.pending_requests())
+
+    def _present_pending_approvals(self) -> None:
+        for request in self.pending_approvals:
+            arguments = json.dumps(request.tool_call.arguments, sort_keys=True)
+            self._print(
+                Text(
+                    f"[approval pending] {request.request_id}: "
+                    f"{request.tool_call.name} {arguments}; "
+                    f"type approve {request.request_id} or deny {request.request_id}",
+                    style="yellow",
+                )
+            )
+
+    async def _handle_approval_input(self, value: str) -> bool:
+        parts = value.split(maxsplit=1)
+        if not parts or parts[0] not in {"approve", "deny"}:
+            return False
+        pending = self.pending_approvals
+        if not pending:
+            self._print(Text("[approval] no pending requests", style="dim"))
+            return True
+        if len(parts) != 2:
+            self._print(Text(f"[approval] use {parts[0]} <request-id>", style="yellow"))
+            return True
+        request_id = parts[1].strip()
+        if request_id not in {request.request_id for request in pending}:
+            self._print(Text(f"[approval] unknown request: {request_id}", style="yellow"))
+            return True
+        resolved = (
+            self._approval_policy.approve(request_id)
+            if parts[0] == "approve"
+            else self._approval_policy.deny(request_id)
+        )
+        if resolved:
+            self._print(Text(f"[approval] {parts[0]}d {request_id}", style="green"))
+
+            async def resume() -> Any:
+                return await self.loop.resume_pending_tool(
+                    request_id, prepared=True
+                )
+
+            resume_task: asyncio.Task[Any] | None = None
+            try:
+                if not self.loop.prepare_resume_pending_tool(request_id):
+                    self._present_pending_approvals()
+                    return True
+                resume_task = asyncio.create_task(resume())
+                self._active_task = resume_task
+                result = await asyncio.shield(resume_task)
+            except asyncio.CancelledError:
+                parent_cancelled = (
+                    asyncio.current_task() is not None
+                    and asyncio.current_task().cancelling() > 0
+                )
+                self.loop.abort()
+                self.loop.finalize_canceled(request_id)
+                if resume_task is not None:
+                    resume_task.cancel()
+                if resume_task is not None:
+                    await asyncio.gather(resume_task, return_exceptions=True)
+                self._print(Text("[aborted]", style="yellow"))
+                if parent_cancelled:
+                    raise
+                return True
+            finally:
+                if resume_task is not None and self._active_task is resume_task:
+                    self._active_task = None
+            request = next(
+                request for request in pending if request.request_id == request_id
+            )
+            if result is not None:
+                self._print(
+                    render_event(
+                        StreamEvent(
+                            StreamEventType.TOOL_EXECUTION_END,
+                            tool_call=request.tool_call,
+                            tool_result=result,
+                        )
+                    )
+                )
+        self._present_pending_approvals()
+        return True
 
     def _make_session(self) -> PromptSession[str]:
         bindings = build_key_bindings(
@@ -302,6 +406,7 @@ class TUIApp:
                 if event.type is StreamEventType.TOOL_EXECUTION_START:
                     self._reset_stream_state()
                     self._loop_state = "tool-running"
+                    self._present_pending_approvals()
                 elif event.type is StreamEventType.TOOL_EXECUTION_END:
                     self._loop_state = "streaming"
                 elif event.type is StreamEventType.AGENT_END:
@@ -333,6 +438,7 @@ class TUIApp:
         """Run until Ctrl-D or an exit request."""
 
         session = session or self._session or self._make_session()
+        self._present_pending_approvals()
         prompt_task: asyncio.Task[str | None] | None = asyncio.create_task(
             self._read_prompt(session)
         )
@@ -358,7 +464,11 @@ class TUIApp:
                         break
                     parsed = parse_input(value)
                     if parsed is not None and not self._exit_requested:
-                        if self.active:
+                        if await self._handle_approval_input(parsed):
+                            pass
+                        elif self.pending_approvals:
+                            self._present_pending_approvals()
+                        elif self.active:
                             self._queued.append(parsed)
                         else:
                             self._print_user(parsed)
@@ -379,15 +489,90 @@ class TUIApp:
 
 
 def create_app(args: argparse.Namespace) -> TUIApp:
-    backend, selected_model = build_backend(args.provider, args.model)
     home = _zeta_home()
-    store = ConversationStore(home / "sessions")
+    manager = SessionManager(home)
+    continue_session = getattr(args, "continue_session", False)
+    resume_id = getattr(args, "resume", None)
+    force_provider = getattr(args, "force_provider", False)
+    resuming = continue_session or resume_id is not None
+    if force_provider and not resuming:
+        raise SessionError("--force-provider requires --continue or --resume")
+    if force_provider and args.model is None:
+        raise SessionError("--force-provider requires --model")
+
+    if resuming:
+        if resume_id is not None:
+            opened = manager.open(resume_id)
+        else:
+            recent = manager.find_most_recent(cwd=Path.cwd())
+            opened = manager.open(recent.session_id)
+        metadata = opened.metadata
+        provider_override = args.provider
+        model_override = args.model
+        mismatches = []
+        if provider_override is not None and provider_override != metadata.provider:
+            mismatches.append(
+                f"provider {provider_override!r} does not match {metadata.provider!r}"
+            )
+        if model_override is not None and model_override != metadata.model:
+            mismatches.append(
+                f"model {model_override!r} does not match {metadata.model!r}"
+            )
+        if mismatches and not force_provider:
+            raise SessionError(
+                f"session override rejected: {'; '.join(mismatches)}; "
+                "use --force-provider to override"
+            )
+        provider = provider_override or metadata.provider
+        model = model_override or metadata.model
+        store = opened.store
+    else:
+        provider = args.provider or "fake"
+        backend, selected_model = build_backend(provider, args.model, home=home)
+        opened = manager.create(
+            provider=provider,
+            model=selected_model,
+            cwd=Path.cwd(),
+        )
+        metadata = opened.metadata
+        store = opened.store
+    if resuming:
+        backend, selected_model = build_backend(provider, model, home=home)
+    approval_policy = ApprovalPolicy(store=store)
+    pending_override = None
+    if resuming and mismatches:
+        pending_override = (
+            provider if provider != metadata.provider else None,
+            model if model != metadata.model else None,
+        )
+
+    def completion_success() -> None:
+        nonlocal pending_override
+        if pending_override is not None:
+            manager.record_override(
+                metadata,
+                provider=pending_override[0],
+                model=pending_override[1],
+            )
+            pending_override = None
+            return
+        manager.touch(metadata)
+
+    loop = AgentLoop(
+        backend,
+        store,
+        approval_policy=approval_policy,
+        token_budget=metadata.compaction_budget,
+        retained_tail=metadata.retained_tail,
+        on_completion_success=completion_success,
+    )
     return TUIApp(
-        AgentLoop(backend, store),
-        provider=args.provider,
+        loop,
+        provider=provider,
         model=selected_model,
         verbose=args.verbose,
         history_path=home / "history",
+        approval_policy=approval_policy,
     )
 
 
@@ -396,20 +581,46 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         choices=("fake", "claude", "codex"),
-        default="fake",
         help="completion provider",
     )
     parser.add_argument("--model", help="provider model override")
+    session_group = parser.add_mutually_exclusive_group()
+    session_group.add_argument(
+        "--continue",
+        "-c",
+        dest="continue_session",
+        action="store_true",
+        help="resume the most recent session in this directory",
+    )
+    session_group.add_argument("--resume", help="resume a session by id")
+    parser.add_argument(
+        "--force-provider",
+        action="store_true",
+        help="allow provider or model overrides during resume",
+    )
     parser.add_argument("--verbose", action="store_true", help="show raw stream events")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    app = create_app(args)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.force_provider and args.model is None:
+        parser.error("--force-provider requires --model")
+    try:
+        app = create_app(args)
+    except SessionError as exc:
+        parser.error(str(exc))
     with patch_stdout(raw=True):
         asyncio.run(app.run())
     return 0
 
 
-__all__ = ["FakeInteractiveBackend", "TUIApp", "build_parser", "create_app", "main"]
+__all__ = [
+    "FakeInteractiveBackend",
+    "TUIApp",
+    "build_backend",
+    "build_parser",
+    "create_app",
+    "main",
+]

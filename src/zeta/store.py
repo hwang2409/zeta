@@ -92,7 +92,8 @@ class ConversationStore:
         session_id: str | None = None,
         cwd: str | Path | None = None,
     ) -> None:
-        self.root_dir = Path(session_dir or Path.home() / ".zeta" / "sessions")
+        default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
+        self.root_dir = Path(session_dir or default_home / "sessions")
         self.session_id = uuid.uuid4().hex if session_id is None else session_id
         session_path = Path(self.session_id)
         if (

@@ -34,6 +34,16 @@ from .context import (
 )
 from .fake import FakeBackend, ScriptedTurn
 from .loop import AgentLoop
+from .session import (
+    META_VERSION,
+    OpenedSession,
+    SessionError,
+    SessionManager,
+    SessionMetadata,
+    env_home,
+    find_most_recent,
+    list_sessions,
+)
 from .store import ConversationEntry, ConversationIntegrityError, ConversationStore
 from .tools import AbortSignal, ToolAbortSignal, ToolDefinition, ToolRegistry
 from .types import *
@@ -71,9 +81,14 @@ __all__ = [
     "FakeBackend",
     "Message",
     "MessageRole",
+    "META_VERSION",
+    "OpenedSession",
     "OAuthTokens",
     "RedactedThinkingContent",
     "ScriptedTurn",
+    "SessionError",
+    "SessionManager",
+    "SessionMetadata",
     "StaleBranchError",
     "SummaryCompletionError",
     "SummaryInputTooLarge",
@@ -91,5 +106,8 @@ __all__ = [
     "build_messages_payload",
     "build_responses_payload",
     "exchange_authorization_code",
+    "env_home",
     "extract_account_id",
+    "find_most_recent",
+    "list_sessions",
 ]
