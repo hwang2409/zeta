@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import math
 import shlex
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -254,41 +255,24 @@ async def test_write_race_reports_overwrite(
 ) -> None:
     target = tmp_path / "raced.txt"
     registry = ToolRegistry(tmp_path)
-    creator_started = threading.Event()
-
-    def create_target() -> None:
-        target.write_bytes(b"concurrent")
-
-    def trigger_creator() -> None:
-        if creator_started.is_set():
-            return
-        creator_started.set()
-        creator = threading.Thread(target=create_target)
-        creator.start()
-        creator.join()
-
-    original_exists = Path.exists
-
-    def racing_exists(path: Path) -> bool:
-        if path == target:
-            trigger_creator()
-            return False
-        return original_exists(path)
-
     original_open = write_module.os.open
 
     def racing_open(
         path: object,
         flags: int,
         mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
     ) -> int:
-        if Path(path) == target and flags & write_module.os.O_EXCL:
-            trigger_creator()
-        return original_open(path, flags, mode)
+        if path == "raced.txt" and dir_fd is not None and flags & write_module.os.O_EXCL:
+            creator = threading.Thread(
+                target=lambda: target.write_bytes(b"concurrent")
+            )
+            creator.start()
+            creator.join()
+        return original_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(Path, "exists", racing_exists)
     monkeypatch.setattr(write_module.os, "open", racing_open)
-
     result = await registry.execute(
         ToolCall("write-race", "write", {"path": "raced.txt", "content": "x"})
     )
@@ -305,6 +289,106 @@ async def test_write_race_reports_overwrite(
 
 
 @pytest.mark.asyncio
+async def test_write_overwrite_symlink_race_stays_in_sandbox(tmp_path: Path) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    target = sandbox / "target"
+    target.write_bytes(b"inside")
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"outside")
+    stop = threading.Event()
+
+    def swap_target() -> None:
+        while not stop.is_set():
+            try:
+                target.unlink()
+            except (FileNotFoundError, IsADirectoryError, PermissionError):
+                pass
+            try:
+                target.symlink_to(outside)
+            except FileExistsError:
+                pass
+
+    swapper = threading.Thread(target=swap_target)
+    swapper.start()
+    try:
+        registry = ToolRegistry(tmp_path)
+        for index in range(50):
+            result = await registry.execute(
+                ToolCall(
+                    f"write-overwrite-race-{index}",
+                    "write",
+                    {"path": "sandbox/target", "content": "x"},
+                )
+            )
+            if not result["isError"]:
+                assert result["structuredContent"]["path"] == str(target)
+            assert outside.read_bytes() == b"outside"
+    finally:
+        stop.set()
+        swapper.join()
+        if target.is_symlink():
+            target.unlink()
+        if not target.exists():
+            target.write_bytes(b"inside")
+
+
+@pytest.mark.asyncio
+async def test_write_create_parents_symlink_race_stays_in_sandbox(
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    intermediate = sandbox / "a" / "b"
+    intermediate.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    (outside / "c").mkdir(parents=True)
+    outside_target = outside / "c" / "target"
+    outside_target.write_bytes(b"outside")
+    stop = threading.Event()
+
+    def swap_intermediate() -> None:
+        while not stop.is_set():
+            shutil.rmtree(intermediate, ignore_errors=True)
+            try:
+                intermediate.symlink_to(outside, target_is_directory=True)
+            except FileExistsError:
+                pass
+            try:
+                intermediate.unlink()
+            except (FileNotFoundError, IsADirectoryError, PermissionError):
+                pass
+            try:
+                intermediate.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+
+    swapper = threading.Thread(target=swap_intermediate)
+    swapper.start()
+    try:
+        registry = ToolRegistry(tmp_path)
+        for index in range(50):
+            result = await registry.execute(
+                ToolCall(
+                    f"write-create-parents-race-{index}",
+                    "write",
+                    {
+                        "path": "sandbox/a/b/c/target",
+                        "content": "x",
+                        "create_parents": True,
+                    },
+                )
+            )
+            if not result["isError"]:
+                assert Path(result["structuredContent"]["path"]).is_relative_to(
+                    sandbox
+                )
+            assert outside_target.read_bytes() == b"outside"
+    finally:
+        stop.set()
+        swapper.join()
+
+
+@pytest.mark.asyncio
 async def test_write_rejects_path_outside_session_cwd(tmp_path: Path) -> None:
     session_cwd = tmp_path / "session"
     session_cwd.mkdir()
@@ -316,7 +400,7 @@ async def test_write_rejects_path_outside_session_cwd(tmp_path: Path) -> None:
     )
 
     assert result["isError"] is True
-    assert "outside session cwd" in result["content"][0]["text"]
+    assert "escaped sandbox" in result["content"][0]["text"]
     assert not outside.exists()
 
 

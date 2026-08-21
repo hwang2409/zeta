@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -25,13 +27,132 @@ class WriteStructuredContent(TypedDict):
     was_overwritten: bool
 
 
-def _resolve_path(registry: ToolRegistry, raw_path: str) -> Path:
-    path = registry._path(raw_path).resolve()
+def _normalized_components(parts: tuple[str, ...]) -> list[str]:
+    components: list[str] = []
+    for part in parts:
+        if part in {"", ".", os.sep}:
+            continue
+        if part == "..":
+            if not components:
+                raise ValueError("path escaped sandbox")
+            components.pop()
+            continue
+        components.append(part)
+    return components
+
+
+def _anchored_components(registry: ToolRegistry, raw_path: str) -> list[str]:
+    candidate = Path(raw_path)
+    components = _normalized_components(candidate.parts)
+    if candidate.is_absolute():
+        cwd_components = _normalized_components(registry.cwd.parts)
+        if components[: len(cwd_components)] != cwd_components:
+            raise ValueError("path escaped sandbox")
+        components = components[len(cwd_components) :]
+    if not components:
+        raise ValueError("path must name a file")
+    return components
+
+
+def _path_for_components(registry: ToolRegistry, components: list[str]) -> Path:
+    return registry.cwd.joinpath(*components)
+
+
+def _path_open_error(path: Path, error: OSError) -> ValueError:
+    if error.errno in {errno.ELOOP, errno.EPERM}:
+        return ValueError("path escaped sandbox")
+    return ValueError(f"could not open path: {path}: {error}")
+
+
+def _path_from_fd(file_descriptor: int, fallback: Path) -> str:
+    get_path = getattr(fcntl, "F_GETPATH", None)
+    if get_path is None:
+        return str(fallback)
+    encoded_path = fcntl.fcntl(file_descriptor, get_path, b"\0" * 1024)
+    return bytes(encoded_path).split(b"\0", 1)[0].decode("utf-8")
+
+
+def _open_anchored(
+    registry: ToolRegistry,
+    raw_path: str,
+    create_parents: bool,
+) -> tuple[int, bool, str]:
+    components = _anchored_components(registry, raw_path)
+    fallback_path = _path_for_components(registry, components)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    sandbox_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     try:
-        path.relative_to(registry.cwd)
-    except ValueError as exc:
-        raise ValueError(f"path outside session cwd: {path}") from exc
-    return path
+        sandbox_fd = os.open(registry.cwd, sandbox_flags)
+    except OSError as exc:
+        raise ValueError(f"could not open session cwd: {registry.cwd}: {exc}") from exc
+
+    parent_fd = sandbox_fd
+    file_descriptor: int | None = None
+    try:
+        for index, component in enumerate(components[:-1]):
+            component_path = _path_for_components(
+                registry, components[: index + 1]
+            )
+            try:
+                child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            except FileNotFoundError as exc:
+                if not create_parents:
+                    raise ValueError(
+                        f"parent directory does not exist: {component_path}"
+                    ) from exc
+                try:
+                    os.mkdir(component, 0o755, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                except OSError as mkdir_error:
+                    raise _path_open_error(component_path, mkdir_error) from mkdir_error
+                try:
+                    child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+                except OSError as open_error:
+                    raise _path_open_error(component_path, open_error) from open_error
+            except OSError as open_error:
+                raise _path_open_error(component_path, open_error) from open_error
+
+            if parent_fd != sandbox_fd:
+                os.close(parent_fd)
+            parent_fd = child_fd
+
+        basename = components[-1]
+        try:
+            file_descriptor = os.open(
+                basename,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                0o666,
+                dir_fd=parent_fd,
+            )
+            was_created = True
+        except FileExistsError:
+            try:
+                file_descriptor = os.open(
+                    basename,
+                    os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent_fd,
+                )
+            except OSError as open_error:
+                raise _path_open_error(fallback_path, open_error) from open_error
+            was_created = False
+        except OSError as open_error:
+            raise _path_open_error(fallback_path, open_error) from open_error
+
+        actual_path = _path_from_fd(file_descriptor, fallback_path)
+        result = file_descriptor, was_created, actual_path
+        file_descriptor = None
+        return result
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        if parent_fd != sandbox_fd:
+            os.close(parent_fd)
+        os.close(sandbox_fd)
 
 
 async def _write(
@@ -44,33 +165,11 @@ async def _write(
     except UnicodeEncodeError as exc:
         raise ValueError("content must be valid UTF-8") from exc
 
-    path = _resolve_path(registry, arguments["path"])
-    parent = path.parent
-    if arguments.get("create_parents", False):
-        try:
-            os.makedirs(parent, exist_ok=True)
-        except OSError as exc:
-            raise ValueError(
-                f"could not create parent directory: {parent}: {exc}"
-            ) from exc
-    elif not parent.is_dir():
-        if not parent.exists():
-            raise ValueError(f"parent directory does not exist: {parent}")
-        raise ValueError(f"parent is not a directory: {parent}")
-
-    try:
-        file_descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o666,
-        )
-        was_created = True
-    except FileExistsError:
-        try:
-            file_descriptor = os.open(path, os.O_WRONLY | os.O_TRUNC)
-        except OSError as exc:
-            raise ValueError(f"could not open file: {path}: {exc}") from exc
-        was_created = False
+    file_descriptor, was_created, path = _open_anchored(
+        registry,
+        arguments["path"],
+        arguments.get("create_parents", False),
+    )
 
     try:
         with os.fdopen(file_descriptor, "wb") as handle:
