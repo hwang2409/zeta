@@ -77,11 +77,7 @@ def _open_anchored(
     components = _anchored_components(registry, raw_path)
     fallback_path = _path_for_components(registry, components)
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    sandbox_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
-    try:
-        sandbox_fd = os.open(registry.cwd, sandbox_flags)
-    except OSError as exc:
-        raise ValueError(f"could not open session cwd: {registry.cwd}: {exc}") from exc
+    sandbox_fd = registry._open_cwd()
 
     parent_fd = sandbox_fd
     file_descriptor: int | None = None

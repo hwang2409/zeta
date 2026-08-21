@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import math
+import os
 import shlex
 import shutil
 import sys
@@ -402,6 +403,58 @@ async def test_write_rejects_path_outside_session_cwd(tmp_path: Path) -> None:
     assert result["isError"] is True
     assert "escaped sandbox" in result["content"][0]["text"]
     assert not outside.exists()
+
+
+@pytest.mark.asyncio
+async def test_write_rejects_replaced_session_cwd(tmp_path: Path) -> None:
+    session_cwd = tmp_path / "session"
+    session_cwd.mkdir()
+    attack = tmp_path / "attack"
+    attack.mkdir()
+    registry = ToolRegistry(session_cwd)
+
+    os.rename(session_cwd, tmp_path / "session-original")
+    session_cwd.symlink_to(attack, target_is_directory=True)
+    result = await registry.execute(
+        ToolCall(
+            "write-replaced-cwd",
+            "write",
+            {
+                "path": "sandbox/file.txt",
+                "content": "x",
+                "create_parents": True,
+            },
+        )
+    )
+
+    assert result["isError"] is True
+    assert "session cwd was replaced" in result["content"][0]["text"]
+    assert not (attack / "sandbox" / "file.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_write_rejects_replaced_session_cwd_identity(tmp_path: Path) -> None:
+    session_cwd = tmp_path / "session"
+    session_cwd.mkdir()
+    registry = ToolRegistry(session_cwd)
+
+    os.rename(session_cwd, tmp_path / "session-original")
+    session_cwd.mkdir()
+    result = await registry.execute(
+        ToolCall(
+            "write-replaced-cwd-identity",
+            "write",
+            {
+                "path": "sandbox/file.txt",
+                "content": "x",
+                "create_parents": True,
+            },
+        )
+    )
+
+    assert result["isError"] is True
+    assert "session cwd was replaced" in result["content"][0]["text"]
+    assert not (session_cwd / "sandbox" / "file.txt").exists()
 
 
 @pytest.mark.asyncio
