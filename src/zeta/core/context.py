@@ -191,6 +191,7 @@ class ContextAssembler:
         self.last_context: AssembledContext | None = None
         self.last_usage: dict[str, Any] = {}
         self._provider_token_total: int | None = None
+        self._tokens_used_this_session = 0
 
     @property
     def digest(self) -> str | None:
@@ -199,6 +200,10 @@ class ContextAssembler:
     @property
     def token_count(self) -> int | None:
         return self.last_context.token_count if self.last_context is not None else None
+
+    @property
+    def tokens_used_this_session(self) -> int:
+        return self._tokens_used_this_session
 
     def record_usage(self, usage: Mapping[str, Any]) -> None:
         self.last_usage = dict(usage)
@@ -210,6 +215,7 @@ class ContextAssembler:
                 total = input_tokens + output_tokens
         if type(total) is int and total >= 0:
             self._provider_token_total = total
+            self._tokens_used_this_session += total
 
     def observe_event(self, event: StreamEvent) -> None:
         usage = event.data.get("usage")
