@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
-import tempfile
+import uuid
 from pathlib import Path
 from typing import TypedDict
 
@@ -58,20 +58,15 @@ async def _bash(
     abort_signal: AbortSignal,
 ) -> StructuredToolResult:
     start_cwd = _start_cwd(registry, arguments)
-    cwd_file = tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        prefix="zeta-bash-cwd-",
-        suffix=".txt",
-        delete=False,
-    )
-    cwd_path = Path(cwd_file.name)
-    cwd_file.close()
+    read_fd, write_fd = os.pipe()
+    nonce = uuid.uuid4().hex
+    bind_fd = "" if write_fd == 3 else f"exec 3>&{write_fd}; exec {write_fd}>&-; "
     script = (
+        f'{bind_fd}'
         'cd -- "$1" || exit $?; '
-        'trap \'pwd > "$3"\' EXIT; '
+        f'trap \'printf "%s\\t%s\\n" "{nonce}" "$PWD" >&3\' EXIT; '
         'eval "$2"; status=$?; '
-        'pwd > "$3"; '
+        f'printf "%s\\t%s\\n" "{nonce}" "$PWD" >&3; '
         'exit "$status"'
     )
     command = shlex.join(
@@ -82,7 +77,6 @@ async def _bash(
             "zeta-bash",
             start_cwd,
             arguments["cmd"],
-            str(cwd_path),
         ]
     )
     process: asyncio.subprocess.Process | None = None
@@ -96,7 +90,10 @@ async def _bash(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            pass_fds=(write_fd,),
         )
+        os.close(write_fd)
+        write_fd = -1
         communicate = asyncio.create_task(process.communicate())
         abort_wait = asyncio.create_task(abort_signal.wait())
         done, _ = await asyncio.wait(
@@ -107,10 +104,22 @@ async def _bash(
             await _kill_and_reap(process, (communicate,))
             return _error_result("tool execution canceled")
         stdout_bytes, stderr_bytes = await communicate
-        try:
-            reported_cwd = cwd_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            pass
+        os.set_blocking(read_fd, False)
+        channel_data = bytearray()
+        while True:
+            try:
+                chunk = os.read(read_fd, 65_536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            channel_data.extend(chunk)
+        nonce_prefix = f"{nonce}\t".encode()
+        for line in channel_data.splitlines():
+            if line.startswith(nonce_prefix):
+                candidate = line[len(nonce_prefix) :].decode(errors="replace")
+                if Path(candidate).is_absolute():
+                    reported_cwd = candidate
     except asyncio.CancelledError:
         if process is not None and communicate is not None:
             await _kill_and_reap(process, (communicate,))
@@ -121,7 +130,9 @@ async def _bash(
         if abort_wait is not None and not abort_wait.done():
             abort_wait.cancel()
             await asyncio.gather(abort_wait, return_exceptions=True)
-        cwd_path.unlink(missing_ok=True)
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
 
     stdout = stdout_bytes.decode(errors="replace")
     cwd_after = start_cwd

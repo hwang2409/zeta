@@ -43,7 +43,6 @@ class SessionMetadata:
     provider: str
     model: str
     cwd: str
-    bash_cwd: str
     retained_tail: int
     compaction_budget: int
     override_audit: list[dict[str, Any]] = field(default_factory=list)
@@ -56,7 +55,6 @@ class SessionMetadata:
         provider: str,
         model: str,
         cwd: str,
-        bash_cwd: str | None = None,
         retained_tail: int,
         compaction_budget: int,
     ) -> SessionMetadata:
@@ -69,7 +67,6 @@ class SessionMetadata:
             provider=provider,
             model=model,
             cwd=cwd,
-            bash_cwd=bash_cwd or cwd,
             retained_tail=retained_tail,
             compaction_budget=compaction_budget,
         )
@@ -102,9 +99,6 @@ class SessionMetadata:
             or compaction_budget < 1
         ):
             raise SessionError(f"session metadata budgets are invalid: {path}")
-        bash_cwd = value.get("bash_cwd", value["cwd"])
-        if type(bash_cwd) is not str or not bash_cwd:
-            raise SessionError(f"session metadata bash cwd is invalid: {path}")
         audit = value.get("override_audit", [])
         if type(audit) is not list or any(type(item) is not dict for item in audit):
             raise SessionError(f"session metadata override audit is invalid: {path}")
@@ -116,7 +110,6 @@ class SessionMetadata:
             provider=value["provider"],
             model=value["model"],
             cwd=value["cwd"],
-            bash_cwd=bash_cwd,
             retained_tail=retained_tail,
             compaction_budget=compaction_budget,
             override_audit=[dict(item) for item in audit],
@@ -131,7 +124,6 @@ class SessionMetadata:
             "provider": self.provider,
             "model": self.model,
             "cwd": self.cwd,
-            "bash_cwd": self.bash_cwd,
             "retained_tail": self.retained_tail,
             "compaction_budget": self.compaction_budget,
             "override_audit": self.override_audit,
@@ -174,7 +166,6 @@ class SessionManager:
                 provider=provider,
                 model=model,
                 cwd=resolved_cwd,
-                bash_cwd=resolved_cwd,
                 retained_tail=retained_tail,
                 compaction_budget=compaction_budget,
             )
@@ -182,7 +173,6 @@ class SessionManager:
                 self.sessions_dir,
                 session_id=session_id,
                 cwd=resolved_cwd,
-                bash_cwd=resolved_cwd,
             )
             self._write(metadata)
             return OpenedSession(metadata, store)
@@ -205,9 +195,6 @@ class SessionManager:
             raise SessionError(f"session {session_id} could not be opened") from exc
         if store.cwd != metadata.cwd:
             raise SessionError(f"session {session_id} cwd does not match its metadata")
-        if store.bash_cwd != metadata.bash_cwd:
-            metadata.bash_cwd = store.bash_cwd
-            self._write(metadata)
         return OpenedSession(metadata, store)
 
     def list_sessions(self) -> list[SessionMetadata]:
@@ -299,7 +286,6 @@ class SessionManager:
         target.provider = source.provider
         target.model = source.model
         target.cwd = source.cwd
-        target.bash_cwd = source.bash_cwd
         target.retained_tail = source.retained_tail
         target.compaction_budget = source.compaction_budget
         target.override_audit = [dict(item) for item in source.override_audit]

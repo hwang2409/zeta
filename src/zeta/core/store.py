@@ -115,7 +115,6 @@ class ConversationStore:
         self.lock_path = self.session_dir / ".lock"
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
-        self._legacy_bash_cwd: str | None = None
         self._entries: list[ConversationEntry] = []
         with self._append_lock():
             self._load()
@@ -185,12 +184,6 @@ class ConversationStore:
                 f"conversation header is incomplete: {self.path}"
             )
         self.cwd = cwd
-        legacy_bash_cwd = header_data.get("bash_cwd", cwd)
-        if type(legacy_bash_cwd) is not str or not legacy_bash_cwd:
-            raise ConversationIntegrityError(
-                f"conversation header bash cwd is invalid: {self.path}"
-            )
-        self._legacy_bash_cwd = legacy_bash_cwd
         if header_session_id != self.session_id:
             raise ConversationIntegrityError(
                 f"conversation header session id mismatch: {self.path}"
@@ -240,7 +233,7 @@ class ConversationStore:
 
     def _load_session_state(self) -> None:
         if not self.state_path.exists():
-            self._write_session_state(self._legacy_bash_cwd or self.bash_cwd)
+            self._write_session_state(self.cwd)
             return
         try:
             value = json.loads(self.state_path.read_text(encoding="utf-8"))

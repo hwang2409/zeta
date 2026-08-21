@@ -333,9 +333,9 @@ class ToolRegistry:
         self.bash_cwd = store.bash_cwd
 
     def update_bash_cwd(self, cwd: str) -> None:
-        self.bash_cwd = cwd
         if self._session_store is not None:
             self._session_store.set_bash_cwd(cwd)
+        self.bash_cwd = cwd
 
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
         self.approval_policy = policy

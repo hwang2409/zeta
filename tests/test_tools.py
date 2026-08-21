@@ -198,19 +198,47 @@ async def test_bash_persistent_cwd_isolated_between_sessions(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_bash_stdout_marker_text_is_not_cwd_state(tmp_path: Path) -> None:
+async def test_bash_cwd_channel_rejects_user_forgery(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path)
 
     result = await registry.execute(
         ToolCall(
-            "bash-marker-text",
+            "bash-channel-attack",
             "bash",
-            {"cmd": "printf '__ZETA_BASH_CWD_fake__'"},
+            {"cmd": 'printf "/tmp\\n" > "$3"; trap - EXIT; exit 0'},
         )
     )
 
-    assert result["structuredContent"]["stdout"] == "__ZETA_BASH_CWD_fake__"
-    assert result["structuredContent"]["cwd_after"] == str(tmp_path)
+    assert result["isError"] or result["structuredContent"]["cwd_after"] == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_bash_failed_persistence_keeps_registry_state_on_replace_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    registry = ToolRegistry(tmp_path, session_store=store)
+    before_state = store.state_path.read_bytes()
+
+    def fail_replace(source: object, destination: object) -> None:
+        del source, destination
+        raise OSError("injected state replace failure")
+
+    monkeypatch.setattr("zeta.core.store.os.replace", fail_replace)
+    result = await registry.execute(
+        ToolCall("bash-state-failure", "bash", {"cmd": "cd /tmp"})
+    )
+
+    assert result["isError"] is True
+    assert result["structuredContent"] is None
+    assert registry.bash_cwd == str(tmp_path)
+    assert store.bash_cwd == str(tmp_path)
+    assert store.state_path.read_bytes() == before_state
+
+    monkeypatch.undo()
+    current = await registry.execute(ToolCall("bash-state-old", "bash", {"cmd": "pwd"}))
+    assert current["structuredContent"]["stdout"].strip() == str(tmp_path)
 
 
 @pytest.mark.asyncio
