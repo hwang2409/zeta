@@ -9,12 +9,15 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
-from zeta.core.fake import FakeBackend
+from zeta.core.approval import ApprovalPolicy
+from zeta.core.context import ContextAssembler
+from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.slash import SlashStatus, create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings
+from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,18 +43,82 @@ def session() -> FakeSlashSession:
     )
 
 
-def test_status_returns_all_required_fields() -> None:
-    output = create_slash_registry().dispatch(session(), "/status")
+@pytest.mark.asyncio
+async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="test-xyz-123")
+    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
+    store.append_compaction_marker("summary", 1, 1)
+    backend = FakeBackend([])
+    policy = ApprovalPolicy(store=store)
+    loop = AgentLoop(backend, store, approval_policy=policy)
+    await loop.context_assembler.assemble()
+    loop.context_assembler.record_usage({"total_tokens": 321})
+    call = ToolCall("approval-live", "write", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    app = TUIApp(
+        loop,
+        provider="provider-live",
+        model="model-live",
+        approval_policy=policy,
+    )
+    output = create_slash_registry().dispatch(app, "/status")
 
     assert output is not None
-    assert "session_id: session-1" in output
-    assert "provider: fake" in output
-    assert "model: offline" in output
-    assert "retained_tail: 8" in output
-    assert "tokens_used_this_session: 123" in output
-    assert "tokens_in_current_context: 45" in output
-    assert "compaction_marker_count: 2" in output
-    assert "live_pending_approvals: 1 (approval-1 (write))" in output
+    assert f"session_id: {store.session_id}" in output
+    assert f"provider: {app.provider}" in output
+    assert f"model: {app.model}" in output
+    assert f"retained_tail: {loop.context_assembler.retained_tail}" in output
+    assert (
+        "tokens_used_this_session: "
+        f"{loop.context_assembler.tokens_used_this_session}"
+    ) in output
+    assert (
+        "tokens_in_current_context: "
+        f"{loop.context_assembler.token_count}"
+    ) in output
+    assert f"compaction_marker_count: {store.compaction_marker_count()}" in output
+    assert "live_pending_approvals: 1 (approval-live (write))" in output
+
+
+@pytest.mark.asyncio
+async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
+    def token_count(message: Message) -> int:
+        if message.role is MessageRole.COMPACTION or message.metadata.get(
+            "compaction_summary"
+        ):
+            return 1
+        return 40
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first")], usage={"total_tokens": 20}),
+            ScriptedTurn([TextContent("summary")], usage={"total_tokens": 10}),
+            ScriptedTurn([TextContent("second")], usage={"total_tokens": 5}),
+        ]
+    )
+    store = ConversationStore(tmp_path / "sessions")
+    assembler = ContextAssembler(
+        store,
+        backend=backend,
+        token_budget=80,
+        retained_tail=1,
+        token_counter=token_count,
+    )
+    loop = AgentLoop(backend, store, context_assembler=assembler)
+
+    async for _ in loop.run_turn("first"):
+        pass
+    async for _ in loop.run_turn("second"):
+        pass
+
+    app = TUIApp(loop, provider="fake", model="offline")
+    output = create_slash_registry().dispatch(app, "/status")
+
+    assert output is not None
+    assert "tokens_used_this_session: 35" in output
 
 
 def test_unknown_command_passes_through_unchanged() -> None:
