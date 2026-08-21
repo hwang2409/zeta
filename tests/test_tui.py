@@ -312,10 +312,18 @@ async def test_streamed_tool_output_is_not_repeated_at_end(tmp_path: Path) -> No
     )
     assert expected_start is not None
     assert expected_end is not None
+    start_idx = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == expected_start.plain
+    )
+    end_idx = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == expected_end.plain
+    )
     tool_region = "\n".join(
-        item.plain
-        for item in rendered
-        if getattr(item, "plain", "").startswith(("▸ bash(", "  ↳ [tool result]"))
+        item.plain for item in rendered[start_idx : end_idx + 1]
     )
     assert tool_region == f"{expected_start.plain}\n{expected_end.plain}"
     assert "  ↳ [stdout] chunk" not in tool_region
@@ -360,15 +368,23 @@ async def test_tui_overflow_final_render_is_authoritative(tmp_path: Path) -> Non
         )
     )
     assert expected is not None
-    tool_region = "\n".join(
-        item.plain
-        for item in rendered
-        if getattr(item, "plain", "").startswith(("▸ stream(", "  ↳ [tool result]"))
-    )
     expected_start = render_event(
         StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
     )
     assert expected_start is not None
+    start_idx = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == expected_start.plain
+    )
+    end_idx = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == expected.plain
+    )
+    tool_region = "\n".join(
+        item.plain for item in rendered[start_idx : end_idx + 1]
+    )
     assert tool_region == f"{expected_start.plain}\n{expected.plain}"
     for index in range(200):
         assert f"  ↳ [stdout] chunk-{index}" not in tool_region
@@ -423,17 +439,23 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
         )
     )
     assert expected is not None
-    tool_region = "\n".join(
-        item.plain
-        for item in rendered
-        if getattr(item, "plain", "").startswith(
-            ("▸ stream(", "  ↳ [tool error]")
-        )
-    )
     expected_start = render_event(
         StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
     )
     assert expected_start is not None
+    start_idx = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == expected_start.plain
+    )
+    end_idx = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == expected.plain
+    )
+    tool_region = "\n".join(
+        item.plain for item in rendered[start_idx : end_idx + 1]
+    )
     assert tool_region == f"{expected_start.plain}\n{expected.plain}"
     assert "  ↳ [stdout] first" not in tool_region
     assert app._loop_state == "idle"
