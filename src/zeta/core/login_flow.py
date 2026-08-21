@@ -54,10 +54,15 @@ class _AuthorizationCode:
 
 
 class _CallbackReceiver:
-    def __init__(self, expected_state: str, expected_path: str) -> None:
+    def __init__(
+        self,
+        expected_state: str,
+        expected_path: str,
+        notify: Callable[[], None] | None = None,
+    ) -> None:
         self.expected_state = expected_state
         self.expected_path = expected_path
-        self.ready = threading.Event()
+        self._notify = notify
         self._result_lock = threading.Lock()
         self.results: queue.Queue[_AuthorizationCode | LoginError] = queue.Queue(maxsize=1)
 
@@ -87,10 +92,11 @@ class _CallbackReceiver:
 
     def _set_result(self, result: _AuthorizationCode | LoginError) -> None:
         with self._result_lock:
-            if self.ready.is_set():
+            if self.results.full():
                 return
             self.results.put_nowait(result)
-            self.ready.set()
+            if self._notify is not None:
+                self._notify()
 
 
 def _query_value(query: dict[str, list[str]], name: str) -> str:
@@ -142,7 +148,13 @@ async def run_login(
     """Run one provider login and return its optional account handle."""
 
     verifier, challenge, state = build_pkce()
-    receiver = _CallbackReceiver(state, "/callback")
+    callback_ready = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def notify() -> None:
+        loop.call_soon_threadsafe(callback_ready.set)
+
+    receiver = _CallbackReceiver(state, "/callback", notify)
     server = _create_redirect_server(_handler_for(receiver))
     server_thread = threading.Thread(
         target=server.serve_forever,
@@ -156,9 +168,11 @@ async def run_login(
         print(
             f"open this URL to log in with {provider.name}:\n{authorization_url}",
             file=output or sys.stdout,
+            flush=True,
         )
-        received = await asyncio.to_thread(receiver.ready.wait, timeout_seconds)
-        if not received:
+        try:
+            await asyncio.wait_for(callback_ready.wait(), timeout_seconds)
+        except asyncio.TimeoutError:
             raise LoginError("login timed out after 5 minutes")
         try:
             result = receiver.results.get_nowait()

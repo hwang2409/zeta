@@ -11,12 +11,12 @@ import json
 import os
 import secrets
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, unquote_plus
+from urllib.parse import unquote_plus
 
 import httpx
 
@@ -478,119 +478,6 @@ def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
         if type(candidate) is str and candidate:
             return candidate
     return None
-
-
-def build_oauth_authorization_url(
-    authorize_url: str,
-    client_id: str,
-    scopes: str,
-    state: str,
-    code_challenge: str,
-    redirect_uri: str = "",
-    *,
-    default_redirect_uri: str = "",
-    error_type: type[RuntimeError],
-) -> str:
-    redirect_uri = redirect_uri or default_redirect_uri
-    if not authorize_url or not client_id or not scopes or not state or not code_challenge or not redirect_uri:
-        raise error_type("OAuth PKCE parameters are incomplete")
-    return f"{authorize_url}?{urlencode({'client_id': client_id, 'response_type': 'code', 'scope': scopes, 'code_challenge': code_challenge, 'code_challenge_method': 'S256', 'state': state, 'redirect_uri': redirect_uri})}"
-
-
-async def exchange_oauth_authorization_code(
-    client: httpx.AsyncClient,
-    code: str,
-    state: str,
-    code_verifier: str,
-    redirect_uri: str,
-    *,
-    token_url: str,
-    client_id: str,
-    provider_label: str,
-    error_type: type[RuntimeError],
-    http_error_type: type[RuntimeError],
-) -> OAuthTokens:
-    if not code or not state or not code_verifier or not redirect_uri:
-        raise error_type("OAuth code exchange parameters are incomplete")
-    try:
-        response = await client.post(
-            token_url,
-            data={
-                "grant_type": "authorization_code",
-                "client_id": client_id,
-                "code": code,
-                "state": state,
-                "redirect_uri": redirect_uri,
-                "code_verifier": code_verifier,
-            },
-            headers={"accept": "application/json"},
-        )
-    except httpx.HTTPError as exc:
-        raise error_type(f"{provider_label} OAuth code exchange failed") from exc
-    if response.status_code >= 400:
-        raise http_error_type(
-            f"{provider_label} OAuth code exchange failed with HTTP {response.status_code}"
-        )
-    try:
-        value = response.json()
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise error_type(f"{provider_label} OAuth code response is invalid") from exc
-    if not isinstance(value, Mapping):
-        raise error_type(f"{provider_label} OAuth code response is invalid")
-    access = _first_string(value, "access_token", "accessToken", "access")
-    refresh = _first_string(value, "refresh_token", "refreshToken", "refresh")
-    expires_in = value.get("expires_in", value.get("expiresIn"))
-    if not access or not refresh or type(expires_in) not in {int, float}:
-        raise error_type(f"{provider_label} OAuth code response is invalid")
-    return OAuthTokens(access, refresh, time.time() + float(expires_in) - 300)
-
-
-def make_oauth_functions(
-    authorize_url: str,
-    client_id: str,
-    scopes: str,
-    default_redirect_uri: str,
-    token_url: str,
-    provider_label: str,
-    error_type: type[RuntimeError],
-    http_error_type: type[RuntimeError],
-) -> tuple[
-    Callable[[str, str, str], str],
-    Callable[[httpx.AsyncClient, str, str, str, str], Awaitable[OAuthTokens]],
-]:
-    def build(state: str, challenge: str, redirect_uri: str = "") -> str:
-        return build_oauth_authorization_url(
-            authorize_url,
-            client_id,
-            scopes,
-            state,
-            challenge,
-            redirect_uri,
-            default_redirect_uri=default_redirect_uri,
-            error_type=error_type,
-        )
-
-    async def exchange(
-        client: httpx.AsyncClient,
-        code: str,
-        state: str,
-        verifier: str,
-        redirect_uri: str,
-    ) -> OAuthTokens:
-        return await exchange_oauth_authorization_code(
-            client,
-            code,
-            state,
-            verifier,
-            redirect_uri,
-            token_url=token_url,
-            client_id=client_id,
-            provider_label=provider_label,
-            error_type=error_type,
-            http_error_type=http_error_type,
-        )
-
-    return build, exchange
 
 
 class OAuthCredentialStore:
