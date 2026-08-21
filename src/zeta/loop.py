@@ -149,6 +149,7 @@ class AgentLoop:
             self.tool_registry = ToolRegistry(store.cwd)
         else:
             raise TypeError("tools must be a mapping or ToolRegistry")
+        self.tool_registry.bind_session_store(store)
         if (
             approval_policy is not None
             and self.tool_registry.approval_policy is not None

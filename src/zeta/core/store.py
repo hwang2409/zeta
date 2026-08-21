@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import tempfile
 import uuid
 import warnings
 from contextlib import contextmanager
@@ -91,6 +92,7 @@ class ConversationStore:
         *,
         session_id: str | None = None,
         cwd: str | Path | None = None,
+        bash_cwd: str | Path | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -109,11 +111,14 @@ class ConversationStore:
         self.session_dir = self.root_dir / self.session_id
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.session_dir / "conversation.jsonl"
+        self.state_path = self.session_dir / "session_state.json"
         self.lock_path = self.session_dir / ".lock"
         self.cwd = str(cwd or Path.cwd())
+        self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
         with self._append_lock():
             self._load()
+            self._load_session_state()
 
     def _load(self) -> None:
         if not self.path.exists():
@@ -172,6 +177,7 @@ class ConversationStore:
             type(header_session_id) is not str
             or not header_session_id
             or type(cwd) is not str
+            or not cwd
             or type(created_at) is not str
         ):
             raise ConversationIntegrityError(
@@ -213,6 +219,54 @@ class ConversationStore:
                 handle.write(b"\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+
+    def set_bash_cwd(self, cwd: str | Path) -> None:
+        """Persist the shell's current directory outside the append-only log."""
+
+        resolved = str(cwd)
+        if not resolved:
+            raise ValueError("bash cwd must be a nonempty string")
+        with self._append_lock():
+            self._load()
+            self._write_session_state(resolved)
+            self.bash_cwd = resolved
+
+    def _load_session_state(self) -> None:
+        if not self.state_path.exists():
+            self._write_session_state(self.cwd)
+            return
+        try:
+            value = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConversationIntegrityError(
+                f"session state could not be read: {self.state_path}"
+            ) from exc
+        bash_cwd = value.get("bash_cwd") if isinstance(value, dict) else None
+        if type(bash_cwd) is not str or not bash_cwd:
+            raise ConversationIntegrityError(
+                f"session state bash cwd is invalid: {self.state_path}"
+            )
+        self.bash_cwd = bash_cwd
+
+    def _write_session_state(self, bash_cwd: str) -> None:
+        temporary = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=self.session_dir,
+            prefix=".session_state.",
+            suffix=".tmp",
+            delete=False,
+        )
+        temporary_path = Path(temporary.name)
+        try:
+            with temporary:
+                json.dump({"bash_cwd": bash_cwd}, temporary, separators=(",", ":"))
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_path, self.state_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     def _validate_entries(self) -> None:
         ids: set[str] = set()

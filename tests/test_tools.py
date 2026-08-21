@@ -13,7 +13,6 @@ from pathlib import Path
 import pytest
 
 import zeta.tools.exec as exec_module
-import zeta.tools.list as list_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -119,30 +118,18 @@ async def test_paths_outside_session_cwd_are_allowed(tmp_path: Path) -> None:
     absolute_result = await registry.execute(
         ToolCall("read-1", "read", {"path": str(outside)})
     )
-    parent_result = await registry.execute(
-        ToolCall("list-1", "list", {"path": "../", "depth": 1})
-    )
     symlink_result = await registry.execute(
         ToolCall("read-2", "read", {"path": "outside-link"})
-    )
-    symlink_dir_result = await registry.execute(
-        ToolCall("list-2", "list", {"path": "outside-dir-link"})
     )
 
     assert absolute_result["isError"] is False
     assert absolute_result["content"][0]["text"] == "outside"
-    assert parent_result["isError"] is False
-    assert "zeta-outside.txt" in {
-        entry["name"] for entry in parent_result["structuredContent"]["entries"]
-    }
     assert symlink_result["isError"] is False
     assert symlink_result["content"][0]["text"] == "outside"
-    assert symlink_dir_result["isError"] is False
-    assert "outside-dir-link/nested.txt" in symlink_dir_result["content"][0]["text"]
 
 
 @pytest.mark.asyncio
-async def test_builtin_tools_read_list_and_exec_use_session_cwd(tmp_path: Path) -> None:
+async def test_builtin_tools_read_and_exec_use_session_cwd(tmp_path: Path) -> None:
     (tmp_path / "nested").mkdir()
     (tmp_path / "nested" / "note.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
     registry = ToolRegistry(tmp_path)
@@ -150,21 +137,260 @@ async def test_builtin_tools_read_list_and_exec_use_session_cwd(tmp_path: Path) 
     read_result = await registry.execute(
         ToolCall("read-1", "read", {"path": "nested/note.txt", "offset": 1, "limit": 1})
     )
-    list_result = await registry.execute(
-        ToolCall("list-1", "list", {"path": ".", "depth": 2})
-    )
     exec_result = await registry.execute(
         ToolCall("exec-1", "exec", {"command": "pwd"})
     )
 
     assert read_result["isError"] is False
     assert read_result["content"][0]["text"] == "two"
-    assert list_result["isError"] is False
-    assert "nested/" in list_result["content"][0]["text"]
-    assert "nested/note.txt" in list_result["content"][0]["text"]
     assert exec_result["isError"] is False
     assert str(tmp_path) in exec_result["content"][0]["text"]
     assert "not a sandbox" in registry.schemas[2]["description"]
+
+
+@pytest.mark.asyncio
+async def test_bash_captures_stdout_stderr_and_exit_code(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "bash-output",
+            "bash",
+            {"cmd": "printf out; printf err >&2; exit 7"},
+        )
+    )
+
+    assert result["isError"] is True
+    assert result["structuredContent"] == {
+        "stdout": "out",
+        "stderr": "err",
+        "exit_code": 7,
+        "cwd_after": str(tmp_path),
+    }
+    assert "stdout:\nout\nstderr:\nerr" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_bash_persists_cwd_across_calls(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    changed = await registry.execute(
+        ToolCall("bash-cd", "bash", {"cmd": "cd /tmp"})
+    )
+    current = await registry.execute(ToolCall("bash-pwd", "bash", {"cmd": "pwd"}))
+
+    assert changed["structuredContent"]["cwd_after"] == "/tmp"
+    assert current["structuredContent"]["stdout"].strip() == "/tmp"
+    assert registry.bash_cwd == "/tmp"
+
+
+@pytest.mark.asyncio
+async def test_bash_persistent_cwd_isolated_between_sessions(tmp_path: Path) -> None:
+    first_store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    first = ToolRegistry(tmp_path, session_store=first_store)
+    await first.execute(ToolCall("first-cd", "bash", {"cmd": "cd /tmp"}))
+
+    second_store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    second = ToolRegistry(tmp_path, session_store=second_store)
+    result = await second.execute(ToolCall("second-pwd", "bash", {"cmd": "pwd"}))
+
+    assert result["structuredContent"]["stdout"].strip() == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_bash_cwd_channel_rejects_user_forgery(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "bash-channel-attack",
+            "bash",
+            {"cmd": 'printf "/tmp\\n" > "$3"; trap - EXIT; exit 0'},
+        )
+    )
+
+    assert result["isError"] or result["structuredContent"]["cwd_after"] == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_bash_failed_persistence_keeps_registry_state_on_replace_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    registry = ToolRegistry(tmp_path, session_store=store)
+    before_state = store.state_path.read_bytes()
+
+    def fail_replace(source: object, destination: object) -> None:
+        del source, destination
+        raise OSError("injected state replace failure")
+
+    monkeypatch.setattr("zeta.core.store.os.replace", fail_replace)
+    result = await registry.execute(
+        ToolCall("bash-state-failure", "bash", {"cmd": "cd /tmp"})
+    )
+
+    assert result["isError"] is True
+    assert result["structuredContent"] is None
+    assert registry.bash_cwd == str(tmp_path)
+    assert store.bash_cwd == str(tmp_path)
+    assert store.state_path.read_bytes() == before_state
+
+    monkeypatch.undo()
+    current = await registry.execute(ToolCall("bash-state-old", "bash", {"cmd": "pwd"}))
+    assert current["structuredContent"]["stdout"].strip() == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_bash_rejects_per_call_cwd_outside_sandbox(tmp_path: Path) -> None:
+    marker = tmp_path / "should-not-run"
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "bash-outside-cwd",
+            "bash",
+            {"cmd": f"touch {shlex.quote(str(marker))}", "cwd": str(tmp_path.parent)},
+        )
+    )
+
+    assert result["isError"] is True
+    assert result["structuredContent"] is None
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_bash_persists_cwd_after_failed_command(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    failed = await registry.execute(
+        ToolCall("bash-failed-cd", "bash", {"cmd": "cd /tmp; exit 3"})
+    )
+    current = await registry.execute(ToolCall("bash-failed-pwd", "bash", {"cmd": "pwd"}))
+
+    assert failed["isError"] is True
+    assert failed["structuredContent"] == {
+        "stdout": "",
+        "stderr": "",
+        "exit_code": 3,
+        "cwd_after": "/tmp",
+    }
+    assert current["structuredContent"]["stdout"].strip() == "/tmp"
+
+
+@pytest.mark.asyncio
+async def test_bash_persists_explicit_cd_from_override(tmp_path: Path) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("bash-explicit-cd", "bash", {"cmd": "cd /tmp", "cwd": str(nested)})
+    )
+    current = await registry.execute(ToolCall("bash-explicit-pwd", "bash", {"cmd": "pwd"}))
+
+    assert result["structuredContent"]["cwd_after"] == "/tmp"
+    assert current["structuredContent"]["stdout"].strip() == "/tmp"
+
+
+@pytest.mark.asyncio
+async def test_bash_abort_kills_process_group_and_reaps_descendants(tmp_path: Path) -> None:
+    marker = tmp_path / "child-alive"
+    abort_signal = ToolAbortSignal()
+    registry = ToolRegistry(tmp_path, abort_signal=abort_signal)
+    task = asyncio.create_task(
+        registry.execute(
+            ToolCall("bash-abort", "bash", {"cmd": _descendant_command(marker)})
+        )
+    )
+
+    await asyncio.sleep(0.05)
+    abort_signal.abort()
+    result = await task
+    await asyncio.sleep(0.5)
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "tool execution canceled"
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_bash_task_cancellation_kills_process_group(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "child-canceled"
+    registry = ToolRegistry(tmp_path)
+    task = asyncio.create_task(
+        registry.execute(
+            ToolCall("bash-cancel", "bash", {"cmd": _descendant_command(marker)})
+        )
+    )
+
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.5)
+
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_bash_invalid_start_cwd_falls_back_without_persisting(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing"
+    registry = ToolRegistry(tmp_path)
+    registry.bash_cwd = str(missing)
+
+    result = await registry.execute(ToolCall("bash-missing-cwd", "bash", {"cmd": "pwd"}))
+
+    assert result["isError"] is True
+    assert result["structuredContent"]["cwd_after"] == str(missing)
+    assert registry.bash_cwd == str(missing)
+
+
+@pytest.mark.asyncio
+async def test_bash_cwd_override_does_not_persist_without_cd(tmp_path: Path) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("bash-override", "bash", {"cmd": "pwd", "cwd": str(nested)})
+    )
+    current = await registry.execute(ToolCall("bash-default", "bash", {"cmd": "pwd"}))
+
+    assert result["structuredContent"]["cwd_after"] == str(nested)
+    assert current["structuredContent"]["stdout"].strip() == str(tmp_path)
+    assert registry.bash_cwd == str(tmp_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"cmd": ""},
+        {"cmd": 1},
+        {"cmd": "pwd", "cwd": 1},
+        {"cmd": "pwd", "extra": True},
+    ],
+)
+async def test_bash_rejects_malformed_arguments(
+    tmp_path: Path,
+    arguments: dict[str, object],
+) -> None:
+    result = await ToolRegistry(tmp_path).execute(
+        ToolCall("bash-invalid", "bash", arguments)
+    )
+
+    assert result["isError"] is True
+    assert result["structuredContent"] is None
+
+
+def test_list_is_not_registered(tmp_path: Path) -> None:
+    assert "list" not in ToolRegistry(tmp_path).definitions_by_name
 
 
 @pytest.mark.asyncio
@@ -798,131 +1024,6 @@ async def test_read_retains_only_bounded_output_from_large_file(
 
 
 @pytest.mark.asyncio
-async def test_list_retains_only_bounded_output_from_large_directory(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captures = []
-    real_capture = list_module._BoundedText
-
-    class TrackingCapture(real_capture):
-        def __init__(self, limit: int) -> None:
-            super().__init__(limit)
-            captures.append(self)
-
-    monkeypatch.setattr(list_module, "_BoundedText", TrackingCapture)
-    for index in range(1_000):
-        (tmp_path / f"file-{index:04d}.txt").write_text("x", encoding="utf-8")
-    registry = ToolRegistry(tmp_path, max_output_chars=64)
-
-    result = await registry.execute(ToolCall("list-large", "list", {"path": "."}))
-
-    assert result["isError"] is False
-    assert len(result["content"][0]["text"]) == 64
-    assert result["content"][0]["truncated"] is True
-    assert len(captures) == 1
-    assert captures[0].retained_chars <= 64
-
-
-@pytest.mark.asyncio
-async def test_list_bounds_directory_working_set(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    for index in range(5_000):
-        (tmp_path / f"file-{index:04d}.txt").write_text("x", encoding="utf-8")
-    calls: list[int] = []
-    real_nsmallest = list_module.heapq.nsmallest
-
-    def tracking_nsmallest(
-        count: int,
-        iterable: object,
-        *,
-        key: object,
-    ) -> list[Path]:
-        calls.append(count)
-        return real_nsmallest(count, iterable, key=key)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(list_module.heapq, "nsmallest", tracking_nsmallest)
-    registry = ToolRegistry(tmp_path, max_output_chars=32)
-
-    result = await registry.execute(ToolCall("list-wide", "list", {"path": "."}))
-
-    assert result["isError"] is False
-    assert len(result["content"][0]["text"]) == 32
-    assert result["content"][0]["truncated"] is True
-    assert calls == [32]
-    full_listing = "\n".join(f"file-{index:04d}.txt" for index in range(5_000))
-    assert result["content"][0]["full_size"] == len(full_listing.encode("utf-8"))
-    structured = result["structuredContent"]
-    assert set(structured) == {
-        "root",
-        "entries",
-        "entry_count",
-        "full_size",
-        "truncated",
-    }
-    assert structured["root"] == str(tmp_path)
-    assert structured["entry_count"] == 5_000
-    assert structured["full_size"] == result["content"][0]["full_size"]
-    assert structured["truncated"] == result["content"][0]["truncated"]
-    assert len(structured["entries"]) == 5_000
-
-
-@pytest.mark.asyncio
-async def test_list_truncation_metadata_matches_capped_content(tmp_path: Path) -> None:
-    for index in range(100):
-        (tmp_path / f"file-{index:03d}.txt").write_text("x", encoding="utf-8")
-    registry = ToolRegistry(tmp_path, max_output_chars=32)
-
-    result = await registry.execute(ToolCall("list-capped", "list", {"path": "."}))
-
-    block = result["content"][0]
-    structured = result["structuredContent"]
-    assert block["truncated"] is True
-    assert structured["truncated"] is True
-    assert structured["full_size"] == block["full_size"]
-
-
-@pytest.mark.asyncio
-async def test_list_truncation_metadata_matches_full_content(tmp_path: Path) -> None:
-    for index in range(601):
-        directory = tmp_path / f"directory-{index:03d}"
-        directory.mkdir()
-        (directory / "file.txt").write_text("x", encoding="utf-8")
-    registry = ToolRegistry(tmp_path, max_output_chars=100_000)
-
-    result = await registry.execute(
-        ToolCall("list-complete", "list", {"path": ".", "depth": 2})
-    )
-
-    block = result["content"][0]
-    structured = result["structuredContent"]
-    assert structured["entry_count"] == 1_202
-    assert block["truncated"] is False
-    assert structured["truncated"] is False
-    assert structured["full_size"] == block["full_size"]
-
-
-@pytest.mark.asyncio
-async def test_list_abort_returns_canceled_result_during_traversal(tmp_path: Path) -> None:
-    for index in range(256):
-        (tmp_path / f"file-{index:03d}.txt").write_text("x", encoding="utf-8")
-    abort_signal = ToolAbortSignal()
-    registry = ToolRegistry(tmp_path, abort_signal=abort_signal)
-
-    async def abort_soon() -> None:
-        await asyncio.sleep(0)
-        abort_signal.abort()
-
-    abort_task = asyncio.create_task(abort_soon())
-    result = await registry.execute(ToolCall("list-abort", "list", {"depth": 1}))
-    await abort_task
-
-    assert result["isError"] is True
-    assert result["content"][0]["text"] == "tool execution canceled"
-
-
 @pytest.mark.asyncio
 async def test_read_abort_returns_canceled_result_during_scan(tmp_path: Path) -> None:
     (tmp_path / "large.txt").write_text("x\n" * 1_000_000, encoding="utf-8")

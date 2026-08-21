@@ -50,6 +50,21 @@ def test_fresh_cli_session_writes_versioned_directory(
     assert metadata["cwd"] == str(tmp_path)
 
 
+def test_session_bash_cwd_round_trips_through_store_state(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+
+    opened.store.set_bash_cwd("/tmp")
+    resumed = manager.open(opened.store.session_id)
+
+    assert resumed.store.bash_cwd == "/tmp"
+    assert json.loads(resumed.store.state_path.read_text(encoding="utf-8")) == {
+        "bash_cwd": "/tmp"
+    }
+
+
 def test_continue_requires_a_prior_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

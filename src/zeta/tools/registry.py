@@ -213,6 +213,7 @@ class ToolRegistry:
         abort_signal: ToolAbortSignal | None = None,
         approval_policy: ApprovalPolicy | None = None,
         approval_store: ConversationStore | None = None,
+        session_store: ConversationStore | None = None,
         max_output_chars: int = 10_000,
         register_builtin: bool = True,
     ) -> None:
@@ -249,6 +250,10 @@ class ToolRegistry:
         if self.approval_policy is not None and approval_store is not None:
             self.approval_policy.bind_store(approval_store)
         self.max_output_chars = max_output_chars
+        self._session_store = session_store
+        self.bash_cwd = (
+            session_store.bash_cwd if session_store is not None else str(self.cwd)
+        )
         self._tools: dict[str, ToolDefinition] = {}
         if register_builtin:
             from . import register_default_tools
@@ -322,6 +327,15 @@ class ToolRegistry:
     def bind_approval_store(self, store: ConversationStore) -> None:
         if self.approval_policy is not None:
             self.approval_policy.bind_store(store)
+
+    def bind_session_store(self, store: ConversationStore) -> None:
+        self._session_store = store
+        self.bash_cwd = store.bash_cwd
+
+    def update_bash_cwd(self, cwd: str) -> None:
+        if self._session_store is not None:
+            self._session_store.set_bash_cwd(cwd)
+        self.bash_cwd = cwd
 
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
         self.approval_policy = policy

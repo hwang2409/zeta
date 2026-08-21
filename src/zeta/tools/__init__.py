@@ -10,10 +10,10 @@ from .registry import (
 
 
 def register_default_tools(registry: ToolRegistry) -> None:
-    from . import edit, exec, list, read, write
+    from . import bash, edit, exec, read, write
 
     read.register(registry)
-    list.register(registry)
+    bash.register(registry)
     exec.register(registry)
     write.register(registry)
     edit.register(registry)
