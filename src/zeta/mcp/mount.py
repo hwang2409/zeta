@@ -54,11 +54,11 @@ async def mount_mcp_servers(registry: ToolRegistry, config: MCPConfig | None = N
                 server_config.name,
                 SERVER_SETUP_TIMEOUT_SECONDS,
             )
-            await client.close()
+            await _close_failed_client(client)
             return None
         except Exception as exc:  # noqa: BLE001 - isolate one bad server
             logger.warning("skipping MCP server %s: %s", server_config.name, exc)
-            await client.close()
+            await _close_failed_client(client)
             return None
         return client, tools
 
@@ -85,6 +85,13 @@ def _build_client(config: MCPServerConfig) -> MCPClient:
 async def _connect_and_list(client: MCPClient) -> list[MCPTool]:
     await client.connect()
     return await client.list_tools()
+
+
+async def _close_failed_client(client: MCPClient) -> None:
+    try:
+        await client.close()
+    except Exception:
+        logger.exception("failed to clean up MCP server %s", client.config.name)
 
 
 def _register_tool(registry: ToolRegistry, client: MCPClient, tool: MCPTool) -> None:

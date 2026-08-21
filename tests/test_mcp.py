@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -7,17 +8,23 @@ import httpx
 import pytest
 
 from zeta.core.abort import AbortSignal
+from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.store import ConversationStore
+from zeta.loop import AgentLoop
 from zeta.mcp import (
     MCPConfig,
     MCPConfigError,
     MCPServerConfig,
+    MCPTool,
     StdioMCPClient,
     StreamableHTTPMCPClient,
     load_mcp_config,
     mount_mcp_servers,
 )
 from zeta.tools import ToolRegistry
-from zeta.types import ToolCall
+from zeta.types import TextContent, ToolCall
+
+mount_module = importlib.import_module("zeta.mcp.mount")
 
 
 def _stdio_source() -> str:
@@ -51,6 +58,38 @@ def _failing_stdio_config(name: str = "fail") -> MCPServerConfig:
         '    elif method == "tools/call":\n        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -1, "message": "tool failed"}}), flush=True)\n        continue\n',
     )
     return MCPServerConfig(name, "stdio", sys.executable, ("-u", "-c", source))
+
+
+def _descendant_stdio_config(marker: Path) -> MCPServerConfig:
+    child_source = f"import time; time.sleep(0.6); open({str(marker)!r}, 'w').write('alive')"
+    source = _stdio_source().replace(
+        '        result = {"content": [{"type": "text", "text": request["params"]["arguments"]["value"]}], "isError": False, "structuredContent": {"ok": True, "latency": 1.5}}',
+        f'        import subprocess; subprocess.Popen([sys.executable, "-c", {child_source!r}]); sys.exit(0)',
+    )
+    return MCPServerConfig("descendant", "stdio", sys.executable, ("-u", "-c", source))
+
+
+class _FakeClient:
+    def __init__(self, config: MCPServerConfig, *, fail_connect: bool = False, fail_close: bool = False) -> None:
+        self.config = config
+        self.protocol_version = "2025-06-18"
+        self.fail_connect = fail_connect
+        self.fail_close = fail_close
+
+    async def connect(self) -> None:
+        if self.fail_connect:
+            raise RuntimeError("connect failed")
+
+    async def list_tools(self) -> list[MCPTool]:
+        return [MCPTool("echo", "", {"type": "object"})]
+
+    async def call_tool(self, name: str, arguments: dict[str, object], abort_signal: AbortSignal):
+        del name, arguments, abort_signal
+        return {"content": [], "isError": False, "structuredContent": None}
+
+    async def close(self) -> None:
+        if self.fail_close:
+            raise RuntimeError("close failed")
 
 
 def test_config_interpolates_and_skips_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -89,6 +128,29 @@ async def test_missing_config_mount_is_a_noop(tmp_path: Path, monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_bootstrap_checks_missing_mcp_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_MCP_CONFIG", str(tmp_path / "missing.json"))
+    calls = 0
+    original_mount = mount_module.mount_mcp_servers
+
+    async def observe_mount(registry: ToolRegistry):
+        nonlocal calls
+        calls += 1
+        return await original_mount(registry)
+
+    monkeypatch.setattr("zeta.loop.mount_mcp_servers", observe_mount)
+    backend = FakeBackend([ScriptedTurn([TextContent("booted")])])
+    loop = AgentLoop(backend, ConversationStore(tmp_path))
+    events = [event async for event in loop.run_turn("hello")]
+    await loop.close()
+
+    assert calls == 1
+    assert events[-1].type.value == "agent_end"
+
+
+@pytest.mark.asyncio
 async def test_stdio_handshake_list_call_and_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     client = StdioMCPClient(_stdio_config())
@@ -118,6 +180,26 @@ async def test_stdio_abort_returns_canceled_result(tmp_path: Path, monkeypatch: 
     signal.abort()
     result = await task
     assert result["content"][0]["text"] == "tool execution canceled"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_abort_kills_descendant_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "descendant-alive"
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    client = StdioMCPClient(_descendant_stdio_config(marker))
+    await client.connect()
+    signal = AbortSignal()
+    task = asyncio.create_task(client.call_tool("echo", {"value": "wait"}, signal))
+    await asyncio.sleep(0.1)
+    signal.abort()
+    result = await task
+    await asyncio.sleep(0.9)
+
+    assert result["content"][0]["text"] == "tool execution canceled"
+    assert not marker.exists()
     await client.close()
 
 
@@ -234,6 +316,26 @@ async def test_mount_registers_prefixed_tool(tmp_path: Path, monkeypatch: pytest
     result = await registry.execute(ToolCall("call", "fake:echo", {"value": "mounted"}))
     assert result["content"][0]["text"] == "mounted"
     assert registry.schemas[0]["parameters"]["$defs"] == {"value": {"type": "string"}}
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mount_continues_when_failed_server_cleanup_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configs = {
+        "bad": MCPServerConfig("bad", "stdio", sys.executable),
+        "good": MCPServerConfig("good", "stdio", sys.executable),
+    }
+
+    def build_client(config: MCPServerConfig):
+        return _FakeClient(config, fail_connect=config.name == "bad", fail_close=config.name == "bad")
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(registry, MCPConfig(tmp_path / "mcp.json", configs))
+
+    assert "good:echo" in {schema["name"] for schema in registry.schemas}
     await mount.close()
 
 

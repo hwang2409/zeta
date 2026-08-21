@@ -189,11 +189,12 @@ class StdioMCPClient(MCPClient):
         try:
             await asyncio.wait_for(asyncio.shield(process.wait()), timeout=0.25)
         except TimeoutError:
-            await _kill_and_reap(
-                process,
-                [reader_task] if reader_task is not None else [],
-            )
-            await process.wait()
+            pass
+        await _kill_and_reap(
+            process,
+            [reader_task] if reader_task is not None else [],
+        )
+        await process.wait()
         if reader_task is not None and not reader_task.done():
             await asyncio.gather(reader_task, return_exceptions=True)
         self._fail_pending(MCPError("MCP stdio server terminated after cancellation"))
