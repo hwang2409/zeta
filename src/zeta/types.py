@@ -119,12 +119,22 @@ class ToolTextBlock(TypedDict):
     full_size: int
 
 
+type StructuredContentValue = (
+    str
+    | int
+    | bool
+    | None
+    | list[StructuredContentValue]
+    | dict[str, StructuredContentValue]
+)
+
+
 class StructuredToolResult(TypedDict):
     """MCP-compatible result returned by the tool registry."""
 
     content: list[ToolTextBlock]
     isError: bool
-    structuredContent: dict[str, str | int | bool | None] | None
+    structuredContent: dict[str, StructuredContentValue] | None
 
 
 def content_from_dict(value: Mapping[str, Any]) -> ContentBlock:

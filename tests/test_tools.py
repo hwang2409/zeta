@@ -105,23 +105,20 @@ def test_registry_rejects_unsupported_schema_constructs(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_paths_outside_session_cwd_are_allowed(tmp_path: Path) -> None:
-    session_cwd = tmp_path / "session"
-    session_cwd.mkdir()
-    outside = tmp_path / "zeta-outside.txt"
+    outside = tmp_path.parent / "zeta-outside.txt"
     outside.write_text("outside", encoding="utf-8")
-    outside_dir = tmp_path / "zeta-outside-dir"
+    outside_dir = tmp_path.parent / "zeta-outside-dir"
     outside_dir.mkdir()
     (outside_dir / "nested.txt").write_text("nested", encoding="utf-8")
-    link = session_cwd / "outside-link"
+    link = tmp_path / "outside-link"
     link.symlink_to(outside)
-    dir_link = session_cwd / "outside-dir-link"
+    dir_link = tmp_path / "outside-dir-link"
     dir_link.symlink_to(outside_dir, target_is_directory=True)
-    registry = ToolRegistry(session_cwd)
+    registry = ToolRegistry(tmp_path)
 
     absolute_result = await registry.execute(
         ToolCall("read-1", "read", {"path": str(outside)})
     )
-    # See ZETA-P2 for the underlying list-cap fragility this rewrite works around.
     parent_result = await registry.execute(
         ToolCall("list-1", "list", {"path": "../", "depth": 1})
     )
@@ -135,7 +132,9 @@ async def test_paths_outside_session_cwd_are_allowed(tmp_path: Path) -> None:
     assert absolute_result["isError"] is False
     assert absolute_result["content"][0]["text"] == "outside"
     assert parent_result["isError"] is False
-    assert "zeta-outside.txt" in parent_result["content"][0]["text"]
+    assert "zeta-outside.txt" in {
+        entry["name"] for entry in parent_result["structuredContent"]["entries"]
+    }
     assert symlink_result["isError"] is False
     assert symlink_result["content"][0]["text"] == "outside"
     assert symlink_dir_result["isError"] is False
@@ -697,12 +696,19 @@ async def test_list_bounds_directory_working_set(
     assert calls == [32]
     full_listing = "\n".join(f"file-{index:04d}.txt" for index in range(5_000))
     assert result["content"][0]["full_size"] == len(full_listing.encode("utf-8"))
-    assert result["structuredContent"] == {
-        "root": str(tmp_path),
-        "entry_count": 5_000,
-        "full_size": result["content"][0]["full_size"],
-        "truncated": result["content"][0]["truncated"],
+    structured = result["structuredContent"]
+    assert set(structured) == {
+        "root",
+        "entries",
+        "entry_count",
+        "full_size",
+        "truncated",
     }
+    assert structured["root"] == str(tmp_path)
+    assert structured["entry_count"] == 5_000
+    assert structured["full_size"] == result["content"][0]["full_size"]
+    assert structured["truncated"] == result["content"][0]["truncated"]
+    assert len(structured["entries"]) == 5_000
 
 
 @pytest.mark.asyncio

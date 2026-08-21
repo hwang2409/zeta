@@ -5,7 +5,12 @@ import pytest
 
 from zeta.tools import ToolRegistry
 from zeta.tools.registry import validate_tool_result
-from zeta.types import StructuredToolResult, ToolCall, ToolTextBlock
+from zeta.types import (
+    StructuredContentValue,
+    StructuredToolResult,
+    ToolCall,
+    ToolTextBlock,
+)
 
 
 def _text_block(result: StructuredToolResult) -> ToolTextBlock:
@@ -94,6 +99,78 @@ async def test_failure_result_uses_mcp_error_shape(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_rejects_cyclic_structured_content(tmp_path: Path) -> None:
+    structured_content: dict[str, StructuredContentValue] = {}
+    cycle: list[StructuredContentValue] = [structured_content]
+    structured_content["cycle"] = cycle
+    handler_result: StructuredToolResult = {
+        "content": [
+            {"type": "text", "text": "bad", "truncated": False, "full_size": 3}
+        ],
+        "isError": False,
+        "structuredContent": structured_content,
+    }
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register("cycle", lambda arguments: handler_result)
+
+    result = await registry.execute(ToolCall("cycle-1", "cycle", {}))
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == (
+        "invalid tool handler result: cyclic structuredContent"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_accepts_aliased_structured_content(tmp_path: Path) -> None:
+    shared: list[StructuredContentValue] = []
+    structured_content: dict[str, StructuredContentValue] = {
+        "left": shared,
+        "right": shared,
+    }
+    handler_result: StructuredToolResult = {
+        "content": [
+            {"type": "text", "text": "good", "truncated": False, "full_size": 4}
+        ],
+        "isError": False,
+        "structuredContent": structured_content,
+    }
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register("alias", lambda arguments: handler_result)
+
+    result = await registry.execute(ToolCall("alias-1", "alias", {}))
+
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "good"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_deep_structured_content(tmp_path: Path) -> None:
+    structured_content: dict[str, StructuredContentValue] = {}
+    current = structured_content
+    for _ in range(100):
+        child: dict[str, StructuredContentValue] = {}
+        current["child"] = child
+        current = child
+    handler_result: StructuredToolResult = {
+        "content": [
+            {"type": "text", "text": "bad", "truncated": False, "full_size": 3}
+        ],
+        "isError": False,
+        "structuredContent": structured_content,
+    }
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register("deep", lambda arguments: handler_result)
+
+    result = await registry.execute(ToolCall("deep-1", "deep", {}))
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == (
+        "invalid tool handler result: structuredContent depth > 32"
+    )
+
+
+@pytest.mark.asyncio
 async def test_capped_text_exposes_truncation_metadata(tmp_path: Path) -> None:
     file_path = tmp_path / "large.txt"
     file_path.write_text("abcdefgh", encoding="utf-8")
@@ -135,6 +212,7 @@ async def test_builtin_tools_populate_structured_content(tmp_path: Path) -> None
     }
     assert list_result["structuredContent"] == {
         "root": str(tmp_path),
+        "entries": [{"name": "note.txt"}],
         "entry_count": 1,
         "full_size": 8,
         "truncated": False,

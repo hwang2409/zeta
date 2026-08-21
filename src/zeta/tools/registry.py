@@ -28,6 +28,7 @@ from ..core.approval import (
 )
 from ..core.store import ConversationStore
 from ..types import (
+    StructuredContentValue,
     StructuredToolResult,
     ToolCall,
     ToolResult,
@@ -37,6 +38,7 @@ from ..types import (
 
 
 AbortSignal = ToolAbortSignal
+MAX_STRUCTURED_CONTENT_DEPTH = 32
 ToolHook = Callable[[str, dict[str, Any]], bool | Awaitable[bool] | None]
 ToolHandlerResult = str | StructuredToolResult | ToolResult
 ToolHandler = Callable[
@@ -131,15 +133,12 @@ def text_block(
 def _success_result(
     block: ToolTextBlock,
     *,
-    structured_content: Mapping[str, object] | None = None,
+    structured_content: Mapping[str, StructuredContentValue] | None = None,
 ) -> StructuredToolResult:
     normalized_content = (
         None
         if structured_content is None
-        else cast(
-            dict[str, str | int | bool | None],
-            dict(structured_content),
-        )
+        else dict(structured_content)
     )
     return {
         "content": [block],
@@ -585,11 +584,7 @@ def validate_tool_result(result: object) -> StructuredToolResult:
     if structured_content is not None:
         if type(structured_content) is not dict:
             raise ValueError("structuredContent must be an object or null")
-        for key, value in structured_content.items():
-            if type(key) is not str or (
-                value is not None and type(value) not in {str, int, bool}
-            ):
-                raise ValueError("structuredContent must contain scalar JSON values")
+        _validate_structured_content(structured_content)
 
     for index, block in enumerate(content):
         if type(block) is not dict:
@@ -607,6 +602,38 @@ def validate_tool_result(result: object) -> StructuredToolResult:
         if type(block["full_size"]) is not int or block["full_size"] < 0:
             raise ValueError(f"content[{index}].full_size must be nonnegative")
     return cast(StructuredToolResult, result)
+
+
+def _validate_structured_content(value: object) -> None:
+    pending: list[tuple[object, int, bool]] = [(value, 0, False)]
+    active: set[int] = set()
+    while pending:
+        current, depth, leaving = pending.pop()
+        if leaving:
+            active.remove(id(current))
+            continue
+        if depth > MAX_STRUCTURED_CONTENT_DEPTH:
+            raise ValueError(
+                f"structuredContent depth > {MAX_STRUCTURED_CONTENT_DEPTH}"
+            )
+        if current is None or type(current) in {str, int, bool}:
+            continue
+        if type(current) not in {list, dict}:
+            raise ValueError("structuredContent must contain JSON values")
+        current_id = id(current)
+        if current_id in active:
+            raise ValueError("cyclic structuredContent")
+        active.add(current_id)
+        if type(current) is list:
+            pending.append((current, depth, True))
+            pending.extend((item, depth + 1, False) for item in reversed(current))
+            continue
+        items = list(current.items())
+        pending.append((current, depth, True))
+        for key, item in reversed(items):
+            if type(key) is not str:
+                raise ValueError("structuredContent object keys must be strings")
+            pending.append((item, depth + 1, False))
 
 
 def _normalize_schema(schema: Mapping[str, Any] | None) -> dict[str, Any]:
