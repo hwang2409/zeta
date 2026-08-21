@@ -16,7 +16,7 @@ import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, Protocol, cast
 
 from ..core.abort import AbortGenerationRegistry
 from ..core.abort import AbortSignal as ToolAbortSignal
@@ -29,6 +29,8 @@ from ..core.approval import (
 from ..core.approval import canceled_result as _canceled_result
 from ..core.store import ConversationStore
 from ..types import (
+    StreamEvent,
+    StreamEventType,
     StructuredContentValue,
     StructuredToolResult,
     ToolCall,
@@ -44,6 +46,38 @@ ToolHandlerResult = str | StructuredToolResult | ToolResult
 ToolHandler = Callable[
     ..., ToolHandlerResult | Awaitable[ToolHandlerResult]
 ]
+ToolStream = Literal["stdout", "stderr"]
+
+
+class ToolStreamPublisher(Protocol):
+    """Publish advisory output for one tool call without changing its result."""
+
+    def publish(self, text: str, stream: ToolStream) -> None:
+        """Publish one output chunk."""
+
+
+ToolStreamSink = Callable[[StreamEvent], None]
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCallStreamPublisher:
+    """Adapt handler chunks into non-blocking events for the agent loop."""
+
+    tool_call: ToolCall
+    abort_signal: ToolAbortSignal
+    sink: ToolStreamSink
+
+    def publish(self, text: str, stream: ToolStream) -> None:
+        if _signal_is_set(self.abort_signal):
+            return
+        self.sink(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_UPDATE,
+                tool_call=self.tool_call,
+                delta=text,
+                data={"stream": stream},
+            )
+        )
 
 
 class _ToolCanceled(Exception):
@@ -362,6 +396,7 @@ class ToolRegistry:
         abort_signal: ToolAbortSignal | None = None,
         _scope_signal: ToolAbortSignal | None = None,
         _boundary_signal: ToolAbortSignal | None = None,
+        _stream_sink: ToolStreamSink | None = None,
     ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
         if _boundary_signal is not None and _signal_is_set(_boundary_signal):
@@ -403,11 +438,17 @@ class ToolRegistry:
             execution_signal = _scope_signal
             if execution_signal.is_set():
                 return _legacy_result(_canceled_result(tool_call.id))
+        stream_publisher = (
+            _ToolCallStreamPublisher(tool_call, execution_signal, _stream_sink)
+            if _stream_sink is not None
+            else None
+        )
         try:
             result = await _invoke_handler(
                 definition.handler,
                 arguments,
                 execution_signal,
+                stream_publisher,
             )
         except _ToolCanceled:
             return _legacy_result(_canceled_result(tool_call.id))
@@ -545,27 +586,73 @@ async def _invoke_handler(
     handler: ToolHandler,
     arguments: dict[str, Any],
     abort_signal: ToolAbortSignal,
+    stream_publisher: ToolStreamPublisher | None = None,
 ) -> ToolHandlerResult:
     try:
         signature = inspect.signature(handler)
     except (TypeError, ValueError):
         result = handler(arguments, abort_signal)
     else:
-        try:
-            signature.bind(arguments, abort_signal)
-        except TypeError:
+        if stream_publisher is not None:
             try:
-                signature.bind(arguments, abort_signal=abort_signal)
+                signature.bind(arguments, abort_signal, stream_publisher)
             except TypeError:
-                signature.bind(arguments)
-                result = handler(arguments)
+                try:
+                    signature.bind(
+                        arguments,
+                        abort_signal=abort_signal,
+                        stream_publisher=stream_publisher,
+                    )
+                except TypeError:
+                    try:
+                        signature.bind(
+                            arguments,
+                            abort_signal,
+                            stream_publisher=stream_publisher,
+                        )
+                    except TypeError:
+                        result = _invoke_handler_without_stream(
+                            handler, signature, arguments, abort_signal
+                        )
+                    else:
+                        result = handler(
+                            arguments,
+                            abort_signal,
+                            stream_publisher=stream_publisher,
+                        )
+                else:
+                    result = handler(
+                        arguments,
+                        abort_signal=abort_signal,
+                        stream_publisher=stream_publisher,
+                    )
             else:
-                result = handler(arguments, abort_signal=abort_signal)
+                result = handler(arguments, abort_signal, stream_publisher)
         else:
-            result = handler(arguments, abort_signal)
+            result = _invoke_handler_without_stream(
+                handler, signature, arguments, abort_signal
+            )
     if inspect.isawaitable(result):
         result = await result
     return result
+
+
+def _invoke_handler_without_stream(
+    handler: ToolHandler,
+    signature: inspect.Signature,
+    arguments: dict[str, Any],
+    abort_signal: ToolAbortSignal,
+) -> ToolHandlerResult | Awaitable[ToolHandlerResult]:
+    try:
+        signature.bind(arguments, abort_signal)
+    except TypeError:
+        try:
+            signature.bind(arguments, abort_signal=abort_signal)
+        except TypeError:
+            signature.bind(arguments)
+            return handler(arguments)
+        return handler(arguments, abort_signal=abort_signal)
+    return handler(arguments, abort_signal)
 
 
 def validate_tool_result(result: object) -> StructuredToolResult:

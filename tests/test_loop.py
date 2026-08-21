@@ -152,6 +152,116 @@ async def test_tool_call_then_next_completion(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_bash_streams_in_order_and_persists_one_result(tmp_path: Path) -> None:
+    call = ToolCall(
+        "stream-1",
+        "bash",
+        {
+            "cmd": (
+                "printf 'one\\n'; sleep 0.05; "
+                "printf 'two\\n'; sleep 0.05; printf 'three\\n'"
+            )
+        },
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await collect(AgentLoop(backend, store).run_turn("start"))
+
+    tool_events = [
+        event
+        for event in events
+        if event.tool_call is not None and event.tool_call.id == call.id
+    ]
+    assert [event.type for event in tool_events] == [
+        StreamEventType.TOOL_EXECUTION_START,
+        StreamEventType.TOOL_EXECUTION_UPDATE,
+        StreamEventType.TOOL_EXECUTION_UPDATE,
+        StreamEventType.TOOL_EXECUTION_UPDATE,
+        StreamEventType.TOOL_EXECUTION_END,
+    ]
+    assert [event.delta for event in tool_events[1:-1]] == [
+        "one\n",
+        "two\n",
+        "three\n",
+    ]
+
+    results = [
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    ]
+    assert len(results) == 1
+    assert results[0].content == tool_events[-1].tool_result.content
+    persisted_context = backend.calls[1][0]
+    assert sum(message.tool_result is not None for message in persisted_context) == 1
+
+
+@pytest.mark.asyncio
+async def test_bash_streams_stdout_and_stderr_labels(tmp_path: Path) -> None:
+    call = ToolCall(
+        "split-1",
+        "bash",
+        {"cmd": "printf out; printf err >&2"},
+    )
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    events = await collect(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path),
+            max_turns=1,
+        ).run_turn("start")
+    )
+
+    updates = [
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE
+    ]
+    assert {event.data["stream"] for event in updates} == {"stdout", "stderr"}
+    assert {event.delta for event in updates} == {"out", "err"}
+
+
+@pytest.mark.asyncio
+async def test_bash_cancel_stops_updates_before_terminal_event(tmp_path: Path) -> None:
+    call = ToolCall(
+        "cancel-1",
+        "bash",
+        {"cmd": "printf first; sleep 5; printf second"},
+    )
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    loop = AgentLoop(backend, ConversationStore(tmp_path), max_turns=1)
+    events: list[StreamEvent] = []
+
+    async for event in loop.run_turn("start"):
+        events.append(event)
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
+            loop.abort()
+
+    tool_events = [
+        event
+        for event in events
+        if event.tool_call is not None and event.tool_call.id == call.id
+    ]
+    end_index = next(
+        index
+        for index, event in enumerate(tool_events)
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+    assert all(
+        event.type is not StreamEventType.TOOL_EXECUTION_UPDATE
+        for event in tool_events[end_index + 1 :]
+    )
+    assert tool_events[end_index].tool_result.is_error is True
+    assert tool_events[end_index].tool_result.content == "tool execution canceled"
+
+
+@pytest.mark.asyncio
 async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -> None:
     first_call = ToolCall("call-1", "first", {})
     second_call = ToolCall("call-2", "second", {})

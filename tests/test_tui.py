@@ -262,6 +262,19 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert result.plain == "  ↳ [tool result] first line\n  ↳ second line"
 
 
+def test_render_event_shows_tool_output_update() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            delta="hello\n",
+            data={"stream": "stdout"},
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.plain == "  ↳ [stdout] hello\n"
+
+
 def test_render_event_preserves_multiline_tool_result_formatting() -> None:
     rendered = render_event(
         StreamEvent(

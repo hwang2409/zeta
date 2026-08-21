@@ -200,6 +200,10 @@ def render_event(event: StreamEvent) -> RenderableType | None:
             (event.tool_call.name, ACCENT),
             (f"({_arguments(event.tool_call.arguments)})", CHROME),
         )
+    if event.type is StreamEventType.TOOL_EXECUTION_UPDATE and event.delta is not None:
+        stream = event.data.get("stream")
+        label = f"[{stream}] " if stream in {"stdout", "stderr"} else ""
+        return Text(f"  ↳ {label}{event.delta}", style=DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:
         style = ERROR if event.tool_result.is_error else OK
         marker = "[tool error]" if event.tool_result.is_error else "[tool result]"
