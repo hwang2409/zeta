@@ -466,6 +466,127 @@ async def test_responses_stream_maps_text_usage_and_has_one_completion_boundary(
 
 
 @pytest.mark.asyncio
+async def test_401_refreshes_token_and_retries_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    statuses = iter((401, 200))
+    refreshes: list[httpx.AsyncClient] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        status = next(statuses)
+        if status == 200:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=sse(message_stream()),
+                request=request,
+            )
+        return httpx.Response(401, json={"error": {"message": "expired"}}, request=request)
+
+    store = store_for(tmp_path / "codex.json", access_token("stale-account"))
+
+    async def refresh_token(client: httpx.AsyncClient) -> str:
+        refreshes.append(client)
+        return access_token("fresh-account")
+
+    monkeypatch.setattr(store, "refresh_token", refresh_token)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client, token_store=store, base_url="https://test.invalid/codex/responses"
+        ).complete([], [])
+    ]
+
+    assert len(refreshes) == 1
+    assert len(requests) == 2
+    assert requests[0].headers["authorization"] == f"Bearer {access_token('stale-account')}"
+    assert requests[1].headers["authorization"] == f"Bearer {access_token('fresh-account')}"
+    assert events[-1].message is not None
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_second_401_fails_loudly_without_a_retry_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    refreshes: list[httpx.AsyncClient] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(401, json={"error": {"message": "expired"}}, request=request)
+
+    store = store_for(tmp_path / "codex.json", access_token("stale-account"))
+
+    async def refresh_token(client: httpx.AsyncClient) -> str:
+        refreshes.append(client)
+        return access_token("fresh-account")
+
+    monkeypatch.setattr(store, "refresh_token", refresh_token)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(CodexAuthError, match="re-login required"):
+        [item async for item in CodexBackend(client=client, token_store=store).complete([], [])]
+
+    assert len(requests) == 2
+    assert len(refreshes) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_401_refresh_failure_propagates_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(401, json={"error": {"message": "expired"}}, request=request)
+
+    store = store_for(tmp_path / "codex.json", access_token("stale-account"))
+
+    async def refresh_token(client: httpx.AsyncClient) -> str:
+        raise RuntimeError("refresh failed")
+
+    monkeypatch.setattr(store, "refresh_token", refresh_token)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="refresh failed"):
+        [item async for item in CodexBackend(client=client, token_store=store).complete([], [])]
+
+    assert len(requests) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_non_401_error_does_not_refresh_or_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    refreshes: list[httpx.AsyncClient] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500, json={"error": {"message": "server"}}, request=request)
+
+    store = store_for(tmp_path / "codex.json")
+
+    async def refresh_token(client: httpx.AsyncClient) -> str:
+        refreshes.append(client)
+        return access_token("fresh-account")
+
+    monkeypatch.setattr(store, "refresh_token", refresh_token)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(CodexHTTPError, match="500"):
+        [item async for item in CodexBackend(client=client, token_store=store).complete([], [])]
+
+    assert len(requests) == 1
+    assert refreshes == []
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Path) -> None:
     stream = sse(
         [
@@ -1635,7 +1756,7 @@ async def test_http_failure_and_transport_failure_are_typed(tmp_path: Path) -> N
         )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(http_handler))
-    with pytest.raises(CodexAuthError) as raised:
+    with pytest.raises(CodexHTTPError) as raised:
         await anext(
             CodexBackend(client=client, token_store=store_for(tmp_path / "codex.json")).complete([], [])
         )

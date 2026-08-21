@@ -21,6 +21,7 @@ from .transport import (
     cleanup_transport,
     is_control_exception,
     request_error,
+    retry_auth_completion,
     task_is_cancelling,
 )
 from ..types import (
@@ -62,6 +63,10 @@ class AnthropicAuthError(AnthropicBackendError):
     """Raised when Claude subscription credentials are missing or invalid."""
 
     code = "auth_error"
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class AnthropicHTTPError(AnthropicBackendError):
@@ -346,12 +351,42 @@ class AnthropicBackend(CompletionBackend):
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
+        attempts = retry_auth_completion(
+            lambda: self._complete_once(messages, tool_schemas),
+            lambda token: self._complete_once(messages, tool_schemas, token=token),
+            self._refresh_token,
+            lambda error: isinstance(error, AnthropicAuthError) and error.status_code == 401,
+            lambda error: AnthropicAuthError(
+                "token refresh did not restore auth; re-login required", status_code=401
+            ),
+        )
+        try:
+            async for event in attempts:
+                yield event
+        finally:
+            await attempts.aclose()
+
+    async def _refresh_token(self) -> str:
+        client = self.client or httpx.AsyncClient(timeout=None)
+        try:
+            return await self.token_store.refresh_token(client)
+        finally:
+            if self.client is None:
+                await client.aclose()
+
+    async def _complete_once(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+        *,
+        token: str | None = None,
+    ) -> AsyncIterator[StreamEvent]:
         client = self.client or httpx.AsyncClient(timeout=None)
         stream_context = None
         entered = False
         primary_exception: BaseException | None = None
         try:
-            token = await self.token_store.access_token(client)
+            token = token if token is not None else await self.token_store.access_token(client)
             payload = build_messages_payload(
                 messages,
                 tool_schemas,
@@ -422,6 +457,10 @@ async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes
 def _http_error(status_code: int, body: bytes) -> AnthropicHTTPError:
     message = error_body_excerpt(body) or "request failed"
     error_type = AnthropicAuthError if status_code in {401, 403} else AnthropicHTTPError
+    if error_type is AnthropicAuthError:
+        return error_type(
+            f"Anthropic HTTP {status_code}: {message}", status_code=status_code
+        )
     return error_type(f"Anthropic HTTP {status_code}: {message}")
 
 

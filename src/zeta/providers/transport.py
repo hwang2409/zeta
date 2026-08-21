@@ -3,11 +3,44 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TypeVar
 
 import httpx
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
+
+
+async def retry_auth_completion[T](
+    first: Callable[[], AsyncIterator[T]],
+    retry: Callable[[str], AsyncIterator[T]],
+    refresh: Callable[[], Awaitable[str]],
+    is_unauthorized: Callable[[RuntimeError], bool],
+    exhausted: Callable[[RuntimeError], RuntimeError],
+) -> AsyncIterator[T]:
+    attempt = first()
+    try:
+        try:
+            async for value in attempt:
+                yield value
+            return
+        except RuntimeError as error:
+            if not is_unauthorized(error):
+                raise
+            token = await refresh()
+    finally:
+        await attempt.aclose()
+
+    attempt = retry(token)
+    try:
+        async for value in attempt:
+            yield value
+    except RuntimeError as error:
+        if is_unauthorized(error):
+            raise exhausted(error) from error
+        raise
+    finally:
+        await attempt.aclose()
 
 
 def task_is_cancelling() -> bool:

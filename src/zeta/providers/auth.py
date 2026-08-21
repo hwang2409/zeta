@@ -536,9 +536,25 @@ class OAuthCredentialStore:
                 if from_bootstrap:
                     self._save_unlocked(tokens)
                 return tokens.access_token
-            refreshed = await self.refresh(tokens.refresh_token, client)
-            self._save_unlocked(refreshed)
-            return refreshed.access_token
+            return await self._refresh_unlocked(tokens, client)
+
+    async def refresh_token(self, client: httpx.AsyncClient) -> str:
+        async with self._async_refresh_lock, self._async_refresh_lock_file():
+            tokens = self._read_unlocked()
+            if tokens is None:
+                tokens = self.bootstrap()
+                if tokens is None:
+                    raise self.auth_error_type(
+                        f"no {self.provider_label} OAuth login found; log in first"
+                    )
+            return await self._refresh_unlocked(tokens, client)
+
+    async def _refresh_unlocked(
+        self, tokens: OAuthTokens, client: httpx.AsyncClient
+    ) -> str:
+        refreshed = await self.refresh(tokens.refresh_token, client)
+        self._save_unlocked(refreshed)
+        return refreshed.access_token
 
     @asynccontextmanager
     async def _async_refresh_lock_file(self) -> AsyncIterator[None]:
