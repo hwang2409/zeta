@@ -1,7 +1,6 @@
 """ChatGPT plan OAuth and Responses SSE support for Codex."""
 
 from __future__ import annotations
-
 import asyncio
 import base64
 import binascii
@@ -15,7 +14,7 @@ from typing import Any
 
 import httpx
 
-from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
+from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt, make_oauth_functions
 from .transport import (
     cleanup_transport,
     is_control_exception,
@@ -42,7 +41,6 @@ CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
 JWT_AUTH_CLAIM = "https://api.openai.com/auth"
-
 
 class CodexBackendError(RuntimeError):
     """Base class for errors that the agent loop can report."""
@@ -71,6 +69,7 @@ class CodexStreamError(CodexBackendError):
 
     code = "stream_error"
 
+build_authorization_url, exchange_authorization_code = make_oauth_functions("https://auth.openai.com/oauth/authorize", CODEX_CLIENT_ID, "openid profile email offline_access", "http://localhost:1455/auth/callback", CODEX_TOKEN_URL, "Codex", CodexAuthError, CodexHTTPError)
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
     for key in keys:
