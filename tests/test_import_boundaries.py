@@ -1,6 +1,7 @@
 import ast
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -14,26 +15,31 @@ FORBIDDEN = {
 }
 
 
-def _module_name(file_path: Path) -> str:
-    relative = file_path.relative_to(ROOT).with_suffix("")
+def _module_name(file_path: Path, root: Path = ROOT) -> str:
+    relative = file_path.relative_to(root).with_suffix("")
     parts = ("zeta", *relative.parts)
     if parts[-1] == "__init__":
         parts = parts[:-1]
     return ".".join(parts)
 
 
-def _import_from_target(file_path: Path, node: ast.ImportFrom) -> tuple[str, ...]:
-    relative = file_path.relative_to(ROOT).with_suffix("")
+def _import_from_target(
+    file_path: Path,
+    node: ast.ImportFrom,
+    root: Path = ROOT,
+) -> tuple[str, ...]:
+    relative = file_path.relative_to(root).with_suffix("")
     package = ("zeta", *relative.parts[:-1])
-    if node.level:
-        package = package[: len(package) - node.level + 1]
+    if node.level == 0:
+        return tuple((node.module or "").split("."))
+    package = package[: len(package) - node.level + 1]
     if node.module:
         return (*package, *node.module.split("."))
     return package
 
 
-def _forbidden_imports(file_path: Path) -> list[str]:
-    relative = file_path.relative_to(ROOT)
+def _forbidden_imports(file_path: Path, root: Path = ROOT) -> list[str]:
+    relative = file_path.relative_to(root)
     bucket = relative.parts[0] if len(relative.parts) > 1 else relative.stem
     forbidden = FORBIDDEN.get(bucket, set())
     if not forbidden:
@@ -46,7 +52,7 @@ def _forbidden_imports(file_path: Path) -> list[str]:
         if isinstance(node, ast.Import):
             targets = [tuple(alias.name.split(".")) for alias in node.names]
         elif isinstance(node, ast.ImportFrom):
-            target = _import_from_target(file_path, node)
+            target = _import_from_target(file_path, node, root)
             targets.append(target)
             if node.module is None:
                 targets.extend((*target, alias.name) for alias in node.names)
@@ -97,6 +103,27 @@ def test_layer_modules_import_in_fresh_processes() -> None:
         if result.returncode:
             failures.append(f"{module}:\n{result.stderr}")
     assert not failures, "\n".join(failures)
+
+
+def test_absolute_import_boundary_has_teeth(tmp_path: Path) -> None:
+    mutated_root = tmp_path / "zeta"
+    shutil.copytree(ROOT, mutated_root)
+    loop_path = mutated_root / "core" / "loop.py"
+    loop_path.write_text(
+        "from zeta.tools import ToolRegistry\n" + loop_path.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    violations = [
+        violation
+        for file_path in mutated_root.rglob("*.py")
+        for violation in _forbidden_imports(file_path, mutated_root)
+    ]
+
+    assert any(
+        "core/loop.py" in violation and "zeta.tools" in violation
+        for violation in violations
+    ), "\n".join(violations)
 
 
 def test_import_boundaries() -> None:
