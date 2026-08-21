@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import os
 import signal
 from collections.abc import Sequence
 from typing import Any
 
 from ..core.abort import AbortSignal
+from ..types import StructuredToolResult, ToolTextBlock
 from .registry import (
-    _truncate,
+    _BoundedText,
+    _success_result,
     ToolRegistry,
     _ToolCanceled,
 )
@@ -20,6 +23,8 @@ class _BoundedOutput:
     def __init__(self, limit: int) -> None:
         self.limit = limit
         self._data = bytearray()
+        self._full_size = 0
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     @property
     def data(self) -> bytes:
@@ -29,10 +34,23 @@ class _BoundedOutput:
     def retained_bytes(self) -> int:
         return len(self._data)
 
+    @property
+    def full_size(self) -> int:
+        return self._full_size
+
     def append(self, chunk: bytes) -> None:
-        remaining = self.limit - len(self._data)
-        if remaining > 0:
-            self._data.extend(chunk[:remaining])
+        self._full_size += len(chunk)
+        self._append_text(self._decoder.decode(chunk, final=False))
+
+    def finish(self) -> None:
+        self._append_text(self._decoder.decode(b"", final=True))
+
+    def _append_text(self, text: str) -> None:
+        for character in text:
+            encoded = character.encode("utf-8")
+            remaining = self.limit - len(self._data)
+            if remaining >= len(encoded):
+                self._data.extend(encoded)
 
 
 async def _drain_stream(stream: object, capture: _BoundedOutput) -> None:
@@ -42,6 +60,7 @@ async def _drain_stream(stream: object, capture: _BoundedOutput) -> None:
     while True:
         chunk = await read(65_536)
         if not chunk:
+            capture.finish()
             return
         capture.append(chunk)
 
@@ -75,18 +94,31 @@ def _format_exec_result(
     output_limit: int,
     *,
     suffix: str | None = None,
-) -> str:
-    output = f"stdout:\n{stdout.decode(errors='replace')}\nstderr:\n{stderr.decode(errors='replace')}"
+    stdout_full_size: int | None = None,
+    stderr_full_size: int | None = None,
+) -> ToolTextBlock:
+    output = _BoundedText(output_limit)
+    output.append(f"exit_code: {returncode}\n")
     if suffix:
-        output = f"{suffix}\n{output}"
-    return _truncate(f"exit_code: {returncode}\n{output}", output_limit)
+        output.append(f"{suffix}\n")
+    output.append("stdout:\n")
+    output.append_captured(
+        stdout.decode(errors="replace"),
+        len(stdout) if stdout_full_size is None else stdout_full_size,
+    )
+    output.append("\nstderr:\n")
+    output.append_captured(
+        stderr.decode(errors="replace"),
+        len(stderr) if stderr_full_size is None else stderr_full_size,
+    )
+    return output.render()
 
 
 async def _exec(
     registry: ToolRegistry,
     arguments: dict[str, Any],
     abort_signal: AbortSignal,
-) -> str:
+) -> StructuredToolResult:
     timeout = arguments.get("timeout", 30.0)
     output_limit = arguments.get("max_output", registry.max_output_chars)
     try:
@@ -125,23 +157,47 @@ async def _exec(
                     stdout_capture.data,
                     stderr_capture.data,
                     output_limit,
+                    stdout_full_size=stdout_capture.full_size,
+                    stderr_full_size=stderr_capture.full_size,
                 )
                 if process.returncode:
-                    raise ValueError(result)
-                return result
+                    return {
+                        "content": [result],
+                        "isError": True,
+                        "structuredContent": {
+                            "exit_code": process.returncode,
+                            "cwd": str(registry.cwd),
+                        },
+                    }
+                return _success_result(
+                    result,
+                    structured_content={
+                        "exit_code": process.returncode,
+                        "cwd": str(registry.cwd),
+                    },
+                )
             if timeout_wait in done:
                 break
 
         await _kill_and_reap(process, process_tasks)
-        raise ValueError(
-            _format_exec_result(
-                process.returncode,
-                stdout_capture.data,
-                stderr_capture.data,
-                output_limit,
-                suffix="command timed out",
-            )
-        )
+        return {
+            "content": [
+                _format_exec_result(
+                    process.returncode,
+                    stdout_capture.data,
+                    stderr_capture.data,
+                    output_limit,
+                    suffix="command timed out",
+                    stdout_full_size=stdout_capture.full_size,
+                    stderr_full_size=stderr_capture.full_size,
+                )
+            ],
+            "isError": True,
+            "structuredContent": {
+                "exit_code": process.returncode,
+                "cwd": str(registry.cwd),
+            },
+        }
     except asyncio.CancelledError:
         await _kill_and_reap(process, process_tasks)
         raise

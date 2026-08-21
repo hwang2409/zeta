@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, AsyncIterator, Mapping, Protocol, Sequence
+from typing import Any, AsyncIterator, Literal, Mapping, Protocol, Sequence, TypedDict
 
 
 class MessageRole(StrEnum):
@@ -110,6 +110,23 @@ RedactedThinkingBlock = RedactedThinkingContent
 ToolUseBlock = ToolUseContent
 
 
+class ToolTextBlock(TypedDict):
+    """MCP text content; metadata is always present, even when not capped."""
+
+    type: Literal["text"]
+    text: str
+    truncated: bool
+    full_size: int
+
+
+class StructuredToolResult(TypedDict):
+    """MCP-compatible result returned by the tool registry."""
+
+    content: list[ToolTextBlock]
+    isError: bool
+    structuredContent: dict[str, str | int | bool | None] | None
+
+
 def content_from_dict(value: Mapping[str, Any]) -> ContentBlock:
     content_type_value = value.get("type")
     if type(content_type_value) is not str:
@@ -144,29 +161,47 @@ class ToolResult:
     tool_call_id: str
     content: str
     is_error: bool = False
+    content_blocks: list[ToolTextBlock] | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "tool_call_id": self.tool_call_id,
             "content": self.content,
             "is_error": self.is_error,
         }
+        if self.content_blocks is not None:
+            result["content_blocks"] = self.content_blocks
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ToolResult:
         tool_call_id = value.get("tool_call_id")
         content = value.get("content")
         is_error = value.get("is_error")
+        content_blocks = value.get("content_blocks")
         if type(tool_call_id) is not str or not tool_call_id:
             raise ValueError("tool result call id must be a nonempty string")
         if type(content) is not str:
             raise ValueError("tool result content must be a string")
         if type(is_error) is not bool:
             raise ValueError("tool result is_error must be a boolean")
+        if content_blocks is not None:
+            if type(content_blocks) is not list:
+                raise ValueError("tool result content_blocks must be an array")
+            for block in content_blocks:
+                if (
+                    type(block) is not dict
+                    or block.get("type") != "text"
+                    or type(block.get("text")) is not str
+                    or type(block.get("truncated")) is not bool
+                    or type(block.get("full_size")) is not int
+                ):
+                    raise ValueError("tool result content block is invalid")
         return cls(
             tool_call_id=tool_call_id,
             content=content,
             is_error=is_error,
+            content_blocks=content_blocks,
         )
 
 

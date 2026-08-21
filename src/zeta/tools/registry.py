@@ -1,4 +1,8 @@
-"""Tool registration, validation, execution, and session-cwd defaults."""
+"""Tool registration and MCP-compatible execution results.
+
+Text blocks always include ``truncated`` and ``full_size``. ``full_size`` is
+the original UTF-8 byte length before a character cap is applied.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +14,7 @@ import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from ..core.abort import AbortGenerationRegistry, AbortSignal as ToolAbortSignal
 from ..core.approval import (
@@ -21,12 +25,21 @@ from ..core.approval import (
     canceled_result as _canceled_result,
 )
 from ..core.store import ConversationStore
-from ..types import ToolCall, ToolResult, ToolSchema
+from ..types import (
+    StructuredToolResult,
+    ToolCall,
+    ToolResult,
+    ToolSchema,
+    ToolTextBlock,
+)
 
 
 AbortSignal = ToolAbortSignal
 ToolHook = Callable[[str, dict[str, Any]], bool | Awaitable[bool] | None]
-ToolHandler = Callable[..., str | ToolResult | Awaitable[str | ToolResult]]
+ToolHandlerResult = str | StructuredToolResult | ToolResult
+ToolHandler = Callable[
+    ..., ToolHandlerResult | Awaitable[ToolHandlerResult]
+]
 
 
 class _ToolCanceled(Exception):
@@ -48,6 +61,7 @@ class _BoundedText:
         self.limit = limit
         self._parts: list[str] = []
         self._length = 0
+        self._full_size = 0
         self._has_line = False
         self.truncated = False
 
@@ -55,7 +69,12 @@ class _BoundedText:
     def retained_chars(self) -> int:
         return self._length
 
+    @property
+    def full_size(self) -> int:
+        return self._full_size
+
     def append(self, value: str) -> None:
+        self._full_size += len(value.encode("utf-8"))
         remaining = self.limit - self._length
         if remaining > 0:
             retained = value[:remaining]
@@ -63,6 +82,10 @@ class _BoundedText:
             self._length += len(retained)
         if len(value) > remaining:
             self.truncated = True
+
+    def append_captured(self, value: str, full_size: int) -> None:
+        self.append(value)
+        self._full_size += max(0, full_size - len(value.encode("utf-8")))
 
     def begin_line(self) -> None:
         if self._has_line:
@@ -73,11 +96,74 @@ class _BoundedText:
         self.begin_line()
         self.append(value)
 
-    def render(self) -> str:
-        text = "".join(self._parts)
-        if self.truncated:
-            return _truncate(text + _TRUNCATION_MARKER, self.limit)
-        return text
+    def render(self, *, full_size: int | None = None) -> ToolTextBlock:
+        return text_block(
+            "".join(self._parts),
+            full_size=self.full_size if full_size is None else full_size,
+        )
+
+
+def text_block(
+    text: str,
+    *,
+    cap: int | None = None,
+    full_size: int | None = None,
+) -> ToolTextBlock:
+    """Build a text block and expose any output cap to the caller."""
+
+    if cap is not None and (type(cap) is not int or cap < 1):
+        raise ValueError("text block cap must be a positive integer")
+    if full_size is not None and (type(full_size) is not int or full_size < 0):
+        raise ValueError("text block full_size must be a nonnegative integer")
+    original_size = len(text.encode("utf-8")) if full_size is None else full_size
+    shown = text if cap is None else text[:cap]
+    truncated = shown != text or original_size > len(shown.encode("utf-8"))
+    return {
+        "type": "text",
+        "text": shown,
+        "truncated": truncated,
+        "full_size": original_size,
+    }
+
+
+def _success_result(
+    block: ToolTextBlock,
+    *,
+    structured_content: dict[str, str | int | bool | None] | None = None,
+) -> StructuredToolResult:
+    return {
+        "content": [block],
+        "isError": False,
+        "structuredContent": structured_content,
+    }
+
+
+def _error_result(message: str) -> StructuredToolResult:
+    return {
+        "content": [text_block(message)],
+        "isError": True,
+        "structuredContent": None,
+    }
+
+
+def _legacy_result(result: ToolResult) -> StructuredToolResult:
+    if type(result.content) is not str:
+        return _error_result("invalid tool result: content")
+    blocks = (
+        result.content_blocks
+        if result.content_blocks is not None
+        else [text_block(result.content)]
+    )
+    try:
+        return validate_tool_result(
+            {
+                "content": blocks,
+                "isError": result.is_error,
+                "structuredContent": None,
+            }
+        )
+    except ValueError as exc:
+        return _error_result(f"invalid tool result: {exc}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,7 +325,7 @@ class ToolRegistry:
         abort_signal: ToolAbortSignal | None = None,
         _scope_signal: ToolAbortSignal | None = None,
         _boundary_signal: ToolAbortSignal | None = None,
-    ) -> ToolResult:
+    ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
         if _boundary_signal is not None and _signal_is_set(_boundary_signal):
             signal_state, abort_result = self._arbitrate_abort(
@@ -256,12 +342,12 @@ class ToolRegistry:
         definition = self._tools.get(tool_call.name)
         if definition is None:
             self._abort_approval(tool_call)
-            return ToolResult(tool_call.id, f"unknown tool: {tool_call.name}", True)
+            return _error_result(f"unknown tool: {tool_call.name}")
         try:
             arguments = _validate_arguments(tool_call.arguments, definition.parameters)
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             self._abort_approval(tool_call)
-            return ToolResult(tool_call.id, f"invalid arguments: {exc}", True)
+            return _error_result(f"invalid arguments: {exc}")
         if _signal_is_set(signal_state):
             signal_state, abort_result = self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
@@ -275,11 +361,11 @@ class ToolRegistry:
             lambda current: self._next_abort_generation(current, _scope_signal),
         )
         if gate_result is not None:
-            return gate_result
+            return _legacy_result(gate_result)
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():
-                return _canceled_result(tool_call.id)
+                return _legacy_result(_canceled_result(tool_call.id))
         try:
             result = await _invoke_handler(
                 definition.handler,
@@ -287,25 +373,27 @@ class ToolRegistry:
                 execution_signal,
             )
         except _ToolCanceled:
-            return _canceled_result(tool_call.id)
+            return _legacy_result(_canceled_result(tool_call.id))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return ToolResult(tool_call.id, str(exc), True)
+            return _error_result(str(exc))
         if isinstance(result, ToolResult):
-            if result.tool_call_id == tool_call.id:
-                return result
-            return ToolResult(
-                tool_call.id,
-                f"tool result id mismatch: expected {tool_call.id}, got {result.tool_call_id}",
-                True,
-            )
+            if result.tool_call_id != tool_call.id:
+                return _error_result(
+                    f"tool result id mismatch: expected {tool_call.id}, "
+                    f"got {result.tool_call_id}"
+                )
+            return _legacy_result(result)
+        if isinstance(result, Mapping):
+            try:
+                return validate_tool_result(result)
+            except ValueError as exc:
+                return _error_result(f"invalid tool handler result: {exc}")
         if isinstance(result, str):
-            return ToolResult(tool_call.id, result)
-        return ToolResult(
-            tool_call.id,
-            "invalid tool handler result: expected str or ToolResult",
-            True,
+            return _success_result(text_block(result))
+        return _error_result(
+            "invalid tool handler result: expected str or structured tool result"
         )
 
     def _abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
@@ -321,16 +409,16 @@ class ToolRegistry:
         tool_call: ToolCall,
         signal_state: ToolAbortSignal,
         scope_signal: ToolAbortSignal | None = None,
-    ) -> tuple[ToolAbortSignal, ToolResult | None]:
+    ) -> tuple[ToolAbortSignal, StructuredToolResult | None]:
         winner = self._abort_approval(tool_call)
         if winner is ApprovalDecision.ALLOW:
             signal_state = self._next_abort_generation(signal_state, scope_signal)
             if _signal_is_set(signal_state):
-                return signal_state, _canceled_result(tool_call.id)
+                return signal_state, _legacy_result(_canceled_result(tool_call.id))
             return signal_state, None
         if winner is ApprovalDecision.DENY:
-            return signal_state, ToolResult(tool_call.id, "tool execution denied", True)
-        return signal_state, _canceled_result(tool_call.id)
+            return signal_state, _error_result("tool execution denied")
+        return signal_state, _legacy_result(_canceled_result(tool_call.id))
 
     def _next_abort_generation(
         self,
@@ -348,7 +436,7 @@ class ToolRegistry:
         tool_calls: Sequence[ToolCall],
         *,
         abort_signal: ToolAbortSignal | None = None,
-    ) -> list[ToolResult]:
+    ) -> list[StructuredToolResult]:
         """Execute calls with safe contiguous groups in parallel, preserving order."""
 
         parent_signal = abort_signal or self.abort_signal
@@ -357,7 +445,7 @@ class ToolRegistry:
         if abort_signal is None:
             scope_signal = self._abort_registry.new_generation()
             self.abort_signal = scope_signal
-        results: list[ToolResult | None] = [None] * len(tool_calls)
+        results: list[StructuredToolResult | None] = [None] * len(tool_calls)
         index = 0
         while index < len(tool_calls):
             definition = self._tools.get(tool_calls[index].name)
@@ -401,7 +489,7 @@ async def _invoke_handler(
     handler: ToolHandler,
     arguments: dict[str, Any],
     abort_signal: ToolAbortSignal,
-) -> str | ToolResult:
+) -> ToolHandlerResult:
     try:
         signature = inspect.signature(handler)
     except (TypeError, ValueError):
@@ -422,6 +510,60 @@ async def _invoke_handler(
     if inspect.isawaitable(result):
         result = await result
     return result
+
+
+def validate_tool_result(result: object) -> StructuredToolResult:
+    """Validate one complete MCP-compatible structured tool result."""
+
+    if type(result) is not dict:
+        raise ValueError("expected a structured result object")
+    if any(type(key) is not str for key in result):
+        raise ValueError("top-level keys must be strings")
+    expected_keys = {"content", "isError", "structuredContent"}
+    result_keys = set(result)
+    if "content_blocks" in result_keys:
+        raise ValueError("legacy content_blocks is not allowed")
+    missing_keys = expected_keys - result_keys
+    if missing_keys:
+        missing = ", ".join(sorted(missing_keys))
+        raise ValueError(f"missing top-level keys: {missing}")
+    extra_keys = result_keys - expected_keys
+    if extra_keys:
+        extra = ", ".join(sorted(extra_keys))
+        raise ValueError(f"unexpected top-level keys: {extra}")
+
+    content = result["content"]
+    if type(content) is not list:
+        raise ValueError("content must be an array")
+    is_error = result["isError"]
+    if type(is_error) is not bool:
+        raise ValueError("isError must be a boolean")
+    structured_content = result["structuredContent"]
+    if structured_content is not None:
+        if type(structured_content) is not dict:
+            raise ValueError("structuredContent must be an object or null")
+        for key, value in structured_content.items():
+            if type(key) is not str or (
+                value is not None and type(value) not in {str, int, bool}
+            ):
+                raise ValueError("structuredContent must contain scalar JSON values")
+
+    for index, block in enumerate(content):
+        if type(block) is not dict:
+            raise ValueError(f"content[{index}] must be an object")
+        block_keys = set(block)
+        expected_block_keys = {"type", "text", "truncated", "full_size"}
+        if block_keys != expected_block_keys:
+            raise ValueError(f"content[{index}] has an invalid shape")
+        if block["type"] != "text":
+            raise ValueError(f"content[{index}].type must be text")
+        if type(block["text"]) is not str:
+            raise ValueError(f"content[{index}].text must be a string")
+        if type(block["truncated"]) is not bool:
+            raise ValueError(f"content[{index}].truncated must be a boolean")
+        if type(block["full_size"]) is not int or block["full_size"] < 0:
+            raise ValueError(f"content[{index}].full_size must be nonnegative")
+    return cast(StructuredToolResult, result)
 
 
 def _normalize_schema(schema: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -561,9 +703,6 @@ def _schema_equal(left: Any, right: Any) -> bool:
     return type(left) is type(right) and left == right
 
 
-_TRUNCATION_MARKER = "\n...[output truncated]"
-
-
 _SCHEMA_KEYS = {
     "type",
     "properties",
@@ -639,12 +778,3 @@ def _validate_schema_definition(schema: Mapping[str, Any], path: str) -> None:
 
 def _signal_is_set(signal_state: ToolAbortSignal) -> bool:
     return signal_state.is_set()
-
-
-def _truncate(value: str, limit: int) -> str:
-    if len(value) <= limit:
-        return value
-    marker = _TRUNCATION_MARKER
-    if limit <= len(marker):
-        return marker[:limit]
-    return value[: limit - len(marker)] + marker

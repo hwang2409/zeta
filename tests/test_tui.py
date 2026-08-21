@@ -274,6 +274,29 @@ def test_render_event_preserves_multiline_tool_result_formatting() -> None:
     assert rendered.plain == "  ↳ [tool result] first\n  ↳ \n  ↳   third"
 
 
+def test_render_event_shows_tool_result_truncation_metadata() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_result=ToolResult(
+                "call-1",
+                "abcd\n[truncated: 4 of 8 chars shown]",
+                content_blocks=[
+                    {
+                        "type": "text",
+                        "text": "abcd",
+                        "truncated": True,
+                        "full_size": 8,
+                    }
+                ],
+            ),
+        )
+    )
+
+    assert rendered is not None
+    assert "[truncated; full_size=8]" in rendered.plain
+
+
 def test_render_helpers_use_the_zeta_palette() -> None:
     markdown = render_markdown("# heading")
     code = render_code("print('hi')", "python")

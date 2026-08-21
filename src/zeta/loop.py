@@ -10,6 +10,7 @@ from .core.approval import ApprovalPolicy
 from .core.context import ContextAssembler
 from .core.store import ConversationStore
 from .tools import ToolHandler, ToolRegistry
+from .tools.registry import validate_tool_result
 from .types import (
     CompletionBackend,
     ContentBlock,
@@ -18,6 +19,7 @@ from .types import (
     MessageRole,
     StreamEvent,
     StreamEventType,
+    StructuredToolResult,
     TextContent,
     ThinkingContent,
     ToolCall,
@@ -48,21 +50,48 @@ def _task_is_cancelling() -> bool:
 
 
 def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
-    if not isinstance(result, ToolResult):
-        return ToolResult(expected_id, "invalid tool result: expected ToolResult", True)
-    if type(result.tool_call_id) is not str or not result.tool_call_id:
-        return ToolResult(expected_id, "invalid tool result: call id", True)
-    if type(result.content) is not str:
-        return ToolResult(expected_id, "invalid tool result: content", True)
-    if type(result.is_error) is not bool:
-        return ToolResult(expected_id, "invalid tool result: is_error", True)
-    if result.tool_call_id != expected_id:
+    if isinstance(result, ToolResult):
+        if type(result.tool_call_id) is not str or not result.tool_call_id:
+            return ToolResult(expected_id, "invalid tool result: call id", True)
+        if type(result.content) is not str:
+            return ToolResult(expected_id, "invalid tool result: content", True)
+        if type(result.is_error) is not bool:
+            return ToolResult(expected_id, "invalid tool result: is_error", True)
+        if result.tool_call_id != expected_id:
+            return ToolResult(
+                expected_id,
+                f"tool result id mismatch: expected {expected_id}, got {result.tool_call_id}",
+                is_error=True,
+            )
+        return result
+    if not isinstance(result, Mapping):
         return ToolResult(
             expected_id,
-            f"tool result id mismatch: expected {expected_id}, got {result.tool_call_id}",
-            is_error=True,
+            "invalid tool result: expected structured result",
+            True,
         )
-    return result
+    try:
+        structured_result = validate_tool_result(result)
+    except ValueError as exc:
+        return ToolResult(expected_id, f"invalid tool result: {exc}", True)
+    blocks = structured_result["content"]
+    is_error = structured_result["isError"]
+    text_values = []
+    for block in blocks:
+        text = block["text"]
+        if block["truncated"]:
+            shown_bytes = len(text.encode("utf-8"))
+            text = (
+                f"{text}\n[truncated: {shown_bytes} of "
+                f"{block['full_size']} bytes]"
+            )
+        text_values.append(text)
+    return ToolResult(
+        expected_id,
+        "\n".join(text_values),
+        is_error,
+        content_blocks=blocks,
+    )
 
 
 class AgentLoop:
@@ -303,7 +332,9 @@ class AgentLoop:
                 return
 
             completed_tool_indexes: set[int] = set()
-            parallel_tasks: dict[asyncio.Task[ToolResult], tuple[int, ToolCall]] = {}
+            parallel_tasks: dict[
+                asyncio.Task[StructuredToolResult], tuple[int, ToolCall]
+            ] = {}
             parallel_results: list[ToolResult | None] = [None] * len(calls)
             try:
                 call_index = 0
@@ -382,7 +413,7 @@ class AgentLoop:
                     )
                     call_index += 1
             except (asyncio.CancelledError, GeneratorExit):
-                pending_tasks: list[asyncio.Task[ToolResult]] = []
+                pending_tasks: list[asyncio.Task[StructuredToolResult]] = []
                 for task, (index, tool_call) in list(parallel_tasks.items()):
                     parallel_tasks.pop(task)
                     if task.done():

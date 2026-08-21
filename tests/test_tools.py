@@ -59,8 +59,8 @@ async def test_registry_validates_arguments_before_running_handler(tmp_path: Pat
 
     result = await registry.execute(ToolCall("call-1", "typed", {"count": "one"}))
 
-    assert result.is_error
-    assert "invalid arguments" in result.content
+    assert result["isError"] is True
+    assert "invalid arguments" in result["content"][0]["text"]
     assert not called
 
 
@@ -125,10 +125,14 @@ async def test_paths_outside_session_cwd_are_allowed(tmp_path: Path) -> None:
         ToolCall("list-2", "list", {"path": "outside-dir-link"})
     )
 
-    assert absolute_result.content == "outside"
-    assert "zeta-outside.txt" in parent_result.content
-    assert symlink_result.content == "outside"
-    assert "outside-dir-link/nested.txt" in symlink_dir_result.content
+    assert absolute_result["isError"] is False
+    assert absolute_result["content"][0]["text"] == "outside"
+    assert parent_result["isError"] is False
+    assert "zeta-outside.txt" in parent_result["content"][0]["text"]
+    assert symlink_result["isError"] is False
+    assert symlink_result["content"][0]["text"] == "outside"
+    assert symlink_dir_result["isError"] is False
+    assert "outside-dir-link/nested.txt" in symlink_dir_result["content"][0]["text"]
 
 
 @pytest.mark.asyncio
@@ -147,10 +151,13 @@ async def test_builtin_tools_read_list_and_exec_use_session_cwd(tmp_path: Path) 
         ToolCall("exec-1", "exec", {"command": "pwd"})
     )
 
-    assert read_result.content == "two"
-    assert "nested/" in list_result.content
-    assert "nested/note.txt" in list_result.content
-    assert str(tmp_path) in exec_result.content
+    assert read_result["isError"] is False
+    assert read_result["content"][0]["text"] == "two"
+    assert list_result["isError"] is False
+    assert "nested/" in list_result["content"][0]["text"]
+    assert "nested/note.txt" in list_result["content"][0]["text"]
+    assert exec_result["isError"] is False
+    assert str(tmp_path) in exec_result["content"][0]["text"]
     assert "not a sandbox" in registry.schemas[2]["description"]
 
 
@@ -182,11 +189,32 @@ async def test_exec_retains_only_bounded_output_from_large_command(
         )
     )
 
-    assert not result.is_error
-    assert len(result.content) == 64
+    assert result["isError"] is False
+    assert len(result["content"][0]["text"]) == 64
+    assert result["content"][0]["truncated"] is True
     assert len(captures) == 2
     assert all(capture.retained_bytes <= 64 for capture in captures)
     assert sum(capture.retained_bytes for capture in captures) <= 128
+
+
+@pytest.mark.asyncio
+async def test_exec_full_size_is_stable_for_capped_utf8_output(tmp_path: Path) -> None:
+    command = _python_command("import sys; sys.stdout.write('é')")
+    uncapped = await ToolRegistry(tmp_path).execute(
+        ToolCall("exec-utf8-full", "exec", {"command": command})
+    )
+    capped = await ToolRegistry(tmp_path).execute(
+        ToolCall(
+            "exec-utf8-capped",
+            "exec",
+            {"command": command, "max_output": 1},
+        )
+    )
+
+    uncapped_block = uncapped["content"][0]
+    capped_block = capped["content"][0]
+    assert uncapped_block["full_size"] == capped_block["full_size"]
+    assert uncapped_block["full_size"] == len(uncapped_block["text"].encode("utf-8"))
 
 
 @pytest.mark.asyncio
@@ -204,16 +232,32 @@ async def test_read_retains_only_bounded_output_from_large_file(
 
     monkeypatch.setattr(read_module, "_BoundedText", TrackingCapture)
     (tmp_path / "large.txt").write_text("x\n" * 1_000_000, encoding="utf-8")
+    real_open = Path.open
+    open_count = 0
+
+    def tracking_open(
+        file_path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal open_count
+        if file_path == tmp_path / "large.txt":
+            open_count += 1
+        return real_open(file_path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "open", tracking_open)
     registry = ToolRegistry(tmp_path, max_output_chars=64)
 
     result = await registry.execute(
         ToolCall("read-large", "read", {"path": "large.txt"})
     )
 
-    assert not result.is_error
-    assert len(result.content) == 64
+    assert result["isError"] is False
+    assert len(result["content"][0]["text"]) == 64
+    assert result["content"][0]["truncated"] is True
     assert len(captures) == 1
     assert captures[0].retained_chars <= 64
+    assert open_count == 1
 
 
 @pytest.mark.asyncio
@@ -236,8 +280,9 @@ async def test_list_retains_only_bounded_output_from_large_directory(
 
     result = await registry.execute(ToolCall("list-large", "list", {"path": "."}))
 
-    assert not result.is_error
-    assert len(result.content) == 64
+    assert result["isError"] is False
+    assert len(result["content"][0]["text"]) == 64
+    assert result["content"][0]["truncated"] is True
     assert len(captures) == 1
     assert captures[0].retained_chars <= 64
 
@@ -249,22 +294,70 @@ async def test_list_bounds_directory_working_set(
 ) -> None:
     for index in range(5_000):
         (tmp_path / f"file-{index:04d}.txt").write_text("x", encoding="utf-8")
-    retained: list[tuple[int, int]] = []
+    calls: list[int] = []
     real_nsmallest = list_module.heapq.nsmallest
 
-    def tracking_nsmallest(count, iterable, *, key=None):
-        entries = real_nsmallest(count, iterable, key=key)
-        retained.append((count, len(entries)))
-        return entries
+    def tracking_nsmallest(
+        count: int,
+        iterable: object,
+        *,
+        key: object,
+    ) -> list[Path]:
+        calls.append(count)
+        return real_nsmallest(count, iterable, key=key)  # type: ignore[arg-type]
 
     monkeypatch.setattr(list_module.heapq, "nsmallest", tracking_nsmallest)
     registry = ToolRegistry(tmp_path, max_output_chars=32)
 
     result = await registry.execute(ToolCall("list-wide", "list", {"path": "."}))
 
-    assert not result.is_error
-    assert len(result.content) == 32
-    assert retained == [(32, 32)]
+    assert result["isError"] is False
+    assert len(result["content"][0]["text"]) == 32
+    assert result["content"][0]["truncated"] is True
+    assert calls == [32]
+    full_listing = "\n".join(f"file-{index:04d}.txt" for index in range(5_000))
+    assert result["content"][0]["full_size"] == len(full_listing.encode("utf-8"))
+    assert result["structuredContent"] == {
+        "root": str(tmp_path),
+        "entry_count": 5_000,
+        "full_size": result["content"][0]["full_size"],
+        "truncated": result["content"][0]["truncated"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_truncation_metadata_matches_capped_content(tmp_path: Path) -> None:
+    for index in range(100):
+        (tmp_path / f"file-{index:03d}.txt").write_text("x", encoding="utf-8")
+    registry = ToolRegistry(tmp_path, max_output_chars=32)
+
+    result = await registry.execute(ToolCall("list-capped", "list", {"path": "."}))
+
+    block = result["content"][0]
+    structured = result["structuredContent"]
+    assert block["truncated"] is True
+    assert structured["truncated"] is True
+    assert structured["full_size"] == block["full_size"]
+
+
+@pytest.mark.asyncio
+async def test_list_truncation_metadata_matches_full_content(tmp_path: Path) -> None:
+    for index in range(601):
+        directory = tmp_path / f"directory-{index:03d}"
+        directory.mkdir()
+        (directory / "file.txt").write_text("x", encoding="utf-8")
+    registry = ToolRegistry(tmp_path, max_output_chars=100_000)
+
+    result = await registry.execute(
+        ToolCall("list-complete", "list", {"path": ".", "depth": 2})
+    )
+
+    block = result["content"][0]
+    structured = result["structuredContent"]
+    assert structured["entry_count"] == 1_202
+    assert block["truncated"] is False
+    assert structured["truncated"] is False
+    assert structured["full_size"] == block["full_size"]
 
 
 @pytest.mark.asyncio
@@ -282,7 +375,8 @@ async def test_list_abort_returns_canceled_result_during_traversal(tmp_path: Pat
     result = await registry.execute(ToolCall("list-abort", "list", {"depth": 1}))
     await abort_task
 
-    assert result == ToolResult("list-abort", "tool execution canceled", True)
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "tool execution canceled"
 
 
 @pytest.mark.asyncio
@@ -303,7 +397,8 @@ async def test_read_abort_returns_canceled_result_during_scan(tmp_path: Path) ->
     result = await registry.execute(ToolCall("read-abort", "read", {"path": "large.txt"}))
     await abort_task
 
-    assert result == ToolResult("read-abort", "tool execution canceled", True)
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "tool execution canceled"
 
 
 @pytest.mark.asyncio
@@ -320,8 +415,8 @@ async def test_exec_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
     )
     await asyncio.sleep(0.4)
 
-    assert result.is_error
-    assert "command timed out" in result.content
+    assert result["isError"] is True
+    assert "command timed out" in result["content"][0]["text"]
     assert not marker.exists()
 
 
@@ -370,7 +465,8 @@ async def test_exec_abort_kills_process_group_and_returns_canceled_result(
     result = await asyncio.wait_for(task, timeout=0.5)
     await asyncio.sleep(0.4)
 
-    assert result == ToolResult("exec-abort", "tool execution canceled", True)
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "tool execution canceled"
     assert not marker.exists()
 
 
@@ -382,8 +478,9 @@ async def test_exec_output_cap_includes_final_content_boundary(tmp_path: Path) -
         ToolCall("exec-cap", "exec", {"command": "printf 1234567890", "max_output": 5})
     )
 
-    assert not result.is_error
-    assert len(result.content) == 5
+    assert result["isError"] is False
+    assert len(result["content"][0]["text"]) == 5
+    assert result["content"][0]["truncated"] is True
 
 
 @pytest.mark.asyncio
@@ -414,7 +511,8 @@ async def test_exec_abort_wins_when_completion_and_abort_are_ready_together(
         )
     )
 
-    assert result == ToolResult("exec-race", "tool execution canceled", True)
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "tool execution canceled"
 
 
 @pytest.mark.asyncio
@@ -436,8 +534,8 @@ async def test_argument_finiteness_covers_undeclared_and_default_fields(
         ToolCall("default", "default", {"extra": math.inf})
     )
 
-    assert undeclared.is_error
-    assert default.is_error
+    assert undeclared["isError"] is True
+    assert default["isError"] is True
 
 
 @pytest.mark.asyncio
@@ -465,8 +563,8 @@ async def test_registered_schema_copies_cannot_disable_validation(tmp_path: Path
 
     result = await registry.execute(ToolCall("typed", "typed", {}))
 
-    assert result.is_error
-    assert "required" in result.content
+    assert result["isError"] is True
+    assert "required" in result["content"][0]["text"]
     assert not called
 
 
@@ -503,9 +601,9 @@ async def test_numeric_validation_rejects_nonfinite_and_bool_enum_values(
     int_result = await registry.execute(
         ToolCall("int", "enum", {"value": 1})
     )
-    assert nan_result.is_error
-    assert bool_result.is_error
-    assert int_result.content == "enum"
+    assert nan_result["isError"] is True
+    assert bool_result["isError"] is True
+    assert int_result["content"][0]["text"] == "enum"
 
 
 @pytest.mark.asyncio
@@ -536,9 +634,12 @@ async def test_abort_cancels_calls_after_the_signal_is_set(tmp_path: Path) -> No
         ]
     )
 
-    assert [result.content for result in results] == ["first", "tool execution canceled"]
+    assert [result["content"][0]["text"] for result in results] == [
+        "first",
+        "tool execution canceled",
+    ]
     assert called == ["first"]
-    assert results[1].is_error
+    assert results[1]["isError"] is True
 
 
 @pytest.mark.asyncio
@@ -565,10 +666,18 @@ async def test_abort_signal_stays_set_for_an_active_handler(tmp_path: Path) -> N
 
     registry.abort()
 
-    assert await asyncio.wait_for(task, timeout=1) == ToolResult(
-        "active",
-        "canceled",
-    )
+    assert await asyncio.wait_for(task, timeout=1) == {
+        "content": [
+            {
+                "type": "text",
+                "text": "canceled",
+                "truncated": False,
+                "full_size": 8,
+            }
+        ],
+        "isError": False,
+        "structuredContent": None,
+    }
     assert observed == [True, True]
 
 
@@ -601,7 +710,7 @@ async def test_parallel_safe_calls_overlap_and_keep_call_order(tmp_path: Path) -
     )
 
     assert finished == ["fast", "slow"]
-    assert [result.content for result in results] == ["slow", "fast"]
+    assert [result["content"][0]["text"] for result in results] == ["slow", "fast"]
 
 
 @pytest.mark.asyncio
@@ -634,7 +743,19 @@ async def test_execute_many_abort_cancels_every_parallel_handler(
     registry.abort()
 
     assert await asyncio.wait_for(task, timeout=1) == [
-        ToolResult(call.id, "canceled") for call in calls
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "canceled",
+                    "truncated": False,
+                    "full_size": 8,
+                }
+            ],
+            "isError": False,
+            "structuredContent": None,
+        }
+        for _ in calls
     ]
     assert generations == [generations[0], generations[0]]
 
@@ -661,9 +782,10 @@ async def test_pre_execution_hook_can_allow_and_deny(tmp_path: Path) -> None:
     allowed = await registry.execute(ToolCall("call-1", "gated", {"allow": True}))
     denied = await registry.execute(ToolCall("call-2", "gated", {"allow": False}))
 
-    assert allowed.content == "allowed"
-    assert denied.is_error
-    assert denied.content == "tool execution denied"
+    assert allowed["isError"] is False
+    assert allowed["content"][0]["text"] == "allowed"
+    assert denied["isError"] is True
+    assert denied["content"][0]["text"] == "tool execution denied"
     assert seen == [("gated", {"allow": True}), ("gated", {"allow": False})]
 
 
