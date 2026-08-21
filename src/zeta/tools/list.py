@@ -34,6 +34,7 @@ async def _list(
     depth = arguments.get("depth", 1)
     output = _BoundedText(registry.max_output_chars)
     entry_count = [0]
+    entry_details: list[dict[str, str]] = []
     full_size = [0]
     has_full_line = [False]
     await _list_children(
@@ -43,6 +44,7 @@ async def _list(
         output,
         abort_signal,
         entry_count,
+        entry_details,
         full_size,
         has_full_line,
     )
@@ -53,6 +55,7 @@ async def _list(
         block,
         structured_content={
             "root": str(path),
+            "entries": entry_details,
             "entry_count": entry_count[0],
             "full_size": block["full_size"],
             "truncated": block["truncated"],
@@ -67,6 +70,7 @@ async def _list_children(
     output: _BoundedText,
     abort_signal: AbortSignal,
     entry_count: list[int],
+    entry_details: list[dict[str, str]],
     full_size: list[int],
     has_full_line: list[bool],
     render_output: bool = True,
@@ -86,6 +90,7 @@ async def _list_children(
                 entries_seen += 1
                 entry_count[0] += 1
                 relative = _relative_entry(registry, entry)
+                entry_details.append({"name": entry.name})
                 if has_full_line[0]:
                     full_size[0] += 1
                 full_size[0] += len(relative.encode("utf-8"))
@@ -113,6 +118,7 @@ async def _list_children(
                 output,
                 abort_signal,
                 entry_count,
+                entry_details,
                 full_size,
                 has_full_line,
                 render_output,
@@ -139,6 +145,7 @@ async def _list_children(
                     output,
                     abort_signal,
                     entry_count,
+                    entry_details,
                     full_size,
                     has_full_line,
                     False,

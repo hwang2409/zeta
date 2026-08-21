@@ -28,6 +28,7 @@ from ..core.approval import (
 )
 from ..core.store import ConversationStore
 from ..types import (
+    StructuredContentValue,
     StructuredToolResult,
     ToolCall,
     ToolResult,
@@ -131,15 +132,12 @@ def text_block(
 def _success_result(
     block: ToolTextBlock,
     *,
-    structured_content: Mapping[str, object] | None = None,
+    structured_content: Mapping[str, StructuredContentValue] | None = None,
 ) -> StructuredToolResult:
     normalized_content = (
         None
         if structured_content is None
-        else cast(
-            dict[str, str | int | bool | None],
-            dict(structured_content),
-        )
+        else dict(structured_content)
     )
     return {
         "content": [block],
@@ -585,11 +583,7 @@ def validate_tool_result(result: object) -> StructuredToolResult:
     if structured_content is not None:
         if type(structured_content) is not dict:
             raise ValueError("structuredContent must be an object or null")
-        for key, value in structured_content.items():
-            if type(key) is not str or (
-                value is not None and type(value) not in {str, int, bool}
-            ):
-                raise ValueError("structuredContent must contain scalar JSON values")
+        _validate_structured_content(structured_content)
 
     for index, block in enumerate(content):
         if type(block) is not dict:
@@ -607,6 +601,22 @@ def validate_tool_result(result: object) -> StructuredToolResult:
         if type(block["full_size"]) is not int or block["full_size"] < 0:
             raise ValueError(f"content[{index}].full_size must be nonnegative")
     return cast(StructuredToolResult, result)
+
+
+def _validate_structured_content(value: object) -> None:
+    if value is None or type(value) in {str, int, bool}:
+        return
+    if type(value) is list:
+        for item in value:
+            _validate_structured_content(item)
+        return
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ValueError("structuredContent object keys must be strings")
+            _validate_structured_content(item)
+        return
+    raise ValueError("structuredContent must contain JSON values")
 
 
 def _normalize_schema(schema: Mapping[str, Any] | None) -> dict[str, Any]:
