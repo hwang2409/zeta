@@ -5,7 +5,12 @@ import pytest
 
 from zeta.tools import ToolRegistry
 from zeta.tools.registry import validate_tool_result
-from zeta.types import StructuredToolResult, ToolCall, ToolTextBlock
+from zeta.types import (
+    StructuredContentValue,
+    StructuredToolResult,
+    ToolCall,
+    ToolTextBlock,
+)
 
 
 def _text_block(result: StructuredToolResult) -> ToolTextBlock:
@@ -91,6 +96,55 @@ async def test_failure_result_uses_mcp_error_shape(tmp_path: Path) -> None:
     block = _text_block(result)
     assert block["type"] == "text"
     assert block["text"] == "unknown tool: missing"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_cyclic_structured_content(tmp_path: Path) -> None:
+    structured_content: dict[str, StructuredContentValue] = {}
+    cycle: list[StructuredContentValue] = [structured_content]
+    structured_content["cycle"] = cycle
+    handler_result: StructuredToolResult = {
+        "content": [
+            {"type": "text", "text": "bad", "truncated": False, "full_size": 3}
+        ],
+        "isError": False,
+        "structuredContent": structured_content,
+    }
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register("cycle", lambda arguments: handler_result)
+
+    result = await registry.execute(ToolCall("cycle-1", "cycle", {}))
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == (
+        "invalid tool handler result: cyclic structuredContent"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_deep_structured_content(tmp_path: Path) -> None:
+    structured_content: dict[str, StructuredContentValue] = {}
+    current = structured_content
+    for _ in range(100):
+        child: dict[str, StructuredContentValue] = {}
+        current["child"] = child
+        current = child
+    handler_result: StructuredToolResult = {
+        "content": [
+            {"type": "text", "text": "bad", "truncated": False, "full_size": 3}
+        ],
+        "isError": False,
+        "structuredContent": structured_content,
+    }
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register("deep", lambda arguments: handler_result)
+
+    result = await registry.execute(ToolCall("deep-1", "deep", {}))
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == (
+        "invalid tool handler result: structuredContent depth > 32"
+    )
 
 
 @pytest.mark.asyncio

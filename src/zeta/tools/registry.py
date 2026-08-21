@@ -38,6 +38,7 @@ from ..types import (
 
 
 AbortSignal = ToolAbortSignal
+MAX_STRUCTURED_CONTENT_DEPTH = 32
 ToolHook = Callable[[str, dict[str, Any]], bool | Awaitable[bool] | None]
 ToolHandlerResult = str | StructuredToolResult | ToolResult
 ToolHandler = Callable[
@@ -604,19 +605,29 @@ def validate_tool_result(result: object) -> StructuredToolResult:
 
 
 def _validate_structured_content(value: object) -> None:
-    if value is None or type(value) in {str, int, bool}:
-        return
-    if type(value) is list:
-        for item in value:
-            _validate_structured_content(item)
-        return
-    if type(value) is dict:
-        for key, item in value.items():
+    pending: list[tuple[object, int]] = [(value, 0)]
+    seen: set[int] = set()
+    while pending:
+        current, depth = pending.pop()
+        if depth > MAX_STRUCTURED_CONTENT_DEPTH:
+            raise ValueError(
+                f"structuredContent depth > {MAX_STRUCTURED_CONTENT_DEPTH}"
+            )
+        if current is None or type(current) in {str, int, bool}:
+            continue
+        if type(current) not in {list, dict}:
+            raise ValueError("structuredContent must contain JSON values")
+        current_id = id(current)
+        if current_id in seen:
+            raise ValueError("cyclic structuredContent")
+        seen.add(current_id)
+        if type(current) is list:
+            pending.extend((item, depth + 1) for item in current)
+            continue
+        for key, item in current.items():
             if type(key) is not str:
                 raise ValueError("structuredContent object keys must be strings")
-            _validate_structured_content(item)
-        return
-    raise ValueError("structuredContent must contain JSON values")
+            pending.append((item, depth + 1))
 
 
 def _normalize_schema(schema: Mapping[str, Any] | None) -> dict[str, Any]:
