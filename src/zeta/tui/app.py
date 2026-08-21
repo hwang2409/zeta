@@ -252,6 +252,7 @@ class TUIApp:
 
             resume_task: asyncio.Task[Any] | None = None
             try:
+                await self.loop.ensure_mcp_servers()
                 if not self.loop.prepare_resume_pending_tool(request_id):
                     self._present_pending_approvals()
                     return True
@@ -634,6 +635,7 @@ class TUIApp:
             if self._active_task is not None and not self._active_task.done():
                 self._active_task.cancel()
                 await asyncio.gather(self._active_task, return_exceptions=True)
+            await self.loop.close()
 
     def _start_turn(self, user_text: str) -> None:
         self._active_task = asyncio.create_task(self._consume_turn(user_text))
