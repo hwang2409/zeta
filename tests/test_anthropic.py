@@ -130,6 +130,131 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
 
 
 @pytest.mark.asyncio
+async def test_401_refreshes_token_and_retries_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    statuses = iter((401, 200))
+    refreshes: list[httpx.AsyncClient] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        status = next(statuses)
+        if status == 200:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=SSE,
+                request=request,
+            )
+        return httpx.Response(401, json={"error": {"message": "expired"}}, request=request)
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("stale-access", "refresh-test", 4_000_000_000))
+
+    async def refresh_token(client: httpx.AsyncClient) -> str:
+        refreshes.append(client)
+        return "fresh-access"
+
+    monkeypatch.setattr(store, "refresh_token", refresh_token)
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(
+            client=client, token_store=store, base_url="https://test.invalid/v1/messages"
+        ).complete([], [])
+    ]
+
+    assert len(refreshes) == 1
+    assert len(requests) == 2
+    assert requests[0].headers["authorization"] == "Bearer stale-access"
+    assert requests[1].headers["authorization"] == "Bearer fresh-access"
+    assert events[-1].message is not None
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_second_401_fails_loudly_without_a_retry_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    refreshes: list[httpx.AsyncClient] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(401, json={"error": {"message": "expired"}}, request=request)
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("stale-access", "refresh-test", 4_000_000_000))
+
+    async def refresh_token(client: httpx.AsyncClient) -> str:
+        refreshes.append(client)
+        return "fresh-access"
+
+    monkeypatch.setattr(store, "refresh_token", refresh_token)
+    client = client_for(handler)
+    with pytest.raises(AnthropicAuthError, match="re-login required"):
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+
+    assert len(requests) == 2
+    assert len(refreshes) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_401_refresh_failure_propagates_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(401, json={"error": {"message": "expired"}}, request=request)
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("stale-access", "refresh-test", 4_000_000_000))
+
+    async def refresh_token(client: httpx.AsyncClient) -> str:
+        raise RuntimeError("refresh failed")
+
+    monkeypatch.setattr(store, "refresh_token", refresh_token)
+    client = client_for(handler)
+    with pytest.raises(RuntimeError, match="refresh failed"):
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+
+    assert len(requests) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_non_401_error_does_not_refresh_or_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    refreshes: list[httpx.AsyncClient] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500, json={"error": {"message": "server"}}, request=request)
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+
+    async def refresh_token(client: httpx.AsyncClient) -> str:
+        refreshes.append(client)
+        return "fresh-access"
+
+    monkeypatch.setattr(store, "refresh_token", refresh_token)
+    client = client_for(handler)
+    with pytest.raises(AnthropicHTTPError, match="500"):
+        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+
+    assert len(requests) == 1
+    assert refreshes == []
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_tool_call_delta_and_single_completion_boundary(tmp_path: Path) -> None:
     stream = """event: message_start
 data: {"type":"message_start","message":{"id":"msg-2","usage":{"input_tokens":1}}}
@@ -532,7 +657,7 @@ async def test_http_failure_is_typed(tmp_path: Path) -> None:
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
-    with pytest.raises(AnthropicAuthError):
+    with pytest.raises(AnthropicHTTPError):
         await anext(AnthropicBackend(client=client, token_store=store).complete([], []))
     await client.aclose()
 

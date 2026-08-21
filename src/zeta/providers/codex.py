@@ -20,6 +20,7 @@ from .transport import (
     cleanup_transport,
     is_control_exception,
     request_error,
+    retry_auth_completion,
     task_is_cancelling,
 )
 from ..types import (
@@ -53,6 +54,10 @@ class CodexAuthError(CodexBackendError):
     """Raised when ChatGPT subscription credentials are missing or invalid."""
 
     code = "auth_error"
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class CodexHTTPError(CodexBackendError):
@@ -410,12 +415,44 @@ class CodexBackend(CompletionBackend):
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
+        attempts = retry_auth_completion(
+            lambda: self._complete_once(messages, tool_schemas),
+            lambda token: self._complete_once(messages, tool_schemas, token=token),
+            self._refresh_token,
+            lambda error: isinstance(error, CodexAuthError) and error.status_code == 401,
+            lambda error: CodexAuthError(
+                "token refresh did not restore auth; re-login required", status_code=401
+            ),
+        )
+        try:
+            async for event in attempts:
+                yield event
+        finally:
+            await attempts.aclose()
+
+    async def _refresh_token(self) -> str:
+        client = self.client or httpx.AsyncClient(timeout=None)
+        try:
+            return await self.token_store.refresh_token(client)
+        finally:
+            if self.client is None:
+                await client.aclose()
+
+    async def _complete_once(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+        *,
+        token: str | None = None,
+    ) -> AsyncIterator[StreamEvent]:
         client = self.client or httpx.AsyncClient(timeout=None)
         stream_context: Any = None
         entered = False
         primary_exception: BaseException | None = None
         try:
-            access_token = await self.token_store.access_token(client)
+            access_token = (
+                token if token is not None else await self.token_store.access_token(client)
+            )
             account_id = extract_account_id(access_token)
             payload = build_responses_payload(
                 messages,
@@ -484,6 +521,11 @@ def _http_error(status_code: int, body: bytes) -> CodexBackendError:
     error_type = CodexAuthError if status_code in {401, 403} else CodexHTTPError
     excerpt = error_body_excerpt(body)
     detail = f": {excerpt}" if excerpt else ""
+    if error_type is CodexAuthError:
+        return error_type(
+            f"Codex HTTP request failed ({status_code}){detail}",
+            status_code=status_code,
+        )
     return error_type(f"Codex HTTP request failed ({status_code}){detail}")
 
 
