@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import warnings
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 
-from .approval import ApprovalPolicy
-from .context import ContextAssembler
-from .store import ConversationStore
+from .core.approval import ApprovalPolicy
+from .core.context import ContextAssembler
+from .core.store import ConversationStore
 from .tools import ToolHandler, ToolRegistry
 from .types import (
     CompletionBackend,

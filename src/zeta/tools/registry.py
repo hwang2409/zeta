@@ -4,22 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import heapq
 import inspect
 import json
 import math
-import os
-import signal
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .abort import AbortGenerationRegistry, AbortSignal as ToolAbortSignal
-from .approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
-from .gate import ApprovalGate, canceled_result as _canceled_result
-from .store import ConversationStore
-from .types import ToolCall, ToolResult, ToolSchema
+from ..core.abort import AbortGenerationRegistry, AbortSignal as ToolAbortSignal
+from ..core.approval import (
+    ApprovalDecision,
+    ApprovalGate,
+    ApprovalPolicy,
+    ApprovalRequest,
+    canceled_result as _canceled_result,
+)
+from ..core.store import ConversationStore
+from ..types import ToolCall, ToolResult, ToolSchema
 
 
 AbortSignal = ToolAbortSignal
@@ -39,25 +41,6 @@ async def _yield_for_abort(
     await asyncio.sleep(0)
     if _signal_is_set(abort_signal):
         raise _ToolCanceled()
-
-
-class _BoundedOutput:
-    def __init__(self, limit: int) -> None:
-        self.limit = limit
-        self._data = bytearray()
-
-    @property
-    def data(self) -> bytes:
-        return bytes(self._data)
-
-    @property
-    def retained_bytes(self) -> int:
-        return len(self._data)
-
-    def append(self, chunk: bytes) -> None:
-        remaining = self.limit - len(self._data)
-        if remaining > 0:
-            self._data.extend(chunk[:remaining])
 
 
 class _BoundedText:
@@ -159,7 +142,9 @@ class ToolRegistry:
         self.max_output_chars = max_output_chars
         self._tools: dict[str, ToolDefinition] = {}
         if register_builtin:
-            self._register_builtin_tools()
+            from . import register_default_tools
+
+            register_default_tools(self)
 
     @property
     def schemas(self) -> list[ToolSchema]:
@@ -406,254 +391,11 @@ class ToolRegistry:
             index = end
         return [result for result in results if result is not None]
 
-    def _register_builtin_tools(self) -> None:
-        self.register(
-            "read",
-            self._read,
-            description="Read a UTF-8 file. Relative paths use the session cwd.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "minLength": 1},
-                    "offset": {"type": "integer", "minimum": 0},
-                    "limit": {"type": "integer", "minimum": 1},
-                },
-                "required": ["path"],
-                "additionalProperties": False,
-            },
-        )
-        self.register(
-            "list",
-            self._list,
-            description="List a directory. Relative paths use the session cwd.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "minLength": 1},
-                    "depth": {"type": "integer", "minimum": 1},
-                },
-                "additionalProperties": False,
-            },
-        )
-        self.register(
-            "exec",
-            self._exec,
-            description=(
-                "Run a shell command from the session cwd. "
-                "This tool is not a sandbox."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "minLength": 1},
-                    "timeout": {"type": "number", "exclusiveMinimum": 0},
-                    "max_output": {"type": "integer", "minimum": 1},
-                },
-                "required": ["command"],
-                "additionalProperties": False,
-            },
-        )
-
-    async def _read(
-        self,
-        arguments: dict[str, Any],
-        abort_signal: ToolAbortSignal,
-    ) -> str:
-        path = self._path(arguments["path"])
-        if not path.is_file():
-            raise ValueError(f"not a file: {arguments['path']}")
-        offset = arguments.get("offset", 0)
-        limit = arguments.get("limit")
-        output = _BoundedText(self.max_output_chars)
-        line_index = 0
-        selected_count = 0
-        line_has_data = False
-        line_started = False
-        try:
-            with path.open("r", encoding="utf-8", newline=None) as handle:
-                while True:
-                    chunk = handle.read(64 * 1024)
-                    if not chunk:
-                        break
-                    for character in chunk:
-                        if character == "\n":
-                            selected = line_index >= offset and (
-                                limit is None or selected_count < limit
-                            )
-                            if selected:
-                                if not line_started:
-                                    output.begin_line()
-                                selected_count += 1
-                                if output.truncated:
-                                    return output.render()
-                            line_index += 1
-                            line_has_data = False
-                            line_started = False
-                            if limit is not None and selected_count >= limit:
-                                return output.render()
-                            continue
-                        line_has_data = True
-                        if line_index < offset or (
-                            limit is not None and selected_count >= limit
-                        ):
-                            continue
-                        if not line_started:
-                            output.begin_line()
-                            line_started = True
-                        output.append(character)
-                        if output.truncated:
-                            return output.render()
-                    await _yield_for_abort(abort_signal)
-                if line_has_data:
-                    selected = line_index >= offset and (
-                        limit is None or selected_count < limit
-                    )
-                    if selected:
-                        if not line_started:
-                            output.begin_line()
-                        selected_count += 1
-        except OSError as exc:
-            raise ValueError(f"could not read file: {exc}") from exc
-        return output.render()
-
-    async def _list(
-        self,
-        arguments: dict[str, Any],
-        abort_signal: ToolAbortSignal,
-    ) -> str:
-        relative_path = arguments.get("path", ".")
-        path = self._path(relative_path)
-        if not path.is_dir():
-            raise ValueError(f"not a directory: {relative_path}")
-        depth = arguments.get("depth", 1)
-        output = _BoundedText(self.max_output_chars)
-        await self._list_children(path, depth, output, abort_signal)
-        if _signal_is_set(abort_signal):
-            raise _ToolCanceled()
-        return output.render()
-
-    async def _list_children(
-        self,
-        path: Path,
-        depth: int,
-        output: _BoundedText,
-        abort_signal: ToolAbortSignal,
-    ) -> bool:
-        if _signal_is_set(abort_signal):
-            raise _ToolCanceled()
-        try:
-            entries = heapq.nsmallest(
-                max(1, self.max_output_chars - output.retained_chars),
-                path.iterdir(),
-                key=lambda item: item.name,
-            )
-        except OSError as exc:
-            raise ValueError(f"could not list directory: {exc}") from exc
-        for index, entry in enumerate(entries):
-            if _signal_is_set(abort_signal):
-                raise _ToolCanceled()
-            if index % 64 == 0:
-                await _yield_for_abort(abort_signal)
-            try:
-                relative = os.fspath(entry.relative_to(self.cwd))
-            except ValueError:
-                relative = os.fspath(entry)
-            if entry.is_dir() and not entry.is_symlink():
-                relative += "/"
-            output.append_line(relative)
-            if output.truncated:
-                return True
-            if depth > 1 and entry.is_dir() and not entry.is_symlink():
-                if await self._list_children(entry, depth - 1, output, abort_signal):
-                    return True
-        return False
-
-    async def _exec(
-        self,
-        arguments: dict[str, Any],
-        abort_signal: ToolAbortSignal,
-    ) -> str:
-        timeout = arguments.get("timeout", 30.0)
-        output_limit = arguments.get("max_output", self.max_output_chars)
-        try:
-            process = await asyncio.create_subprocess_shell(
-                arguments["command"],
-                cwd=self.cwd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            raise ValueError(f"could not execute command: {exc}") from exc
-
-        stdout_capture = _BoundedOutput(output_limit)
-        stderr_capture = _BoundedOutput(output_limit)
-        process_wait = asyncio.create_task(process.wait())
-        stdout_drain = asyncio.create_task(
-            _drain_stream(process.stdout, stdout_capture)
-        )
-        stderr_drain = asyncio.create_task(
-            _drain_stream(process.stderr, stderr_capture)
-        )
-        process_tasks = (process_wait, stdout_drain, stderr_drain)
-        abort_wait = asyncio.create_task(_wait_for_abort(abort_signal))
-        timeout_wait = asyncio.create_task(asyncio.sleep(timeout))
-        try:
-            pending: set[asyncio.Task[Any]] = {
-                *process_tasks,
-                abort_wait,
-                timeout_wait,
-            }
-            while True:
-                done, pending = await asyncio.wait(
-                    pending,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if _signal_is_set(abort_signal):
-                    await _kill_and_reap(process, process_tasks)
-                    raise _ToolCanceled()
-                if all(task.done() for task in process_tasks):
-                    process_wait.result()
-                    result = _format_exec_result(
-                        process.returncode,
-                        stdout_capture.data,
-                        stderr_capture.data,
-                        output_limit,
-                    )
-                    if process.returncode:
-                        raise ValueError(result)
-                    return result
-                if timeout_wait in done:
-                    break
-
-            await _kill_and_reap(process, process_tasks)
-            raise ValueError(
-                _format_exec_result(
-                    process.returncode,
-                    stdout_capture.data,
-                    stderr_capture.data,
-                    output_limit,
-                    suffix="command timed out",
-                )
-            )
-        except asyncio.CancelledError:
-            await _kill_and_reap(process, process_tasks)
-            raise
-        except BaseException:
-            await _kill_and_reap(process, process_tasks)
-            raise
-        finally:
-            for waiter in (abort_wait, timeout_wait):
-                if not waiter.done():
-                    waiter.cancel()
-            await asyncio.gather(abort_wait, timeout_wait, return_exceptions=True)
-
     def _path(self, raw_path: object) -> Path:
         if type(raw_path) is not str or not raw_path:
             raise ValueError("path must be a nonempty string")
         candidate = Path(raw_path)
         return candidate if candidate.is_absolute() else self.cwd / candidate
-
 
 async def _invoke_handler(
     handler: ToolHandler,
@@ -897,57 +639,6 @@ def _validate_schema_definition(schema: Mapping[str, Any], path: str) -> None:
 
 def _signal_is_set(signal_state: ToolAbortSignal) -> bool:
     return signal_state.is_set()
-
-
-async def _wait_for_abort(signal_state: ToolAbortSignal) -> None:
-    await signal_state.wait()
-
-
-async def _drain_stream(stream: object, capture: _BoundedOutput) -> None:
-    if stream is None:
-        return
-    read = getattr(stream, "read")
-    while True:
-        chunk = await read(65_536)
-        if not chunk:
-            return
-        capture.append(chunk)
-
-
-async def _kill_and_reap(
-    process: asyncio.subprocess.Process,
-    process_tasks: Sequence[asyncio.Task[Any]],
-) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        process.kill()
-    for task in process_tasks:
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                current = asyncio.current_task()
-                if current is not None:
-                    current.uncancel()
-        if not task.cancelled():
-            task.exception()
-
-
-def _format_exec_result(
-    returncode: int | None,
-    stdout: bytes,
-    stderr: bytes,
-    output_limit: int,
-    *,
-    suffix: str | None = None,
-) -> str:
-    output = f"stdout:\n{stdout.decode(errors='replace')}\nstderr:\n{stderr.decode(errors='replace')}"
-    if suffix:
-        output = f"{suffix}\n{output}"
-    return _truncate(f"exit_code: {returncode}\n{output}", output_limit)
 
 
 def _truncate(value: str, limit: int) -> str:

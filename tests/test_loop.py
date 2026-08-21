@@ -6,9 +6,9 @@ from unittest.mock import patch
 
 import pytest
 
-from zeta.fake import FakeBackend, ScriptedTurn
-from zeta.loop import AgentLoop
-from zeta.store import ConversationStore
+from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.loop import AgentLoop
+from zeta.core.store import ConversationStore
 from zeta.tools import ToolRegistry
 from zeta.types import (
     CompletionBackend,

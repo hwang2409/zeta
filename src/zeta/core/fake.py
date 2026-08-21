@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Sequence
 
-from .types import (
+from ..types import (
     CompletionBackend,
     ContentBlock,
     Message,

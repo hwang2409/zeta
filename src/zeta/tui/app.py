@@ -13,18 +13,17 @@ from typing import Any
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import get_app
 from prompt_toolkit.formatted_text import FormattedText
-from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from rich.console import Console, RenderableType
 from rich.text import Text
 
-from ..approval import ApprovalPolicy, ApprovalRequest
-from ..anthropic import AnthropicBackend
-from ..anthropic import AnthropicCredentialStore
-from ..codex import CodexBackend
-from ..codex import CodexCredentialStore
+from ..core.approval import ApprovalPolicy, ApprovalRequest
 from ..loop import AgentLoop
-from ..session import SessionError, SessionManager, env_home
+from ..core.session import SessionError, SessionManager, env_home
+from ..providers.anthropic import AnthropicBackend
+from ..providers.anthropic import AnthropicCredentialStore
+from ..providers.codex import CodexBackend
+from ..providers.codex import CodexCredentialStore
 from ..types import (
     CompletionBackend,
     Message,
@@ -576,51 +575,18 @@ def create_app(args: argparse.Namespace) -> TUIApp:
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="chat with the zeta harness")
-    parser.add_argument(
-        "--provider",
-        choices=("fake", "claude", "codex"),
-        help="completion provider",
-    )
-    parser.add_argument("--model", help="provider model override")
-    session_group = parser.add_mutually_exclusive_group()
-    session_group.add_argument(
-        "--continue",
-        "-c",
-        dest="continue_session",
-        action="store_true",
-        help="resume the most recent session in this directory",
-    )
-    session_group.add_argument("--resume", help="resume a session by id")
-    parser.add_argument(
-        "--force-provider",
-        action="store_true",
-        help="allow provider or model overrides during resume",
-    )
-    parser.add_argument("--verbose", action="store_true", help="show raw stream events")
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.force_provider and args.model is None:
-        parser.error("--force-provider requires --model")
-    try:
-        app = create_app(args)
-    except SessionError as exc:
-        parser.error(str(exc))
-    with patch_stdout(raw=True):
-        asyncio.run(app.run())
-    return 0
-
-
 __all__ = [
     "FakeInteractiveBackend",
     "TUIApp",
-    "build_backend",
-    "build_parser",
     "create_app",
+    "build_backend",
     "main",
 ]
+
+
+def __getattr__(name: str) -> object:
+    if name == "main":
+        from ..cli import main
+
+        return main
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -9,9 +9,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-import zeta.codex as codex_module
-from zeta.anthropic import OAuthTokens
-from zeta.codex import (
+import zeta.providers.codex as codex_module
+from zeta.providers.anthropic import OAuthTokens
+from zeta.providers.codex import (
     DEFAULT_CODEX_MODEL,
     CodexAuthError,
     CodexBackend,

@@ -15,7 +15,7 @@ from typing import Any, Iterable, Iterator, Mapping
 
 import fcntl
 
-from .types import Message, MessageRole, ToolCall, ToolUseContent
+from ..types import Message, MessageRole, ToolCall, ToolUseContent
 
 
 SCHEMA = "zeta.conversation.v1"

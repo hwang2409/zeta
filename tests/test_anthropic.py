@@ -7,8 +7,8 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-import zeta.anthropic as anthropic_module
-from zeta.anthropic import (
+import zeta.providers.anthropic as anthropic_module
+from zeta.providers.anthropic import (
     AnthropicAuthError,
     AnthropicBackend,
     AnthropicCredentialStore,
@@ -18,8 +18,8 @@ from zeta.anthropic import (
     build_authorization_url,
     build_messages_payload,
 )
-from zeta.loop import AgentLoop
-from zeta.store import ConversationStore
+from zeta.core.loop import AgentLoop
+from zeta.core.store import ConversationStore
 from zeta.types import (
     Message,
     MessageRole,
@@ -644,7 +644,7 @@ async def test_cancellation_survives_failing_owned_client_cleanup(
 
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
-    with patch("zeta.anthropic.httpx.AsyncClient", return_value=Client()):
+    with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         task = asyncio.create_task(
             anext(AnthropicBackend(token_store=store).complete([], []))
         )
@@ -688,7 +688,7 @@ async def test_cancellation_during_owned_client_close_is_not_swallowed(
     async def consume() -> list[object]:
         return [event async for event in AnthropicBackend(token_store=store).complete([], [])]
 
-    with patch("zeta.anthropic.httpx.AsyncClient", return_value=Client()):
+    with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         task = asyncio.create_task(consume())
         await close_started.wait()
         task.cancel()
@@ -725,7 +725,7 @@ async def test_consumer_aclose_suppresses_failing_stream_cleanup(
 
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
-    with patch("zeta.anthropic.httpx.AsyncClient", return_value=Client()):
+    with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         stream = AnthropicBackend(token_store=store).complete([], [])
         await anext(stream)
         await stream.aclose()
@@ -800,7 +800,7 @@ async def test_client_cleanup_cancellation_wins_over_stream_error(
 
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
-    with patch("zeta.anthropic.httpx.AsyncClient", return_value=Client()):
+    with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         task = asyncio.create_task(
             anext(AnthropicBackend(token_store=store).complete([], []))
         )
@@ -868,7 +868,7 @@ async def test_client_cleanup_http_error_is_typed(tmp_path: Path) -> None:
 
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
-    with patch("zeta.anthropic.httpx.AsyncClient", return_value=Client()):
+    with patch("zeta.providers.anthropic.httpx.AsyncClient", return_value=Client()):
         with pytest.raises(AnthropicHTTPError) as raised:
             [
                 event

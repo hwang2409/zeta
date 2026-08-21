@@ -1,6 +1,6 @@
 """Custom agent harness."""
-from .approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
-from .anthropic import (
+from .core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
+from .providers.anthropic import (
     AnthropicAuthError,
     AnthropicBackend,
     AnthropicBackendError,
@@ -12,7 +12,7 @@ from .anthropic import (
     build_messages_payload,
     exchange_authorization_code,
 )
-from .codex import (
+from .providers.codex import (
     DEFAULT_CODEX_MODEL,
     CodexAuthError,
     CodexBackend,
@@ -23,7 +23,7 @@ from .codex import (
     build_responses_payload,
     extract_account_id,
 )
-from .context import (
+from .core.context import (
     AssembledContext,
     BudgetExceeded,
     CompactionPolicy,
@@ -32,9 +32,9 @@ from .context import (
     SummaryCompletionError,
     SummaryInputTooLarge,
 )
-from .fake import FakeBackend, ScriptedTurn
+from .core.fake import FakeBackend, ScriptedTurn
 from .loop import AgentLoop
-from .session import (
+from .core.session import (
     META_VERSION,
     OpenedSession,
     SessionError,
@@ -44,7 +44,7 @@ from .session import (
     find_most_recent,
     list_sessions,
 )
-from .store import ConversationEntry, ConversationIntegrityError, ConversationStore
+from .core.store import ConversationEntry, ConversationIntegrityError, ConversationStore
 from .tools import AbortSignal, ToolAbortSignal, ToolDefinition, ToolRegistry
 from .types import *
 

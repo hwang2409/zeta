@@ -4,15 +4,15 @@ from time import perf_counter
 
 import pytest
 
-from zeta.context import (
+from zeta.core.context import (
     BudgetExceeded,
     CompactionPolicy,
     ContextAssembler,
     StaleBranchError,
     SummaryInputTooLarge,
 )
-from zeta.fake import FakeBackend, ScriptedTurn
-from zeta.store import ConversationStore
+from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.store import ConversationStore
 from zeta.types import (
     Message,
     MessageRole,

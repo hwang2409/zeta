@@ -19,8 +19,8 @@ from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
 
-from zeta.loop import AgentLoop
-from zeta.store import ConversationStore
+from zeta.core.loop import AgentLoop
+from zeta.core.store import ConversationStore
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings, parse_input
 from zeta.tui.render import MarkdownStream, format_status, render_event
@@ -469,6 +469,29 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
             process.kill()
             process.wait()
         os.close(master_fd)
+
+
+def test_main_import_compatibility() -> None:
+    from zeta.cli import main as cli_main
+    from zeta.tui import main as tui_main
+    from zeta.tui.app import main as app_main
+
+    assert tui_main is cli_main
+    assert app_main is cli_main
+
+
+def test_tui_import_does_not_load_cli() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import zeta.tui; raise SystemExit('zeta.cli' in sys.modules)",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_markdown_stream_renders_complete_table() -> None:
