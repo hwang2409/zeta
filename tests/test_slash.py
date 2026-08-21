@@ -48,15 +48,27 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="test-xyz-123")
     store.append_message(Message(MessageRole.USER, [TextContent("old")]))
     store.append_compaction_marker("summary", 1, 1)
+    store.append_compaction_marker("summary 2", 1, 1)
     backend = FakeBackend([])
     policy = ApprovalPolicy(store=store)
-    loop = AgentLoop(backend, store, approval_policy=policy)
+    loop = AgentLoop(
+        backend,
+        store,
+        approval_policy=policy,
+        retained_tail=17,
+    )
     await loop.context_assembler.assemble()
     loop.context_assembler.record_usage({"total_tokens": 321})
-    call = ToolCall("approval-live", "write", {})
+    calls = [
+        ToolCall("approval-live-1", "write", {}),
+        ToolCall("approval-live-2", "write", {}),
+    ]
     store.append_message_with_approval_requests(
-        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
-        [(call.id, call)],
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(call) for call in calls],
+        ),
+        [(call.id, call) for call in calls],
     )
     app = TUIApp(
         loop,
@@ -80,7 +92,8 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
         f"{loop.context_assembler.token_count}"
     ) in output
     assert f"compaction_marker_count: {store.compaction_marker_count()}" in output
-    assert "live_pending_approvals: 1 (approval-live (write))" in output
+    assert "compaction_marker_count: 2" in output
+    assert "live_pending_approvals: 2" in output
 
 
 @pytest.mark.asyncio
