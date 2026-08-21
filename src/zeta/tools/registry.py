@@ -520,10 +520,10 @@ class ToolRegistry:
         except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
             return _error_result(str(exc))
         finally:
+            stream_publisher.close()
             if not abort_wait.done():
                 abort_wait.cancel()
                 await asyncio.gather(abort_wait, return_exceptions=True)
-            stream_publisher.close()
 
     def _abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
         if self.approval_policy is None:

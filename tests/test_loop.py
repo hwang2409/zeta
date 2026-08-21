@@ -384,6 +384,58 @@ async def test_streamed_message_log_is_cadence_stable(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_update_queue_drops_oldest_without_truncating_result(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("burst-1", "stream", {})
+    chunks = [f"chunk-{index}\n" for index in range(200)]
+    final_text = "".join(chunks)
+    publish_duration = 0.0
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+
+    async def stream(
+        arguments: dict[str, object],
+        abort_signal: object,
+        publisher: ToolStreamPublisher,
+    ) -> str:
+        nonlocal publish_duration
+        del arguments, abort_signal
+        started = asyncio.get_running_loop().time()
+        for chunk in chunks:
+            publisher.publish(chunk, "stdout")
+        publish_duration = asyncio.get_running_loop().time() - started
+        return final_text
+
+    events: list[StreamEvent] = []
+    loop = AgentLoop(
+        backend,
+        ConversationStore(tmp_path),
+        tools={"stream": stream},
+        max_turns=1,
+    )
+    async for event in loop.run_turn("start"):
+        events.append(event)
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
+            await asyncio.sleep(0.001)
+
+    updates = [
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE
+    ]
+    end = next(
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+    assert publish_duration < 0.1
+    assert len(updates) == 128
+    assert updates[0].delta == "chunk-72\n"
+    assert updates[-1].delta == "chunk-199\n"
+    assert end.tool_result.content == final_text
+
+
+@pytest.mark.asyncio
 async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -> None:
     first_call = ToolCall("call-1", "first", {})
     second_call = ToolCall("call-2", "second", {})

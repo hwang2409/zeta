@@ -48,6 +48,18 @@ def _zeta_home() -> Path:
     return env_home()
 
 
+def _tool_output_matches_result(
+    event: StreamEvent,
+    streamed_output: dict[str, str],
+) -> bool:
+    if event.tool_result is None or not streamed_output:
+        return False
+    stdout = streamed_output.get("stdout", "")
+    stderr = streamed_output.get("stderr", "")
+    expected = f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    return event.tool_result.content == expected
+
+
 class FakeInteractiveBackend(CompletionBackend):
     """Small streaming backend for offline CLI smoke tests."""
 
@@ -167,7 +179,7 @@ class TUIApp:
         self._spinner_active = False
         self._spinner_frame = 0
         self._spinner_reset = asyncio.Event()
-        self._active_tool_updates: dict[str, bool] = {}
+        self._active_tool_updates: dict[str, dict[str, str]] = {}
         self._abort_requested = False
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
@@ -459,8 +471,8 @@ class TUIApp:
             async for event in self.loop.run_turn(user_text):
                 self._update_usage(event)
                 self._prepare_stream_event(event)
-                streamed = False
                 stop_after_tool = False
+                render_end = True
                 if self.verbose:
                     self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style=DIM))
                 if event.type is StreamEventType.MESSAGE_UPDATE:
@@ -471,21 +483,32 @@ class TUIApp:
                     self._reset_stream_state()
                     self._loop_state = "tool-running"
                     if event.tool_call is not None:
-                        self._active_tool_updates[event.tool_call.id] = False
+                        self._active_tool_updates[event.tool_call.id] = {}
                     self._present_pending_approvals()
                 elif event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
-                    if event.tool_call is not None:
-                        self._active_tool_updates[event.tool_call.id] = True
+                    if event.tool_call is not None and event.delta is not None:
+                        stream = event.data.get("stream")
+                        if stream in {"stdout", "stderr"}:
+                            output = self._active_tool_updates.setdefault(
+                                event.tool_call.id,
+                                {},
+                            )
+                            output[stream] = output.get(stream, "") + event.delta
                 elif event.type is StreamEventType.TOOL_EXECUTION_END:
                     self._loop_state = "streaming"
-                    streamed = (
-                        self._active_tool_updates.pop(event.tool_call.id, False)
+                    streamed_output = (
+                        self._active_tool_updates.pop(event.tool_call.id, {})
                         if event.tool_call is not None
-                        else False
+                        else {}
+                    )
+                    render_end = not streamed_output or not _tool_output_matches_result(
+                        event,
+                        streamed_output,
                     )
                     if self._abort_requested:
                         self._abort_requested = False
                         stop_after_tool = True
+                        self._loop_state = "idle"
                     else:
                         stop_after_tool = False
                 elif event.type is StreamEventType.TURN_START:
@@ -497,9 +520,7 @@ class TUIApp:
                 elif event.type is StreamEventType.AGENT_END:
                     self._reset_stream_state()
                     self._loop_state = "idle"
-                if not (
-                    event.type is StreamEventType.TOOL_EXECUTION_END and streamed
-                ):
+                if event.type is not StreamEventType.TOOL_EXECUTION_END or render_end:
                     self._print(render_event(event))
                 self._invalidate_prompt()
                 if event.type is StreamEventType.TOOL_EXECUTION_END and stop_after_tool:

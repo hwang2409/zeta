@@ -22,6 +22,7 @@ from rich.table import Table
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
+from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings, parse_input
 from zeta.tui.render import (
@@ -299,6 +300,48 @@ async def test_streamed_tool_output_is_not_repeated_at_end(tmp_path: Path) -> No
     output = app.console.file.getvalue()
     assert output.count("[stdout] chunk") == 1
     assert "[tool result]" not in output
+
+
+@pytest.mark.asyncio
+async def test_tui_overflow_final_render_is_authoritative(tmp_path: Path) -> None:
+    call = ToolCall("burst-1", "stream", {})
+    final_text = "".join(f"chunk-{index}\n" for index in range(200))
+
+    async def stream(
+        arguments: dict[str, object],
+        abort_signal: object,
+        publisher: ToolStreamPublisher,
+    ) -> str:
+        del arguments, abort_signal
+        for index in range(200):
+            publisher.publish(f"chunk-{index}\n", "stdout")
+        return final_text
+
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn(tool_calls=[call])]),
+            ConversationStore(tmp_path),
+            tools={"stream": stream},
+            max_turns=1,
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    rendered: list[object] = []
+    app._print = rendered.append
+
+    await app._consume_turn("prompt")
+
+    expected = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, final_text),
+        )
+    )
+    assert expected is not None
+    assert any(getattr(item, "plain", None) == expected.plain for item in rendered)
 
 
 def test_render_event_preserves_multiline_tool_result_formatting() -> None:
