@@ -14,7 +14,7 @@ import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import Any, cast
 
 from ..core.abort import AbortGenerationRegistry, AbortSignal as ToolAbortSignal
 from ..core.approval import (
@@ -96,8 +96,11 @@ class _BoundedText:
         self.begin_line()
         self.append(value)
 
-    def render(self) -> ToolTextBlock:
-        return text_block("".join(self._parts), full_size=self.full_size)
+    def render(self, *, full_size: int | None = None) -> ToolTextBlock:
+        return text_block(
+            "".join(self._parts),
+            full_size=self.full_size if full_size is None else full_size,
+        )
 
 
 def text_block(
@@ -151,11 +154,16 @@ def _legacy_result(result: ToolResult) -> StructuredToolResult:
         if result.content_blocks is not None
         else [text_block(result.content)]
     )
-    return {
-        "content": blocks,
-        "isError": result.is_error,
-        "structuredContent": None,
-    }
+    try:
+        return validate_tool_result(
+            {
+                "content": blocks,
+                "isError": result.is_error,
+                "structuredContent": None,
+            }
+        )
+    except ValueError as exc:
+        return _error_result(f"invalid tool result: {exc}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,11 +386,10 @@ class ToolRegistry:
                 )
             return _legacy_result(result)
         if isinstance(result, Mapping):
-            if _is_structured_result(result):
-                return result
-            return _error_result(
-                "invalid tool handler result: malformed structured result"
-            )
+            try:
+                return validate_tool_result(result)
+            except ValueError as exc:
+                return _error_result(f"invalid tool handler result: {exc}")
         if isinstance(result, str):
             return _success_result(text_block(result))
         return _error_result(
@@ -505,27 +512,58 @@ async def _invoke_handler(
     return result
 
 
-def _is_structured_result(
-    value: Mapping[str, object],
-) -> TypeGuard[StructuredToolResult]:
-    content = value.get("content")
-    is_error = value.get("isError")
-    structured_content = value.get("structuredContent")
-    if type(content) is not list or type(is_error) is not bool:
-        return False
-    if structured_content is not None and type(structured_content) is not dict:
-        return False
-    for block in content:
+def validate_tool_result(result: object) -> StructuredToolResult:
+    """Validate one complete MCP-compatible structured tool result."""
+
+    if type(result) is not dict:
+        raise ValueError("expected a structured result object")
+    if any(type(key) is not str for key in result):
+        raise ValueError("top-level keys must be strings")
+    expected_keys = {"content", "isError", "structuredContent"}
+    result_keys = set(result)
+    if "content_blocks" in result_keys:
+        raise ValueError("legacy content_blocks is not allowed")
+    missing_keys = expected_keys - result_keys
+    if missing_keys:
+        missing = ", ".join(sorted(missing_keys))
+        raise ValueError(f"missing top-level keys: {missing}")
+    extra_keys = result_keys - expected_keys
+    if extra_keys:
+        extra = ", ".join(sorted(extra_keys))
+        raise ValueError(f"unexpected top-level keys: {extra}")
+
+    content = result["content"]
+    if type(content) is not list:
+        raise ValueError("content must be an array")
+    is_error = result["isError"]
+    if type(is_error) is not bool:
+        raise ValueError("isError must be a boolean")
+    structured_content = result["structuredContent"]
+    if structured_content is not None:
+        if type(structured_content) is not dict:
+            raise ValueError("structuredContent must be an object or null")
+        for key, value in structured_content.items():
+            if type(key) is not str or (
+                value is not None and type(value) not in {str, int, bool}
+            ):
+                raise ValueError("structuredContent must contain scalar JSON values")
+
+    for index, block in enumerate(content):
         if type(block) is not dict:
-            return False
-        if (
-            block.get("type") != "text"
-            or type(block.get("text")) is not str
-            or type(block.get("truncated")) is not bool
-            or type(block.get("full_size")) is not int
-        ):
-            return False
-    return True
+            raise ValueError(f"content[{index}] must be an object")
+        block_keys = set(block)
+        expected_block_keys = {"type", "text", "truncated", "full_size"}
+        if block_keys != expected_block_keys:
+            raise ValueError(f"content[{index}] has an invalid shape")
+        if block["type"] != "text":
+            raise ValueError(f"content[{index}].type must be text")
+        if type(block["text"]) is not str:
+            raise ValueError(f"content[{index}].text must be a string")
+        if type(block["truncated"]) is not bool:
+            raise ValueError(f"content[{index}].truncated must be a boolean")
+        if type(block["full_size"]) is not int or block["full_size"] < 0:
+            raise ValueError(f"content[{index}].full_size must be nonnegative")
+    return cast(StructuredToolResult, result)
 
 
 def _normalize_schema(schema: Mapping[str, Any] | None) -> dict[str, Any]:

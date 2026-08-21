@@ -9,6 +9,7 @@ import pytest
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
+from zeta.loop import _validated_tool_result
 from zeta.tools import ToolRegistry
 from zeta.types import (
     CompletionBackend,
@@ -51,6 +52,52 @@ async def test_empty_system_prompt_is_not_sent_to_backend(tmp_path: Path) -> Non
     assert all(
         message.role is not MessageRole.SYSTEM for message in backend.calls[0][0]
     )
+
+
+def test_validated_tool_result_joins_multiple_text_blocks() -> None:
+    result = _validated_tool_result(
+        {
+            "content": [
+                {"type": "text", "text": "one", "truncated": False, "full_size": 3},
+                {"type": "text", "text": "two", "truncated": False, "full_size": 3},
+            ],
+            "isError": False,
+            "structuredContent": None,
+        },
+        "call-1",
+    )
+
+    assert result.content == "one\ntwo"
+
+
+def test_validated_tool_result_uses_utf8_bytes_in_truncation_marker() -> None:
+    result = _validated_tool_result(
+        {
+            "content": [
+                {"type": "text", "text": "é", "truncated": True, "full_size": 10}
+            ],
+            "isError": False,
+            "structuredContent": None,
+        },
+        "call-1",
+    )
+
+    assert result.content == "é\n[truncated: 2 of 10 bytes]"
+
+
+def test_validated_tool_result_has_no_marker_when_not_truncated() -> None:
+    result = _validated_tool_result(
+        {
+            "content": [
+                {"type": "text", "text": "é", "truncated": False, "full_size": 2}
+            ],
+            "isError": False,
+            "structuredContent": None,
+        },
+        "call-1",
+    )
+
+    assert result.content == "é"
 
 
 @pytest.mark.asyncio

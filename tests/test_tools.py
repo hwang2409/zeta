@@ -198,6 +198,26 @@ async def test_exec_retains_only_bounded_output_from_large_command(
 
 
 @pytest.mark.asyncio
+async def test_exec_full_size_is_stable_for_capped_utf8_output(tmp_path: Path) -> None:
+    command = _python_command("import sys; sys.stdout.write('é')")
+    uncapped = await ToolRegistry(tmp_path).execute(
+        ToolCall("exec-utf8-full", "exec", {"command": command})
+    )
+    capped = await ToolRegistry(tmp_path).execute(
+        ToolCall(
+            "exec-utf8-capped",
+            "exec",
+            {"command": command, "max_output": 1},
+        )
+    )
+
+    uncapped_block = uncapped["content"][0]
+    capped_block = capped["content"][0]
+    assert uncapped_block["full_size"] == capped_block["full_size"]
+    assert uncapped_block["full_size"] == len(uncapped_block["text"].encode("utf-8"))
+
+
+@pytest.mark.asyncio
 async def test_read_retains_only_bounded_output_from_large_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -212,6 +232,20 @@ async def test_read_retains_only_bounded_output_from_large_file(
 
     monkeypatch.setattr(read_module, "_BoundedText", TrackingCapture)
     (tmp_path / "large.txt").write_text("x\n" * 1_000_000, encoding="utf-8")
+    real_open = Path.open
+    open_count = 0
+
+    def tracking_open(
+        file_path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal open_count
+        if file_path == tmp_path / "large.txt":
+            open_count += 1
+        return real_open(file_path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "open", tracking_open)
     registry = ToolRegistry(tmp_path, max_output_chars=64)
 
     result = await registry.execute(
@@ -223,6 +257,7 @@ async def test_read_retains_only_bounded_output_from_large_file(
     assert result["content"][0]["truncated"] is True
     assert len(captures) == 1
     assert captures[0].retained_chars <= 64
+    assert open_count == 1
 
 
 @pytest.mark.asyncio
@@ -255,9 +290,23 @@ async def test_list_retains_only_bounded_output_from_large_directory(
 @pytest.mark.asyncio
 async def test_list_bounds_directory_working_set(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for index in range(5_000):
         (tmp_path / f"file-{index:04d}.txt").write_text("x", encoding="utf-8")
+    calls: list[int] = []
+    real_nsmallest = list_module.heapq.nsmallest
+
+    def tracking_nsmallest(
+        count: int,
+        iterable: object,
+        *,
+        key: object,
+    ) -> list[Path]:
+        calls.append(count)
+        return real_nsmallest(count, iterable, key=key)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(list_module.heapq, "nsmallest", tracking_nsmallest)
     registry = ToolRegistry(tmp_path, max_output_chars=32)
 
     result = await registry.execute(ToolCall("list-wide", "list", {"path": "."}))
@@ -268,7 +317,12 @@ async def test_list_bounds_directory_working_set(
     assert result["structuredContent"] == {
         "root": str(tmp_path),
         "entry_count": 5_000,
+        "full_size": 5_000,
+        "truncated": True,
     }
+    assert calls == [32]
+    full_listing = "\n".join(f"file-{index:04d}.txt" for index in range(5_000))
+    assert result["content"][0]["full_size"] == len(full_listing.encode("utf-8"))
 
 
 @pytest.mark.asyncio

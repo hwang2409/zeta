@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from zeta.tools import ToolRegistry
+from zeta.tools.registry import validate_tool_result
 from zeta.types import StructuredToolResult, ToolCall, ToolTextBlock
 
 
@@ -13,6 +14,52 @@ def _text_block(result: StructuredToolResult) -> ToolTextBlock:
     block = content[0]
     assert type(block) is dict
     return block
+
+
+@pytest.mark.parametrize(
+    ("result", "message"),
+    [
+        (
+            {
+                "content": [],
+                "isError": False,
+            },
+            "missing top-level keys",
+        ),
+        (
+            {
+                "content": [],
+                "isError": False,
+                "structuredContent": None,
+                "extra": True,
+            },
+            "unexpected top-level keys",
+        ),
+        (
+            {
+                "content": [{"type": "image"}],
+                "isError": False,
+                "structuredContent": None,
+            },
+            "invalid shape",
+        ),
+        (
+            {
+                "content": [],
+                "isError": False,
+                "structuredContent": None,
+                "content_blocks": [],
+            },
+            "legacy content_blocks",
+        ),
+    ],
+)
+def test_validate_tool_result_rejects_malformed_shapes(
+    result: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        validate_tool_result(result)
 
 
 @pytest.mark.asyncio
@@ -89,6 +136,8 @@ async def test_builtin_tools_populate_structured_content(tmp_path: Path) -> None
     assert list_result["structuredContent"] == {
         "root": str(tmp_path),
         "entry_count": 1,
+        "full_size": 1,
+        "truncated": False,
     }
     assert exec_result["structuredContent"] == {
         "exit_code": 0,

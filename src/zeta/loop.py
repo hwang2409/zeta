@@ -10,6 +10,7 @@ from .core.approval import ApprovalPolicy
 from .core.context import ContextAssembler
 from .core.store import ConversationStore
 from .tools import ToolHandler, ToolRegistry
+from .tools.registry import validate_tool_result
 from .types import (
     CompletionBackend,
     ContentBlock,
@@ -24,7 +25,6 @@ from .types import (
     ToolCall,
     ToolResult,
     ToolSchema,
-    ToolTextBlock,
     ToolUseContent,
 )
 
@@ -70,31 +70,20 @@ def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
             "invalid tool result: expected structured result",
             True,
         )
-    content = result.get("content")
-    is_error = result.get("isError")
-    if type(content) is not list:
-        return ToolResult(expected_id, "invalid tool result: content", True)
-    if type(is_error) is not bool:
-        return ToolResult(expected_id, "invalid tool result: isError", True)
-    blocks: list[ToolTextBlock] = []
-    for block in content:
-        if type(block) is not dict:
-            return ToolResult(expected_id, "invalid tool result: content block", True)
-        if (
-            block.get("type") != "text"
-            or type(block.get("text")) is not str
-            or type(block.get("truncated")) is not bool
-            or type(block.get("full_size")) is not int
-        ):
-            return ToolResult(expected_id, "invalid tool result: text block", True)
-        blocks.append(block)
+    try:
+        structured_result = validate_tool_result(result)
+    except ValueError as exc:
+        return ToolResult(expected_id, f"invalid tool result: {exc}", True)
+    blocks = structured_result["content"]
+    is_error = structured_result["isError"]
     text_values = []
     for block in blocks:
         text = block["text"]
         if block["truncated"]:
+            shown_bytes = len(text.encode("utf-8"))
             text = (
-                f"{text}\n[truncated: {len(text)} of "
-                f"{block['full_size']} chars shown]"
+                f"{text}\n[truncated: {shown_bytes} of "
+                f"{block['full_size']} bytes]"
             )
         text_values.append(text)
     return ToolResult(

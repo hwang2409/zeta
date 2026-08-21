@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import os
 import signal
 from collections.abc import Sequence
@@ -23,6 +24,7 @@ class _BoundedOutput:
         self.limit = limit
         self._data = bytearray()
         self._full_size = 0
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     @property
     def data(self) -> bytes:
@@ -38,9 +40,17 @@ class _BoundedOutput:
 
     def append(self, chunk: bytes) -> None:
         self._full_size += len(chunk)
-        remaining = self.limit - len(self._data)
-        if remaining > 0:
-            self._data.extend(chunk[:remaining])
+        self._append_text(self._decoder.decode(chunk, final=False))
+
+    def finish(self) -> None:
+        self._append_text(self._decoder.decode(b"", final=True))
+
+    def _append_text(self, text: str) -> None:
+        for character in text:
+            encoded = character.encode("utf-8")
+            remaining = self.limit - len(self._data)
+            if remaining >= len(encoded):
+                self._data.extend(encoded)
 
 
 async def _drain_stream(stream: object, capture: _BoundedOutput) -> None:
@@ -50,6 +60,7 @@ async def _drain_stream(stream: object, capture: _BoundedOutput) -> None:
     while True:
         chunk = await read(65_536)
         if not chunk:
+            capture.finish()
             return
         capture.append(chunk)
 
