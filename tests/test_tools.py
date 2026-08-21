@@ -185,6 +185,144 @@ async def test_bash_persists_cwd_across_calls(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_bash_persistent_cwd_isolated_between_sessions(tmp_path: Path) -> None:
+    first_store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    first = ToolRegistry(tmp_path, session_store=first_store)
+    await first.execute(ToolCall("first-cd", "bash", {"cmd": "cd /tmp"}))
+
+    second_store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    second = ToolRegistry(tmp_path, session_store=second_store)
+    result = await second.execute(ToolCall("second-pwd", "bash", {"cmd": "pwd"}))
+
+    assert result["structuredContent"]["stdout"].strip() == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_bash_stdout_marker_text_is_not_cwd_state(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "bash-marker-text",
+            "bash",
+            {"cmd": "printf '__ZETA_BASH_CWD_fake__'"},
+        )
+    )
+
+    assert result["structuredContent"]["stdout"] == "__ZETA_BASH_CWD_fake__"
+    assert result["structuredContent"]["cwd_after"] == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_bash_rejects_per_call_cwd_outside_sandbox(tmp_path: Path) -> None:
+    marker = tmp_path / "should-not-run"
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "bash-outside-cwd",
+            "bash",
+            {"cmd": f"touch {shlex.quote(str(marker))}", "cwd": str(tmp_path.parent)},
+        )
+    )
+
+    assert result["isError"] is True
+    assert result["structuredContent"] is None
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_bash_persists_cwd_after_failed_command(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    failed = await registry.execute(
+        ToolCall("bash-failed-cd", "bash", {"cmd": "cd /tmp; exit 3"})
+    )
+    current = await registry.execute(ToolCall("bash-failed-pwd", "bash", {"cmd": "pwd"}))
+
+    assert failed["isError"] is True
+    assert failed["structuredContent"] == {
+        "stdout": "",
+        "stderr": "",
+        "exit_code": 3,
+        "cwd_after": "/tmp",
+    }
+    assert current["structuredContent"]["stdout"].strip() == "/tmp"
+
+
+@pytest.mark.asyncio
+async def test_bash_persists_explicit_cd_from_override(tmp_path: Path) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("bash-explicit-cd", "bash", {"cmd": "cd /tmp", "cwd": str(nested)})
+    )
+    current = await registry.execute(ToolCall("bash-explicit-pwd", "bash", {"cmd": "pwd"}))
+
+    assert result["structuredContent"]["cwd_after"] == "/tmp"
+    assert current["structuredContent"]["stdout"].strip() == "/tmp"
+
+
+@pytest.mark.asyncio
+async def test_bash_abort_kills_process_group_and_reaps_descendants(tmp_path: Path) -> None:
+    marker = tmp_path / "child-alive"
+    abort_signal = ToolAbortSignal()
+    registry = ToolRegistry(tmp_path, abort_signal=abort_signal)
+    task = asyncio.create_task(
+        registry.execute(
+            ToolCall("bash-abort", "bash", {"cmd": _descendant_command(marker)})
+        )
+    )
+
+    await asyncio.sleep(0.05)
+    abort_signal.abort()
+    result = await task
+    await asyncio.sleep(0.5)
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "tool execution canceled"
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_bash_task_cancellation_kills_process_group(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "child-canceled"
+    registry = ToolRegistry(tmp_path)
+    task = asyncio.create_task(
+        registry.execute(
+            ToolCall("bash-cancel", "bash", {"cmd": _descendant_command(marker)})
+        )
+    )
+
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.5)
+
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_bash_invalid_start_cwd_falls_back_without_persisting(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing"
+    registry = ToolRegistry(tmp_path)
+    registry.bash_cwd = str(missing)
+
+    result = await registry.execute(ToolCall("bash-missing-cwd", "bash", {"cmd": "pwd"}))
+
+    assert result["isError"] is True
+    assert result["structuredContent"]["cwd_after"] == str(missing)
+    assert registry.bash_cwd == str(missing)
+
+
+@pytest.mark.asyncio
 async def test_bash_cwd_override_does_not_persist_without_cd(tmp_path: Path) -> None:
     nested = tmp_path / "nested"
     nested.mkdir()

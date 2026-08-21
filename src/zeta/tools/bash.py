@@ -11,12 +11,13 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
-import uuid
+import tempfile
 from pathlib import Path
 from typing import TypedDict
 
 from ..core.abort import AbortSignal
 from ..types import StructuredToolResult
+from ._process import _kill_and_reap
 from .registry import ToolRegistry, _error_result, text_block
 
 
@@ -57,20 +58,41 @@ async def _bash(
     abort_signal: AbortSignal,
 ) -> StructuredToolResult:
     start_cwd = _start_cwd(registry, arguments)
-    marker = f"__ZETA_BASH_CWD_{uuid.uuid4().hex}__"
+    cwd_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="zeta-bash-cwd-",
+        suffix=".txt",
+        delete=False,
+    )
+    cwd_path = Path(cwd_file.name)
+    cwd_file.close()
     script = (
         'cd -- "$1" || exit $?; '
+        'trap \'pwd > "$3"\' EXIT; '
         'eval "$2"; status=$?; '
-        'printf "\\n%s%s\\n" "$3" "$PWD"; '
+        'pwd > "$3"; '
         'exit "$status"'
     )
     command = shlex.join(
-        ["bash", "-c", script, "zeta-bash", start_cwd, arguments["cmd"], marker]
+        [
+            "bash",
+            "-c",
+            script,
+            "zeta-bash",
+            start_cwd,
+            arguments["cmd"],
+            str(cwd_path),
+        ]
     )
+    process: asyncio.subprocess.Process | None = None
+    communicate: asyncio.Task[tuple[bytes, bytes]] | None = None
     abort_wait: asyncio.Task[None] | None = None
+    reported_cwd = ""
     try:
         process = await asyncio.create_subprocess_shell(
             command,
+            cwd=registry.cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -82,27 +104,32 @@ async def _bash(
             return_when=asyncio.FIRST_COMPLETED,
         )
         if abort_wait in done and communicate not in done:
-            process.kill()
-            await communicate
+            await _kill_and_reap(process, (communicate,))
             return _error_result("tool execution canceled")
         stdout_bytes, stderr_bytes = await communicate
+        try:
+            reported_cwd = cwd_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    except asyncio.CancelledError:
+        if process is not None and communicate is not None:
+            await _kill_and_reap(process, (communicate,))
+        raise
     except OSError as exc:
         raise ValueError(f"could not execute command: {exc}") from exc
     finally:
         if abort_wait is not None and not abort_wait.done():
             abort_wait.cancel()
             await asyncio.gather(abort_wait, return_exceptions=True)
+        cwd_path.unlink(missing_ok=True)
 
     stdout = stdout_bytes.decode(errors="replace")
-    marker_position = stdout.rfind(f"\n{marker}")
-    if marker_position < 0:
-        cwd_after = start_cwd
-    else:
-        cwd_after = stdout[marker_position + len(marker) + 1 :].rstrip("\n")
-        stdout = stdout[:marker_position]
+    cwd_after = start_cwd
+    if reported_cwd and Path(reported_cwd).is_absolute():
+        cwd_after = reported_cwd
     stderr = stderr_bytes.decode(errors="replace")
     exit_code = process.returncode if process.returncode is not None else 1
-    if exit_code == 0 and cwd_after != start_cwd:
+    if cwd_after != start_cwd:
         registry.update_bash_cwd(cwd_after)
     combined = "stdout:\n" + stdout + "\nstderr:\n" + stderr
     structured_content: BashStructuredContent = {
@@ -123,7 +150,7 @@ def register(registry: ToolRegistry) -> None:
         "bash",
         lambda arguments, abort_signal: _bash(registry, arguments, abort_signal),
         description=(
-            "Run a shell command. Session cwd persists after successful cd. "
+            "Run a shell command. Session cwd persists after cd. "
             "Sandboxing is truly best-effort."
         ),
         parameters={

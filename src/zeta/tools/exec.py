@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import codecs
-import os
-import signal
-from collections.abc import Sequence
 from typing import Any
 
 from ..core.abort import AbortSignal
@@ -17,6 +14,7 @@ from .registry import (
     _success_result,
     _ToolCanceled,
 )
+from ._process import _kill_and_reap
 
 
 class _BoundedOutput:
@@ -63,28 +61,6 @@ async def _drain_stream(stream: object, capture: _BoundedOutput) -> None:
             capture.finish()
             return
         capture.append(chunk)
-
-
-async def _kill_and_reap(
-    process: asyncio.subprocess.Process,
-    process_tasks: Sequence[asyncio.Task[Any]],
-) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        process.kill()
-    for task in process_tasks:
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                current = asyncio.current_task()
-                if current is not None:
-                    current.uncancel()
-        if not task.cancelled():
-            task.exception()
 
 
 def _format_exec_result(

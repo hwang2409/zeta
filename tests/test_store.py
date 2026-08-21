@@ -30,15 +30,30 @@ def test_append_replay_round_trip_and_parent_links(tmp_path: Path) -> None:
     assert reopened.cwd == "/work"
 
 
-def test_bash_cwd_serializes_in_store_header(tmp_path: Path) -> None:
+def test_bash_cwd_serializes_in_separate_state_file(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, cwd=tmp_path, bash_cwd="/tmp")
 
     store.set_bash_cwd("/var/tmp")
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
     assert reopened.bash_cwd == "/var/tmp"
-    header = json.loads(reopened.path.read_text().splitlines()[0])
-    assert header["data"]["bash_cwd"] == "/var/tmp"
+    state = json.loads(reopened.state_path.read_text(encoding="utf-8"))
+    assert state == {"bash_cwd": "/var/tmp"}
+
+
+def test_bash_cwd_state_write_failure_preserves_conversation(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(message(MessageRole.USER, "kept"))
+    before = store.path.read_bytes()
+
+    with patch("zeta.core.store.os.replace", side_effect=OSError("injected replace failure")):
+        with pytest.raises(OSError, match="injected replace failure"):
+            store.set_bash_cwd("/tmp")
+
+    assert store.path.read_bytes() == before
+    assert store.bash_cwd == str(Path.cwd())
 
 
 def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
