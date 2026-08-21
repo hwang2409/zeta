@@ -12,10 +12,18 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 
 from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
+from .codex_errors import (
+    CodexAuthError,
+    CodexBackendError,
+    CodexHTTPError,
+    CodexStreamError,
+)
+from .codex_payload import build_responses_payload
 from .transport import (
     cleanup_transport,
     is_control_exception,
@@ -38,38 +46,83 @@ from ..types import (
 )
 
 CODEX_API_URL = "https://chatgpt.com/backend-api/codex/responses"
+CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_OAUTH_SCOPES = "openid profile email offline_access"
+DEFAULT_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback"
 DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
 JWT_AUTH_CLAIM = "https://api.openai.com/auth"
 
 
-class CodexBackendError(RuntimeError):
-    """Base class for errors that the agent loop can report."""
+def build_authorization_url(
+    state: str,
+    code_challenge: str,
+    redirect_uri: str = DEFAULT_CODEX_REDIRECT_URI,
+) -> str:
+    """Build the ChatGPT plan OAuth PKCE authorization URL."""
 
-    code = "backend_error"
+    if not state or not code_challenge or not redirect_uri:
+        raise CodexAuthError("Codex OAuth PKCE parameters are incomplete")
+    params = {
+        "client_id": CODEX_CLIENT_ID,
+        "response_type": "code",
+        "scope": CODEX_OAUTH_SCOPES,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "id_token_add_organizations": "true",
+        "codex_cli_simplified_flow": "true",
+        "state": state,
+        "originator": "codex_cli_rs",
+        "redirect_uri": redirect_uri,
+    }
+    return f"{CODEX_AUTHORIZE_URL}?{urlencode(params)}"
 
 
-class CodexAuthError(CodexBackendError):
-    """Raised when ChatGPT subscription credentials are missing or invalid."""
+async def exchange_authorization_code(
+    client: httpx.AsyncClient,
+    code: str,
+    state: str,
+    code_verifier: str,
+    redirect_uri: str,
+    *,
+    token_url: str = CODEX_TOKEN_URL,
+) -> OAuthTokens:
+    """Exchange a ChatGPT plan authorization code for OAuth tokens."""
 
-    code = "auth_error"
-
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-
-
-class CodexHTTPError(CodexBackendError):
-    """Raised when the ChatGPT backend returns an unsuccessful response."""
-
-    code = "http_error"
-
-
-class CodexStreamError(CodexBackendError):
-    """Raised when a Responses SSE stream violates its lifecycle contract."""
-
-    code = "stream_error"
+    if not code or not state or not code_verifier or not redirect_uri:
+        raise CodexAuthError("Codex OAuth code exchange parameters are incomplete")
+    try:
+        response = await client.post(
+            token_url,
+            data={
+                "grant_type": "authorization_code",
+                "client_id": CODEX_CLIENT_ID,
+                "code": code,
+                "state": state,
+                "redirect_uri": redirect_uri,
+                "code_verifier": code_verifier,
+            },
+            headers={"accept": "application/json"},
+        )
+    except httpx.HTTPError as exc:
+        raise CodexAuthError("Codex OAuth code exchange failed") from exc
+    if response.status_code >= 400:
+        raise CodexHTTPError(
+            f"Codex OAuth code exchange failed with HTTP {response.status_code}"
+        )
+    try:
+        value = response.json()
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise CodexAuthError("Codex OAuth code response is invalid") from exc
+    if not isinstance(value, Mapping):
+        raise CodexAuthError("Codex OAuth code response is invalid")
+    access = _first_string(value, "access_token", "accessToken", "access")
+    refresh = _first_string(value, "refresh_token", "refreshToken", "refresh")
+    expires_in = value.get("expires_in", value.get("expiresIn"))
+    if not access or not refresh or type(expires_in) not in {int, float}:
+        raise CodexAuthError("Codex OAuth code response is invalid")
+    return OAuthTokens(access, refresh, time.time() + float(expires_in) - 300)
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
@@ -193,128 +246,6 @@ def _jwt_payload(access_token: str) -> Mapping[str, Any]:
     payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
     if not isinstance(payload, Mapping):
         raise TypeError
-    return payload
-
-
-def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for block in blocks:
-        if isinstance(block, TextContent):
-            result.append({"type": "output_text" if output else "input_text", "text": block.text})
-        elif isinstance(block, ThinkingContent):
-            if output:
-                reasoning: dict[str, Any] = {
-                    "type": "reasoning",
-                    "summary": [{"type": "summary_text", "text": block.text}],
-                }
-                if block.signature:
-                    reasoning["encrypted_content"] = block.signature
-                result.append(reasoning)
-        elif isinstance(block, ToolUseContent):
-            if output:
-                result.append(
-                    {
-                        "type": "function_call",
-                        "call_id": block.tool_call.id,
-                        "name": block.tool_call.name,
-                        "arguments": json.dumps(
-                            block.tool_call.arguments, separators=(",", ":")
-                        ),
-                    }
-                )
-            else:
-                raise CodexHTTPError("tool calls are not valid user content")
-        else:
-            raise CodexHTTPError("unsupported zeta content block")
-    return result
-
-
-def build_responses_payload(
-    messages: Sequence[Message],
-    tool_schemas: Sequence[ToolSchema],
-    *,
-    model: str,
-) -> dict[str, Any]:
-    instructions: list[str] = []
-    input_items: list[dict[str, Any]] = []
-    for message in messages:
-        if message.role is MessageRole.SYSTEM:
-            instructions.extend(
-                block.text for block in message.content if isinstance(block, TextContent)
-            )
-        elif message.role is MessageRole.TOOL_RESULT:
-            if message.tool_result is None:
-                raise CodexHTTPError("tool result message is missing its result")
-            input_items.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": message.tool_result.tool_call_id,
-                    "output": message.tool_result.content,
-                }
-            )
-        else:
-            output = message.role is MessageRole.ASSISTANT
-            if output and "codex_output_items" in message.metadata:
-                replayed = message.metadata["codex_output_items"]
-                if type(replayed) is not list or any(
-                    not isinstance(item, Mapping) for item in replayed
-                ):
-                    raise CodexHTTPError("Codex replay output items are invalid")
-                input_items.extend(dict(item) for item in replayed)
-                continue
-            wire_blocks = _wire_text(message.content, output=output)
-            if not output:
-                input_items.append({"role": "user", "content": wire_blocks})
-                continue
-            text_blocks: list[dict[str, Any]] = []
-            for block in wire_blocks:
-                if block.get("type") == "output_text":
-                    text_blocks.append({"type": "input_text", "text": block["text"]})
-                    continue
-                if text_blocks:
-                    input_items.append({"role": "assistant", "content": text_blocks})
-                    text_blocks = []
-                input_items.append(block)
-            if text_blocks:
-                input_items.append({"role": "assistant", "content": text_blocks})
-
-    tools = []
-    for schema in tool_schemas:
-        name = schema.get("name")
-        if type(name) is not str or not name:
-            raise CodexHTTPError("tool schema name must be a nonempty string")
-        if "parameters" in schema:
-            parameters = schema["parameters"]
-        elif "input_schema" in schema:
-            parameters = schema["input_schema"]
-        else:
-            parameters = {"type": "object", "properties": {}}
-        if not isinstance(parameters, Mapping):
-            raise CodexHTTPError("tool schema parameters must be an object")
-        tool: dict[str, Any] = {
-            "type": "function",
-            "name": name,
-            "parameters": dict(parameters),
-            "strict": False,
-        }
-        description = schema.get("description")
-        if type(description) is str:
-            tool["description"] = description
-        tools.append(tool)
-
-    payload: dict[str, Any] = {
-        "model": model,
-        "store": False,
-        "stream": True,
-        "instructions": "\n\n".join(instructions) or "You are a helpful assistant.",
-        "input": input_items,
-        "tool_choice": "auto",
-        "parallel_tool_calls": True,
-        "reasoning": {"summary": "auto"},
-        "include": ["reasoning.encrypted_content"],
-    }
-    if tools:
-        payload["tools"] = tools
     return payload
 
 

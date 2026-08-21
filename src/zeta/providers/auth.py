@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -447,6 +449,27 @@ class OAuthTokens:
 
     def is_valid(self, *, skew: float = 60) -> bool:
         return self.expires_at > time.time() + skew
+
+
+@dataclass(frozen=True, slots=True)
+class PKCEParameters:
+    """The verifier, challenge, and state for one OAuth authorization."""
+
+    verifier: str
+    challenge: str
+    state: str
+
+
+def build_pkce_parameters() -> PKCEParameters:
+    """Create the PKCE values required by an OAuth authorization request."""
+
+    verifier = secrets.token_urlsafe(32)
+    challenge = hashlib.sha256(verifier.encode("ascii")).digest()
+    return PKCEParameters(
+        verifier=verifier,
+        challenge=base64.urlsafe_b64encode(challenge).decode("ascii").rstrip("="),
+        state=secrets.token_urlsafe(32),
+    )
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
