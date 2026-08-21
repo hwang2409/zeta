@@ -18,6 +18,7 @@ from rich.console import Console, RenderableType
 from rich.text import Text
 
 from ..core.approval import ApprovalPolicy, ApprovalRequest
+from ..core.slash import SlashStatus, create_slash_registry
 from ..loop import AgentLoop
 from ..core.session import SessionError, SessionManager, env_home
 from ..providers.anthropic import AnthropicBackend
@@ -169,6 +170,7 @@ class TUIApp:
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
         self._approval_policy = approval_policy
+        self._slash_commands = create_slash_registry()
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
@@ -183,6 +185,24 @@ class TUIApp:
         if self._approval_policy is None:
             return ()
         return tuple(self._approval_policy.pending_requests())
+
+    def slash_status(self) -> SlashStatus:
+        pending = tuple(
+            f"{request.request_id} ({request.tool_call.name})"
+            for request in self.pending_approvals
+        )
+        return SlashStatus(
+            session_id=self.loop.store.session_id,
+            provider=self.provider,
+            model=self.model,
+            retained_tail=self.loop.context_assembler.retained_tail,
+            tokens_used_this_session=(
+                self.loop.context_assembler.tokens_used_this_session
+            ),
+            tokens_in_current_context=self.loop.context_assembler.token_count,
+            compaction_marker_count=self.loop.store.compaction_marker_count(),
+            pending_approvals=pending,
+        )
 
     def _present_pending_approvals(self) -> None:
         for request in self.pending_approvals:
@@ -386,6 +406,9 @@ class TUIApp:
             Text.assemble(("[user] ", USER_PREFIX), (user_text, BODY))
         )
 
+    def _print_system(self, output: str) -> None:
+        self._print(Text(f"[system]\n{output}", style=CHROME))
+
     def _start_queued_turn(self) -> None:
         if self._queued:
             user_text = self._queued.popleft()
@@ -510,13 +533,21 @@ class TUIApp:
                     if parsed is not None and not self._exit_requested:
                         if await self._handle_approval_input(parsed):
                             pass
-                        elif self.pending_approvals:
-                            self._present_pending_approvals()
-                        elif self.active:
-                            self._queued.append(parsed)
                         else:
-                            self._print_user(parsed)
-                            self._start_turn(parsed)
+                            slash_output = self._slash_commands.dispatch(self, parsed)
+                            if slash_output is not None:
+                                self._print_system(slash_output)
+                            else:
+                                model_input = self._slash_commands.input_for_model(
+                                    parsed
+                                )
+                                if self.pending_approvals:
+                                    self._present_pending_approvals()
+                                elif self.active:
+                                    self._queued.append(model_input)
+                                else:
+                                    self._print_user(model_input)
+                                    self._start_turn(model_input)
                     if self._exit_requested:
                         break
                     prompt_task = asyncio.create_task(self._read_prompt(session))

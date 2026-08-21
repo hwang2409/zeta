@@ -103,6 +103,7 @@ class CompactionPolicy:
         system_prompt: Message | None = None,
         max_source_tokens: int | None = None,
         on_success: Callable[[], None] | None = None,
+        on_usage: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> str:
         completion_backend = backend or self.backend
         if completion_backend is None:
@@ -129,9 +130,13 @@ class CompactionPolicy:
 
         partial: list[ContentBlock] = []
         completed: Message | None = None
+        summary_usage: dict[str, Any] = {}
         try:
             completion = completion_backend.complete(summary_messages, [])
             async for event in completion:
+                usage = event.data.get("usage")
+                if isinstance(usage, Mapping):
+                    summary_usage.update(usage)
                 if event.type is StreamEventType.MESSAGE_UPDATE:
                     if event.content is not None:
                         partial.append(event.content)
@@ -142,6 +147,8 @@ class CompactionPolicy:
         except Exception as exc:
             raise SummaryCompletionError("summary completion failed") from exc
 
+        if on_usage is not None and summary_usage:
+            on_usage(summary_usage)
         result = completed or Message(MessageRole.ASSISTANT, partial)
         if _has_tool_call(result):
             raise SummaryCompletionError("summary completion returned a tool call")
@@ -191,6 +198,7 @@ class ContextAssembler:
         self.last_context: AssembledContext | None = None
         self.last_usage: dict[str, Any] = {}
         self._provider_token_total: int | None = None
+        self._tokens_used_this_session = 0
 
     @property
     def digest(self) -> str | None:
@@ -199,6 +207,10 @@ class ContextAssembler:
     @property
     def token_count(self) -> int | None:
         return self.last_context.token_count if self.last_context is not None else None
+
+    @property
+    def tokens_used_this_session(self) -> int:
+        return self._tokens_used_this_session
 
     def record_usage(self, usage: Mapping[str, Any]) -> None:
         self.last_usage = dict(usage)
@@ -210,6 +222,7 @@ class ContextAssembler:
                 total = input_tokens + output_tokens
         if type(total) is int and total >= 0:
             self._provider_token_total = total
+            self._tokens_used_this_session += total
 
     def observe_event(self, event: StreamEvent) -> None:
         usage = event.data.get("usage")
@@ -283,6 +296,7 @@ class ContextAssembler:
             system_prompt=system_prompt,
             max_source_tokens=max(1, self.token_budget // 2),
             on_success=self.on_completion_success,
+            on_usage=self.record_usage,
         )
         if self._branch_id(self.store.replay()) != branch_id:
             raise StaleBranchError("active branch changed during compaction")

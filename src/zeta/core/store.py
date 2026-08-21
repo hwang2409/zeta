@@ -713,6 +713,9 @@ class ConversationStore:
             if decision is None
         ]
 
+    def compaction_marker_count(self) -> int:
+        return sum(entry.type == "compaction" for entry in self.replay())
+
     def replay(self) -> list[ConversationEntry]:
         if not self._entries:
             return []

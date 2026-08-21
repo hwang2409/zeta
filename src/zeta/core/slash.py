@@ -1,0 +1,107 @@
+"""Small input-time slash-command dispatcher."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Protocol
+
+
+@dataclass(frozen=True, slots=True)
+class SlashStatus:
+    """Read-only session values rendered by ``/status``."""
+
+    session_id: str
+    provider: str
+    model: str
+    retained_tail: int
+    tokens_used_this_session: int
+    tokens_in_current_context: int | None
+    compaction_marker_count: int
+    pending_approvals: tuple[str, ...]
+
+
+class SlashSession(Protocol):
+    def slash_status(self) -> SlashStatus: ...
+
+
+SlashHandler = Callable[[SlashSession, str], str]
+
+
+@dataclass(frozen=True, slots=True)
+class SlashCommand:
+    """One named command in the input-time registry."""
+
+    name: str
+    handler: SlashHandler
+
+    def run(self, session: SlashSession, args: str) -> str:
+        return self.handler(session, args)
+
+
+class SlashCommandRegistry:
+    """Map registered command names to their handlers."""
+
+    def __init__(self) -> None:
+        self._commands: dict[str, SlashCommand] = {}
+
+    def register(self, command: SlashCommand) -> None:
+        if not command.name or any(character.isspace() for character in command.name):
+            raise ValueError("slash command name must be one nonempty word")
+        if command.name in self._commands:
+            raise ValueError(f"slash command already registered: {command.name}")
+        self._commands[command.name] = command
+
+    def dispatch(self, session: SlashSession, value: str) -> str | None:
+        """Run a known command from the first line, or pass the input through."""
+
+        first_line = value.split("\n", 1)[0]
+        if not first_line.startswith("/") or first_line.startswith("//"):
+            return None
+        parts = first_line[1:].split(maxsplit=1)
+        if not parts:
+            return None
+        command = self._commands.get(parts[0])
+        if command is None:
+            return None
+        return command.run(session, parts[1] if len(parts) == 2 else "")
+
+    @staticmethod
+    def input_for_model(value: str) -> str:
+        """Turn the double-slash escape into one literal leading slash."""
+
+        return value[1:] if value.startswith("//") else value
+
+
+def _format_status(status: SlashStatus) -> str:
+    context_tokens = (
+        str(status.tokens_in_current_context)
+        if status.tokens_in_current_context is not None
+        else "unknown"
+    )
+    pending = ", ".join(status.pending_approvals) or "none"
+    return "\n".join(
+        (
+            f"session_id: {status.session_id}",
+            f"provider: {status.provider}",
+            f"model: {status.model}",
+            f"retained_tail: {status.retained_tail}",
+            f"tokens_used_this_session: {status.tokens_used_this_session}",
+            f"tokens_in_current_context: {context_tokens}",
+            f"compaction_marker_count: {status.compaction_marker_count}",
+            f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",
+        )
+    )
+
+
+def _run_status(session: SlashSession, args: str) -> str:
+    del args
+    return _format_status(session.slash_status())
+
+
+def create_slash_registry() -> SlashCommandRegistry:
+    """Create the built-in registry."""
+
+    registry = SlashCommandRegistry()
+    registry.register(SlashCommand("status", _run_status))
+    return registry
