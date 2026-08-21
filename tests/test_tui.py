@@ -700,9 +700,11 @@ async def test_spinner_pulses_on_timer(tmp_path: Path) -> None:
         model="offline",
     )
     app._streaming = True
+    app._spinner_active = True
     task = asyncio.create_task(app._pulse_spinner())
     await asyncio.sleep(0.45)
     app._streaming = False
+    app._spinner_active = False
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
@@ -733,19 +735,27 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
 
     turn = asyncio.create_task(app._consume_turn("prompt"))
     await tool_started.wait()
-    await asyncio.sleep(0.45)
+    while app._spinner_frame < 1:
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.14)
     during_tool_frame = app._spinner_frame
+    during_tool_toolbar = "".join(value for _, value in app._status_toolbar())
     release_tool.set()
     await backend.second_started.wait()
     starting_frame = app._spinner_frame
-    await asyncio.sleep(0.45)
+    await asyncio.sleep(0.06)
+    first_provider_frame = app._spinner_frame
+    await asyncio.sleep(0.39)
     ending_frame = app._spinner_frame
     backend.release_second.set()
     await turn
 
     assert app._streaming is False
-    assert during_tool_frame == 0
+    assert during_tool_frame >= 1
+    assert any(marker in during_tool_toolbar for marker in ("·", "•", "●"))
     assert starting_frame == 0
+    assert first_provider_frame == 0
+    assert app._spinner_frame >= 1
     assert ending_frame - starting_frame >= 2
 
 

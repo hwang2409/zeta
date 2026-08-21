@@ -248,9 +248,11 @@ def format_status(
     streaming: bool = False,
     width: int | None = None,
     spinner_frame: int = 0,
+    spinner_active: bool | None = None,
 ) -> Text:
     """Format the persistent status line shown beneath the composer."""
 
+    show_spinner = streaming if spinner_active is None else spinner_active
     usage = usage or {}
     input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
     output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
@@ -268,7 +270,7 @@ def format_status(
         and retained_tail is None
         and token_count is None
         and width is None
-        and not streaming
+        and not show_spinner
     ):
         line = f" {provider}/{model}  {loop_state}"
         if input_tokens is not None or output_tokens is not None:
@@ -280,7 +282,7 @@ def format_status(
     session_text = f"s:{(session_id or '')[:5]}" if session_id else "s:?"
     tail_text = f"tail {retained_tail}" if retained_tail is not None else "tail ?"
     segments = [f"mode {loop_state}", token_text]
-    if streaming:
+    if show_spinner:
         segments.append(SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)])
     optional = [f"{provider}/{model}", session_text, tail_text]
     separator = "  |  " if (width or 0) >= 160 else " | "

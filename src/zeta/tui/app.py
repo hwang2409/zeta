@@ -39,6 +39,7 @@ from .theme import BODY, CHROME, DIM, ERROR, RICH_THEME, USER_PREFIX
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
+SPINNER_INTERVAL = 0.2
 
 
 def _zeta_home() -> Path:
@@ -148,7 +149,9 @@ class TUIApp:
         self._stream_kind: str | None = None
         self._partial = ""
         self._streaming = False
+        self._spinner_active = False
         self._spinner_frame = 0
+        self._spinner_reset = asyncio.Event()
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
 
@@ -200,6 +203,7 @@ class TUIApp:
             streaming=self._streaming,
             width=width,
             spinner_frame=self._spinner_frame,
+            spinner_active=self._spinner_active,
         )
         return FormattedText([("class:bottom-toolbar", status.plain)])
 
@@ -269,7 +273,6 @@ class TUIApp:
         self._reset_stream_buffers()
         self._partial = ""
         self._streaming = False
-        self._spinner_frame = 0
 
     def _reset_stream_buffers(self) -> None:
         self._assistant_lines.value = ""
@@ -304,14 +307,21 @@ class TUIApp:
 
     async def _pulse_spinner(self) -> None:
         while True:
-            await asyncio.sleep(0.2)
-            if self._streaming:
-                self._spinner_frame += 1
-                self._invalidate_prompt()
+            try:
+                await asyncio.wait_for(
+                    self._spinner_reset.wait(), timeout=SPINNER_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                if self._spinner_active:
+                    self._spinner_frame += 1
+                    self._invalidate_prompt()
+            else:
+                self._spinner_reset.clear()
 
     async def _consume_turn(self, user_text: str) -> None:
         self._loop_state = "streaming"
         self._streaming = True
+        self._spinner_active = True
         spinner_task = asyncio.create_task(self._pulse_spinner())
         try:
             async for event in self.loop.run_turn(user_text):
@@ -330,6 +340,7 @@ class TUIApp:
                     self._loop_state = "streaming"
                 elif event.type is StreamEventType.TURN_START:
                     self._spinner_frame = 0
+                    self._spinner_reset.set()
                     self._streaming = True
                 elif event.type is StreamEventType.MESSAGE_END:
                     self._streaming = False
@@ -349,6 +360,7 @@ class TUIApp:
             self._print(Text(f"[error] {exc}", style=ERROR))
         finally:
             self._streaming = False
+            self._spinner_active = False
             spinner_task.cancel()
             await asyncio.gather(spinner_task, return_exceptions=True)
 
