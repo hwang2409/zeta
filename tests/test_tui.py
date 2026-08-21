@@ -716,11 +716,10 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
     call = ToolCall("call-1", "read", {})
     backend = SlowSecondCompletionBackend(call)
     tool_started = asyncio.Event()
-    release_tool = asyncio.Event()
 
     async def slow_tool(_: dict[str, object]) -> str:
         tool_started.set()
-        await release_tool.wait()
+        await asyncio.sleep(0.8)
         return "tool result"
 
     app = TUIApp(
@@ -734,13 +733,18 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
     )
 
     turn = asyncio.create_task(app._consume_turn("prompt"))
-    await tool_started.wait()
-    while app._spinner_frame < 1:
-        await asyncio.sleep(0.01)
-    await asyncio.sleep(0.14)
-    during_tool_frame = app._spinner_frame
-    during_tool_toolbar = "".join(value for _, value in app._status_toolbar())
-    release_tool.set()
+
+    async def observe_tool_spinner() -> tuple[int, int, str]:
+        await tool_started.wait()
+        frame_before = app._spinner_frame
+        await asyncio.sleep(0.75)
+        frame_after = app._spinner_frame
+        toolbar = "".join(value for _, value in app._status_toolbar())
+        return frame_before, frame_after, toolbar
+
+    frame_before, frame_after, during_tool_toolbar = await asyncio.wait_for(
+        observe_tool_spinner(), timeout=2.0
+    )
     await backend.second_started.wait()
     starting_frame = app._spinner_frame
     await asyncio.sleep(0.06)
@@ -751,7 +755,7 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
     await turn
 
     assert app._streaming is False
-    assert during_tool_frame >= 1
+    assert frame_after > frame_before, "spinner did not advance during tool execution"
     assert any(marker in during_tool_toolbar for marker in ("·", "•", "●"))
     assert starting_frame == 0
     assert first_provider_frame == 0
