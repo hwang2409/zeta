@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import math
 import shlex
 import sys
@@ -159,6 +160,137 @@ async def test_builtin_tools_read_list_and_exec_use_session_cwd(tmp_path: Path) 
     assert exec_result["isError"] is False
     assert str(tmp_path) in exec_result["content"][0]["text"]
     assert "not a sandbox" in registry.schemas[2]["description"]
+
+
+@pytest.mark.asyncio
+async def test_write_creates_file_with_structured_result(tmp_path: Path) -> None:
+    content = "héllo\n"
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("write-new", "write", {"path": "note.txt", "content": content})
+    )
+
+    file_path = tmp_path / "note.txt"
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == f"wrote 7 bytes to {file_path}"
+    assert result["structuredContent"] == {
+        "path": str(file_path),
+        "bytes_written": 7,
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "was_created": True,
+        "was_overwritten": False,
+    }
+    assert file_path.read_bytes() == content.encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_write_reports_overwrite(tmp_path: Path) -> None:
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("old", encoding="utf-8")
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("write-overwrite", "write", {"path": "note.txt", "content": "new"})
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"] == {
+        "path": str(file_path),
+        "bytes_written": 3,
+        "sha256": hashlib.sha256(b"new").hexdigest(),
+        "was_created": False,
+        "was_overwritten": True,
+    }
+    assert file_path.read_text(encoding="utf-8") == "new"
+
+
+@pytest.mark.asyncio
+async def test_write_rejects_missing_parent_by_default(tmp_path: Path) -> None:
+    target = tmp_path / "missing" / "note.txt"
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("write-missing-parent", "write", {"path": str(target), "content": "x"})
+    )
+
+    assert result["isError"] is True
+    assert str(target.parent) in result["content"][0]["text"]
+    assert not target.parent.exists()
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_write_can_create_missing_parents(tmp_path: Path) -> None:
+    target = tmp_path / "missing" / "note.txt"
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "write-create-parent",
+            "write",
+            {"path": str(target), "content": "x", "create_parents": True},
+        )
+    )
+
+    assert result["isError"] is False
+    assert target.read_text(encoding="utf-8") == "x"
+    assert target.parent.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_write_rejects_path_outside_session_cwd(tmp_path: Path) -> None:
+    session_cwd = tmp_path / "session"
+    session_cwd.mkdir()
+    outside = tmp_path / "outside.txt"
+    registry = ToolRegistry(session_cwd)
+
+    result = await registry.execute(
+        ToolCall("write-outside", "write", {"path": str(outside), "content": "x"})
+    )
+
+    assert result["isError"] is True
+    assert "outside session cwd" in result["content"][0]["text"]
+    assert not outside.exists()
+
+
+@pytest.mark.asyncio
+async def test_write_rejects_invalid_utf8_content_before_writing(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "invalid.txt"
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "write-invalid-utf8", "write", {"path": str(target), "content": "\ud800"}
+        )
+    )
+
+    assert result["isError"] is True
+    assert "valid UTF-8" in result["content"][0]["text"]
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"path": "note.txt"},
+        {"path": "note.txt", "content": "x", "create_parents": "yes"},
+        {"path": "note.txt", "content": "x", "extra": True},
+    ],
+)
+async def test_registry_rejects_malformed_write_arguments(
+    tmp_path: Path,
+    arguments: dict[str, object],
+) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(ToolCall("write-invalid", "write", arguments))
+
+    assert result["isError"] is True
+    assert "invalid arguments" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio
