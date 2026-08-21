@@ -136,7 +136,7 @@ async def test_builtin_tools_populate_structured_content(tmp_path: Path) -> None
     assert list_result["structuredContent"] == {
         "root": str(tmp_path),
         "entry_count": 1,
-        "full_size": 1,
+        "full_size": 8,
         "truncated": False,
     }
     assert exec_result["structuredContent"] == {

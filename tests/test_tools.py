@@ -314,15 +314,50 @@ async def test_list_bounds_directory_working_set(
     assert result["isError"] is False
     assert len(result["content"][0]["text"]) == 32
     assert result["content"][0]["truncated"] is True
-    assert result["structuredContent"] == {
-        "root": str(tmp_path),
-        "entry_count": 5_000,
-        "full_size": 5_000,
-        "truncated": True,
-    }
     assert calls == [32]
     full_listing = "\n".join(f"file-{index:04d}.txt" for index in range(5_000))
     assert result["content"][0]["full_size"] == len(full_listing.encode("utf-8"))
+    assert result["structuredContent"] == {
+        "root": str(tmp_path),
+        "entry_count": 5_000,
+        "full_size": result["content"][0]["full_size"],
+        "truncated": result["content"][0]["truncated"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_truncation_metadata_matches_capped_content(tmp_path: Path) -> None:
+    for index in range(100):
+        (tmp_path / f"file-{index:03d}.txt").write_text("x", encoding="utf-8")
+    registry = ToolRegistry(tmp_path, max_output_chars=32)
+
+    result = await registry.execute(ToolCall("list-capped", "list", {"path": "."}))
+
+    block = result["content"][0]
+    structured = result["structuredContent"]
+    assert block["truncated"] is True
+    assert structured["truncated"] is True
+    assert structured["full_size"] == block["full_size"]
+
+
+@pytest.mark.asyncio
+async def test_list_truncation_metadata_matches_full_content(tmp_path: Path) -> None:
+    for index in range(601):
+        directory = tmp_path / f"directory-{index:03d}"
+        directory.mkdir()
+        (directory / "file.txt").write_text("x", encoding="utf-8")
+    registry = ToolRegistry(tmp_path, max_output_chars=100_000)
+
+    result = await registry.execute(
+        ToolCall("list-complete", "list", {"path": ".", "depth": 2})
+    )
+
+    block = result["content"][0]
+    structured = result["structuredContent"]
+    assert structured["entry_count"] == 1_202
+    assert block["truncated"] is False
+    assert structured["truncated"] is False
+    assert structured["full_size"] == block["full_size"]
 
 
 @pytest.mark.asyncio

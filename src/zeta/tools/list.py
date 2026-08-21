@@ -48,13 +48,14 @@ async def _list(
     )
     if abort_signal.is_set():
         raise _ToolCanceled()
+    block = output.render(full_size=full_size[0])
     return _success_result(
-        output.render(full_size=full_size[0]),
+        block,
         structured_content={
             "root": str(path),
             "entry_count": entry_count[0],
-            "full_size": entry_count[0],
-            "truncated": entry_count[0] > MAX_ENTRIES_SHOWN,
+            "full_size": block["full_size"],
+            "truncated": block["truncated"],
         },
     )
 
