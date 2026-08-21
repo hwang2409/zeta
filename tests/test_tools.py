@@ -1,7 +1,13 @@
 import asyncio
+import errno
+import fcntl
+import hashlib
 import math
+import os
 import shlex
+import shutil
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -9,6 +15,7 @@ import pytest
 import zeta.tools.exec as exec_module
 import zeta.tools.list as list_module
 import zeta.tools.read as read_module
+import zeta.tools.write as write_module
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
@@ -159,6 +166,379 @@ async def test_builtin_tools_read_list_and_exec_use_session_cwd(tmp_path: Path) 
     assert exec_result["isError"] is False
     assert str(tmp_path) in exec_result["content"][0]["text"]
     assert "not a sandbox" in registry.schemas[2]["description"]
+
+
+@pytest.mark.asyncio
+async def test_write_creates_file_with_structured_result(tmp_path: Path) -> None:
+    content = "héllo\n"
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("write-new", "write", {"path": "note.txt", "content": content})
+    )
+
+    file_path = tmp_path / "note.txt"
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == f"wrote 7 bytes to {file_path}"
+    assert result["structuredContent"] == {
+        "path": str(file_path),
+        "bytes_written": 7,
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "was_created": True,
+        "was_overwritten": False,
+    }
+    assert file_path.read_bytes() == content.encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_write_reports_overwrite(tmp_path: Path) -> None:
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("old", encoding="utf-8")
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("write-overwrite", "write", {"path": "note.txt", "content": "new"})
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"] == {
+        "path": str(file_path),
+        "bytes_written": 3,
+        "sha256": hashlib.sha256(b"new").hexdigest(),
+        "was_created": False,
+        "was_overwritten": True,
+    }
+    assert file_path.read_text(encoding="utf-8") == "new"
+
+
+@pytest.mark.asyncio
+async def test_write_getpath_failure_does_not_truncate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "getpath-failure.txt"
+    target.write_text("original", encoding="utf-8")
+    registry = ToolRegistry(tmp_path)
+
+    def fail_getpath(file_descriptor: int) -> str:
+        raise OSError("injected F_GETPATH failure")
+
+    monkeypatch.setattr(write_module, "_path_from_fd", fail_getpath)
+    result = await registry.execute(
+        ToolCall("write-getpath-failure", "write", {"path": target.name, "content": "new"})
+    )
+
+    assert result["isError"] is True
+    assert target.read_text(encoding="utf-8") == "original"
+
+
+@pytest.mark.asyncio
+async def test_write_fdopen_failure_closes_raw_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "fdopen-failure.txt"
+    registry = ToolRegistry(tmp_path)
+    raw_fds: list[int] = []
+
+    def fail_fdopen(file_descriptor: int, mode: str) -> object:
+        raw_fds.append(file_descriptor)
+        raise OSError("injected fdopen failure")
+
+    monkeypatch.setattr(write_module.os, "fdopen", fail_fdopen)
+    result = await registry.execute(
+        ToolCall("write-fdopen-failure", "write", {"path": target.name, "content": "x"})
+    )
+
+    assert result["isError"] is True
+    assert len(raw_fds) == 1
+    with pytest.raises(OSError) as error:
+        fcntl.fcntl(raw_fds[0], fcntl.F_GETFD)
+    assert error.value.errno == errno.EBADF
+
+
+@pytest.mark.asyncio
+async def test_write_rejects_missing_parent_by_default(tmp_path: Path) -> None:
+    target = tmp_path / "missing" / "note.txt"
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("write-missing-parent", "write", {"path": str(target), "content": "x"})
+    )
+
+    assert result["isError"] is True
+    assert str(target.parent) in result["content"][0]["text"]
+    assert not target.parent.exists()
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_write_can_create_missing_parents(tmp_path: Path) -> None:
+    target = tmp_path / "missing" / "note.txt"
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "write-create-parent",
+            "write",
+            {"path": str(target), "content": "x", "create_parents": True},
+        )
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"] == {
+        "path": str(target),
+        "bytes_written": 1,
+        "sha256": hashlib.sha256(b"x").hexdigest(),
+        "was_created": True,
+        "was_overwritten": False,
+    }
+    assert target.read_text(encoding="utf-8") == "x"
+    assert target.parent.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_write_race_reports_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "raced.txt"
+    registry = ToolRegistry(tmp_path)
+    original_open = write_module.os.open
+
+    def racing_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == "raced.txt" and dir_fd is not None and flags & write_module.os.O_EXCL:
+            creator = threading.Thread(
+                target=lambda: target.write_bytes(b"concurrent")
+            )
+            creator.start()
+            creator.join()
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(write_module.os, "open", racing_open)
+    result = await registry.execute(
+        ToolCall("write-race", "write", {"path": "raced.txt", "content": "x"})
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"] == {
+        "path": str(target),
+        "bytes_written": 1,
+        "sha256": hashlib.sha256(b"x").hexdigest(),
+        "was_created": False,
+        "was_overwritten": True,
+    }
+    assert target.read_bytes() == b"x"
+
+
+@pytest.mark.asyncio
+async def test_write_overwrite_symlink_race_stays_in_sandbox(tmp_path: Path) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    target = sandbox / "target"
+    target.write_bytes(b"inside")
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"outside")
+    stop = threading.Event()
+
+    def swap_target() -> None:
+        while not stop.is_set():
+            try:
+                target.unlink()
+            except (FileNotFoundError, IsADirectoryError, PermissionError):
+                pass
+            try:
+                target.symlink_to(outside)
+            except FileExistsError:
+                pass
+
+    swapper = threading.Thread(target=swap_target)
+    swapper.start()
+    try:
+        registry = ToolRegistry(tmp_path)
+        for index in range(50):
+            result = await registry.execute(
+                ToolCall(
+                    f"write-overwrite-race-{index}",
+                    "write",
+                    {"path": "sandbox/target", "content": "x"},
+                )
+            )
+            if not result["isError"]:
+                assert result["structuredContent"]["path"] == str(target)
+            assert outside.read_bytes() == b"outside"
+    finally:
+        stop.set()
+        swapper.join()
+        if target.is_symlink():
+            target.unlink()
+        if not target.exists():
+            target.write_bytes(b"inside")
+
+
+@pytest.mark.asyncio
+async def test_write_create_parents_symlink_race_stays_in_sandbox(
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    intermediate = sandbox / "a" / "b"
+    intermediate.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    (outside / "c").mkdir(parents=True)
+    outside_target = outside / "c" / "target"
+    outside_target.write_bytes(b"outside")
+    stop = threading.Event()
+
+    def swap_intermediate() -> None:
+        while not stop.is_set():
+            shutil.rmtree(intermediate, ignore_errors=True)
+            try:
+                intermediate.symlink_to(outside, target_is_directory=True)
+            except FileExistsError:
+                pass
+            try:
+                intermediate.unlink()
+            except (FileNotFoundError, IsADirectoryError, PermissionError):
+                pass
+            try:
+                intermediate.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+
+    swapper = threading.Thread(target=swap_intermediate)
+    swapper.start()
+    try:
+        registry = ToolRegistry(tmp_path)
+        for index in range(50):
+            result = await registry.execute(
+                ToolCall(
+                    f"write-create-parents-race-{index}",
+                    "write",
+                    {
+                        "path": "sandbox/a/b/c/target",
+                        "content": "x",
+                        "create_parents": True,
+                    },
+                )
+            )
+            if not result["isError"]:
+                assert Path(result["structuredContent"]["path"]).is_relative_to(
+                    sandbox
+                )
+            assert outside_target.read_bytes() == b"outside"
+    finally:
+        stop.set()
+        swapper.join()
+
+
+@pytest.mark.asyncio
+async def test_write_rejects_path_outside_session_cwd(tmp_path: Path) -> None:
+    session_cwd = tmp_path / "session"
+    session_cwd.mkdir()
+    outside = tmp_path / "outside.txt"
+    registry = ToolRegistry(session_cwd)
+
+    result = await registry.execute(
+        ToolCall("write-outside", "write", {"path": str(outside), "content": "x"})
+    )
+
+    assert result["isError"] is True
+    assert "escaped sandbox" in result["content"][0]["text"]
+    assert not outside.exists()
+
+
+@pytest.mark.asyncio
+async def test_write_rejects_replaced_session_cwd(tmp_path: Path) -> None:
+    session_cwd = tmp_path / "session"
+    session_cwd.mkdir()
+    attack = tmp_path / "attack"
+    attack.mkdir()
+    registry = ToolRegistry(session_cwd)
+
+    os.rename(session_cwd, tmp_path / "session-original")
+    session_cwd.symlink_to(attack, target_is_directory=True)
+    result = await registry.execute(
+        ToolCall(
+            "write-replaced-cwd",
+            "write",
+            {
+                "path": "sandbox/file.txt",
+                "content": "x",
+                "create_parents": True,
+            },
+        )
+    )
+
+    assert result["isError"] is True
+    assert "session cwd was replaced" in result["content"][0]["text"]
+    assert not (attack / "sandbox" / "file.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_write_rejects_replaced_session_cwd_identity(tmp_path: Path) -> None:
+    session_cwd = tmp_path / "session"
+    session_cwd.mkdir()
+    registry = ToolRegistry(session_cwd)
+
+    os.rename(session_cwd, tmp_path / "session-original")
+    session_cwd.mkdir()
+    result = await registry.execute(
+        ToolCall(
+            "write-replaced-cwd-identity",
+            "write",
+            {
+                "path": "sandbox/file.txt",
+                "content": "x",
+                "create_parents": True,
+            },
+        )
+    )
+
+    assert result["isError"] is True
+    assert "session cwd was replaced" in result["content"][0]["text"]
+    assert not (session_cwd / "sandbox" / "file.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_write_rejects_invalid_utf8_content_before_writing(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "invalid.txt"
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "write-invalid-utf8", "write", {"path": str(target), "content": "\ud800"}
+        )
+    )
+
+    assert result["isError"] is True
+    assert "valid UTF-8" in result["content"][0]["text"]
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"path": "note.txt"},
+        {"path": "note.txt", "content": "x", "create_parents": "yes"},
+        {"path": "note.txt", "content": "x", "extra": True},
+    ],
+)
+async def test_registry_rejects_malformed_write_arguments(
+    tmp_path: Path,
+    arguments: dict[str, object],
+) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(ToolCall("write-invalid", "write", arguments))
+
+    assert result["isError"] is True
+    assert "invalid arguments" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio

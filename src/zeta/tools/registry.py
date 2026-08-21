@@ -11,6 +11,8 @@ import copy
 import inspect
 import json
 import math
+import os
+import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,12 +131,20 @@ def text_block(
 def _success_result(
     block: ToolTextBlock,
     *,
-    structured_content: dict[str, str | int | bool | None] | None = None,
+    structured_content: Mapping[str, object] | None = None,
 ) -> StructuredToolResult:
+    normalized_content = (
+        None
+        if structured_content is None
+        else cast(
+            dict[str, str | int | bool | None],
+            dict(structured_content),
+        )
+    )
     return {
         "content": [block],
         "isError": False,
-        "structuredContent": structured_content,
+        "structuredContent": normalized_content,
     }
 
 
@@ -207,9 +217,23 @@ class ToolRegistry:
         max_output_chars: int = 10_000,
         register_builtin: bool = True,
     ) -> None:
-        self.cwd = Path(cwd).expanduser().resolve()
-        if not self.cwd.is_dir():
-            raise ValueError(f"tool cwd is not a directory: {self.cwd}")
+        self.cwd = Path(os.path.abspath(os.fspath(Path(cwd).expanduser())))
+        cwd_fd = -1
+        try:
+            cwd_fd = os.open(
+                self.cwd,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            cwd_stat = os.fstat(cwd_fd)
+        except OSError as exc:
+            if cwd_fd >= 0:
+                os.close(cwd_fd)
+            raise ValueError(
+                f"tool cwd is not a directory or is a symlink: {self.cwd}"
+            ) from exc
+        self._cwd_fd = cwd_fd
+        self._cwd_identity = (cwd_stat.st_dev, cwd_stat.st_ino)
+        self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)
         if type(max_output_chars) is not int or max_output_chars < 1:
             raise ValueError("max_output_chars must be a positive integer")
         if pre_execute_hook is not None and hook is not None:
@@ -484,6 +508,25 @@ class ToolRegistry:
             raise ValueError("path must be a nonempty string")
         candidate = Path(raw_path)
         return candidate if candidate.is_absolute() else self.cwd / candidate
+
+    def _open_cwd(self) -> int:
+        try:
+            cwd_fd = os.open(
+                self.cwd,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+        except OSError as exc:
+            raise ValueError("session cwd was replaced") from exc
+        try:
+            cwd_stat = os.fstat(cwd_fd)
+        except OSError as exc:
+            os.close(cwd_fd)
+            raise ValueError("session cwd was replaced") from exc
+        if (cwd_stat.st_dev, cwd_stat.st_ino) != self._cwd_identity:
+            os.close(cwd_fd)
+            raise ValueError("session cwd was replaced")
+        return cwd_fd
+
 
 async def _invoke_handler(
     handler: ToolHandler,

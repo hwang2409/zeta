@@ -10,11 +10,12 @@ from .registry import (
 
 
 def register_default_tools(registry: ToolRegistry) -> None:
-    from . import exec, list, read
+    from . import exec, list, read, write
 
     read.register(registry)
     list.register(registry)
     exec.register(registry)
+    write.register(registry)
 
 
 __all__ = [
