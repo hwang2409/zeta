@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import warnings
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 
 from .approval import ApprovalPolicy
 from .context import ContextAssembler
 from .store import ConversationStore
-from .tools import ToolHandler, ToolRegistry
-from .types import (
+from ..types import (
     CompletionBackend,
     ContentBlock,
     ErrorInfo,
@@ -25,6 +25,17 @@ from .types import (
     ToolSchema,
     ToolUseContent,
 )
+
+
+ToolHandler = Callable[..., str | ToolResult | Awaitable[str | ToolResult]]
+
+
+def _tool_registry_class() -> type:
+    return importlib.import_module("zeta.tools.registry").ToolRegistry
+
+
+def _new_tool_registry(cwd: object, **kwargs: object) -> object:
+    return _tool_registry_class()(cwd, **kwargs)
 
 
 async def _close_completion(
@@ -71,8 +82,8 @@ class AgentLoop:
         backend: CompletionBackend,
         store: ConversationStore,
         *,
-        tools: Mapping[str, ToolHandler] | ToolRegistry | None = None,
-        registry: ToolRegistry | None = None,
+        tools: Mapping[str, ToolHandler] | object | None = None,
+        registry: object | None = None,
         approval_policy: ApprovalPolicy | None = None,
         tool_schemas: Sequence[ToolSchema] | None = None,
         max_turns: int = 10,
@@ -88,10 +99,10 @@ class AgentLoop:
             raise ValueError("pass only one tool registry")
         if registry is not None:
             self.tool_registry = registry
-        elif isinstance(tools, ToolRegistry):
+        elif isinstance(tools, _tool_registry_class()):
             self.tool_registry = tools
         elif isinstance(tools, Mapping):
-            self.tool_registry = ToolRegistry(store.cwd, register_builtin=False)
+            self.tool_registry = _new_tool_registry(store.cwd, register_builtin=False)
             schemas_by_name = {
                 schema.get("name"): schema
                 for schema in (tool_schemas or [])
@@ -117,7 +128,7 @@ class AgentLoop:
                     parameters=parameters,
                 )
         elif tools is None:
-            self.tool_registry = ToolRegistry(store.cwd)
+            self.tool_registry = _new_tool_registry(store.cwd)
         else:
             raise TypeError("tools must be a mapping or ToolRegistry")
         if (

@@ -22,7 +22,7 @@ from .transport import (
     request_error,
     task_is_cancelling,
 )
-from .types import (
+from ..types import (
     CompletionBackend,
     ContentBlock,
     Message,

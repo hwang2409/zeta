@@ -6,12 +6,11 @@ from threading import Event
 
 import pytest
 
-from zeta.abort import AbortGenerationRegistry
-from zeta.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
-from zeta.fake import FakeBackend, ScriptedTurn
-from zeta.gate import ApprovalGate
-from zeta.loop import AgentLoop
-from zeta.store import ConversationIntegrityError, ConversationStore
+from zeta.core.abort import AbortGenerationRegistry
+from zeta.core.approval import ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest
+from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.loop import AgentLoop
+from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.types import (
     Message,

@@ -1,5 +1,5 @@
 """Interactive terminal interface for zeta."""
 
-from .app import TUIApp, main
+from .app import TUIApp
 
-__all__ = ["TUIApp", "main"]
+__all__ = ["TUIApp"]

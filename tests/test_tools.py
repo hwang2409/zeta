@@ -6,10 +6,12 @@ from pathlib import Path
 
 import pytest
 
-import zeta.tools as tools_module
-from zeta.fake import FakeBackend, ScriptedTurn
-from zeta.loop import AgentLoop
-from zeta.store import ConversationStore
+import zeta.tools.exec as exec_module
+import zeta.tools.list as list_module
+import zeta.tools.read as read_module
+from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.loop import AgentLoop
+from zeta.core.store import ConversationStore
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.types import MessageRole, StreamEventType, TextContent, ToolCall, ToolResult
 
@@ -158,14 +160,14 @@ async def test_exec_retains_only_bounded_output_from_large_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captures = []
-    real_capture = tools_module._BoundedOutput
+    real_capture = exec_module._BoundedOutput
 
     class TrackingCapture(real_capture):
         def __init__(self, limit: int) -> None:
             super().__init__(limit)
             captures.append(self)
 
-    monkeypatch.setattr(tools_module, "_BoundedOutput", TrackingCapture)
+    monkeypatch.setattr(exec_module, "_BoundedOutput", TrackingCapture)
     registry = ToolRegistry(tmp_path)
     result = await registry.execute(
         ToolCall(
@@ -193,14 +195,14 @@ async def test_read_retains_only_bounded_output_from_large_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captures = []
-    real_capture = tools_module._BoundedText
+    real_capture = read_module._BoundedText
 
     class TrackingCapture(real_capture):
         def __init__(self, limit: int) -> None:
             super().__init__(limit)
             captures.append(self)
 
-    monkeypatch.setattr(tools_module, "_BoundedText", TrackingCapture)
+    monkeypatch.setattr(read_module, "_BoundedText", TrackingCapture)
     (tmp_path / "large.txt").write_text("x\n" * 1_000_000, encoding="utf-8")
     registry = ToolRegistry(tmp_path, max_output_chars=64)
 
@@ -220,14 +222,14 @@ async def test_list_retains_only_bounded_output_from_large_directory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captures = []
-    real_capture = tools_module._BoundedText
+    real_capture = list_module._BoundedText
 
     class TrackingCapture(real_capture):
         def __init__(self, limit: int) -> None:
             super().__init__(limit)
             captures.append(self)
 
-    monkeypatch.setattr(tools_module, "_BoundedText", TrackingCapture)
+    monkeypatch.setattr(list_module, "_BoundedText", TrackingCapture)
     for index in range(1_000):
         (tmp_path / f"file-{index:04d}.txt").write_text("x", encoding="utf-8")
     registry = ToolRegistry(tmp_path, max_output_chars=64)
@@ -248,14 +250,14 @@ async def test_list_bounds_directory_working_set(
     for index in range(5_000):
         (tmp_path / f"file-{index:04d}.txt").write_text("x", encoding="utf-8")
     retained: list[tuple[int, int]] = []
-    real_nsmallest = tools_module.heapq.nsmallest
+    real_nsmallest = list_module.heapq.nsmallest
 
     def tracking_nsmallest(count, iterable, *, key=None):
         entries = real_nsmallest(count, iterable, key=key)
         retained.append((count, len(entries)))
         return entries
 
-    monkeypatch.setattr(tools_module.heapq, "nsmallest", tracking_nsmallest)
+    monkeypatch.setattr(list_module.heapq, "nsmallest", tracking_nsmallest)
     registry = ToolRegistry(tmp_path, max_output_chars=32)
 
     result = await registry.execute(ToolCall("list-wide", "list", {"path": "."}))
@@ -391,7 +393,7 @@ async def test_exec_abort_wins_when_completion_and_abort_are_ready_together(
 ) -> None:
     abort_signal = ToolAbortSignal()
     registry = ToolRegistry(tmp_path, abort_signal=abort_signal)
-    real_wait = tools_module.asyncio.wait
+    real_wait = exec_module.asyncio.wait
 
     async def forced_tie(tasks, *, return_when):
         await asyncio.sleep(0.1)
@@ -403,7 +405,7 @@ async def test_exec_abort_wins_when_completion_and_abort_are_ready_together(
             return await real_wait(task_set, return_when=return_when)
         return done, task_set - done
 
-    monkeypatch.setattr(tools_module.asyncio, "wait", forced_tie)
+    monkeypatch.setattr(exec_module.asyncio, "wait", forced_tie)
     result = await registry.execute(
         ToolCall(
             "exec-race",

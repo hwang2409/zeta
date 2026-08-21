@@ -10,7 +10,7 @@ from math import ceil
 from typing import Any
 
 from .store import ConversationEntry, ConversationStore
-from .types import (
+from ..types import (
     CompletionBackend,
     ContentBlock,
     Message,

@@ -19,8 +19,8 @@ from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
 
-from zeta.loop import AgentLoop
-from zeta.store import ConversationStore
+from zeta.core.loop import AgentLoop
+from zeta.core.store import ConversationStore
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings, parse_input
 from zeta.tui.render import MarkdownStream, format_status, render_event
@@ -439,7 +439,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
         [
             sys.executable,
             "-c",
-            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'fake']))",
+            "from zeta.cli import main; raise SystemExit(main(['--provider', 'fake']))",
         ],
         stdin=slave_fd,
         stdout=slave_fd,

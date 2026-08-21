@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from zeta.store import ConversationIntegrityError, ConversationStore
+from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
 
 
@@ -198,7 +198,7 @@ def test_compaction_marker_persists(tmp_path: Path) -> None:
 
 def test_append_fsyncs_before_return(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    with patch("zeta.store.os.fsync") as fsync:
+    with patch("zeta.core.store.os.fsync") as fsync:
         store.append_message(message(MessageRole.USER, "hello"))
 
     fsync.assert_called_once()
@@ -341,7 +341,7 @@ def test_duplicate_generated_id_is_rejected_on_append(tmp_path: Path) -> None:
     first = store.append_message(message(MessageRole.USER, "one"))
 
     with patch(
-        "zeta.store.uuid.uuid4",
+        "zeta.core.store.uuid.uuid4",
         return_value=SimpleNamespace(hex=first.id),
     ):
         with pytest.raises(ConversationIntegrityError, match="duplicate"):

@@ -20,7 +20,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.scripts]
-zeta = "zeta.tui.app:main"
+zeta = "zeta.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zeta"]

@@ -11,12 +11,13 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from zeta.approval import ApprovalPolicy
-from zeta.context import ContextAssembler
-from zeta.fake import FakeBackend, ScriptedTurn
-from zeta.loop import AgentLoop
-from zeta.session import SessionError, SessionManager
-from zeta.tui.app import TUIApp, build_parser, create_app, main
+from zeta.core.approval import ApprovalPolicy
+from zeta.core.context import ContextAssembler
+from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.loop import AgentLoop
+from zeta.core.session import SessionError, SessionManager
+from zeta.tui.app import TUIApp, create_app
+from zeta.cli import build_parser, main
 from zeta.types import (
     Message,
     MessageRole,
@@ -776,7 +777,7 @@ def test_session_id_collision_retries(
             uuid.UUID("00000000000000000000000000000004"),
         ]
     )
-    monkeypatch.setattr("zeta.session.uuid.uuid4", lambda: next(calls))
+    monkeypatch.setattr("zeta.core.session.uuid.uuid4", lambda: next(calls))
     manager.create(provider="fake", model="offline", cwd=tmp_path)
     created = manager.create(provider="fake", model="offline", cwd=tmp_path)
 
