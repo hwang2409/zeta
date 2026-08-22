@@ -150,7 +150,7 @@ class SessionManager:
         model: str,
         cwd: str | Path | None = None,
         retained_tail: int = 8,
-        compaction_budget: int = 100_000,
+        compaction_budget: int = 200_000,
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         self.sessions_dir.mkdir(parents=True, exist_ok=True)

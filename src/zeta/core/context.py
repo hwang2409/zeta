@@ -171,7 +171,7 @@ class ContextAssembler:
         self,
         store: ConversationStore,
         *,
-        token_budget: int = 100_000,
+        token_budget: int = 200_000,
         retained_tail: int = 8,
         system_prompt: str | Message = "",
         backend: CompletionBackend | None = None,
@@ -263,7 +263,9 @@ class ContextAssembler:
             )
         if committed_tokens > self.token_budget:
             raise BudgetExceeded(
-                "system prompt and retained tail exceed the token budget"
+                "system prompt and retained tail "
+                f"({committed_tokens} tokens) exceed the token budget "
+                f"({self.token_budget}); raise it with --token-budget"
             )
 
         candidates = list(items[:boundary])

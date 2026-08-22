@@ -53,6 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="auto-approve every tool call (skip approval prompts)",
     )
+    parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=None,
+        help="override the compaction/context token budget for this run",
+    )
     commands = parser.add_subparsers(dest="command")
     login_parser = commands.add_parser("login", help="log in to an OAuth provider")
     login_parser.add_argument(
