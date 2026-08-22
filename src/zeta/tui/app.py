@@ -18,7 +18,7 @@ from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.text import Text
 
-from ..core.approval import ApprovalPolicy, ApprovalRequest
+from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.slash import SlashStatus, create_slash_registry
 from ..loop import AgentLoop
 from ..core.session import SessionError, SessionManager, env_home
@@ -691,7 +691,10 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         store = opened.store
     if resuming:
         backend, selected_model = build_backend(provider, model, home=home)
-    approval_policy = ApprovalPolicy(store=store)
+    approval_default = (
+        ApprovalDecision.ALLOW if getattr(args, "yolo", False) else ApprovalDecision.ASK
+    )
+    approval_policy = ApprovalPolicy(store=store, default=approval_default)
     pending_override = None
     if resuming and mismatches:
         pending_override = (
