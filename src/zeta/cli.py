@@ -48,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow provider or model overrides during resume",
     )
     parser.add_argument("--verbose", action="store_true", help="show raw stream events")
+    parser.add_argument(
+        "--yolo",
+        action="store_true",
+        help="auto-approve every tool call (skip approval prompts)",
+    )
     commands = parser.add_subparsers(dest="command")
     login_parser = commands.add_parser("login", help="log in to an OAuth provider")
     login_parser.add_argument(
