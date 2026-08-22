@@ -163,7 +163,7 @@ async def run_login(
     )
     server_thread.start()
     try:
-        redirect_uri = f"http://127.0.0.1:{server.server_port}/callback"
+        redirect_uri = f"http://localhost:{server.server_port}/callback"
         authorization_url = provider.build_authorization_url(state, challenge, redirect_uri)
         print(
             f"open this URL to log in with {provider.name}:\n{authorization_url}",
