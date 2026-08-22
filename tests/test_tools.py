@@ -995,20 +995,20 @@ async def test_read_retains_only_bounded_output_from_large_file(
 
     monkeypatch.setattr(read_module, "_BoundedText", TrackingCapture)
     (tmp_path / "large.txt").write_text("x\n" * 1_000_000, encoding="utf-8")
-    real_open = Path.open
+    real_fdopen = read_module.os.fdopen
     open_count = 0
 
-    def tracking_open(
-        file_path: Path,
+    def tracking_fdopen(
+        file_descriptor: int,
+        mode: str,
         *args: object,
         **kwargs: object,
     ) -> object:
         nonlocal open_count
-        if file_path == tmp_path / "large.txt":
-            open_count += 1
-        return real_open(file_path, *args, **kwargs)  # type: ignore[arg-type]
+        open_count += 1
+        return real_fdopen(file_descriptor, mode, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", tracking_open)
+    monkeypatch.setattr(read_module.os, "fdopen", tracking_fdopen)
     registry = ToolRegistry(tmp_path, max_output_chars=64)
 
     result = await registry.execute(

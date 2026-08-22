@@ -1,9 +1,11 @@
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 import zeta.tools._sandbox as sandbox_module
+import zeta.tools.read as read_module
 from zeta.tools import ToolRegistry
 from zeta.types import ToolCall
 
@@ -39,6 +41,55 @@ async def test_read_allows_hard_link_target(tmp_path: Path) -> None:
 
     assert result["isError"] is False
     assert result["content"][0]["text"] == "outside"
+
+
+@pytest.mark.asyncio
+async def test_read_uses_verified_fd_after_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    target = sandbox / "target"
+    target.write_text("original", encoding="utf-8")
+    moved = sandbox / "moved"
+    registry = ToolRegistry(sandbox)
+    real_open_target = read_module.open_target
+
+    @contextmanager
+    def open_and_rename(
+        registry: ToolRegistry,
+        raw_path: str,
+        *,
+        flags: int,
+        mode: int = 0o644,
+        create_parents: bool = False,
+    ):
+        with real_open_target(
+            registry,
+            raw_path,
+            flags=flags,
+            mode=mode,
+            create_parents=create_parents,
+        ) as target_info:
+            os.rename(target, moved)
+            yield target_info
+
+    def fail_path_reopen(*args: object, **kwargs: object) -> object:
+        raise AssertionError("internal read reopened the target by path")
+
+    monkeypatch.setattr(read_module, "open_target", open_and_rename)
+    monkeypatch.setattr(read_module.Path, "open", fail_path_reopen)
+
+    result = await registry.execute(
+        ToolCall("read-after-rename", "read", {"path": "target"})
+    )
+
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "original"
+    assert result["structuredContent"]["path"] == str(target)
+    monkeypatch.undo()
+    assert moved.read_text(encoding="utf-8") == "original"
 
 
 def test_path_from_fd_returns_absolute_path(tmp_path: Path) -> None:

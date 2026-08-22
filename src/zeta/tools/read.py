@@ -25,24 +25,6 @@ class _Digest(Protocol):
     def hexdigest(self) -> str: ...
 
 
-class _DescriptorPath:
-    """Expose an open descriptor through the existing Path.open interface."""
-
-    def __init__(self, file_descriptor: int, display_path: Path) -> None:
-        self._file_descriptor = file_descriptor
-        self._display_path = display_path
-
-    def __fspath__(self) -> str:
-        if os.path.isdir("/proc/self/fd"):
-            return f"/proc/self/fd/{self._file_descriptor}"
-        if os.path.isdir("/dev/fd"):
-            return f"/dev/fd/{self._file_descriptor}"
-        raise OSError("no descriptor path is available")
-
-    def __eq__(self, other: object) -> bool:
-        return self._display_path == other
-
-
 async def _read_handle(
     handle: BinaryIO,
     path: Path,
@@ -163,18 +145,21 @@ async def _read(
             registry,
             raw_path,
             flags=os.O_RDONLY | os.O_CLOEXEC,
-        ) as (file_descriptor, _resolved_path):
+        ) as (file_descriptor, resolved_path):
             try:
-                handle = Path.open(
-                    _DescriptorPath(file_descriptor, path),
-                    "rb",
-                )
+                handle = os.fdopen(file_descriptor, "rb")
             except (OSError, ValueError):
                 os.close(file_descriptor)
                 raise
             with handle:
                 return await _read_handle(
-                    handle, path, offset, limit, output, digest, abort_signal
+                    handle,
+                    resolved_path,
+                    offset,
+                    limit,
+                    output,
+                    digest,
+                    abort_signal,
                 )
     except OSError as exc:
         raise ValueError(f"could not read file: {exc}") from exc
