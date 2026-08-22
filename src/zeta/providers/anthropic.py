@@ -40,7 +40,7 @@ from ..types import (
 )
 
 
-CLIENT_ID = "9d1c250a-e61b-44d9-88ed-594d1962f5e"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-594d1962f5ee"
 AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 API_URL = "https://api.anthropic.com/v1/messages"
