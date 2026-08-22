@@ -108,7 +108,7 @@ class AgentLoop:
         max_turns: int = 10,
         context_assembler: ContextAssembler | None = None,
         system_prompt: str | Message = "",
-        token_budget: int = 100_000,
+        token_budget: int = 200_000,
         retained_tail: int = 8,
         on_completion_success: Callable[[], None] | None = None,
     ) -> None:

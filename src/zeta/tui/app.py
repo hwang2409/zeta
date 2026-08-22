@@ -721,11 +721,17 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             return
         manager.touch(metadata)
 
+    token_budget_override = getattr(args, "token_budget", None)
+    effective_token_budget = (
+        token_budget_override
+        if token_budget_override is not None and token_budget_override > 0
+        else max(metadata.compaction_budget, 200_000)
+    )
     loop = AgentLoop(
         backend,
         store,
         approval_policy=approval_policy,
-        token_budget=metadata.compaction_budget,
+        token_budget=effective_token_budget,
         retained_tail=metadata.retained_tail,
         on_completion_success=completion_success,
     )
