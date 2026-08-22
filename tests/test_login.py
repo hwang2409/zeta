@@ -139,7 +139,7 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
     else:
         assert result == "account"
     assert store.read() == expected
-    assert urlsplit(received["redirect_uri"]).hostname == "127.0.0.1"
+    assert urlsplit(received["redirect_uri"]).hostname == "localhost"
     assert urlsplit(received["redirect_uri"]).port is not None
 
 
