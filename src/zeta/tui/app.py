@@ -244,6 +244,13 @@ class TUIApp:
         )
         if resolved:
             self._print(Text(f"[approval] {parts[0]}d {request_id}", style="green"))
+            # If a turn is already parked in the approval poll, it will pick up
+            # the resolution and execute the tool itself. Running the tool here
+            # would race that path and persist a duplicate tool_result — which
+            # Anthropic rejects (each tool_use must have a single result).
+            if self.active:
+                self._present_pending_approvals()
+                return True
 
             async def resume() -> Any:
                 return await self.loop.resume_pending_tool(
