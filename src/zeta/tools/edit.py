@@ -1,12 +1,4 @@
-"""The built-in UTF-8 str_replace file editing tool.
-
-Sandbox
--------
-Sandbox is best-effort per peer-tool convention: lexical outside-cwd rejection
-plus O_NOFOLLOW anchored walk. Direct-truncate write means a partial-failure
-mid-write can leave a corrupt file. TOCTOU races (parent rename, hard-link,
-ancestor symlink swaps) are out of scope, tracked as ZETA-22.
-"""
+"""The built-in UTF-8 str_replace file editing tool."""
 
 from __future__ import annotations
 
@@ -15,7 +7,7 @@ import os
 from typing import TypedDict
 
 from ..types import StructuredToolResult
-from ._sandbox import _path_from_fd, _path_open_error, open_parent
+from ._sandbox import _path_from_fd, open_target
 from .registry import (
     AbortSignal,
     ToolRegistry,
@@ -58,61 +50,46 @@ async def _edit(
     except UnicodeEncodeError as exc:
         raise ValueError("old_string and new_string must be valid UTF-8") from exc
 
-    with open_parent(registry, arguments["path"], create_parents=False) as parent:
-        components, parent_fd, fallback_path = parent
-        file_descriptor: int | None = None
+    with open_target(
+        registry,
+        arguments["path"],
+        flags=os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+    ) as (file_descriptor, _resolved_path):
+        path = _path_from_fd(file_descriptor)
         try:
-            try:
-                file_descriptor = os.open(
-                    components[-1],
-                    os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=parent_fd,
-                )
-            except OSError as open_error:
-                raise _path_open_error(fallback_path, open_error) from open_error
-            try:
-                path = _path_from_fd(file_descriptor)
-            except OSError as exc:
-                raise ValueError(
-                    f"could not resolve path: {fallback_path}: {exc}"
-                ) from exc
-
-            with os.fdopen(file_descriptor, "r+b") as handle:
-                file_descriptor = None
-                content_bytes = handle.read()
-                try:
-                    content = content_bytes.decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise ValueError(f"file is not valid UTF-8: {path}") from exc
-
-                match_count = _count_overlapping(content, arguments["old_string"])
-                if match_count == 0:
-                    return _error_result(
-                        f"old_string not found in {arguments['path']}"
-                    )
-                if match_count > 1:
-                    return _error_result(
-                        f"old_string found {match_count} times in {arguments['path']}; "
-                        "must be unique"
-                    )
-
-                updated_content = content.replace(
-                    arguments["old_string"], arguments["new_string"], 1
-                )
-                updated_bytes = updated_content.encode("utf-8")
-                try:
-                    handle.seek(0)
-                    handle.truncate()
-                    handle.write(updated_bytes)
-                    handle.flush()
-                except OSError as exc:
-                    raise ValueError(f"could not write file: {path}: {exc}") from exc
-
+            handle = os.fdopen(file_descriptor, "r+b")
         except (OSError, ValueError):
-            if file_descriptor is not None:
-                os.close(file_descriptor)
+            os.close(file_descriptor)
             raise
+        with handle:
+            content_bytes = handle.read()
+            try:
+                content = content_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"file is not valid UTF-8: {path}") from exc
 
+            match_count = _count_overlapping(content, arguments["old_string"])
+            if match_count == 0:
+                return _error_result(
+                    f"old_string not found in {arguments['path']}"
+                )
+            if match_count > 1:
+                return _error_result(
+                    f"old_string found {match_count} times in {arguments['path']}; "
+                    "must be unique"
+                )
+
+            updated_content = content.replace(
+                arguments["old_string"], arguments["new_string"], 1
+            )
+            updated_bytes = updated_content.encode("utf-8")
+            try:
+                handle.seek(0)
+                handle.truncate()
+                handle.write(updated_bytes)
+                handle.flush()
+            except OSError as exc:
+                raise ValueError(f"could not write file: {path}: {exc}") from exc
     structured_content: EditStructuredContent = {
         "path": path,
         "bytes_before": len(content_bytes),

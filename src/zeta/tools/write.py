@@ -1,12 +1,4 @@
-"""The built-in file writing tool.
-
-Sandbox
--------
-Layer A rejects lexical paths outside the session cwd. The anchored openat
-walk, O_EXCL/O_TRUNC selection, and O_NOFOLLOW checks are best effort.
-TOCTOU races, hard-link writes, and ancestor-symlink swaps are out of scope
-for ZETA-15 and tracked in ZETA-22.
-"""
+"""The built-in file writing tool."""
 
 from __future__ import annotations
 
@@ -16,7 +8,7 @@ from typing import NotRequired, TypedDict
 
 from ..types import StructuredToolResult
 from ._sandbox import _path_from_fd as _sandbox_path_from_fd
-from ._sandbox import _path_open_error, open_parent
+from ._sandbox import open_target
 from .registry import AbortSignal, ToolRegistry, _success_result, text_block
 
 
@@ -38,49 +30,38 @@ def _path_from_fd(file_descriptor: int) -> str:
     return _sandbox_path_from_fd(file_descriptor)
 
 
-def _open_anchored(
+def _write_target(
     registry: ToolRegistry,
     raw_path: str,
+    content: bytes,
+    *,
     create_parents: bool,
-) -> tuple[int, bool, str]:
-    with open_parent(registry, raw_path, create_parents=create_parents) as parent:
-        components, parent_fd, fallback_path = parent
-        file_descriptor: int | None = None
+    was_created: bool,
+) -> str:
+    flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    if was_created:
+        flags |= os.O_CREAT | os.O_EXCL
+    with open_target(
+        registry,
+        raw_path,
+        flags=flags,
+        mode=0o666,
+        create_parents=create_parents,
+    ) as (file_descriptor, _resolved_path):
+        path = _path_from_fd(file_descriptor)
+        if not was_created:
+            os.ftruncate(file_descriptor, 0)
         try:
-            try:
-                file_descriptor = os.open(
-                    components[-1],
-                    os.O_WRONLY
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | os.O_NOFOLLOW
-                    | os.O_CLOEXEC,
-                    0o666,
-                    dir_fd=parent_fd,
-                )
-                was_created = True
-            except FileExistsError:
-                try:
-                    file_descriptor = os.open(
-                        components[-1],
-                        os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                        dir_fd=parent_fd,
-                    )
-                except OSError as open_error:
-                    raise _path_open_error(fallback_path, open_error) from open_error
-                was_created = False
-            except OSError as open_error:
-                raise _path_open_error(fallback_path, open_error) from open_error
-
-            actual_path = _path_from_fd(file_descriptor)
-            if not was_created:
-                os.ftruncate(file_descriptor, 0)
-            result = file_descriptor, was_created, actual_path
-            file_descriptor = None
-            return result
-        finally:
-            if file_descriptor is not None:
-                os.close(file_descriptor)
+            handle = os.fdopen(file_descriptor, "wb")
+        except (OSError, ValueError):
+            os.close(file_descriptor)
+            raise
+        try:
+            with handle:
+                handle.write(content)
+        except OSError as exc:
+            raise ValueError(f"could not write file: {path}: {exc}") from exc
+    return path
 
 
 async def _write(
@@ -93,26 +74,32 @@ async def _write(
     except UnicodeEncodeError as exc:
         raise ValueError("content must be valid UTF-8") from exc
 
-    file_descriptor, was_created, path = _open_anchored(
-        registry,
-        arguments["path"],
-        arguments.get("create_parents", False),
-    )
-
     try:
-        handle = os.fdopen(file_descriptor, "wb")
-    except (OSError, ValueError):
-        os.close(file_descriptor)
-        raise
-
-    try:
-        with handle:
-            handle.write(encoded_content)
-    except OSError as exc:
-        raise ValueError(f"could not write file: {path}: {exc}") from exc
+        path = _write_target(
+            registry,
+            arguments["path"],
+            encoded_content,
+            create_parents=arguments.get("create_parents", False),
+            was_created=True,
+        )
+        was_created = True
+    except FileExistsError:
+        try:
+            path = _write_target(
+                registry,
+                arguments["path"],
+                encoded_content,
+                create_parents=arguments.get("create_parents", False),
+                was_created=False,
+            )
+        except ValueError as exc:
+            if str(exc).startswith("parent directory does not exist:"):
+                raise ValueError("path escaped sandbox") from exc
+            raise
+        was_created = False
 
     structured_content: WriteStructuredContent = {
-        "path": str(path),
+        "path": path,
         "bytes_written": len(encoded_content),
         "sha256": hashlib.sha256(encoded_content).hexdigest(),
         "was_created": was_created,

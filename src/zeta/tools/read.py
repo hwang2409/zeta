@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import codecs
 import hashlib
-from typing import Any
+import os
+from pathlib import Path
+from typing import Any, BinaryIO, Protocol
 
 from ..core.abort import AbortSignal
 from ..types import StructuredToolResult
+from ._sandbox import open_target
 from .registry import (
     ToolRegistry,
     _BoundedText,
@@ -16,18 +19,21 @@ from .registry import (
 )
 
 
-async def _read(
-    registry: ToolRegistry,
-    arguments: dict[str, Any],
+class _Digest(Protocol):
+    def update(self, data: bytes, /) -> None: ...
+
+    def hexdigest(self) -> str: ...
+
+
+async def _read_handle(
+    handle: BinaryIO,
+    path: Path,
+    offset: int,
+    limit: int | None,
+    output: _BoundedText,
+    digest: _Digest,
     abort_signal: AbortSignal,
 ) -> StructuredToolResult:
-    path = registry._path(arguments["path"])
-    if not path.is_file():
-        raise ValueError(f"not a file: {arguments['path']}")
-    offset = arguments.get("offset", 0)
-    limit = arguments.get("limit")
-    output = _BoundedText(registry.max_output_chars)
-    digest = hashlib.sha256()
     line_count = 0
     last_byte: int | None = None
     decoder = codecs.getincrementaldecoder("utf-8")()
@@ -71,46 +77,92 @@ async def _read(
             line_started = True
         output.append(character)
 
-    try:
+    await _yield_for_abort(abort_signal)
+    while True:
+        chunk = handle.read(64 * 1024)
+        if not chunk:
+            await _yield_for_abort(abort_signal)
+            break
+        digest.update(chunk)
+        line_count += chunk.count(b"\n")
+        last_byte = chunk[-1]
+        for character in decoder.decode(chunk, final=False):
+            append_character(character)
         await _yield_for_abort(abort_signal)
-        with path.open("rb") as handle:
-            while True:
-                chunk = handle.read(64 * 1024)
-                if not chunk:
-                    await _yield_for_abort(abort_signal)
-                    break
-                digest.update(chunk)
-                line_count += chunk.count(b"\n")
-                last_byte = chunk[-1]
-                for character in decoder.decode(chunk, final=False):
-                    append_character(character)
-                await _yield_for_abort(abort_signal)
-            for character in decoder.decode(b"", final=True):
-                append_character(character)
-            if pending_carriage_return:
-                pending_carriage_return = False
-                append_newline()
-            if line_has_data:
-                selected = line_index >= offset and (
-                    limit is None or selected_count < limit
-                )
-                if selected:
-                    if not line_started:
-                        output.begin_line()
-                    selected_count += 1
-    except OSError as exc:
-        raise ValueError(f"could not read file: {exc}") from exc
+    for character in decoder.decode(b"", final=True):
+        append_character(character)
+    if pending_carriage_return:
+        pending_carriage_return = False
+        append_newline()
+    if line_has_data:
+        selected = line_index >= offset and (
+            limit is None or selected_count < limit
+        )
+        if selected:
+            if not line_started:
+                output.begin_line()
+            selected_count += 1
     if last_byte is not None and last_byte != ord("\n"):
         line_count += 1
-    structured_content = {
-        "path": str(path),
-        "sha256": digest.hexdigest(),
-        "line_count": line_count,
-    }
     return _success_result(
         output.render(),
-        structured_content=structured_content,
+        structured_content={
+            "path": str(path),
+            "sha256": digest.hexdigest(),
+            "line_count": line_count,
+        },
     )
+
+
+def _is_external_path(path: Path, cwd: Path) -> bool:
+    try:
+        path.relative_to(cwd)
+    except ValueError:
+        return True
+    return False
+
+
+async def _read(
+    registry: ToolRegistry,
+    arguments: dict[str, Any],
+    abort_signal: AbortSignal,
+) -> StructuredToolResult:
+    raw_path = arguments["path"]
+    path = registry._path(raw_path)
+    offset = arguments.get("offset", 0)
+    limit = arguments.get("limit")
+    output = _BoundedText(registry.max_output_chars)
+    digest = hashlib.sha256()
+    try:
+        if _is_external_path(path, registry.cwd):
+            if not path.is_file():
+                raise ValueError(f"not a file: {raw_path}")
+            with path.open("rb") as handle:
+                return await _read_handle(
+                    handle, path, offset, limit, output, digest, abort_signal
+                )
+        with open_target(
+            registry,
+            raw_path,
+            flags=os.O_RDONLY | os.O_CLOEXEC,
+        ) as (file_descriptor, resolved_path):
+            try:
+                handle = os.fdopen(file_descriptor, "rb")
+            except (OSError, ValueError):
+                os.close(file_descriptor)
+                raise
+            with handle:
+                return await _read_handle(
+                    handle,
+                    resolved_path,
+                    offset,
+                    limit,
+                    output,
+                    digest,
+                    abort_signal,
+                )
+    except OSError as exc:
+        raise ValueError(f"could not read file: {exc}") from exc
 
 
 def register(registry: ToolRegistry) -> None:
