@@ -727,14 +727,16 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         if token_budget_override is not None and token_budget_override > 0
         else max(metadata.compaction_budget, 200_000)
     )
-    loop = AgentLoop(
-        backend,
-        store,
-        approval_policy=approval_policy,
-        token_budget=effective_token_budget,
-        retained_tail=metadata.retained_tail,
-        on_completion_success=completion_success,
-    )
+    max_turns_override = getattr(args, "max_turns", None)
+    loop_kwargs: dict[str, Any] = {
+        "approval_policy": approval_policy,
+        "token_budget": effective_token_budget,
+        "retained_tail": metadata.retained_tail,
+        "on_completion_success": completion_success,
+    }
+    if max_turns_override is not None and max_turns_override > 0:
+        loop_kwargs["max_turns"] = max_turns_override
+    loop = AgentLoop(backend, store, **loop_kwargs)
     return TUIApp(
         loop,
         provider=provider,

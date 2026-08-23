@@ -192,6 +192,10 @@ def open_target(
             _verify_ancestry(parent_fd, registry._cwd_identity)
             target_stat = os.fstat(target_fd)
             if not stat.S_ISREG(target_stat.st_mode):
+                if stat.S_ISDIR(target_stat.st_mode):
+                    raise ValueError(
+                        f"{fallback_path} is a directory; use bash (e.g. `ls`) to list its contents"
+                    )
                 raise ValueError(f"not a file: {fallback_path}")
             if flags & (os.O_WRONLY | os.O_RDWR) and target_stat.st_nlink > 1:
                 raise ValueError(
