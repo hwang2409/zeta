@@ -296,7 +296,13 @@ class ContextAssembler:
             [item.message for item in candidates],
             backend=backend or self.backend,
             system_prompt=system_prompt,
-            max_source_tokens=max(1, self.token_budget // 2),
+            # Cap the source at the budget minus a small overhead for the
+            # summary prompt and response, floored at half-budget so tiny
+            # budgets used in tests still get a workable cap. Old behaviour
+            # was `budget // 2` unconditionally, which dead-ended real
+            # sessions with a single large tool_result in the compactible
+            # range even though the provider window had room for it.
+            max_source_tokens=max(1, self.token_budget // 2, self.token_budget - 8_000),
             on_success=self.on_completion_success,
             on_usage=self.record_usage,
         )
