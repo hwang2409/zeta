@@ -59,6 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override the compaction/context token budget for this run",
     )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        help="cap the assistant's tool-use loop turns per user message",
+    )
     commands = parser.add_subparsers(dest="command")
     login_parser = commands.add_parser("login", help="log in to an OAuth provider")
     login_parser.add_argument(

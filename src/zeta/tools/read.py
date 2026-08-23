@@ -136,6 +136,10 @@ async def _read(
     try:
         if _is_external_path(path, registry.cwd):
             if not path.is_file():
+                if path.is_dir():
+                    raise ValueError(
+                        f"{raw_path} is a directory; use bash (e.g. `ls`) to list its contents"
+                    )
                 raise ValueError(f"not a file: {raw_path}")
             with path.open("rb") as handle:
                 return await _read_handle(
