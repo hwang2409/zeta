@@ -1456,7 +1456,7 @@ async def test_agent_loop_executes_tool_calls_through_registry(tmp_path: Path) -
     assert result_message.tool_result is not None
     assert result_message.tool_result.content == "from registry"
     assert events[-1].type.value == "agent_end"
-    assert backend.calls[0][1][0]["name"] == "read"
+    assert any(schema["name"] == "read" for schema in backend.calls[0][1])
 
 
 @pytest.mark.asyncio

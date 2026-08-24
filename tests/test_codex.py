@@ -36,6 +36,40 @@ from zeta.types import (
 )
 
 
+def test_codex_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
+    payload = build_responses_payload(
+        [
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult(
+                    "call-1",
+                    "stale",
+                    content_blocks=[
+                        {
+                            "type": "image",
+                            "data": "aGVsbG8=",
+                            "mimeType": "image/png",
+                        },
+                        {
+                            "type": "resource",
+                            "resource": {
+                                "uri": "file:///tmp/note.txt",
+                                "text": "note",
+                            },
+                        },
+                    ],
+                ),
+            )
+        ],
+        [],
+        model="codex-test",
+    )
+
+    assert payload["input"][0]["output"] == (
+        "[image block]\n[resource: file:///tmp/note.txt]"
+    )
+
+
 def access_token(account_id: str = "account-test") -> str:
     def encode(value: object) -> str:
         return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")

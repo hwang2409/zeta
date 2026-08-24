@@ -8,15 +8,17 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib
 import inspect
 import json
 import math
 import os
+import pkgutil
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol
 
 from ..core.abort import AbortGenerationRegistry
 from ..core.abort import AbortSignal as ToolAbortSignal
@@ -31,12 +33,14 @@ from ..core.store import ConversationStore
 from ..types import (
     StreamEvent,
     StreamEventType,
+    ToolContentBlock,
     StructuredContentValue,
     StructuredToolResult,
     ToolCall,
     ToolResult,
     ToolSchema,
     ToolTextBlock,
+    validate_tool_content_block,
 )
 
 AbortSignal = ToolAbortSignal
@@ -47,6 +51,44 @@ ToolHandler = Callable[
     ..., ToolHandlerResult | Awaitable[ToolHandlerResult]
 ]
 ToolStream = Literal["stdout", "stderr"]
+
+
+def _discover_tool_modules() -> list[str]:
+    package = importlib.import_module(__package__)
+    return sorted(
+        f"{package.__name__}.{module_info.name}"
+        for module_info in pkgutil.iter_modules(package.__path__)
+        if not module_info.name.startswith("_")
+    )
+
+
+def _register_discovered_tools(registry: ToolRegistry) -> None:
+    """Load modules with ``register(registry)``; underscore modules are helpers."""
+
+    for module_name in _discover_tool_modules():
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001 - identify broken modules clearly
+            raise RuntimeError(
+                f"failed to load tool module {module_name}: {exc}"
+            ) from exc
+        if not hasattr(module, "register"):
+            continue
+        register = module.register
+        if not callable(register):
+            raise TypeError(
+                f"tool module {module_name} has a non-callable register contract"
+            )
+        try:
+            result = register(registry)
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                raise TypeError("register must be synchronous")
+        except Exception as exc:  # noqa: BLE001 - name malformed modules clearly
+            raise RuntimeError(
+                f"failed to register tool module {module_name}: {exc}"
+            ) from exc
 
 
 class ToolStreamPublisher(Protocol):
@@ -213,6 +255,29 @@ def _legacy_result(result: ToolResult) -> StructuredToolResult:
         return _error_result(f"invalid tool result: {exc}")
 
 
+def _normalize_result(
+    result: StructuredToolResult,
+    max_output_chars: int,
+) -> StructuredToolResult:
+    content: list[ToolContentBlock] = []
+    remaining = max_output_chars
+    for block in result["content"]:
+        if block["type"] != "text":
+            content.append(block)
+            continue
+        full_size = max(block["full_size"], len(block["text"].encode("utf-8")))
+        shown = block["text"][:remaining]
+        normalized = text_block(shown, full_size=full_size)
+        if "annotations" in block:
+            normalized["annotations"] = block["annotations"]
+        normalized["truncated"] |= (
+            block["truncated"] or shown != block["text"]
+        )
+        remaining -= len(shown)
+        content.append(normalized)
+    return {**result, "content": content}
+
+
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
     name: str
@@ -296,9 +361,7 @@ class ToolRegistry:
         )
         self._tools: dict[str, ToolDefinition] = {}
         if register_builtin:
-            from . import register_default_tools
-
-            register_default_tools(self)
+            _register_discovered_tools(self)
 
     @property
     def schemas(self) -> list[ToolSchema]:
@@ -416,17 +479,20 @@ class ToolRegistry:
                 tool_call, _boundary_signal, _scope_signal
             )
             if abort_result is not None:
-                return abort_result
+                return _normalize_result(abort_result, self.max_output_chars)
         if _signal_is_set(signal_state):
             signal_state, abort_result = self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
             )
             if abort_result is not None:
-                return abort_result
+                return _normalize_result(abort_result, self.max_output_chars)
         definition = self._tools.get(tool_call.name)
         if definition is None:
             self._abort_approval(tool_call)
-            return _error_result(f"unknown tool: {tool_call.name}")
+            return _normalize_result(
+                _error_result(f"unknown tool: {tool_call.name}"),
+                self.max_output_chars,
+            )
         try:
             arguments = (
                 _validate_arguments(tool_call.arguments, definition.parameters)
@@ -435,13 +501,16 @@ class ToolRegistry:
             )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             self._abort_approval(tool_call)
-            return _error_result(f"invalid arguments: {exc}")
+            return _normalize_result(
+                _error_result(f"invalid arguments: {exc}"),
+                self.max_output_chars,
+            )
         if _signal_is_set(signal_state):
             signal_state, abort_result = self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
             )
             if abort_result is not None:
-                return abort_result
+                return _normalize_result(abort_result, self.max_output_chars)
         gate_result, execution_signal = await self._approval_gate.run(
             tool_call,
             arguments,
@@ -449,11 +518,16 @@ class ToolRegistry:
             lambda current: self._next_abort_generation(current, _scope_signal),
         )
         if gate_result is not None:
-            return _legacy_result(gate_result)
+            return _normalize_result(
+                _legacy_result(gate_result), self.max_output_chars
+            )
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():
-                return _legacy_result(_canceled_result(tool_call.id))
+                return _normalize_result(
+                    _legacy_result(_canceled_result(tool_call.id)),
+                    self.max_output_chars,
+                )
         stream_publisher = (
             _ToolCallStreamPublisher(tool_call, execution_signal, _stream_sink)
             if _stream_sink is not None
@@ -467,11 +541,11 @@ class ToolRegistry:
                     execution_signal,
                 )
             except _ToolCanceled:
-                return _legacy_result(_canceled_result(tool_call.id))
+                result = _legacy_result(_canceled_result(tool_call.id))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
-                return _error_result(str(exc))
+                result = _error_result(str(exc))
         else:
             result = await self._invoke_streaming_handler(
                 definition.handler,
@@ -482,21 +556,26 @@ class ToolRegistry:
             )
         if isinstance(result, ToolResult):
             if result.tool_call_id != tool_call.id:
-                return _error_result(
+                normalized_result = _error_result(
                     f"tool result id mismatch: expected {tool_call.id}, "
                     f"got {result.tool_call_id}"
                 )
-            return _legacy_result(result)
-        if isinstance(result, Mapping):
+            else:
+                normalized_result = _legacy_result(result)
+        elif isinstance(result, Mapping):
             try:
-                return validate_tool_result(result)
+                normalized_result = validate_tool_result(result)
             except ValueError as exc:
-                return _error_result(f"invalid tool handler result: {exc}")
-        if isinstance(result, str):
-            return _success_result(text_block(result))
-        return _error_result(
-            "invalid tool handler result: expected str or structured tool result"
-        )
+                normalized_result = _error_result(
+                    f"invalid tool handler result: {exc}"
+                )
+        elif isinstance(result, str):
+            normalized_result = _success_result(text_block(result))
+        else:
+            normalized_result = _error_result(
+                "invalid tool handler result: expected str or structured tool result"
+            )
+        return _normalize_result(normalized_result, self.max_output_chars)
 
     async def _invoke_streaming_handler(
         self,
@@ -750,22 +829,11 @@ def validate_tool_result(result: object) -> StructuredToolResult:
             raise ValueError("structuredContent must be an object or null")
         _validate_structured_content(structured_content)
 
-    for index, block in enumerate(content):
-        if type(block) is not dict:
-            raise ValueError(f"content[{index}] must be an object")
-        block_keys = set(block)
-        expected_block_keys = {"type", "text", "truncated", "full_size"}
-        if block_keys != expected_block_keys:
-            raise ValueError(f"content[{index}] has an invalid shape")
-        if block["type"] != "text":
-            raise ValueError(f"content[{index}].type must be text")
-        if type(block["text"]) is not str:
-            raise ValueError(f"content[{index}].text must be a string")
-        if type(block["truncated"]) is not bool:
-            raise ValueError(f"content[{index}].truncated must be a boolean")
-        if type(block["full_size"]) is not int or block["full_size"] < 0:
-            raise ValueError(f"content[{index}].full_size must be nonnegative")
-    return cast(StructuredToolResult, result)
+    normalized_content = [
+        validate_tool_content_block(index, block)
+        for index, block in enumerate(content)
+    ]
+    return {**result, "content": normalized_content}
 
 
 def _validate_structured_content(value: object) -> None:

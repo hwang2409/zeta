@@ -21,10 +21,34 @@ from zeta.mcp import (
     load_mcp_config,
     mount_mcp_servers,
 )
+from zeta.mcp.client import translate_call_result
 from zeta.tools import ToolRegistry
 from zeta.types import TextContent, ToolCall
 
 mount_module = importlib.import_module("zeta.mcp.mount")
+
+
+def test_mcp_non_text_blocks_use_readable_flattening() -> None:
+    result = translate_call_result(
+        {
+            "content": [
+                {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///tmp/note.txt",
+                        "blob": "bm90ZQ==",
+                    },
+                },
+            ],
+            "isError": False,
+        }
+    )
+
+    assert [block["text"] for block in result["content"]] == [
+        "[image block]",
+        "[resource: file:///tmp/note.txt]",
+    ]
 
 
 def _stdio_source() -> str:

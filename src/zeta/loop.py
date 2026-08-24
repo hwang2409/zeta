@@ -16,6 +16,7 @@ from .types import (
     CompletionBackend,
     ContentBlock,
     ErrorInfo,
+    flatten_tool_content,
     Message,
     MessageRole,
     StreamEvent,
@@ -75,23 +76,11 @@ def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
         structured_result = validate_tool_result(result)
     except ValueError as exc:
         return ToolResult(expected_id, f"invalid tool result: {exc}", True)
-    blocks = structured_result["content"]
-    is_error = structured_result["isError"]
-    text_values = []
-    for block in blocks:
-        text = block["text"]
-        if block["truncated"]:
-            shown_bytes = len(text.encode("utf-8"))
-            text = (
-                f"{text}\n[truncated: {shown_bytes} of "
-                f"{block['full_size']} bytes]"
-            )
-        text_values.append(text)
     return ToolResult(
         expected_id,
-        "\n".join(text_values),
-        is_error,
-        content_blocks=blocks,
+        flatten_tool_content(structured_result["content"]),
+        structured_result["isError"],
+        content_blocks=structured_result["content"],
     )
 
 

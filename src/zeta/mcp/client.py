@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -10,7 +9,12 @@ from typing import Protocol
 
 from ..core.abort import AbortSignal
 from ..tools.registry import text_block
-from ..types import StructuredToolResult, ToolTextBlock
+from ..types import (
+    StructuredToolResult,
+    ToolTextBlock,
+    flatten_tool_content,
+    validate_tool_content_block,
+)
 from .config import MCPServerConfig
 
 
@@ -95,7 +99,12 @@ def translate_call_result(value: object) -> StructuredToolResult:
         if type(item) is not dict:
             return make_error_result(f"MCP content[{index}] must be an object")
         if item.get("type") != "text" or type(item.get("text")) is not str:
-            rendered = json.dumps(item, sort_keys=True, separators=(",", ":"))
+            try:
+                block = validate_tool_content_block(index, item)
+            except ValueError:
+                rendered = f"[unsupported MCP block: {item.get('type', 'unknown')}]"
+            else:
+                rendered = flatten_tool_content([block])
             blocks.append(text_block(rendered))
             continue
         blocks.append(text_block(item["text"]))

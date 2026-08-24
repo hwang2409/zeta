@@ -28,6 +28,7 @@ from .usage import normalize_usage
 from ..types import (
     CompletionBackend,
     ContentBlock,
+    flatten_tool_content,
     Message,
     MessageRole,
     RedactedThinkingContent,
@@ -837,7 +838,11 @@ def build_messages_payload(
                 {
                     "type": "tool_result",
                     "tool_use_id": message.tool_result.tool_call_id,
-                    "content": message.tool_result.content,
+                    "content": (
+                        flatten_tool_content(message.tool_result.content_blocks)
+                        if message.tool_result.content_blocks is not None
+                        else message.tool_result.content
+                    ),
                     "is_error": message.tool_result.is_error,
                 }
             ]

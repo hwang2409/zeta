@@ -8,6 +8,7 @@ from typing import Any
 
 from ..types import (
     ContentBlock,
+    flatten_tool_content,
     Message,
     MessageRole,
     TextContent,
@@ -71,7 +72,11 @@ def build_responses_payload(
                 {
                     "type": "function_call_output",
                     "call_id": message.tool_result.tool_call_id,
-                    "output": message.tool_result.content,
+                    "output": (
+                        flatten_tool_content(message.tool_result.content_blocks)
+                        if message.tool_result.content_blocks is not None
+                        else message.tool_result.content
+                    ),
                 }
             )
         else:
