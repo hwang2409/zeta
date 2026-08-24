@@ -40,6 +40,7 @@ from ..types import (
     ToolResult,
     ToolSchema,
     ToolTextBlock,
+    validate_tool_content_block,
 )
 
 AbortSignal = ToolAbortSignal
@@ -827,45 +828,8 @@ def validate_tool_result(result: object) -> StructuredToolResult:
         _validate_structured_content(structured_content)
 
     for index, block in enumerate(content):
-        _validate_content_block(index, block)
+        validate_tool_content_block(index, block)
     return cast(StructuredToolResult, result)
-
-
-def _validate_content_block(index: int, block: object) -> None:
-    if type(block) is not dict:
-        raise ValueError(f"content[{index}] must be an object")
-    block_type = block.get("type")
-    if block_type == "text":
-        expected_keys = {"type", "text", "truncated", "full_size"}
-        if set(block) != expected_keys:
-            raise ValueError(f"content[{index}] has an invalid text shape")
-        if type(block["text"]) is not str:
-            raise ValueError(f"content[{index}].text must be a string")
-        if type(block["truncated"]) is not bool:
-            raise ValueError(f"content[{index}].truncated must be a boolean")
-        if type(block["full_size"]) is not int or block["full_size"] < 0:
-            raise ValueError(f"content[{index}].full_size must be nonnegative")
-        return
-    if block_type == "image":
-        if type(block.get("data")) is not str:
-            raise ValueError(f"content[{index}].data must be a string")
-        if type(block.get("mimeType")) is not str:
-            raise ValueError(f"content[{index}].mimeType must be a string")
-        return
-    if block_type == "resource":
-        resource = block.get("resource")
-        if type(resource) is not dict:
-            raise ValueError(f"content[{index}].resource must be an object")
-        if type(resource.get("uri")) is not str:
-            raise ValueError(f"content[{index}].resource.uri must be a string")
-        for key in ("mimeType", "text", "blob"):
-            value = resource.get(key)
-            if value is not None and type(value) is not str:
-                raise ValueError(
-                    f"content[{index}].resource.{key} must be a string"
-                )
-        return
-    raise ValueError(f"content[{index}].type is unsupported: {block_type}")
 
 
 def _validate_structured_content(value: object) -> None:
