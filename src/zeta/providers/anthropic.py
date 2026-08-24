@@ -357,7 +357,8 @@ class AnthropicBackend(CompletionBackend):
             self._refresh_token,
             lambda error: isinstance(error, AnthropicAuthError) and error.status_code == 401,
             lambda error: AnthropicAuthError(
-                "token refresh did not restore auth; re-login required", status_code=401
+                "Anthropic authentication failed after token refresh; run `zeta login`",
+                status_code=401,
             ),
         )
         try:
