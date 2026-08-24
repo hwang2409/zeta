@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from rich.console import RenderableType
 from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -20,22 +21,35 @@ from ..types import (
     StreamEventType,
     TextContent,
     ThinkingContent,
+    ToolCall,
     ToolUseContent,
 )
 from .theme import (
     ACCENT,
+    AFFORDANCE,
     BODY,
+    CARD_BG,
+    CARD_BORDER,
     CHROME,
     CODE_BG,
+    COMMAND,
     DIM,
     ERROR,
     OK,
+    RECEIPT,
+    THOUGHT,
 )
 
 
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
+MAX_TOOL_LINES = 15
 SPINNER_FRAMES = ("·", "•", "●", "•")
+RECEIPT_TOOLS = frozenset(
+    {"read", "glob", "grep", "search", "find", "list", "websearch"}
+)
+SUMMARY_TOOLS = frozenset({"glob", "grep", "search", "find", "websearch"})
+ToolRenderMode = Literal["card", "receipt"]
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -47,6 +61,178 @@ def _truncate(value: str, limit: int) -> str:
 def _arguments(arguments: dict[str, Any]) -> str:
     encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
     return _truncate(encoded, MAX_ARGUMENTS)
+
+
+def _tool_content(event: StreamEvent) -> str:
+    result = event.tool_result
+    if result is None:
+        return ""
+    blocks = result.content_blocks or []
+    return flatten_tool_content(blocks) if blocks else result.content
+
+
+def _summary_appropriate(event: StreamEvent) -> bool:
+    if event.data.get("summary_appropriate") is True:
+        return True
+    result = event.tool_result
+    if result is None or not result.content_blocks:
+        return False
+    return any(
+        block.get("annotations", {}).get("summary_appropriate") is True
+        for block in result.content_blocks
+        if block.get("type") == "text"
+    )
+
+
+def tool_render_mode(event: StreamEvent) -> ToolRenderMode:
+    """Choose the one display mode for completed tool results."""
+
+    call = event.tool_call
+    result = event.tool_result
+    if call is None or result is None or call.name.lower() not in RECEIPT_TOOLS:
+        return "card"
+    line_count = len(_tool_content(event).splitlines()) or 1
+    if (
+        line_count < 3
+        or call.name.lower() in SUMMARY_TOOLS
+        or _summary_appropriate(event)
+    ):
+        return "receipt"
+    return "card"
+
+
+def _command(arguments: dict[str, Any]) -> str:
+    value = arguments.get("cmd", arguments.get("command", ""))
+    return str(value) if value else _arguments(arguments)
+
+
+def _tool_header(call: ToolCall) -> Text:
+    if call.name.lower() == "bash":
+        return Text.assemble(("$ ", COMMAND), (_command(call.arguments), COMMAND))
+    return Text.assemble((call.name, COMMAND), (f" {_arguments(call.arguments)}", DIM))
+
+
+def _receipt_arguments(call: ToolCall, content: str) -> str:
+    arguments = call.arguments
+    name = call.name.lower()
+    if name == "read":
+        label = str(arguments.get("path", arguments.get("file", "")))
+        limit = arguments.get("limit")
+        return f"{label} [limit={limit}]" if limit is not None else label
+    if name in SUMMARY_TOOLS:
+        pattern = arguments.get(
+            "pattern", arguments.get("query", arguments.get("path", ""))
+        )
+        if not content:
+            return f'"{pattern}"'
+        matches = re.search(r"(\d+)\s+matches?", content, re.IGNORECASE)
+        count = (
+            matches.group(1)
+            if matches
+            else str(sum(bool(line.strip()) for line in content.splitlines()))
+        )
+        return f'"{pattern}" [{count} matches]'
+    return _arguments(arguments)
+
+
+def _tool_receipt(event: StreamEvent) -> Text:
+    call = event.tool_call
+    assert call is not None
+    result = event.tool_result
+    assert result is not None
+    prefix = "failed · " if result.is_error else ""
+    suffix = _receipt_arguments(call, _tool_content(event))
+    return Text(
+        f"{prefix}{call.name}{f' {suffix}' if suffix else ''}",
+        style=RECEIPT,
+    )
+
+
+def _tool_body(event: StreamEvent) -> Text:
+    content = _tool_content(event)
+    if not content:
+        content = "empty"
+    lines = content.splitlines() or ["empty"]
+    truncated = len(lines) > MAX_TOOL_LINES
+    visible = lines[:MAX_TOOL_LINES]
+    result = event.tool_result
+    if result is not None and result.content_blocks:
+        sizes = [
+            block["full_size"]
+            for block in result.content_blocks
+            if block.get("type") == "text" and block.get("truncated")
+        ]
+        if sizes:
+            visible.append(f"[truncated; full_size={max(sizes)}]")
+    rendered = Text(
+        "\n".join(_truncate(line, MAX_RESULT) for line in visible),
+        style=BODY,
+    )
+    if truncated:
+        rendered.append(f"\n… +{len(lines) - MAX_TOOL_LINES} lines", style=AFFORDANCE)
+    return rendered
+
+
+def _tool_card(event: StreamEvent, *, running: bool = False) -> Panel:
+    call = event.tool_call or ToolCall(
+        event.tool_result.tool_call_id if event.tool_result is not None else "unknown",
+        "tool",
+        {},
+    )
+    body = Text("running…", style=DIM) if running else _tool_body(event)
+    return _tool_panel(
+        call,
+        body,
+        error=bool(event.tool_result and event.tool_result.is_error),
+    )
+
+
+def _tool_panel(call: ToolCall, body: Text, *, error: bool = False) -> Panel:
+    return Panel(
+        Text.assemble(_tool_header(call), "\n", body),
+        border_style=ERROR if error else CARD_BORDER,
+        style=CARD_BG,
+        padding=(0, 1),
+        expand=True,
+    )
+
+
+def render_tool_progress(call: ToolCall, content: str) -> Panel:
+    """Render streamed tool output inside the same card surface."""
+
+    body = Text(content or "running…", style=DIM)
+    return _tool_panel(call, body)
+
+
+def collapse_thought(value: str) -> str:
+    """Keep the first sentence of provider reasoning for the transcript."""
+
+    normalized = " ".join(value.replace("\n", " ").split())
+    if not normalized:
+        return ""
+    match = re.search(r"^(.+?[.!?])(?:\s|$)", normalized)
+    sentence = match.group(1) if match else normalized
+    return _truncate(sentence, MAX_RESULT)
+
+
+def format_thought(value: str, duration: float | None = None) -> Text:
+    label = "thought"
+    if duration is not None:
+        label += f" · {duration:.1f}s"
+    summary = collapse_thought(value)
+    return Text.assemble((label, THOUGHT), (f"  {summary}" if summary else "", THOUGHT))
+
+
+def _duration(data: dict[str, Any]) -> float | None:
+    for key in ("duration", "elapsed_seconds", "thinking_duration"):
+        value = data.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    for key in ("duration_ms", "elapsed_ms", "thinking_duration_ms"):
+        value = data.get(key)
+        if isinstance(value, (int, float)):
+            return float(value) / 1000
+    return None
 
 
 def render_markdown(value: str) -> RenderableType:
@@ -196,56 +382,33 @@ def render_event(event: StreamEvent) -> RenderableType | None:
     """
 
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
-        return Text.assemble(
-            ("▸ ", CHROME),
-            (event.tool_call.name, ACCENT),
-            (f"({_arguments(event.tool_call.arguments)})", CHROME),
-        )
+        if event.tool_call.name.lower() in RECEIPT_TOOLS:
+            suffix = _receipt_arguments(event.tool_call, "")
+            return Text(
+                f"{event.tool_call.name}{f' {suffix}' if suffix else ''} · running",
+                style=RECEIPT,
+            )
+        return _tool_card(event, running=True)
     if event.type is StreamEventType.TOOL_EXECUTION_UPDATE and event.delta is not None:
         stream = event.data.get("stream")
         label = f"[{stream}] " if stream in {"stdout", "stderr"} else ""
         return Text(f"  ↳ {label}{event.delta}", style=DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:
-        style = ERROR if event.tool_result.is_error else OK
-        marker = "[tool error]" if event.tool_result.is_error else "[tool result]"
-        content_blocks = event.tool_result.content_blocks or []
-        truncated_sizes = [
-            block["full_size"]
-            for block in content_blocks
-            if block["type"] == "text" and block["truncated"]
-        ]
-        if truncated_sizes:
-            marker = f"{marker} [truncated; full_size={max(truncated_sizes)}]"
-        content = (
-            flatten_tool_content(content_blocks)
-            if content_blocks
-            else event.tool_result.content
-        )
-        lines = content.split("\n")
-        if not content:
-            lines = ["empty"]
-        rendered = Text()
-        for index, line in enumerate(lines):
-            if index:
-                rendered.append("\n")
-            rendered.append("  ↳ ", style=DIM)
-            if index == 0:
-                rendered.append(f"{marker} ", style=style)
-            rendered.append(_truncate(line, MAX_RESULT), style=DIM)
-        return rendered
+        if tool_render_mode(event) == "receipt":
+            return _tool_receipt(event)
+        return _tool_card(event)
     if event.type is StreamEventType.ERROR:
         message = event.error.message if event.error else "unknown error"
         return Text(f"[error] {message}", style=ERROR)
     if event.type is StreamEventType.AGENT_END:
-        return Text("[done]", style=OK)
+        return Text("done", style=OK)
     if event.type is StreamEventType.TURN_START:
-        turn = event.data.get("turn", "?")
-        return Text(f"[turn {turn}]", style=CHROME)
+        return None
     if event.type is StreamEventType.MESSAGE_UPDATE:
         if isinstance(event.content, ThinkingContent):
-            return Text(f"[thinking] {event.content.text}", style=DIM)
+            return format_thought(event.content.text, _duration(event.data))
         if isinstance(event.content, RedactedThinkingContent):
-            return Text("[thinking] redacted", style=DIM)
+            return format_thought("redacted", _duration(event.data))
         if isinstance(event.content, ToolUseContent):
             return None
         if isinstance(event.content, TextContent) or event.delta is not None:
@@ -276,6 +439,8 @@ def format_status(
     output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
     if input_tokens is not None and output_tokens is not None:
         token_text = f"tok {input_tokens}/{output_tokens}"
+    elif input_tokens is not None or output_tokens is not None:
+        token_text = f"tok in={input_tokens or 0} out={output_tokens or 0}"
     elif usage.get("total_tokens") is not None:
         token_text = f"tok {usage['total_tokens']}"
     elif token_count is not None:
@@ -283,34 +448,27 @@ def format_status(
     else:
         token_text = "tok ?"
 
-    if (
-        session_id is None
-        and retained_tail is None
-        and token_count is None
-        and width is None
-        and not show_spinner
-    ):
-        line = f" {provider}/{model}  {loop_state}"
-        if input_tokens is not None or output_tokens is not None:
-            line += f"  tokens in={input_tokens or 0} out={output_tokens or 0}"
-        if partial:
-            line += f"  |  {partial}"
-        return Text(line, style=CHROME)
-
-    session_text = f"s:{(session_id or '')[:5]}" if session_id else "s:?"
-    tail_text = f"tail {retained_tail}" if retained_tail is not None else "tail ?"
-    segments = [f"mode {loop_state}", token_text]
+    state = loop_state if loop_state in {"streaming", "idle", "interrupted", "compacting"} else "streaming"
+    session_text = (session_id or "session")[:8]
+    left = f"{session_text} · {model} · {state}"
+    right_segments = [token_text]
+    if retained_tail is not None:
+        right_segments.append(f"tail {retained_tail}")
+    cache_read = usage.get("cache_read_input_tokens", usage.get("cache_read"))
+    cache_write = usage.get("cache_creation_input_tokens", usage.get("cache_creation"))
+    if cache_read is not None or cache_write is not None:
+        right_segments.append(f"cache {cache_read or 0}/{cache_write or 0}")
+    right = " · ".join(right_segments)
     if show_spinner:
-        segments.append(SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)])
-    optional = [f"{provider}/{model}", session_text, tail_text]
-    separator = "  |  " if (width or 0) >= 160 else " | "
-    for candidate in optional:
-        proposed = separator.join([*segments, candidate])
-        if width is None or len(proposed) <= max(1, width):
-            segments.append(candidate)
-    if partial:
-        partial_text = _truncate(partial.replace("\n", " "), 32)
-        proposed = separator.join([*segments, partial_text])
-        if width is None or len(proposed) <= max(1, width):
-            segments.append(partial_text)
-    return Text(separator.join(segments), style=CHROME)
+        right = f"{SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]} {right}"
+    if partial and width is None:
+        right += f" · {_truncate(partial.replace(chr(10), ' '), 32)}"
+    if width is not None and len(left) + len(right) + 2 > width:
+        right = " · ".join(right_segments)
+    if width is not None and len(left) + len(right) + 2 > width:
+        right = token_text
+    if width is not None and len(left) + len(right) + 2 > width:
+        left = _truncate(left, max(1, width - len(right) - 2))
+    if width is not None and len(left) + len(right) < width:
+        return Text(f"{left}{' ' * (width - len(left) - len(right))}{right}", style=CHROME)
+    return Text(f"{left}  {right}", style=CHROME)

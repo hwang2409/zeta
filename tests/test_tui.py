@@ -27,10 +27,13 @@ from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings, parse_input
 from zeta.tui.render import (
     MarkdownStream,
+    collapse_thought,
     format_status,
+    format_thought,
     render_code,
     render_event,
     render_markdown,
+    tool_render_mode,
 )
 from zeta.tui.theme import ACCENT, BODY, CODE_BG
 from zeta.types import (
@@ -247,6 +250,15 @@ def app_session(app: TUIApp, pipe: PipeInput) -> PromptSession[str]:
     )
 
 
+def renderable_plain(renderable: object) -> str:
+    if hasattr(renderable, "plain"):
+        return renderable.plain
+    inner = getattr(renderable, "renderable", None)
+    if inner is not None and hasattr(inner, "plain"):
+        return inner.plain
+    raise AssertionError(f"renderable has no plain text: {renderable!r}")
+
+
 def test_render_event_compacts_tool_call_and_result() -> None:
     call = ToolCall("call-1", "read", {"path": "README.md", "extra": "x"})
     start = render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call))
@@ -258,10 +270,11 @@ def test_render_event_compacts_tool_call_and_result() -> None:
         )
     )
 
-    assert start is not None and start.plain.startswith("▸ read(")
-    assert "README.md" in start.plain
+    assert start is not None
+    assert "read" in renderable_plain(start)
+    assert "README.md" in renderable_plain(start)
     assert result is not None
-    assert result.plain == "  ↳ [tool result] first line\n  ↳ second line"
+    assert result.plain == "read README.md"
 
 
 def test_render_event_shows_tool_output_update() -> None:
@@ -315,17 +328,17 @@ async def test_streamed_tool_output_is_not_repeated_at_end(tmp_path: Path) -> No
     start_idx = next(
         index
         for index, item in enumerate(rendered)
-        if getattr(item, "plain", None) == expected_start.plain
+        if renderable_plain(item) == renderable_plain(expected_start)
     )
     end_idx = next(
         index
         for index, item in enumerate(rendered)
-        if getattr(item, "plain", None) == expected_end.plain
+        if renderable_plain(item) == renderable_plain(expected_end)
     )
     tool_region = "\n".join(
-        item.plain for item in rendered[start_idx : end_idx + 1]
+        renderable_plain(item) for item in rendered[start_idx : end_idx + 1]
     )
-    assert tool_region == f"{expected_start.plain}\n{expected_end.plain}"
+    assert tool_region == f"{renderable_plain(expected_start)}\n{renderable_plain(expected_end)}"
     assert "  ↳ [stdout] chunk" not in tool_region
 
 
@@ -375,17 +388,17 @@ async def test_tui_overflow_final_render_is_authoritative(tmp_path: Path) -> Non
     start_idx = next(
         index
         for index, item in enumerate(rendered)
-        if getattr(item, "plain", None) == expected_start.plain
+        if renderable_plain(item) == renderable_plain(expected_start)
     )
     end_idx = next(
         index
         for index, item in enumerate(rendered)
-        if getattr(item, "plain", None) == expected.plain
+        if renderable_plain(item) == renderable_plain(expected)
     )
     tool_region = "\n".join(
-        item.plain for item in rendered[start_idx : end_idx + 1]
+        renderable_plain(item) for item in rendered[start_idx : end_idx + 1]
     )
-    assert tool_region == f"{expected_start.plain}\n{expected.plain}"
+    assert tool_region == f"{renderable_plain(expected_start)}\n{renderable_plain(expected)}"
     for index in range(200):
         assert f"  ↳ [stdout] chunk-{index}" not in tool_region
 
@@ -446,17 +459,17 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
     start_idx = next(
         index
         for index, item in enumerate(rendered)
-        if getattr(item, "plain", None) == expected_start.plain
+        if renderable_plain(item) == renderable_plain(expected_start)
     )
     end_idx = next(
         index
         for index, item in enumerate(rendered)
-        if getattr(item, "plain", None) == expected.plain
+        if renderable_plain(item) == renderable_plain(expected)
     )
     tool_region = "\n".join(
-        item.plain for item in rendered[start_idx : end_idx + 1]
+        renderable_plain(item) for item in rendered[start_idx : end_idx + 1]
     )
-    assert tool_region == f"{expected_start.plain}\n{expected.plain}"
+    assert tool_region == f"{renderable_plain(expected_start)}\n{renderable_plain(expected)}"
     assert "  ↳ [stdout] first" not in tool_region
     assert app._loop_state == "idle"
     results = [
@@ -478,7 +491,8 @@ def test_render_event_preserves_multiline_tool_result_formatting() -> None:
     )
 
     assert rendered is not None
-    assert rendered.plain == "  ↳ [tool result] first\n  ↳ \n  ↳   third"
+    assert "first" in renderable_plain(rendered)
+    assert "third" in renderable_plain(rendered)
 
 
 def test_render_event_shows_tool_result_truncation_metadata() -> None:
@@ -501,7 +515,7 @@ def test_render_event_shows_tool_result_truncation_metadata() -> None:
     )
 
     assert rendered is not None
-    assert "[truncated; full_size=8]" in rendered.plain
+    assert "[truncated; full_size=8]" in renderable_plain(rendered)
 
 
 def test_render_event_shows_non_text_tool_block_placeholders() -> None:
@@ -529,11 +543,10 @@ def test_render_event_shows_non_text_tool_block_placeholders() -> None:
     )
 
     assert rendered is not None
-    assert rendered.plain == (
-        "  ↳ [tool result] answer\n"
-        "  ↳ [image block]\n"
-        "  ↳ [resource: file:///tmp/note.txt]"
-    )
+    rendered_text = renderable_plain(rendered)
+    assert "answer" in rendered_text
+    assert "[image block]" in rendered_text
+    assert "[resource: file:///tmp/note.txt]" in rendered_text
 
 
 def test_render_helpers_use_the_zeta_palette() -> None:
@@ -542,14 +555,15 @@ def test_render_helpers_use_the_zeta_palette() -> None:
     start = render_event(
         StreamEvent(
             StreamEventType.TOOL_EXECUTION_START,
-            tool_call=ToolCall("call-1", "read", {}),
+            tool_call=ToolCall("call-1", "bash", {"cmd": "printf hi"}),
         )
     )
 
     assert markdown.style == BODY
     assert code.background_color == CODE_BG
     assert start is not None
-    assert any(span.style == ACCENT for span in start.spans)
+    styled_text = start if hasattr(start, "spans") else start.renderable
+    assert any(ACCENT in str(span.style) for span in styled_text.spans)
 
 
 def test_render_event_error_is_visible() -> None:
@@ -562,6 +576,83 @@ def test_render_event_error_is_visible() -> None:
 
     assert rendered is not None
     assert rendered.plain == "[error] provider stopped"
+
+
+def test_tool_render_mode_keeps_receipt_rule_in_one_place() -> None:
+    read = ToolCall("read-1", "read", {"path": "README.md"})
+    short = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=read,
+        tool_result=ToolResult(read.id, "one\ntwo"),
+    )
+    long_read = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=read,
+        tool_result=ToolResult(read.id, "one\ntwo\nthree"),
+    )
+    marked_read = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=read,
+        tool_result=ToolResult(read.id, "one\ntwo\nthree"),
+        data={"summary_appropriate": True},
+    )
+    glob = ToolCall("glob-1", "glob", {"pattern": "**/*.py"})
+    search = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=glob,
+        tool_result=ToolResult(glob.id, "\n".join(f"file-{i}.py" for i in range(38))),
+    )
+    bash = ToolCall("bash-1", "bash", {"cmd": "printf hi"})
+    generic = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=bash,
+        tool_result=ToolResult(bash.id, "hi"),
+    )
+
+    assert tool_render_mode(short) == "receipt"
+    assert tool_render_mode(long_read) == "card"
+    assert tool_render_mode(marked_read) == "receipt"
+    assert tool_render_mode(search) == "receipt"
+    assert tool_render_mode(generic) == "card"
+
+
+def test_tool_card_truncates_at_fifteen_lines() -> None:
+    call = ToolCall("long-1", "bash", {"cmd": "seq 30"})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "\n".join(f"line-{i}" for i in range(20))),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "line-0" in plain and "line-14" in plain
+    assert "line-15" not in plain
+    assert "… +5 lines" in plain
+
+
+def test_thought_collapses_to_first_sentence_and_keeps_duration() -> None:
+    assert collapse_thought("Plan first. Hide the rest.") == "Plan first."
+    rendered = format_thought("Plan first. Hide the rest.", 2.7)
+
+    assert rendered.plain == "thought · 2.7s  Plan first."
+    assert "italic" in str(rendered.spans[0].style)
+
+
+@pytest.mark.parametrize("state", ["streaming", "idle", "interrupted", "compacting"])
+def test_status_bar_supports_all_session_states(state: str) -> None:
+    rendered = format_status(
+        "fake",
+        "offline",
+        state,
+        session_id="abcdef123456",
+        token_count=12,
+        width=120,
+    )
+
+    assert f"abcdef12 · offline · {state}" in rendered.plain
 
 
 def test_markdown_stream_highlights_complete_fence() -> None:
@@ -631,7 +722,7 @@ def test_stream_kind_switch_flushes_assistant_before_thinking(tmp_path: Path) ->
     )
 
     assert isinstance(rendered[0], Table)
-    assert rendered[1].plain == "[thinking] plan"
+    assert rendered[1].plain == "thought  plan"
 
 
 @pytest.mark.asyncio
@@ -782,7 +873,7 @@ async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> N
         await run_task
 
     rendered = output.getvalue()
-    assert rendered.index("name") < rendered.index("[user] second")
+    assert rendered.index("name") < rendered.index("> second")
 
 
 def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
@@ -866,7 +957,8 @@ def test_markdown_stream_renders_complete_table() -> None:
 def test_status_includes_provider_state_and_usage() -> None:
     status = format_status("fake", "offline", "streaming", {"input_tokens": 2}, "partial")
 
-    assert status.plain == " fake/offline  streaming  tokens in=2 out=0  |  partial"
+    assert "session · offline · streaming" in status.plain
+    assert "tok in=2 out=0" in status.plain
 
 
 def test_status_bar_includes_session_context_and_streaming_indicator() -> None:
@@ -884,10 +976,8 @@ def test_status_bar_includes_session_context_and_streaming_indicator() -> None:
     )
 
     assert len(status.plain) <= 120
-    assert "mode streaming" in status.plain
+    assert "abc12345 · gpt-5.4 · streaming" in status.plain
     assert "tok 5/121" in status.plain
-    assert "codex/gpt-5.4" in status.plain
-    assert "s:abc12" in status.plain
     assert "tail 8" in status.plain
 
 
@@ -908,11 +998,10 @@ def test_status_bar_fits_segments_and_pulses() -> None:
     ]
 
     assert all(len(status.plain) <= width for status, width in zip(statuses, (80, 120, 200)))
-    assert all("mode streaming" in status.plain and "tok 5/121" in status.plain for status in statuses)
+    assert all(" · gpt-5.4 · streaming" in status.plain and "tok 5/121" in status.plain for status in statuses)
     assert all(marker in statuses[index].plain for index, marker in enumerate(("·", "•", "●")))
-    assert all(value in statuses[1].plain for value in ("codex/gpt-5.4", "s:abc12", "tail 8"))
-    assert all(value in statuses[2].plain for value in ("codex/gpt-5.4", "s:abc12", "tail 8"))
-    assert "  |  " in statuses[2].plain
+    assert all(value in statuses[1].plain for value in ("abc12345", "tail 8"))
+    assert all(value in statuses[2].plain for value in ("abc12345", "tail 8"))
 
     narrow = format_status(
         "provider-with-a-long-name",
@@ -925,7 +1014,7 @@ def test_status_bar_fits_segments_and_pulses() -> None:
         width=80,
     )
     assert len(narrow.plain) <= 80
-    assert "mode streaming" in narrow.plain
+    assert " · model-with-a-long-name-that-does-not-fit · streaming" in narrow.plain
     assert "tok 5/121" in narrow.plain
 
     cleared = format_status(
@@ -937,7 +1026,7 @@ def test_status_bar_fits_segments_and_pulses() -> None:
         streaming=False,
         width=80,
     )
-    assert not any(marker in cleared.plain for marker in ("·", "•", "●"))
+    assert "abc12345 · gpt-5.4 · idle" in cleared.plain
 
 
 def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
@@ -959,6 +1048,7 @@ def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
     toolbar = app._status_toolbar()
     plain = "".join(value for _, value in toolbar)
     assert "tok 5/121" in plain
+    assert "cache 0/0" in plain
 
 
 def test_status_toolbar_does_not_advance_spinner_frame(tmp_path: Path) -> None:
@@ -1070,19 +1160,61 @@ async def test_full_session_preserves_assistant_tool_user_order(tmp_path: Path) 
     await app._consume_turn("second user")
 
     rendered = output.getvalue()
-    first_result = rendered.index("[tool result] tool result")
-    second_result = rendered.rindex("[tool result] tool result")
+    first_result = rendered.index("read\n")
+    second_result = rendered.rindex("read\n")
     markers = [
-        rendered.index("[user] first user"),
+        rendered.index("> first user"),
         rendered.index("assistant 1"),
-        rendered.index("▸ read("),
+        rendered.index("read\n"),
         first_result,
         rendered.index("assistant after tool 1"),
-        rendered.index("[user] second user"),
+        rendered.index("> second user"),
         rendered.index("assistant 2"),
         second_result,
     ]
     assert markers == sorted(markers)
+
+
+@pytest.mark.asyncio
+async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path: Path) -> None:
+    bash = ToolCall("bash-visual", "bash", {"cmd": "seq 24"})
+    read = ToolCall("read-visual", "read", {"path": "README.md", "limit": 120})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                content=[ThinkingContent("Plan the inspection. More reasoning stays collapsed.")],
+                tool_calls=[bash],
+            ),
+            ScriptedTurn(tool_calls=[read]),
+            ScriptedTurn(content=[TextContent("finished")]),
+        ]
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+            tools={
+                "bash": lambda _: "\n".join(f"line-{i}" for i in range(24)),
+                "read": lambda _: "title\nbody",
+            },
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False, width=72),
+    )
+
+    app._print_user("inspect the session")
+    await app._consume_turn("inspect the session")
+    snapshot = output.getvalue()
+
+    assert "> inspect the session" in snapshot
+    assert "thought  Plan the inspection." in snapshot
+    assert "$ seq 24" in snapshot
+    assert "… +9 lines" in snapshot
+    assert "read README.md [limit=120] · running" in snapshot
+    assert "\nread README.md [limit=120]\n" in snapshot
+    assert "More reasoning stays collapsed." not in snapshot
 
 
 @pytest.mark.asyncio

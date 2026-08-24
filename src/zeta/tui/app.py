@@ -34,10 +34,17 @@ from ..types import (
     StreamEventType,
     TextContent,
     ThinkingContent,
+    ToolCall,
 )
 from .composer import build_key_bindings, history_for, parse_input
-from .render import MarkdownStream, format_status, render_event
-from .theme import BODY, CHROME, DIM, ERROR, RICH_THEME, USER_PREFIX
+from .render import (
+    MarkdownStream,
+    format_status,
+    format_thought,
+    render_event,
+    render_tool_progress,
+)
+from .theme import BODY, CHROME, DIM, ERROR, RICH_THEME, USER_PREFIX, USER_ROLE
 
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -160,7 +167,8 @@ class TUIApp:
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
         self._assistant_lines = _LineBuffer()
-        self._thinking_lines = _LineBuffer()
+        self._thinking_text = ""
+        self._thinking_duration: float | None = None
         self._markdown_stream = MarkdownStream()
         self._stream_kind: str | None = None
         self._partial = ""
@@ -172,11 +180,13 @@ class TUIApp:
         self._pending_tool_renders: list[RenderableType] = []
         self._tool_region: Live | None = None
         self._tool_region_text: Text | None = None
+        self._tool_region_call: ToolCall | None = None
         self._abort_requested = False
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
         self._approval_policy = approval_policy
         self._slash_commands = create_slash_registry()
+        self._printed_units = False
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
@@ -343,11 +353,20 @@ class TUIApp:
 
     def _status_toolbar(self) -> FormattedText:
         width = get_app().output.get_size().columns
+        usage = dict(self._usage)
+        usage.setdefault(
+            "cache_read_input_tokens",
+            self.loop.context_assembler.cache_read_input_tokens_this_session,
+        )
+        usage.setdefault(
+            "cache_creation_input_tokens",
+            self.loop.context_assembler.cache_creation_input_tokens_this_session,
+        )
         status = format_status(
             self.provider,
             self.model,
             self._loop_state,
-            self._usage,
+            usage,
             self._partial,
             session_id=self.loop.store.session_id[:8],
             token_count=self.loop.context_assembler.token_count,
@@ -361,7 +380,10 @@ class TUIApp:
 
     def _print(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
+            if self._printed_units:
+                self.console.print()
             self.console.print(renderable)
+            self._printed_units = True
 
     def _update_tool_region(self, event: StreamEvent) -> None:
         rendered = render_event(event)
@@ -369,8 +391,14 @@ class TUIApp:
             return
         if self._tool_region is None:
             self._tool_region_text = Text()
+            self._tool_region_call = event.tool_call
             self._tool_region = Live(
-                self._tool_region_text,
+                render_tool_progress(
+                    self._tool_region_call,
+                    self._tool_region_text.plain,
+                )
+                if self._tool_region_call is not None
+                else self._tool_region_text,
                 console=self.console,
                 transient=True,
                 refresh_per_second=20,
@@ -381,7 +409,15 @@ class TUIApp:
         if self._tool_region_text:
             self._tool_region_text.append("\n")
         self._tool_region_text.append(rendered)
-        self._tool_region.update(self._tool_region_text)
+        if self._tool_region_call is not None:
+            self._tool_region.update(
+                render_tool_progress(
+                    self._tool_region_call,
+                    self._tool_region_text.plain,
+                )
+            )
+        else:
+            self._tool_region.update(self._tool_region_text)
 
     def _commit_tool_region(self) -> None:
         final_renders = self._pending_tool_renders
@@ -392,6 +428,7 @@ class TUIApp:
             self._tool_region.stop()
             self._tool_region = None
             self._tool_region_text = None
+            self._tool_region_call = None
         for rendered in final_renders:
             self._print(rendered)
 
@@ -401,11 +438,13 @@ class TUIApp:
             self._tool_region.stop()
             self._tool_region = None
             self._tool_region_text = None
+            self._tool_region_call = None
 
     def _print_committed(self, lines: list[str], *, thinking: bool = False) -> None:
         if thinking:
-            for line in lines:
-                self._print(Text(f"[thinking] {line}", style=DIM))
+            value = "\n".join(lines)
+            if value:
+                self._print(format_thought(value, self._thinking_duration))
             return
         for line in lines:
             for renderable in self._markdown_stream.consume(line):
@@ -422,11 +461,14 @@ class TUIApp:
 
     def _flush_stream_kind(self) -> None:
         if self._stream_kind == "thinking":
-            self._print_committed(self._thinking_lines.flush(), thinking=True)
+            if self._thinking_text:
+                self._print_committed([self._thinking_text], thinking=True)
         elif self._stream_kind == "assistant":
             self._print_committed(self._assistant_lines.flush())
         self._stream_kind = None
         self._partial = ""
+        self._thinking_text = ""
+        self._thinking_duration = None
 
     def _flush_markdown(self) -> None:
         for renderable in self._markdown_stream.flush():
@@ -451,7 +493,17 @@ class TUIApp:
         if self._stream_kind is not None and self._stream_kind != stream_kind:
             self._flush_pending_stream()
         self._stream_kind = stream_kind
-        buffer = self._thinking_lines if thinking else self._assistant_lines
+        if thinking:
+            self._thinking_text += value
+            duration = event.data.get("duration", event.data.get("elapsed_seconds"))
+            if isinstance(duration, (int, float)):
+                self._thinking_duration = float(duration)
+            duration_ms = event.data.get("duration_ms", event.data.get("elapsed_ms"))
+            if isinstance(duration_ms, (int, float)):
+                self._thinking_duration = float(duration_ms) / 1000
+            self._partial = self._thinking_text
+            return
+        buffer = self._assistant_lines
         committed = buffer.feed(value)
         self._partial = buffer.value
         self._print_committed(committed, thinking=thinking)
@@ -467,15 +519,14 @@ class TUIApp:
 
     def _reset_stream_buffers(self) -> None:
         self._assistant_lines.value = ""
-        self._thinking_lines.value = ""
+        self._thinking_text = ""
+        self._thinking_duration = None
 
     def _print_user(self, user_text: str) -> None:
-        self.console.print(
-            Text.assemble(("[user] ", USER_PREFIX), (user_text, BODY))
-        )
+        self._print(Text.assemble(("> ", USER_ROLE), (user_text, BODY)))
 
     def _print_system(self, output: str) -> None:
-        self._print(Text(f"[system]\n{output}", style=CHROME))
+        self._print(Text(f"system · {output}", style=CHROME))
 
     def _start_queued_turn(self) -> None:
         if self._queued:
@@ -565,7 +616,9 @@ class TUIApp:
                     StreamEventType.TOOL_EXECUTION_UPDATE,
                     StreamEventType.TOOL_EXECUTION_END,
                 }:
-                    self._print(render_event(event))
+                    rendered = render_event(event)
+                    if rendered is not None:
+                        self._print(rendered)
                 self._invalidate_prompt()
                 if event.type is StreamEventType.TOOL_EXECUTION_END and stop_after_tool:
                     break

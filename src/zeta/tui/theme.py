@@ -13,6 +13,13 @@ OK = "green"
 USER_PREFIX = "bold #62d8ff"
 CODE_BG = "#1c1f2b"
 CHROME = "#677083"
+CARD_BG = "on #1b1e27"
+CARD_BORDER = "#394052"
+COMMAND = f"bold {ACCENT}"
+RECEIPT = f"dim {CHROME}"
+THOUGHT = "italic dim #b9a7ff"
+AFFORDANCE = "dim #677083"
+USER_ROLE = "#62d8ff"
 
 RICH_THEME = Theme(
     {
@@ -26,5 +33,11 @@ RICH_THEME = Theme(
         "markdown.code_block": f"{ACCENT} on {CODE_BG}",
         "markdown.table.border": CHROME,
         "markdown.table.header": f"bold {ACCENT}",
+        "zeta.card": CARD_BG,
+        "zeta.card.border": CARD_BORDER,
+        "zeta.command": COMMAND,
+        "zeta.receipt": RECEIPT,
+        "zeta.thought": THOUGHT,
+        "zeta.affordance": AFFORDANCE,
     }
 )
