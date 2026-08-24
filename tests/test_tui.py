@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import pty
+import re
 import select
 import subprocess
 import sys
@@ -290,6 +291,23 @@ def test_render_event_shows_tool_output_update() -> None:
 
     assert rendered is not None
     assert rendered.plain == "  ↳ [stdout] hello\n"
+
+
+def test_tool_output_strips_terminal_controls() -> None:
+    call = ToolCall("ansi-1", "bash", {})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "a\x1b[2Jb\x1b]0;title\x07c"),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "abc" in plain
+    assert "2J" not in plain
+    assert "title" not in plain
 
 
 @pytest.mark.asyncio
@@ -592,12 +610,6 @@ def test_tool_render_mode_keeps_receipt_rule_in_one_place() -> None:
         tool_call=read,
         tool_result=ToolResult(read.id, "one\ntwo\nthree"),
     )
-    marked_read = StreamEvent(
-        StreamEventType.TOOL_EXECUTION_END,
-        tool_call=read,
-        tool_result=ToolResult(read.id, "one\ntwo\nthree"),
-        data={"summary_appropriate": True},
-    )
     glob = ToolCall("glob-1", "glob", {"pattern": "**/*.py"})
     search = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,
@@ -613,9 +625,22 @@ def test_tool_render_mode_keeps_receipt_rule_in_one_place() -> None:
 
     assert tool_render_mode(short) == "receipt"
     assert tool_render_mode(long_read) == "card"
-    assert tool_render_mode(marked_read) == "receipt"
     assert tool_render_mode(search) == "receipt"
     assert tool_render_mode(generic) == "card"
+
+
+def test_long_single_line_read_uses_a_cropped_card() -> None:
+    call = ToolCall("read-long", "read", {"path": "README.md"})
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "x" * 240),
+    )
+
+    assert tool_render_mode(event) == "card"
+    rendered = render_event(event)
+    assert rendered is not None
+    assert "x" * 240 in renderable_plain(rendered)
 
 
 def test_receipt_mode_forces_errors_and_non_text_results_into_cards() -> None:
@@ -682,6 +707,20 @@ def test_thought_collapses_to_first_sentence_and_keeps_duration() -> None:
     assert "italic" in str(rendered.style)
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ('Use U.S. defaults. Hide the rest.', "Use U.S. defaults."),
+        ('Run at 5 p.m. today. Hide the rest.', "Run at 5 p.m. today."),
+        ('It said "Done." Then continue.', 'It said "Done."'),
+    ],
+)
+def test_thought_sentence_detection_handles_initialisms_and_quotes(
+    value: str, expected: str
+) -> None:
+    assert collapse_thought(value) == expected
+
+
 @pytest.mark.parametrize("state", ["streaming", "idle", "interrupted", "compacting"])
 def test_status_bar_supports_all_session_states(state: str) -> None:
     rendered = format_status(
@@ -695,6 +734,21 @@ def test_status_bar_supports_all_session_states(state: str) -> None:
 
     assert state in rendered.plain
     assert "abcdef12" in rendered.plain
+
+
+@pytest.mark.parametrize("state", ["interrupted", "compacting"])
+def test_special_status_states_override_spinner(state: str) -> None:
+    rendered = format_status(
+        "fake",
+        "offline",
+        state,
+        streaming=True,
+        spinner_active=True,
+        spinner_frame=2,
+    )
+
+    assert rendered.plain.startswith(state)
+    assert "esc interrupt" not in rendered.plain
 
 
 def test_markdown_stream_highlights_complete_fence() -> None:
@@ -764,7 +818,33 @@ def test_stream_kind_switch_flushes_assistant_before_thinking(tmp_path: Path) ->
     )
 
     assert isinstance(rendered[0], Table)
-    assert rendered[1].plain == "✱ thought · plan"
+    assert rendered[1].plain.startswith("✱ thought · plan · ")
+    assert rendered[1].plain.endswith("s")
+
+
+def test_thought_duration_uses_local_monotonic_lifecycle_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ticks = iter((10.0, 10.25))
+    monkeypatch.setattr("zeta.tui.app.time.monotonic", lambda: next(ticks))
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    rendered: list[object] = []
+    app._print = rendered.append
+
+    app._consume_text(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=ThinkingContent("plan"),
+        )
+    )
+    app._flush_pending_stream()
+
+    assert rendered[0].plain == "✱ thought · plan · 0.2s"
 
 
 def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
@@ -780,7 +860,7 @@ def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
     app._print_committed(["```python", "print('hi')", "```"])
     rendered = "\n".join(line.rstrip() for line in output.getvalue().splitlines())
 
-    assert " first paragraph\n second paragraph" in rendered
+    assert "  first paragraph\n  second paragraph" in rendered
     assert "first paragraph\n\nsecond paragraph" not in rendered
     assert "print('hi')\n\n" not in rendered
 
@@ -940,6 +1020,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     master_fd, slave_fd = pty.openpty()
     env = os.environ.copy()
     env["ZETA_HOME"] = str(tmp_path / "zeta-home")
+    env["TERM"] = "xterm-256color"
     process = subprocess.Popen(
         [
             sys.executable,
@@ -968,7 +1049,21 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
         assert "❯ ".encode() in output
 
         os.write(master_fd, b"\x04")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 0.1)
+            if not ready:
+                if process.poll() is not None:
+                    break
+                continue
+            try:
+                output.extend(os.read(master_fd, 4096))
+            except OSError:
+                break
         assert process.wait(timeout=5) == 0
+        assert b"\x1b[?1049h" in output
+        assert b"\x1b[?1049l" in output
+        assert output.count(b"\x1b[?1049h") == 1
     finally:
         if process.poll() is None:
             process.kill()
@@ -1028,6 +1123,14 @@ def test_composer_info_builder_aligns_identity_row() -> None:
     assert plain.startswith("zeta")
     assert plain.endswith("openai · gpt-5.4")
     assert len(plain) == 40
+
+
+def test_composer_info_crops_optional_fields_to_width() -> None:
+    for width in (10, 20, 22):
+        info = format_composer_info("provider", "a-very-long-model", width=width)
+        plain = "".join(value for _, value in info)
+        assert len(plain) <= width
+        assert not plain.endswith(" ·")
 
 
 def test_footer_builder_formats_context_usage_and_hints() -> None:
@@ -1135,7 +1238,7 @@ def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
     plain = "".join(value for _, value in toolbar)
     assert "5 (0%)" in plain
     assert "/status" in plain
-    assert "zeta" in plain
+    assert "\n" not in plain
 
 
 def test_status_toolbar_does_not_advance_spinner_frame(tmp_path: Path) -> None:
@@ -1276,6 +1379,7 @@ async def test_app_surfaces_compacting_state_before_provider_output(tmp_path: Pa
         return messages
 
     assembler.assemble = compacted_assemble  # type: ignore[method-assign]
+    assembler.needs_compaction = lambda: True  # type: ignore[method-assign]
     app._invalidate_prompt = lambda: states.append(app._loop_state)
 
     await app._consume_turn("prompt")
@@ -1283,6 +1387,25 @@ async def test_app_surfaces_compacting_state_before_provider_output(tmp_path: Pa
     assert "compacting" in states
     compacting_index = states.index("compacting")
     assert "streaming" in states[compacting_index + 1 :]
+
+
+@pytest.mark.asyncio
+async def test_empty_completion_prints_neutral_fallback(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn()]),
+            ConversationStore(tmp_path / "sessions"),
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._print_user("empty turn")
+    await app._consume_turn("empty turn")
+
+    rendered = app.console.file.getvalue()
+    assert "empty turn" in rendered
+    assert "no response" in rendered
 
 
 @pytest.mark.asyncio
@@ -1355,38 +1478,43 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path:
     snapshot = "\n".join(
         line.rstrip() for line in output.getvalue().splitlines()
     ).strip()
+    snapshot = re.sub(
+        r"(✱ thought · Plan the inspection\.) · \d+\.\ds",
+        r"\1",
+        snapshot,
+    )
     expected = """▌ inspect the session
 
- ✱ thought · Plan the inspection.
+  ✱ thought · Plan the inspection.
 
- ╭─────────────────────────────────────────────────────────────────────╮
- │ $ seq 24                                                            │
- │ running…                                                            │
- ╰─────────────────────────────────────────────────────────────────────╯
- ╭─────────────────────────────────────────────────────────────────────╮
- │ $ seq 24                                                            │
- │ line-0                                                              │
- │ line-1                                                              │
- │ line-2                                                              │
- │ line-3                                                              │
- │ line-4                                                              │
- │ line-5                                                              │
- │ line-6                                                              │
- │ line-7                                                              │
- │ line-8                                                              │
- │ line-9                                                              │
- │ line-10                                                             │
- │ line-11                                                             │
- │ line-12                                                             │
- │ line-13                                                             │
- │ line-14                                                             │
- │ … +9 lines                                                          │
- ╰─────────────────────────────────────────────────────────────────────╯
+  ╭──────────────────────────────────────────────────────────────────╮
+  │ $ seq 24                                                         │
+  │ running…                                                         │
+  ╰──────────────────────────────────────────────────────────────────╯
+  ╭──────────────────────────────────────────────────────────────────╮
+  │ $ seq 24                                                         │
+  │ line-0                                                           │
+  │ line-1                                                           │
+  │ line-2                                                           │
+  │ line-3                                                           │
+  │ line-4                                                           │
+  │ line-5                                                           │
+  │ line-6                                                           │
+  │ line-7                                                           │
+  │ line-8                                                           │
+  │ line-9                                                           │
+  │ line-10                                                          │
+  │ line-11                                                          │
+  │ line-12                                                          │
+  │ line-13                                                          │
+  │ line-14                                                          │
+  │ … +9 lines                                                       │
+  ╰──────────────────────────────────────────────────────────────────╯
 
- ⏺ read README.md [limit=120] · running
- ⏺ read README.md [limit=120]
+  ⏺ read README.md [limit=120] · running
+  ⏺ read README.md [limit=120]
 
- finished"""
+  finished"""
 
     assert snapshot == expected
 

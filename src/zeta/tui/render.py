@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from rich.cells import cell_len
 from rich.console import RenderableType
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -66,6 +67,11 @@ ABBREVIATIONS = frozenset(
         "jr",
     }
 )
+OSC_RE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b]*(?:\x07|\x1b\\)")
+ESC_RE = re.compile(r"\x1b(?:[PX^_].*?\x1b\\|\][^\x07]*(?:\x07|\x1b\\))")
+CSI_UNSUPPORTED_RE = re.compile(
+    r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?!m)[@-~]"
+)
 ToolRenderMode = Literal["card", "receipt"]
 
 
@@ -88,19 +94,6 @@ def _tool_content(event: StreamEvent) -> str:
     return flatten_tool_content(blocks) if blocks else result.content
 
 
-def _summary_appropriate(event: StreamEvent) -> bool:
-    if event.data.get("summary_appropriate") is True:
-        return True
-    result = event.tool_result
-    if result is None or not result.content_blocks:
-        return False
-    return any(
-        block.get("annotations", {}).get("summary_appropriate") is True
-        for block in result.content_blocks
-        if block.get("type") == "text"
-    )
-
-
 def tool_render_mode(event: StreamEvent) -> ToolRenderMode:
     """Choose the one display mode for completed tool results."""
 
@@ -112,11 +105,13 @@ def tool_render_mode(event: StreamEvent) -> ToolRenderMode:
         block.get("type") != "text" for block in result.content_blocks or []
     ):
         return "card"
-    line_count = len(_tool_content(event).splitlines()) or 1
+    content = _tool_content(event)
+    line_count = len(content.splitlines()) or 1
+    if any(cell_len(_strip_terminal_controls(line)) > MAX_RESULT for line in content.splitlines()):
+        return "card"
     if (
         line_count < 3
         or call.name.lower() in SUMMARY_TOOLS
-        or _summary_appropriate(event)
     ):
         return "receipt"
     return "card"
@@ -157,6 +152,28 @@ def _receipt_arguments(call: ToolCall, content: str) -> str:
     return _arguments(arguments)
 
 
+def _strip_terminal_controls(value: str) -> str:
+    """Remove terminal controls that are unsafe in transcript scrollback."""
+
+    value = OSC_RE.sub("", value)
+    value = ESC_RE.sub("", value)
+    value = CSI_UNSUPPORTED_RE.sub("", value)
+    return "".join(
+        character
+        for character in value
+        if character in {"\n", "\t"} or ord(character) >= 0x20
+    )
+
+
+def _safe_text(value: str, *, style: str) -> Text:
+    return Text.from_ansi(
+        _strip_terminal_controls(value),
+        style=style,
+        overflow="ellipsis",
+        no_wrap=True,
+    )
+
+
 def _tool_receipt(event: StreamEvent) -> Text:
     call = event.tool_call
     assert call is not None
@@ -178,10 +195,11 @@ def _render_tool_output(content: str, extra_lines: list[str] | None = None) -> T
     visible = lines[:MAX_TOOL_LINES]
     if extra_lines:
         visible.extend(extra_lines)
-    rendered = Text(
-        "\n".join(_truncate(line, MAX_RESULT) for line in visible),
-        style=BODY,
-    )
+    rendered = Text(style=BODY, overflow="ellipsis", no_wrap=True)
+    for index, line in enumerate(visible):
+        if index:
+            rendered.append("\n")
+        rendered.append(_safe_text(line, style=BODY))
     if truncated:
         rendered.append(f"\n… +{len(lines) - MAX_TOOL_LINES} lines", style=AFFORDANCE)
     return rendered
@@ -217,8 +235,11 @@ def _tool_card(event: StreamEvent, *, running: bool = False) -> Panel:
 
 
 def _tool_panel(call: ToolCall, body: Text, *, error: bool = False) -> Panel:
+    content = Text.assemble(_tool_header(call), "\n", body)
+    content.no_wrap = True
+    content.overflow = "ellipsis"
     return Panel(
-        Text.assemble(_tool_header(call), "\n", body),
+        content,
         border_style=ERROR if error else CARD_BORDER,
         style=CARD_BG,
         padding=(0, 1),
@@ -248,11 +269,16 @@ def collapse_thought(value: str) -> str:
             continue
         if character == ".":
             token = normalized[: index + 1].rsplit(" ", 1)[-1]
-            token = token.rstrip(".,!?;:").lower()
-            if token in ABBREVIATIONS:
+            normalized_token = token.rstrip(".,!?;:").lower()
+            if normalized_token in ABBREVIATIONS or re.fullmatch(
+                r"(?:[a-z]\.){2,}", token.lower()
+            ):
                 continue
-        if index + 1 == len(normalized) or normalized[index + 1].isspace():
-            return _truncate(normalized[: index + 1], MAX_RESULT)
+        end = index + 1
+        while end < len(normalized) and normalized[end] in "\"'”’)]}":
+            end += 1
+        if end == len(normalized) or normalized[end].isspace():
+            return _truncate(normalized[:end], MAX_RESULT)
     return _truncate(normalized, MAX_RESULT)
 
 
@@ -435,7 +461,7 @@ def render_event(event: StreamEvent) -> RenderableType | None:
     if event.type is StreamEventType.TOOL_EXECUTION_UPDATE and event.delta is not None:
         stream = event.data.get("stream")
         label = f"[{stream}] " if stream in {"stdout", "stderr"} else ""
-        return Text(f"  ↳ {label}{event.delta}", style=DIM)
+        return _safe_text(f"  ↳ {label}{event.delta}", style=DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:
         if tool_render_mode(event) == "receipt":
             return _tool_receipt(event)
@@ -443,7 +469,11 @@ def render_event(event: StreamEvent) -> RenderableType | None:
     if event.type is StreamEventType.ERROR:
         message = event.error.message if event.error else "unknown error"
         return Text(f"[error] {message}", style=ERROR)
-    if event.type is StreamEventType.AGENT_END:
+    if event.type in {
+        StreamEventType.AGENT_END,
+        StreamEventType.COMPACTION_START,
+        StreamEventType.COMPACTION_END,
+    }:
         return None
     if event.type is StreamEventType.TURN_START:
         return None
@@ -493,7 +523,7 @@ def format_status(
     context_text = f"{value} ({percent}%)"
 
     state = loop_state if loop_state in {"streaming", "idle", "interrupted", "compacting"} else "streaming"
-    if show_spinner:
+    if show_spinner and state not in {"interrupted", "compacting"}:
         left = f"{SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]}  esc interrupt"
     else:
         left = state
@@ -501,12 +531,16 @@ def format_status(
     if session_id:
         right_segments.append(session_id[:8])
     right = " · ".join(right_segments)
-    if width is not None and len(left) + len(right) + 1 > width:
+    if width is not None and cell_len(left) + cell_len(right) + 1 > width:
         right = " · ".join(right_segments[:3])
-    if width is not None and len(left) + len(right) + 1 > width:
+    if width is not None and cell_len(left) + cell_len(right) + 1 > width:
         right = context_text
-    if width is not None and len(left) + len(right) < width:
-        value = f"{left}{' ' * (width - len(left) - len(right))}{right}"
+    if width is not None and cell_len(left) + cell_len(right) < width:
+        value = f"{left}{' ' * (width - cell_len(left) - cell_len(right))}{right}"
     else:
         value = f"{left}  {right}"
+    if width is not None:
+        fitted = Text(value, no_wrap=True, overflow="ellipsis")
+        fitted.truncate(width, overflow="ellipsis")
+        value = fitted.plain.rstrip(" ·")
     return Text(value, style=CHROME)

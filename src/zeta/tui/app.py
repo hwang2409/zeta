@@ -1,19 +1,27 @@
-"""Composition root for the inline zeta terminal UI."""
+"""Composition root for the full-screen zeta terminal UI."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+from io import StringIO
+import os
+import sys
+import time
 from collections import deque
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.application import get_app
-from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.application import Application, get_app
+from prompt_toolkit.enums import EditingMode
+from prompt_toolkit.formatted_text import ANSI, FormattedText
 from prompt_toolkit.styles import Style
+from prompt_toolkit.layout import Dimension
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.containers import Window
 from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.padding import Padding
@@ -37,7 +45,7 @@ from ..types import (
     ThinkingContent,
     ToolCall,
 )
-from .composer import build_key_bindings, format_composer_info, history_for, parse_input
+from .composer import build_key_bindings, history_for, parse_input
 from .render import (
     MarkdownStream,
     format_status,
@@ -51,6 +59,30 @@ from .theme import ACCENT, BODY, CHROME, DIM, ERROR, RICH_THEME, SURFACE, USER_R
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 SPINNER_INTERVAL = 0.2
+
+
+class FullScreenPromptSession(PromptSession[str]):
+    """Prompt session that owns the alternate screen for the whole app."""
+
+    def _create_application(
+        self, editing_mode: EditingMode, erase_when_done: bool
+    ) -> Application[str]:
+        application = super()._create_application(editing_mode, erase_when_done)
+        application.full_screen = True
+        application.renderer.full_screen = True
+        application.erase_when_done = False
+        return application
+
+    def restore_terminal(self) -> None:
+        """Restore the shell viewport after prompt-toolkit exits."""
+
+        self.app.output.quit_alternate_screen()
+        self.app.output.show_cursor()
+        self.app.output.flush()
+        try:
+            os.write(sys.__stdout__.fileno(), b"\x1b[?1049l\x1b[?25h")
+        except OSError:
+            pass
 
 
 def _zeta_home() -> Path:
@@ -143,7 +175,7 @@ class _LineBuffer:
 
 
 class TUIApp:
-    """Inline transcript, persistent composer, and follow-up queue."""
+    """Full-screen transcript, persistent composer, and follow-up queue."""
 
     def __init__(
         self,
@@ -170,6 +202,7 @@ class TUIApp:
         self._assistant_lines = _LineBuffer()
         self._thinking_text = ""
         self._thinking_duration: float | None = None
+        self._thinking_started_at: float | None = None
         self._markdown_stream = MarkdownStream()
         self._stream_kind: str | None = None
         self._partial = ""
@@ -190,6 +223,10 @@ class TUIApp:
         self._printed_units = False
         self._assistant_unit_open = False
         self._compaction_shown = False
+        self._turn_had_visible_output = False
+        self._active_session: PromptSession[str] | None = None
+        self._transcript_lines: list[str] = []
+        self._input_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
@@ -329,11 +366,14 @@ class TUIApp:
         bindings = build_key_bindings(
             on_interrupt=self.abort_active,
             on_exit=self.request_exit,
+            on_submit=self._submit_input,
         )
-        return PromptSession(
+        return FullScreenPromptSession(
+            message=[("class:prompt", " ❯ ")],
             history=history_for(self._history_path),
             key_bindings=bindings,
             multiline=True,
+            bottom_toolbar=self._status_toolbar,
             erase_when_done=True,
             style=Style.from_dict(
                 {
@@ -386,24 +426,55 @@ class TUIApp:
             spinner_active=self._spinner_active,
             model_window=self.loop.context_assembler.token_budget,
         )
-        info = format_composer_info(self.provider, self.model, width=width)
         return FormattedText(
             [
-                *info,
-                ("class:status-bar", "\n"),
                 ("class:status-bar", status.plain),
             ]
         )
 
+    def _transcript_content(self) -> ANSI | str:
+        if not self._transcript_lines:
+            return ""
+        rows = get_app().output.get_size().rows
+        visible = self._transcript_lines[-max(1, rows - 2) :]
+        return ANSI("\n".join(visible))
+
+    def _full_screen_active(self) -> bool:
+        return isinstance(self._active_session, FullScreenPromptSession)
+
+    def _append_transcript(self, renderable: RenderableType | None) -> None:
+        if renderable is None:
+            return
+        width = max(1, get_app().output.get_size().columns - 4)
+        output = StringIO()
+        transcript_console = Console(
+            file=output,
+            force_terminal=True,
+            color_system="truecolor",
+            width=width,
+            theme=RICH_THEME,
+        )
+        transcript_console.print(Padding(renderable, (0, 2, 0, 2)))
+        self._transcript_lines.extend(output.getvalue().rstrip("\n").splitlines())
+
+    def _append_transcript_blank(self) -> None:
+        self._transcript_lines.append("")
+
     def _print(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
-            self.console.print(Padding(renderable, (0, 0, 0, 1)))
+            if self._full_screen_active():
+                self._append_transcript(renderable)
+            else:
+                self.console.print(Padding(renderable, (0, 2, 0, 2)))
 
     def _print_unit(self, renderable: RenderableType | None) -> None:
         if renderable is None:
             return
         if self._printed_units:
-            self.console.print()
+            if self._full_screen_active():
+                self._append_transcript_blank()
+            else:
+                self.console.print()
         self._print(renderable)
         self._printed_units = True
 
@@ -415,10 +486,21 @@ class TUIApp:
             self._assistant_unit_open = True
         else:
             self._print(renderable)
+        plain = getattr(renderable, "plain", None)
+        if plain is None or plain.strip():
+            self._turn_had_visible_output = True
 
     def _update_tool_region(self, event: StreamEvent) -> None:
         rendered = render_event(event)
         if not isinstance(rendered, Text):
+            return
+        if self._full_screen_active():
+            if self._tool_region_text is None:
+                self._tool_region_text = Text()
+                self._tool_region_call = event.tool_call
+            if self._tool_region_text:
+                self._tool_region_text.append("\n")
+            self._tool_region_text.append(rendered)
             return
         if self._tool_region is None:
             self._tool_region_text = Text()
@@ -429,7 +511,7 @@ class TUIApp:
                         self._tool_region_call,
                         self._tool_region_text.plain,
                     ),
-                    (0, 0, 0, 1),
+                    (0, 2, 0, 2),
                 )
                 if self._tool_region_call is not None
                 else self._tool_region_text,
@@ -437,7 +519,7 @@ class TUIApp:
                 transient=True,
                 refresh_per_second=20,
             )
-            self._tool_region.start()
+
         if self._tool_region_text is None:
             return
         if self._tool_region_text:
@@ -450,11 +532,33 @@ class TUIApp:
                         self._tool_region_call,
                         self._tool_region_text.plain,
                     ),
-                    (0, 0, 0, 1),
+                    (0, 2, 0, 2),
                 )
             )
         else:
             self._tool_region.update(self._tool_region_text)
+
+    def _submit_input(self, value: str) -> None:
+        self._input_queue.put_nowait(value)
+
+    async def _handle_prompt_value(self, value: str) -> None:
+        parsed = parse_input(value)
+        if parsed is None or self._exit_requested:
+            return
+        if await self._handle_approval_input(parsed):
+            return
+        slash_output = self._slash_commands.dispatch(self, parsed)
+        if slash_output is not None:
+            self._print_system(slash_output)
+            return
+        model_input = self._slash_commands.input_for_model(parsed)
+        if self.pending_approvals:
+            self._present_pending_approvals()
+        elif self.active:
+            self._queued.append(model_input)
+        else:
+            self._print_user(model_input)
+            self._start_turn(model_input)
 
     def _commit_tool_region(self) -> None:
         final_renders = self._pending_tool_renders
@@ -483,6 +587,7 @@ class TUIApp:
             value = "\n".join(lines)
             if value:
                 self._print_unit(format_thought(value, self._thinking_duration))
+                self._turn_had_visible_output = True
             return
         for line in lines:
             for renderable in self._markdown_stream.consume(line):
@@ -507,6 +612,7 @@ class TUIApp:
         self._partial = ""
         self._thinking_text = ""
         self._thinking_duration = None
+        self._thinking_started_at = None
 
     def _flush_markdown(self) -> None:
         for renderable in self._markdown_stream.flush():
@@ -533,13 +639,12 @@ class TUIApp:
             self._flush_pending_stream()
         self._stream_kind = stream_kind
         if thinking:
+            if self._thinking_started_at is None:
+                self._thinking_started_at = time.monotonic()
             self._thinking_text += value
-            duration = event.data.get("duration", event.data.get("elapsed_seconds"))
-            if isinstance(duration, (int, float)):
-                self._thinking_duration = float(duration)
-            duration_ms = event.data.get("duration_ms", event.data.get("elapsed_ms"))
-            if isinstance(duration_ms, (int, float)):
-                self._thinking_duration = float(duration_ms) / 1000
+            self._thinking_duration = max(
+                0.0, time.monotonic() - self._thinking_started_at
+            )
             self._partial = self._thinking_text
             return
         buffer = self._assistant_lines
@@ -560,6 +665,7 @@ class TUIApp:
         self._assistant_lines.value = ""
         self._thinking_text = ""
         self._thinking_duration = None
+        self._thinking_started_at = None
 
     def _print_user(self, user_text: str) -> None:
         self._assistant_unit_open = False
@@ -605,6 +711,7 @@ class TUIApp:
 
     async def _consume_turn(self, user_text: str) -> None:
         self._abort_requested = False
+        self._turn_had_visible_output = False
         self._loop_state = "streaming"
         self._streaming = True
         self._spinner_active = True
@@ -627,9 +734,14 @@ class TUIApp:
                     if event.tool_call is not None:
                         self._active_tool_calls.add(event.tool_call.id)
                     self._present_pending_approvals()
-                    self._print_unit(render_event(event))
+                    rendered = render_event(event)
+                    self._print_unit(rendered)
+                    if rendered is not None:
+                        self._turn_had_visible_output = True
                 elif event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
                     self._update_tool_region(event)
+                    if event.delta and event.delta.strip():
+                        self._turn_had_visible_output = True
                 elif event.type is StreamEventType.TOOL_EXECUTION_END:
                     aborted = self._abort_requested
                     self._loop_state = "interrupted" if aborted else "streaming"
@@ -638,6 +750,7 @@ class TUIApp:
                     rendered = render_event(event)
                     if rendered is not None:
                         self._pending_tool_renders.append(rendered)
+                        self._turn_had_visible_output = True
                     if self._abort_requested:
                         self._abort_requested = False
                         stop_after_tool = True
@@ -651,19 +764,19 @@ class TUIApp:
                     self._spinner_reset.set()
                     self._streaming = True
                     self._compaction_shown = False
-                elif event.type is StreamEventType.MESSAGE_START:
-                    context = self.loop.context_assembler.last_context
-                    if context is not None and context.compacted and not self._compaction_shown:
-                        self._compaction_shown = True
-                        self._loop_state = "compacting"
-                        self._invalidate_prompt()
-                        await asyncio.sleep(0)
-                        self._loop_state = "streaming"
+                elif event.type is StreamEventType.COMPACTION_START:
+                    self._compaction_shown = True
+                    self._loop_state = "compacting"
+                elif event.type is StreamEventType.COMPACTION_END:
+                    self._loop_state = "streaming"
                 elif event.type is StreamEventType.MESSAGE_END:
                     self._streaming = False
                 elif event.type is StreamEventType.AGENT_END:
                     self._reset_stream_state()
                     self._loop_state = "idle"
+                    if not self._turn_had_visible_output:
+                        self._print_unit(Text("no response", style=CHROME))
+                        self._turn_had_visible_output = True
                 if event.type not in {
                     StreamEventType.TOOL_EXECUTION_UPDATE,
                     StreamEventType.TOOL_EXECUTION_END,
@@ -676,6 +789,8 @@ class TUIApp:
                             StreamEventType.ERROR,
                         }:
                             self._print_unit(rendered)
+                            if event.type is StreamEventType.ERROR:
+                                self._turn_had_visible_output = True
                         else:
                             self._print(rendered)
                 self._invalidate_prompt()
@@ -698,6 +813,7 @@ class TUIApp:
             self._spinner_active = False
             spinner_task.cancel()
             await asyncio.gather(spinner_task, return_exceptions=True)
+            self._invalidate_prompt()
 
     async def _read_prompt(self, session: PromptSession[str]) -> str | None:
         try:
@@ -709,15 +825,68 @@ class TUIApp:
             return None
         return value
 
-    async def run(self, session: PromptSession[str] | None = None) -> None:
-        """Run until Ctrl-D or an exit request."""
-
-        session = session or self._session or self._make_session()
-        self._present_pending_approvals()
-        prompt_task: asyncio.Task[str | None] | None = asyncio.create_task(
-            self._read_prompt(session)
+    async def _run_full_screen(self, session: FullScreenPromptSession) -> None:
+        prompt_task = asyncio.create_task(session.app.run_async())
+        input_task: asyncio.Task[str | None] = asyncio.create_task(
+            self._input_queue.get()
         )
         try:
+            while not self._exit_requested:
+                wait_for: set[asyncio.Task[Any]] = {prompt_task, input_task}
+                if self._active_task is not None:
+                    wait_for.add(self._active_task)
+                done, _ = await asyncio.wait(
+                    wait_for, return_when=asyncio.FIRST_COMPLETED
+                )
+                if self._active_task is not None and self._active_task in done:
+                    try:
+                        await self._active_task
+                    except asyncio.CancelledError:
+                        pass
+                    self._active_task = None
+                    if self._queued:
+                        self._start_queued_turn()
+                if prompt_task in done:
+                    try:
+                        await prompt_task
+                    except (EOFError, asyncio.CancelledError):
+                        pass
+                    break
+                if input_task in done:
+                    value = await input_task
+                    if value is None:
+                        break
+                    await self._handle_prompt_value(value)
+                    input_task = asyncio.create_task(self._input_queue.get())
+        finally:
+            if not prompt_task.done():
+                prompt_task.cancel()
+                await asyncio.gather(prompt_task, return_exceptions=True)
+            if not input_task.done():
+                input_task.cancel()
+                await asyncio.gather(input_task, return_exceptions=True)
+
+    async def run(self, session: PromptSession[str] | None = None) -> None:
+        """Run the alternate-screen app until Ctrl-D or an exit request."""
+
+        session = session or self._session or self._make_session()
+        self._active_session = session
+        if isinstance(session, FullScreenPromptSession):
+            session.layout.container.children.insert(
+                0,
+                Window(
+                    FormattedTextControl(self._transcript_content),
+                    height=Dimension(weight=1, min=1),
+                    wrap_lines=False,
+                ),
+            )
+        self._present_pending_approvals()
+        prompt_task: asyncio.Task[str | None] | None = None
+        try:
+            if isinstance(session, FullScreenPromptSession):
+                await self._run_full_screen(session)
+                return
+            prompt_task = asyncio.create_task(self._read_prompt(session))
             while prompt_task is not None and not self._exit_requested:
                 wait_for: set[asyncio.Task[Any]] = {prompt_task}
                 if self._active_task is not None:
@@ -737,25 +906,7 @@ class TUIApp:
                     value = await prompt_task
                     if value is None:
                         break
-                    parsed = parse_input(value)
-                    if parsed is not None and not self._exit_requested:
-                        if await self._handle_approval_input(parsed):
-                            pass
-                        else:
-                            slash_output = self._slash_commands.dispatch(self, parsed)
-                            if slash_output is not None:
-                                self._print_system(slash_output)
-                            else:
-                                model_input = self._slash_commands.input_for_model(
-                                    parsed
-                                )
-                                if self.pending_approvals:
-                                    self._present_pending_approvals()
-                                elif self.active:
-                                    self._queued.append(model_input)
-                                else:
-                                    self._print_user(model_input)
-                                    self._start_turn(model_input)
+                    await self._handle_prompt_value(value)
                     if self._exit_requested:
                         break
                     prompt_task = asyncio.create_task(self._read_prompt(session))
@@ -766,7 +917,10 @@ class TUIApp:
             if self._active_task is not None and not self._active_task.done():
                 self._active_task.cancel()
                 await asyncio.gather(self._active_task, return_exceptions=True)
+            if isinstance(session, FullScreenPromptSession):
+                session.restore_terminal()
             await self.loop.close()
+            self._active_session = None
 
     def _start_turn(self, user_text: str) -> None:
         self._active_task = asyncio.create_task(self._consume_turn(user_text))

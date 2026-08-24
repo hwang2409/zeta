@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -131,8 +132,14 @@ def main(argv: list[str] | None = None) -> int:
         app = create_app(args)
     except SessionError as exc:
         parser.error(str(exc))
-    with patch_stdout(raw=True):
-        asyncio.run(app.run())
+    try:
+        with patch_stdout(raw=True):
+            asyncio.run(app.run())
+    finally:
+        try:
+            os.write(sys.__stdout__.fileno(), b"\x1b[?1049l\x1b[?25h")
+        except OSError:
+            pass
     return 0
 
 

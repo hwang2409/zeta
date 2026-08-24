@@ -459,6 +459,8 @@ class Message:
 class StreamEventType(StrEnum):
     AGENT_START = "agent_start"
     TURN_START = "turn_start"
+    COMPACTION_START = "compaction_start"
+    COMPACTION_END = "compaction_end"
     MESSAGE_START = "message_start"
     MESSAGE_UPDATE = "message_update"
     MESSAGE_END = "message_end"

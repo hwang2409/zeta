@@ -208,6 +208,20 @@ class ContextAssembler:
     def digest(self) -> str | None:
         return self.last_context.digest if self.last_context is not None else None
 
+    def needs_compaction(self) -> bool:
+        """Return whether the next assembly must compact the active branch."""
+
+        branch = self.store.replay()
+        items = self._visible_items(branch)
+        system_prompt = self._system_prompt_message()
+        messages = [
+            *([] if system_prompt is None else [system_prompt]),
+            *(item.message for item in items),
+        ]
+        return self.compaction_policy.should_compact(
+            self._total_tokens(messages), self.token_budget
+        )
+
     @property
     def token_count(self) -> int | None:
         return self.last_context.token_count if self.last_context is not None else None

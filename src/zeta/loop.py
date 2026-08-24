@@ -269,10 +269,24 @@ class AgentLoop:
             assistant_message: Message | None = None
             completion: AsyncIterator[StreamEvent] | None = None
             completion_succeeded = False
-            context = await self.context_assembler.assemble(backend=self.backend)
+            if self.context_assembler.needs_compaction():
+                yield StreamEvent(
+                    StreamEventType.COMPACTION_START,
+                    data={"turn": turn_number},
+                )
+            context_messages = await self.context_assembler.assemble(backend=self.backend)
+            context = self.context_assembler.last_context
+            if context is not None and context.compacted:
+                yield StreamEvent(
+                    StreamEventType.COMPACTION_END,
+                    data={
+                        "turn": turn_number,
+                        "token_count": context.token_count,
+                    },
+                )
             try:
                 completion = self.backend.complete(
-                    context, self.tool_schemas
+                    context_messages, self.tool_schemas
                 )
                 async for event in completion:
                     self.context_assembler.observe_event(event)

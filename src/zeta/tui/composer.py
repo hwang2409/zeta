@@ -9,6 +9,16 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
+from rich.cells import cell_len
+from rich.text import Text
+
+
+def _fit(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    text = Text(value, no_wrap=True, overflow="ellipsis")
+    text.truncate(width, overflow="ellipsis")
+    return text.plain
 
 def parse_input(value: str) -> str | None:
     """Return a usable user turn, or None for blank input."""
@@ -35,13 +45,23 @@ def format_composer_info(
                 ("class:composer-info", right),
             ]
         )
-    spaces = max(2, width - len(left) - len(right))
+    if width <= 0:
+        return FormattedText()
+    if cell_len(left) + 2 + cell_len(right) <= width:
+        spaces = width - cell_len(left) - cell_len(right)
+        return FormattedText(
+            [
+                ("class:composer-info", left),
+                ("class:composer-info", " " * spaces),
+                ("class:composer-info", right),
+            ]
+        )
+    if width <= cell_len(left) + 2:
+        return FormattedText([("class:composer-info", _fit(left, width))])
+    right = _fit(right, width - cell_len(left) - 2).rstrip(" ·")
+    value = f"{left}  {right}" if right else _fit(left, width)
     return FormattedText(
-        [
-            ("class:composer-info", left),
-            ("class:composer-info", " " * spaces),
-            ("class:composer-info", right),
-        ]
+        [("class:composer-info", _fit(value, width))]
     )
 
 
@@ -49,14 +69,19 @@ def build_key_bindings(
     *,
     on_interrupt: Callable[[], None],
     on_exit: Callable[[], None],
+    on_submit: Callable[[str], None] | None = None,
 ) -> KeyBindings:
-    """Build the small key map used by the inline composer."""
+    """Build the small key map used by the full-screen composer."""
 
     bindings = KeyBindings()
 
     @bindings.add("enter")
     def submit(event: KeyPressEvent) -> None:
-        event.current_buffer.validate_and_handle()
+        if on_submit is not None:
+            on_submit(event.current_buffer.text)
+            event.current_buffer.reset()
+        else:
+            event.current_buffer.validate_and_handle()
 
     @bindings.add("c-j")
     def newline(event: KeyPressEvent) -> None:

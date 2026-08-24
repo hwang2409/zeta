@@ -41,8 +41,9 @@ the harness-native distillation.
 - `ApprovalPolicy`: allow / deny / ask with durable pending requests (stronger
   than pi's hook-only model — this we keep from the Wiki design).
 - Sessions: `~/.zeta/sessions/` (own home, not ~/.wiki), versioned schema.
-- TUI later: inline renderer + sticky composer (prompt_toolkit + rich), reuses
-  the wk-tui design decisions; lands after the loop is real.
+- TUI: full-screen alternate-buffer renderer with a scrollable transcript,
+  sticky composer, and one pinned footer row. It uses prompt_toolkit + rich and
+  restores the user's terminal on exit or crash.
 
 ## Isolation
 
@@ -83,7 +84,7 @@ the harness-native distillation.
 | ZETA-26 | Skills loader (fills the ZETA-21 stub): `src/zeta/skills/*.md`, frontmatter = name + description + trigger keywords, body = prompt content. System prompt carries a name+description index; a built-in `skill` tool loads a body on demand. No per-skill tool mounting. | ZETA-24 |
 | ZETA-27 | Session ergonomics: `/model` (swap model in place), `/compact` (force compaction now), `--resume` picker listing recent sessions with first-message preview. | ZETA-7, ZETA-19 |
 | ZETA-28 | Native non-text tool content transport: send image blocks to Anthropic tool_result natively, define codex fallback, TUI inline rendering. Replaces the ZETA-24 flatten fallback. | ZETA-24 |
-| ZETA-29 | TUI parity round 2 (OpenCode chrome): tool-call cards with truncation affordance, one-line tool receipts, styled thought lines with duration, vertical rhythm, status-bar state, theme consolidation. Todo widget + inline images out of scope. | ZETA-20 |
+| ZETA-29 | Full-screen alternate-buffer TUI parity round 2 (OpenCode chrome): transcript viewport, pinned composer/footer, tool-call cards with truncation affordance, one-line tool receipts, styled thought lines with duration, vertical rhythm, status-bar state, and theme consolidation. Todo widget + inline images out of scope. | ZETA-20 |
 
 ## Deferred / open followups (not yet ticketed)
 
