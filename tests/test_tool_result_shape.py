@@ -46,7 +46,7 @@ def _text_block(result: StructuredToolResult) -> ToolTextBlock:
                 "isError": False,
                 "structuredContent": None,
             },
-            "data must be a string",
+            "invalid image shape",
         ),
         (
             {
@@ -237,6 +237,7 @@ async def test_mixed_mcp_content_caps_text_and_preserves_other_blocks(
         image,
         resource,
     ]
+    assert result["content"][1] is not image
 
 
 @pytest.mark.asyncio

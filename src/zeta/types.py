@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import (
@@ -13,7 +14,6 @@ from typing import (
     Protocol,
     Sequence,
     TypedDict,
-    cast,
 )
 
 
@@ -120,6 +120,12 @@ RedactedThinkingBlock = RedactedThinkingContent
 ToolUseBlock = ToolUseContent
 
 
+class ToolAnnotations(TypedDict, total=False):
+    audience: list[Literal["user", "assistant"]]
+    priority: float
+    lastModified: str
+
+
 class ToolTextBlock(TypedDict):
     """MCP text content; metadata is always present, even when not capped."""
 
@@ -127,6 +133,7 @@ class ToolTextBlock(TypedDict):
     text: str
     truncated: bool
     full_size: int
+    annotations: NotRequired[ToolAnnotations]
 
 
 type StructuredContentValue = (
@@ -143,6 +150,7 @@ class ToolImageBlock(TypedDict):
     type: Literal["image"]
     data: str
     mimeType: str
+    annotations: NotRequired[ToolAnnotations]
 
 
 class ToolTextResource(TypedDict):
@@ -160,11 +168,13 @@ class ToolBlobResource(TypedDict):
 class ToolTextResourceBlock(TypedDict):
     type: Literal["resource"]
     resource: ToolTextResource
+    annotations: NotRequired[ToolAnnotations]
 
 
 class ToolBlobResourceBlock(TypedDict):
     type: Literal["resource"]
     resource: ToolBlobResource
+    annotations: NotRequired[ToolAnnotations]
 
 
 ToolResourceBlock = ToolTextResourceBlock | ToolBlobResourceBlock
@@ -177,8 +187,9 @@ def validate_tool_content_block(index: int, block: object) -> ToolContentBlock:
         raise ValueError(f"{prefix} must be an object")
     block_type = block.get("type")
     if block_type == "text":
-        expected_keys = {"type", "text", "truncated", "full_size"}
-        if set(block) != expected_keys:
+        required_keys = {"type", "text", "truncated", "full_size"}
+        allowed_keys = {*required_keys, "annotations"}
+        if not required_keys <= set(block) or not set(block) <= allowed_keys:
             raise ValueError(f"{prefix} has an invalid text shape")
         if type(block["text"]) is not str:
             raise ValueError(f"{prefix}.text must be a string")
@@ -186,17 +197,47 @@ def validate_tool_content_block(index: int, block: object) -> ToolContentBlock:
             raise ValueError(f"{prefix}.truncated must be a boolean")
         if type(block["full_size"]) is not int or block["full_size"] < 0:
             raise ValueError(f"{prefix}.full_size must be nonnegative")
-        return cast(ToolContentBlock, block)
+        normalized: ToolTextBlock = {
+            "type": "text",
+            "text": block["text"],
+            "truncated": block["truncated"],
+            "full_size": block["full_size"],
+        }
+        if "annotations" in block:
+            normalized["annotations"] = _validate_annotations(
+                prefix, block["annotations"]
+            )
+        return normalized
     if block_type == "image":
+        required_keys = {"type", "data", "mimeType"}
+        allowed_keys = {*required_keys, "annotations"}
+        if not required_keys <= set(block) or not set(block) <= allowed_keys:
+            raise ValueError(f"{prefix} has an invalid image shape")
         if type(block.get("data")) is not str:
             raise ValueError(f"{prefix}.data must be a string")
         if type(block.get("mimeType")) is not str:
             raise ValueError(f"{prefix}.mimeType must be a string")
-        return cast(ToolContentBlock, block)
+        normalized_image: ToolImageBlock = {
+            "type": "image",
+            "data": block["data"],
+            "mimeType": block["mimeType"],
+        }
+        if "annotations" in block:
+            normalized_image["annotations"] = _validate_annotations(
+                prefix, block["annotations"]
+            )
+        return normalized_image
     if block_type == "resource":
+        required_keys = {"type", "resource"}
+        allowed_keys = {*required_keys, "annotations"}
+        if not required_keys <= set(block) or not set(block) <= allowed_keys:
+            raise ValueError(f"{prefix} has an invalid resource shape")
         resource = block.get("resource")
         if type(resource) is not dict:
             raise ValueError(f"{prefix}.resource must be an object")
+        resource_keys = {"uri", "mimeType", "text", "blob"}
+        if not set(resource) <= resource_keys:
+            raise ValueError(f"{prefix}.resource has unsupported fields")
         if type(resource.get("uri")) is not str:
             raise ValueError(f"{prefix}.resource.uri must be a string")
         has_text = "text" in resource
@@ -209,8 +250,57 @@ def validate_tool_content_block(index: int, block: object) -> ToolContentBlock:
         mime_type = resource.get("mimeType")
         if mime_type is not None and type(mime_type) is not str:
             raise ValueError(f"{prefix}.resource.mimeType must be a string")
-        return cast(ToolContentBlock, block)
+        normalized_resource: ToolTextResource | ToolBlobResource
+        if has_text:
+            normalized_resource = {"uri": resource["uri"], "text": resource["text"]}
+        else:
+            normalized_resource = {"uri": resource["uri"], "blob": resource["blob"]}
+        if mime_type is not None:
+            normalized_resource["mimeType"] = mime_type
+        normalized_block: ToolTextResourceBlock | ToolBlobResourceBlock = {
+            "type": "resource",
+            "resource": normalized_resource,
+        }
+        if "annotations" in block:
+            normalized_block["annotations"] = _validate_annotations(
+                prefix, block["annotations"]
+            )
+        return normalized_block
     raise ValueError(f"{prefix}.type is unsupported: {block_type}")
+
+
+def _validate_annotations(prefix: str, value: object) -> ToolAnnotations:
+    if type(value) is not dict:
+        raise ValueError(f"{prefix}.annotations must be an object")
+    allowed_keys = {"audience", "priority", "lastModified"}
+    if not set(value) <= allowed_keys:
+        raise ValueError(f"{prefix}.annotations has unsupported fields")
+    normalized: ToolAnnotations = {}
+    if "audience" in value:
+        audience = value["audience"]
+        if type(audience) is not list or any(
+            type(role) is not str or role not in {"user", "assistant"}
+            for role in audience
+        ):
+            raise ValueError(
+                f"{prefix}.annotations.audience must contain user or assistant"
+            )
+        normalized["audience"] = list(audience)
+    if "priority" in value:
+        priority = value["priority"]
+        if (
+            type(priority) not in {int, float}
+            or not math.isfinite(priority)
+            or not 0 <= priority <= 1
+        ):
+            raise ValueError(f"{prefix}.annotations.priority must be between 0 and 1")
+        normalized["priority"] = float(priority)
+    if "lastModified" in value:
+        last_modified = value["lastModified"]
+        if type(last_modified) is not str:
+            raise ValueError(f"{prefix}.annotations.lastModified must be a string")
+        normalized["lastModified"] = last_modified
+    return normalized
 
 
 def flatten_tool_content(blocks: Sequence[ToolContentBlock]) -> str:
@@ -301,13 +391,17 @@ class ToolResult:
         if content_blocks is not None:
             if type(content_blocks) is not list:
                 raise ValueError("tool result content_blocks must be an array")
+            normalized_blocks: list[ToolContentBlock] = []
             for index, block in enumerate(content_blocks):
                 try:
-                    validate_tool_content_block(index, block)
+                    normalized_blocks.append(
+                        validate_tool_content_block(index, block)
+                    )
                 except ValueError as exc:
                     raise ValueError(
                         f"tool result content block is invalid: {exc}"
                     ) from exc
+            content_blocks = normalized_blocks
         return cls(
             tool_call_id=tool_call_id,
             content=content,

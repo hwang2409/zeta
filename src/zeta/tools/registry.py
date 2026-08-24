@@ -18,7 +18,7 @@ import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol
 
 from ..core.abort import AbortGenerationRegistry
 from ..core.abort import AbortSignal as ToolAbortSignal
@@ -268,6 +268,8 @@ def _normalize_result(
         full_size = max(block["full_size"], len(block["text"].encode("utf-8")))
         shown = block["text"][:remaining]
         normalized = text_block(shown, full_size=full_size)
+        if "annotations" in block:
+            normalized["annotations"] = block["annotations"]
         normalized["truncated"] |= (
             block["truncated"] or shown != block["text"]
         )
@@ -827,9 +829,11 @@ def validate_tool_result(result: object) -> StructuredToolResult:
             raise ValueError("structuredContent must be an object or null")
         _validate_structured_content(structured_content)
 
-    for index, block in enumerate(content):
+    normalized_content = [
         validate_tool_content_block(index, block)
-    return cast(StructuredToolResult, result)
+        for index, block in enumerate(content)
+    ]
+    return {**result, "content": normalized_content}
 
 
 def _validate_structured_content(value: object) -> None:
