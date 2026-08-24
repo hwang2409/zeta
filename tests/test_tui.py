@@ -12,11 +12,13 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit import PromptSession
 from prompt_toolkit.input import PipeInput, create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.data_structures import Size
 from rich.cells import cell_len
 from rich.console import Console
 from rich.syntax import Syntax
@@ -1250,6 +1252,25 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     bottom = root.children[1]
     assert bottom.__class__.__name__ == "HSplit"
     assert bottom.children[-1].__class__.__name__ == "ConditionalContainer"
+
+
+def test_full_screen_transcript_drops_markdown_list_placeholder_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._active_session = app._make_session()
+    output = SimpleNamespace(get_size=lambda: Size(rows=24, columns=40))
+    monkeypatch.setattr("zeta.tui.app.get_app", lambda: SimpleNamespace(output=output))
+
+    app._append_transcript(render_markdown("1. first item"))
+
+    assert app._transcript_lines
+    assert app._transcript_lines[0].strip() == "1 first item"
 
 
 def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
