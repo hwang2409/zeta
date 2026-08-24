@@ -253,6 +253,23 @@ def _legacy_result(result: ToolResult) -> StructuredToolResult:
         return _error_result(f"invalid tool result: {exc}")
 
 
+def _cap_result_text(
+    result: StructuredToolResult,
+    max_output_chars: int,
+) -> StructuredToolResult:
+    content = []
+    for block in result["content"]:
+        full_size = max(block["full_size"], len(block["text"].encode("utf-8")))
+        normalized = text_block(
+            block["text"],
+            cap=max_output_chars,
+            full_size=full_size,
+        )
+        normalized["truncated"] |= block["truncated"]
+        content.append(normalized)
+    return {**result, "content": content}
+
+
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
     name: str
@@ -524,17 +541,19 @@ class ToolRegistry:
                     f"tool result id mismatch: expected {tool_call.id}, "
                     f"got {result.tool_call_id}"
                 )
-            return _legacy_result(result)
-        if isinstance(result, Mapping):
+            normalized_result = _legacy_result(result)
+        elif isinstance(result, Mapping):
             try:
-                return validate_tool_result(result)
+                normalized_result = validate_tool_result(result)
             except ValueError as exc:
                 return _error_result(f"invalid tool handler result: {exc}")
-        if isinstance(result, str):
-            return _success_result(text_block(result))
-        return _error_result(
-            "invalid tool handler result: expected str or structured tool result"
-        )
+        elif isinstance(result, str):
+            normalized_result = _success_result(text_block(result))
+        else:
+            return _error_result(
+                "invalid tool handler result: expected str or structured tool result"
+            )
+        return _cap_result_text(normalized_result, self.max_output_chars)
 
     async def _invoke_streaming_handler(
         self,

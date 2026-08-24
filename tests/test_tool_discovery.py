@@ -48,12 +48,19 @@ def register(registry):
     )
     _use_tool_path(monkeypatch, tmp_path)
 
-    registry = ToolRegistry(tmp_path)
-    result = await registry.execute(ToolCall("fixture-call", "fixture", {"value": "ok"}))
+    registry = ToolRegistry(tmp_path, max_output_chars=4)
+    result = await registry.execute(
+        ToolCall("fixture-call", "fixture", {"value": "oversized"})
+    )
 
     assert result["isError"] is False
-    assert result["content"][0]["text"] == "ok"
-    assert result["structuredContent"] == {"value": "ok"}
+    assert result["content"][0] == {
+        "type": "text",
+        "text": "over",
+        "truncated": True,
+        "full_size": 9,
+    }
+    assert result["structuredContent"] == {"value": "oversized"}
 
 
 def test_registry_ignores_helpers_and_discovers_in_name_order(
