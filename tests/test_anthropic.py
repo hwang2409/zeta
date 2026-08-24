@@ -405,6 +405,41 @@ def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
     }
 
 
+def test_anthropic_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
+    payload = build_messages_payload(
+        [
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult(
+                    "call-1",
+                    "stale",
+                    content_blocks=[
+                        {
+                            "type": "image",
+                            "data": "aGVsbG8=",
+                            "mimeType": "image/png",
+                        },
+                        {
+                            "type": "resource",
+                            "resource": {
+                                "uri": "file:///tmp/note.txt",
+                                "text": "note",
+                            },
+                        },
+                    ],
+                ),
+            )
+        ],
+        [],
+        model="claude-test",
+        max_tokens=100,
+    )
+
+    assert payload["messages"][0]["content"][0]["content"] == (
+        "[image block]\n[resource: file:///tmp/note.txt]"
+    )
+
+
 @pytest.mark.asyncio
 async def test_backend_keeps_four_cache_breakpoints_governed(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []

@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, AsyncIterator, Literal, Mapping, Protocol, Sequence, TypedDict
+from typing import (
+    Any,
+    AsyncIterator,
+    Literal,
+    Mapping,
+    NotRequired,
+    Protocol,
+    Sequence,
+    TypedDict,
+    cast,
+)
 
 
 class MessageRole(StrEnum):
@@ -135,12 +145,91 @@ class ToolImageBlock(TypedDict):
     mimeType: str
 
 
-class ToolResourceBlock(TypedDict):
+class ToolTextResource(TypedDict):
+    uri: str
+    mimeType: NotRequired[str]
+    text: str
+
+
+class ToolBlobResource(TypedDict):
+    uri: str
+    mimeType: NotRequired[str]
+    blob: str
+
+
+class ToolTextResourceBlock(TypedDict):
     type: Literal["resource"]
-    resource: dict[str, StructuredContentValue]
+    resource: ToolTextResource
 
 
+class ToolBlobResourceBlock(TypedDict):
+    type: Literal["resource"]
+    resource: ToolBlobResource
+
+
+ToolResourceBlock = ToolTextResourceBlock | ToolBlobResourceBlock
 ToolContentBlock = ToolTextBlock | ToolImageBlock | ToolResourceBlock
+
+
+def validate_tool_content_block(index: int, block: object) -> ToolContentBlock:
+    prefix = f"content[{index}]"
+    if type(block) is not dict:
+        raise ValueError(f"{prefix} must be an object")
+    block_type = block.get("type")
+    if block_type == "text":
+        expected_keys = {"type", "text", "truncated", "full_size"}
+        if set(block) != expected_keys:
+            raise ValueError(f"{prefix} has an invalid text shape")
+        if type(block["text"]) is not str:
+            raise ValueError(f"{prefix}.text must be a string")
+        if type(block["truncated"]) is not bool:
+            raise ValueError(f"{prefix}.truncated must be a boolean")
+        if type(block["full_size"]) is not int or block["full_size"] < 0:
+            raise ValueError(f"{prefix}.full_size must be nonnegative")
+        return cast(ToolContentBlock, block)
+    if block_type == "image":
+        if type(block.get("data")) is not str:
+            raise ValueError(f"{prefix}.data must be a string")
+        if type(block.get("mimeType")) is not str:
+            raise ValueError(f"{prefix}.mimeType must be a string")
+        return cast(ToolContentBlock, block)
+    if block_type == "resource":
+        resource = block.get("resource")
+        if type(resource) is not dict:
+            raise ValueError(f"{prefix}.resource must be an object")
+        if type(resource.get("uri")) is not str:
+            raise ValueError(f"{prefix}.resource.uri must be a string")
+        has_text = "text" in resource
+        has_blob = "blob" in resource
+        if has_text == has_blob:
+            raise ValueError(f"{prefix}.resource must contain text or blob")
+        payload_key = "text" if has_text else "blob"
+        if type(resource[payload_key]) is not str:
+            raise ValueError(f"{prefix}.resource.{payload_key} must be a string")
+        mime_type = resource.get("mimeType")
+        if mime_type is not None and type(mime_type) is not str:
+            raise ValueError(f"{prefix}.resource.mimeType must be a string")
+        return cast(ToolContentBlock, block)
+    raise ValueError(f"{prefix}.type is unsupported: {block_type}")
+
+
+def flatten_tool_content(blocks: Sequence[ToolContentBlock]) -> str:
+    values: list[str] = []
+    for block in blocks:
+        if block["type"] == "text":
+            text = block["text"]
+            if block["truncated"]:
+                shown_bytes = len(text.encode("utf-8"))
+                text = (
+                    f"{text}\n[truncated: {shown_bytes} of "
+                    f"{block['full_size']} bytes]"
+                )
+            values.append(text)
+        elif block["type"] == "image":
+            values.append("[image block]")
+        else:
+            values.append(f"[resource: {block['resource']['uri']}]")
+    return "\n".join(values)
 
 
 class StructuredToolResult(TypedDict):
@@ -212,15 +301,13 @@ class ToolResult:
         if content_blocks is not None:
             if type(content_blocks) is not list:
                 raise ValueError("tool result content_blocks must be an array")
-            for block in content_blocks:
-                if (
-                    type(block) is not dict
-                    or block.get("type") != "text"
-                    or type(block.get("text")) is not str
-                    or type(block.get("truncated")) is not bool
-                    or type(block.get("full_size")) is not int
-                ):
-                    raise ValueError("tool result content block is invalid")
+            for index, block in enumerate(content_blocks):
+                try:
+                    validate_tool_content_block(index, block)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"tool result content block is invalid: {exc}"
+                    ) from exc
         return cls(
             tool_call_id=tool_call_id,
             content=content,

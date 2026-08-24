@@ -14,6 +14,7 @@ from rich.table import Table
 from rich.text import Text
 
 from ..types import (
+    flatten_tool_content,
     RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
@@ -207,15 +208,21 @@ def render_event(event: StreamEvent) -> RenderableType | None:
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:
         style = ERROR if event.tool_result.is_error else OK
         marker = "[tool error]" if event.tool_result.is_error else "[tool result]"
+        content_blocks = event.tool_result.content_blocks or []
         truncated_sizes = [
             block["full_size"]
-            for block in (event.tool_result.content_blocks or [])
-            if block["truncated"]
+            for block in content_blocks
+            if block["type"] == "text" and block["truncated"]
         ]
         if truncated_sizes:
             marker = f"{marker} [truncated; full_size={max(truncated_sizes)}]"
-        lines = event.tool_result.content.split("\n")
-        if not event.tool_result.content:
+        content = (
+            flatten_tool_content(content_blocks)
+            if content_blocks
+            else event.tool_result.content
+        )
+        lines = content.split("\n")
+        if not content:
             lines = ["empty"]
         rendered = Text()
         for index, line in enumerate(lines):

@@ -504,6 +504,38 @@ def test_render_event_shows_tool_result_truncation_metadata() -> None:
     assert "[truncated; full_size=8]" in rendered.plain
 
 
+def test_render_event_shows_non_text_tool_block_placeholders() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_result=ToolResult(
+                "call-1",
+                "",
+                content_blocks=[
+                    {
+                        "type": "text",
+                        "text": "answer",
+                        "truncated": False,
+                        "full_size": 6,
+                    },
+                    {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+                    {
+                        "type": "resource",
+                        "resource": {"uri": "file:///tmp/note.txt", "text": "note"},
+                    },
+                ],
+            ),
+        )
+    )
+
+    assert rendered is not None
+    assert rendered.plain == (
+        "  ↳ [tool result] answer\n"
+        "  ↳ [image block]\n"
+        "  ↳ [resource: file:///tmp/note.txt]"
+    )
+
+
 def test_render_helpers_use_the_zeta_palette() -> None:
     markdown = render_markdown("# heading")
     code = render_code("print('hi')", "python")

@@ -36,3 +36,22 @@ def test_signed_and_redacted_thinking_round_trip() -> None:
     )
 
     assert Message.from_dict(message.to_dict()) == message
+
+
+def test_tool_result_round_trip_preserves_mixed_content_blocks() -> None:
+    result = ToolResult(
+        "call-1",
+        "[image block]\n[resource: file:///tmp/note.txt]",
+        content_blocks=[
+            {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+            {
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///tmp/note.txt",
+                    "text": "note",
+                },
+            },
+        ],
+    )
+
+    assert ToolResult.from_dict(result.to_dict()) == result

@@ -103,6 +103,43 @@ def test_validated_tool_result_has_no_marker_when_not_truncated() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_preserves_mixed_tool_blocks(tmp_path: Path) -> None:
+    call = ToolCall("mixed-1", "mixed", {})
+    blocks = [
+        {"type": "text", "text": "answer", "truncated": False, "full_size": 6},
+        {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+        {
+            "type": "resource",
+            "resource": {"uri": "file:///tmp/note.txt", "text": "note"},
+        },
+    ]
+
+    async def mixed(arguments: dict[str, object]) -> dict[str, object]:
+        return {
+            "content": blocks,
+            "isError": False,
+            "structuredContent": None,
+        }
+
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register("mixed", mixed)
+
+    await collect(AgentLoop(backend, store, registry=registry).run_turn("start"))
+
+    result = store.messages()[2].tool_result
+    assert result is not None
+    assert result.content == "answer\n[image block]\n[resource: file:///tmp/note.txt]"
+    assert result.content_blocks == blocks
+    replayed_result = backend.calls[1][0][-1].tool_result
+    assert replayed_result is not None
+    assert replayed_result.content_blocks == blocks
+
+
+@pytest.mark.asyncio
 async def test_tool_call_then_next_completion(tmp_path: Path) -> None:
     first_call = ToolCall("call-1", "echo", {"value": "one"})
     second_call = ToolCall("call-2", "echo", {"value": "two"})

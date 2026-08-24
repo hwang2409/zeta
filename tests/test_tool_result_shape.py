@@ -67,6 +67,26 @@ def test_validate_tool_result_rejects_malformed_shapes(
         validate_tool_result(result)
 
 
+@pytest.mark.parametrize(
+    "resource",
+    [
+        {"uri": "file:///tmp/note.txt"},
+        {"uri": "file:///tmp/note.txt", "text": "note", "blob": "bm90ZQ=="},
+    ],
+)
+def test_validate_tool_result_requires_one_resource_payload(
+    resource: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError, match="text or blob"):
+        validate_tool_result(
+            {
+                "content": [{"type": "resource", "resource": resource}],
+                "isError": False,
+                "structuredContent": None,
+            }
+        )
+
+
 @pytest.mark.asyncio
 async def test_success_result_uses_mcp_content_shape(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, register_builtin=False)
