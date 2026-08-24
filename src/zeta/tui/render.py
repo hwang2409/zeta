@@ -530,17 +530,17 @@ def format_status(
     right_segments = [context_text, "/status", "ctrl+c quit"]
     if session_id:
         right_segments.append(session_id[:8])
-    right = " · ".join(right_segments)
-    if width is not None and cell_len(left) + cell_len(right) + 1 > width:
-        right = " · ".join(right_segments[:3])
-    if width is not None and cell_len(left) + cell_len(right) + 1 > width:
-        right = context_text
-    if width is not None and cell_len(left) + cell_len(right) < width:
-        value = f"{left}{' ' * (width - cell_len(left) - cell_len(right))}{right}"
+    if width is None:
+        value = f"{left}  {' · '.join(right_segments)}"
     else:
-        value = f"{left}  {right}"
-    if width is not None:
-        fitted = Text(value, no_wrap=True, overflow="ellipsis")
-        fitted.truncate(width, overflow="ellipsis")
-        value = fitted.plain.rstrip(" ·")
+        value = left
+        for count in range(len(right_segments), 0, -1):
+            candidate = f"{left}  {' · '.join(right_segments[:count])}"
+            if cell_len(candidate) <= width:
+                value = candidate
+                break
+        if cell_len(value) > width:
+            fitted = Text(value, no_wrap=True, overflow="ellipsis")
+            fitted.truncate(width, overflow="ellipsis")
+            value = fitted.plain.rstrip(" ·")
     return Text(value, style=CHROME)

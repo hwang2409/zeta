@@ -17,6 +17,7 @@ import pytest
 from prompt_toolkit import PromptSession
 from prompt_toolkit.input import PipeInput, create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from rich.cells import cell_len
 from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
@@ -1169,6 +1170,21 @@ def test_status_bar_includes_session_context_and_streaming_indicator() -> None:
     assert "ctrl+c quit" in status.plain
 
 
+def test_status_bar_drops_whole_segments_at_narrow_widths() -> None:
+    for width in range(10, 81):
+        status = format_status(
+            "fake",
+            "offline",
+            "idle",
+            token_count=14,
+            session_id="abcdef12",
+            width=width,
+        )
+
+        assert cell_len(status.plain) <= width
+        assert "/stat" not in status.plain or "/status" in status.plain
+
+
 def test_status_bar_fits_segments_and_pulses() -> None:
     statuses = [
         format_status(
@@ -1216,6 +1232,24 @@ def test_status_bar_fits_segments_and_pulses() -> None:
     )
     assert "idle" in cleared.plain
     assert "abc12345" in cleared.plain
+
+
+def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    session = app._make_session()
+    app._install_full_screen_layout(session)
+
+    root = session.layout.container
+    assert len(root.children) == 2
+    assert root.children[0].__class__.__name__ == "Window"
+    bottom = root.children[1]
+    assert bottom.__class__.__name__ == "HSplit"
+    assert bottom.children[-1].__class__.__name__ == "ConditionalContainer"
 
 
 def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:

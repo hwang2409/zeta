@@ -21,7 +21,7 @@ from prompt_toolkit.formatted_text import ANSI, FormattedText
 from prompt_toolkit.styles import Style
 from prompt_toolkit.layout import Dimension
 from prompt_toolkit.layout.controls import FormattedTextControl
-from prompt_toolkit.layout.containers import Window
+from prompt_toolkit.layout.containers import HSplit, Window
 from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.padding import Padding
@@ -455,7 +455,10 @@ class TUIApp:
             theme=RICH_THEME,
         )
         transcript_console.print(Padding(renderable, (0, 2, 0, 2)))
-        self._transcript_lines.extend(output.getvalue().rstrip("\n").splitlines())
+        lines = output.getvalue().rstrip("\n").splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        self._transcript_lines.extend(lines)
 
     def _append_transcript_blank(self) -> None:
         self._transcript_lines.append("")
@@ -590,6 +593,12 @@ class TUIApp:
                 self._turn_had_visible_output = True
             return
         for line in lines:
+            if not line:
+                if self._full_screen_active():
+                    self._append_transcript_blank()
+                else:
+                    self.console.print()
+                continue
             for renderable in self._markdown_stream.consume(line):
                 self._print_assistant(renderable)
 
@@ -866,20 +875,30 @@ class TUIApp:
                 input_task.cancel()
                 await asyncio.gather(input_task, return_exceptions=True)
 
+    def _install_full_screen_layout(self, session: FullScreenPromptSession) -> None:
+        root = session.layout.container
+        composer_rows = list(root.children)
+        footer = composer_rows.pop()
+        transcript = Window(
+            FormattedTextControl(self._transcript_content),
+            height=Dimension(weight=1, min=1),
+            wrap_lines=False,
+        )
+        root.children[:] = [
+            transcript,
+            HSplit(
+                [*composer_rows, footer],
+                height=Dimension(min=2, max=8),
+            ),
+        ]
+
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run the alternate-screen app until Ctrl-D or an exit request."""
 
         session = session or self._session or self._make_session()
         self._active_session = session
         if isinstance(session, FullScreenPromptSession):
-            session.layout.container.children.insert(
-                0,
-                Window(
-                    FormattedTextControl(self._transcript_content),
-                    height=Dimension(weight=1, min=1),
-                    wrap_lines=False,
-                ),
-            )
+            self._install_full_screen_layout(session)
         self._present_pending_approvals()
         prompt_task: asyncio.Task[str | None] | None = None
         try:
