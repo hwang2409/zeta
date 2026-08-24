@@ -31,6 +31,7 @@ from .transport import (
     retry_auth_completion,
     task_is_cancelling,
 )
+from .usage import normalize_usage
 from ..types import (
     CompletionBackend,
     ContentBlock,
@@ -571,7 +572,7 @@ def _translate_event(
                     content,
                     metadata={"codex_output_items": output_items},
                 ),
-                data={"usage": dict(usage), **response_data},
+                data={"usage": normalize_usage(usage), **response_data},
             ),
             "stopped",
         )

@@ -208,6 +208,18 @@ class TUIApp:
             tokens_in_current_context=self.loop.context_assembler.token_count,
             compaction_marker_count=self.loop.store.compaction_marker_count(),
             pending_approvals=pending,
+            cache_read_input_tokens=(
+                self.loop.context_assembler.cache_read_input_tokens_this_session
+            ),
+            cache_creation_input_tokens=(
+                self.loop.context_assembler.cache_creation_input_tokens_this_session
+            ),
+            uncached_input_tokens=(
+                self.loop.context_assembler.uncached_input_tokens_this_session
+            ),
+            output_tokens_this_session=(
+                self.loop.context_assembler.output_tokens_this_session
+            ),
         )
 
     def _present_pending_approvals(self) -> None:

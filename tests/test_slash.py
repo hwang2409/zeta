@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import StringIO
 from pathlib import Path
 
@@ -39,6 +39,10 @@ def session() -> FakeSlashSession:
             tokens_in_current_context=45,
             compaction_marker_count=2,
             pending_approvals=("approval-1 (write)",),
+            cache_read_input_tokens=50,
+            cache_creation_input_tokens=25,
+            uncached_input_tokens=25,
+            output_tokens_this_session=4,
         )
     )
 
@@ -58,7 +62,15 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
         retained_tail=17,
     )
     await loop.context_assembler.assemble()
-    loop.context_assembler.record_usage({"total_tokens": 321})
+    loop.context_assembler.record_usage(
+        {
+            "total_tokens": 321,
+            "cache_read_input_tokens": 50,
+            "cache_creation_input_tokens": 25,
+            "input_tokens": 25,
+            "output_tokens": 4,
+        }
+    )
     calls = [
         ToolCall("approval-live-1", "write", {}),
         ToolCall("approval-live-2", "write", {}),
@@ -94,6 +106,11 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
     assert f"compaction_marker_count: {store.compaction_marker_count()}" in output
     assert "compaction_marker_count: 2" in output
     assert "live_pending_approvals: 2" in output
+    assert "prompt_cache_read: 50" in output
+    assert "prompt_cache_write: 25" in output
+    assert "prompt_cache_uncached_input: 25" in output
+    assert "prompt_cache_hit_rate: 50.0%" in output
+    assert "output_tokens_this_session: 4" in output
 
 
 @pytest.mark.asyncio
@@ -132,6 +149,21 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
 
     assert output is not None
     assert "tokens_used_this_session: 35" in output
+
+
+def test_status_renders_cache_hit_rate_as_na_without_usage() -> None:
+    empty_session = FakeSlashSession(
+        replace(
+            session().status,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+            uncached_input_tokens=0,
+        )
+    )
+    output = create_slash_registry().dispatch(empty_session, "/status")
+
+    assert output is not None
+    assert "prompt_cache_hit_rate: n/a" in output
 
 
 def test_unknown_command_passes_through_unchanged() -> None:

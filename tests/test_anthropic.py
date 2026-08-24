@@ -28,6 +28,7 @@ from zeta.types import (
     TextContent,
     ThinkingContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
 )
 
@@ -126,6 +127,41 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
         ThinkingContent("plan", "sig-1"),
         TextContent("hello"),
     ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_preserves_anthropic_cache_usage_fields(tmp_path: Path) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=SSE.replace(
+                '"input_tokens":12',
+                '"input_tokens":12,"cache_read_input_tokens":8,'
+                '"cache_creation_input_tokens":2',
+            ),
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(
+            client=client,
+            token_store=store,
+            base_url="https://test.invalid/v1/messages",
+        ).complete([], [])
+    ]
+
+    assert events[-1].data["usage"] == {
+        "input_tokens": 12,
+        "cache_read_input_tokens": 8,
+        "cache_creation_input_tokens": 2,
+        "output_tokens": 4,
+    }
     await client.aclose()
 
 
@@ -367,6 +403,64 @@ def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
     assert payload["messages"][-1]["content"][0]["cache_control"] == {
         "type": "ephemeral"
     }
+
+
+@pytest.mark.asyncio
+async def test_backend_keeps_four_cache_breakpoints_governed(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=SSE,
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    backend = AnthropicBackend(
+        client=client,
+        token_store=store,
+        base_url="https://test.invalid/v1/messages",
+    )
+    events = [
+        event
+        async for event in backend.complete(
+            [
+                Message(MessageRole.SYSTEM, [TextContent("stable")]),
+                Message(MessageRole.USER, [TextContent("run")]),
+                Message(
+                    MessageRole.TOOL_RESULT,
+                    tool_result=ToolResult("call-1", "result"),
+                ),
+            ],
+            [{"name": "read", "parameters": {"type": "object"}}],
+        )
+    ]
+
+    del events
+    payload = json.loads(requests[0].content)
+    assert payload["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert payload["system"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert payload["messages"][-1]["content"][-1]["cache_control"] == {
+        "type": "ephemeral"
+    }
+    assert sum(
+        isinstance(value, dict) and "cache_control" in value
+        for section in (payload["system"], payload["tools"], payload["messages"])
+        for value in section
+        if isinstance(value, dict)
+    ) == 3
+    assert sum(
+        isinstance(block, dict) and "cache_control" in block
+        for message in payload["messages"]
+        for block in message["content"]
+    ) == 1
+    await client.aclose()
 
 
 def test_empty_system_prompt_is_omitted_from_payload() -> None:

@@ -199,6 +199,10 @@ class ContextAssembler:
         self.last_usage: dict[str, Any] = {}
         self._provider_token_total: int | None = None
         self._tokens_used_this_session = 0
+        self._cache_read_input_tokens_this_session = 0
+        self._cache_creation_input_tokens_this_session = 0
+        self._uncached_input_tokens_this_session = 0
+        self._output_tokens_this_session = 0
 
     @property
     def digest(self) -> str | None:
@@ -212,14 +216,50 @@ class ContextAssembler:
     def tokens_used_this_session(self) -> int:
         return self._tokens_used_this_session
 
+    @property
+    def cache_read_input_tokens_this_session(self) -> int:
+        return self._cache_read_input_tokens_this_session
+
+    @property
+    def cache_creation_input_tokens_this_session(self) -> int:
+        return self._cache_creation_input_tokens_this_session
+
+    @property
+    def uncached_input_tokens_this_session(self) -> int:
+        return self._uncached_input_tokens_this_session
+
+    @property
+    def output_tokens_this_session(self) -> int:
+        return self._output_tokens_this_session
+
     def record_usage(self, usage: Mapping[str, Any]) -> None:
         self.last_usage = dict(usage)
+        input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
+        output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
+        cache_read_tokens = usage.get("cache_read_input_tokens")
+        cache_creation_tokens = usage.get("cache_creation_input_tokens")
+        if type(input_tokens) is int and input_tokens >= 0:
+            self._uncached_input_tokens_this_session += input_tokens
+        if type(output_tokens) is int and output_tokens >= 0:
+            self._output_tokens_this_session += output_tokens
+        if type(cache_read_tokens) is int and cache_read_tokens >= 0:
+            self._cache_read_input_tokens_this_session += cache_read_tokens
+        if type(cache_creation_tokens) is int and cache_creation_tokens >= 0:
+            self._cache_creation_input_tokens_this_session += cache_creation_tokens
         total = usage.get("total_tokens")
         if type(total) is not int:
-            input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
-            output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
-            if type(input_tokens) is int and type(output_tokens) is int:
-                total = input_tokens + output_tokens
+            known_tokens = [
+                value
+                for value in (
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                )
+                if type(value) is int and value >= 0
+            ]
+            if known_tokens:
+                total = sum(known_tokens)
         if type(total) is int and total >= 0:
             self._provider_token_total = total
             self._tokens_used_this_session += total

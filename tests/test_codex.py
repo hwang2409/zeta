@@ -21,6 +21,9 @@ from zeta.providers.codex import (
     build_responses_payload,
     extract_account_id,
 )
+from zeta.core.context import ContextAssembler
+from zeta.core.slash import SlashStatus, _format_status
+from zeta.core.store import ConversationStore
 from zeta.types import (
     Message,
     MessageRole,
@@ -61,7 +64,9 @@ def sse(events: list[dict[str, object]]) -> str:
     )
 
 
-def message_stream() -> list[dict[str, object]]:
+def message_stream(
+    usage: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
     return [
         event(
             "response.created",
@@ -107,7 +112,7 @@ def message_stream() -> list[dict[str, object]]:
             response={
                 "id": "response-test",
                 "status": "completed",
-                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "usage": usage or {"input_tokens": 3, "output_tokens": 2},
             },
         ),
     ]
@@ -462,6 +467,53 @@ async def test_responses_stream_maps_text_usage_and_has_one_completion_boundary(
     assert events[-1].data["usage"] == {"input_tokens": 3, "output_tokens": 2}
     assert events[-1].message is not None
     assert events[-1].message.content == [TextContent("hello")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_normalizes_cached_input_usage(tmp_path: Path) -> None:
+    usage = {
+        "input_tokens": 20,
+        "output_tokens": 4,
+        "input_tokens_details": {"cached_tokens": 17},
+    }
+    client = client_for(sse(message_stream(usage)))
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+            base_url="https://test.invalid/codex/responses",
+        ).complete([], [])
+    ]
+
+    assert events[-1].data["usage"] == {
+        **usage,
+        "input_tokens": 3,
+        "cache_read_input_tokens": 17,
+    }
+    assert "cache_creation_input_tokens" not in events[-1].data["usage"]
+    assembler = ContextAssembler(ConversationStore(tmp_path / "sessions"))
+    assembler.record_usage(events[-1].data["usage"])
+    assert assembler.uncached_input_tokens_this_session == 3
+    assert assembler.cache_read_input_tokens_this_session == 17
+    assert assembler.output_tokens_this_session == 4
+    assert assembler.tokens_used_this_session == 24
+    status = SlashStatus(
+        session_id="session-1",
+        provider="codex",
+        model="test",
+        retained_tail=1,
+        tokens_used_this_session=assembler.tokens_used_this_session,
+        tokens_in_current_context=None,
+        compaction_marker_count=0,
+        pending_approvals=(),
+        cache_read_input_tokens=assembler.cache_read_input_tokens_this_session,
+        cache_creation_input_tokens=0,
+        uncached_input_tokens=assembler.uncached_input_tokens_this_session,
+        output_tokens_this_session=assembler.output_tokens_this_session,
+    )
+    assert "prompt_cache_hit_rate: 85.0%" in _format_status(status)
     await client.aclose()
 
 
