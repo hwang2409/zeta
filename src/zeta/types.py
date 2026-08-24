@@ -129,10 +129,24 @@ type StructuredContentValue = (
 )
 
 
+class ToolImageBlock(TypedDict):
+    type: Literal["image"]
+    data: str
+    mimeType: str
+
+
+class ToolResourceBlock(TypedDict):
+    type: Literal["resource"]
+    resource: dict[str, StructuredContentValue]
+
+
+ToolContentBlock = ToolTextBlock | ToolImageBlock | ToolResourceBlock
+
+
 class StructuredToolResult(TypedDict):
     """MCP-compatible result returned by the tool registry."""
 
-    content: list[ToolTextBlock]
+    content: list[ToolContentBlock]
     isError: bool
     structuredContent: dict[str, StructuredContentValue] | None
 
@@ -171,7 +185,7 @@ class ToolResult:
     tool_call_id: str
     content: str
     is_error: bool = False
-    content_blocks: list[ToolTextBlock] | None = field(default=None, compare=False)
+    content_blocks: list[ToolContentBlock] | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {

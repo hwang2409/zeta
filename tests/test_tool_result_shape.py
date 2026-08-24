@@ -46,7 +46,7 @@ def _text_block(result: StructuredToolResult) -> ToolTextBlock:
                 "isError": False,
                 "structuredContent": None,
             },
-            "invalid shape",
+            "data must be a string",
         ),
         (
             {
@@ -164,6 +164,58 @@ async def test_result_cap_is_aggregate_across_text_blocks(tmp_path: Path) -> Non
             "truncated": True,
             "full_size": 5,
         },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mixed_mcp_content_caps_text_and_preserves_other_blocks(
+    tmp_path: Path,
+) -> None:
+    image = {
+        "type": "image",
+        "data": "aGVsbG8=",
+        "mimeType": "image/png",
+        "annotations": {"audience": ["user"]},
+    }
+    resource = {
+        "type": "resource",
+        "resource": {
+            "uri": "file:///tmp/note.txt",
+            "mimeType": "text/plain",
+            "text": "resource body",
+        },
+    }
+    registry = ToolRegistry(tmp_path, max_output_chars=4, register_builtin=False)
+    registry.register(
+        "mixed",
+        lambda arguments: {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "oversized",
+                    "truncated": False,
+                    "full_size": 9,
+                },
+                image,
+                resource,
+            ],
+            "isError": False,
+            "structuredContent": None,
+        },
+    )
+
+    result = await registry.execute(ToolCall("mixed-1", "mixed", {}))
+
+    assert result["isError"] is False
+    assert result["content"] == [
+        {
+            "type": "text",
+            "text": "over",
+            "truncated": True,
+            "full_size": 9,
+        },
+        image,
+        resource,
     ]
 
 
