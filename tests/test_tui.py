@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from zeta.tui.render import (
     render_code,
     render_event,
     render_markdown,
+    render_tool_progress,
     tool_render_mode,
 )
 from zeta.tui.theme import ACCENT, BODY, CODE_BG
@@ -471,7 +473,7 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
     )
     assert tool_region == f"{renderable_plain(expected_start)}\n{renderable_plain(expected)}"
     assert "  ↳ [stdout] first" not in tool_region
-    assert app._loop_state == "idle"
+    assert app._loop_state == "interrupted"
     results = [
         message.tool_result
         for message in store.messages()
@@ -616,6 +618,32 @@ def test_tool_render_mode_keeps_receipt_rule_in_one_place() -> None:
     assert tool_render_mode(generic) == "card"
 
 
+def test_receipt_mode_forces_errors_and_non_text_results_into_cards() -> None:
+    call = ToolCall("read-special", "read", {"path": "missing.txt"})
+    error = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "permission denied", is_error=True),
+    )
+    mixed = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "answer\n[image block]",
+            content_blocks=[
+                {"type": "text", "text": "answer", "truncated": False, "full_size": 6},
+                {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+            ],
+        ),
+    )
+
+    assert tool_render_mode(error) == "card"
+    assert tool_render_mode(mixed) == "card"
+    assert "permission denied" in renderable_plain(render_event(error))
+    assert "[image block]" in renderable_plain(render_event(mixed))
+
+
 def test_tool_card_truncates_at_fifteen_lines() -> None:
     call = ToolCall("long-1", "bash", {"cmd": "seq 30"})
     rendered = render_event(
@@ -633,8 +661,21 @@ def test_tool_card_truncates_at_fifteen_lines() -> None:
     assert "… +5 lines" in plain
 
 
+def test_live_tool_preview_reuses_the_fifteen_line_limit() -> None:
+    call = ToolCall("live-1", "bash", {"cmd": "seq 20"})
+    rendered = render_tool_progress(call, "\n".join(f"line-{i}" for i in range(20)))
+    plain = renderable_plain(rendered)
+
+    assert "line-14" in plain
+    assert "line-15" not in plain
+    assert "… +5 lines" in plain
+
+
 def test_thought_collapses_to_first_sentence_and_keeps_duration() -> None:
     assert collapse_thought("Plan first. Hide the rest.") == "Plan first."
+    assert collapse_thought("Use e.g. this value. Hide the rest.") == "Use e.g. this value."
+    assert collapse_thought("") == ""
+    assert collapse_thought("No final punctuation") == "No final punctuation"
     rendered = format_thought("Plan first. Hide the rest.", 2.7)
 
     assert rendered.plain == "thought · 2.7s  Plan first."
@@ -723,6 +764,24 @@ def test_stream_kind_switch_flushes_assistant_before_thinking(tmp_path: Path) ->
 
     assert isinstance(rendered[0], Table)
     assert rendered[1].plain == "thought  plan"
+
+
+def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    app._print_committed(["first paragraph", "second paragraph"])
+    app._print_committed(["```python", "print('hi')", "```"])
+    rendered = "\n".join(line.rstrip() for line in output.getvalue().splitlines())
+
+    assert "first paragraph\nsecond paragraph" in rendered
+    assert "first paragraph\n\nsecond paragraph" not in rendered
+    assert "print('hi')\n\n" not in rendered
 
 
 @pytest.mark.asyncio
@@ -1139,6 +1198,66 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_app_abort_enters_interrupted_state(tmp_path: Path) -> None:
+    backend = GateBackend()
+    app = TUIApp(
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    states: list[str] = []
+    app._invalidate_prompt = lambda: states.append(app._loop_state)
+    turn = asyncio.create_task(app._consume_turn("prompt"))
+    app._active_task = turn
+    await backend.started.wait()
+
+    app.abort_active()
+    await asyncio.gather(turn, return_exceptions=True)
+
+    assert "interrupted" in states
+    assert app._loop_state == "interrupted"
+    assert "interrupted" in format_status(
+        app.provider,
+        app.model,
+        app._loop_state,
+        session_id="session",
+    ).plain
+
+
+@pytest.mark.asyncio
+async def test_app_surfaces_compacting_state_before_provider_output(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions"),
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    assembler = app.loop.context_assembler
+    assemble = assembler.assemble
+    states: list[str] = []
+
+    async def compacted_assemble(*args: object, **kwargs: object) -> list[Message]:
+        messages = await assemble(*args, **kwargs)
+        assert assembler.last_context is not None
+        assembler.last_context = replace(assembler.last_context, compacted=True)
+        return messages
+
+    assembler.assemble = compacted_assemble  # type: ignore[method-assign]
+    app._invalidate_prompt = lambda: states.append(app._loop_state)
+
+    await app._consume_turn("prompt")
+
+    assert "compacting" in states
+    compacting_index = states.index("compacting")
+    assert "streaming" in states[compacting_index + 1 :]
+
+
+@pytest.mark.asyncio
 async def test_full_session_preserves_assistant_tool_user_order(tmp_path: Path) -> None:
     calls = [ToolCall("call-1", "read", {}), ToolCall("call-2", "read", {})]
     backend = OrderedToolBackend(calls)
@@ -1206,15 +1325,45 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path:
 
     app._print_user("inspect the session")
     await app._consume_turn("inspect the session")
-    snapshot = output.getvalue()
+    snapshot = "\n".join(
+        line.rstrip() for line in output.getvalue().splitlines()
+    ).strip()
+    expected = """> inspect the session
 
-    assert "> inspect the session" in snapshot
-    assert "thought  Plan the inspection." in snapshot
-    assert "$ seq 24" in snapshot
-    assert "… +9 lines" in snapshot
-    assert "read README.md [limit=120] · running" in snapshot
-    assert "\nread README.md [limit=120]\n" in snapshot
-    assert "More reasoning stays collapsed." not in snapshot
+thought  Plan the inspection.
+
+╭──────────────────────────────────────────────────────────────────────╮
+│ $ seq 24                                                             │
+│ running…                                                             │
+╰──────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────╮
+│ $ seq 24                                                             │
+│ line-0                                                               │
+│ line-1                                                               │
+│ line-2                                                               │
+│ line-3                                                               │
+│ line-4                                                               │
+│ line-5                                                               │
+│ line-6                                                               │
+│ line-7                                                               │
+│ line-8                                                               │
+│ line-9                                                               │
+│ line-10                                                              │
+│ line-11                                                              │
+│ line-12                                                              │
+│ line-13                                                              │
+│ line-14                                                              │
+│ … +9 lines                                                           │
+╰──────────────────────────────────────────────────────────────────────╯
+
+read README.md [limit=120] · running
+read README.md [limit=120]
+
+finished
+
+done"""
+
+    assert snapshot == expected
 
 
 @pytest.mark.asyncio

@@ -49,6 +49,23 @@ RECEIPT_TOOLS = frozenset(
     {"read", "glob", "grep", "search", "find", "list", "websearch"}
 )
 SUMMARY_TOOLS = frozenset({"glob", "grep", "search", "find", "websearch"})
+ABBREVIATIONS = frozenset(
+    {
+        "e.g",
+        "i.e",
+        "etc",
+        "mr",
+        "mrs",
+        "ms",
+        "dr",
+        "vs",
+        "no",
+        "fig",
+        "prof",
+        "sr",
+        "jr",
+    }
+)
 ToolRenderMode = Literal["card", "receipt"]
 
 
@@ -90,6 +107,10 @@ def tool_render_mode(event: StreamEvent) -> ToolRenderMode:
     call = event.tool_call
     result = event.tool_result
     if call is None or result is None or call.name.lower() not in RECEIPT_TOOLS:
+        return "card"
+    if result.is_error or any(
+        block.get("type") != "text" for block in result.content_blocks or []
+    ):
         return "card"
     line_count = len(_tool_content(event).splitlines()) or 1
     if (
@@ -148,22 +169,12 @@ def _tool_receipt(event: StreamEvent) -> Text:
     )
 
 
-def _tool_body(event: StreamEvent) -> Text:
-    content = _tool_content(event)
-    if not content:
-        content = "empty"
+def _render_tool_output(content: str, extra_lines: list[str] | None = None) -> Text:
     lines = content.splitlines() or ["empty"]
     truncated = len(lines) > MAX_TOOL_LINES
     visible = lines[:MAX_TOOL_LINES]
-    result = event.tool_result
-    if result is not None and result.content_blocks:
-        sizes = [
-            block["full_size"]
-            for block in result.content_blocks
-            if block.get("type") == "text" and block.get("truncated")
-        ]
-        if sizes:
-            visible.append(f"[truncated; full_size={max(sizes)}]")
+    if extra_lines:
+        visible.extend(extra_lines)
     rendered = Text(
         "\n".join(_truncate(line, MAX_RESULT) for line in visible),
         style=BODY,
@@ -171,6 +182,21 @@ def _tool_body(event: StreamEvent) -> Text:
     if truncated:
         rendered.append(f"\n… +{len(lines) - MAX_TOOL_LINES} lines", style=AFFORDANCE)
     return rendered
+
+
+def _tool_body(event: StreamEvent) -> Text:
+    content = _tool_content(event) or "empty"
+    result = event.tool_result
+    extra_lines: list[str] = []
+    if result is not None and result.content_blocks:
+        sizes = [
+            block["full_size"]
+            for block in result.content_blocks
+            if block.get("type") == "text" and block.get("truncated")
+        ]
+        if sizes:
+            extra_lines.append(f"[truncated; full_size={max(sizes)}]")
+    return _render_tool_output(content, extra_lines)
 
 
 def _tool_card(event: StreamEvent, *, running: bool = False) -> Panel:
@@ -200,7 +226,11 @@ def _tool_panel(call: ToolCall, body: Text, *, error: bool = False) -> Panel:
 def render_tool_progress(call: ToolCall, content: str) -> Panel:
     """Render streamed tool output inside the same card surface."""
 
-    body = Text(content or "running…", style=DIM)
+    body = (
+        Text("running…", style=DIM)
+        if not content
+        else _render_tool_output(content)
+    )
     return _tool_panel(call, body)
 
 
@@ -210,9 +240,17 @@ def collapse_thought(value: str) -> str:
     normalized = " ".join(value.replace("\n", " ").split())
     if not normalized:
         return ""
-    match = re.search(r"^(.+?[.!?])(?:\s|$)", normalized)
-    sentence = match.group(1) if match else normalized
-    return _truncate(sentence, MAX_RESULT)
+    for index, character in enumerate(normalized):
+        if character not in ".!?":
+            continue
+        if character == ".":
+            token = normalized[: index + 1].rsplit(" ", 1)[-1]
+            token = token.rstrip(".,!?;:").lower()
+            if token in ABBREVIATIONS:
+                continue
+        if index + 1 == len(normalized) or normalized[index + 1].isspace():
+            return _truncate(normalized[: index + 1], MAX_RESULT)
+    return _truncate(normalized, MAX_RESULT)
 
 
 def format_thought(value: str, duration: float | None = None) -> Text:

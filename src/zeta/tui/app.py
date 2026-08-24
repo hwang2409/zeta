@@ -187,6 +187,8 @@ class TUIApp:
         self._approval_policy = approval_policy
         self._slash_commands = create_slash_registry()
         self._printed_units = False
+        self._assistant_unit_open = False
+        self._compaction_shown = False
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
@@ -345,8 +347,11 @@ class TUIApp:
 
     def abort_active(self) -> None:
         if self._active_task is not None and not self._active_task.done():
+            tool_running = self._loop_state == "tool-running"
             self.loop.abort()
-            if self._loop_state == "tool-running":
+            self._loop_state = "interrupted"
+            self._invalidate_prompt()
+            if tool_running:
                 self._abort_requested = True
             else:
                 self._active_task.cancel()
@@ -380,10 +385,24 @@ class TUIApp:
 
     def _print(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
-            if self._printed_units:
-                self.console.print()
             self.console.print(renderable)
-            self._printed_units = True
+
+    def _print_unit(self, renderable: RenderableType | None) -> None:
+        if renderable is None:
+            return
+        if self._printed_units:
+            self.console.print()
+        self._print(renderable)
+        self._printed_units = True
+
+    def _print_assistant(self, renderable: RenderableType | None) -> None:
+        if renderable is None:
+            return
+        if not self._assistant_unit_open:
+            self._print_unit(renderable)
+            self._assistant_unit_open = True
+        else:
+            self._print(renderable)
 
     def _update_tool_region(self, event: StreamEvent) -> None:
         rendered = render_event(event)
@@ -431,6 +450,7 @@ class TUIApp:
             self._tool_region_call = None
         for rendered in final_renders:
             self._print(rendered)
+        self._assistant_unit_open = False
 
     def _discard_tool_region(self) -> None:
         self._pending_tool_renders.clear()
@@ -444,11 +464,11 @@ class TUIApp:
         if thinking:
             value = "\n".join(lines)
             if value:
-                self._print(format_thought(value, self._thinking_duration))
+                self._print_unit(format_thought(value, self._thinking_duration))
             return
         for line in lines:
             for renderable in self._markdown_stream.consume(line):
-                self._print(renderable)
+                self._print_assistant(renderable)
 
     def _update_usage(self, event: StreamEvent) -> None:
         usage = event.data.get("usage")
@@ -472,11 +492,12 @@ class TUIApp:
 
     def _flush_markdown(self) -> None:
         for renderable in self._markdown_stream.flush():
-            self._print(renderable)
+            self._print_assistant(renderable)
 
     def _flush_pending_stream(self) -> None:
         self._flush_stream_kind()
         self._flush_markdown()
+        self._assistant_unit_open = False
 
     def _consume_text(self, event: StreamEvent) -> None:
         value = event.delta
@@ -523,16 +544,17 @@ class TUIApp:
         self._thinking_duration = None
 
     def _print_user(self, user_text: str) -> None:
-        self._print(Text.assemble(("> ", USER_ROLE), (user_text, BODY)))
+        self._assistant_unit_open = False
+        self._print_unit(Text.assemble(("> ", USER_ROLE), (user_text, BODY)))
 
     def _print_system(self, output: str) -> None:
-        self._print(Text(f"system · {output}", style=CHROME))
+        self._print_unit(Text(f"system · {output}", style=CHROME))
 
     def _start_queued_turn(self) -> None:
         if self._queued:
             user_text = self._queued.popleft()
             self._print_user(user_text)
-            self.console.print(Text("[queued]", style=DIM))
+            self._print(Text("[queued]", style=DIM))
             self._start_turn(user_text)
 
     def _prepare_stream_event(self, event: StreamEvent) -> None:
@@ -582,14 +604,17 @@ class TUIApp:
                     continue
                 if event.type is StreamEventType.TOOL_EXECUTION_START:
                     self._reset_stream_state()
+                    self._assistant_unit_open = False
                     self._loop_state = "tool-running"
                     if event.tool_call is not None:
                         self._active_tool_calls.add(event.tool_call.id)
                     self._present_pending_approvals()
+                    self._print_unit(render_event(event))
                 elif event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
                     self._update_tool_region(event)
                 elif event.type is StreamEventType.TOOL_EXECUTION_END:
-                    self._loop_state = "streaming"
+                    aborted = self._abort_requested
+                    self._loop_state = "interrupted" if aborted else "streaming"
                     if event.tool_call is not None:
                         self._active_tool_calls.discard(event.tool_call.id)
                     rendered = render_event(event)
@@ -598,7 +623,7 @@ class TUIApp:
                     if self._abort_requested:
                         self._abort_requested = False
                         stop_after_tool = True
-                        self._loop_state = "idle"
+                        self._loop_state = "interrupted"
                     else:
                         stop_after_tool = False
                     if not self._active_tool_calls:
@@ -607,6 +632,15 @@ class TUIApp:
                     self._spinner_frame = 0
                     self._spinner_reset.set()
                     self._streaming = True
+                    self._compaction_shown = False
+                elif event.type is StreamEventType.MESSAGE_START:
+                    context = self.loop.context_assembler.last_context
+                    if context is not None and context.compacted and not self._compaction_shown:
+                        self._compaction_shown = True
+                        self._loop_state = "compacting"
+                        self._invalidate_prompt()
+                        await asyncio.sleep(0)
+                        self._loop_state = "streaming"
                 elif event.type is StreamEventType.MESSAGE_END:
                     self._streaming = False
                 elif event.type is StreamEventType.AGENT_END:
@@ -615,22 +649,29 @@ class TUIApp:
                 if event.type not in {
                     StreamEventType.TOOL_EXECUTION_UPDATE,
                     StreamEventType.TOOL_EXECUTION_END,
+                    StreamEventType.TOOL_EXECUTION_START,
                 }:
                     rendered = render_event(event)
                     if rendered is not None:
-                        self._print(rendered)
+                        if event.type in {
+                            StreamEventType.AGENT_END,
+                            StreamEventType.ERROR,
+                        }:
+                            self._print_unit(rendered)
+                        else:
+                            self._print(rendered)
                 self._invalidate_prompt()
                 if event.type is StreamEventType.TOOL_EXECUTION_END and stop_after_tool:
                     break
         except asyncio.CancelledError:
             self._finish_stream()
-            self._loop_state = "idle"
-            self._print(Text("[aborted]", style=ERROR))
+            self._loop_state = "interrupted"
+            self._print_unit(Text("[aborted]", style=ERROR))
             raise
         except Exception as exc:
             self._finish_stream()
             self._loop_state = "idle"
-            self._print(Text(f"[error] {exc}", style=ERROR))
+            self._print_unit(Text(f"[error] {exc}", style=ERROR))
         finally:
             self._active_tool_calls.clear()
             self._discard_tool_region()
