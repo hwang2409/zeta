@@ -86,6 +86,88 @@ async def test_success_result_uses_mcp_content_shape(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("handler_kind", ["exception", "malformed"])
+async def test_handler_errors_are_capped(
+    tmp_path: Path, handler_kind: str
+) -> None:
+    oversized_message = "x" * 20
+    if handler_kind == "exception":
+
+        def handler(arguments: dict[str, object]) -> str:
+            raise ValueError(oversized_message)
+
+    else:
+
+        def handler(arguments: dict[str, object]) -> dict[str, object]:
+            return {
+                "content": "invalid",
+                "isError": False,
+                "structuredContent": None,
+            }
+
+    registry = ToolRegistry(tmp_path, max_output_chars=4, register_builtin=False)
+    registry.register("failure", handler)
+
+    result = await registry.execute(ToolCall("failure-1", "failure", {}))
+
+    expected = (
+        oversized_message
+        if handler_kind == "exception"
+        else "invalid tool handler result: content must be an array"
+    )
+    assert result["isError"] is True
+    assert result["content"][0] == {
+        "type": "text",
+        "text": expected[:4],
+        "truncated": True,
+        "full_size": len(expected),
+    }
+
+
+@pytest.mark.asyncio
+async def test_result_cap_is_aggregate_across_text_blocks(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, max_output_chars=5, register_builtin=False)
+    registry.register(
+        "multi",
+        lambda arguments: {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "abc",
+                    "truncated": False,
+                    "full_size": 3,
+                },
+                {
+                    "type": "text",
+                    "text": "defgh",
+                    "truncated": False,
+                    "full_size": 5,
+                },
+            ],
+            "isError": False,
+            "structuredContent": None,
+        },
+    )
+
+    result = await registry.execute(ToolCall("multi-1", "multi", {}))
+
+    assert result["content"] == [
+        {
+            "type": "text",
+            "text": "abc",
+            "truncated": False,
+            "full_size": 3,
+        },
+        {
+            "type": "text",
+            "text": "de",
+            "truncated": True,
+            "full_size": 5,
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_failure_result_uses_mcp_error_shape(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, register_builtin=False)
 
