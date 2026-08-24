@@ -352,7 +352,7 @@ class CodexBackend(CompletionBackend):
             self._refresh_token,
             lambda error: isinstance(error, CodexAuthError) and error.status_code == 401,
             lambda error: CodexAuthError(
-                "Codex authentication failed after token refresh; run `zeta login`",
+                "Codex authentication failed after token refresh; run `zeta login --provider codex`",
                 status_code=401,
             ),
         )
