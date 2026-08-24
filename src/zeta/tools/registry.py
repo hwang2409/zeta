@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib
 import inspect
 import json
 import math
 import os
+import pkgutil
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -47,6 +49,44 @@ ToolHandler = Callable[
     ..., ToolHandlerResult | Awaitable[ToolHandlerResult]
 ]
 ToolStream = Literal["stdout", "stderr"]
+
+
+def _discover_tool_modules() -> list[str]:
+    package = importlib.import_module(__package__)
+    return sorted(
+        f"{package.__name__}.{module_info.name}"
+        for module_info in pkgutil.iter_modules(package.__path__)
+        if not module_info.name.startswith("_")
+    )
+
+
+def _register_discovered_tools(registry: ToolRegistry) -> None:
+    """Load modules with ``register(registry)``; underscore modules are helpers."""
+
+    for module_name in _discover_tool_modules():
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001 - identify broken modules clearly
+            raise RuntimeError(
+                f"failed to load tool module {module_name}: {exc}"
+            ) from exc
+        if not hasattr(module, "register"):
+            continue
+        register = module.register
+        if not callable(register):
+            raise TypeError(
+                f"tool module {module_name} has a non-callable register contract"
+            )
+        try:
+            result = register(registry)
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                raise TypeError("register must be synchronous")
+        except Exception as exc:  # noqa: BLE001 - name malformed modules clearly
+            raise RuntimeError(
+                f"failed to register tool module {module_name}: {exc}"
+            ) from exc
 
 
 class ToolStreamPublisher(Protocol):
@@ -296,9 +336,7 @@ class ToolRegistry:
         )
         self._tools: dict[str, ToolDefinition] = {}
         if register_builtin:
-            from . import register_default_tools
-
-            register_default_tools(self)
+            _register_discovered_tools(self)
 
     @property
     def schemas(self) -> list[ToolSchema]:

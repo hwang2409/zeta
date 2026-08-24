@@ -1,4 +1,8 @@
-"""Built-in and custom tool registration."""
+"""Tool registry and dynamically discovered tool modules.
+
+Modules without a module-level ``register(registry)`` function are helpers.
+Modules whose names start with an underscore are also treated as helpers.
+"""
 
 from .registry import (
     AbortSignal,
@@ -10,16 +14,6 @@ from .registry import (
 )
 
 
-def register_default_tools(registry: ToolRegistry) -> None:
-    from . import bash, edit, exec, read, write
-
-    read.register(registry)
-    bash.register(registry)
-    exec.register(registry)
-    write.register(registry)
-    edit.register(registry)
-
-
 __all__ = [
     "AbortSignal",
     "ToolAbortSignal",
@@ -27,5 +21,4 @@ __all__ = [
     "ToolHandler",
     "ToolRegistry",
     "ToolStreamPublisher",
-    "register_default_tools",
 ]
