@@ -24,6 +24,7 @@ from .transport import (
     retry_auth_completion,
     task_is_cancelling,
 )
+from .usage import normalize_usage
 from ..types import (
     CompletionBackend,
     ContentBlock,
@@ -496,7 +497,11 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
             translated = StreamEvent(
                 translated.type,
                 message=translated.message,
-                data={**translated.data, "usage": usage, "stop_reason": stop_reason},
+                data={
+                    **translated.data,
+                    "usage": normalize_usage(usage),
+                    "stop_reason": stop_reason,
+                },
             )
             finished = True
         yield translated
@@ -515,7 +520,7 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
                     message=translated.message,
                     data={
                         **translated.data,
-                        "usage": usage,
+                        "usage": normalize_usage(usage),
                         "stop_reason": stop_reason,
                     },
                 )

@@ -61,7 +61,9 @@ def sse(events: list[dict[str, object]]) -> str:
     )
 
 
-def message_stream() -> list[dict[str, object]]:
+def message_stream(
+    usage: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
     return [
         event(
             "response.created",
@@ -107,7 +109,7 @@ def message_stream() -> list[dict[str, object]]:
             response={
                 "id": "response-test",
                 "status": "completed",
-                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "usage": usage or {"input_tokens": 3, "output_tokens": 2},
             },
         ),
     ]
@@ -462,6 +464,31 @@ async def test_responses_stream_maps_text_usage_and_has_one_completion_boundary(
     assert events[-1].data["usage"] == {"input_tokens": 3, "output_tokens": 2}
     assert events[-1].message is not None
     assert events[-1].message.content == [TextContent("hello")]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_normalizes_cached_input_usage(tmp_path: Path) -> None:
+    usage = {
+        "input_tokens": 20,
+        "output_tokens": 4,
+        "input_tokens_details": {"cached_tokens": 17},
+    }
+    client = client_for(sse(message_stream(usage)))
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+            base_url="https://test.invalid/codex/responses",
+        ).complete([], [])
+    ]
+
+    assert events[-1].data["usage"] == {
+        **usage,
+        "cache_read_input_tokens": 17,
+    }
+    assert "cache_creation_input_tokens" not in events[-1].data["usage"]
     await client.aclose()
 
 

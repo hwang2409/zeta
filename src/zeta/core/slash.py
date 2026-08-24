@@ -19,6 +19,9 @@ class SlashStatus:
     tokens_in_current_context: int | None
     compaction_marker_count: int
     pending_approvals: tuple[str, ...]
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    uncached_input_tokens: int = 0
 
 
 class SlashSession(Protocol):
@@ -80,6 +83,16 @@ def _format_status(status: SlashStatus) -> str:
         else "unknown"
     )
     pending = ", ".join(status.pending_approvals) or "none"
+    cache_total = (
+        status.cache_read_input_tokens
+        + status.cache_creation_input_tokens
+        + status.uncached_input_tokens
+    )
+    cache_hit_rate = (
+        "n/a"
+        if cache_total == 0
+        else f"{status.cache_read_input_tokens / cache_total * 100:.1f}%"
+    )
     return "\n".join(
         (
             f"session_id: {status.session_id}",
@@ -90,6 +103,10 @@ def _format_status(status: SlashStatus) -> str:
             f"tokens_in_current_context: {context_tokens}",
             f"compaction_marker_count: {status.compaction_marker_count}",
             f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",
+            f"prompt_cache_read: {status.cache_read_input_tokens}",
+            f"prompt_cache_write: {status.cache_creation_input_tokens}",
+            f"prompt_cache_uncached_input: {status.uncached_input_tokens}",
+            f"prompt_cache_hit_rate: {cache_hit_rate}",
         )
     )
 

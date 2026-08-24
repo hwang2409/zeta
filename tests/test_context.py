@@ -220,6 +220,40 @@ async def test_provider_usage_informs_next_assembly(context_root: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cached_provider_usage_triggers_compaction(context_root: Path) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(text(MessageRole.USER, "old"))
+    store.append_message(text(MessageRole.USER, "tail"))
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
+    assembler = ContextAssembler(
+        store,
+        token_budget=30,
+        retained_tail=1,
+        token_counter=lambda _: 1,
+        backend=backend,
+    )
+
+    await assembler.assemble()
+    assembler.record_usage(
+        {
+            "input_tokens": 18,
+            "cache_read_input_tokens": 10,
+            "cache_creation_input_tokens": 5,
+            "output_tokens": 7,
+        }
+    )
+
+    compacted = await assembler.assemble_context()
+
+    assert compacted.compacted is True
+    assert assembler.tokens_used_this_session == 40
+    assert assembler.cache_read_input_tokens_this_session == 10
+    assert assembler.cache_creation_input_tokens_this_session == 5
+    assert assembler.uncached_input_tokens_this_session == 18
+    assert assembler.output_tokens_this_session == 7
+
+
+@pytest.mark.asyncio
 async def test_compaction_is_idempotent_for_same_store_state(context_root: Path) -> None:
     store = ConversationStore(context_root)
     store.append_message(text(MessageRole.USER, "old content"))
