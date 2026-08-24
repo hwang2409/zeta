@@ -527,7 +527,10 @@ async def test_second_401_fails_loudly_without_a_retry_loop(
 
     monkeypatch.setattr(store, "refresh_token", refresh_token)
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    with pytest.raises(CodexAuthError, match="re-login required"):
+    with pytest.raises(
+        CodexAuthError,
+        match=r"Codex authentication failed after token refresh; run `zeta login --provider codex`",
+    ):
         [item async for item in CodexBackend(client=client, token_store=store).complete([], [])]
 
     assert len(requests) == 2

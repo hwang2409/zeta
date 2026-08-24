@@ -193,7 +193,7 @@ async def test_second_401_fails_loudly_without_a_retry_loop(
 
     monkeypatch.setattr(store, "refresh_token", refresh_token)
     client = client_for(handler)
-    with pytest.raises(AnthropicAuthError, match="re-login required"):
+    with pytest.raises(AnthropicAuthError, match=r"Anthropic.*zeta login"):
         [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
 
     assert len(requests) == 2
