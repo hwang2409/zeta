@@ -16,6 +16,7 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 from rich.console import Console, Group, RenderableType
 from rich.live import Live
+from rich.padding import Padding
 from rich.text import Text
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
@@ -36,7 +37,7 @@ from ..types import (
     ThinkingContent,
     ToolCall,
 )
-from .composer import build_key_bindings, history_for, parse_input
+from .composer import build_key_bindings, format_composer_info, history_for, parse_input
 from .render import (
     MarkdownStream,
     format_status,
@@ -44,7 +45,7 @@ from .render import (
     render_event,
     render_tool_progress,
 )
-from .theme import BODY, CHROME, DIM, ERROR, RICH_THEME, USER_PREFIX, USER_ROLE
+from .theme import ACCENT, BODY, CHROME, DIM, ERROR, RICH_THEME, SURFACE, USER_ROLE
 
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -333,10 +334,13 @@ class TUIApp:
             history=history_for(self._history_path),
             key_bindings=bindings,
             multiline=True,
+            erase_when_done=True,
             style=Style.from_dict(
                 {
-                    "prompt": USER_PREFIX,
-                    "bottom-toolbar": CHROME,
+                    "": f"fg:{BODY} bg:{SURFACE}",
+                    "prompt": f"fg:{ACCENT} bold bg:{SURFACE}",
+                    "status-bar": f"noreverse fg:{CHROME} bg:{SURFACE}",
+                    "composer-info": f"noreverse fg:{CHROME} bg:{SURFACE}",
                 }
             ),
         )
@@ -380,12 +384,20 @@ class TUIApp:
             width=width,
             spinner_frame=self._spinner_frame,
             spinner_active=self._spinner_active,
+            model_window=self.loop.context_assembler.token_budget,
         )
-        return FormattedText([("class:bottom-toolbar", status.plain)])
+        info = format_composer_info(self.provider, self.model, width=width)
+        return FormattedText(
+            [
+                *info,
+                ("class:status-bar", "\n"),
+                ("class:status-bar", status.plain),
+            ]
+        )
 
     def _print(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
-            self.console.print(renderable)
+            self.console.print(Padding(renderable, (0, 0, 0, 1)))
 
     def _print_unit(self, renderable: RenderableType | None) -> None:
         if renderable is None:
@@ -412,9 +424,12 @@ class TUIApp:
             self._tool_region_text = Text()
             self._tool_region_call = event.tool_call
             self._tool_region = Live(
-                render_tool_progress(
-                    self._tool_region_call,
-                    self._tool_region_text.plain,
+                Padding(
+                    render_tool_progress(
+                        self._tool_region_call,
+                        self._tool_region_text.plain,
+                    ),
+                    (0, 0, 0, 1),
                 )
                 if self._tool_region_call is not None
                 else self._tool_region_text,
@@ -430,9 +445,12 @@ class TUIApp:
         self._tool_region_text.append(rendered)
         if self._tool_region_call is not None:
             self._tool_region.update(
-                render_tool_progress(
-                    self._tool_region_call,
-                    self._tool_region_text.plain,
+                Padding(
+                    render_tool_progress(
+                        self._tool_region_call,
+                        self._tool_region_text.plain,
+                    ),
+                    (0, 0, 0, 1),
                 )
             )
         else:
@@ -545,7 +563,7 @@ class TUIApp:
 
     def _print_user(self, user_text: str) -> None:
         self._assistant_unit_open = False
-        self._print_unit(Text.assemble(("> ", USER_ROLE), (user_text, BODY)))
+        self._print_unit(Text.assemble(("▌ ", USER_ROLE), (user_text, BODY)))
 
     def _print_system(self, output: str) -> None:
         self._print_unit(Text(f"system · {output}", style=CHROME))
@@ -684,7 +702,7 @@ class TUIApp:
     async def _read_prompt(self, session: PromptSession[str]) -> str | None:
         try:
             value = await session.prompt_async(
-                "you > ",
+                [("class:prompt", " ❯ ")],
                 bottom_toolbar=self._status_toolbar,
             )
         except EOFError:

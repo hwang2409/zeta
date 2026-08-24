@@ -25,7 +25,7 @@ from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import TUIApp
-from zeta.tui.composer import build_key_bindings, parse_input
+from zeta.tui.composer import build_key_bindings, format_composer_info, parse_input
 from zeta.tui.render import (
     MarkdownStream,
     collapse_thought,
@@ -276,7 +276,7 @@ def test_render_event_compacts_tool_call_and_result() -> None:
     assert "read" in renderable_plain(start)
     assert "README.md" in renderable_plain(start)
     assert result is not None
-    assert result.plain == "read README.md"
+    assert result.plain == "⏺ read README.md"
 
 
 def test_render_event_shows_tool_output_update() -> None:
@@ -678,8 +678,8 @@ def test_thought_collapses_to_first_sentence_and_keeps_duration() -> None:
     assert collapse_thought("No final punctuation") == "No final punctuation"
     rendered = format_thought("Plan first. Hide the rest.", 2.7)
 
-    assert rendered.plain == "thought · 2.7s  Plan first."
-    assert "italic" in str(rendered.spans[0].style)
+    assert rendered.plain == "✱ thought · Plan first. · 2.7s"
+    assert "italic" in str(rendered.style)
 
 
 @pytest.mark.parametrize("state", ["streaming", "idle", "interrupted", "compacting"])
@@ -693,7 +693,8 @@ def test_status_bar_supports_all_session_states(state: str) -> None:
         width=120,
     )
 
-    assert f"abcdef12 · offline · {state}" in rendered.plain
+    assert state in rendered.plain
+    assert "abcdef12" in rendered.plain
 
 
 def test_markdown_stream_highlights_complete_fence() -> None:
@@ -763,7 +764,7 @@ def test_stream_kind_switch_flushes_assistant_before_thinking(tmp_path: Path) ->
     )
 
     assert isinstance(rendered[0], Table)
-    assert rendered[1].plain == "thought  plan"
+    assert rendered[1].plain == "✱ thought · plan"
 
 
 def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
@@ -779,7 +780,7 @@ def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
     app._print_committed(["```python", "print('hi')", "```"])
     rendered = "\n".join(line.rstrip() for line in output.getvalue().splitlines())
 
-    assert "first paragraph\nsecond paragraph" in rendered
+    assert " first paragraph\n second paragraph" in rendered
     assert "first paragraph\n\nsecond paragraph" not in rendered
     assert "print('hi')\n\n" not in rendered
 
@@ -932,7 +933,7 @@ async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> N
         await run_task
 
     rendered = output.getvalue()
-    assert rendered.index("name") < rendered.index("> second")
+    assert rendered.index("name") < rendered.index("▌ second")
 
 
 def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
@@ -955,7 +956,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     try:
         output = bytearray()
         deadline = time.monotonic() + 5
-        while b"you > " not in output and time.monotonic() < deadline:
+        while "❯ ".encode() not in output and time.monotonic() < deadline:
             ready, _, _ = select.select(
                 [master_fd],
                 [],
@@ -964,7 +965,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
             )
             if ready:
                 output.extend(os.read(master_fd, 4096))
-        assert b"you > " in output
+        assert "❯ ".encode() in output
 
         os.write(master_fd, b"\x04")
         assert process.wait(timeout=5) == 0
@@ -1016,8 +1017,32 @@ def test_markdown_stream_renders_complete_table() -> None:
 def test_status_includes_provider_state_and_usage() -> None:
     status = format_status("fake", "offline", "streaming", {"input_tokens": 2}, "partial")
 
-    assert "session · offline · streaming" in status.plain
-    assert "tok in=2 out=0" in status.plain
+    assert "streaming" in status.plain
+    assert "2 (0%)" in status.plain
+
+
+def test_composer_info_builder_aligns_identity_row() -> None:
+    info = format_composer_info("openai", "gpt-5.4", width=40)
+    plain = "".join(value for _, value in info)
+
+    assert plain.startswith("zeta")
+    assert plain.endswith("openai · gpt-5.4")
+    assert len(plain) == 40
+
+
+def test_footer_builder_formats_context_usage_and_hints() -> None:
+    footer = format_status(
+        "openai",
+        "gpt-5.4",
+        "idle",
+        token_count=18_600,
+        model_window=200_000,
+        session_id="abcdef12",
+    )
+
+    assert footer.plain == (
+        "idle  18.6K (9%) · /status · ctrl+c quit · abcdef12"
+    )
 
 
 def test_status_bar_includes_session_context_and_streaming_indicator() -> None:
@@ -1035,9 +1060,10 @@ def test_status_bar_includes_session_context_and_streaming_indicator() -> None:
     )
 
     assert len(status.plain) <= 120
-    assert "abc12345 · gpt-5.4 · streaming" in status.plain
-    assert "tok 5/121" in status.plain
-    assert "tail 8" in status.plain
+    assert "esc interrupt" in status.plain
+    assert "42 (0%)" in status.plain
+    assert "/status" in status.plain
+    assert "ctrl+c quit" in status.plain
 
 
 def test_status_bar_fits_segments_and_pulses() -> None:
@@ -1057,10 +1083,10 @@ def test_status_bar_fits_segments_and_pulses() -> None:
     ]
 
     assert all(len(status.plain) <= width for status, width in zip(statuses, (80, 120, 200)))
-    assert all(" · gpt-5.4 · streaming" in status.plain and "tok 5/121" in status.plain for status in statuses)
+    assert all("esc interrupt" in status.plain and "5 (0%)" in status.plain for status in statuses)
     assert all(marker in statuses[index].plain for index, marker in enumerate(("·", "•", "●")))
-    assert all(value in statuses[1].plain for value in ("abc12345", "tail 8"))
-    assert all(value in statuses[2].plain for value in ("abc12345", "tail 8"))
+    assert all(value in statuses[1].plain for value in ("/status", "ctrl+c quit"))
+    assert all(value in statuses[2].plain for value in ("abc12345", "/status"))
 
     narrow = format_status(
         "provider-with-a-long-name",
@@ -1073,8 +1099,8 @@ def test_status_bar_fits_segments_and_pulses() -> None:
         width=80,
     )
     assert len(narrow.plain) <= 80
-    assert " · model-with-a-long-name-that-does-not-fit · streaming" in narrow.plain
-    assert "tok 5/121" in narrow.plain
+    assert "esc interrupt" in narrow.plain
+    assert "5 (0%)" in narrow.plain
 
     cleared = format_status(
         "codex",
@@ -1085,7 +1111,8 @@ def test_status_bar_fits_segments_and_pulses() -> None:
         streaming=False,
         width=80,
     )
-    assert "abc12345 · gpt-5.4 · idle" in cleared.plain
+    assert "idle" in cleared.plain
+    assert "abc12345" in cleared.plain
 
 
 def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
@@ -1106,8 +1133,9 @@ def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
 
     toolbar = app._status_toolbar()
     plain = "".join(value for _, value in toolbar)
-    assert "tok 5/121" in plain
-    assert "cache 0/0" in plain
+    assert "5 (0%)" in plain
+    assert "/status" in plain
+    assert "zeta" in plain
 
 
 def test_status_toolbar_does_not_advance_spinner_frame(tmp_path: Path) -> None:
@@ -1279,15 +1307,14 @@ async def test_full_session_preserves_assistant_tool_user_order(tmp_path: Path) 
     await app._consume_turn("second user")
 
     rendered = output.getvalue()
-    first_result = rendered.index("read\n")
-    second_result = rendered.rindex("read\n")
+    first_result = rendered.index("⏺ read")
+    second_result = rendered.rindex("⏺ read")
     markers = [
-        rendered.index("> first user"),
+        rendered.index("▌ first user"),
         rendered.index("assistant 1"),
-        rendered.index("read\n"),
         first_result,
         rendered.index("assistant after tool 1"),
-        rendered.index("> second user"),
+        rendered.index("▌ second user"),
         rendered.index("assistant 2"),
         second_result,
     ]
@@ -1328,40 +1355,38 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path:
     snapshot = "\n".join(
         line.rstrip() for line in output.getvalue().splitlines()
     ).strip()
-    expected = """> inspect the session
+    expected = """▌ inspect the session
 
-thought  Plan the inspection.
+ ✱ thought · Plan the inspection.
 
-╭──────────────────────────────────────────────────────────────────────╮
-│ $ seq 24                                                             │
-│ running…                                                             │
-╰──────────────────────────────────────────────────────────────────────╯
-╭──────────────────────────────────────────────────────────────────────╮
-│ $ seq 24                                                             │
-│ line-0                                                               │
-│ line-1                                                               │
-│ line-2                                                               │
-│ line-3                                                               │
-│ line-4                                                               │
-│ line-5                                                               │
-│ line-6                                                               │
-│ line-7                                                               │
-│ line-8                                                               │
-│ line-9                                                               │
-│ line-10                                                              │
-│ line-11                                                              │
-│ line-12                                                              │
-│ line-13                                                              │
-│ line-14                                                              │
-│ … +9 lines                                                           │
-╰──────────────────────────────────────────────────────────────────────╯
+ ╭─────────────────────────────────────────────────────────────────────╮
+ │ $ seq 24                                                            │
+ │ running…                                                            │
+ ╰─────────────────────────────────────────────────────────────────────╯
+ ╭─────────────────────────────────────────────────────────────────────╮
+ │ $ seq 24                                                            │
+ │ line-0                                                              │
+ │ line-1                                                              │
+ │ line-2                                                              │
+ │ line-3                                                              │
+ │ line-4                                                              │
+ │ line-5                                                              │
+ │ line-6                                                              │
+ │ line-7                                                              │
+ │ line-8                                                              │
+ │ line-9                                                              │
+ │ line-10                                                             │
+ │ line-11                                                             │
+ │ line-12                                                             │
+ │ line-13                                                             │
+ │ line-14                                                             │
+ │ … +9 lines                                                          │
+ ╰─────────────────────────────────────────────────────────────────────╯
 
-read README.md [limit=120] · running
-read README.md [limit=120]
+ ⏺ read README.md [limit=120] · running
+ ⏺ read README.md [limit=120]
 
-finished
-
-done"""
+ finished"""
 
     assert snapshot == expected
 
@@ -1485,7 +1510,7 @@ async def test_composer_submits_enter_and_keeps_ctrl_j_multiline() -> None:
             key_bindings=build_key_bindings(on_interrupt=lambda: None, on_exit=lambda: None),
             multiline=True,
         )
-        task = asyncio.create_task(session.prompt_async("you > "))
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
         await asyncio.sleep(0)
         pipe.send_text("line one")
         pipe.send_text("\x0a")

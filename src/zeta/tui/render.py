@@ -32,10 +32,10 @@ from .theme import (
     CARD_BORDER,
     CHROME,
     CODE_BG,
+    CODE_THEME,
     COMMAND,
     DIM,
     ERROR,
-    OK,
     RECEIPT,
     THOUGHT,
 )
@@ -152,7 +152,8 @@ def _receipt_arguments(call: ToolCall, content: str) -> str:
             if matches
             else str(sum(bool(line.strip()) for line in content.splitlines()))
         )
-        return f'"{pattern}" [{count} matches]'
+        location = arguments.get("path", arguments.get("cwd", "."))
+        return f'"{pattern}" in {location} · {count} matches'
     return _arguments(arguments)
 
 
@@ -161,7 +162,9 @@ def _tool_receipt(event: StreamEvent) -> Text:
     assert call is not None
     result = event.tool_result
     assert result is not None
-    prefix = "failed · " if result.is_error else ""
+    prefix = "⏺ "
+    if result.is_error:
+        prefix += "failed · "
     suffix = _receipt_arguments(call, _tool_content(event))
     return Text(
         f"{prefix}{call.name}{f' {suffix}' if suffix else ''}",
@@ -254,11 +257,13 @@ def collapse_thought(value: str) -> str:
 
 
 def format_thought(value: str, duration: float | None = None) -> Text:
-    label = "thought"
-    if duration is not None:
-        label += f" · {duration:.1f}s"
     summary = collapse_thought(value)
-    return Text.assemble((label, THOUGHT), (f"  {summary}" if summary else "", THOUGHT))
+    parts = ["✱ thought"]
+    if summary:
+        parts.append(summary)
+    if duration is not None:
+        parts.append(f"{duration:.1f}s")
+    return Text(" · ".join(parts), style=THOUGHT)
 
 
 def _duration(data: dict[str, Any]) -> float | None:
@@ -278,7 +283,7 @@ def render_markdown(value: str) -> RenderableType:
 
     return Markdown(
         value,
-        code_theme="monokai",
+        code_theme=CODE_THEME,
         hyperlinks=False,
         inline_code_theme="monokai",
         style=BODY,
@@ -291,7 +296,7 @@ def render_code(value: str, language: str = "text") -> Syntax:
     return Syntax(
         value,
         language or "text",
-        theme="monokai",
+        theme=CODE_THEME,
         word_wrap=True,
         background_color=CODE_BG,
     )
@@ -423,7 +428,7 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         if event.tool_call.name.lower() in RECEIPT_TOOLS:
             suffix = _receipt_arguments(event.tool_call, "")
             return Text(
-                f"{event.tool_call.name}{f' {suffix}' if suffix else ''} · running",
+                f"⏺ {event.tool_call.name}{f' {suffix}' if suffix else ''} · running",
                 style=RECEIPT,
             )
         return _tool_card(event, running=True)
@@ -439,7 +444,7 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         message = event.error.message if event.error else "unknown error"
         return Text(f"[error] {message}", style=ERROR)
     if event.type is StreamEventType.AGENT_END:
-        return Text("done", style=OK)
+        return None
     if event.type is StreamEventType.TURN_START:
         return None
     if event.type is StreamEventType.MESSAGE_UPDATE:
@@ -468,45 +473,40 @@ def format_status(
     width: int | None = None,
     spinner_frame: int = 0,
     spinner_active: bool | None = None,
+    model_window: int | None = None,
 ) -> Text:
-    """Format the persistent status line shown beneath the composer."""
+    """Format the tinted footer shown below the composer identity row."""
 
     show_spinner = streaming if spinner_active is None else spinner_active
     usage = usage or {}
-    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
-    output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
-    if input_tokens is not None and output_tokens is not None:
-        token_text = f"tok {input_tokens}/{output_tokens}"
-    elif input_tokens is not None or output_tokens is not None:
-        token_text = f"tok in={input_tokens or 0} out={output_tokens or 0}"
-    elif usage.get("total_tokens") is not None:
-        token_text = f"tok {usage['total_tokens']}"
-    elif token_count is not None:
-        token_text = f"tok ~{token_count}"
+    del provider, model, partial, retained_tail
+    context_tokens = token_count
+    if context_tokens is None:
+        context_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
+    context_tokens = context_tokens or 0
+    window = model_window or 200_000
+    percent = round((context_tokens / window) * 100) if window else 0
+    if context_tokens >= 1000:
+        value = f"{context_tokens / 1000:.1f}K".removesuffix(".0K")
     else:
-        token_text = "tok ?"
+        value = str(context_tokens)
+    context_text = f"{value} ({percent}%)"
 
     state = loop_state if loop_state in {"streaming", "idle", "interrupted", "compacting"} else "streaming"
-    session_text = (session_id or "session")[:8]
-    left = f"{session_text} · {model} · {state}"
-    right_segments = [token_text]
-    if retained_tail is not None:
-        right_segments.append(f"tail {retained_tail}")
-    cache_read = usage.get("cache_read_input_tokens", usage.get("cache_read"))
-    cache_write = usage.get("cache_creation_input_tokens", usage.get("cache_creation"))
-    if cache_read is not None or cache_write is not None:
-        right_segments.append(f"cache {cache_read or 0}/{cache_write or 0}")
-    right = " · ".join(right_segments)
     if show_spinner:
-        right = f"{SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]} {right}"
-    if partial and width is None:
-        right += f" · {_truncate(partial.replace(chr(10), ' '), 32)}"
-    if width is not None and len(left) + len(right) + 2 > width:
-        right = " · ".join(right_segments)
-    if width is not None and len(left) + len(right) + 2 > width:
-        right = token_text
-    if width is not None and len(left) + len(right) + 2 > width:
-        left = _truncate(left, max(1, width - len(right) - 2))
+        left = f"{SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]}  esc interrupt"
+    else:
+        left = state
+    right_segments = [context_text, "/status", "ctrl+c quit"]
+    if session_id:
+        right_segments.append(session_id[:8])
+    right = " · ".join(right_segments)
+    if width is not None and len(left) + len(right) + 1 > width:
+        right = " · ".join(right_segments[:3])
+    if width is not None and len(left) + len(right) + 1 > width:
+        right = context_text
     if width is not None and len(left) + len(right) < width:
-        return Text(f"{left}{' ' * (width - len(left) - len(right))}{right}", style=CHROME)
-    return Text(f"{left}  {right}", style=CHROME)
+        value = f"{left}{' ' * (width - len(left) - len(right))}{right}"
+    else:
+        value = f"{left}  {right}"
+    return Text(value, style=CHROME)

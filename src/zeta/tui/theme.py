@@ -5,21 +5,25 @@ from __future__ import annotations
 from rich.theme import Theme
 
 
-ACCENT = "#62d8ff"
-DIM = "dim"
-BODY = "bright_white"
-ERROR = "bold red"
-OK = "green"
-USER_PREFIX = "bold #62d8ff"
-CODE_BG = "#1c1f2b"
-CHROME = "#677083"
-CARD_BG = "on #1b1e27"
-CARD_BORDER = "#394052"
+SURFACE = "#3a3533"
+TINT = "#302c2a"
+ACCENT = "#ff8a1f"
+WARM_ACCENT = "#ffb454"
+DIM = "#9f9488"
+BODY = "#f4e8c8"
+ERROR = "bold #ff5c57"
+OK = "#a8c76f"
+USER_PREFIX = f"bold {ACCENT}"
+CODE_BG = "#24211f"
+CODE_THEME = "monokai"
+CHROME = DIM
+CARD_BG = f"on {TINT}"
+CARD_BORDER = "#5a4d45"
 COMMAND = f"bold {ACCENT}"
-RECEIPT = f"dim {CHROME}"
-THOUGHT = "italic dim #b9a7ff"
-AFFORDANCE = "dim #677083"
-USER_ROLE = "#62d8ff"
+RECEIPT = f"dim {ACCENT}"
+THOUGHT = f"italic {WARM_ACCENT}"
+AFFORDANCE = f"dim {DIM}"
+USER_ROLE = ACCENT
 
 RICH_THEME = Theme(
     {
