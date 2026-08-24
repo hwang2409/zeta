@@ -253,6 +253,25 @@ async def test_cached_provider_usage_triggers_compaction(context_root: Path) -> 
     assert assembler.output_tokens_this_session == 7
 
 
+@pytest.mark.parametrize(
+    ("usage", "expected_total"),
+    [
+        ({"input_tokens": 8, "cache_read_input_tokens": 5}, 13),
+        ({"cache_read_input_tokens": 5, "output_tokens": 2}, 7),
+    ],
+)
+def test_partial_provider_usage_counts_known_tokens(
+    context_root: Path,
+    usage: dict[str, int],
+    expected_total: int,
+) -> None:
+    assembler = ContextAssembler(ConversationStore(context_root))
+
+    assembler.record_usage(usage)
+
+    assert assembler.tokens_used_this_session == expected_total
+
+
 @pytest.mark.asyncio
 async def test_compaction_is_idempotent_for_same_store_state(context_root: Path) -> None:
     store = ConversationStore(context_root)

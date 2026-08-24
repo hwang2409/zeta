@@ -42,6 +42,7 @@ def session() -> FakeSlashSession:
             cache_read_input_tokens=50,
             cache_creation_input_tokens=25,
             uncached_input_tokens=25,
+            output_tokens_this_session=4,
         )
     )
 
@@ -67,6 +68,7 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
             "cache_read_input_tokens": 50,
             "cache_creation_input_tokens": 25,
             "input_tokens": 25,
+            "output_tokens": 4,
         }
     )
     calls = [
@@ -108,6 +110,7 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
     assert "prompt_cache_write: 25" in output
     assert "prompt_cache_uncached_input: 25" in output
     assert "prompt_cache_hit_rate: 50.0%" in output
+    assert "output_tokens_this_session: 4" in output
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,9 @@ from zeta.providers.codex import (
     build_responses_payload,
     extract_account_id,
 )
+from zeta.core.context import ContextAssembler
+from zeta.core.slash import SlashStatus, _format_status
+from zeta.core.store import ConversationStore
 from zeta.types import (
     Message,
     MessageRole,
@@ -486,9 +489,31 @@ async def test_responses_stream_normalizes_cached_input_usage(tmp_path: Path) ->
 
     assert events[-1].data["usage"] == {
         **usage,
+        "input_tokens": 3,
         "cache_read_input_tokens": 17,
     }
     assert "cache_creation_input_tokens" not in events[-1].data["usage"]
+    assembler = ContextAssembler(ConversationStore(tmp_path / "sessions"))
+    assembler.record_usage(events[-1].data["usage"])
+    assert assembler.uncached_input_tokens_this_session == 3
+    assert assembler.cache_read_input_tokens_this_session == 17
+    assert assembler.output_tokens_this_session == 4
+    assert assembler.tokens_used_this_session == 24
+    status = SlashStatus(
+        session_id="session-1",
+        provider="codex",
+        model="test",
+        retained_tail=1,
+        tokens_used_this_session=assembler.tokens_used_this_session,
+        tokens_in_current_context=None,
+        compaction_marker_count=0,
+        pending_approvals=(),
+        cache_read_input_tokens=assembler.cache_read_input_tokens_this_session,
+        cache_creation_input_tokens=0,
+        uncached_input_tokens=assembler.uncached_input_tokens_this_session,
+        output_tokens_this_session=assembler.output_tokens_this_session,
+    )
+    assert "prompt_cache_hit_rate: 85.0%" in _format_status(status)
     await client.aclose()
 
 

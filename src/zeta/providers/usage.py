@@ -24,6 +24,13 @@ def normalize_usage(usage: Mapping[str, Any]) -> dict[str, Any]:
         details = normalized.get("prompt_tokens_details")
     if isinstance(details, Mapping) and "cache_read_input_tokens" not in normalized:
         cached_tokens = details.get("cached_tokens")
-        if type(cached_tokens) is int:
+        input_tokens = normalized.get("input_tokens")
+        if (
+            type(cached_tokens) is int
+            and cached_tokens >= 0
+            and type(input_tokens) is int
+            and cached_tokens <= input_tokens
+        ):
             normalized["cache_read_input_tokens"] = cached_tokens
+            normalized["input_tokens"] = input_tokens - cached_tokens
     return normalized

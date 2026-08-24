@@ -22,6 +22,7 @@ class SlashStatus:
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     uncached_input_tokens: int = 0
+    output_tokens_this_session: int = 0
 
 
 class SlashSession(Protocol):
@@ -107,6 +108,7 @@ def _format_status(status: SlashStatus) -> str:
             f"prompt_cache_write: {status.cache_creation_input_tokens}",
             f"prompt_cache_uncached_input: {status.uncached_input_tokens}",
             f"prompt_cache_hit_rate: {cache_hit_rate}",
+            f"output_tokens_this_session: {status.output_tokens_this_session}",
         )
     )
 

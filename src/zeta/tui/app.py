@@ -217,6 +217,9 @@ class TUIApp:
             uncached_input_tokens=(
                 self.loop.context_assembler.uncached_input_tokens_this_session
             ),
+            output_tokens_this_session=(
+                self.loop.context_assembler.output_tokens_this_session
+            ),
         )
 
     def _present_pending_approvals(self) -> None:

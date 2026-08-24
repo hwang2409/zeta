@@ -248,12 +248,18 @@ class ContextAssembler:
             self._cache_creation_input_tokens_this_session += cache_creation_tokens
         total = usage.get("total_tokens")
         if type(total) is not int:
-            if type(input_tokens) is int and type(output_tokens) is int:
-                total = input_tokens + output_tokens
-                if type(cache_read_tokens) is int:
-                    total += cache_read_tokens
-                if type(cache_creation_tokens) is int:
-                    total += cache_creation_tokens
+            known_tokens = [
+                value
+                for value in (
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                )
+                if type(value) is int and value >= 0
+            ]
+            if known_tokens:
+                total = sum(known_tokens)
         if type(total) is int and total >= 0:
             self._provider_token_total = total
             self._tokens_used_this_session += total
