@@ -124,7 +124,8 @@ def test_anthropic_sends_valid_image_without_dimensions_natively() -> None:
         [Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("call-1", "stale", content_blocks=[block]))],
         [],
         model="claude-test",
-        max_tokens=100,
+        max_tokens=4096,
+        thinking_budget=2048,
     )
 
     content = payload["messages"][0]["content"][0]["content"]
@@ -143,7 +144,8 @@ def test_anthropic_falls_back_for_oversized_image_dimensions() -> None:
         [Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("call-1", "stale", content_blocks=[block]))],
         [],
         model="claude-test",
-        max_tokens=100,
+        max_tokens=4096,
+        thinking_budget=2048,
     )
 
     content = payload["messages"][0]["content"][0]["content"]
@@ -169,7 +171,8 @@ def test_anthropic_sends_supported_tool_images_as_native_blocks() -> None:
         ],
         [],
         model="claude-test",
-        max_tokens=100,
+        max_tokens=4096,
+        thinking_budget=2048,
     )
 
     content = payload["messages"][0]["content"][0]["content"]
@@ -193,7 +196,8 @@ def test_anthropic_falls_back_for_images_outside_native_limits(
         [Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("call-1", "stale", content_blocks=[block]))],
         [],
         model="claude-test",
-        max_tokens=100,
+        max_tokens=4096,
+        thinking_budget=2048,
     )
 
     content = payload["messages"][0]["content"][0]["content"]
