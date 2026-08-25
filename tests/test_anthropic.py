@@ -996,6 +996,26 @@ def test_stream_diagnostic_redacts_secrets_and_bounds_record(
     assert "[redacted]" in record["cause"]
 
 
+def test_stream_diagnostic_redacts_bare_provider_keys(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "logs" / "stream-diagnostics.jsonl"
+    anthropic_key = "sk-ant-api03-anthropic-secret"
+    openai_key = "sk-openai-secret"
+
+    diagnostics_module.write_stream_diagnostic(
+        path,
+        {
+            "cause": f"stream failed with {anthropic_key} then retried with {openai_key}",
+        },
+    )
+
+    record = json.loads(path.read_text())
+    assert anthropic_key not in record["cause"]
+    assert openai_key not in record["cause"]
+    assert record["cause"] == "stream failed with [redacted] then retried with [redacted]"
+
+
 @pytest.mark.asyncio
 async def test_message_stop_salvages_parseable_open_tool_block(tmp_path: Path) -> None:
     events = await _collect_anthropic_events(

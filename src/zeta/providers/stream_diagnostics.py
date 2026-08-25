@@ -14,8 +14,9 @@ from typing import Any
 STREAM_DIAGNOSTICS_MAX_BYTES = 1024 * 1024
 _CAUSE_MAX_BYTES = 300
 _SECRET_PATTERN = re.compile(
-    r"(?i)\b(?:bearer|api[-_ ]?key|(?:access|refresh|auth(?:entication)?)?[-_ ]?token)"
-    r"\b(?:\s*[:=]\s*|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    r"(?i)(?:\b(?:bearer|api[-_ ]?key|(?:access|refresh|auth(?:entication)?)?[-_ ]?token)"
+    r"\b(?:\s*[:=]\s*|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)|"
+    r"\bsk-[a-z0-9-]+\b)"
 )
 
 
