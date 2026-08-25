@@ -10,6 +10,7 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.cells import cell_len
 from rich.console import Console
 
 from zeta.core.approval import ApprovalPolicy
@@ -342,6 +343,67 @@ def test_invalid_model_swap_keeps_the_current_model(tmp_path: Path) -> None:
     assert app.model == "claude-sonnet-4-6"
 
 
+def test_unknown_model_prefix_is_rejected_before_state_change(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    manager = SessionManager(home)
+    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), opened.store),
+        provider="claude",
+        model="claude-sonnet-4-6",
+    )
+
+    output = create_slash_registry().dispatch(
+        app, "/model claude-definitely-not-real"
+    )
+
+    assert output == (
+        "model unchanged: model 'claude-definitely-not-real' is not valid for claude"
+    )
+    assert app.model == "claude-sonnet-4-6"
+    assert manager.open(opened.store.session_id).metadata.model == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_model_swap_is_rejected_during_active_turn(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_task = asyncio.create_task(asyncio.sleep(1))
+
+    try:
+        output = create_slash_registry().dispatch(app, "/model faster")
+    finally:
+        app._active_task.cancel()
+        await asyncio.gather(app._active_task, return_exceptions=True)
+
+    assert output == "model unchanged: cannot change model while a turn or approval is active"
+    assert app.model == "offline"
+
+
+def test_model_swap_is_rejected_with_pending_approval(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    policy = ApprovalPolicy(store=store)
+    call = ToolCall("pending-model-swap", "echo", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+    )
+
+    output = create_slash_registry().dispatch(app, "/model faster")
+
+    assert output == "model unchanged: cannot change model while a turn or approval is active"
+    assert app.model == "offline"
+
+
 @pytest.mark.asyncio
 async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("summary")])])
@@ -396,6 +458,57 @@ def test_session_previews_are_ordered_and_ansi_safe(tmp_path: Path) -> None:
     ]
     assert previews[0].preview == "new message with controls"
     assert "\x1b" not in previews[0].preview
+
+
+def test_session_preview_strips_c1_controls_and_truncates_by_cell_width(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened.store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("wide \u009b31m" + "界" * 40 + "\u009b0m tail")],
+        )
+    )
+
+    preview = manager.list_session_previews()[0].preview
+
+    assert "\u009b" not in preview
+    assert cell_len(preview) <= 80
+    assert preview.endswith("...")
+
+
+def test_session_preview_picker_limits_recent_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    sessions = [create_app(_args()).loop.store.session_id for _ in range(21)]
+    manager = SessionManager(home)
+    for index, session_id in enumerate(sessions):
+        metadata = manager.open(session_id).metadata
+        metadata.updated_at = f"2030-01-01T00:00:{index:02d}+00:00"
+        manager._write(metadata)
+
+    previews = manager.list_session_previews()
+
+    assert len(previews) == 20
+    assert previews[0].session_id == sessions[-1]
+
+
+def test_resume_picker_rejects_zero_and_negative_choices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    create_app(_args())
+
+    for choice in ("0", "-1"):
+        monkeypatch.setattr("builtins.input", lambda prompt, choice=choice: choice)
+        with pytest.raises(SessionError, match="invalid resume session selection"):
+            create_app(build_parser().parse_args(["--resume", "--provider", "fake"]))
 
 
 def test_resume_picker_matches_direct_resume(
@@ -511,6 +624,12 @@ async def test_forced_override_commits_after_first_successful_request(
             ]
         )
     )
+    assert create_slash_registry().dispatch(app, "/model claude-opus-4-1") == (
+        "model: claude-opus-4-1"
+    )
+    assert json.loads(
+        (home / "sessions" / session_id / "meta.json").read_text()
+    )["model"] == "offline"
     app._invalidate_prompt = lambda: None
     await app._consume_turn("hello")
 
@@ -518,7 +637,7 @@ async def test_forced_override_commits_after_first_successful_request(
         (home / "sessions" / session_id / "meta.json").read_text()
     )
     assert metadata["provider"] == "claude"
-    assert metadata["model"] == "claude-sonnet-4-6"
+    assert metadata["model"] == "claude-opus-4-1"
     assert metadata["override_audit"]
 
 

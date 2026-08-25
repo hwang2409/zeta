@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import re
+import unicodedata
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -14,6 +15,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
+
+from rich.cells import cell_len
 
 from .store import ConversationStore
 
@@ -34,18 +37,32 @@ class SessionPreview:
     preview: str
 
 
-_ANSI_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_ANSI_SEQUENCE = re.compile(
+    r"(?:\x1b\[[0-?]*[ -/]*[@-~]|\x9b[0-?]*[ -/]*[@-~])"
+    r"|(?:\x1b\][^\x07]*(?:\x07|\x1b\\)|\x9d[^\x07]*(?:\x07|\x1b\\))"
+    r"|\x1b[ -/]*[@-~]"
+)
 
 
 def _preview_text(value: str, *, limit: int = 80) -> str:
     clean = _ANSI_SEQUENCE.sub("", value)
     clean = "".join(
-        character for character in clean if character in "\t\n\r" or ord(character) >= 32
+        character
+        for character in clean
+        if character in "\t\n\r" or unicodedata.category(character) != "Cc"
     )
     clean = " ".join(clean.split())
-    if len(clean) <= limit:
+    if cell_len(clean) <= limit:
         return clean
-    return clean[: max(0, limit - 3)] + "..."
+    suffix = "..."
+    available = max(0, limit - cell_len(suffix))
+    result = ""
+    for character in clean:
+        candidate = result + character
+        if cell_len(candidate) > available:
+            break
+        result = candidate
+    return result + suffix
 
 
 def env_home() -> Path:
@@ -253,12 +270,11 @@ class SessionManager:
             sessions.append(self._read(session_path.name))
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
 
-    def list_session_previews(self, *, limit: int | None = None) -> list[SessionPreview]:
+    def list_session_previews(self, *, limit: int = 20) -> list[SessionPreview]:
         """Return recent sessions with safe, single-line first-message previews."""
 
         sessions = self.list_sessions()
-        if limit is not None:
-            sessions = sessions[:limit]
+        sessions = sessions[:limit]
         previews: list[SessionPreview] = []
         for metadata in sessions:
             opened = self.open(metadata.session_id)

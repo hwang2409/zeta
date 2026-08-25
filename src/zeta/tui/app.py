@@ -55,16 +55,22 @@ from .transcript import TranscriptPresenter, TranscriptWidget
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
+MODEL_CATALOGS = {
+    "fake": frozenset({"offline", "faster"}),
+    "claude": frozenset(
+        {"claude-haiku-4-5", "claude-opus-4-1", DEFAULT_CLAUDE_MODEL}
+    ),
+    "codex": frozenset({DEFAULT_CODEX_MODEL, "gpt-5.6-luna"}),
+}
+RECENT_SESSION_LIMIT = 20
 SPINNER_INTERVAL = 0.2
 
 
 def _validate_model_name(provider: str, model: str) -> None:
     if not model or any(character.isspace() for character in model):
         raise ValueError("model must be one nonempty word")
-    if provider == "claude" and not model.startswith("claude-"):
-        raise ValueError(f"model {model!r} is not valid for claude")
-    if provider == "codex" and not model.startswith(("gpt-", "o", "codex-")):
-        raise ValueError(f"model {model!r} is not valid for codex")
+    if model not in MODEL_CATALOGS.get(provider, frozenset()):
+        raise ValueError(f"model {model!r} is not valid for {provider}")
 
 
 class FullScreenPromptSession(PromptSession[str]):
@@ -299,6 +305,8 @@ class TUIApp:
 
         if not args:
             return f"model: {self.model}"
+        if self.active or self.pending_approvals:
+            return "model unchanged: cannot change model while a turn or approval is active"
         model = args.strip()
         try:
             _validate_model_name(self.provider, model)
@@ -945,7 +953,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
 
     if resuming:
         if resume_id == "":
-            previews = manager.list_session_previews()
+            previews = manager.list_session_previews(limit=RECENT_SESSION_LIMIT)
             if not previews:
                 raise SessionError("no prior zeta session found")
             print("recent zeta sessions:")
@@ -956,9 +964,11 @@ def create_app(args: argparse.Namespace) -> TUIApp:
                 )
             try:
                 choice = input("select a session: ").strip()
-                selected = int(choice) - 1
-                resume_id = previews[selected].session_id
-            except (EOFError, ValueError, IndexError) as exc:
+                selected = int(choice)
+                if not 1 <= selected <= len(previews):
+                    raise ValueError("selection out of range")
+                resume_id = previews[selected - 1].session_id
+            except (EOFError, ValueError) as exc:
                 raise SessionError("invalid resume session selection") from exc
         if resume_id is not None:
             opened = manager.open(resume_id)
@@ -1046,6 +1056,10 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         manager.touch(metadata)
 
     def model_changed(model_name: str) -> None:
+        nonlocal pending_override
+        if pending_override is not None:
+            pending_override = (provider, model_name)
+            return
         manager.record_override(metadata, provider=None, model=model_name)
 
     token_budget_override = getattr(args, "token_budget", None)
