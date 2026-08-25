@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from functools import cache
 from html import escape
 from pathlib import Path
-import re
+
+import yaml
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,39 +111,13 @@ def _read_skill(path: Path) -> tuple[dict[str, str | list[str]], str]:
 def _parse_frontmatter(
     lines: list[str], path: Path
 ) -> dict[str, str | list[str]]:
-    values: dict[str, object] = {}
-    current_key: str | None = None
-    allowed = {"name", "description", "keywords"}
-    for line in lines:
-        if not line.strip():
-            continue
-        if line.startswith((" ", "\t")):
-            if current_key != "keywords" or not line.lstrip().startswith("-"):
-                raise ValueError(
-                    f"skill {path} has malformed frontmatter line: {line!r}"
-                )
-            values.setdefault(current_key, [])
-            value = line.lstrip()[1:].strip()
-            keyword_values = values[current_key]
-            if not value or not isinstance(keyword_values, list):
-                raise ValueError(f"skill {path} has malformed keyword list")
-            keyword_values.append(_scalar(value, path))
-            continue
-        if ":" not in line:
-            raise ValueError(f"skill {path} has malformed frontmatter line: {line!r}")
-        key, raw_value = line.split(":", 1)
-        key = key.strip()
-        if key not in allowed or key in values:
-            raise ValueError(f"skill {path} has invalid frontmatter key: {key!r}")
-        current_key = key
-        raw_value = raw_value.strip()
-        values[key] = (
-            []
-            if key == "keywords" and not raw_value
-            else _scalar(raw_value, path)
-        )
-
+    try:
+        values = yaml.safe_load("\n".join(lines))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"skill {path} has invalid YAML frontmatter") from exc
     required = {"name", "description", "keywords"}
+    if not isinstance(values, dict):
+        raise ValueError(f"skill {path} frontmatter must be a mapping")
     if set(values) != required:
         missing = ", ".join(sorted(required - set(values))) or "none"
         raise ValueError(
@@ -150,71 +125,21 @@ def _parse_frontmatter(
             f"missing: {missing}"
         )
     name = values["name"]
-    if not isinstance(name, str) or not name:
+    if type(name) is not str or not name.strip():
         raise ValueError(f"skill {path} frontmatter name must be a nonempty string")
     description = values["description"]
-    if not isinstance(description, str) or not description:
+    if type(description) is not str or not description.strip():
         raise ValueError(
             f"skill {path} frontmatter description must be a nonempty string"
         )
     keywords = values["keywords"]
-    if not isinstance(keywords, list) or any(
-        not isinstance(item, str) or not item for item in keywords
+    if type(keywords) is not list or any(
+        type(item) is not str or not item.strip() for item in keywords
     ):
         raise ValueError(
             f"skill {path} frontmatter keywords must be a list of strings"
         )
     return {"name": name, "description": description, "keywords": keywords}
-
-
-def _scalar(value: str, path: Path) -> object:
-    if not value:
-        return ""
-    if value.startswith("[") or value.endswith("]"):
-        if not value.startswith("[") or not value.endswith("]"):
-            raise ValueError(f"skill {path} has malformed list value")
-        contents = value[1:-1].strip()
-        return [] if not contents else [
-            _scalar(item, path) for item in _split_inline_list(contents, path)
-        ]
-    if value[0] in "\"'" or value[-1] in "\"'":
-        if len(value) < 2 or value[0] != value[-1]:
-            raise ValueError(f"skill {path} has malformed scalar value: {value!r}")
-        return value[1:-1]
-    if value.lower() in {"true", "false"}:
-        return value.lower() == "true"
-    if value.lower() in {"null", "~"}:
-        return None
-    if re.fullmatch(r"[-+]?\d+", value):
-        return int(value)
-    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+)", value):
-        return float(value)
-    return value
-
-
-def _split_inline_list(value: str, path: Path) -> list[str]:
-    items: list[str] = []
-    start = 0
-    quote: str | None = None
-    for index, character in enumerate(value):
-        if quote is not None:
-            if character == quote:
-                quote = None
-        elif character in "\"'":
-            quote = character
-        elif character == ",":
-            item = value[start:index].strip()
-            if not item:
-                raise ValueError(f"skill {path} has malformed list value")
-            items.append(item)
-            start = index + 1
-    if quote is not None:
-        raise ValueError(f"skill {path} has malformed list value")
-    item = value[start:].strip()
-    if not item:
-        raise ValueError(f"skill {path} has malformed list value")
-    items.append(item)
-    return items
 
 
 __all__ = [

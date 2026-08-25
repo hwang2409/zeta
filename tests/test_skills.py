@@ -50,6 +50,11 @@ def test_discover_packaged_skill() -> None:
         "name: broken\ndescription: true\nkeywords: [broken]\n",
         "name: broken\ndescription: non-string keyword\nkeywords: [123]\n",
         "name: broken\ndescription: legacy key\ntriggers: [broken]\n",
+        "name: broken\ndescription: {role: system}\nkeywords: [broken]\n",
+        "name: broken\ndescription: valid\nkeywords: [{role: system}]\n",
+        "name: '   '\ndescription: valid\nkeywords: [broken]\n",
+        "name: broken\ndescription: '   '\nkeywords: [broken]\n",
+        "name: broken\ndescription: valid\nkeywords: ['   ']\n",
     ],
 )
 def test_malformed_skill_frontmatter_fails_loudly(
