@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
+from textwrap import dedent
 from types import SimpleNamespace
 
 import pytest
@@ -1694,7 +1695,7 @@ def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:
         "foo_bar_baz",
         "*literal*",
         "a_b_c",
-        "bold mid text",
+        "**bold** mid _text_",
     ]
 
 
@@ -1722,11 +1723,11 @@ def test_markdown_stream_preserves_model_line_structure(tmp_path: Path) -> None:
     assert rendered == [
         "pick what sounds fun:",
         "",
-        "1. take a walk — get some air.",
-        "2. read a book — settle in.",
-        "3. make a meal — try a recipe.",
-        "4. play a game — choose one.",
-        "5. call a friend — catch up.",
+        "1. **take a walk** — get some air.",
+        "2. **read a book** — settle in.",
+        "3. **make a meal** — try a recipe.",
+        "4. **play a game** — choose one.",
+        "5. **call a friend** — catch up.",
     ]
 
 
@@ -1748,12 +1749,80 @@ def test_markdown_stream_keeps_model_blank_lines_without_inserting_more(
     assert rendered == source
 
 
-def test_render_line_styles_inline_markdown_without_relayout() -> None:
-    rendered = render_line("1. **bold** and *italic* `code`")
+@pytest.mark.parametrize("value", ["*unclosed", "**unclosed", "_unclosed", "__unclosed"])
+def test_render_line_keeps_unmatched_emphasis_literal(value: str) -> None:
+    rendered = render_line(value)
 
-    assert rendered.plain == "1. bold and italic code"
-    assert any("bold" in str(span.style) for span in rendered.spans)
-    assert any("italic" in str(span.style) for span in rendered.spans)
+    assert rendered.plain == value
+
+
+def test_render_line_keeps_emphasis_markers_literal() -> None:
+    rendered = render_line("1. **bold** and *italic* foo_bar_baz")
+
+    assert rendered.plain == "1. **bold** and *italic* foo_bar_baz"
+
+
+def test_render_line_styles_code_span() -> None:
+    rendered = render_line("`code_span`")
+
+    assert rendered.plain == "code_span"
+    assert rendered.spans
+
+
+def test_render_line_keeps_unmatched_backtick_literal() -> None:
+    rendered = render_line("before `unmatched")
+
+    assert rendered.plain == "before `unmatched"
+
+
+def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
+    script = dedent(
+        """
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from zeta.core.fake import FakeBackend
+        from zeta.core.loop import AgentLoop
+        from zeta.core.store import ConversationStore
+        from zeta.tui.app import TUIApp
+        from zeta.types import StreamEvent, StreamEventType, TextContent
+
+        with TemporaryDirectory() as directory:
+            app = TUIApp(
+                AgentLoop(FakeBackend([]), ConversationStore(Path(directory))),
+                provider="fake",
+                model="offline",
+            )
+            app._active_session = app._make_session()
+            app._consume_text(
+                StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    content=TextContent(
+                        "\\n".join(
+                            [
+                                "*unclosed",
+                                "**unclosed",
+                                "_unclosed",
+                                "__unclosed",
+                                "before `unmatched",
+                            ]
+                        )
+                    ),
+                )
+            )
+            app._flush_pending_stream()
+        print("finished")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "finished"
 
 
 def test_markdown_stream_keeps_code_fence_rows_and_highlighting() -> None:

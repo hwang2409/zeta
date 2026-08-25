@@ -306,32 +306,6 @@ def _duration(data: dict[str, Any]) -> float | None:
 
 
 _ESCAPABLE = frozenset(r"!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
-_DELIMITERS = ("**", "__", "*", "_")
-
-
-def _delimiter_can_open(value: str, start: int, delimiter: str) -> bool:
-    before = value[start - 1] if start else ""
-    after_index = start + len(delimiter)
-    after = value[after_index] if after_index < len(value) else ""
-    if not after or after.isspace():
-        return False
-    return delimiter != "_" or not (before.isalnum() and after.isalnum())
-
-
-def _delimiter_can_close(value: str, start: int, delimiter: str) -> bool:
-    before = value[start - 1] if start else ""
-    after_index = start + len(delimiter)
-    after = value[after_index] if after_index < len(value) else ""
-    if not before or before.isspace():
-        return False
-    return delimiter != "_" or not (before.isalnum() and after.isalnum())
-
-
-def _delimiter_at(value: str, index: int) -> str | None:
-    return next(
-        (delimiter for delimiter in _DELIMITERS if value.startswith(delimiter, index)),
-        None,
-    )
 
 
 def _code_span(value: str, start: int) -> tuple[int, int, str] | None:
@@ -366,31 +340,8 @@ def _render_inline(value: str, style: str = BODY) -> Text:
                 cursor = content_end
                 continue
 
-        delimiter = _delimiter_at(value, cursor)
-        if delimiter is None or not _delimiter_can_open(value, cursor, delimiter):
-            rendered.append(value[cursor], style=style)
-            cursor += 1
-            continue
-
-        close = cursor + len(delimiter)
-        while close < len(value):
-            candidate = value.find(delimiter, close)
-            if candidate < 0:
-                break
-            if _delimiter_can_close(value, candidate, delimiter):
-                inner = _render_inline(
-                    value[cursor + len(delimiter) : candidate],
-                    f"{'bold' if len(delimiter) == 2 else 'italic'} {style}",
-                )
-                rendered.append(inner)
-                cursor = candidate + len(delimiter)
-                break
-            close = candidate + len(delimiter)
-        else:
-            close = -1
-        if close < 0 or cursor == close:
-            rendered.append(delimiter, style=style)
-            cursor += len(delimiter)
+        rendered.append(value[cursor], style=style)
+        cursor += 1
     return rendered
 
 
