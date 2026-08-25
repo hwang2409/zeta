@@ -393,7 +393,7 @@ class TranscriptPresenter:
             return
         if self._printed_units:
             if self._full_screen_active():
-                self._append_blank()
+                self.append_blank()
             else:
                 self.console.print()
         self.print(renderable)
@@ -472,7 +472,7 @@ class TranscriptPresenter:
                 return ToolEventPresentation()
             if self._full_screen_active() and event.tool_call is not None:
                 if self._printed_units:
-                    self._append_blank()
+                    self.append_blank()
                 self.transcript.start_tool(
                     event.tool_call.id,
                     event.tool_call,

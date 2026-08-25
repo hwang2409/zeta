@@ -1677,6 +1677,31 @@ async def test_empty_completion_prints_neutral_fallback(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_full_screen_separates_user_and_assistant_units(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn([TextContent("answer")])]),
+            ConversationStore(tmp_path / "sessions"),
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._active_session = app._make_session()
+
+    app._print_user("prompt")
+    await app._consume_turn("prompt")
+
+    units = app._transcript.units
+    assert len(units) == 3
+    assert units[0] is not None
+    assert units[1] is None
+    assert units[2] is not None
+    assert renderable_plain(units[0]) == "▌ prompt"
+    assert "answer" in app._transcript.render(80)
+
+
+@pytest.mark.asyncio
 async def test_full_session_preserves_assistant_tool_user_order(tmp_path: Path) -> None:
     calls = [ToolCall("call-1", "read", {}), ToolCall("call-2", "read", {})]
     backend = OrderedToolBackend(calls)
