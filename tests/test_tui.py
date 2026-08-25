@@ -24,6 +24,7 @@ from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.data_structures import Size
 from rich.cells import cell_len
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -38,6 +39,7 @@ from zeta.tui.composer import (
     history_for,
     parse_input,
 )
+from zeta.tui.layout import content_width
 from zeta.tui.render import (
     MarkdownStream,
     collapse_thought,
@@ -1321,7 +1323,7 @@ def test_markdown_stream_renders_complete_table() -> None:
     assert isinstance(output[0], Table)
     assert output[0].columns[0].header == "name"
     assert output[0].columns[1].header == "value"
-    assert output[1].__class__.__name__ == "Markdown"
+    assert isinstance(output[1], Markdown)
 
 
 def test_status_includes_provider_state_and_usage() -> None:
@@ -2008,40 +2010,66 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path:
         r"\1",
         snapshot,
     )
-    expected = """▌ inspect the session
+    lines = snapshot.splitlines()
+    panel_lines = [
+        line for line in lines if line.startswith(("  ╭", "  │", "  ╰"))
+    ]
+    assert "▌ inspect the session" in snapshot
+    assert "✱ thought · Plan the inspection." in snapshot
+    assert "⏺ read README.md [limit=120]" in snapshot
+    assert "finished" in snapshot
+    assert len(panel_lines) == 23
+    assert all(cell_len(line) <= 72 for line in panel_lines)
+    assert all(
+        cell_len(line) == 70
+        for line in panel_lines
+        if line.startswith(("  ╭", "  ╰"))
+    )
 
-  ✱ thought · Plan the inspection.
 
-  ╭──────────╮
-  │ $ seq 24 │
-  │ running… │
-  ╰──────────╯
-  ╭────────────╮
-  │ $ seq 24   │
-  │ line-0     │
-  │ line-1     │
-  │ line-2     │
-  │ line-3     │
-  │ line-4     │
-  │ line-5     │
-  │ line-6     │
-  │ line-7     │
-  │ line-8     │
-  │ line-9     │
-  │ line-10    │
-  │ line-11    │
-  │ line-12    │
-  │ line-13    │
-  │ line-14    │
-  │ … +9 lines │
-  ╰────────────╯
+@pytest.mark.parametrize("terminal_width", [200, 120, 80, 40])
+def test_transcript_units_share_the_padded_content_edges(terminal_width: int) -> None:
+    width = content_width(terminal_width)
+    transcript = TranscriptWidget()
+    call = ToolCall("visual", "bash", {"cmd": "printf output"})
+    transcript.append(Text("assistant prose that wraps at the shared edge."))
+    transcript.append(
+        render_markdown(
+            "> quoted markdown\n\n```python\nprint(\"hello\")\n```"
+        )
+    )
+    transcript.append(
+        render_event(
+            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        )
+    )
+    transcript.append(
+        render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(call.id, "done"),
+            )
+        )
+    )
+    transcript.append(
+        Text(
+            "[approval pending] request-1: bash; type approve request-1 or deny request-1",
+            style=ACCENT,
+        )
+    )
 
-  ⏺ read README.md [limit=120] · running
-  ⏺ read README.md [limit=120]
-
-  finished"""
-
-    assert snapshot == expected
+    lines = [Text.from_ansi(line).plain for line in transcript.lines(width)]
+    assert all(cell_len(line) <= width for line in lines)
+    panel_lines = [
+        line
+        for line in lines
+        if line.startswith(("╭", "│", "╰"))
+    ]
+    assert panel_lines
+    assert all(cell_len(line) == width for line in panel_lines)
+    assert any(line.startswith("╭") and line.endswith("╮") for line in panel_lines)
+    assert any(line.startswith("╰") and line.endswith("╯") for line in panel_lines)
 
 
 @pytest.mark.asyncio

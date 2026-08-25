@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from rich.cells import cell_len
@@ -24,6 +25,7 @@ from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.tui.app import TUIApp, create_app
 from zeta.cli import build_parser, main
+from zeta.tui.layout import CONTENT_MARGIN, content_width
 from zeta.types import (
     Message,
     MessageRole,
@@ -753,6 +755,50 @@ def test_resume_picker_matches_direct_resume(
     )
 
     assert picked.loop.store.session_id == direct.loop.store.session_id
+
+
+@pytest.mark.parametrize("terminal_width", [200, 120, 80, 40])
+def test_resume_picker_stays_within_shared_content_width(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    terminal_width: int,
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    session = create_app(_args())
+    session.loop.store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("a very long session preview " * 12)],
+        )
+    )
+    monkeypatch.setattr(
+        "zeta.tui.app.get_terminal_size",
+        lambda fallback: SimpleNamespace(columns=terminal_width, lines=24),
+    )
+    prompts: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: prompts.append(prompt) or "1",
+    )
+
+    create_app(build_parser().parse_args(["--resume", "--provider", "fake"]))
+
+    output = capsys.readouterr().out.splitlines()
+    assert output
+    assert len(prompts) == 1
+    assert output[0].startswith(" " * CONTENT_MARGIN)
+    assert prompts[0].startswith(" " * CONTENT_MARGIN)
+    assert prompts[0].endswith(" ")
+    assert all(cell_len(line) <= terminal_width for line in output)
+    assert cell_len(prompts[0]) <= terminal_width
+    assert all(
+        cell_len(line[CONTENT_MARGIN:]) <= content_width(terminal_width)
+        for line in output
+    )
+    assert cell_len(prompts[0][CONTENT_MARGIN:]) <= content_width(terminal_width)
 
 
 def test_resume_rejects_an_unknown_session(

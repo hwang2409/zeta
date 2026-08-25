@@ -20,6 +20,7 @@ from rich.padding import Padding
 from rich.text import Text
 
 from ..types import StreamEvent, StreamEventType, ToolCall
+from .layout import CONTENT_MARGIN
 from .render import render_event, render_tool_progress
 from .theme import ASSISTANT_ROLE, RICH_THEME
 
@@ -436,7 +437,7 @@ class TranscriptPresenter:
                         self._tool_region_call,
                         self._tool_region_text.plain,
                     ),
-                    (0, 2, 0, 2),
+                    (0, CONTENT_MARGIN, 0, CONTENT_MARGIN),
                 )
                 if self._tool_region_call is not None
                 else self._tool_region_text,
@@ -456,7 +457,7 @@ class TranscriptPresenter:
                         self._tool_region_call,
                         self._tool_region_text.plain,
                     ),
-                    (0, 2, 0, 2),
+                    (0, CONTENT_MARGIN, 0, CONTENT_MARGIN),
                 )
             )
         else:
