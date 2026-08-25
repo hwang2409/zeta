@@ -54,6 +54,8 @@ from .render import (
     format_thought,
     render_event,
 )
+from .render import render_thought, render_thought_live
+from .stream import stream_key
 from .theme import (
     ACCENT,
     BODY,
@@ -217,6 +219,7 @@ class TUIApp:
         self._thinking_started_at: float | None = None
         self._markdown_stream = MarkdownStream()
         self._stream_kind: str | None = None
+        self._stream_identity: tuple[str, object] | None = None
         self._partial = ""
         self._streaming = False
         self._spinner_active = False
@@ -691,7 +694,9 @@ class TUIApp:
         if thinking:
             value = "\n".join(lines)
             if value:
-                self._print_unit(format_thought(value, self._thinking_duration))
+                self._presenter.finish_thinking(
+                    render_thought(value, self._thinking_duration)
+                )
                 self._turn_had_visible_output = True
             return
         for line in lines:
@@ -719,9 +724,8 @@ class TUIApp:
                 self._print_committed([self._thinking_text], thinking=True)
         elif self._stream_kind == "assistant":
             self._print_committed(self._assistant_lines.flush())
-        self._stream_kind = None
-        self._partial = ""
-        self._thinking_text = ""
+        self._stream_kind = self._stream_identity = None
+        self._partial = self._thinking_text = ""
         self._thinking_duration = None
         self._thinking_started_at = None
 
@@ -734,7 +738,12 @@ class TUIApp:
         self._presenter.reset_assistant_unit()
 
     def _consume_text(self, event: StreamEvent) -> None:
-        redacted = event.content is not None and event.content.type.value == "redacted_thinking"
+        incoming_kind, incoming_identity = stream_key(event)
+        if self._stream_kind is not None and (
+            incoming_kind, incoming_identity
+        ) != (self._stream_kind, self._stream_identity):
+            self._flush_pending_stream()
+        redacted = incoming_kind == "redacted-thinking"
         thinking = redacted
         value = "redacted" if thinking else event.delta
         if isinstance(event.content, TextContent):
@@ -745,18 +754,20 @@ class TUIApp:
         if not value:
             return
         self._streaming = True
-        stream_kind = "redacted-thinking" if redacted else "thinking" if thinking else "assistant"
-        if self._stream_kind is not None and self._stream_kind != stream_kind:
-            self._flush_pending_stream()
+        stream_kind = incoming_kind
+        assert stream_kind is not None
         self._stream_kind = stream_kind
+        self._stream_identity = incoming_identity
         if thinking:
             if self._thinking_started_at is None:
                 self._thinking_started_at = time.monotonic()
+                self._presenter.start_thinking(render_thought_live(value))
             self._thinking_text += value
             self._thinking_duration = max(
                 0.0, time.monotonic() - self._thinking_started_at
             )
             self._partial = self._thinking_text
+            self._presenter.update_thinking(render_thought_live(self._thinking_text))
             return
         buffer = self._assistant_lines
         committed = buffer.feed(value)
@@ -799,15 +810,9 @@ class TUIApp:
         if event.type is not StreamEventType.MESSAGE_UPDATE:
             self._flush_pending_stream()
             return
-        if isinstance(event.content, ThinkingContent):
-            incoming_kind = "thinking"
-        elif isinstance(event.content, TextContent) or event.delta is not None:
-            incoming_kind = "assistant"
-        else:
-            incoming_kind = None
-        if incoming_kind != self._stream_kind and (
-            incoming_kind is not None or self._stream_kind is not None
-        ):
+        incoming_kind, incoming_identity = stream_key(event)
+        current = self._stream_kind, self._stream_identity
+        if (incoming_kind, incoming_identity) != current:
             self._flush_pending_stream()
 
     async def _pulse_spinner(self) -> None:

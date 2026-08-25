@@ -763,6 +763,7 @@ def _translate_event(
             return StreamEvent(
                 StreamEventType.MESSAGE_UPDATE,
                 content=ThinkingContent(text),
+                data={"index": index},
             )
         if kind == "signature_delta":
             if block.kind != "thinking":

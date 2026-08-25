@@ -82,13 +82,25 @@ class TranscriptWidget(UIControl):
         self._revision += 1
         self._parsed_cache.clear()
 
-    def _append_unit(self, value: RenderableType | _ToolUnit | None) -> None:
-        self._units.append(_TranscriptUnit(self._next_key, value))
+    def _append_unit(self, value: RenderableType | _ToolUnit | None) -> _TranscriptUnit:
+        unit = _TranscriptUnit(self._next_key, value)
+        self._units.append(unit)
         self._next_key += 1
         self._bump_revision()
+        return unit
 
-    def append(self, renderable: RenderableType) -> None:
-        self._append_unit(renderable)
+    def append(self, renderable: RenderableType) -> _TranscriptUnit:
+        return self._append_unit(renderable)
+
+    def replace(
+        self, unit: _TranscriptUnit, renderable: RenderableType
+    ) -> _TranscriptUnit:
+        if unit not in self._units:
+            return self._append_unit(renderable)
+        unit.value = renderable
+        self._render_cache.pop(unit.key, None)
+        self._bump_revision()
+        return unit
 
     def append_blank(self) -> None:
         self._append_unit(None)
@@ -375,6 +387,8 @@ class TranscriptPresenter:
         self._tool_region: Live | None = None
         self._tool_region_text: Text | None = None
         self._tool_region_call: ToolCall | None = None
+        self._thinking_live: Live | None = None
+        self._thinking_unit: _TranscriptUnit | None = None
 
     @property
     def tool_region(self) -> Live | None:
@@ -391,9 +405,9 @@ class TranscriptPresenter:
             return
         self._print_callback(renderable)
 
-    def print_unit(self, renderable: RenderableType | None) -> None:
+    def print_unit(self, renderable: RenderableType | None) -> _TranscriptUnit | None:
         if renderable is None:
-            return
+            return None
         if self._printed_units:
             if self._full_screen_active():
                 self.append_blank()
@@ -401,6 +415,9 @@ class TranscriptPresenter:
                 self.console.print()
         self.print(renderable)
         self._printed_units = True
+        if self._full_screen_active() and self.transcript._units:
+            return self.transcript._units[-1]
+        return None
 
     def print_assistant(self, renderable: RenderableType | None) -> bool:
         if renderable is None:
@@ -415,6 +432,47 @@ class TranscriptPresenter:
 
     def reset_assistant_unit(self) -> None:
         self._assistant_unit_open = False
+
+    def start_thinking(self, rendered: Text) -> None:
+        self.reset_assistant_unit()
+        if self._full_screen_active():
+            self._thinking_unit = self.print_unit(rendered)
+        else:
+            self._thinking_live = Live(
+                Padding(rendered, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN)),
+                console=self.console,
+                transient=True,
+                refresh_per_second=20,
+            )
+            self._thinking_live.start()
+
+    def update_thinking(self, rendered: Text) -> None:
+        if self._full_screen_active():
+            if self._thinking_unit is None:
+                self._thinking_unit = self.print_unit(rendered)
+            else:
+                self._thinking_unit = self.transcript.replace(
+                    self._thinking_unit, rendered
+                )
+        elif self._thinking_live is not None:
+            self._thinking_live.update(
+                Padding(rendered, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN))
+            )
+
+    def finish_thinking(self, rendered: Text) -> None:
+        if self._full_screen_active():
+            if self._thinking_unit is None:
+                self._thinking_unit = self.print_unit(rendered)
+            else:
+                self._thinking_unit = self.transcript.replace(
+                    self._thinking_unit, rendered
+                )
+            self._thinking_unit = None
+        elif self._thinking_live is not None:
+            self._thinking_live.stop()
+            self._thinking_live = None
+            self.print_unit(rendered)
+        self.reset_assistant_unit()
 
     def update_tool_region(self, event: StreamEvent) -> bool:
         rendered = render_event(event)
