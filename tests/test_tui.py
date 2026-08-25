@@ -27,7 +27,6 @@ from prompt_toolkit.data_structures import Size
 from rich.cells import cell_len
 from rich.console import Console
 from rich.syntax import Syntax
-from rich.table import Table
 from rich.text import Text
 
 from zeta.core.approval import ApprovalPolicy
@@ -1111,9 +1110,10 @@ def test_stream_kind_switch_flushes_assistant_before_thinking(tmp_path: Path) ->
         )
     )
 
-    assert isinstance(rendered[0], Table)
-    assert rendered[1].plain.startswith("✱ thought · plan · ")
-    assert rendered[1].plain.endswith("s")
+    assert rendered[0].plain == "| name | value |"
+    assert rendered[1].plain == "| --- | --- |"
+    assert rendered[2].plain.startswith("✱ thought · plan · ")
+    assert rendered[2].plain.endswith("s")
 
 
 def test_thought_duration_uses_local_monotonic_lifecycle_clock(
@@ -1177,15 +1177,17 @@ async def test_error_flushes_assistant_before_error(tmp_path: Path) -> None:
 
     await app._consume_turn("prompt")
 
-    table_index = next(
-        index for index, item in enumerate(rendered) if isinstance(item, Table)
+    line_index = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == "| name | value |"
     )
     error_index = next(
         index
         for index, item in enumerate(rendered)
         if getattr(item, "plain", None) == "[error] boom"
     )
-    assert table_index < error_index
+    assert line_index < error_index
 
 
 @pytest.mark.asyncio
@@ -1207,8 +1209,10 @@ async def test_verbose_error_flushes_before_raw_error(tmp_path: Path) -> None:
 
     await app._consume_turn("prompt")
 
-    table_index = next(
-        index for index, item in enumerate(rendered) if isinstance(item, Table)
+    line_index = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == "| name | value |"
     )
     raw_error_index = next(
         index
@@ -1220,7 +1224,7 @@ async def test_verbose_error_flushes_before_raw_error(tmp_path: Path) -> None:
         for index, item in enumerate(rendered)
         if getattr(item, "plain", None) == "[error] boom"
     )
-    assert table_index < raw_error_index < pretty_error_index
+    assert line_index < raw_error_index < pretty_error_index
 
 
 @pytest.mark.parametrize(
@@ -1273,8 +1277,10 @@ async def test_verbose_transition_flushes_before_raw_event(
 
     await app._consume_turn("prompt")
 
-    table_index = next(
-        index for index, item in enumerate(rendered) if isinstance(item, Table)
+    line_index = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "plain", None) == "| name | value |"
     )
     raw_index = next(
         index
@@ -1282,7 +1288,7 @@ async def test_verbose_transition_flushes_before_raw_event(
         if getattr(item, "plain", "").startswith("{")
         and raw_marker in item.plain
     )
-    assert table_index < raw_index
+    assert line_index < raw_index
 
 
 @pytest.mark.asyncio
@@ -1518,19 +1524,44 @@ def test_tui_import_does_not_load_cli() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_markdown_stream_renders_complete_table() -> None:
+def test_markdown_stream_renders_table_lines_verbatim() -> None:
     stream = MarkdownStream()
 
-    assert stream.consume("| name | value |") == []
-    assert stream.consume("| --- | --- |") == []
-    assert stream.consume("| one | two |") == []
+    lines = [
+        "| name | value |",
+        "| --- | --- |",
+        "| one | two |",
+    ]
+    output = [item for line in lines for item in stream.consume(line)]
 
-    output = stream.consume("after")
-    assert len(output) == 2
-    assert isinstance(output[0], Table)
-    assert output[0].columns[0].header == "name"
-    assert output[0].columns[1].header == "value"
-    assert isinstance(output[1], Text)
+    assert [item.plain for item in output] == lines
+    assert all(isinstance(item, Text) for item in output)
+
+
+def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    source = "foo_bar_baz\n\\*literal\\*\n`a_b_c`\n**bold** mid _text_\n"
+
+    app._consume_text(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent(source),
+        )
+    )
+    app._flush_pending_stream()
+
+    rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
+    assert rendered == [
+        "foo_bar_baz",
+        "*literal*",
+        "a_b_c",
+        "bold mid text",
+    ]
 
 
 def test_markdown_stream_preserves_model_line_structure(tmp_path: Path) -> None:

@@ -11,7 +11,6 @@ from rich.cells import cell_len
 from rich.console import RenderableType
 from rich.panel import Panel
 from rich.syntax import Syntax
-from rich.table import Table
 from rich.text import Text
 
 from ..types import (
@@ -306,36 +305,99 @@ def _duration(data: dict[str, Any]) -> float | None:
     return None
 
 
-_INLINE_MARKER = re.compile(r"(\*\*|__|`|(?<!\*)\*(?!\*)|(?<!_)_(?!_))")
+_ESCAPABLE = frozenset(r"!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+_DELIMITERS = ("**", "__", "*", "_")
+
+
+def _delimiter_can_open(value: str, start: int, delimiter: str) -> bool:
+    before = value[start - 1] if start else ""
+    after_index = start + len(delimiter)
+    after = value[after_index] if after_index < len(value) else ""
+    if not after or after.isspace():
+        return False
+    return delimiter != "_" or not (before.isalnum() and after.isalnum())
+
+
+def _delimiter_can_close(value: str, start: int, delimiter: str) -> bool:
+    before = value[start - 1] if start else ""
+    after_index = start + len(delimiter)
+    after = value[after_index] if after_index < len(value) else ""
+    if not before or before.isspace():
+        return False
+    return delimiter != "_" or not (before.isalnum() and after.isalnum())
+
+
+def _delimiter_at(value: str, index: int) -> str | None:
+    return next(
+        (delimiter for delimiter in _DELIMITERS if value.startswith(delimiter, index)),
+        None,
+    )
+
+
+def _code_span(value: str, start: int) -> tuple[int, int, str] | None:
+    end = start
+    while end < len(value) and value[end] == "`":
+        end += 1
+    delimiter = value[start:end]
+    close = value.find(delimiter, end)
+    if close < 0:
+        return None
+    return end, close + len(delimiter), value[end:close]
+
+
+def _render_inline(value: str, style: str = BODY) -> Text:
+    rendered = Text(style=BODY)
+    cursor = 0
+    while cursor < len(value):
+        if value[cursor] == "\\":
+            if cursor + 1 < len(value) and value[cursor + 1] in _ESCAPABLE:
+                rendered.append(value[cursor + 1], style=style)
+                cursor += 2
+            else:
+                rendered.append("\\", style=style)
+                cursor += 1
+            continue
+
+        if value[cursor] == "`":
+            span = _code_span(value, cursor)
+            if span is not None:
+                _, content_end, content = span
+                rendered.append(content, style=BODY)
+                cursor = content_end
+                continue
+
+        delimiter = _delimiter_at(value, cursor)
+        if delimiter is None or not _delimiter_can_open(value, cursor, delimiter):
+            rendered.append(value[cursor], style=style)
+            cursor += 1
+            continue
+
+        close = cursor + len(delimiter)
+        while close < len(value):
+            candidate = value.find(delimiter, close)
+            if candidate < 0:
+                break
+            if _delimiter_can_close(value, candidate, delimiter):
+                inner = _render_inline(
+                    value[cursor + len(delimiter) : candidate],
+                    f"{'bold' if len(delimiter) == 2 else 'italic'} {style}",
+                )
+                rendered.append(inner)
+                cursor = candidate + len(delimiter)
+                break
+            close = candidate + len(delimiter)
+        else:
+            close = -1
+        if close < 0 or cursor == close:
+            rendered.append(delimiter, style=style)
+            cursor += len(delimiter)
+    return rendered
 
 
 def render_line(value: str) -> Text:
     """Keep one model line intact while styling common inline markdown."""
 
-    rendered = Text(style=BODY)
-    markers = list(_INLINE_MARKER.finditer(value))
-    cursor = 0
-    marker_stack: list[tuple[str, str]] = []
-    for marker in markers:
-        if marker.start() > cursor:
-            style = marker_stack[-1][1] if marker_stack else BODY
-            rendered.append(value[cursor : marker.start()], style=style)
-        token = marker.group()
-        if marker_stack and marker_stack[-1][0] == token:
-            marker_stack.pop()
-        elif token == "`":
-            marker_stack.append((token, BODY))
-        elif token in {"**", "__"}:
-            marker_stack.append((token, f"bold {BODY}"))
-        else:
-            marker_stack.append((token, f"italic {BODY}"))
-        cursor = marker.end()
-    if marker_stack:
-        return Text(value, style=BODY)
-    if cursor < len(value):
-        style = marker_stack[-1][1] if marker_stack else BODY
-        rendered.append(value[cursor:], style=style)
-    return rendered
+    return _render_inline(value)
 
 
 def render_code(value: str, language: str = "text") -> Syntax:
@@ -362,7 +424,6 @@ class MarkdownStream:
     language: str | None = None
     fence_char: str | None = None
     fence_length: int = 0
-    table_lines: list[str] | None = None
 
     @staticmethod
     def _fence(line: str) -> tuple[str, int, str] | None:
@@ -375,52 +436,6 @@ class MarkdownStream:
             return None
         return char, length, stripped[length:]
 
-    @staticmethod
-    def _table_cells(line: str) -> list[str] | None:
-        stripped = line.strip()
-        if not stripped.startswith("|"):
-            return None
-        body = stripped[1:]
-        if body.endswith("|"):
-            body = body[:-1]
-        return [cell.strip() for cell in body.split("|")]
-
-    @classmethod
-    def _is_table_separator(cls, line: str) -> bool:
-        cells = cls._table_cells(line)
-        return bool(cells) and all(
-            re.fullmatch(r":?-{3,}:?", cell.replace(" ", ""))
-            for cell in cells
-        )
-
-    def _render_table(self) -> list[RenderableType]:
-        lines = self.table_lines
-        self.table_lines = None
-        if lines is None:
-            return []
-
-        def render_lines() -> list[RenderableType]:
-            return [render_line(line) if line else Text("") for line in lines]
-
-        separator_index = next(
-            (index for index, line in enumerate(lines) if self._is_table_separator(line)),
-            None,
-        )
-        if separator_index != 1:
-            return render_lines()
-        header = self._table_cells(lines[0])
-        if header is None:
-            return render_lines()
-        table = Table(show_header=True, header_style=ACCENT, expand=True)
-        for cell in header:
-            table.add_column(cell)
-        for line in lines[separator_index + 1 :]:
-            cells = self._table_cells(line)
-            if cells is None:
-                return render_lines()
-            table.add_row(*(cells + [""] * len(header))[: len(header)])
-        return [table]
-
     def _consume_plain(self, line: str) -> list[RenderableType]:
         fence = self._fence(line)
         if fence is not None:
@@ -429,16 +444,6 @@ class MarkdownStream:
             self.fence_char = char
             self.fence_length = length
             return [Text(line, style=DIM)]
-        if self.table_lines is not None:
-            if self._table_cells(line) is not None:
-                self.table_lines.append(line)
-                return []
-            result = self._render_table()
-            result.extend(self._consume_plain(line))
-            return result
-        if self._table_cells(line) is not None:
-            self.table_lines = [line]
-            return []
         return [render_line(line) if line else Text("")]
 
     def consume(self, line: str) -> list[RenderableType]:
@@ -463,7 +468,7 @@ class MarkdownStream:
         self.language = None
         self.fence_char = None
         self.fence_length = 0
-        return self._render_table()
+        return []
 
 
 def render_event(event: StreamEvent) -> RenderableType | None:
