@@ -9,10 +9,8 @@ from typing import Any, Literal
 
 from rich.cells import cell_len
 from rich.console import RenderableType
-from rich.markdown import Markdown, TableElement
 from rich.panel import Panel
 from rich.syntax import Syntax
-from rich.table import Table
 from rich.text import Text
 
 from ..types import (
@@ -311,33 +309,50 @@ def _duration(data: dict[str, Any]) -> float | None:
     return None
 
 
-class _ExpandedMarkdownTable(TableElement):
-    """Keep Rich's native markdown tables on the shared content width."""
-
-    def __rich_console__(self, console: Any, options: Any):
-        for renderable in super().__rich_console__(console, options):
-            if isinstance(renderable, Table):
-                renderable.expand = True
-            yield renderable
+_ESCAPABLE = frozenset(r"!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 
 
-class _ZetaMarkdown(Markdown):
-    elements = {
-        **Markdown.elements,
-        "table_open": _ExpandedMarkdownTable,
-    }
+def _code_span(value: str, start: int) -> tuple[int, int, str] | None:
+    end = start
+    while end < len(value) and value[end] == "`":
+        end += 1
+    delimiter = value[start:end]
+    close = value.find(delimiter, end)
+    if close < 0:
+        return None
+    return end, close + len(delimiter), value[end:close]
 
 
-def render_markdown(value: str) -> RenderableType:
-    """Render assistant text with Rich markdown and fenced-code highlighting."""
+def _render_inline(value: str, style: str = BODY) -> Text:
+    rendered = Text(style=BODY)
+    cursor = 0
+    while cursor < len(value):
+        if value[cursor] == "\\":
+            if cursor + 1 < len(value) and value[cursor + 1] in _ESCAPABLE:
+                rendered.append(value[cursor + 1], style=style)
+                cursor += 2
+            else:
+                rendered.append("\\", style=style)
+                cursor += 1
+            continue
 
-    return _ZetaMarkdown(
-        value,
-        code_theme=CODE_THEME,
-        hyperlinks=False,
-        inline_code_theme="monokai",
-        style=BODY,
-    )
+        if value[cursor] == "`":
+            span = _code_span(value, cursor)
+            if span is not None:
+                _, content_end, content = span
+                rendered.append(content, style=BODY)
+                cursor = content_end
+                continue
+
+        rendered.append(value[cursor], style=style)
+        cursor += 1
+    return rendered
+
+
+def render_line(value: str) -> Text:
+    """Keep one model line intact while styling common inline markdown."""
+
+    return _render_inline(value)
 
 
 def render_code(value: str, language: str = "text") -> Syntax:
@@ -364,7 +379,6 @@ class MarkdownStream:
     language: str | None = None
     fence_char: str | None = None
     fence_length: int = 0
-    table_lines: list[str] | None = None
 
     @staticmethod
     def _fence(line: str) -> tuple[str, int, str] | None:
@@ -377,52 +391,6 @@ class MarkdownStream:
             return None
         return char, length, stripped[length:]
 
-    @staticmethod
-    def _table_cells(line: str) -> list[str] | None:
-        stripped = line.strip()
-        if not stripped.startswith("|"):
-            return None
-        body = stripped[1:]
-        if body.endswith("|"):
-            body = body[:-1]
-        return [cell.strip() for cell in body.split("|")]
-
-    @classmethod
-    def _is_table_separator(cls, line: str) -> bool:
-        cells = cls._table_cells(line)
-        return bool(cells) and all(
-            re.fullmatch(r":?-{3,}:?", cell.replace(" ", ""))
-            for cell in cells
-        )
-
-    def _render_table(self) -> list[RenderableType]:
-        lines = self.table_lines
-        self.table_lines = None
-        if lines is None:
-            return []
-
-        def render_lines() -> list[RenderableType]:
-            return [render_markdown(line) if line else Text("") for line in lines]
-
-        separator_index = next(
-            (index for index, line in enumerate(lines) if self._is_table_separator(line)),
-            None,
-        )
-        if separator_index != 1:
-            return render_lines()
-        header = self._table_cells(lines[0])
-        if header is None:
-            return render_lines()
-        table = Table(show_header=True, header_style=ACCENT, expand=True)
-        for cell in header:
-            table.add_column(cell)
-        for line in lines[separator_index + 1 :]:
-            cells = self._table_cells(line)
-            if cells is None:
-                return render_lines()
-            table.add_row(*(cells + [""] * len(header))[: len(header)])
-        return [table]
-
     def _consume_plain(self, line: str) -> list[RenderableType]:
         fence = self._fence(line)
         if fence is not None:
@@ -431,17 +399,7 @@ class MarkdownStream:
             self.fence_char = char
             self.fence_length = length
             return [Text(line, style=DIM)]
-        if self.table_lines is not None:
-            if self._table_cells(line) is not None:
-                self.table_lines.append(line)
-                return []
-            result = self._render_table()
-            result.extend(self._consume_plain(line))
-            return result
-        if self._table_cells(line) is not None:
-            self.table_lines = [line]
-            return []
-        return [render_markdown(line) if line else Text("")]
+        return [render_line(line) if line else Text("")]
 
     def consume(self, line: str) -> list[RenderableType]:
         if self.language is not None:
@@ -465,7 +423,7 @@ class MarkdownStream:
         self.language = None
         self.fence_char = None
         self.fence_length = 0
-        return self._render_table()
+        return []
 
 
 def render_event(event: StreamEvent) -> RenderableType | None:
