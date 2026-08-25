@@ -11,6 +11,7 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
+from shutil import get_terminal_size
 from typing import Any
 
 from prompt_toolkit import PromptSession
@@ -28,7 +29,7 @@ from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.project_context import ProjectContext, discover_repo_root, load_project_context
 from ..core.slash import SlashStatus, create_slash_registry
 from ..loop import AgentLoop
-from ..core.session import SessionError, SessionManager, env_home
+from ..core.session import SessionError, SessionManager, _preview_text, env_home
 from ..providers.anthropic import AnthropicBackend
 from ..providers.anthropic import AnthropicCredentialStore
 from ..providers.codex import CodexBackend
@@ -104,6 +105,10 @@ class FullScreenPromptSession(PromptSession[str]):
 
 def _zeta_home() -> Path:
     return env_home()
+
+
+def _resume_picker_line(value: str, width: int) -> str:
+    return " " * CONTENT_MARGIN + _preview_text(value, limit=width)
 
 
 class FakeInteractiveBackend(CompletionBackend):
@@ -1030,14 +1035,20 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             previews = manager.list_session_previews(limit=RECENT_SESSION_LIMIT)
             if not previews:
                 raise SessionError("no prior zeta session found")
-            print("recent zeta sessions:")
+            width = content_width(get_terminal_size(fallback=(80, 24)).columns)
+            print(_resume_picker_line("recent zeta sessions:", width))
             for index, preview in enumerate(previews, start=1):
                 print(
-                    f"{index}. {preview.updated_at} "
-                    f"{preview.session_id[:8]} {preview.preview}"
+                    _resume_picker_line(
+                        f"{index}. {preview.updated_at} "
+                        f"{preview.session_id[:8]} {preview.preview}",
+                        width,
+                    )
                 )
             try:
-                choice = input("select a session: ").strip()
+                choice = input(
+                    _resume_picker_line("select a session:", width - 1) + " "
+                ).strip()
                 selected = int(choice)
                 if not 1 <= selected <= len(previews):
                     raise ValueError("selection out of range")
