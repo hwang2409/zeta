@@ -50,6 +50,22 @@ def test_fresh_cli_session_writes_versioned_directory(
     assert metadata["cwd"] == str(tmp_path)
 
 
+def test_fresh_session_injects_context_and_lists_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    (tmp_path / "AGENTS.md").write_text("repo rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(_args())
+    system_prompt = app.loop.context_assembler.system_prompt.content[0].text
+
+    assert "You are zeta" in system_prompt
+    assert "repo rules" in system_prompt
+    assert str((tmp_path / "AGENTS.md").resolve()) in app.slash_status().context_files
+
+
 def test_session_bash_cwd_round_trips_through_store_state(
     tmp_path: Path,
 ) -> None:

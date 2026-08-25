@@ -25,6 +25,7 @@ from .transport import (
     task_is_cancelling,
 )
 from .usage import normalize_usage
+from ..prompts import load_identity
 from ..types import (
     CompletionBackend,
     ContentBlock,
@@ -401,7 +402,23 @@ class AnthropicBackend(CompletionBackend):
                 "text": "You are Claude Code, Anthropic's official CLI for Claude.",
                 "cache_control": {"type": "ephemeral"},
             }
-            payload["system"] = [identity, *payload.get("system", [])]
+            system = payload.get("system", [])
+            if not any(
+                block.get("text") == load_identity()
+                for block in system
+                if isinstance(block, dict)
+            ):
+                if system:
+                    system[-1].pop("cache_control", None)
+                system = [
+                    *system,
+                    {
+                        "type": "text",
+                        "text": load_identity(),
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ]
+            payload["system"] = [identity, *system]
             headers = {
                 "accept": "text/event-stream",
                 "anthropic-beta": f"{CLAUDE_CODE_BETA},{OAUTH_BETA}",

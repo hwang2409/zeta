@@ -111,6 +111,7 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
     assert request_payload["model"] == "claude-sonnet-4-6"
     assert request_payload["system"][0]["text"].startswith("You are Claude Code")
     assert request_payload["system"][1]["text"] == "keep this system prompt"
+    assert request_payload["system"][2]["text"].startswith("You are zeta")
     assert [event.type for event in events] == [
         StreamEventType.MESSAGE_START,
         StreamEventType.MESSAGE_UPDATE,
