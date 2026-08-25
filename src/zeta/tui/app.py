@@ -252,6 +252,7 @@ class TUIApp:
         self._compaction_shown = False
         self._turn_had_visible_output = False
         self._active_session: PromptSession[str] | None = None
+        self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._presenter = TranscriptPresenter(
             self._transcript,
@@ -479,6 +480,29 @@ class TUIApp:
         self._present_pending_approvals()
         return True
 
+    def _prompt_style(self) -> Style:
+        focused = get_app().current_buffer.name == "DEFAULT_BUFFER"
+        style = self._prompt_styles.get(focused)
+        if style is None:
+            style = Style.from_dict(
+                {
+                    "": f"fg:{BODY}",
+                    "prompt": f"fg:{ACCENT} bold",
+                    "placeholder": f"italic fg:{DIM}",
+                    "status-bar": f"noreverse fg:{CHROME}",
+                    "frame": "",
+                    "frame.border": (
+                        f"fg:{COMPOSER_FOCUS}"
+                        if focused
+                        else f"fg:{COMPOSER_BORDER}"
+                    ),
+                    "text-area": f"fg:{BODY}",
+                    "text-area.prompt": f"fg:{ACCENT} bold",
+                }
+            )
+            self._prompt_styles[focused] = style
+        return style
+
     def _make_session(self) -> PromptSession[str]:
         bindings = build_key_bindings(
             on_interrupt=self.abort_active,
@@ -496,24 +520,7 @@ class TUIApp:
             bottom_toolbar=self._status_toolbar,
             erase_when_done=True,
             show_frame=True,
-            style=DynamicStyle(
-                lambda: Style.from_dict(
-                    {
-                        "": f"fg:{BODY}",
-                        "prompt": f"fg:{ACCENT} bold",
-                        "placeholder": f"italic fg:{DIM}",
-                        "status-bar": f"noreverse fg:{CHROME}",
-                        "frame": "",
-                        "frame.border": (
-                            f"fg:{COMPOSER_FOCUS}"
-                            if get_app().current_buffer.name == "DEFAULT_BUFFER"
-                            else f"fg:{COMPOSER_BORDER}"
-                        ),
-                        "text-area": f"fg:{BODY}",
-                        "text-area.prompt": f"fg:{ACCENT} bold",
-                    }
-                )
-            ),
+            style=DynamicStyle(self._prompt_style),
         )
 
     def request_exit(self) -> None:
