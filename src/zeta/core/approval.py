@@ -208,9 +208,11 @@ class ApprovalGate:
         signal: AbortSignal,
         advance_generation: AdvanceGeneration,
         lifecycle: Callable[[str], None] | None = None,
+        *,
+        skip_approval: bool = False,
     ) -> tuple[ToolResult | None, AbortSignal]:
         execution_signal = signal
-        if self.policy is not None:
+        if self.policy is not None and not skip_approval:
             approval_started = (
                 self.policy.durable_decision(tool_call.id) is None
                 and self.policy.decide(tool_call.name, arguments)

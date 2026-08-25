@@ -201,11 +201,12 @@ class AgentLoop:
         return self._run_turn(user_text)
 
     async def close(self) -> None:
-        """Close session-owned MCP transports."""
+        """Close session-owned transports and background processes."""
 
         if self._mcp_mount is not None:
             await self._mcp_mount.close()
             self._mcp_mount = None
+        await self.tool_registry.background_tasks.close()
 
     async def _ensure_mcp_servers(self) -> None:
         if self._mcp_mount_attempted:

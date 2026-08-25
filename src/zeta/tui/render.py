@@ -589,6 +589,7 @@ def format_status(
     spinner_active: bool | None = None,
     model_window: int | None = None,
     vim_state: str | None = None,
+    background_count: int = 0,
 ) -> Text:
     """Format the compact status bar shown below the composer."""
 
@@ -623,6 +624,8 @@ def format_status(
     left_segments = [state_segment]
     if vim_state:
         left_segments.insert(0, vim_state)
+    if background_count > 0:
+        left_segments.append(f"bg {background_count}")
     left = "  ".join(left_segments)
     right_segments = ["/status", "ctrl+c interrupt", "ctrl+d quit"]
     if session_id:
@@ -631,7 +634,9 @@ def format_status(
         value = f"{left}  {' · '.join(right_segments)}"
     else:
         value = left
-        candidates = (left, state_segment) if vim_state else (left,)
+        candidates = (left, state_segment)
+        if vim_state and background_count > 0:
+            candidates = (left, f"{vim_state}  {state_segment}", state_segment)
         for candidate_left in candidates:
             value = candidate_left
             for start in range(len(right_segments)):
