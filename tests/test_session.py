@@ -96,6 +96,85 @@ def test_resume_restores_context_snapshot_across_directories(
     assert resumed.slash_status().context_files == (str(original_context.resolve()),)
 
 
+def test_legacy_resume_persists_context_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    context_file = tmp_path / "AGENTS.md"
+    context_file.write_text("legacy rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    metadata_path = home / "sessions" / opened.store.session_id / "meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("system_prompt")
+    metadata.pop("context_files")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
+    )
+    saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    assert saved["system_prompt"] == resumed.loop.context_assembler.system_prompt.content[0].text
+    assert saved["context_files"] == [str(context_file.resolve())]
+
+
+def test_legacy_resume_uses_persisted_snapshot_on_second_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    context_file = tmp_path / "AGENTS.md"
+    context_file.write_text("first rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    metadata_path = home / "sessions" / opened.store.session_id / "meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("system_prompt")
+    metadata.pop("context_files")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    create_app(
+        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
+    )
+    context_file.write_text("second rules", encoding="utf-8")
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
+    )
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+
+    assert "first rules" in prompt
+    assert "second rules" not in prompt
+
+
+def test_partial_context_metadata_is_replaced_with_fallback_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    context_file = tmp_path / "AGENTS.md"
+    context_file.write_text("first rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    metadata_path = home / "sessions" / session_id / "meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("context_files")
+    context_file.write_text("replacement rules", encoding="utf-8")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+    )
+    saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+
+    assert "replacement rules" in prompt
+    assert saved["context_files"] == [str(context_file.resolve())]
+
+
 def test_session_bash_cwd_round_trips_through_store_state(
     tmp_path: Path,
 ) -> None:

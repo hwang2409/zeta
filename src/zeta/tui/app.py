@@ -712,6 +712,11 @@ def create_app(args: argparse.Namespace) -> TUIApp:
                 repo_root=discover_repo_root(Path(metadata.cwd)),
                 zeta_home=home,
             )
+            manager.persist_context_snapshot(
+                metadata,
+                system_prompt=project_context.system_prompt,
+                context_files=[str(path) for path in project_context.files],
+            )
     else:
         provider = args.provider or "fake"
         backend, selected_model = build_backend(provider, args.model, home=home)

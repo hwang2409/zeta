@@ -108,8 +108,9 @@ class SessionMetadata:
         audit = value.get("override_audit", [])
         if type(audit) is not list or any(type(item) is not dict for item in audit):
             raise SessionError(f"session metadata override audit is invalid: {path}")
-        system_prompt = value.get("system_prompt", "")
-        context_files = value.get("context_files", [])
+        has_context_snapshot = "system_prompt" in value and "context_files" in value
+        system_prompt = value.get("system_prompt", "") if has_context_snapshot else ""
+        context_files = value.get("context_files", []) if has_context_snapshot else []
         if type(system_prompt) is not str or type(context_files) is not list or any(
             type(item) is not str for item in context_files
         ):
@@ -237,6 +238,23 @@ class SessionManager:
 
     def touch(self, metadata: SessionMetadata) -> None:
         current = self._mutate(metadata.session_id, lambda item: self._touch(item))
+        self._copy_metadata(metadata, current)
+
+    def persist_context_snapshot(
+        self,
+        metadata: SessionMetadata,
+        *,
+        system_prompt: str,
+        context_files: list[str] | tuple[str, ...],
+    ) -> None:
+        def update(item: SessionMetadata) -> SessionMetadata:
+            if item.system_prompt:
+                return item
+            item.system_prompt = system_prompt
+            item.context_files = list(context_files)
+            return self._touch(item)
+
+        current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
     def record_override(
