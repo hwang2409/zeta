@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.enums import EditingMode
@@ -33,6 +34,7 @@ from zeta.core.approval import ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
+from zeta.providers.anthropic import AnthropicBackend, AnthropicCredentialStore, OAuthTokens
 from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.composer import (
@@ -59,6 +61,7 @@ from zeta.types import (
     ErrorInfo,
     Message,
     MessageRole,
+    RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
     TextContent,
@@ -928,6 +931,137 @@ def test_thought_collapses_to_first_sentence_and_keeps_duration() -> None:
 
     assert rendered.plain == "✱ thought · Plan first. · 2.7s"
     assert "italic" in str(rendered.style)
+
+
+def test_redacted_thought_renders_as_collapsed_line_with_duration() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=RedactedThinkingContent("opaque"),
+            data={"duration": 1.25},
+        )
+    )
+
+    assert isinstance(rendered, Text)
+    assert rendered.plain == "✱ thought · redacted · 1.2s"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_redacted_thinking_reaches_tui_stream(tmp_path: Path) -> None:
+    stream = "\n".join(
+        [
+            'data: {"type":"message_start","message":{}}',
+            "",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque"}}',
+            "",
+            'data: {"type":"content_block_stop","index":0}',
+            "",
+            'data: {"type":"message_stop"}',
+            "",
+        ]
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=stream,
+            request=request,
+        )
+
+    credentials = AnthropicCredentialStore(tmp_path / "zeta.json")
+    credentials.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend = AnthropicBackend(
+        client=client,
+        token_store=credentials,
+        base_url="https://test.invalid/v1/messages",
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._consume_turn("hello")
+    await client.aclose()
+
+    rendered = output.getvalue()
+    assert "✱ thought · redacted" in rendered
+    assert "no response" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redacted_first", [True, False])
+async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
+    tmp_path: Path, redacted_first: bool
+) -> None:
+    blocks = (
+        [("redacted_thinking", '"data":"opaque"'), ("thinking", '"thinking":"plan"')]
+        if redacted_first
+        else [("thinking", '"thinking":"plan"'), ("redacted_thinking", '"data":"opaque"')]
+    )
+    lines = [
+        'data: {"type":"message_start","message":{}}',
+        "",
+    ]
+    for index, (kind, value) in enumerate(blocks):
+        lines.extend(
+            [
+                f'data: {{"type":"content_block_start","index":{index},"content_block":{{"type":"{kind}",{value}}}}}',
+                "",
+            ]
+        )
+        if kind == "thinking":
+            lines.extend(
+                [
+                    f'data: {{"type":"content_block_delta","index":{index},"delta":{{"type":"thinking_delta","thinking":"plan"}}}}',
+                    "",
+                    f'data: {{"type":"content_block_delta","index":{index},"delta":{{"type":"signature_delta","signature":"sig-{index}"}}}}',
+                    "",
+                ]
+            )
+        lines.extend(
+            [
+                f'data: {{"type":"content_block_stop","index":{index}}}',
+                "",
+            ]
+        )
+    lines.extend(['data: {"type":"message_stop"}', ""])
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text="\n".join(lines),
+            request=request,
+        )
+
+    credentials = AnthropicCredentialStore(tmp_path / "zeta.json")
+    credentials.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend = AnthropicBackend(
+        client=client,
+        token_store=credentials,
+        base_url="https://test.invalid/v1/messages",
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._consume_turn("hello")
+    await client.aclose()
+
+    rendered = output.getvalue()
+    assert rendered.count("✱ thought · redacted") == 1
+    assert rendered.count("✱ thought · plan") == 1
+    assert "redactedplan" not in rendered
 
 
 @pytest.mark.parametrize(

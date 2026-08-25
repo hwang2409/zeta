@@ -16,12 +16,14 @@ from zeta.core.store import ConversationStore
 from zeta.types import (
     Message,
     MessageRole,
+    RedactedThinkingContent,
     TextContent,
     ToolCall,
     ToolResult,
     ToolUseContent,
     StreamEvent,
     StreamEventType,
+    ThinkingContent,
 )
 
 
@@ -144,6 +146,71 @@ async def test_summary_completion_has_no_tools(context_root: Path) -> None:
     await assembler.assemble()
 
     assert backend.calls[0][1] == []
+
+
+@pytest.mark.asyncio
+async def test_compaction_strips_thinking_from_input_and_summary(context_root: Path) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [
+                ThinkingContent("private plan", "signature-secret"),
+                RedactedThinkingContent("redacted-secret"),
+                TextContent("visible fact"),
+            ],
+        )
+    )
+    store.append_message(text(MessageRole.USER, "tail"))
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                [
+                    ThinkingContent("summary private", "summary-signature"),
+                    RedactedThinkingContent("summary-redacted"),
+                    TextContent("summary visible"),
+                ]
+            )
+        ]
+    )
+    assembler = ContextAssembler(
+        store,
+        token_budget=40,
+        retained_tail=1,
+        token_counter=compact_count,
+        backend=backend,
+    )
+
+    compacted = await assembler.assemble()
+
+    source_prompt = backend.calls[0][0][-1].content[0].text
+    assert "private plan" not in source_prompt
+    assert "signature-secret" not in source_prompt
+    assert "redacted-secret" not in source_prompt
+    assert '"thinking"' not in source_prompt
+    assert '"redacted_thinking"' not in source_prompt
+    assert all(
+        isinstance(block, TextContent)
+        for message in compacted
+        for block in message.content
+    )
+    assert "summary visible" in "".join(
+        block.text
+        for message in compacted
+        for block in message.content
+        if isinstance(block, TextContent)
+    )
+
+    replayed = await assembler.assemble()
+
+    assert [message.to_dict() for message in replayed] == [
+        message.to_dict() for message in compacted
+    ]
+    assert all(
+        isinstance(block, TextContent)
+        for message in replayed
+        for block in message.content
+    )
 
 
 @pytest.mark.asyncio

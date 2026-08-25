@@ -111,6 +111,12 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
     assert "x-api-key" not in requests[0].headers
     request_payload = json.loads(requests[0].content)
     assert request_payload["model"] == "claude-sonnet-4-6"
+    assert request_payload["max_tokens"] == 16384
+    assert request_payload["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 8192,
+    }
+    assert "interleaved-thinking-2025-05-14" in requests[0].headers["anthropic-beta"]
     assert request_payload["system"][0]["text"].startswith("You are Claude Code")
     assert request_payload["system"][1]["text"] == "keep this system prompt"
     assert [event.type for event in events] == [
@@ -429,7 +435,8 @@ def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
         ],
         [{"name": "read", "description": "read a file", "parameters": {"type": "object"}}],
         model="claude-test",
-        max_tokens=100,
+        max_tokens=4096,
+        thinking_budget=2048,
     )
 
     assert payload["system"][-1]["cache_control"] == {"type": "ephemeral"}
@@ -469,7 +476,8 @@ def test_anthropic_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
         ],
         [],
         model="claude-test",
-        max_tokens=100,
+        max_tokens=4096,
+        thinking_budget=2048,
     )
 
     assert payload["messages"][0]["content"][0]["content"] == (
@@ -543,7 +551,8 @@ def test_empty_system_prompt_is_omitted_from_payload() -> None:
         ],
         [],
         model="claude-test",
-        max_tokens=100,
+        max_tokens=4096,
+        thinking_budget=2048,
     )
 
     assert "system" not in payload
@@ -806,12 +815,66 @@ def test_signed_thinking_blocks_use_anthropic_wire_types() -> None:
         ],
         [],
         model="claude-test",
-        max_tokens=100,
+        max_tokens=4096,
+        thinking_budget=2048,
     )
 
     assert payload["messages"][0]["content"] == [
         {"type": "thinking", "thinking": "plan", "signature": "sig-1"},
         {"type": "redacted_thinking", "data": "opaque"},
+    ]
+
+
+def test_thinking_tool_turn_replays_assistant_blocks_before_tool_result() -> None:
+    payload = build_messages_payload(
+        [
+            Message(MessageRole.USER, [TextContent("inspect this")]),
+            Message(
+                MessageRole.ASSISTANT,
+                [
+                    ThinkingContent("plan", "sig-1"),
+                    RedactedThinkingContent("opaque"),
+                    ToolUseContent(ToolCall("call-1", "read", {"path": "note.txt"})),
+                ],
+            ),
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult("call-1", "contents"),
+            ),
+        ],
+        [{"name": "read", "parameters": {"type": "object"}}],
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+
+    assert payload["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "inspect this"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "sig-1"},
+                {"type": "redacted_thinking", "data": "opaque"},
+                {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "read",
+                    "input": {"path": "note.txt"},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "contents",
+                    "is_error": False,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        },
     ]
 
 
@@ -1056,7 +1119,8 @@ def test_salvaged_context_omits_unsigned_thinking_on_replay() -> None:
         ],
         [],
         model="claude-test",
-        max_tokens=100,
+        max_tokens=4096,
+        thinking_budget=2048,
     )
 
     assert payload["messages"][-1] == {
