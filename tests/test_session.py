@@ -66,6 +66,36 @@ def test_fresh_session_injects_context_and_lists_files(
     assert str((tmp_path / "AGENTS.md").resolve()) in app.slash_status().context_files
 
 
+def test_resume_restores_context_snapshot_across_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    original = tmp_path / "original"
+    other = tmp_path / "other"
+    original.mkdir()
+    other.mkdir()
+    original_context = original / "AGENTS.md"
+    original_context.write_text("original rules", encoding="utf-8")
+    (other / "AGENTS.md").write_text("new directory rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(original)
+
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    original_context.write_text("changed rules", encoding="utf-8")
+    monkeypatch.chdir(other)
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+    )
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+
+    assert "original rules" in prompt
+    assert "changed rules" not in prompt
+    assert "new directory rules" not in prompt
+    assert resumed.slash_status().context_files == (str(original_context.resolve()),)
+
+
 def test_session_bash_cwd_round_trips_through_store_state(
     tmp_path: Path,
 ) -> None:

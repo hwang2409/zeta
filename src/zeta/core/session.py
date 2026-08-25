@@ -46,6 +46,8 @@ class SessionMetadata:
     retained_tail: int
     compaction_budget: int
     override_audit: list[dict[str, Any]] = field(default_factory=list)
+    system_prompt: str = ""
+    context_files: list[str] = field(default_factory=list)
 
     @classmethod
     def new(
@@ -57,6 +59,8 @@ class SessionMetadata:
         cwd: str,
         retained_tail: int,
         compaction_budget: int,
+        system_prompt: str = "",
+        context_files: list[str] | tuple[str, ...] = (),
     ) -> SessionMetadata:
         timestamp = _now()
         return cls(
@@ -69,6 +73,8 @@ class SessionMetadata:
             cwd=cwd,
             retained_tail=retained_tail,
             compaction_budget=compaction_budget,
+            system_prompt=system_prompt,
+            context_files=list(context_files),
         )
 
     @classmethod
@@ -102,6 +108,12 @@ class SessionMetadata:
         audit = value.get("override_audit", [])
         if type(audit) is not list or any(type(item) is not dict for item in audit):
             raise SessionError(f"session metadata override audit is invalid: {path}")
+        system_prompt = value.get("system_prompt", "")
+        context_files = value.get("context_files", [])
+        if type(system_prompt) is not str or type(context_files) is not list or any(
+            type(item) is not str for item in context_files
+        ):
+            raise SessionError(f"session metadata context is invalid: {path}")
         return cls(
             version=value["version"],
             session_id=value["session_id"],
@@ -113,6 +125,8 @@ class SessionMetadata:
             retained_tail=retained_tail,
             compaction_budget=compaction_budget,
             override_audit=[dict(item) for item in audit],
+            system_prompt=system_prompt,
+            context_files=list(context_files),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -127,6 +141,8 @@ class SessionMetadata:
             "retained_tail": self.retained_tail,
             "compaction_budget": self.compaction_budget,
             "override_audit": self.override_audit,
+            "system_prompt": self.system_prompt,
+            "context_files": self.context_files,
         }
 
 
@@ -151,6 +167,8 @@ class SessionManager:
         cwd: str | Path | None = None,
         retained_tail: int = 8,
         compaction_budget: int = 200_000,
+        system_prompt: str = "",
+        context_files: list[str] | tuple[str, ...] = (),
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -168,6 +186,8 @@ class SessionManager:
                 cwd=resolved_cwd,
                 retained_tail=retained_tail,
                 compaction_budget=compaction_budget,
+                system_prompt=system_prompt,
+                context_files=context_files,
             )
             store = ConversationStore(
                 self.sessions_dir,
@@ -289,6 +309,8 @@ class SessionManager:
         target.retained_tail = source.retained_tail
         target.compaction_budget = source.compaction_budget
         target.override_audit = [dict(item) for item in source.override_audit]
+        target.system_prompt = source.system_prompt
+        target.context_files = list(source.context_files)
 
     def _read(self, session_id: str) -> SessionMetadata:
         path = self.sessions_dir / session_id / "meta.json"

@@ -19,7 +19,7 @@ from rich.live import Live
 from rich.text import Text
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
-from ..core.project_context import load_project_context
+from ..core.project_context import ProjectContext, discover_repo_root, load_project_context
 from ..core.slash import SlashStatus, create_slash_registry
 from ..loop import AgentLoop
 from ..core.session import SessionError, SessionManager, env_home
@@ -666,7 +666,6 @@ class TUIApp:
 
 def create_app(args: argparse.Namespace) -> TUIApp:
     home = _zeta_home()
-    project_context = load_project_context(repo_root=Path.cwd(), zeta_home=home)
     manager = SessionManager(home)
     continue_session = getattr(args, "continue_session", False)
     resume_id = getattr(args, "resume", None)
@@ -703,13 +702,29 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         provider = provider_override or metadata.provider
         model = model_override or metadata.model
         store = opened.store
+        if metadata.system_prompt:
+            project_context = ProjectContext(
+                metadata.system_prompt,
+                tuple(Path(path) for path in metadata.context_files),
+            )
+        else:
+            project_context = load_project_context(
+                repo_root=discover_repo_root(Path(metadata.cwd)),
+                zeta_home=home,
+            )
     else:
         provider = args.provider or "fake"
         backend, selected_model = build_backend(provider, args.model, home=home)
+        project_context = load_project_context(
+            repo_root=discover_repo_root(Path.cwd()),
+            zeta_home=home,
+        )
         opened = manager.create(
             provider=provider,
             model=selected_model,
             cwd=Path.cwd(),
+            system_prompt=project_context.system_prompt,
+            context_files=[str(path) for path in project_context.files],
         )
         metadata = opened.metadata
         store = opened.store

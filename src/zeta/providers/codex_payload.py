@@ -17,7 +17,6 @@ from ..types import (
     ToolUseContent,
 )
 from .codex_errors import CodexHTTPError
-from ..prompts import load_identity
 
 
 def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str, Any]]:
@@ -134,7 +133,7 @@ def build_responses_payload(
         "model": model,
         "store": False,
         "stream": True,
-        "instructions": "\n\n".join(instructions) or load_identity(),
+        "instructions": "\n\n".join(instructions) or "You are a helpful assistant.",
         "input": input_items,
         "tool_choice": "auto",
         "parallel_tool_calls": True,

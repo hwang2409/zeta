@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
+import subprocess
 
 from ..prompts import load_identity
 
@@ -14,6 +16,23 @@ class ProjectContext:
 
     system_prompt: str
     files: tuple[Path, ...]
+
+
+def discover_repo_root(cwd: str | Path | None = None) -> Path:
+    """Resolve the git worktree root, or use cwd when it is not a repository."""
+
+    directory = Path(cwd or Path.cwd()).expanduser().resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return directory
+    root = result.stdout.strip()
+    return Path(root).expanduser().resolve() if root else directory
 
 
 def _present(path: Path) -> bool:
@@ -44,9 +63,14 @@ def load_project_context(
             continue
         content = path.read_text(encoding="utf-8")
         loaded.append(path)
-        sections.append(f"Instructions from {path}:\n{content}")
+        source = escape(str(path), quote=True)
+        sections.append(
+            f'<zeta-project-instructions source="{source}">\n'
+            f"{escape(content, quote=True)}\n"
+            "</zeta-project-instructions>"
+        )
 
     return ProjectContext("\n\n".join(sections), tuple(loaded))
 
 
-__all__ = ["ProjectContext", "load_project_context"]
+__all__ = ["ProjectContext", "discover_repo_root", "load_project_context"]

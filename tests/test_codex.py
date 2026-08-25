@@ -24,7 +24,6 @@ from zeta.providers.codex import (
 from zeta.core.context import ContextAssembler
 from zeta.core.slash import SlashStatus, _format_status
 from zeta.core.store import ConversationStore
-from zeta.prompts import load_identity
 from zeta.types import (
     Message,
     MessageRole,
@@ -1152,10 +1151,10 @@ def test_payload_maps_plan_messages_and_tools() -> None:
     ]
 
 
-def test_empty_codex_instructions_use_zeta_identity() -> None:
+def test_empty_codex_instructions_keep_provider_fallback() -> None:
     payload = build_responses_payload([], [], model=DEFAULT_CODEX_MODEL)
 
-    assert payload["instructions"] == load_identity()
+    assert payload["instructions"] == "You are a helpful assistant."
 
 
 def test_codex_http_error_includes_safe_truncated_body() -> None:
