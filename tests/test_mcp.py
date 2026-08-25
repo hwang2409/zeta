@@ -32,7 +32,11 @@ def test_mcp_non_text_blocks_keep_the_standard_content_shape() -> None:
     result = translate_call_result(
         {
             "content": [
-                {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+                {
+                    "type": "image",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg==",
+                    "mimeType": "image/png",
+                },
                 {
                     "type": "resource",
                     "resource": {
@@ -46,7 +50,11 @@ def test_mcp_non_text_blocks_keep_the_standard_content_shape() -> None:
     )
 
     assert result["content"] == [
-        {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+        {
+            "type": "image",
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg==",
+            "mimeType": "image/png",
+        },
         {
             "type": "resource",
             "resource": {
