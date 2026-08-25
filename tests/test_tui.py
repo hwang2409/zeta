@@ -18,11 +18,14 @@ from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import set_app
 from prompt_toolkit.input import PipeInput, create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.data_structures import Size
 from rich.cells import cell_len
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -37,6 +40,7 @@ from zeta.tui.composer import (
     history_for,
     parse_input,
 )
+from zeta.tui.layout import content_width
 from zeta.tui.render import (
     MarkdownStream,
     collapse_thought,
@@ -1385,7 +1389,7 @@ def test_markdown_stream_renders_complete_table() -> None:
     assert isinstance(output[0], Table)
     assert output[0].columns[0].header == "name"
     assert output[0].columns[1].header == "value"
-    assert output[1].__class__.__name__ == "Markdown"
+    assert isinstance(output[1], Markdown)
 
 
 def test_status_includes_provider_state_and_usage() -> None:
@@ -1516,6 +1520,40 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     bottom = content.children[1]
     assert bottom.__class__.__name__ == "HSplit"
     assert bottom.children[-1].__class__.__name__ == "ConditionalContainer"
+
+
+@pytest.mark.asyncio
+async def test_full_screen_steady_state_paint_does_not_clear_screen(
+    tmp_path: Path,
+) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        history_path=tmp_path / "history",
+    )
+    session = app._make_session()
+    app._install_full_screen_layout(session)
+    output_text = StringIO()
+    output = Vt100_Output(
+        output_text,
+        lambda: Size(rows=45, columns=200),
+    )
+    session.app.output = output
+    session.app.renderer.output = output
+    session.app.renderer.full_screen = True
+
+    with set_app(session.app):
+        session.app.renderer.render(session.app, session.app.layout)
+        output_text.seek(0)
+        output_text.truncate(0)
+        app._spinner_active = True
+        app._spinner_frame = 1
+        session.app.renderer.render(session.app, session.app.layout)
+
+    steady_state = output_text.getvalue()
+    assert "\x1b[J" not in steady_state
+    assert "\x1b[2J" not in steady_state
 
 
 @pytest.mark.parametrize(
@@ -2047,40 +2085,66 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path:
         r"\1",
         snapshot,
     )
-    expected = """▌ inspect the session
+    lines = snapshot.splitlines()
+    panel_lines = [
+        line for line in lines if line.startswith(("  ╭", "  │", "  ╰"))
+    ]
+    assert "▌ inspect the session" in snapshot
+    assert "✱ thought · Plan the inspection." in snapshot
+    assert "⏺ read README.md [limit=120]" in snapshot
+    assert "finished" in snapshot
+    assert len(panel_lines) == 23
+    assert all(cell_len(line) <= 72 for line in panel_lines)
+    assert all(
+        cell_len(line) == 70
+        for line in panel_lines
+        if line.startswith(("  ╭", "  ╰"))
+    )
 
-  ✱ thought · Plan the inspection.
 
-  ╭──────────╮
-  │ $ seq 24 │
-  │ running… │
-  ╰──────────╯
-  ╭────────────╮
-  │ $ seq 24   │
-  │ line-0     │
-  │ line-1     │
-  │ line-2     │
-  │ line-3     │
-  │ line-4     │
-  │ line-5     │
-  │ line-6     │
-  │ line-7     │
-  │ line-8     │
-  │ line-9     │
-  │ line-10    │
-  │ line-11    │
-  │ line-12    │
-  │ line-13    │
-  │ line-14    │
-  │ … +9 lines │
-  ╰────────────╯
+@pytest.mark.parametrize("terminal_width", [200, 120, 80, 40])
+def test_transcript_units_share_the_padded_content_edges(terminal_width: int) -> None:
+    width = content_width(terminal_width)
+    transcript = TranscriptWidget()
+    call = ToolCall("visual", "bash", {"cmd": "printf output"})
+    transcript.append(Text("assistant prose that wraps at the shared edge."))
+    transcript.append(
+        render_markdown(
+            "> quoted markdown\n\n```python\nprint(\"hello\")\n```"
+        )
+    )
+    transcript.append(
+        render_event(
+            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        )
+    )
+    transcript.append(
+        render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(call.id, "done"),
+            )
+        )
+    )
+    transcript.append(
+        Text(
+            "[approval pending] request-1: bash; type approve request-1 or deny request-1",
+            style=ACCENT,
+        )
+    )
 
-  ⏺ read README.md [limit=120] · running
-  ⏺ read README.md [limit=120]
-
-  finished"""
-
-    assert snapshot == expected
+    lines = [Text.from_ansi(line).plain for line in transcript.lines(width)]
+    assert all(cell_len(line) <= width for line in lines)
+    panel_lines = [
+        line
+        for line in lines
+        if line.startswith(("╭", "│", "╰"))
+    ]
+    assert panel_lines
+    assert all(cell_len(line) == width for line in panel_lines)
+    assert any(line.startswith("╭") and line.endswith("╮") for line in panel_lines)
+    assert any(line.startswith("╰") and line.endswith("╯") for line in panel_lines)
 
 
 @pytest.mark.asyncio

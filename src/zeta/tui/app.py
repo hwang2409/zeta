@@ -11,6 +11,7 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
+from shutil import get_terminal_size
 from typing import Any
 
 from prompt_toolkit import PromptSession
@@ -28,7 +29,7 @@ from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.project_context import ProjectContext, discover_repo_root, load_project_context
 from ..core.slash import SlashStatus, create_slash_registry
 from ..loop import AgentLoop
-from ..core.session import SessionError, SessionManager, env_home
+from ..core.session import SessionError, SessionManager, _preview_text, env_home
 from ..providers.anthropic import AnthropicBackend
 from ..providers.anthropic import AnthropicCredentialStore
 from ..providers.codex import CodexBackend
@@ -43,6 +44,7 @@ from ..types import (
     ThinkingContent,
 )
 from .composer import build_key_bindings, history_for, parse_input
+from .layout import CONTENT_MARGIN, content_width
 from .render import (
     MarkdownStream,
     format_status,
@@ -103,6 +105,10 @@ class FullScreenPromptSession(PromptSession[str]):
 
 def _zeta_home() -> Path:
     return env_home()
+
+
+def _resume_picker_line(value: str, width: int) -> str:
+    return " " * CONTENT_MARGIN + _preview_text(value, limit=width)
 
 
 class FakeInteractiveBackend(CompletionBackend):
@@ -246,6 +252,7 @@ class TUIApp:
         self._compaction_shown = False
         self._turn_had_visible_output = False
         self._active_session: PromptSession[str] | None = None
+        self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._presenter = TranscriptPresenter(
             self._transcript,
@@ -259,7 +266,7 @@ class TUIApp:
     def _transcript_lines(self) -> list[str]:
         """Expose rendered lines for diagnostics while keeping logical units in the widget."""
 
-        width = get_app().output.get_size().columns
+        width = content_width(get_app().output.get_size().columns)
         return self._transcript.lines(width)
 
     @property
@@ -473,6 +480,29 @@ class TUIApp:
         self._present_pending_approvals()
         return True
 
+    def _prompt_style(self) -> Style:
+        focused = get_app().current_buffer.name == "DEFAULT_BUFFER"
+        style = self._prompt_styles.get(focused)
+        if style is None:
+            style = Style.from_dict(
+                {
+                    "": f"fg:{BODY}",
+                    "prompt": f"fg:{ACCENT} bold",
+                    "placeholder": f"italic fg:{DIM}",
+                    "status-bar": f"noreverse fg:{CHROME}",
+                    "frame": "",
+                    "frame.border": (
+                        f"fg:{COMPOSER_FOCUS}"
+                        if focused
+                        else f"fg:{COMPOSER_BORDER}"
+                    ),
+                    "text-area": f"fg:{BODY}",
+                    "text-area.prompt": f"fg:{ACCENT} bold",
+                }
+            )
+            self._prompt_styles[focused] = style
+        return style
+
     def _make_session(self) -> PromptSession[str]:
         bindings = build_key_bindings(
             on_interrupt=self.abort_active,
@@ -490,24 +520,7 @@ class TUIApp:
             bottom_toolbar=self._status_toolbar,
             erase_when_done=True,
             show_frame=True,
-            style=DynamicStyle(
-                lambda: Style.from_dict(
-                    {
-                        "": f"fg:{BODY}",
-                        "prompt": f"fg:{ACCENT} bold",
-                        "placeholder": f"italic fg:{DIM}",
-                        "status-bar": f"noreverse fg:{CHROME}",
-                        "frame": "",
-                        "frame.border": (
-                            f"fg:{COMPOSER_FOCUS}"
-                            if get_app().current_buffer.name == "DEFAULT_BUFFER"
-                            else f"fg:{COMPOSER_BORDER}"
-                        ),
-                        "text-area": f"fg:{BODY}",
-                        "text-area.prompt": f"fg:{ACCENT} bold",
-                    }
-                )
-            ),
+            style=DynamicStyle(self._prompt_style),
         )
 
     def request_exit(self) -> None:
@@ -534,7 +547,7 @@ class TUIApp:
 
     def _status_toolbar(self) -> FormattedText:
         terminal_width = get_app().output.get_size().columns
-        width = max(1, terminal_width - 4)
+        width = content_width(terminal_width)
         usage = dict(self._usage)
         usage.setdefault(
             "cache_read_input_tokens",
@@ -580,7 +593,12 @@ class TUIApp:
             if self._full_screen_active():
                 self._append_transcript(renderable)
             else:
-                self.console.print(Padding(renderable, (0, 2, 0, 2)))
+                self.console.print(
+                    Padding(
+                        renderable,
+                        (0, CONTENT_MARGIN, 0, CONTENT_MARGIN),
+                    )
+                )
 
     def _print_unit(self, renderable: RenderableType | None) -> None:
         self._presenter.print_unit(renderable)
@@ -949,9 +967,9 @@ class TUIApp:
         )
         padded = VSplit(
             [
-                Window(width=2, char=" "),
+                Window(width=CONTENT_MARGIN, char=" "),
                 content,
-                Window(width=2, char=" "),
+                Window(width=CONTENT_MARGIN, char=" "),
             ],
         )
         root.children[:] = [
@@ -1028,14 +1046,20 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             previews = manager.list_session_previews(limit=RECENT_SESSION_LIMIT)
             if not previews:
                 raise SessionError("no prior zeta session found")
-            print("recent zeta sessions:")
+            width = content_width(get_terminal_size(fallback=(80, 24)).columns)
+            print(_resume_picker_line("recent zeta sessions:", width))
             for index, preview in enumerate(previews, start=1):
                 print(
-                    f"{index}. {preview.updated_at} "
-                    f"{preview.session_id[:8]} {preview.preview}"
+                    _resume_picker_line(
+                        f"{index}. {preview.updated_at} "
+                        f"{preview.session_id[:8]} {preview.preview}",
+                        width,
+                    )
                 )
             try:
-                choice = input("select a session: ").strip()
+                choice = input(
+                    _resume_picker_line("select a session:", width - 1) + " "
+                ).strip()
                 selected = int(choice)
                 if not 1 <= selected <= len(previews):
                     raise ValueError("selection out of range")
