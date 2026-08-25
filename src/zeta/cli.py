@@ -41,7 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="resume the most recent session in this directory",
     )
-    session_group.add_argument("--resume", help="resume a session by id")
+    session_group.add_argument(
+        "--resume",
+        nargs="?",
+        const="",
+        help="resume a session by id, or choose one from the recent-session picker",
+    )
     parser.add_argument(
         "--force-provider",
         action="store_true",

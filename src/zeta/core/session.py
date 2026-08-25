@@ -6,6 +6,8 @@ import copy
 import fcntl
 import json
 import os
+import re
+import unicodedata
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -13,6 +15,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
+
+from rich.cells import cell_len
 
 from .store import ConversationStore
 
@@ -22,6 +26,53 @@ META_VERSION = 1
 
 class SessionError(ValueError):
     """Raised when a session cannot be created or resumed."""
+
+
+@dataclass(frozen=True, slots=True)
+class SessionPreview:
+    """A session row suitable for the interactive resume picker."""
+
+    session_id: str
+    updated_at: str
+    preview: str
+
+
+_ANSI_SEQUENCE = re.compile(
+    r"(?:\x1b\[[0-?]*[ -/]*[@-~]|\x9b[0-?]*[ -/]*[@-~])"
+    r"|(?:\x1b\][^\x07]*(?:\x07|\x1b\\)|\x9d[^\x07]*(?:\x07|\x1b\\))"
+    r"|\x1b[ -/]*[@-~]"
+)
+_PREVIEW_CODEPOINT_LIMIT = 512
+_PREVIEW_STRIPPED_CHARACTERS = frozenset(
+    chr(codepoint)
+    for start, end in ((0x200B, 0x200D), (0x202A, 0x202E), (0x2066, 0x2069))
+    for codepoint in range(start, end + 1)
+) | {"\ufeff"}
+
+
+def _preview_text(value: str, *, limit: int = 80) -> str:
+    clean = _ANSI_SEQUENCE.sub("", value)
+    clean = "".join(
+        character
+        for character in clean
+        if (
+            character not in _PREVIEW_STRIPPED_CHARACTERS
+            and (character in "\t\n\r" or unicodedata.category(character) != "Cc")
+        )
+    )
+    clean = clean[:_PREVIEW_CODEPOINT_LIMIT]
+    clean = " ".join(clean.split())
+    if cell_len(clean) <= limit:
+        return clean
+    suffix = "..."
+    available = max(0, limit - cell_len(suffix))
+    result = ""
+    for character in clean:
+        candidate = result + character
+        if cell_len(candidate) > available:
+            break
+        result = candidate
+    return result + suffix
 
 
 def env_home() -> Path:
@@ -229,6 +280,43 @@ class SessionManager:
             sessions.append(self._read(session_path.name))
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
 
+    def list_session_previews(self, *, limit: int = 20) -> list[SessionPreview]:
+        """Return recent sessions with safe, single-line first-message previews."""
+
+        sessions = self.list_sessions()
+        sessions = sessions[:limit]
+        previews: list[SessionPreview] = []
+        for metadata in sessions:
+            opened = self.open(metadata.session_id)
+            first_message = ""
+            for entry in opened.store.replay():
+                if entry.type != "message":
+                    continue
+                message = entry.data.get("message")
+                if not isinstance(message, dict):
+                    continue
+                if message.get("role") != "user":
+                    continue
+                parts = []
+                for block in message.get("content", []):
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") in {
+                        "text",
+                        "thinking",
+                    } and isinstance(block.get("text"), str):
+                        parts.append(block["text"])
+                first_message = "".join(parts)
+                break
+            previews.append(
+                SessionPreview(
+                    session_id=metadata.session_id,
+                    updated_at=metadata.updated_at,
+                    preview=_preview_text(first_message) or "(no user message)",
+                )
+            )
+        return previews
+
     def find_most_recent(self, *, cwd: str | Path | None = None) -> SessionMetadata:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         matches = [item for item in self.list_sessions() if item.cwd == resolved_cwd]
@@ -392,6 +480,7 @@ __all__ = [
     "SessionError",
     "SessionManager",
     "SessionMetadata",
+    "SessionPreview",
     "env_home",
     "find_most_recent",
     "list_sessions",

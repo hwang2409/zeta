@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -29,8 +29,13 @@ class SlashStatus:
 class SlashSession(Protocol):
     def slash_status(self) -> SlashStatus: ...
 
+    def slash_model(self, args: str) -> str: ...
 
-SlashHandler = Callable[[SlashSession, str], str]
+    async def slash_compact(self) -> str: ...
+
+
+SlashResult = str | Awaitable[str]
+SlashHandler = Callable[[SlashSession, str], SlashResult]
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +45,7 @@ class SlashCommand:
     name: str
     handler: SlashHandler
 
-    def run(self, session: SlashSession, args: str) -> str:
+    def run(self, session: SlashSession, args: str) -> SlashResult:
         return self.handler(session, args)
 
 
@@ -57,7 +62,7 @@ class SlashCommandRegistry:
             raise ValueError(f"slash command already registered: {command.name}")
         self._commands[command.name] = command
 
-    def dispatch(self, session: SlashSession, value: str) -> str | None:
+    def _dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command from the first line, or pass the input through."""
 
         first_line = value.split("\n", 1)[0]
@@ -70,6 +75,21 @@ class SlashCommandRegistry:
         if command is None:
             return None
         return command.run(session, parts[1] if len(parts) == 2 else "")
+
+    def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
+        """Run a known command, returning an awaitable for async commands."""
+
+        return self._dispatch(session, value)
+
+    async def dispatch_async(self, session: SlashSession, value: str) -> str | None:
+        """Run a known command, awaiting it when the command is asynchronous."""
+
+        result = self._dispatch(session, value)
+        if result is None:
+            return None
+        if isinstance(result, str):
+            return result
+        return await result
 
     @staticmethod
     def input_for_model(value: str) -> str:
@@ -120,9 +140,20 @@ def _run_status(session: SlashSession, args: str) -> str:
     return _format_status(session.slash_status())
 
 
+def _run_model(session: SlashSession, args: str) -> str:
+    return session.slash_model(args.strip())
+
+
+async def _run_compact(session: SlashSession, args: str) -> str:
+    del args
+    return await session.slash_compact()
+
+
 def create_slash_registry() -> SlashCommandRegistry:
     """Create the built-in registry."""
 
     registry = SlashCommandRegistry()
     registry.register(SlashCommand("status", _run_status))
+    registry.register(SlashCommand("model", _run_model))
+    registry.register(SlashCommand("compact", _run_compact))
     return registry
