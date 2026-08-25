@@ -61,6 +61,7 @@ from zeta.types import (
     ErrorInfo,
     Message,
     MessageRole,
+    RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
     TextContent,
@@ -930,6 +931,19 @@ def test_thought_collapses_to_first_sentence_and_keeps_duration() -> None:
 
     assert rendered.plain == "✱ thought · Plan first. · 2.7s"
     assert "italic" in str(rendered.style)
+
+
+def test_redacted_thought_renders_as_collapsed_line_with_duration() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=RedactedThinkingContent("opaque"),
+            data={"duration": 1.25},
+        )
+    )
+
+    assert isinstance(rendered, Text)
+    assert rendered.plain == "✱ thought · redacted · 1.2s"
 
 
 @pytest.mark.parametrize(

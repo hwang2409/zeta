@@ -49,6 +49,9 @@ API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_REDIRECT_URI = "http://localhost:53692/callback"
 OAUTH_BETA = "oauth-2025-04-20"
 CLAUDE_CODE_BETA = "claude-code-20250219"
+INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14"
+DEFAULT_MAX_TOKENS = 16_384
+DEFAULT_THINKING_BUDGET = 8_192
 OAUTH_SCOPES = (
     "org:create_api_key user:profile user:inference user:sessions:claude_code "
     "user:mcp_servers user:file_upload"
@@ -330,13 +333,16 @@ class AnthropicBackend(CompletionBackend):
         self,
         *,
         model: str = "claude-sonnet-4-6",
-        max_tokens: int = 8192,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        thinking_budget: int = DEFAULT_THINKING_BUDGET,
         base_url: str = API_URL,
         token_store: AnthropicCredentialStore | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
+        _validate_thinking_parameters(max_tokens, thinking_budget)
         self.model = model
         self.max_tokens = max_tokens
+        self.thinking_budget = thinking_budget
         self.base_url = base_url.rstrip("/")
         self.token_store = token_store or AnthropicCredentialStore()
         self.client = client
@@ -395,6 +401,7 @@ class AnthropicBackend(CompletionBackend):
                 tool_schemas,
                 model=self.model,
                 max_tokens=self.max_tokens,
+                thinking_budget=self.thinking_budget,
             )
             identity = {
                 "type": "text",
@@ -404,7 +411,9 @@ class AnthropicBackend(CompletionBackend):
             payload["system"] = [identity, *payload.get("system", [])]
             headers = {
                 "accept": "text/event-stream",
-                "anthropic-beta": f"{CLAUDE_CODE_BETA},{OAUTH_BETA}",
+                "anthropic-beta": (
+                    f"{CLAUDE_CODE_BETA},{OAUTH_BETA},{INTERLEAVED_THINKING_BETA}"
+                ),
                 "anthropic-version": "2023-06-01",
                 "authorization": f"Bearer {token}",
                 "content-type": "application/json",
@@ -875,7 +884,9 @@ def build_messages_payload(
     *,
     model: str,
     max_tokens: int,
+    thinking_budget: int = DEFAULT_THINKING_BUDGET,
 ) -> dict[str, Any]:
+    _validate_thinking_parameters(max_tokens, thinking_budget)
     system: list[dict[str, Any]] = []
     wire_messages: list[dict[str, Any]] = []
     for message in messages:
@@ -917,6 +928,7 @@ def build_messages_payload(
     payload: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
+        "thinking": {"type": "enabled", "budget_tokens": thinking_budget},
         "messages": wire_messages,
         "stream": True,
     }
@@ -934,6 +946,13 @@ def build_messages_payload(
                 last_block["cache_control"] = {"type": "ephemeral"}
         break
     return payload
+
+
+def _validate_thinking_parameters(max_tokens: int, thinking_budget: int) -> None:
+    if thinking_budget < 1024:
+        raise ValueError("thinking_budget must be at least 1024 tokens")
+    if thinking_budget >= max_tokens:
+        raise ValueError("max_tokens must exceed thinking_budget")
 
 
 def _wire_tool_schema(schema: ToolSchema) -> dict[str, Any]:
