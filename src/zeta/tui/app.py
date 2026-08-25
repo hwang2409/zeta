@@ -29,7 +29,7 @@ from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.project_context import ProjectContext, discover_repo_root, load_project_context
 from ..core.slash import SlashStatus, create_slash_registry
 from ..loop import AgentLoop
-from ..core.session import SessionError, SessionManager, _preview_text, env_home
+from ..core.session import SessionError, SessionManager, env_home
 from ..providers.anthropic import AnthropicBackend
 from ..providers.anthropic import AnthropicCredentialStore
 from ..providers.codex import CodexBackend
@@ -43,8 +43,9 @@ from ..types import (
     TextContent,
     ThinkingContent,
 )
-from .composer import build_key_bindings, history_for, parse_input
-from .layout import CONTENT_MARGIN, content_width
+from .composer import VimCursorShapeConfig, build_key_bindings, history_for
+from .composer import parse_input, status_formatted_text, vim_state_label
+from .layout import CONTENT_MARGIN, content_width, resume_picker_line
 from .render import (
     MarkdownStream,
     format_status,
@@ -84,9 +85,8 @@ class FullScreenPromptSession(PromptSession[str]):
         self, editing_mode: EditingMode, erase_when_done: bool
     ) -> Application[str]:
         application = super()._create_application(editing_mode, erase_when_done)
-        application.full_screen = True
-        application.renderer.full_screen = True
-        application.erase_when_done = False
+        application.ttimeoutlen, application.timeoutlen, application.cursor = 0.02, 0.5, VimCursorShapeConfig()
+        application.full_screen, application.renderer.full_screen, application.erase_when_done = True, True, False
         return application
 
     def restore_terminal(self) -> None:
@@ -105,10 +105,6 @@ class FullScreenPromptSession(PromptSession[str]):
 
 def _zeta_home() -> Path:
     return env_home()
-
-
-def _resume_picker_line(value: str, width: int) -> str:
-    return " " * CONTENT_MARGIN + _preview_text(value, limit=width)
 
 
 class FakeInteractiveBackend(CompletionBackend):
@@ -214,6 +210,8 @@ class TUIApp:
         approval_policy: ApprovalPolicy | None = None,
         context_files: Sequence[str] = (),
         on_model_change: Callable[[str], None] | None = None,
+        vim_mode: bool = True,
+        on_vim_mode_change: Callable[[bool], None] | None = None,
         model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
     ) -> None:
         self.loop = loop
@@ -244,6 +242,8 @@ class TUIApp:
         self._approval_policy = approval_policy
         self._context_files = tuple(context_files)
         self._on_model_change = on_model_change
+        self.vim_mode = vim_mode
+        self._on_vim_mode_change = on_vim_mode_change
         self._model_catalog_loader = model_catalog_loader or _load_model_catalog
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
@@ -311,6 +311,7 @@ class TUIApp:
                 self.loop.context_assembler.output_tokens_this_session
             ),
             context_files=self._context_files,
+            vim_mode=self.vim_mode,
         )
 
     def slash_model(self, args: str) -> str:
@@ -347,6 +348,26 @@ class TUIApp:
         if catalog_warning is not None:
             return f"model: {model} ({catalog_warning})"
         return f"model: {model}"
+
+    def slash_vim(self, args: str) -> str:
+        requested = args.strip().lower()
+        if not args:
+            return f"vim mode: {'on' if self.vim_mode else 'off'}"
+        if requested not in {"on", "off", "toggle"}:
+            return "vim mode unchanged: use /vim on, /vim off, or /vim toggle"
+        enabled = not self.vim_mode if requested == "toggle" else requested == "on"
+        was_enabled = self.vim_mode
+        if self._on_vim_mode_change is not None:
+            self._on_vim_mode_change(enabled)
+        self.vim_mode = enabled
+        if (session := self._active_session or self._session) is not None:
+            if was_enabled and not enabled:
+                session.app.output.reset_cursor_shape()
+                session.app.output.flush()
+            session.editing_mode = EditingMode.VI if enabled else EditingMode.EMACS
+            session.app.vi_state.reset()
+        self._invalidate_prompt()
+        return f"vim mode: {'on' if self.vim_mode else 'off'}"
 
     def _start_model_catalog_load(self) -> None:
         if self._model_catalog_task is not None:
@@ -516,6 +537,7 @@ class TUIApp:
             history=history_for(self._history_path),
             key_bindings=bindings,
             multiline=True,
+            editing_mode=EditingMode.VI if self.vim_mode else EditingMode.EMACS,
             bottom_toolbar=self._status_toolbar,
             erase_when_done=True,
             show_frame=True,
@@ -570,12 +592,9 @@ class TUIApp:
             spinner_frame=self._spinner_frame,
             spinner_active=self._spinner_active,
             model_window=self.loop.context_assembler.token_budget,
+            vim_state=vim_state_label(self.vim_mode),
         )
-        return FormattedText(
-            [
-                ("class:status-bar", status.plain),
-            ]
-        )
+        return status_formatted_text(status)
 
     def _full_screen_active(self) -> bool:
         return isinstance(self._active_session, FullScreenPromptSession)
@@ -592,12 +611,7 @@ class TUIApp:
             if self._full_screen_active():
                 self._append_transcript(renderable)
             else:
-                self.console.print(
-                    Padding(
-                        renderable,
-                        (0, CONTENT_MARGIN, 0, CONTENT_MARGIN),
-                    )
-                )
+                self.console.print(Padding(renderable, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN)))
 
     def _print_unit(self, renderable: RenderableType | None) -> None:
         self._presenter.print_unit(renderable)
@@ -961,16 +975,8 @@ class TUIApp:
                 ),
             ],
         )
-        padded = VSplit(
-            [
-                Window(width=CONTENT_MARGIN, char=" "),
-                content,
-                Window(width=CONTENT_MARGIN, char=" "),
-            ],
-        )
-        root.children[:] = [
-            padded,
-        ]
+        padded = VSplit([Window(width=CONTENT_MARGIN, char=" "), content, Window(width=CONTENT_MARGIN, char=" ")])
+        root.children[:] = [padded]
 
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run the alternate-screen app until Ctrl-D or an exit request."""
@@ -1043,19 +1049,11 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             if not previews:
                 raise SessionError("no prior zeta session found")
             width = content_width(get_terminal_size(fallback=(80, 24)).columns)
-            print(_resume_picker_line("recent zeta sessions:", width))
+            print(resume_picker_line("recent zeta sessions:", width))
             for index, preview in enumerate(previews, start=1):
-                print(
-                    _resume_picker_line(
-                        f"{index}. {preview.updated_at} "
-                        f"{preview.session_id[:8]} {preview.preview}",
-                        width,
-                    )
-                )
+                print(resume_picker_line(f"{index}. {preview.updated_at} {preview.session_id[:8]} {preview.preview}", width))
             try:
-                choice = input(
-                    _resume_picker_line("select a session:", width - 1) + " "
-                ).strip()
+                choice = input(resume_picker_line("select a session:", width - 1) + " ").strip()
                 selected = int(choice)
                 if not 1 <= selected <= len(previews):
                     raise ValueError("selection out of range")
@@ -1180,6 +1178,8 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         approval_policy=approval_policy,
         context_files=[str(path) for path in project_context.files],
         on_model_change=model_changed,
+        vim_mode=metadata.vim_mode,
+        on_vim_mode_change=lambda enabled: manager.record_vim_mode(metadata, enabled=enabled),
     )
 
 

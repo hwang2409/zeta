@@ -94,6 +94,7 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
     assert f"session_id: {store.session_id}" in output
     assert f"provider: {app.provider}" in output
     assert f"model: {app.model}" in output
+    assert "vim_mode: on" in output
     assert f"retained_tail: {loop.context_assembler.retained_tail}" in output
     assert (
         "tokens_used_this_session: "

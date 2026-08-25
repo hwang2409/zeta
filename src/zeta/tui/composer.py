@@ -4,10 +4,83 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
+from prompt_toolkit.application import Application, get_app
+from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
+from prompt_toolkit.enums import EditingMode
+from prompt_toolkit.filters import Condition, vi_insert_mode
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
+from prompt_toolkit.key_binding.vi_state import InputMode
+from prompt_toolkit.keys import Keys
+from rich.text import Text
+
+
+SHIFT_ENTER_SEQUENCES = frozenset(
+    {
+        "\x1b[27;2;13~",
+        "\x1b[27;5;13~",
+        "\x1b[27;6;13~",
+    }
+)
+
+
+class VimCursorShapeConfig(CursorShapeConfig):
+    """Use a beam in insert mode and a block in every other vi mode."""
+
+    def get_cursor_shape(self, application: Application[Any]) -> CursorShape:
+        if getattr(application, "editing_mode", None) is not EditingMode.VI:
+            return CursorShape._NEVER_CHANGE
+        if getattr(application.vi_state, "input_mode", None) in {
+            InputMode.INSERT,
+            InputMode.INSERT_MULTIPLE,
+        }:
+            return CursorShape.BEAM
+        return CursorShape.BLOCK
+
+
+def vim_state_label(vim_mode: bool) -> str | None:
+    """Return the native prompt-toolkit vi state for the footer."""
+
+    if not vim_mode:
+        return None
+    try:
+        app = get_app()
+    except RuntimeError:
+        return "INSERT"
+    if getattr(app, "editing_mode", EditingMode.VI) is not EditingMode.VI:
+        return None
+    buffer = getattr(app, "current_buffer", None)
+    if buffer is not None and buffer.selection_state is not None:
+        return "VISUAL"
+    mode = getattr(getattr(app, "vi_state", None), "input_mode", None)
+    return "NORMAL" if mode is InputMode.NAVIGATION else "INSERT"
+
+
+def status_formatted_text(status: Text) -> FormattedText:
+    """Convert Rich status spans into prompt-toolkit fragments."""
+
+    fragments: list[tuple[str, str]] = []
+    boundaries = {0, len(status.plain)}
+    for span in status.spans:
+        boundaries.update((span.start, span.end))
+    ordered_boundaries = sorted(boundaries)
+    for start, end in zip(ordered_boundaries, ordered_boundaries[1:]):
+        styles = ["class:status-bar"]
+        if status.style:
+            styles.append(str(status.style))
+        styles.extend(
+            str(span.style)
+            for span in status.spans
+            if span.start <= start and end <= span.end
+        )
+        fragments.append((" ".join(styles), status.plain[start:end]))
+    return FormattedText(fragments)
+
 
 def parse_input(value: str) -> str | None:
     """Return a usable user turn, or None for blank input."""
@@ -27,9 +100,39 @@ def build_key_bindings(
     """Build the small key map used by the full-screen composer."""
 
     bindings = KeyBindings()
+    escape_chord_pending = False
+    escape_chord_cursor_position: int | None = None
+
+    @Condition
+    def vi_insert_history_navigation() -> bool:
+        app = get_app()
+        buffer = app.current_buffer
+        return vi_insert_mode() and (
+            not buffer.text
+            or buffer.working_index < len(buffer._working_lines) - 1
+        )
+
+    @Condition
+    def full_screen_mode() -> bool:
+        return get_app().full_screen
+
+    def insert_newline(event: KeyPressEvent) -> None:
+        event.current_buffer.insert_text("\n")
 
     @bindings.add("enter")
     def submit(event: KeyPressEvent) -> None:
+        nonlocal escape_chord_cursor_position, escape_chord_pending
+        if escape_chord_pending:
+            escape_chord_pending = False
+            if escape_chord_cursor_position is not None:
+                event.current_buffer.cursor_position = escape_chord_cursor_position
+            escape_chord_cursor_position = None
+            event.app.vi_state.input_mode = InputMode.INSERT
+            insert_newline(event)
+            return
+        if event.data in SHIFT_ENTER_SEQUENCES:
+            insert_newline(event)
+            return
         if on_submit is not None:
             event.current_buffer.append_to_history()
             on_submit(event.current_buffer.text)
@@ -39,7 +142,37 @@ def build_key_bindings(
 
     @bindings.add("c-j")
     def newline(event: KeyPressEvent) -> None:
-        event.current_buffer.insert_text("\n")
+        insert_newline(event)
+
+    @bindings.add("escape", "enter", filter=~full_screen_mode)
+    def alt_enter(event: KeyPressEvent) -> None:
+        insert_newline(event)
+
+    native_escape = next(
+        binding
+        for binding in load_vi_bindings().bindings
+        if binding.keys == (Keys.Escape,)
+    )
+
+    bindings.add(Keys.Escape, filter=native_escape.filter & ~full_screen_mode)(native_escape)
+
+    @bindings.add(Keys.Escape, filter=native_escape.filter & full_screen_mode, eager=True)
+    def escape(event: KeyPressEvent) -> None:
+        nonlocal escape_chord_cursor_position, escape_chord_pending
+        escape_chord_cursor_position = event.current_buffer.cursor_position
+        native_escape.call(event)
+        next_key = next(iter(event.key_processor.input_queue), None)
+        escape_chord_pending = next_key is not None and next_key.key == Keys.Enter
+        if not escape_chord_pending:
+            escape_chord_cursor_position = None
+
+    @bindings.add("up", filter=vi_insert_history_navigation)
+    def history_up(event: KeyPressEvent) -> None:
+        event.current_buffer.auto_up()
+
+    @bindings.add("down", filter=vi_insert_history_navigation)
+    def history_down(event: KeyPressEvent) -> None:
+        event.current_buffer.auto_down()
 
     @bindings.add("c-c")
     def interrupt(event: KeyPressEvent) -> None:

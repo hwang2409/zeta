@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import set_app
+from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
@@ -30,11 +31,12 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
+from zeta.core.approval import ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.tools import ToolStreamPublisher
-from zeta.tui.app import TUIApp
+from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.composer import (
     build_key_bindings,
     history_for,
@@ -266,6 +268,16 @@ def app_session(app: TUIApp, pipe: PipeInput) -> PromptSession[str]:
         ),
         multiline=True,
     )
+
+
+def fast_vi_timeouts(session: PromptSession[str]) -> None:
+    session.app.ttimeoutlen = 0.02
+    session.app.timeoutlen = 0.02
+
+
+def paced_vi_timeouts(session: PromptSession[str]) -> None:
+    session.app.ttimeoutlen = 0.02
+    session.app.timeoutlen = 0.5
 
 
 def renderable_plain(renderable: object) -> str:
@@ -1346,11 +1358,141 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
         assert process.wait(timeout=5) == 0
         assert b"\x1b[?1049h" in output
         assert b"\x1b[?1049l" in output
+        assert b"\x1b[0 q" in output
         assert output.count(b"\x1b[?1049h") == 1
     finally:
         if process.poll() is None:
             process.kill()
             process.wait()
+        os.close(master_fd)
+
+
+def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
+    tmp_path: Path,
+) -> None:
+    master_fd, slave_fd = pty.openpty()
+    env = os.environ.copy()
+    env["ZETA_HOME"] = str(tmp_path / "zeta-home")
+    env["TERM"] = "xterm-256color"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'fake']))",
+        ],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    output = bytearray()
+
+    def read_until(needle: bytes, start: int = 0) -> None:
+        deadline = time.monotonic() + 5
+        while needle not in output[start:] and time.monotonic() < deadline:
+            ready, _, _ = select.select(
+                [master_fd],
+                [],
+                [],
+                max(0, deadline - time.monotonic()),
+            )
+            if ready:
+                try:
+                    output.extend(os.read(master_fd, 4096))
+                except OSError:
+                    break
+        assert needle in output[start:]
+
+    try:
+        read_until(b" > ")
+        read_until(b"\x1b[6 q")
+
+        os.write(master_fd, b"\x1b")
+        read_until(b"\x1b[2 q")
+
+        start = len(output)
+        os.write(master_fd, b"i")
+        read_until(b"\x1b[6 q", start)
+        time.sleep(0.1)
+
+        start = len(output)
+        os.write(master_fd, b"/vim off\r")
+        read_until(b"vim mode: off", start)
+        read_until(b"\x1b[0 q", start)
+
+        os.write(master_fd, b"\x04")
+        deadline = time.monotonic() + 5
+        while process.poll() is None and time.monotonic() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 0.1)
+            if ready:
+                try:
+                    output.extend(os.read(master_fd, 4096))
+                except OSError:
+                    break
+        assert process.wait(timeout=5) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master_fd)
+
+
+def test_main_pty_normal_command_then_queued_enter_submits(
+    tmp_path: Path,
+) -> None:
+    master_fd, slave_fd = pty.openpty()
+    env = os.environ.copy()
+    env["ZETA_HOME"] = str(tmp_path / "zeta-home")
+    env["TERM"] = "xterm-256color"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'fake']))",
+        ],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    output = bytearray()
+
+    def read_until(needle: bytes, start: int = 0) -> None:
+        deadline = time.monotonic() + 5
+        while needle not in output[start:] and time.monotonic() < deadline:
+            ready, _, _ = select.select(
+                [master_fd],
+                [],
+                [],
+                max(0, deadline - time.monotonic()),
+            )
+            if ready:
+                try:
+                    output.extend(os.read(master_fd, 4096))
+                except OSError:
+                    break
+        assert needle in output[start:]
+
+    try:
+        read_until(b" > ")
+        os.write(master_fd, b"abc")
+        read_until(b"abc")
+
+        start = len(output)
+        os.write(master_fd, b"\x1bx\r")
+        read_until(b"you said: ab", start)
+    finally:
+        if process.poll() is None:
+            os.write(master_fd, b"\x04")
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
         os.close(master_fd)
 
 
@@ -1412,6 +1554,31 @@ def test_footer_builder_formats_context_usage_and_hints() -> None:
     assert footer.plain == (
         "idle  18.6K (9%)  /status · ctrl+c interrupt · ctrl+d quit · abcdef12"
     )
+
+
+def test_footer_shows_vim_state_and_degrades_as_a_whole_segment() -> None:
+    footer = format_status(
+        "fake",
+        "offline",
+        "idle",
+        token_count=14,
+        session_id="abcdef12",
+        width=80,
+        vim_state="NORMAL",
+    )
+    assert footer.plain.startswith("NORMAL  idle")
+
+    narrow = format_status(
+        "fake",
+        "offline",
+        "idle",
+        token_count=14,
+        session_id="abcdef12",
+        width=30,
+        vim_state="NORMAL",
+    )
+    assert "NORMAL" not in narrow.plain
+    assert "idle" in narrow.plain
 
 
 def test_status_bar_includes_session_context_and_streaming_indicator() -> None:
@@ -1814,6 +1981,32 @@ def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
     assert "5 (0%)" in plain
     assert "/status" in plain
     assert "\n" not in plain
+
+
+def test_status_toolbar_preserves_vim_state_style(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    output = SimpleNamespace(get_size=lambda: Size(rows=24, columns=80))
+    monkeypatch.setattr(
+        "zeta.tui.app.get_app",
+        lambda: SimpleNamespace(output=output),
+    )
+    monkeypatch.setattr(
+        "zeta.tui.composer.get_app",
+        lambda: SimpleNamespace(output=output),
+    )
+
+    toolbar = app._status_toolbar()
+
+    assert any(
+        text == "INSERT" and "bold" in style and "#ff8a1f" in style
+        for style, text in toolbar
+    )
 
 
 def test_status_toolbar_does_not_advance_spinner_frame(tmp_path: Path) -> None:
@@ -2276,6 +2469,414 @@ async def test_composer_submits_enter_and_keeps_ctrl_j_multiline() -> None:
 
 
 @pytest.mark.asyncio
+async def test_vi_composer_motions_move_and_delete_the_current_line() -> None:
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+            ),
+            multiline=True,
+        )
+        fast_vi_timeouts(session)
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("hello")
+        await wait_until(lambda: session.app.current_buffer.text == "hello")
+        pipe.send_text("\x1b")
+        await wait_until(
+            lambda: session.app.vi_state.input_mode.value == "vi-navigation"
+        )
+        pipe.send_text("0")
+        await wait_until(lambda: session.app.current_buffer.cursor_position == 0)
+        pipe.send_text("$")
+        await wait_until(lambda: session.app.current_buffer.cursor_position == 4)
+        pipe.send_text("dd")
+        await wait_until(lambda: session.app.current_buffer.text == "")
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_vi_composer_normal_enter_submits_without_losing_buffer() -> None:
+    submitted: list[str] = []
+    with create_pipe_input() as pipe:
+        session: PromptSession[str] | None = None
+
+        def submit(value: str) -> None:
+            submitted.append(value)
+            assert session is not None
+            session.app.exit()
+
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_submit=submit,
+            ),
+            multiline=True,
+        )
+        fast_vi_timeouts(session)
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("keep this buffer")
+        await wait_until(lambda: session is not None and session.app.current_buffer.text == "keep this buffer")
+        pipe.send_text("\x1b")
+        await wait_until(
+            lambda: session is not None
+            and session.app.vi_state.input_mode.value == "vi-navigation"
+        )
+        pipe.send_text("\r")
+        await task
+
+    assert submitted == ["keep this buffer"]
+
+
+@pytest.mark.asyncio
+async def test_full_screen_vi_escape_enter_chord_keeps_insert_mode() -> None:
+    submitted: list[str] = []
+    with create_pipe_input() as pipe:
+        session: FullScreenPromptSession | None = None
+
+        def submit(value: str) -> None:
+            submitted.append(value)
+            assert session is not None
+            session.app.exit()
+
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_submit=submit,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("line one\x1b\rline two\r")
+        await task
+
+    assert submitted == ["line one\nline two"]
+
+
+@pytest.mark.asyncio
+async def test_full_screen_vi_escape_enters_normal_mode_with_low_latency() -> None:
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+            ),
+            multiline=True,
+        )
+        assert session.app.ttimeoutlen <= 0.1
+        assert session.app.timeoutlen >= 0.5
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        started = time.monotonic()
+        pipe.send_text("\x1b")
+        await wait_until(
+            lambda: session.app.vi_state.input_mode.value == "vi-navigation"
+        )
+        elapsed = time.monotonic() - started
+        session.app.exit()
+        await task
+
+    assert elapsed < 0.1
+
+
+@pytest.mark.asyncio
+async def test_vi_composer_paced_dd_and_gg_commands() -> None:
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+            ),
+            multiline=True,
+        )
+        paced_vi_timeouts(session)
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("first line\nsecond line")
+        await wait_until(lambda: session.app.current_buffer.text == "first line\nsecond line")
+        pipe.send_text("\x1b")
+        await wait_until(
+            lambda: session.app.vi_state.input_mode.value == "vi-navigation"
+        )
+        pipe.send_text("d")
+        await asyncio.sleep(0.1)
+        pipe.send_text("d")
+        await wait_until(lambda: session.app.current_buffer.text == "first line")
+        pipe.send_text("g")
+        await asyncio.sleep(0.1)
+        pipe.send_text("g")
+        await wait_until(lambda: session.app.current_buffer.cursor_position == 0)
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_vi_composer_ctrl_c_interrupts_in_insert_and_normal_modes() -> None:
+    interrupts: list[None] = []
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: interrupts.append(None),
+                on_exit=lambda: None,
+            ),
+            multiline=True,
+        )
+        fast_vi_timeouts(session)
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("draft")
+        await wait_until(lambda: session.app.current_buffer.text == "draft")
+        pipe.send_text("\x03")
+        await wait_until(lambda: len(interrupts) == 1)
+        assert session.app.current_buffer.text == ""
+        pipe.send_text("draft")
+        await wait_until(lambda: session.app.current_buffer.text == "draft")
+        pipe.send_text("\x1b")
+        await wait_until(
+            lambda: session.app.vi_state.input_mode.value == "vi-navigation"
+        )
+        pipe.send_text("\x03")
+        await wait_until(lambda: len(interrupts) == 2)
+        assert session.app.current_buffer.text == ""
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_vi_composer_paste_in_insert_mode_and_wrapped_multiline_submission() -> None:
+    submitted: list[str] = []
+    long_line = "wrapped " + "x" * 160
+    with create_pipe_input() as pipe:
+        session: PromptSession[str] | None = None
+
+        def submit(value: str) -> None:
+            submitted.append(value)
+            assert session is not None
+            session.app.exit()
+
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_submit=submit,
+            ),
+            multiline=True,
+        )
+        fast_vi_timeouts(session)
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("\x1b[200~pasted line 1\npasted line 2\x1b[201~")
+        await wait_until(
+            lambda: session is not None
+            and session.app.current_buffer.text == "pasted line 1\npasted line 2"
+        )
+        pipe.send_text("\x1b[200~\n" + long_line + "\x1b[201~\r")
+        await task
+
+    assert submitted == ["pasted line 1\npasted line 2\n" + long_line]
+
+
+@pytest.mark.asyncio
+async def test_vi_composer_history_down_returns_to_empty_buffer(tmp_path: Path) -> None:
+    history = history_for(tmp_path / "history")
+    submitted: list[str] = []
+
+    with create_pipe_input() as pipe:
+        session: PromptSession[str] | None = None
+
+        def submit(value: str) -> None:
+            submitted.append(value)
+            assert session is not None
+            session.app.exit()
+
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            history=history,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_submit=submit,
+            ),
+            multiline=True,
+        )
+        fast_vi_timeouts(session)
+        first = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("first\r")
+        await first
+        second = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("second\r")
+        await second
+        third = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("\x1b[A")
+        await wait_until(lambda: session.app.current_buffer.text == "second")
+        pipe.send_text("\x1b[B")
+        await wait_until(lambda: session.app.current_buffer.text == "")
+        session.app.exit()
+        await third
+
+    assert submitted == ["first", "second"]
+
+
+def test_vim_slash_command_toggles_both_directions(tmp_path: Path) -> None:
+    session = PromptSession()
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        session=session,
+        vim_mode=True,
+    )
+    app._invalidate_prompt = lambda: None
+    session.editing_mode = EditingMode.VI
+
+    assert app.slash_vim("off") == "vim mode: off"
+    assert app.vim_mode is False
+    assert session.editing_mode is EditingMode.EMACS
+    assert app.slash_vim("on") == "vim mode: on"
+    assert app.vim_mode is True
+    assert session.editing_mode is EditingMode.VI
+
+
+@pytest.mark.asyncio
+async def test_vi_composer_can_show_approval_prompt_while_in_normal_mode(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("approval-1", "danger", {})
+    store = ConversationStore(tmp_path / "sessions")
+    policy = ApprovalPolicy(default="ask", store=store)
+    app = TUIApp(
+        AgentLoop(
+            BlockingToolBackend(call),
+            store,
+            tools={"danger": lambda _: "done"},
+            approval_policy=policy,
+        ),
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        fast_vi_timeouts(session)
+        run_task = asyncio.create_task(app.run(session))
+        pipe.send_text("run\r")
+        await wait_until(lambda: bool(app.pending_approvals))
+        pipe.send_text("\x1b")
+        await wait_until(
+            lambda: session.app.vi_state.input_mode.value == "vi-navigation"
+        )
+        assert app.pending_approvals[0].request_id == "approval-1"
+        pipe.send_text("\x04")
+        await run_task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("newline", ["\x1b[27;2;13~", "\x1b\r", "\x0a"])
+async def test_vi_composer_modified_enter_inserts_newline(newline: str) -> None:
+    with create_pipe_input() as pipe:
+        session: PromptSession[str] | None = None
+        submitted: list[str] = []
+
+        def submit(value: str) -> None:
+            submitted.append(value)
+            assert session is not None
+            session.app.exit()
+
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_submit=submit,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text(f"line one{newline}line two\r")
+        await task
+
+    assert submitted == ["line one\nline two"]
+
+
+@pytest.mark.asyncio
+async def test_vi_composer_escape_and_insert_update_native_state() -> None:
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("\x1b")
+        for _ in range(300):
+            if session.app.vi_state.input_mode.value == "vi-navigation":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("vi escape did not enter navigation mode")
+        pipe.send_text("i")
+        for _ in range(100):
+            if session.app.vi_state.input_mode.value == "vi-insert":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("vi insert key did not enter insert mode")
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
 async def test_composer_submit_writes_file_history_and_up_replays_it(
     tmp_path: Path,
 ) -> None:
@@ -2328,6 +2929,46 @@ async def test_composer_submit_writes_file_history_and_up_replays_it(
         await asyncio.sleep(0)
         pipe.send_text("\x1b[A\r")
         await second_task
+
+    assert submitted == ["remember me", "remember me"]
+
+
+@pytest.mark.asyncio
+async def test_vi_composer_history_up_works_from_insert_mode_on_empty_buffer(
+    tmp_path: Path,
+) -> None:
+    history = history_for(tmp_path / "history")
+    submitted: list[str] = []
+
+    with create_pipe_input() as pipe:
+        session: PromptSession[str] | None = None
+
+        def submit(value: str) -> None:
+            submitted.append(value)
+            assert session is not None
+            session.app.exit()
+
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            history=history,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_submit=submit,
+            ),
+            multiline=True,
+        )
+        first = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("remember me\r")
+        await first
+
+        second = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("\x1b[A\r")
+        await second
 
     assert submitted == ["remember me", "remember me"]
 
