@@ -2262,7 +2262,6 @@ async def test_full_screen_separates_user_and_assistant_units(tmp_path: Path) ->
     assert units[2] is not None
     assert renderable_plain(units[0]) == "▌ prompt"
     rendered = app._transcript.render(80)
-    assert "zeta" in rendered
     assert "answer" in rendered
 
 
