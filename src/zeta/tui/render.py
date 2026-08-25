@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from rich.cells import cell_len
-from rich.console import RenderableType
+from rich.columns import Columns
+from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
@@ -81,8 +83,23 @@ def _truncate(value: str, limit: int) -> str:
 
 
 def _arguments(arguments: dict[str, Any]) -> str:
-    encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
-    return _truncate(encoded, MAX_ARGUMENTS)
+    parts: list[str] = []
+    for key in sorted(arguments):
+        value = arguments[key]
+        if isinstance(value, str):
+            rendered = shlex.quote(value)
+        else:
+            try:
+                rendered = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError):
+                rendered = str(value)
+        parts.append(f"{key}={rendered}")
+    return _truncate(" ".join(parts), MAX_ARGUMENTS)
 
 
 def _tool_content(event: StreamEvent) -> str:
@@ -119,14 +136,34 @@ def tool_render_mode(event: StreamEvent) -> ToolRenderMode:
     return "card"
 
 
-def _command(arguments: dict[str, Any]) -> str:
-    value = arguments.get("cmd", arguments.get("command", ""))
-    return str(value) if value else _arguments(arguments)
+def _command(arguments: dict[str, Any]) -> str | None:
+    for key in ("command", "cmd"):
+        if key in arguments:
+            return str(arguments[key])
+    return None
 
 
-def _tool_header(call: ToolCall) -> Text:
-    if call.name.lower() == "bash":
-        return Text.assemble(("$ ", COMMAND), (_command(call.arguments), COMMAND))
+def _shell_syntax(command: str) -> Syntax:
+    return Syntax(
+        command,
+        "bash",
+        theme=CODE_THEME,
+        word_wrap=True,
+        background_color="default",
+    )
+
+
+def _tool_header(call: ToolCall) -> RenderableType:
+    command = _command(call.arguments)
+    if command is not None:
+        return Columns(
+            [
+                Text.assemble((call.name, COMMAND)),
+                _shell_syntax(command),
+            ],
+            padding=(0, 1),
+            expand=True,
+        )
     return Text.assemble((call.name, COMMAND), (f" {_arguments(call.arguments)}", DIM))
 
 
@@ -194,7 +231,7 @@ def _tool_receipt(event: StreamEvent) -> Text:
 
 
 def _render_tool_output(content: str, extra_lines: list[str] | None = None) -> Text:
-    lines = content.splitlines() or ["empty"]
+    lines = content.splitlines()
     truncated = len(lines) > MAX_TOOL_LINES
     visible = lines[:MAX_TOOL_LINES]
     if extra_lines:
@@ -210,8 +247,42 @@ def _render_tool_output(content: str, extra_lines: list[str] | None = None) -> T
     return rendered
 
 
-def _tool_body(event: StreamEvent) -> Text:
-    content = _tool_content(event) or "empty"
+def _split_tool_output(
+    content: str,
+) -> tuple[list[tuple[str, str]], str]:
+    """Split standard command receipts without hiding generic tool output."""
+
+    lines = content.splitlines()
+    if not any(
+        line in {"stdout:", "stderr:"} or line.startswith("exit_code:")
+        for line in lines
+    ):
+        return [], content
+
+    sections: list[tuple[str, str]] = []
+    current_label: str | None = None
+    current_lines: list[str] = []
+
+    def flush() -> None:
+        if current_label is not None:
+            sections.append((current_label, "\n".join(current_lines)))
+
+    for line in lines:
+        if line in {"stdout:", "stderr:"}:
+            flush()
+            current_label = line[:-1]
+            current_lines = []
+        elif line.startswith("exit_code:") and current_label is None:
+            continue
+        elif current_label is not None:
+            current_lines.append(line)
+    flush()
+    return sections, ""
+
+
+def _tool_body(event: StreamEvent) -> Text | None:
+    content = _tool_content(event)
+    sections, generic = _split_tool_output(content)
     result = event.tool_result
     extra_lines: list[str] = []
     if result is not None and result.content_blocks:
@@ -222,7 +293,22 @@ def _tool_body(event: StreamEvent) -> Text:
         ]
         if sizes:
             extra_lines.append(f"[truncated; full_size={max(sizes)}]")
-    return _render_tool_output(content, extra_lines)
+    rendered = Text(style=BODY, overflow="ellipsis", no_wrap=True)
+
+    visible_sections = [(label, value) for label, value in sections if value.strip()]
+    if sections:
+        for label, value in visible_sections:
+            if rendered:
+                rendered.append("\n\n")
+            rendered.append(f"{label}:\n", style=DIM)
+            rendered.append_text(_render_tool_output(value, extra_lines))
+            extra_lines = []
+    elif generic.strip():
+        if rendered:
+            rendered.append("\n\n")
+        rendered.append_text(_render_tool_output(generic, extra_lines))
+
+    return rendered if rendered else None
 
 
 def _tool_card(event: StreamEvent, *, running: bool = False) -> Panel:
@@ -239,10 +325,21 @@ def _tool_card(event: StreamEvent, *, running: bool = False) -> Panel:
     )
 
 
-def _tool_panel(call: ToolCall, body: Text, *, error: bool = False) -> Panel:
-    content = Text.assemble(_tool_header(call), "\n", body)
-    content.no_wrap = True
-    content.overflow = "ellipsis"
+def _tool_panel(
+    call: ToolCall,
+    body: Text | None,
+    *,
+    error: bool = False,
+) -> Panel:
+    header = _tool_header(call)
+    if body is None:
+        content: RenderableType = header
+    elif isinstance(header, Text):
+        content = Text.assemble(header, "\n", body)
+        content.no_wrap = True
+        content.overflow = "ellipsis"
+    else:
+        content = Group(header, body)
     return Panel(
         content,
         border_style=ERROR if error else CARD_BORDER,
@@ -255,11 +352,7 @@ def _tool_panel(call: ToolCall, body: Text, *, error: bool = False) -> Panel:
 def render_tool_progress(call: ToolCall, content: str) -> Panel:
     """Render streamed tool output inside the same card surface."""
 
-    body = (
-        Text("running…", style=DIM)
-        if not content
-        else _render_tool_output(content)
-    )
+    body = Text("running…", style=DIM) if not content else _render_tool_output(content)
     return _tool_panel(call, body)
 
 
