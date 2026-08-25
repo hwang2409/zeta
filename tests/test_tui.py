@@ -306,10 +306,28 @@ def paced_vi_timeouts(session: PromptSession[str]) -> None:
 def renderable_plain(renderable: object) -> str:
     if hasattr(renderable, "plain"):
         return renderable.plain
+    if hasattr(renderable, "code"):
+        return renderable.code
+    children = getattr(renderable, "renderables", None)
+    if children is not None:
+        return "\n".join(renderable_plain(child) for child in children)
     inner = getattr(renderable, "renderable", None)
     if inner is not None and hasattr(inner, "plain"):
         return inner.plain
+    if inner is not None:
+        return renderable_plain(inner)
     raise AssertionError(f"renderable has no plain text: {renderable!r}")
+
+
+def renderable_spans(renderable: object) -> list[object]:
+    spans = getattr(renderable, "spans", None)
+    if spans is not None:
+        return list(spans)
+    children = getattr(renderable, "renderables", None)
+    if children is not None:
+        return [span for child in children for span in renderable_spans(child)]
+    inner = getattr(renderable, "renderable", None)
+    return renderable_spans(inner) if inner is not None else []
 
 
 def test_render_event_compacts_tool_call_and_result() -> None:
@@ -841,8 +859,266 @@ def test_render_helpers_use_the_zeta_palette() -> None:
     assert markdown.style == BODY
     assert code.background_color == "default"
     assert start is not None
-    styled_text = start if hasattr(start, "spans") else start.renderable
-    assert any(ACCENT in str(span.style) for span in styled_text.spans)
+    assert any(ACCENT in str(span.style) for span in renderable_spans(start))
+
+
+def test_command_tool_card_highlights_extracted_command() -> None:
+    command = 'python3 -c "import fastapi; print(fastapi.__version__)"'
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("exec-1", "exec", {"command": command}),
+            tool_result=ToolResult("exec-1", ""),
+        )
+    )
+
+    assert rendered is not None
+    header = rendered.renderable
+    assert isinstance(header.renderables[1], Syntax)
+    assert header.renderables[1].code == command
+    plain = renderable_plain(rendered)
+    assert command in plain
+    assert '{"command"' not in plain
+
+
+def test_command_syntax_has_no_background_sgr() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("exec-3", "exec", {"command": "printf hi"}),
+            tool_result=ToolResult("exec-3", ""),
+        )
+    )
+    assert rendered is not None
+
+    output = StringIO()
+    Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        width=100,
+    ).print(rendered.renderable)
+
+    assert "\x1b[48" not in output.getvalue()
+
+
+def test_tool_card_renders_nested_arguments_without_json_escapes() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall(
+                "tool-1",
+                "custom",
+                {
+                    "payload": {"path": "/tmp/a\nb", "quote": "don't"},
+                    "count": 3,
+                },
+            ),
+            tool_result=ToolResult("tool-1", ""),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "count=3" in plain
+    assert "path=/tmp/a b" in plain
+    assert "quote=don't" in plain
+    assert r"\n" not in plain
+
+
+def test_tool_card_omits_empty_output_sections_and_exit_codes() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("bash-1", "bash", {"cmd": "true"}),
+            tool_result=ToolResult(
+                "bash-1",
+                "exit_code: 0\nstdout:\nstderr:\n",
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "true" in plain
+    assert "stdout:" not in plain
+    assert "stderr:" not in plain
+    assert "exit_code:" not in plain
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_tool_card_never_displays_exit_codes(exit_code: int) -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("exec-2", "exec", {"command": "false"}),
+            tool_result=ToolResult(
+                "exec-2",
+                f"exit_code: {exit_code}\nstdout:\nstderr:\nfailed",
+                is_error=exit_code != 0,
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "failed" in plain
+    assert "exit_code:" not in plain
+
+
+def test_tool_card_renders_only_nonempty_output_sections() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("bash-2", "bash", {"cmd": "printf err >&2"}),
+            tool_result=ToolResult(
+                "bash-2",
+                "exit_code: 0\nstdout:\nstderr:\nerr",
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "stderr:\nerr" in plain
+    assert "stdout:" not in plain
+
+
+def test_tool_card_renders_nonempty_result_section_without_misnesting() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-2", "exec", {"command": "run"}),
+            tool_result=ToolResult(
+                "tool-2",
+                "stdout:\nout\nstderr:\nresult:\nanswer",
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "stdout:\nout" in plain
+    assert "result:\nanswer" in plain
+    assert "stderr:" not in plain
+
+
+def test_tool_card_preserves_timeout_preamble_before_stdout() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-5", "exec", {"command": "sleep 1"}),
+            tool_result=ToolResult(
+                "tool-5",
+                "command timed out\nstdout:\npartial output",
+                is_error=True,
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "command timed out" in plain
+    assert "stdout:\npartial output" in plain
+    assert plain.index("command timed out") < plain.index("stdout:")
+
+
+def test_tool_card_preserves_preamble_without_sections() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-6", "exec", {"command": "sleep 1"}),
+            tool_result=ToolResult("tool-6", "command timed out", is_error=True),
+        )
+    )
+
+    assert rendered is not None
+    assert "command timed out" in renderable_plain(rendered)
+
+
+def test_tool_card_preserves_preamble_before_multiple_sections() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-7", "exec", {"command": "run"}),
+            tool_result=ToolResult(
+                "tool-7",
+                "warning\nstdout:\nout\nstderr:\nerr",
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "warning" in plain
+    assert "stdout:\nout" in plain
+    assert "stderr:\nerr" in plain
+    assert plain.index("warning") < plain.index("stdout:") < plain.index("stderr:")
+
+
+def test_tool_card_keeps_trailing_text_in_active_section() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-8", "exec", {"command": "run"}),
+            tool_result=ToolResult(
+                "tool-8",
+                "stdout:\nout\nstderr:\nerr\ntrailing detail",
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "stderr:\nerr\ntrailing detail" in plain
+    assert "result:" not in plain
+
+
+@pytest.mark.parametrize("position", ["leading", "middle", "trailing"])
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_tool_card_omits_exit_codes_in_any_section_position(
+    position: str, exit_code: int
+) -> None:
+    sections = {
+        "leading": f"exit_code: {exit_code}\nstdout:\nout",
+        "middle": f"stdout:\nout\nexit_code: {exit_code}\nstderr:\nerr",
+        "trailing": f"stdout:\nout\nexit_code: {exit_code}",
+    }
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-3", "exec", {"command": "run"}),
+            tool_result=ToolResult("tool-3", sections[position]),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "exit_code:" not in plain
+
+
+@pytest.mark.parametrize("position", ["leading", "middle", "trailing"])
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_tool_card_preserves_unlabeled_output_around_exit_codes(
+    position: str, exit_code: int
+) -> None:
+    outputs = {
+        "leading": f"exit_code: {exit_code}\nbefore\nafter",
+        "middle": f"before\nexit_code: {exit_code}\nafter",
+        "trailing": f"before\nafter\nexit_code: {exit_code}",
+    }
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-4", "exec", {"command": "run"}),
+            tool_result=ToolResult("tool-4", outputs[position]),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "before\nafter" in plain
+    assert "exit_code:" not in plain
 
 
 def test_render_event_error_is_visible() -> None:
