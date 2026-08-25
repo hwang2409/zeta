@@ -161,10 +161,8 @@ def build_key_bindings(
         nonlocal escape_chord_cursor_position, escape_chord_pending
         escape_chord_cursor_position = event.current_buffer.cursor_position
         native_escape.call(event)
-        escape_chord_pending = any(
-            key_press.key == Keys.Enter
-            for key_press in event.key_processor.input_queue
-        )
+        next_key = next(iter(event.key_processor.input_queue), None)
+        escape_chord_pending = next_key is not None and next_key.key == Keys.Enter
         if not escape_chord_pending:
             escape_chord_cursor_position = None
 

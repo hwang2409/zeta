@@ -1439,6 +1439,63 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
         os.close(master_fd)
 
 
+def test_main_pty_normal_command_then_queued_enter_submits(
+    tmp_path: Path,
+) -> None:
+    master_fd, slave_fd = pty.openpty()
+    env = os.environ.copy()
+    env["ZETA_HOME"] = str(tmp_path / "zeta-home")
+    env["TERM"] = "xterm-256color"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'fake']))",
+        ],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    output = bytearray()
+
+    def read_until(needle: bytes, start: int = 0) -> None:
+        deadline = time.monotonic() + 5
+        while needle not in output[start:] and time.monotonic() < deadline:
+            ready, _, _ = select.select(
+                [master_fd],
+                [],
+                [],
+                max(0, deadline - time.monotonic()),
+            )
+            if ready:
+                try:
+                    output.extend(os.read(master_fd, 4096))
+                except OSError:
+                    break
+        assert needle in output[start:]
+
+    try:
+        read_until(b" > ")
+        os.write(master_fd, b"abc")
+        read_until(b"abc")
+
+        start = len(output)
+        os.write(master_fd, b"\x1bx\r")
+        read_until(b"you said: ab", start)
+    finally:
+        if process.poll() is None:
+            os.write(master_fd, b"\x04")
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        os.close(master_fd)
+
+
 def test_main_import_compatibility() -> None:
     from zeta.cli import main as cli_main
     from zeta.tui import main as tui_main
