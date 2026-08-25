@@ -357,6 +357,37 @@ def test_transcript_resize_preserves_anchor_and_tail_reentry() -> None:
     assert transcript.scroll_offset == len(transcript._parsed_lines(20)) - 3
 
 
+def test_transcript_resize_preserves_offset_in_long_wrapped_unit() -> None:
+    source = " ".join(f"token-{index:03}" for index in range(500))
+    transcript = TranscriptWidget()
+    transcript.append(Text(source))
+
+    transcript.create_content(80, 3)
+    transcript.page_up()
+    transcript.create_content(80, 3)
+    wide_line = transcript.lines(80)[transcript.scroll_offset]
+    anchor_offset = source.index(transcript._strip_padding(wide_line))
+
+    transcript.create_content(20, 3)
+    narrow_line = transcript.lines(20)[transcript.scroll_offset]
+    mapped_offset = source.index(transcript._strip_padding(narrow_line))
+
+    assert mapped_offset == anchor_offset
+    assert not transcript.follow_tail
+
+
+def test_transcript_parsed_cache_is_bounded_and_revision_scoped() -> None:
+    transcript = TranscriptWidget()
+    transcript.append(Text("line"))
+
+    for width in (20, 30, 40, 50):
+        transcript._parsed_lines(width)
+    assert len(transcript._parsed_cache) == 3
+
+    transcript.append(Text("new line"))
+    assert not transcript._parsed_cache
+
+
 def test_transcript_cache_uses_stable_keys_after_tool_discard() -> None:
     transcript = TranscriptWidget()
     call = ToolCall("old", "read", {"path": "old.txt"})

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from io import StringIO
@@ -58,7 +59,9 @@ class TranscriptWidget(UIControl):
         self._units: list[_TranscriptUnit | None] = []
         self._tools: dict[str, _ToolUnit] = {}
         self._render_cache: dict[int, tuple[int, int, str]] = {}
-        self._parsed_cache: dict[int, tuple[int, list[list[tuple[str, str]]]]] = {}
+        self._parsed_cache: OrderedDict[int, list[list[tuple[str, str]]]] = (
+            OrderedDict()
+        )
         self._revision = 0
         self._next_key = 0
         self._follow_tail = True
@@ -72,17 +75,21 @@ class TranscriptWidget(UIControl):
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
         return tuple(unit.value if unit is not None else None for unit in self._units)
 
+    def _bump_revision(self) -> None:
+        self._revision += 1
+        self._parsed_cache.clear()
+
     def _append_unit(self, value: RenderableType | _ToolUnit) -> None:
         self._units.append(_TranscriptUnit(self._next_key, value))
         self._next_key += 1
-        self._revision += 1
+        self._bump_revision()
 
     def append(self, renderable: RenderableType) -> None:
         self._append_unit(renderable)
 
     def append_blank(self) -> None:
         self._units.append(None)
-        self._revision += 1
+        self._bump_revision()
 
     def start_tool(
         self, call_id: str, call: ToolCall, renderable: RenderableType
@@ -95,13 +102,13 @@ class TranscriptWidget(UIControl):
         unit = self._tools.get(call_id)
         if unit is not None:
             unit.update(rendered)
-            self._revision += 1
+            self._bump_revision()
 
     def finish_tool(self, call_id: str, rendered: RenderableType) -> None:
         unit = self._tools.pop(call_id, None)
         if unit is not None:
             unit.finish(rendered)
-            self._revision += 1
+            self._bump_revision()
         else:
             self.append(rendered)
 
@@ -122,7 +129,7 @@ class TranscriptWidget(UIControl):
         for key in removed_keys:
             self._render_cache.pop(key, None)
         self._tools.clear()
-        self._revision += 1
+        self._bump_revision()
 
     @property
     def follow_tail(self) -> bool:
@@ -191,11 +198,15 @@ class TranscriptWidget(UIControl):
 
     def _parsed_lines(self, width: int) -> list[list[tuple[str, str]]]:
         cached = self._parsed_cache.get(width)
-        if cached is not None and cached[0] == self._revision:
-            return cached[1]
+        if cached is not None:
+            self._parsed_cache.move_to_end(width)
+            return cached
         fragments = to_formatted_text(ANSI(self.render(width)))
         lines = list(split_lines(fragments)) or [[]]
-        self._parsed_cache[width] = (self._revision, lines)
+        self._parsed_cache[width] = lines
+        self._parsed_cache.move_to_end(width)
+        while len(self._parsed_cache) > 3:
+            self._parsed_cache.popitem(last=False)
         return lines
 
     def _locations(self, width: int) -> list[tuple[_TranscriptUnit | None, int]]:
@@ -204,11 +215,44 @@ class TranscriptWidget(UIControl):
             if unit is None:
                 raw_lines.append(("", None, 0))
                 continue
-            lines = self._render_unit(unit, width).splitlines() or [""]
-            raw_lines.extend((line, unit, index) for index, line in enumerate(lines))
-        while raw_lines and not Text.from_ansi(raw_lines[0][0]).plain.strip():
+            rendered = self._render_unit(unit, width)
+            rendered_lines = self._plain_lines(rendered)
+            renderable = (
+                unit.value.renderable
+                if isinstance(unit.value, _ToolUnit)
+                else unit.value
+            )
+            source = getattr(renderable, "plain", None)
+            if not isinstance(source, str):
+                source = "\n".join(
+                    self._strip_padding(line) for line in rendered_lines
+                )
+            source_offset = 0
+            for line in rendered_lines:
+                content = self._strip_padding(line)
+                offset = source.find(content, source_offset)
+                if offset < 0:
+                    offset = source_offset
+                raw_lines.append((line, unit, offset))
+                source_offset = offset + len(content)
+        while raw_lines and not raw_lines[0][0].strip():
             raw_lines.pop(0)
-        return [(unit, line_index) for _, unit, line_index in raw_lines]
+        return [(unit, text_offset) for _, unit, text_offset in raw_lines]
+
+    @staticmethod
+    def _plain_lines(rendered: str) -> list[str]:
+        if "\x1b" in rendered:
+            rendered = Text.from_ansi(rendered).plain
+        return rendered.splitlines() or [""]
+
+    @staticmethod
+    def _strip_padding(line: str) -> str:
+        if "\x1b" in line:
+            line = Text.from_ansi(line).plain
+        plain = line
+        if plain.startswith("  "):
+            plain = plain[2:]
+        return plain.rstrip()
 
     @staticmethod
     def _anchor_index(
@@ -218,7 +262,7 @@ class TranscriptWidget(UIControl):
         for index, location in enumerate(locations):
             if location == anchor:
                 return index
-        unit, line_index = anchor
+        unit, text_offset = anchor
         if unit is None:
             return None
         candidates = [
@@ -228,7 +272,10 @@ class TranscriptWidget(UIControl):
         ]
         if not candidates:
             return None
-        return min(candidates, key=lambda item: abs(item[1] - line_index))[0]
+        preceding = [item for item in candidates if item[1] <= text_offset]
+        if preceding:
+            return preceding[-1][0]
+        return candidates[0][0]
 
     def create_content(self, width: int, height: int | None) -> UIContent:
         width = max(1, width)
