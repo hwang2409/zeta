@@ -18,6 +18,8 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionError, SessionManager
+from zeta.core.slash import create_slash_registry
+from zeta.core.store import ConversationStore
 from zeta.tui.app import TUIApp, create_app
 from zeta.cli import build_parser, main
 from zeta.types import (
@@ -304,6 +306,131 @@ def test_resume_reopens_an_explicit_session(
     )
 
     assert resumed.loop.store.session_id == session_id
+
+
+def test_model_swap_persists_and_restores_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    first = create_app(_args())
+
+    output = create_slash_registry().dispatch(first, "/model faster")
+    assert output == "model: faster"
+    assert first.model == "faster"
+    assert SessionManager(home).open(first.loop.store.session_id).metadata.model == "faster"
+
+    resumed = create_app(
+        build_parser().parse_args(
+            ["--resume", first.loop.store.session_id, "--provider", "fake"]
+        )
+    )
+    assert resumed.model == "faster"
+
+
+def test_invalid_model_swap_keeps_the_current_model(tmp_path: Path) -> None:
+    backend = FakeBackend([])
+    app = TUIApp(
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        provider="claude",
+        model="claude-sonnet-4-6",
+    )
+
+    output = create_slash_registry().dispatch(app, "/model offline")
+
+    assert output == "model unchanged: model 'offline' is not valid for claude"
+    assert app.model == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("summary")])])
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("first")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("answer")]))
+    assembler = ContextAssembler(
+        store,
+        backend=backend,
+        token_budget=1000,
+        retained_tail=1,
+        system_prompt="stable identity",
+        token_counter=lambda message: 10,
+    )
+    app = TUIApp(
+        AgentLoop(backend, store, context_assembler=assembler),
+        provider="fake",
+        model="offline",
+    )
+
+    output = await create_slash_registry().dispatch_async(app, "/compact")
+
+    assert output is not None
+    assert output.startswith("compacted entries ")
+    assert store.compaction_marker_count() == 1
+    assert backend.calls[0][0][0].content[0].text == "stable identity"
+
+
+def test_session_previews_are_ordered_and_ansi_safe(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    older = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    newer = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    older.store.append_message(
+        Message(MessageRole.USER, [TextContent("older message")])
+    )
+    newer.store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("\x1b[31mnew\x1b[0m\nmessage with controls")],
+        )
+    )
+    older.metadata.updated_at = "2020-01-01T00:00:00+00:00"
+    newer.metadata.updated_at = "2030-01-01T00:00:00+00:00"
+    manager._write(older.metadata)
+    manager._write(newer.metadata)
+
+    previews = manager.list_session_previews()
+
+    assert [item.session_id for item in previews] == [
+        newer.store.session_id,
+        older.store.session_id,
+    ]
+    assert previews[0].preview == "new message with controls"
+    assert "\x1b" not in previews[0].preview
+
+
+def test_resume_picker_matches_direct_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    first = create_app(_args())
+    second = create_app(_args())
+    first.loop.store.append_message(
+        Message(MessageRole.USER, [TextContent("first session")])
+    )
+    second.loop.store.append_message(
+        Message(MessageRole.USER, [TextContent("second session")])
+    )
+    manager = SessionManager(home)
+    first_metadata = manager.open(first.loop.store.session_id).metadata
+    second_metadata = manager.open(second.loop.store.session_id).metadata
+    first_metadata.updated_at = "2020-01-01T00:00:00+00:00"
+    second_metadata.updated_at = "2030-01-01T00:00:00+00:00"
+    manager._write(first_metadata)
+    manager._write(second_metadata)
+    monkeypatch.setattr("builtins.input", lambda prompt: "2")
+
+    picked = create_app(
+        build_parser().parse_args(["--resume", "--provider", "fake"])
+    )
+    direct = create_app(
+        build_parser().parse_args(
+            ["--resume", first.loop.store.session_id, "--provider", "fake"]
+        )
+    )
+
+    assert picked.loop.store.session_id == direct.loop.store.session_id
 
 
 def test_resume_rejects_an_unknown_session(

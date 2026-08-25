@@ -9,7 +9,7 @@ import os
 import sys
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +58,15 @@ DEFAULT_CODEX_MODEL = "gpt-5.4"
 SPINNER_INTERVAL = 0.2
 
 
+def _validate_model_name(provider: str, model: str) -> None:
+    if not model or any(character.isspace() for character in model):
+        raise ValueError("model must be one nonempty word")
+    if provider == "claude" and not model.startswith("claude-"):
+        raise ValueError(f"model {model!r} is not valid for claude")
+    if provider == "codex" and not model.startswith(("gpt-", "o", "codex-")):
+        raise ValueError(f"model {model!r} is not valid for codex")
+
+
 class FullScreenPromptSession(PromptSession[str]):
     """Prompt session that owns the alternate screen for the whole app."""
 
@@ -91,8 +100,9 @@ def _zeta_home() -> Path:
 class FakeInteractiveBackend(CompletionBackend):
     """Small streaming backend for offline CLI smoke tests."""
 
-    def __init__(self, *, delay: float = 0.03) -> None:
+    def __init__(self, *, delay: float = 0.03, model: str = "offline") -> None:
         self.delay = delay
+        self.model = model
         self.calls: list[list[Message]] = []
 
     async def complete(
@@ -139,7 +149,8 @@ def build_backend(
 
     auth_home = Path(home) if home is not None else _zeta_home()
     if provider == "fake":
-        return FakeInteractiveBackend(), model or "offline"
+        selected_model = model or "offline"
+        return FakeInteractiveBackend(model=selected_model), selected_model
     if provider == "claude":
         selected_model = model or DEFAULT_CLAUDE_MODEL
         return AnthropicBackend(
@@ -188,6 +199,7 @@ class TUIApp:
         history_path: str | Path | None = None,
         approval_policy: ApprovalPolicy | None = None,
         context_files: Sequence[str] = (),
+        on_model_change: Callable[[str], None] | None = None,
     ) -> None:
         self.loop = loop
         self.provider = provider
@@ -216,6 +228,7 @@ class TUIApp:
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
         self._approval_policy = approval_policy
         self._context_files = tuple(context_files)
+        self._on_model_change = on_model_change
         self._slash_commands = create_slash_registry()
         self._compaction_shown = False
         self._turn_had_visible_output = False
@@ -279,6 +292,54 @@ class TUIApp:
                 self.loop.context_assembler.output_tokens_this_session
             ),
             context_files=self._context_files,
+        )
+
+    def slash_model(self, args: str) -> str:
+        """Show or change the model for future completions."""
+
+        if not args:
+            return f"model: {self.model}"
+        model = args.strip()
+        try:
+            _validate_model_name(self.provider, model)
+        except ValueError as exc:
+            return f"model unchanged: {exc}"
+        previous = self.model
+        try:
+            self.loop.set_model(model)
+            if self._on_model_change is not None:
+                self._on_model_change(model)
+        except Exception as exc:
+            self.loop.set_model(previous)
+            return f"model unchanged: {exc}"
+        self.model = model
+        return f"model: {model}"
+
+    async def slash_compact(self) -> str:
+        """Force one compaction through the context assembler."""
+
+        if self.active:
+            return "compact unavailable while a turn is running"
+        before = self.loop.store.compaction_marker_count()
+        try:
+            context = await self.loop.context_assembler.assemble_context(
+                backend=self.loop.backend,
+                force=True,
+            )
+        except Exception as exc:
+            return f"compact failed: {exc}"
+        after = self.loop.store.compaction_marker_count()
+        if after == before:
+            return "compact: nothing to compact"
+        marker = next(
+            entry
+            for entry in reversed(self.loop.store.replay())
+            if entry.type == "compaction"
+        )
+        return (
+            "compacted entries "
+            f"{marker.data['source_seq_start']}–{marker.data['source_seq_end']}; "
+            f"tokens after: {context.token_count}"
         )
 
     def _present_pending_approvals(self) -> None:
@@ -524,7 +585,7 @@ class TUIApp:
             return
         if await self._handle_approval_input(parsed):
             return
-        slash_output = self._slash_commands.dispatch(self, parsed)
+        slash_output = await self._slash_commands.dispatch_async(self, parsed)
         if slash_output is not None:
             self._print_system(slash_output)
             return
@@ -883,6 +944,22 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         raise SessionError("--force-provider requires --model")
 
     if resuming:
+        if resume_id == "":
+            previews = manager.list_session_previews()
+            if not previews:
+                raise SessionError("no prior zeta session found")
+            print("recent zeta sessions:")
+            for index, preview in enumerate(previews, start=1):
+                print(
+                    f"{index}. {preview.updated_at} "
+                    f"{preview.session_id[:8]} {preview.preview}"
+                )
+            try:
+                choice = input("select a session: ").strip()
+                selected = int(choice) - 1
+                resume_id = previews[selected].session_id
+            except (EOFError, ValueError, IndexError) as exc:
+                raise SessionError("invalid resume session selection") from exc
         if resume_id is not None:
             opened = manager.open(resume_id)
         else:
@@ -968,6 +1045,9 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             return
         manager.touch(metadata)
 
+    def model_changed(model_name: str) -> None:
+        manager.record_override(metadata, provider=None, model=model_name)
+
     token_budget_override = getattr(args, "token_budget", None)
     effective_token_budget = (
         token_budget_override
@@ -993,6 +1073,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         history_path=home / "history",
         approval_policy=approval_policy,
         context_files=[str(path) for path in project_context.files],
+        on_model_change=model_changed,
     )
 
 

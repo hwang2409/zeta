@@ -171,6 +171,16 @@ class AgentLoop:
         )
         self.on_completion_success = on_completion_success
 
+    def set_model(self, model: str) -> None:
+        """Set the model used by subsequent provider completions."""
+
+        if not model.strip():
+            raise ValueError("model must be a nonempty name")
+        if hasattr(self.backend, "model"):
+            self.backend.model = model
+        else:
+            self._model = model
+
     def abort(self) -> None:
         """Signal the active tool batch before the caller cancels the turn."""
 

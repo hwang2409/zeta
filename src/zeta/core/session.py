@@ -6,6 +6,7 @@ import copy
 import fcntl
 import json
 import os
+import re
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -22,6 +23,29 @@ META_VERSION = 1
 
 class SessionError(ValueError):
     """Raised when a session cannot be created or resumed."""
+
+
+@dataclass(frozen=True, slots=True)
+class SessionPreview:
+    """A session row suitable for the interactive resume picker."""
+
+    session_id: str
+    updated_at: str
+    preview: str
+
+
+_ANSI_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+
+
+def _preview_text(value: str, *, limit: int = 80) -> str:
+    clean = _ANSI_SEQUENCE.sub("", value)
+    clean = "".join(
+        character for character in clean if character in "\t\n\r" or ord(character) >= 32
+    )
+    clean = " ".join(clean.split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(0, limit - 3)] + "..."
 
 
 def env_home() -> Path:
@@ -229,6 +253,44 @@ class SessionManager:
             sessions.append(self._read(session_path.name))
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
 
+    def list_session_previews(self, *, limit: int | None = None) -> list[SessionPreview]:
+        """Return recent sessions with safe, single-line first-message previews."""
+
+        sessions = self.list_sessions()
+        if limit is not None:
+            sessions = sessions[:limit]
+        previews: list[SessionPreview] = []
+        for metadata in sessions:
+            opened = self.open(metadata.session_id)
+            first_message = ""
+            for entry in opened.store.replay():
+                if entry.type != "message":
+                    continue
+                message = entry.data.get("message")
+                if not isinstance(message, dict):
+                    continue
+                if message.get("role") != "user":
+                    continue
+                parts = []
+                for block in message.get("content", []):
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") in {
+                        "text",
+                        "thinking",
+                    } and isinstance(block.get("text"), str):
+                        parts.append(block["text"])
+                first_message = "".join(parts)
+                break
+            previews.append(
+                SessionPreview(
+                    session_id=metadata.session_id,
+                    updated_at=metadata.updated_at,
+                    preview=_preview_text(first_message) or "(no user message)",
+                )
+            )
+        return previews
+
     def find_most_recent(self, *, cwd: str | Path | None = None) -> SessionMetadata:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         matches = [item for item in self.list_sessions() if item.cwd == resolved_cwd]
@@ -392,6 +454,7 @@ __all__ = [
     "SessionError",
     "SessionManager",
     "SessionMetadata",
+    "SessionPreview",
     "env_home",
     "find_most_recent",
     "list_sessions",
