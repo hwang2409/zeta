@@ -1016,6 +1016,41 @@ def test_stream_diagnostic_redacts_bare_provider_keys(
     assert record["cause"] == "stream failed with [redacted] then retried with [redacted]"
 
 
+@pytest.mark.parametrize(
+    "provider_key",
+    [
+        "sk-proj-AbC123_def456-Ghi789",
+        "sk-proj-abc.def",
+        "sk-proj-abc+def",
+        "sk-proj-AbC123_def456-Ghi789+/=",
+        "sk-proj-tail.",
+    ],
+)
+def test_stream_diagnostic_redacts_entire_provider_key_token(
+    tmp_path: Path, provider_key: str
+) -> None:
+    path = tmp_path / "logs" / "stream-diagnostics.jsonl"
+
+    diagnostics_module.write_stream_diagnostic(
+        path, {"cause": f"stream failed with {provider_key}"}
+    )
+
+    record = json.loads(path.read_text())
+    assert provider_key not in record["cause"]
+    assert record["cause"] == "stream failed with [redacted]"
+
+
+def test_stream_diagnostic_keeps_words_without_provider_key_prefix(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "logs" / "stream-diagnostics.jsonl"
+
+    diagnostics_module.write_stream_diagnostic(path, {"cause": "skip sketch"})
+
+    record = json.loads(path.read_text())
+    assert record["cause"] == "skip sketch"
+
+
 @pytest.mark.asyncio
 async def test_message_stop_salvages_parseable_open_tool_block(tmp_path: Path) -> None:
     events = await _collect_anthropic_events(
