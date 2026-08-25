@@ -534,6 +534,9 @@ def render_event(event: StreamEvent) -> RenderableType | None:
                 style=DIM,
             )
         return Text("response truncated (stream ended early)", style=DIM)
+    if event.type is StreamEventType.RETRY:
+        text = event.data.get("text")
+        return Text(text if type(text) is str else "retrying", style=DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
         if event.tool_call.name.lower() in RECEIPT_TOOLS:
             suffix = _receipt_arguments(event.tool_call, "")

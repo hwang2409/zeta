@@ -26,9 +26,13 @@ from .anthropic_payload import (
 from .stream_diagnostics import Cause, StreamDiagnostics
 from .transport import (
     cleanup_transport,
+    format_retry_delay,
     is_control_exception,
     request_error,
-    retry_auth_completion,
+    retry_after_seconds,
+    retry_provider_completion,
+    retry_error_label,
+    retryable_provider_error,
     task_is_cancelling,
 )
 from .usage import normalize_usage
@@ -84,11 +88,28 @@ class AnthropicHTTPError(AnthropicBackendError):
 
     code = "http_error"
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.retryable = retryable
+
 
 class AnthropicStreamError(AnthropicBackendError):
     """Raised when an Anthropic SSE stream is invalid or ends early."""
 
     code = "stream_error"
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
@@ -370,7 +391,7 @@ class AnthropicBackend(CompletionBackend):
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
-        attempts = retry_auth_completion(
+        attempts = retry_provider_completion(
             lambda: self._complete_once(messages, tool_schemas),
             lambda token: self._complete_once(messages, tool_schemas, token=token),
             self._refresh_token,
@@ -379,6 +400,10 @@ class AnthropicBackend(CompletionBackend):
                 "Anthropic authentication failed after token refresh; run `zeta login`",
                 status_code=401,
             ),
+            lambda event: event.type is StreamEventType.MESSAGE_START,
+            retryable_provider_error,
+            self._retry_notice,
+            self._record_retry_exhausted,
         )
         try:
             async for event in attempts:
@@ -439,7 +464,7 @@ class AnthropicBackend(CompletionBackend):
             try:
                 if response.status_code >= 400:
                     body = await _read_error_body(response)
-                    raise _http_error(response.status_code, body)
+                    raise _http_error(response.status_code, body, response.headers)
                 async for event in _decode_response(
                     response,
                     diagnostics_path=self.diagnostics_path,
@@ -473,6 +498,28 @@ class AnthropicBackend(CompletionBackend):
             if primary_exception is not None:
                 raise primary_exception
 
+    def _retry_notice(
+        self, retry_number: int, delay: float, error: RuntimeError
+    ) -> StreamEvent:
+        return StreamEvent(
+            StreamEventType.RETRY,
+            data={
+                "text": (
+                    f"retrying ({retry_number}/3) in {format_retry_delay(delay)}s — "
+                    f"{retry_error_label(error)}"
+                ),
+                "retry": retry_number,
+                "delay": delay,
+            },
+        )
+
+    def _record_retry_exhausted(self, error: RuntimeError, retries: int) -> None:
+        StreamDiagnostics.record_retry_exhausted(
+            self.diagnostics_path,
+            error,
+            retries=retries,
+        )
+
 
 async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes:
     body = bytearray()
@@ -483,14 +530,36 @@ async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes
     return bytes(body)
 
 
-def _http_error(status_code: int, body: bytes) -> AnthropicHTTPError:
+def _http_error(
+    status_code: int,
+    body: bytes,
+    headers: Mapping[str, str] | None = None,
+) -> AnthropicHTTPError:
     message = error_body_excerpt(body) or "request failed"
     error_type = AnthropicAuthError if status_code in {401, 403} else AnthropicHTTPError
+    retry_after = retry_after_seconds(headers)
+    retryable = _is_overloaded_body(body)
     if error_type is AnthropicAuthError:
         return error_type(
             f"Anthropic HTTP {status_code}: {message}", status_code=status_code
         )
-    return error_type(f"Anthropic HTTP {status_code}: {message}")
+    return error_type(
+        f"Anthropic HTTP {status_code}: {message}",
+        status_code=status_code,
+        retry_after=retry_after,
+        retryable=retryable,
+    )
+
+
+def _is_overloaded_body(body: bytes) -> bool:
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    detail = payload.get("error")
+    return isinstance(detail, Mapping) and detail.get("type") == "overloaded_error"
 
 
 async def _decode_response(
@@ -664,7 +733,8 @@ def _translate_event(
         if type(message) is not str:
             raise AnthropicStreamError("Anthropic stream error message is invalid")
         raise AnthropicStreamError(
-            error_body_excerpt(message.encode()) or "Anthropic stream error"
+            error_body_excerpt(message.encode()) or "Anthropic stream error",
+            retryable=detail.get("type") in {"overloaded_error", "rate_limit_error"},
         )
     if event_type == "message_start":
         message = payload.get("message", {})
