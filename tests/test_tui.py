@@ -1451,6 +1451,43 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     assert bottom.children[-1].__class__.__name__ == "ConditionalContainer"
 
 
+@pytest.mark.parametrize(
+    ("terminal_width", "right_segments"),
+    [(120, ("/status", "ctrl+c interrupt", "ctrl+d quit", "abcdef12")),
+     (80, ("/status", "ctrl+c interrupt", "ctrl+d quit", "abcdef12")),
+     (40, ("abcdef12",))],
+)
+def test_full_screen_footer_fits_content_column(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_width: int,
+    right_segments: tuple[str, ...],
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions", session_id="abcdef123456"),
+        ),
+        provider="fake",
+        model="offline",
+    )
+    output = SimpleNamespace(
+        get_size=lambda: Size(rows=24, columns=terminal_width),
+    )
+    monkeypatch.setattr("zeta.tui.app.get_app", lambda: SimpleNamespace(output=output))
+
+    footer = "".join(value for _, value in app._status_toolbar())
+    content_width = min(100, terminal_width - 4)
+
+    assert cell_len(footer) <= content_width
+    assert all(segment in footer for segment in right_segments)
+    if terminal_width == 40:
+        assert all(
+            segment not in footer
+            for segment in ("/status", "ctrl+c interrupt")
+        )
+
+
 @pytest.mark.parametrize(("width", "height"), [(120, 40), (80, 24), (40, 12)])
 def test_transcript_visual_snapshot_is_compact_and_bottom_aligned(
     width: int, height: int

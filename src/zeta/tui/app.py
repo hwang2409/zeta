@@ -434,7 +434,8 @@ class TUIApp:
             self._approval_policy.abort(request_id)
 
     def _status_toolbar(self) -> FormattedText:
-        width = get_app().output.get_size().columns
+        terminal_width = get_app().output.get_size().columns
+        width = max(1, min(100, terminal_width - 4))
         usage = dict(self._usage)
         usage.setdefault(
             "cache_read_input_tokens",
