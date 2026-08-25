@@ -169,7 +169,11 @@ async def test_agent_loop_preserves_mixed_tool_blocks(tmp_path: Path) -> None:
     call = ToolCall("mixed-1", "mixed", {})
     blocks = [
         {"type": "text", "text": "answer", "truncated": False, "full_size": 6},
-        {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+        {
+            "type": "image",
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg==",
+            "mimeType": "image/png",
+        },
         {
             "type": "resource",
             "resource": {"uri": "file:///tmp/note.txt", "text": "note"},
@@ -194,7 +198,10 @@ async def test_agent_loop_preserves_mixed_tool_blocks(tmp_path: Path) -> None:
 
     result = store.messages()[2].tool_result
     assert result is not None
-    assert result.content == "answer\n[image block]\n[resource: file:///tmp/note.txt]"
+    assert result.content == (
+        "answer\n[image block] media_type=image/png dimensions=1x1 bytes=70\n"
+        "[resource: file:///tmp/note.txt]"
+    )
     assert result.content_blocks == blocks
     replayed_result = backend.calls[1][0][-1].tool_result
     assert replayed_result is not None
@@ -212,7 +219,7 @@ async def test_agent_loop_rejects_invalid_block_metadata_before_persistence(
             "content": [
                 {
                     "type": "image",
-                    "data": "aGVsbG8=",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg==",
                     "mimeType": "image/png",
                     "annotations": {"extra": object()},
                 }

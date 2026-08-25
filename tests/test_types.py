@@ -43,7 +43,11 @@ def test_tool_result_round_trip_preserves_mixed_content_blocks() -> None:
         "call-1",
         "[image block]\n[resource: file:///tmp/note.txt]",
         content_blocks=[
-            {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+            {
+                "type": "image",
+                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg==",
+                "mimeType": "image/png",
+            },
             {
                 "type": "resource",
                 "resource": {

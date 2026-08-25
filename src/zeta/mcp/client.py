@@ -11,8 +11,7 @@ from ..core.abort import AbortSignal
 from ..tools.registry import text_block
 from ..types import (
     StructuredToolResult,
-    ToolTextBlock,
-    flatten_tool_content,
+    ToolContentBlock,
     validate_tool_content_block,
 )
 from .config import MCPServerConfig
@@ -94,20 +93,25 @@ def translate_call_result(value: object) -> StructuredToolResult:
     content_value = value.get("content", [])
     if type(content_value) is not list:
         return make_error_result("MCP tool result content must be an array")
-    blocks: list[ToolTextBlock] = []
+    blocks: list[ToolContentBlock] = []
     for index, item in enumerate(content_value):
         if type(item) is not dict:
             return make_error_result(f"MCP content[{index}] must be an object")
-        if item.get("type") != "text" or type(item.get("text")) is not str:
-            try:
-                block = validate_tool_content_block(index, item)
-            except ValueError:
-                rendered = f"[unsupported MCP block: {item.get('type', 'unknown')}]"
-            else:
-                rendered = flatten_tool_content([block])
-            blocks.append(text_block(rendered))
+        if item.get("type") == "text":
+            if type(item.get("text")) is not str:
+                return make_error_result(
+                    f"invalid MCP content[{index}].text: must be a string"
+                )
+            blocks.append(text_block(item["text"]))
             continue
-        blocks.append(text_block(item["text"]))
+        try:
+            block = validate_tool_content_block(index, item)
+        except ValueError as exc:
+            return make_error_result(f"invalid MCP content[{index}]: {exc}")
+        if block["type"] == "text":
+            blocks.append(text_block(block["text"]))
+        else:
+            blocks.append(block)
     is_error = value.get("isError", False)
     if type(is_error) is not bool:
         return make_error_result("MCP tool result isError must be a boolean")

@@ -55,6 +55,7 @@ from zeta.tui.render import (
     render_markdown,
     render_tool_progress,
     tool_render_mode,
+    _render_tool_output,
 )
 from zeta.tui.theme import ACCENT, BODY, DIM, RICH_THEME
 from zeta.tui.transcript import TranscriptWidget
@@ -795,6 +796,17 @@ def test_render_event_shows_non_text_tool_block_placeholders() -> None:
     assert "answer" in rendered_text
     assert "[image block]" in rendered_text
     assert "[resource: file:///tmp/note.txt]" in rendered_text
+
+
+def test_image_placeholders_use_dim_style() -> None:
+    rendered = _render_tool_output(
+        "[image block] media_type=image/png bytes=70\nanswer"
+    )
+
+    assert any(
+        span.start == 0 and span.style == DIM
+        for span in rendered.spans
+    )
 
 
 def test_render_helpers_use_the_zeta_palette() -> None:

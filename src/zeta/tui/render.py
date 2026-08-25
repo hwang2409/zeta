@@ -92,7 +92,10 @@ def _tool_content(event: StreamEvent) -> str:
     if result is None:
         return ""
     blocks = result.content_blocks or []
-    return flatten_tool_content(blocks) if blocks else result.content
+    if not blocks:
+        return result.content
+    tool_name = event.tool_call.name if event.tool_call is not None else "tool"
+    return flatten_tool_content(blocks, detailed_images=True, tool_name=tool_name)
 
 
 def tool_render_mode(event: StreamEvent) -> ToolRenderMode:
@@ -202,7 +205,8 @@ def _render_tool_output(content: str, extra_lines: list[str] | None = None) -> T
     for index, line in enumerate(visible):
         if index:
             rendered.append("\n")
-        rendered.append(_safe_text(line, style=BODY))
+        style = DIM if line.startswith("[image block]") else BODY
+        rendered.append(_safe_text(line, style=style))
     if truncated:
         rendered.append(f"\n… +{len(lines) - MAX_TOOL_LINES} lines", style=AFFORDANCE)
     return rendered

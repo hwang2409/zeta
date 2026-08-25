@@ -13,6 +13,7 @@ from .store import ConversationEntry, ConversationStore
 from ..types import (
     CompletionBackend,
     ContentBlock,
+    flatten_tool_content,
     Message,
     MessageRole,
     StreamEvent,
@@ -89,6 +90,23 @@ def _strip_thinking(message: Message) -> Message:
     )
 
 
+def _summary_message(message: Message) -> dict[str, Any]:
+    """Serialize a message without copying image base64 into a summary prompt."""
+
+    value = message.to_dict()
+    tool_result = value.get("tool_result")
+    if not isinstance(tool_result, dict):
+        return value
+    blocks = tool_result.get("content_blocks")
+    if not isinstance(blocks, list) or not any(
+        isinstance(block, dict) and block.get("type") == "image" for block in blocks
+    ):
+        return value
+    tool_result["content"] = flatten_tool_content(blocks, detailed_images=True)
+    tool_result.pop("content_blocks", None)
+    return value
+
+
 def _has_tool_call(message: Message) -> bool:
     return any(isinstance(block, ToolUseContent) for block in message.content)
 
@@ -123,7 +141,7 @@ class CompactionPolicy:
             raise SummaryCompletionError("compaction requires a completion backend")
         sanitized_messages = [_strip_thinking(message) for message in messages]
         source = json.dumps(
-            [message.to_dict() for message in sanitized_messages],
+            [_summary_message(message) for message in sanitized_messages],
             sort_keys=True,
             separators=(",", ":"),
         )

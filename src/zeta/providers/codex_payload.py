@@ -58,6 +58,11 @@ def build_responses_payload(
     *,
     model: str,
 ) -> dict[str, Any]:
+    """Build a Responses request.
+
+    Codex has no native image tool-result block. Its one fallback is the
+    provider-neutral text description emitted by ``flatten_tool_content``.
+    """
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
     for message in messages:
@@ -73,7 +78,10 @@ def build_responses_payload(
                     "type": "function_call_output",
                     "call_id": message.tool_result.tool_call_id,
                     "output": (
-                        flatten_tool_content(message.tool_result.content_blocks)
+                        flatten_tool_content(
+                            message.tool_result.content_blocks,
+                            detailed_images=True,
+                        )
                         if message.tool_result.content_blocks is not None
                         else message.tool_result.content
                     ),

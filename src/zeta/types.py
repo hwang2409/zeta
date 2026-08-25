@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import math
+import struct
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import (
@@ -150,6 +153,9 @@ class ToolImageBlock(TypedDict):
     type: Literal["image"]
     data: str
     mimeType: str
+    caption: NotRequired[str]
+    width: NotRequired[int]
+    height: NotRequired[int]
     annotations: NotRequired[ToolAnnotations]
 
 
@@ -210,18 +216,40 @@ def validate_tool_content_block(index: int, block: object) -> ToolContentBlock:
         return normalized
     if block_type == "image":
         required_keys = {"type", "data", "mimeType"}
-        allowed_keys = {*required_keys, "annotations"}
+        allowed_keys = {*required_keys, "annotations", "caption", "width", "height"}
         if not required_keys <= set(block) or not set(block) <= allowed_keys:
             raise ValueError(f"{prefix} has an invalid image shape")
         if type(block.get("data")) is not str:
             raise ValueError(f"{prefix}.data must be a string")
+        if not block["data"]:
+            raise ValueError(f"{prefix}.data must be nonempty base64")
+        try:
+            data = base64.b64decode(block["data"], validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError(f"{prefix}.data must be valid base64") from None
         if type(block.get("mimeType")) is not str:
             raise ValueError(f"{prefix}.mimeType must be a string")
+        if not block["mimeType"]:
+            raise ValueError(f"{prefix}.mimeType must be nonempty")
+        if not image_signature_matches(block["mimeType"], data):
+            raise ValueError(
+                f"{prefix}.data does not match media type {block['mimeType']}"
+            )
         normalized_image: ToolImageBlock = {
             "type": "image",
             "data": block["data"],
             "mimeType": block["mimeType"],
         }
+        for key in ("caption", "width", "height"):
+            if key not in block:
+                continue
+            value = block[key]
+            if key == "caption":
+                if type(value) is not str:
+                    raise ValueError(f"{prefix}.caption must be a string")
+            elif type(value) is not int or value < 1:
+                raise ValueError(f"{prefix}.{key} must be a positive integer")
+            normalized_image[key] = value
         if "annotations" in block:
             normalized_image["annotations"] = _validate_annotations(
                 prefix, block["annotations"]
@@ -303,7 +331,156 @@ def _validate_annotations(prefix: str, value: object) -> ToolAnnotations:
     return normalized
 
 
-def flatten_tool_content(blocks: Sequence[ToolContentBlock]) -> str:
+SUPPORTED_IMAGE_MEDIA_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp"}
+)
+
+
+def image_signature_matches(mime_type: str, data: bytes) -> bool:
+    if mime_type == "image/png":
+        return (
+            len(data) >= 24
+            and data[:8] == b"\x89PNG\r\n\x1a\n"
+            and data[12:16] == b"IHDR"
+            and all(struct.unpack(">II", data[16:24]))
+        )
+    if mime_type == "image/jpeg":
+        return data[:3] == b"\xff\xd8\xff"
+    if mime_type == "image/gif":
+        return (
+            len(data) >= 10
+            and data[:6] in {b"GIF87a", b"GIF89a"}
+            and all(struct.unpack("<HH", data[6:10]))
+        )
+    if mime_type == "image/webp":
+        return _webp_dimensions(data) is not None
+    return True
+
+
+def _webp_chunk(data: bytes) -> tuple[bytes, int, int] | None:
+    if len(data) < 20 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    chunk_type = data[12:16]
+    chunk_size = int.from_bytes(data[16:20], "little")
+    if chunk_type not in {b"VP8 ", b"VP8L", b"VP8X"}:
+        return None
+    if len(data) < 20 + chunk_size:
+        return None
+    return chunk_type, 20, chunk_size
+
+
+def decoded_image_bytes(block: ToolImageBlock) -> bytes | None:
+    try:
+        return base64.b64decode(block["data"], validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def image_dimensions(block: ToolImageBlock, data: bytes | None = None) -> tuple[int, int] | None:
+    """Return cheap raster dimensions when the image header exposes them."""
+
+    data = decoded_image_bytes(block) if data is None else data
+    mime_type = block["mimeType"]
+    if data is not None and mime_type == "image/png" and image_signature_matches(mime_type, data):
+        dimensions = struct.unpack(">II", data[16:24])
+        if all(dimensions):
+            return dimensions
+    if data is not None and mime_type == "image/gif" and image_signature_matches(mime_type, data):
+        dimensions = struct.unpack("<HH", data[6:10])
+        if all(dimensions):
+            return dimensions
+    if data is not None and mime_type == "image/webp":
+        dimensions = _webp_dimensions(data)
+        if dimensions is not None:
+            return dimensions
+    if data is not None and mime_type == "image/jpeg" and image_signature_matches(mime_type, data):
+        offset = 2
+        while offset + 9 < len(data):
+            if data[offset] != 0xFF:
+                offset += 1
+                continue
+            marker = data[offset + 1]
+            offset += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            if offset + 2 > len(data):
+                break
+            segment_size = int.from_bytes(data[offset : offset + 2], "big")
+            if segment_size < 2 or offset + segment_size > len(data):
+                break
+            if marker in set(range(0xC0, 0xC4)) | set(range(0xC5, 0xC8)) | set(range(0xC9, 0xCC)) | set(range(0xCD, 0xD0)):
+                dimensions = (
+                    int.from_bytes(data[offset + 5 : offset + 7], "big"),
+                    int.from_bytes(data[offset + 3 : offset + 5], "big"),
+                )
+                if all(dimensions):
+                    return dimensions
+            offset += segment_size
+    width = block.get("width")
+    height = block.get("height")
+    if type(width) is int and type(height) is int:
+        return width, height
+    return None
+
+
+def _webp_dimensions(data: bytes) -> tuple[int, int] | None:
+    chunk = _webp_chunk(data)
+    if chunk is None:
+        return None
+    chunk_type, offset, chunk_size = chunk
+    if chunk_type == b"VP8X" and chunk_size >= 10:
+        dimensions = (
+            1 + int.from_bytes(data[offset + 4 : offset + 7], "little"),
+            1 + int.from_bytes(data[offset + 7 : offset + 10], "little"),
+        )
+        return dimensions if all(dimensions) else None
+    if chunk_type == b"VP8L" and chunk_size >= 5 and data[offset] == 0x2F:
+        packed = int.from_bytes(data[offset + 1 : offset + 5], "little")
+        dimensions = 1 + (packed & 0x3FFF), 1 + ((packed >> 14) & 0x3FFF)
+        return dimensions if all(dimensions) else None
+    if chunk_type == b"VP8 " and chunk_size >= 10 and data[offset + 3 : offset + 6] == b"\x9d\x01\x2a":
+        dimensions = (
+            int.from_bytes(data[offset + 6 : offset + 8], "little") & 0x3FFF,
+            int.from_bytes(data[offset + 8 : offset + 10], "little") & 0x3FFF,
+        )
+        return dimensions if all(dimensions) else None
+    return None
+
+
+def image_description(
+    block: ToolImageBlock,
+    *,
+    detailed: bool = False,
+    reason: str | None = None,
+    tool_name: str | None = None,
+) -> str:
+    """Describe an image without exposing its base64 payload."""
+
+    data = decoded_image_bytes(block)
+    dimensions = image_dimensions(block, data)
+    if not detailed and dimensions is None and reason is None:
+        return "[image block]"
+    parts = ["[image block]"]
+    if tool_name:
+        parts.append(f"tool={tool_name}")
+    parts.append(f"media_type={block['mimeType']}")
+    if dimensions:
+        parts.append(f"dimensions={dimensions[0]}x{dimensions[1]}")
+    parts.append(f"bytes={len(data) if data is not None else 'unknown'}")
+    caption = block.get("caption")
+    if caption:
+        parts.append(f"caption={caption}")
+    if reason:
+        parts.append(f"fallback={reason}")
+    return " ".join(parts)
+
+
+def flatten_tool_content(
+    blocks: Sequence[ToolContentBlock],
+    *,
+    detailed_images: bool = False,
+    tool_name: str | None = None,
+) -> str:
     values: list[str] = []
     for block in blocks:
         if block["type"] == "text":
@@ -316,7 +493,11 @@ def flatten_tool_content(blocks: Sequence[ToolContentBlock]) -> str:
                 )
             values.append(text)
         elif block["type"] == "image":
-            values.append("[image block]")
+            values.append(
+                image_description(
+                    block, detailed=detailed_images, tool_name=tool_name
+                )
+            )
         else:
             values.append(f"[resource: {block['resource']['uri']}]")
     return "\n".join(values)
