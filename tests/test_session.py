@@ -330,6 +330,48 @@ def test_model_swap_persists_and_restores_on_resume(
     assert resumed.model == "faster"
 
 
+def test_vim_mode_defaults_on_and_persists_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    first = create_app(_args())
+
+    assert first.vim_mode is True
+    assert create_slash_registry().dispatch(first, "/vim off") == "vim mode: off"
+    assert first.vim_mode is False
+    assert (
+        SessionManager(home).open(first.loop.store.session_id).metadata.vim_mode
+        is False
+    )
+
+    resumed = create_app(
+        build_parser().parse_args(
+            ["--resume", first.loop.store.session_id, "--provider", "fake"]
+        )
+    )
+    assert resumed.vim_mode is False
+
+
+def test_legacy_session_metadata_defaults_vim_mode_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    first = create_app(_args())
+    metadata_path = home / "sessions" / first.loop.store.session_id / "meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("vim_mode")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    resumed = create_app(
+        build_parser().parse_args(
+            ["--resume", first.loop.store.session_id, "--provider", "fake"]
+        )
+    )
+    assert resumed.vim_mode is True
+
+
 @pytest.mark.asyncio
 async def test_unknown_model_swap_warns_and_changes_the_model(tmp_path: Path) -> None:
     backend = FakeBackend([])

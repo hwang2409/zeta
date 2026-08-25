@@ -39,6 +39,7 @@ from .theme import (
     ERROR,
     RECEIPT,
     THOUGHT,
+    VIM_STATE,
 )
 
 
@@ -506,6 +507,7 @@ def format_status(
     spinner_frame: int = 0,
     spinner_active: bool | None = None,
     model_window: int | None = None,
+    vim_state: str | None = None,
 ) -> Text:
     """Format the compact status bar shown below the composer."""
 
@@ -536,7 +538,11 @@ def format_status(
         state_text = f"{SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]} {state}"
     else:
         state_text = state
-    left = f"{state_text}  {context_text}"
+    state_segment = f"{state_text}  {context_text}"
+    left_segments = [state_segment]
+    if vim_state:
+        left_segments.insert(0, vim_state)
+    left = "  ".join(left_segments)
     right_segments = ["/status", "ctrl+c interrupt", "ctrl+d quit"]
     if session_id:
         right_segments.append(session_id[:8])
@@ -544,14 +550,22 @@ def format_status(
         value = f"{left}  {' · '.join(right_segments)}"
     else:
         value = left
-        for start in range(len(right_segments)):
-            right = " · ".join(right_segments[start:])
-            gap = width - cell_len(left) - cell_len(right)
-            if gap >= 2:
-                value = f"{left}{' ' * gap}{right}"
+        candidates = (left, state_segment) if vim_state else (left,)
+        for candidate_left in candidates:
+            value = candidate_left
+            for start in range(len(right_segments)):
+                right = " · ".join(right_segments[start:])
+                gap = width - cell_len(candidate_left) - cell_len(right)
+                if gap >= 2:
+                    value = f"{candidate_left}{' ' * gap}{right}"
+                    break
+            if value != candidate_left or candidate_left == state_segment:
                 break
         if cell_len(value) > width:
             fitted = Text(value, no_wrap=True, overflow="ellipsis")
             fitted.truncate(width, overflow="ellipsis")
             value = fitted.plain.rstrip(" ·")
-    return Text(value, style=CHROME)
+    rendered = Text(value, style=CHROME)
+    if vim_state and value.startswith(vim_state):
+        rendered.stylize(VIM_STATE, 0, len(vim_state))
+    return rendered

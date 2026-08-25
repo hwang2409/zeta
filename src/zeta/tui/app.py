@@ -42,7 +42,7 @@ from ..types import (
     TextContent,
     ThinkingContent,
 )
-from .composer import build_key_bindings, history_for, parse_input
+from .composer import build_key_bindings, history_for, parse_input, vim_state_label
 from .render import (
     MarkdownStream,
     format_status,
@@ -208,6 +208,8 @@ class TUIApp:
         approval_policy: ApprovalPolicy | None = None,
         context_files: Sequence[str] = (),
         on_model_change: Callable[[str], None] | None = None,
+        vim_mode: bool = True,
+        on_vim_mode_change: Callable[[bool], None] | None = None,
         model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
     ) -> None:
         self.loop = loop
@@ -238,6 +240,8 @@ class TUIApp:
         self._approval_policy = approval_policy
         self._context_files = tuple(context_files)
         self._on_model_change = on_model_change
+        self.vim_mode = vim_mode
+        self._on_vim_mode_change = on_vim_mode_change
         self._model_catalog_loader = model_catalog_loader or _load_model_catalog
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
@@ -305,6 +309,7 @@ class TUIApp:
                 self.loop.context_assembler.output_tokens_this_session
             ),
             context_files=self._context_files,
+            vim_mode=self.vim_mode,
         )
 
     def slash_model(self, args: str) -> str:
@@ -341,6 +346,23 @@ class TUIApp:
         if catalog_warning is not None:
             return f"model: {model} ({catalog_warning})"
         return f"model: {model}"
+
+    def slash_vim(self, args: str) -> str:
+        """Show or change the composer's Vim editing mode."""
+        if not args:
+            return f"vim mode: {'on' if self.vim_mode else 'off'}"
+        requested = args.strip().lower()
+        if requested not in {"on", "off", "toggle"}:
+            return "vim mode unchanged: use /vim on, /vim off, or /vim toggle"
+        enabled = not self.vim_mode if requested == "toggle" else requested == "on"
+        if self._on_vim_mode_change is not None:
+            self._on_vim_mode_change(enabled)
+        self.vim_mode = enabled
+        if (session := self._active_session or self._session) is not None:
+            session.editing_mode = EditingMode.VI if enabled else EditingMode.EMACS
+            session.app.vi_state.reset()
+        self._invalidate_prompt()
+        return f"vim mode: {'on' if self.vim_mode else 'off'}"
 
     def _start_model_catalog_load(self) -> None:
         if self._model_catalog_task is not None:
@@ -487,6 +509,7 @@ class TUIApp:
             history=history_for(self._history_path),
             key_bindings=bindings,
             multiline=True,
+            editing_mode=EditingMode.VI if self.vim_mode else EditingMode.EMACS,
             bottom_toolbar=self._status_toolbar,
             erase_when_done=True,
             show_frame=True,
@@ -558,12 +581,9 @@ class TUIApp:
             spinner_frame=self._spinner_frame,
             spinner_active=self._spinner_active,
             model_window=self.loop.context_assembler.token_budget,
+            vim_state=vim_state_label(self.vim_mode),
         )
-        return FormattedText(
-            [
-                ("class:status-bar", status.plain),
-            ]
-        )
+        return FormattedText([("class:status-bar", status.plain)])
 
     def _full_screen_active(self) -> bool:
         return isinstance(self._active_session, FullScreenPromptSession)
@@ -1156,6 +1176,8 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         approval_policy=approval_policy,
         context_files=[str(path) for path in project_context.files],
         on_model_change=model_changed,
+        vim_mode=metadata.vim_mode,
+        on_vim_mode_change=lambda enabled: manager.record_vim_mode(metadata, enabled=enabled),
     )
 
 

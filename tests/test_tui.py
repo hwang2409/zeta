@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit import PromptSession
+from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.data_structures import Size
@@ -1345,6 +1346,31 @@ def test_footer_builder_formats_context_usage_and_hints() -> None:
     )
 
 
+def test_footer_shows_vim_state_and_degrades_as_a_whole_segment() -> None:
+    footer = format_status(
+        "fake",
+        "offline",
+        "idle",
+        token_count=14,
+        session_id="abcdef12",
+        width=80,
+        vim_state="NORMAL",
+    )
+    assert footer.plain.startswith("NORMAL  idle")
+
+    narrow = format_status(
+        "fake",
+        "offline",
+        "idle",
+        token_count=14,
+        session_id="abcdef12",
+        width=30,
+        vim_state="NORMAL",
+    )
+    assert "NORMAL" not in narrow.plain
+    assert "idle" in narrow.plain
+
+
 def test_status_bar_includes_session_context_and_streaming_indicator() -> None:
     status = format_status(
         "codex",
@@ -2147,6 +2173,70 @@ async def test_composer_submits_enter_and_keeps_ctrl_j_multiline() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("newline", ["\x1b[27;2;13~", "\x1b\r", "\x0a"])
+async def test_vi_composer_modified_enter_inserts_newline(newline: str) -> None:
+    with create_pipe_input() as pipe:
+        session: PromptSession[str] | None = None
+        submitted: list[str] = []
+
+        def submit(value: str) -> None:
+            submitted.append(value)
+            assert session is not None
+            session.app.exit()
+
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_submit=submit,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text(f"line one{newline}line two\r")
+        await task
+
+    assert submitted == ["line one\nline two"]
+
+
+@pytest.mark.asyncio
+async def test_vi_composer_escape_and_insert_update_native_state() -> None:
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("\x1b")
+        for _ in range(300):
+            if session.app.vi_state.input_mode.value == "vi-navigation":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("vi escape did not enter navigation mode")
+        pipe.send_text("i")
+        for _ in range(100):
+            if session.app.vi_state.input_mode.value == "vi-insert":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("vi insert key did not enter insert mode")
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
 async def test_composer_submit_writes_file_history_and_up_replays_it(
     tmp_path: Path,
 ) -> None:
@@ -2199,6 +2289,46 @@ async def test_composer_submit_writes_file_history_and_up_replays_it(
         await asyncio.sleep(0)
         pipe.send_text("\x1b[A\r")
         await second_task
+
+    assert submitted == ["remember me", "remember me"]
+
+
+@pytest.mark.asyncio
+async def test_vi_composer_history_up_works_from_insert_mode_on_empty_buffer(
+    tmp_path: Path,
+) -> None:
+    history = history_for(tmp_path / "history")
+    submitted: list[str] = []
+
+    with create_pipe_input() as pipe:
+        session: PromptSession[str] | None = None
+
+        def submit(value: str) -> None:
+            submitted.append(value)
+            assert session is not None
+            session.app.exit()
+
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            history=history,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_submit=submit,
+            ),
+            multiline=True,
+        )
+        first = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("remember me\r")
+        await first
+
+        second = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("\x1b[A\r")
+        await second
 
     assert submitted == ["remember me", "remember me"]
 
