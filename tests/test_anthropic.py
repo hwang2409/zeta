@@ -129,6 +129,7 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
         ThinkingContent("plan", "sig-1"),
         TextContent("hello"),
     ]
+    assert not (tmp_path / "logs" / "stream-diagnostics.jsonl").exists()
     await client.aclose()
 
 
@@ -852,6 +853,18 @@ async def test_early_stream_end_is_salvaged(tmp_path: Path) -> None:
     assert events[-1].type is StreamEventType.MESSAGE_END
     assert events[-1].data["truncated"] is True
     assert events[-1].message == Message(MessageRole.ASSISTANT)
+    record = json.loads(
+        (tmp_path / "logs" / "stream-diagnostics.jsonl").read_text().strip()
+    )
+    assert record["cause"] == "clean-eof"
+    assert record["stream_age_seconds"] >= 0
+    assert record["bytes_received"] > 0
+    assert record["sse_events_received"] == 1
+    assert record["idle_gap_seconds"] >= 0
+    assert record["open_blocks"] == 0
+    assert record["closed_blocks"] == 0
+    assert record["stop_reason"] is None
+    assert record["model"] == "claude-sonnet-4-6"
 
 
 @pytest.mark.asyncio
@@ -876,6 +889,82 @@ async def test_message_stop_salvages_open_text_block(tmp_path: Path) -> None:
         MessageRole.ASSISTANT, [TextContent("partial")]
     )
     assert events[-1].data["truncated"] is True
+    record = json.loads(
+        (tmp_path / "logs" / "stream-diagnostics.jsonl").read_text().strip()
+    )
+    assert record["cause"] == "message_stop"
+    assert record["open_blocks"] == 1
+    assert record["closed_blocks"] == 0
+
+
+@pytest.mark.asyncio
+async def test_network_eof_salvage_records_exception_and_headers(tmp_path: Path) -> None:
+    request = httpx.Request("POST", "https://test.invalid/v1/messages")
+
+    class Response:
+        status_code = 200
+        headers = {"request-id": "req-123", "model": "header-model"}
+
+        async def aiter_lines(self):
+            for line in (
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}',
+                "",
+            ):
+                yield line
+            raise httpx.ReadError("peer closed", request=request)
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            return False
+
+    class Client:
+        def stream(self, method, url, *, headers, json):
+            return Stream()
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    events = [
+        event
+        async for event in AnthropicBackend(client=Client(), token_store=store).complete(
+            [], []
+        )
+    ]
+
+    assert events[-1].message == Message(
+        MessageRole.ASSISTANT, [TextContent("partial")]
+    )
+    assert events[-1].data["truncated"] is True
+    record = json.loads(
+        (tmp_path / "logs" / "stream-diagnostics.jsonl").read_text().strip()
+    )
+    assert record["cause"] == "ReadError: peer closed"
+    assert record["request_id"] == "req-123"
+    assert record["model"] == "header-model"
+    assert record["sse_events_received"] == 3
+    assert record["open_blocks"] == 1
+    assert record["closed_blocks"] == 0
+
+
+def test_stream_diagnostic_log_rotates_at_size_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "logs" / "stream-diagnostics.jsonl"
+    monkeypatch.setattr(anthropic_module, "STREAM_DIAGNOSTICS_MAX_BYTES", 160)
+
+    anthropic_module._write_stream_diagnostic(path, {"cause": "x" * 100})
+    anthropic_module._write_stream_diagnostic(path, {"cause": "y" * 100})
+
+    assert path.exists()
+    assert path.with_name("stream-diagnostics.jsonl.1").exists()
+    assert path.stat().st_size <= 160
+    assert path.with_name("stream-diagnostics.jsonl.1").stat().st_size <= 160
 
 
 @pytest.mark.asyncio

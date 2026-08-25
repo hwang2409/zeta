@@ -47,6 +47,7 @@ AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_REDIRECT_URI = "http://localhost:53692/callback"
+STREAM_DIAGNOSTICS_MAX_BYTES = 1024 * 1024
 OAUTH_BETA = "oauth-2025-04-20"
 CLAUDE_CODE_BETA = "claude-code-20250219"
 OAUTH_SCOPES = (
@@ -81,6 +82,27 @@ class AnthropicStreamError(AnthropicBackendError):
     """Raised when an Anthropic SSE stream is invalid or ends early."""
 
     code = "stream_error"
+
+
+def _write_stream_diagnostic(path: Path, record: Mapping[str, Any]) -> None:
+    """Append one bounded, local-only record without affecting stream handling."""
+
+    try:
+        encoded = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
+        if (
+            path.exists()
+            and path.stat().st_size + len(encoded) > STREAM_DIAGNOSTICS_MAX_BYTES
+        ):
+            rotated = path.with_name(f"{path.name}.1")
+            rotated.unlink(missing_ok=True)
+            path.replace(rotated)
+        with path.open("ab") as handle:
+            handle.write(encoded)
+        os.chmod(path, 0o600)
+    except OSError:
+        return
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
@@ -334,12 +356,18 @@ class AnthropicBackend(CompletionBackend):
         base_url: str = API_URL,
         token_store: AnthropicCredentialStore | None = None,
         client: httpx.AsyncClient | None = None,
+        diagnostics_path: str | Path | None = None,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
         self.base_url = base_url.rstrip("/")
         self.token_store = token_store or AnthropicCredentialStore()
         self.client = client
+        self.diagnostics_path = (
+            Path(diagnostics_path)
+            if diagnostics_path is not None
+            else self.token_store.path.parent / "logs" / "stream-diagnostics.jsonl"
+        )
 
     def complete(
         self,
@@ -410,6 +438,7 @@ class AnthropicBackend(CompletionBackend):
                 "content-type": "application/json",
                 "user-agent": "zeta/0.1",
             }
+            stream_started_at = time.monotonic()
             stream_context = client.stream(
                 "POST", self.base_url, headers=headers, json=payload
             )
@@ -419,7 +448,12 @@ class AnthropicBackend(CompletionBackend):
                 if response.status_code >= 400:
                     body = await _read_error_body(response)
                     raise _http_error(response.status_code, body)
-                async for event in _decode_response(response):
+                async for event in _decode_response(
+                    response,
+                    diagnostics_path=self.diagnostics_path,
+                    model=self.model,
+                    stream_started_at=stream_started_at,
+                ):
                     yield event
             except AnthropicBackendError as exc:
                 primary_exception = exc
@@ -467,7 +501,13 @@ def _http_error(status_code: int, body: bytes) -> AnthropicHTTPError:
     return error_type(f"Anthropic HTTP {status_code}: {message}")
 
 
-async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEvent]:
+async def _decode_response(
+    response: httpx.Response,
+    *,
+    diagnostics_path: Path | None = None,
+    model: str | None = None,
+    stream_started_at: float | None = None,
+) -> AsyncIterator[StreamEvent]:
     decoder = _SSEDecoder()
     blocks: dict[int, _BlockState] = {}
     active_blocks: set[int] = set()
@@ -476,11 +516,80 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
     stop_reason: str | None = None
     finished = False
     message_state = "not-started"
+    started_at = time.monotonic() if stream_started_at is None else stream_started_at
+    last_event_at = started_at
+    bytes_received = 0
+    sse_events_received = 0
+    diagnostics_written = False
+
+    def write_diagnostic(
+        cause: str,
+        *,
+        open_block_count: int,
+        closed_block_count: int,
+    ) -> None:
+        nonlocal diagnostics_written
+        if diagnostics_path is None or diagnostics_written:
+            return
+        headers = getattr(response, "headers", {})
+        request_id = headers.get("request-id") or headers.get("x-request-id")
+        response_model = (
+            headers.get("model")
+            or headers.get("x-model")
+            or headers.get("anthropic-model")
+            or model
+        )
+        now = time.monotonic()
+        _write_stream_diagnostic(
+            diagnostics_path,
+            {
+                "timestamp": time.time(),
+                "cause": cause,
+                "stream_age_seconds": max(0.0, now - started_at),
+                "bytes_received": bytes_received,
+                "sse_events_received": sse_events_received,
+                "idle_gap_seconds": max(0.0, now - last_event_at),
+                "open_blocks": open_block_count,
+                "closed_blocks": closed_block_count,
+                "stop_reason": stop_reason,
+                "request_id": request_id,
+                "model": response_model,
+            },
+        )
+        diagnostics_written = True
+
+    def salvage(cause: str) -> StreamEvent:
+        open_blocks = set(active_blocks)
+        open_block_count = len(open_blocks)
+        closed_block_count = len(stopped_blocks)
+        active_blocks.clear()
+        translated = _finish_message(
+            blocks,
+            truncated=True,
+            open_blocks=open_blocks,
+        )
+        write_diagnostic(
+            cause,
+            open_block_count=open_block_count,
+            closed_block_count=closed_block_count,
+        )
+        return StreamEvent(
+            translated.type,
+            message=translated.message,
+            data={
+                **translated.data,
+                "usage": normalize_usage(usage),
+                "stop_reason": stop_reason,
+            },
+        )
 
     def process_record(record: tuple[str, dict[str, Any]]) -> StreamEvent | None:
         nonlocal message_state, stop_reason
         event, payload = record
         event_type = payload.get("type", event)
+        truncation_counts = None
+        if event_type == "message_stop" and active_blocks:
+            truncation_counts = (len(active_blocks), len(stopped_blocks))
         if type(event_type) is str:
             message_state = _advance_message_state(message_state, event_type)
         translated = _translate_event(
@@ -491,29 +600,55 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
             if not isinstance(delta, Mapping):
                 raise AnthropicStreamError("Anthropic message delta is invalid")
             stop_reason = delta.get("stop_reason")
+        if (
+            translated is not None
+            and translated.type is StreamEventType.MESSAGE_END
+            and translated.data.get("truncated")
+        ):
+            open_count, closed_count = truncation_counts or (
+                len(active_blocks),
+                len(stopped_blocks),
+            )
+            write_diagnostic(
+                "message_stop",
+                open_block_count=open_count,
+                closed_block_count=closed_count,
+            )
         return translated
 
-    async for line in response.aiter_lines():
-        record = decoder.feed(line)
-        if record is None:
-            continue
-        translated = process_record(record)
-        if translated is None:
-            continue
-        if translated.type is StreamEventType.MESSAGE_END:
-            translated = StreamEvent(
-                translated.type,
-                message=translated.message,
-                data={
-                    **translated.data,
-                    "usage": normalize_usage(usage),
-                    "stop_reason": stop_reason,
-                },
-            )
-            finished = True
-        yield translated
+    try:
+        async for line in response.aiter_lines():
+            bytes_received += len(line.encode()) + 1
+            record = decoder.feed(line)
+            if record is None:
+                continue
+            sse_events_received += 1
+            last_event_at = time.monotonic()
+            translated = process_record(record)
+            if translated is None:
+                continue
+            if translated.type is StreamEventType.MESSAGE_END:
+                translated = StreamEvent(
+                    translated.type,
+                    message=translated.message,
+                    data={
+                        **translated.data,
+                        "usage": normalize_usage(usage),
+                        "stop_reason": stop_reason,
+                    },
+                )
+                finished = True
+            yield translated
+    except httpx.HTTPError as exc:
+        if finished or message_state == "not-started":
+            raise
+        yield salvage(f"{type(exc).__name__}: {exc}")
+        return
+
     record = decoder.finish()
     if record is not None:
+        sse_events_received += 1
+        last_event_at = time.monotonic()
         translated = process_record(record)
         if translated is not None:
             if translated.type is StreamEventType.MESSAGE_END:
@@ -532,22 +667,7 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
     if not finished:
         if message_state == "not-started":
             raise AnthropicStreamError("Anthropic stream ended before message_start")
-        open_blocks = set(active_blocks)
-        active_blocks.clear()
-        translated = _finish_message(
-            blocks,
-            truncated=True,
-            open_blocks=open_blocks,
-        )
-        yield StreamEvent(
-            translated.type,
-            message=translated.message,
-            data={
-                **translated.data,
-                "usage": normalize_usage(usage),
-                "stop_reason": stop_reason,
-            },
-        )
+        yield salvage("clean-eof")
 
 
 def _translate_event(
