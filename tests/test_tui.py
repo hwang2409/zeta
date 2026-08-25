@@ -5,9 +5,11 @@ import os
 import pty
 import re
 import select
+import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import replace
 from io import StringIO
@@ -46,7 +48,7 @@ from zeta.tui.render import (
     render_tool_progress,
     tool_render_mode,
 )
-from zeta.tui.theme import ACCENT, BODY, CODE_BG
+from zeta.tui.theme import ACCENT, BODY, RICH_THEME
 from zeta.tui.transcript import TranscriptWidget
 from zeta.types import (
     CompletionBackend,
@@ -787,7 +789,7 @@ def test_render_helpers_use_the_zeta_palette() -> None:
     )
 
     assert markdown.style == BODY
-    assert code.background_color == CODE_BG
+    assert code.background_color is None
     assert start is not None
     styled_text = start if hasattr(start, "spans") else start.renderable
     assert any(ACCENT in str(span.style) for span in styled_text.spans)
@@ -1440,10 +1442,10 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
 
     root = session.layout.container
     assert len(root.children) == 1
-    centered = root.children[0]
-    assert centered.__class__.__name__ == "VSplit"
-    assert centered.children[0].__class__.__name__ == "Window"
-    content = centered.children[1]
+    padded = root.children[0]
+    assert padded.__class__.__name__ == "VSplit"
+    assert padded.children[0].__class__.__name__ == "Window"
+    content = padded.children[1]
     assert content.__class__.__name__ == "HSplit"
     assert content.children[0].__class__.__name__ == "Window"
     bottom = content.children[1]
@@ -1477,7 +1479,7 @@ def test_full_screen_footer_fits_content_column(
     monkeypatch.setattr("zeta.tui.app.get_app", lambda: SimpleNamespace(output=output))
 
     footer = "".join(value for _, value in app._status_toolbar())
-    content_width = min(100, terminal_width - 4)
+    content_width = terminal_width - 4
 
     assert cell_len(footer) <= content_width
     assert all(segment in footer for segment in right_segments)
@@ -1486,6 +1488,110 @@ def test_full_screen_footer_fits_content_column(
             segment not in footer
             for segment in ("/status", "ctrl+c interrupt")
         )
+
+
+def test_rich_rendering_does_not_paint_terminal_background() -> None:
+    output = StringIO()
+    console = Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        width=80,
+        theme=RICH_THEME,
+    )
+    console.print(render_markdown("# heading\n\n`inline`"))
+    console.print(render_code("print('hi')", "python"))
+    console.print(
+        render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_START,
+                tool_call=ToolCall("call-1", "bash", {"cmd": "pwd"}),
+            )
+        )
+    )
+
+    assert not re.search(r"\x1b\[[0-9;]*48(?:;[0-9;]*)?m", output.getvalue())
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+@pytest.mark.parametrize(("columns", "rows"), [(200, 45), (80, 24)])
+def test_full_screen_pty_keeps_padded_margins_clean(
+    tmp_path: Path, columns: int, rows: int
+) -> None:
+    session = f"zeta-pty-{uuid.uuid4().hex[:10]}"
+    zeta = Path(sys.executable).with_name("zeta")
+    env = os.environ.copy()
+    env["ZETA_HOME"] = str(tmp_path / "zeta-home")
+    env["TERM"] = "xterm-256color"
+    subprocess.run(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-x",
+            str(columns),
+            "-y",
+            str(rows),
+            str(zeta),
+            "--provider",
+            "fake",
+        ],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        check=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            capture = subprocess.run(
+                ["tmux", "capture-pane", "-t", session, "-p"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            if " > type a message..." in capture:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("zeta did not render the full-screen prompt")
+
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session, "hello", "Enter"],
+            check=True,
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            capture = subprocess.run(
+                ["tmux", "capture-pane", "-t", session, "-p"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            if "you said: hello" in capture:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("fake provider response did not render")
+
+        plain = subprocess.run(
+            ["tmux", "capture-pane", "-t", session, "-p"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        escaped = subprocess.run(
+            ["tmux", "capture-pane", "-e", "-t", session, "-p"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert any(line.startswith("  ▌ hello") for line in plain)
+        assert all(not line[:2].strip() for line in plain)
+        assert not re.search(r"\x1b\[[0-9;]*48(?:;[0-9;]*)?m", escaped)
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", session], check=False)
 
 
 @pytest.mark.parametrize(("width", "height"), [(120, 40), (80, 24), (40, 12)])

@@ -5,16 +5,17 @@ from __future__ import annotations
 from rich.theme import Theme
 
 
-SURFACE = "#0b0c0a"
-TINT = "#151713"
+# Keep surfaces transparent so zeta inherits the terminal theme.
+SURFACE = ""
+TINT = ""
 ACCENT = "#ff8a1f"
 DIM = "#8e938b"
 BODY = "#f1f2ed"
 ERROR = "bold #ff5c57"
-CODE_BG = "#252724"
+CODE_BG = None
 CODE_THEME = "monokai"
 CHROME = DIM
-CARD_BG = f"on {TINT}"
+CARD_BG = ""
 CARD_BORDER = "#50544d"
 COMPOSER_BORDER = "#50544d"
 COMPOSER_FOCUS = ACCENT
@@ -33,8 +34,8 @@ RICH_THEME = Theme(
         "markdown.h3": BODY,
         "markdown.link": f"{BODY} underline",
         "markdown.link_url": f"{CHROME} underline",
-        "markdown.code": f"{BODY} on {CODE_BG}",
-        "markdown.code_block": f"{BODY} on {CODE_BG}",
+        "markdown.code": BODY,
+        "markdown.code_block": BODY,
         "markdown.table.border": CHROME,
         "markdown.table.header": f"bold {BODY}",
         "zeta.card": CARD_BG,

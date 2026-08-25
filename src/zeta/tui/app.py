@@ -19,7 +19,7 @@ from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import DynamicStyle, Style
 from prompt_toolkit.layout import Dimension
-from prompt_toolkit.layout.containers import HSplit, HorizontalAlign, VSplit, Window
+from prompt_toolkit.layout.containers import HSplit, VSplit, Window
 from rich.console import Console, RenderableType
 from rich.padding import Padding
 from rich.text import Text
@@ -58,7 +58,6 @@ from .theme import (
     DIM,
     ERROR,
     RICH_THEME,
-    SURFACE,
     USER_ROLE,
 )
 from .transcript import TranscriptPresenter, TranscriptWidget
@@ -394,18 +393,18 @@ class TUIApp:
             style=DynamicStyle(
                 lambda: Style.from_dict(
                     {
-                        "": f"fg:{BODY} bg:{SURFACE}",
-                        "prompt": f"fg:{ACCENT} bold bg:{SURFACE}",
-                        "placeholder": f"italic fg:{DIM} bg:{SURFACE}",
-                        "status-bar": f"noreverse fg:{CHROME} bg:{SURFACE}",
-                        "frame": f"bg:{SURFACE}",
+                        "": f"fg:{BODY}",
+                        "prompt": f"fg:{ACCENT} bold",
+                        "placeholder": f"italic fg:{DIM}",
+                        "status-bar": f"noreverse fg:{CHROME}",
+                        "frame": "",
                         "frame.border": (
-                            f"fg:{COMPOSER_FOCUS} bg:{SURFACE}"
+                            f"fg:{COMPOSER_FOCUS}"
                             if get_app().current_buffer.name == "DEFAULT_BUFFER"
-                            else f"fg:{COMPOSER_BORDER} bg:{SURFACE}"
+                            else f"fg:{COMPOSER_BORDER}"
                         ),
-                        "text-area": f"fg:{BODY} bg:{SURFACE}",
-                        "text-area.prompt": f"fg:{ACCENT} bold bg:{SURFACE}",
+                        "text-area": f"fg:{BODY}",
+                        "text-area.prompt": f"fg:{ACCENT} bold",
                     }
                 )
             ),
@@ -435,7 +434,7 @@ class TUIApp:
 
     def _status_toolbar(self) -> FormattedText:
         terminal_width = get_app().output.get_size().columns
-        width = max(1, min(100, terminal_width - 4))
+        width = max(1, terminal_width - 4)
         usage = dict(self._usage)
         usage.setdefault(
             "cache_read_input_tokens",
@@ -843,18 +842,16 @@ class TUIApp:
                     height=Dimension(min=4, max=10),
                 ),
             ],
-            width=Dimension(min=1, preferred=100, max=100),
         )
-        centered = VSplit(
+        padded = VSplit(
             [
                 Window(width=2, char=" "),
                 content,
                 Window(width=2, char=" "),
             ],
-            align=HorizontalAlign.CENTER,
         )
         root.children[:] = [
-            centered,
+            padded,
         ]
 
     async def run(self, session: PromptSession[str] | None = None) -> None:
