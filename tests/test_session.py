@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from io import StringIO
@@ -329,21 +330,25 @@ def test_model_swap_persists_and_restores_on_resume(
     assert resumed.model == "faster"
 
 
-def test_unknown_model_swap_warns_and_changes_the_model(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_unknown_model_swap_warns_and_changes_the_model(tmp_path: Path) -> None:
     backend = FakeBackend([])
     app = TUIApp(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
         provider="claude",
         model="claude-sonnet-4-6",
+        model_catalog_loader=lambda provider: frozenset({"claude-sonnet-4-6"}),
     )
 
     output = create_slash_registry().dispatch(app, "/model offline")
+    await wait_until(lambda: app._model_catalog_loaded)
 
-    assert output == "model: offline (model not found in claude catalog — using anyway)"
+    assert output == "model: offline (model catalog unavailable for claude — using anyway)"
     assert app.model == "offline"
 
 
-def test_unknown_model_with_provider_prefix_warns_before_state_change(
+@pytest.mark.asyncio
+async def test_unknown_model_with_provider_prefix_warns_before_state_change(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -353,21 +358,24 @@ def test_unknown_model_with_provider_prefix_warns_before_state_change(
         AgentLoop(FakeBackend([]), opened.store),
         provider="claude",
         model="claude-sonnet-4-6",
+        model_catalog_loader=lambda provider: frozenset({"claude-sonnet-4-6"}),
     )
 
     output = create_slash_registry().dispatch(
         app, "/model claude-definitely-not-real"
     )
+    await wait_until(lambda: app._model_catalog_loaded)
 
     assert output == (
         "model: claude-definitely-not-real "
-        "(model not found in claude catalog — using anyway)"
+        "(model catalog unavailable for claude — using anyway)"
     )
     assert app.model == "claude-definitely-not-real"
     assert manager.open(opened.store.session_id).metadata.model == "claude-sonnet-4-6"
 
 
-def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
         provider="claude",
@@ -375,12 +383,19 @@ def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
         model_catalog_loader=lambda provider: frozenset({"claude-opus-4-7"}),
     )
 
+    first = create_slash_registry().dispatch(app, "/model claude-opus-4-7")
+    await wait_until(lambda: app._model_catalog_loaded)
     output = create_slash_registry().dispatch(app, "/model claude-opus-4-7")
 
+    assert first == (
+        "model: claude-opus-4-7 "
+        "(model catalog unavailable for claude — using anyway)"
+    )
     assert output == "model: claude-opus-4-7"
 
 
-def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
     calls: list[str] = []
 
     def load_catalog(provider: str) -> frozenset[str]:
@@ -395,16 +410,59 @@ def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
     )
 
     first = create_slash_registry().dispatch(app, "/model claude-new")
+    await wait_until(lambda: app._model_catalog_loaded)
     second = create_slash_registry().dispatch(app, "/model claude-other")
 
-    assert first == "model: claude-new (model not found in claude catalog — using anyway)"
+    assert first == (
+        "model: claude-new "
+        "(model catalog unavailable for claude — using anyway)"
+    )
     assert second == (
         "model: claude-other (model not found in claude catalog — using anyway)"
     )
     assert calls == ["claude"]
 
 
-def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def load_catalog(provider: str) -> frozenset[str]:
+        del provider
+        started.set()
+        release.wait(timeout=1)
+        return frozenset({"claude-opus-4-7"})
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="claude",
+        model="claude-sonnet-4-6",
+        model_catalog_loader=load_catalog,
+    )
+
+    began = time.monotonic()
+    first = create_slash_registry().dispatch(app, "/model claude-opus-4-7")
+    elapsed = time.monotonic() - began
+
+    try:
+        assert elapsed < 0.25
+        assert first == (
+            "model: claude-opus-4-7 "
+            "(model catalog unavailable for claude — using anyway)"
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+    finally:
+        release.set()
+
+    await wait_until(lambda: app._model_catalog_loaded)
+    assert create_slash_registry().dispatch(app, "/model claude-opus-4-7") == (
+        "model: claude-opus-4-7"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
         provider="codex",
@@ -413,6 +471,7 @@ def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
     )
 
     output = create_slash_registry().dispatch(app, "/model gpt-5.6-sol")
+    await wait_until(lambda: app._model_catalog_loaded)
 
     assert output == "model: gpt-5.6-sol (model catalog unavailable for codex — using anyway)"
 
@@ -710,6 +769,7 @@ async def test_forced_override_commits_after_first_successful_request(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider: None)
     first = create_app(_args())
     session_id = first.loop.store.session_id
     backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
@@ -733,7 +793,8 @@ async def test_forced_override_commits_after_first_successful_request(
         )
     )
     assert create_slash_registry().dispatch(app, "/model claude-opus-4-1") == (
-        "model: claude-opus-4-1 (model not found in claude catalog — using anyway)"
+        "model: claude-opus-4-1 "
+        "(model catalog unavailable for claude — using anyway)"
     )
     assert json.loads(
         (home / "sessions" / session_id / "meta.json").read_text()

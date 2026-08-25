@@ -51,7 +51,8 @@ from .render import (
 )
 from .theme import ACCENT, BODY, CHROME, DIM, ERROR, RICH_THEME, SURFACE, USER_ROLE
 from .transcript import TranscriptPresenter, TranscriptWidget
-from .models import load_model_catalog as _load_model_catalog, validate_model_name
+from .models import MODEL_CATALOGS, load_model_catalog as _load_model_catalog
+from .models import validate_model_name
 
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -228,8 +229,9 @@ class TUIApp:
         self._context_files = tuple(context_files)
         self._on_model_change = on_model_change
         self._model_catalog_loader = model_catalog_loader or _load_model_catalog
-        self._model_catalog_loaded = False
-        self._model_catalog: frozenset[str] | None = None
+        self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
+        self._model_catalog_loaded = self._model_catalog is not None
+        self._model_catalog_task: asyncio.Task[None] | None = None
         self._slash_commands = create_slash_registry()
         self._compaction_shown = False
         self._turn_had_visible_output = False
@@ -308,11 +310,7 @@ class TUIApp:
         except ValueError as exc:
             return f"model unchanged: {exc}"
         if not self._model_catalog_loaded:
-            self._model_catalog_loaded = True
-            try:
-                self._model_catalog = self._model_catalog_loader(self.provider)
-            except Exception:
-                self._model_catalog = None
+            self._start_model_catalog_load()
         if self._model_catalog is None:
             catalog_warning = f"model catalog unavailable for {self.provider} — using anyway"
         elif model not in self._model_catalog:
@@ -333,6 +331,28 @@ class TUIApp:
         if catalog_warning is not None:
             return f"model: {model} ({catalog_warning})"
         return f"model: {model}"
+
+    def _start_model_catalog_load(self) -> None:
+        if self._model_catalog_task is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._model_catalog_task = loop.create_task(
+            self._load_model_catalog_in_background()
+        )
+
+    async def _load_model_catalog_in_background(self) -> None:
+        try:
+            self._model_catalog = await asyncio.to_thread(
+                self._model_catalog_loader, self.provider
+            )
+        except Exception:
+            self._model_catalog = None
+        finally:
+            self._model_catalog_loaded = True
+            self._model_catalog_task = None
 
     async def slash_compact(self) -> str:
         """Force one compaction through the context assembler."""

@@ -55,12 +55,10 @@ def _model_names_from_payload(payload: Any) -> frozenset[str] | None:
 
 def _load_codex_model_catalog() -> frozenset[str] | None:
     configured_home = os.environ.get("CODEX_HOME")
+    codex_home = Path(configured_home) if configured_home else Path.home() / ".codex"
     candidates = (
-        (
-            Path(configured_home) / "models.json"
-            if configured_home
-            else Path.home() / ".codex" / "models.json"
-        ),
+        codex_home / "models_cache.json",
+        codex_home / "models.json",
         Path.home() / ".config" / "codex" / "models.json",
         Path(__file__).with_name("models.json"),
     )
