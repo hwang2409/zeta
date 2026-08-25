@@ -11,7 +11,6 @@ from .core.context import ContextAssembler
 from .core.store import ConversationStore
 from .mcp import MCPMount, mount_mcp_servers
 from .prompts import load_identity
-from .skills import discover_packaged_skills
 from .tools import ToolHandler, ToolRegistry
 from .tools.registry import validate_tool_result
 from .types import (
@@ -105,7 +104,6 @@ class AgentLoop:
     ) -> None:
         self.backend = backend
         self.store = store
-        skill_catalog = discover_packaged_skills()
         if registry is not None and tools is not None:
             raise ValueError("pass only one tool registry")
         if registry is not None:
@@ -146,7 +144,6 @@ class AgentLoop:
         self._mcp_mount_attempted = False
         self._provided_tool_schemas = tool_schemas is not None
         self.tool_registry.bind_session_store(store)
-        self.tool_registry.set_skill_loader(skill_catalog.load)
         if (
             approval_policy is not None
             and self.tool_registry.approval_policy is not None

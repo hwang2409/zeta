@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import ast
-import json
 from dataclasses import dataclass
 from functools import cache
+from html import escape
 from pathlib import Path
+import re
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,13 +15,6 @@ class SkillMeta:
     description: str
     keywords: list[str]
     path: Path
-
-    @property
-    def triggers(self) -> list[str]:
-        """Compatibility name for the ZETA-21 stub field."""
-
-        return self.keywords
-
 
 @dataclass(frozen=True, slots=True)
 class SkillCatalog:
@@ -32,9 +25,9 @@ class SkillCatalog:
         if not self.skills:
             lines.append("- none")
         for skill in self.skills:
-            keywords = ", ".join(skill.keywords) or "none"
             lines.append(
-                f"- {skill.name}: {skill.description} (keywords: {keywords})"
+                f"- {escape(skill.name, quote=True)}: "
+                f"{escape(skill.description, quote=True)}"
             )
         lines.append("</zeta-skills>")
         return "\n".join(lines)
@@ -60,11 +53,20 @@ def discover_skills(home: Path) -> list[SkillMeta]:
     if not skills_dir.is_dir():
         return []
     discovered: list[SkillMeta] = []
+    paths_by_name: dict[str, Path] = {}
     for path in sorted(skills_dir.glob("*.md")):
         metadata, _ = _read_skill(path)
+        name = metadata["name"]
+        assert isinstance(name, str)
+        previous_path = paths_by_name.get(name)
+        if previous_path is not None:
+            raise ValueError(
+                f"duplicate skill name {name!r} in {previous_path} and {path}"
+            )
+        paths_by_name[name] = path
         discovered.append(
             SkillMeta(
-                name=metadata["name"],
+                name=name,
                 description=metadata["description"],
                 keywords=metadata["keywords"],
                 path=path,
@@ -108,24 +110,23 @@ def _read_skill(path: Path) -> tuple[dict[str, str | list[str]], str]:
 def _parse_frontmatter(
     lines: list[str], path: Path
 ) -> dict[str, str | list[str]]:
-    values: dict[str, str | list[str]] = {}
+    values: dict[str, object] = {}
     current_key: str | None = None
-    allowed = {"name", "description", "keywords", "triggers"}
+    allowed = {"name", "description", "keywords"}
     for line in lines:
         if not line.strip():
             continue
         if line.startswith((" ", "\t")):
-            if current_key not in {"keywords", "triggers"} or not line.lstrip().startswith(
-                "-"
-            ):
+            if current_key != "keywords" or not line.lstrip().startswith("-"):
                 raise ValueError(
                     f"skill {path} has malformed frontmatter line: {line!r}"
                 )
             values.setdefault(current_key, [])
             value = line.lstrip()[1:].strip()
-            if not value or not isinstance(values[current_key], list):
+            keyword_values = values[current_key]
+            if not value or not isinstance(keyword_values, list):
                 raise ValueError(f"skill {path} has malformed keyword list")
-            values[current_key].append(_scalar(value, path))
+            keyword_values.append(_scalar(value, path))
             continue
         if ":" not in line:
             raise ValueError(f"skill {path} has malformed frontmatter line: {line!r}")
@@ -137,12 +138,10 @@ def _parse_frontmatter(
         raw_value = raw_value.strip()
         values[key] = (
             []
-            if key in {"keywords", "triggers"} and not raw_value
+            if key == "keywords" and not raw_value
             else _scalar(raw_value, path)
         )
 
-    if "keywords" not in values and "triggers" in values:
-        values["keywords"] = values.pop("triggers")
     required = {"name", "description", "keywords"}
     if set(values) != required:
         missing = ", ".join(sorted(required - set(values))) or "none"
@@ -150,9 +149,11 @@ def _parse_frontmatter(
             f"skill {path} frontmatter must contain name, description, keywords; "
             f"missing: {missing}"
         )
-    if not isinstance(values["name"], str) or not values["name"]:
+    name = values["name"]
+    if not isinstance(name, str) or not name:
         raise ValueError(f"skill {path} frontmatter name must be a nonempty string")
-    if not isinstance(values["description"], str) or not values["description"]:
+    description = values["description"]
+    if not isinstance(description, str) or not description:
         raise ValueError(
             f"skill {path} frontmatter description must be a nonempty string"
         )
@@ -163,39 +164,57 @@ def _parse_frontmatter(
         raise ValueError(
             f"skill {path} frontmatter keywords must be a list of strings"
         )
-    return values
+    return {"name": name, "description": description, "keywords": keywords}
 
 
-def _scalar(value: str, path: Path) -> str | list[str]:
+def _scalar(value: str, path: Path) -> object:
     if not value:
         return ""
     if value.startswith("[") or value.endswith("]"):
         if not value.startswith("[") or not value.endswith("]"):
             raise ValueError(f"skill {path} has malformed list value")
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            try:
-                parsed = ast.literal_eval(value)
-            except (ValueError, SyntaxError) as exc:
-                items = [item.strip() for item in value[1:-1].split(",")]
-                if not items or any(not item for item in items):
-                    raise ValueError(f"skill {path} has malformed list value") from exc
-                parsed = [_scalar(item, path) for item in items]
-        if not isinstance(parsed, list):
-            raise ValueError(f"skill {path} list value is not a list")
-        return [str(item) for item in parsed]
+        contents = value[1:-1].strip()
+        return [] if not contents else [
+            _scalar(item, path) for item in _split_inline_list(contents, path)
+        ]
     if value[0] in "\"'" or value[-1] in "\"'":
-        if value[0] != value[-1]:
+        if len(value) < 2 or value[0] != value[-1]:
             raise ValueError(f"skill {path} has malformed scalar value: {value!r}")
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        try:
-            parsed = ast.literal_eval(value)
-        except (ValueError, SyntaxError):
-            parsed = value
-    return parsed if isinstance(parsed, str) else str(parsed)
+        return value[1:-1]
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    if value.lower() in {"null", "~"}:
+        return None
+    if re.fullmatch(r"[-+]?\d+", value):
+        return int(value)
+    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+)", value):
+        return float(value)
+    return value
+
+
+def _split_inline_list(value: str, path: Path) -> list[str]:
+    items: list[str] = []
+    start = 0
+    quote: str | None = None
+    for index, character in enumerate(value):
+        if quote is not None:
+            if character == quote:
+                quote = None
+        elif character in "\"'":
+            quote = character
+        elif character == ",":
+            item = value[start:index].strip()
+            if not item:
+                raise ValueError(f"skill {path} has malformed list value")
+            items.append(item)
+            start = index + 1
+    if quote is not None:
+        raise ValueError(f"skill {path} has malformed list value")
+    item = value[start:].strip()
+    if not item:
+        raise ValueError(f"skill {path} has malformed list value")
+    items.append(item)
+    return items
 
 
 __all__ = [

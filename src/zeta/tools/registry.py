@@ -50,7 +50,6 @@ ToolHandlerResult = str | StructuredToolResult | ToolResult
 ToolHandler = Callable[
     ..., ToolHandlerResult | Awaitable[ToolHandlerResult]
 ]
-SkillLoader = Callable[[str], str]
 ToolStream = Literal["stdout", "stderr"]
 
 
@@ -356,7 +355,6 @@ class ToolRegistry:
         if self.approval_policy is not None and approval_store is not None:
             self.approval_policy.bind_store(approval_store)
         self.max_output_chars = max_output_chars
-        self._skill_loader: SkillLoader | None = None
         self._session_store = session_store
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
@@ -441,18 +439,6 @@ class ToolRegistry:
     def bind_session_store(self, store: ConversationStore) -> None:
         self._session_store = store
         self.bash_cwd = store.bash_cwd
-
-    def set_skill_loader(self, loader: SkillLoader) -> None:
-        """Bind the session's static skill catalog to the built-in tool."""
-
-        self._skill_loader = loader
-
-    def load_skill(self, name: str) -> str:
-        if type(name) is not str or not name:
-            raise ValueError("skill name must be a nonempty string")
-        if self._skill_loader is None:
-            raise ValueError("skills are not available")
-        return self._skill_loader(name)
 
     def update_bash_cwd(self, cwd: str) -> None:
         if self._session_store is not None:
