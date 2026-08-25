@@ -159,7 +159,7 @@ def _tool_header(call: ToolCall) -> RenderableType:
                 _shell_syntax(command),
             ],
             padding=(0, 1),
-            expand=True,
+            expand=False,
         )
     return Text.assemble((call.name, COMMAND), (f" {_arguments(call.arguments)}", DIM))
 
