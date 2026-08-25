@@ -5,6 +5,7 @@ import hashlib
 import json
 import threading
 import uuid
+from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from zeta.cli import build_parser, main
 from zeta.types import (
     Message,
     MessageRole,
+    StreamEvent,
+    StreamEventType,
     TextContent,
     ToolCall,
     ToolResult,
@@ -31,6 +34,14 @@ from zeta.types import (
 
 def _args(*values: str):
     return build_parser().parse_args([*values, "--provider", "fake"])
+
+
+async def wait_until(check: Callable[[], bool]) -> None:
+    for _ in range(100):
+        if check():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition did not become true")
 
 
 def test_fresh_cli_session_writes_versioned_directory(
@@ -516,6 +527,47 @@ async def test_resumed_pending_approval_is_presented_and_resolvable(
 
 
 @pytest.mark.asyncio
+async def test_cancel_then_approve_does_not_resume_tool(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    policy = ApprovalPolicy(store=opened.store)
+    executed: list[str] = []
+
+    async def echo(arguments: dict[str, str]) -> str:
+        executed.append(arguments["value"])
+        return arguments["value"]
+
+    call = ToolCall("approval-cancel-then-approve", "echo", {"value": "no"})
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([ScriptedTurn(tool_calls=[call])]),
+            opened.store,
+            tools={"echo": echo},
+            approval_policy=policy,
+            max_turns=1,
+        ),
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+    )
+    turn = asyncio.create_task(app._consume_turn("start"))
+    app._active_task = turn
+    await wait_until(lambda: bool(app.pending_approvals))
+
+    app.abort_active()
+    await asyncio.gather(turn, return_exceptions=True)
+
+    assert app.pending_approvals == ()
+    assert opened.store.messages()[-1].tool_result is not None
+    assert opened.store.messages()[-1].tool_result.content == "tool execution canceled"
+    assert await app._handle_approval_input(f"approve {call.id}")
+    assert executed == []
+    assert len(
+        [message for message in opened.store.messages() if message.tool_result is not None]
+    ) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("decision", ["allow", "deny"])
 async def test_resume_pending_tool_executes_and_persists_result(
     tmp_path: Path, decision: str
@@ -545,11 +597,17 @@ async def test_resume_pending_tool_executes_and_persists_result(
     else:
         assert policy.deny(call.id)
 
-    result = await loop.resume_pending_tool(call.id)
+    events = []
+    result = await loop.resume_pending_tool(call.id, event_sink=events.append)
 
     assert result is not None
     assert opened.store.messages()[-1].tool_result == result
     assert executed == (["done"] if decision == "allow" else [])
+    assert [event.type for event in events] == (
+        [StreamEventType.TOOL_EXECUTION_START, StreamEventType.TOOL_EXECUTION_END]
+        if decision == "allow"
+        else [StreamEventType.TOOL_EXECUTION_END]
+    )
 
 
 @pytest.mark.asyncio
@@ -616,7 +674,8 @@ async def test_resumed_tool_direct_cancel_persists_canceled_result(tmp_path: Pat
         [(call.id, call)],
     )
     policy.approve(call.id)
-    task = asyncio.create_task(loop.resume_pending_tool(call.id))
+    events: list[StreamEvent] = []
+    task = asyncio.create_task(loop.resume_pending_tool(call.id, event_sink=events.append))
     await started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -624,6 +683,10 @@ async def test_resumed_tool_direct_cancel_persists_canceled_result(tmp_path: Pat
 
     assert opened.store.messages()[-1].tool_result is not None
     assert opened.store.messages()[-1].tool_result.content == "tool execution canceled"
+    assert [event.type for event in events] == [
+        StreamEventType.TOOL_EXECUTION_START,
+        StreamEventType.TOOL_EXECUTION_END,
+    ]
 
 
 @pytest.mark.asyncio
@@ -710,6 +773,46 @@ def test_completion_edge_idempotence_preserves_success(tmp_path: Path) -> None:
 
     assert result == success
     assert results == [success]
+
+
+@pytest.mark.asyncio
+async def test_resume_pending_tool_rejects_existing_result(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    policy = ApprovalPolicy(store=opened.store)
+    executed: list[str] = []
+
+    async def echo(arguments: dict[str, str]) -> str:
+        executed.append(arguments["value"])
+        return arguments["value"]
+
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        tools={"echo": echo},
+        approval_policy=policy,
+    )
+    call = ToolCall("approval-existing-result", "echo", {"value": "done"})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    assert policy.approve(call.id)
+    success = ToolResult(call.id, "already completed")
+    opened.store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent(success.content)],
+            tool_result=success,
+        )
+    )
+
+    events: list[StreamEvent] = []
+    result = await loop.resume_pending_tool(call.id, event_sink=events.append)
+
+    assert result == success
+    assert executed == []
+    assert events == []
 
 
 @pytest.mark.asyncio

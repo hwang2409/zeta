@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
@@ -42,6 +43,41 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
     assert [message.role for message in store.messages()] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_lifecycle_events_separate_approval_from_execution(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("approval-live", "echo", {"value": "ok"})
+    store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(store=store)
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    loop = AgentLoop(
+        backend,
+        store,
+        tools={"echo": lambda arguments: arguments["value"]},
+        approval_policy=policy,
+        max_turns=1,
+    )
+
+    events: list[StreamEvent] = []
+    async for event in loop.run_turn("start"):
+        events.append(event)
+        if event.type is StreamEventType.TOOL_APPROVAL_START:
+            assert policy.approve(call.id)
+
+    lifecycle = [
+        event.type
+        for event in events
+        if event.tool_call is not None and event.tool_call.id == call.id
+    ]
+    assert lifecycle == [
+        StreamEventType.TOOL_APPROVAL_START,
+        StreamEventType.TOOL_APPROVAL_END,
+        StreamEventType.TOOL_EXECUTION_START,
+        StreamEventType.TOOL_EXECUTION_END,
     ]
 
 

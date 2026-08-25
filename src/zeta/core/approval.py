@@ -207,13 +207,24 @@ class ApprovalGate:
         arguments: dict[str, object],
         signal: AbortSignal,
         advance_generation: AdvanceGeneration,
+        lifecycle: Callable[[str], None] | None = None,
     ) -> tuple[ToolResult | None, AbortSignal]:
         execution_signal = signal
         if self.policy is not None:
+            approval_started = (
+                self.policy.durable_decision(tool_call.id) is None
+                and self.policy.decide(tool_call.name, arguments)
+                is ApprovalDecision.ASK
+            )
+            if approval_started and lifecycle is not None:
+                lifecycle("approval_start")
             try:
                 decision = await self.policy.authorize(tool_call, signal)
             except Exception as exc:
                 return ToolResult(tool_call.id, f"approval failed: {exc}", True), execution_signal
+            finally:
+                if approval_started and lifecycle is not None:
+                    lifecycle("approval_end")
             if decision is None:
                 return canceled_result(tool_call.id), execution_signal
             if signal.is_set():

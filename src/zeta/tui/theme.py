@@ -1,30 +1,44 @@
-"""Shared visual tokens for the inline terminal UI."""
+"""Shared visual tokens for the full-screen terminal UI."""
 
 from __future__ import annotations
 
 from rich.theme import Theme
 
 
-ACCENT = "#62d8ff"
-DIM = "dim"
-BODY = "bright_white"
-ERROR = "bold red"
-OK = "green"
-USER_PREFIX = "bold #62d8ff"
-CODE_BG = "#1c1f2b"
-CHROME = "#677083"
+SURFACE = "#181918"
+TINT = "#20211f"
+ACCENT = "#ff8a1f"
+DIM = "#8e938b"
+BODY = "#f1f2ed"
+ERROR = "bold #ff5c57"
+CODE_BG = "#252724"
+CODE_THEME = "monokai"
+CHROME = DIM
+CARD_BG = f"on {TINT}"
+CARD_BORDER = "#50544d"
+COMMAND = f"bold {ACCENT}"
+RECEIPT = CHROME
+THOUGHT = f"italic {CHROME}"
+AFFORDANCE = f"dim {DIM}"
+USER_ROLE = ACCENT
 
 RICH_THEME = Theme(
     {
         "markdown.paragraph": BODY,
-        "markdown.h1": f"bold {ACCENT}",
-        "markdown.h2": f"bold {ACCENT}",
-        "markdown.h3": ACCENT,
-        "markdown.link": f"{ACCENT} underline",
+        "markdown.h1": f"bold {BODY}",
+        "markdown.h2": f"bold {BODY}",
+        "markdown.h3": BODY,
+        "markdown.link": f"{BODY} underline",
         "markdown.link_url": f"{CHROME} underline",
-        "markdown.code": f"bold {ACCENT} on {CODE_BG}",
-        "markdown.code_block": f"{ACCENT} on {CODE_BG}",
+        "markdown.code": f"{BODY} on {CODE_BG}",
+        "markdown.code_block": f"{BODY} on {CODE_BG}",
         "markdown.table.border": CHROME,
-        "markdown.table.header": f"bold {ACCENT}",
+        "markdown.table.header": f"bold {BODY}",
+        "zeta.card": CARD_BG,
+        "zeta.card.border": CARD_BORDER,
+        "zeta.command": COMMAND,
+        "zeta.receipt": RECEIPT,
+        "zeta.thought": THOUGHT,
+        "zeta.affordance": AFFORDANCE,
     }
 )
