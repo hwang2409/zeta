@@ -68,8 +68,8 @@ class TranscriptWidget(UIControl):
         self._scroll_offset = 0
         self._viewport_height = 1
         self._content_width = 80
-        self._last_width: int | None = None
         self._line_locations: list[tuple[_TranscriptUnit | None, int]] = []
+        self._anchor: tuple[_TranscriptUnit | None, int] | None = None
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -126,6 +126,8 @@ class TranscriptWidget(UIControl):
             for unit in self._units
             if unit is None or unit.value not in active
         ]
+        if self._anchor is not None and self._anchor[0] not in self._units:
+            self._anchor = None
         for key in removed_keys:
             self._render_cache.pop(key, None)
         self._tools.clear()
@@ -144,6 +146,9 @@ class TranscriptWidget(UIControl):
         tail = max(0, line_count - self._viewport_height)
         self._scroll_offset = min(max(0, value), tail)
         self._follow_tail = self._scroll_offset >= tail
+        locations = self._locations(self._content_width)
+        if locations:
+            self._anchor = locations[min(self._scroll_offset, len(locations) - 1)]
 
     def page_up(self) -> None:
         self._set_scroll_offset(self._scroll_offset - self._viewport_height)
@@ -280,22 +285,14 @@ class TranscriptWidget(UIControl):
     def create_content(self, width: int, height: int | None) -> UIContent:
         width = max(1, width)
         height = max(1, height or 1)
-        old_anchor: tuple[_TranscriptUnit | None, int] | None = None
-        resized = self._last_width is not None and self._last_width != width
-        if resized and not self._follow_tail:
-            old_locations = self._locations(self._last_width or width)
-            if old_locations:
-                old_anchor = old_locations[
-                    min(self._scroll_offset, len(old_locations) - 1)
-                ]
         self._content_width = max(1, width)
         self._viewport_height = height
         lines = self._parsed_lines(width)
         locations = self._locations(width)
         if self._follow_tail:
             self._scroll_offset = max(0, len(lines) - self._viewport_height)
-        elif old_anchor is not None:
-            anchor_index = self._anchor_index(locations, old_anchor)
+        elif self._anchor is not None:
+            anchor_index = self._anchor_index(locations, self._anchor)
             self._scroll_offset = (
                 anchor_index
                 if anchor_index is not None
@@ -314,7 +311,6 @@ class TranscriptWidget(UIControl):
             self._follow_tail = True
         if self._follow_tail:
             self._scroll_offset = tail
-        self._last_width = width
         self._line_locations = locations
         cursor_y = min(self._scroll_offset, len(lines) - 1)
         return UIContent(

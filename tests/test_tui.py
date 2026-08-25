@@ -376,6 +376,60 @@ def test_transcript_resize_preserves_offset_in_long_wrapped_unit() -> None:
     assert not transcript.follow_tail
 
 
+def test_transcript_resize_round_trip_preserves_canonical_token() -> None:
+    source = " ".join(f"token-{index:03}" for index in range(500))
+    transcript = TranscriptWidget()
+    transcript.append(Text(source))
+    transcript.create_content(20, 3)
+    for _ in range(10):
+        transcript.scroll_up()
+    transcript.create_content(20, 3)
+    initial_token = transcript.lines(20)[transcript.scroll_offset].strip().split()[0]
+
+    transcript.create_content(80, 3)
+    transcript.create_content(20, 3)
+
+    round_trip_token = transcript.lines(20)[transcript.scroll_offset].strip().split()[0]
+    assert round_trip_token == initial_token
+    assert not transcript.follow_tail
+
+
+def test_transcript_resize_cycles_have_zero_anchor_drift() -> None:
+    source = " ".join(f"token-{index:03}" for index in range(500))
+    transcript = TranscriptWidget()
+    transcript.append(Text(source))
+    transcript.create_content(20, 3)
+    for _ in range(10):
+        transcript.scroll_up()
+    transcript.create_content(20, 3)
+    initial_anchor = transcript._anchor
+
+    for _ in range(3):
+        transcript.create_content(80, 3)
+        transcript.create_content(20, 3)
+        assert transcript._anchor == initial_anchor
+        assert transcript._line_locations[transcript.scroll_offset] == initial_anchor
+
+
+def test_transcript_resize_preserves_anchor_in_unbroken_unit() -> None:
+    source = "".join(f"{index:03}" for index in range(500))
+    transcript = TranscriptWidget()
+    transcript.append(Text(source))
+    transcript.create_content(20, 3)
+    for _ in range(10):
+        transcript.scroll_up()
+    transcript.create_content(20, 3)
+    initial_anchor = transcript._anchor
+
+    assert len(transcript.units) == 1
+    assert len(transcript.lines(20)) > 10
+    for width in (80, 20, 80, 20, 80, 20):
+        transcript.create_content(width, 3)
+
+    assert transcript._anchor == initial_anchor
+    assert transcript._line_locations[transcript.scroll_offset] == initial_anchor
+
+
 def test_transcript_parsed_cache_is_bounded_and_revision_scoped() -> None:
     transcript = TranscriptWidget()
     transcript.append(Text("line"))
