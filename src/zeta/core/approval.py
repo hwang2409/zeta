@@ -186,7 +186,9 @@ def _decision(value: ApprovalDecision | str) -> ApprovalDecision:
         raise ValueError(f"invalid approval decision: {value}") from exc
 
 
-ApprovalHook = Callable[[str, dict[str, object]], bool | Awaitable[bool] | None]
+ApprovalHook = Callable[
+    [str, dict[str, object]], bool | str | Awaitable[bool | str] | None
+]
 AdvanceGeneration = Callable[[AbortSignal], AbortSignal]
 
 
@@ -248,6 +250,8 @@ class ApprovalGate:
                 allowed = await allowed
         except Exception as exc:
             return ToolResult(tool_call.id, f"pre-execution hook failed: {exc}", True), execution_signal
+        if isinstance(allowed, str):
+            return ToolResult(tool_call.id, allowed, True), execution_signal
         if allowed is False:
             return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
         if signal.is_set() and execution_signal is signal:

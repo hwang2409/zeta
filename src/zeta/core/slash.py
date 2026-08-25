@@ -25,6 +25,7 @@ class SlashStatus:
     output_tokens_this_session: int = 0
     context_files: tuple[str, ...] = ()
     vim_mode: bool = True
+    hooks: tuple[str, ...] = ()
 
 
 class SlashSession(Protocol):
@@ -135,6 +136,7 @@ def _format_status(status: SlashStatus) -> str:
             f"prompt_cache_hit_rate: {cache_hit_rate}",
             f"output_tokens_this_session: {status.output_tokens_this_session}",
             "context_files: " + (", ".join(status.context_files) or "none"),
+            "hooks: " + (", ".join(status.hooks) or "none"),
         )
     )
 
