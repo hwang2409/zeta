@@ -15,6 +15,7 @@ from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
+from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionError, SessionManager
 from zeta.tui.app import TUIApp, create_app
 from zeta.cli import build_parser, main
@@ -173,6 +174,66 @@ def test_partial_context_metadata_is_replaced_with_fallback_snapshot(
 
     assert "replacement rules" in prompt
     assert saved["context_files"] == [str(context_file.resolve())]
+
+
+def test_concurrent_legacy_resumes_adopt_the_persisted_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    session_id = opened.store.session_id
+    metadata_path = home / "sessions" / session_id / "meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("system_prompt")
+    metadata.pop("context_files")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    barrier = threading.Barrier(2)
+    load_count = 0
+    load_count_lock = threading.Lock()
+
+    def load_context(*, repo_root: Path, zeta_home: Path) -> ProjectContext:
+        del repo_root, zeta_home
+        nonlocal load_count
+        with load_count_lock:
+            index = load_count
+            load_count += 1
+        barrier.wait()
+        return ProjectContext(f"fallback {index}", (tmp_path / f"context-{index}.md",))
+
+    monkeypatch.setattr("zeta.tui.app.load_project_context", load_context)
+    apps: list[TUIApp] = []
+    errors: list[Exception] = []
+
+    def resume() -> None:
+        try:
+            apps.append(
+                create_app(
+                    build_parser().parse_args(
+                        ["--resume", session_id, "--provider", "fake"]
+                    )
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=resume)
+    second = threading.Thread(target=resume)
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+
+    assert errors == []
+    assert load_count == 2
+    saved = SessionManager(home).open(session_id).metadata
+    prompts = [app.loop.context_assembler.system_prompt.content[0].text for app in apps]
+    context_files = [app.slash_status().context_files for app in apps]
+    assert saved.system_prompt in {"fallback 0", "fallback 1"}
+    assert prompts == [saved.system_prompt, saved.system_prompt]
+    assert context_files == [tuple(saved.context_files), tuple(saved.context_files)]
 
 
 def test_session_bash_cwd_round_trips_through_store_state(

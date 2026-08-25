@@ -712,10 +712,14 @@ def create_app(args: argparse.Namespace) -> TUIApp:
                 repo_root=discover_repo_root(Path(metadata.cwd)),
                 zeta_home=home,
             )
-            manager.persist_context_snapshot(
+            persisted = manager.persist_context_snapshot(
                 metadata,
                 system_prompt=project_context.system_prompt,
                 context_files=[str(path) for path in project_context.files],
+            )
+            project_context = ProjectContext(
+                persisted.system_prompt,
+                tuple(Path(path) for path in persisted.context_files),
             )
     else:
         provider = args.provider or "fake"

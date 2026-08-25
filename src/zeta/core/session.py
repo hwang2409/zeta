@@ -246,7 +246,7 @@ class SessionManager:
         *,
         system_prompt: str,
         context_files: list[str] | tuple[str, ...],
-    ) -> None:
+    ) -> SessionMetadata:
         def update(item: SessionMetadata) -> SessionMetadata:
             if item.system_prompt:
                 return item
@@ -256,6 +256,7 @@ class SessionManager:
 
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
+        return current
 
     def record_override(
         self,
