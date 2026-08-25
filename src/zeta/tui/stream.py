@@ -17,7 +17,7 @@ def stream_key(
     index = event.data.get("index")
     identity = (
         ("index", index)
-        if isinstance(index, (int, str))
+        if isinstance(index, (int, str, tuple))
         else None
     )
     if isinstance(content, ThinkingContent):

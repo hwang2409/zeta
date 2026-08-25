@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
 import pty
 import re
@@ -36,6 +38,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.providers.anthropic import AnthropicBackend, AnthropicCredentialStore, OAuthTokens
+from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
 from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.composer import (
@@ -93,6 +96,128 @@ def _contains_background_sgr(value: str) -> bool:
         for sequence in re.findall(r"\x1b\[([0-9;]*)m", value)
         for parameter in sequence.split(";")
     )
+
+
+def _codex_access_token() -> str:
+    def encode(value: object) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+    return ".".join(
+        (
+            encode({"alg": "none"}),
+            encode(
+                {
+                    "exp": 4_000_000_000,
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "account-test"
+                    },
+                }
+            ),
+            encode({"signature": "fixture"}),
+        )
+    )
+
+
+def _codex_sse(events: list[dict[str, object]]) -> str:
+    return "".join(
+        f"event: {value['type']}\ndata: {json.dumps(value)}\n\n" for value in events
+    )
+
+
+def _codex_event(event_type: str, **values: object) -> dict[str, object]:
+    return {"type": event_type, **values}
+
+
+def _codex_reasoning_events(items: list[tuple[str, str]]) -> list[dict[str, object]]:
+    events = [_codex_event("response.created", response={"id": "response-test"})]
+    for index, (summary, raw) in enumerate(items):
+        item_id = f"reasoning-{index}"
+        events.append(
+            _codex_event(
+                "response.output_item.added",
+                output_index=index,
+                item={"type": "reasoning", "id": item_id},
+            )
+        )
+        if summary:
+            events.extend(
+                [
+                    _codex_event(
+                        "response.reasoning_summary_part.added",
+                        output_index=index,
+                        summary_index=0,
+                        part={"type": "summary_text"},
+                    ),
+                    _codex_event(
+                        "response.reasoning_summary_text.delta",
+                        output_index=index,
+                        summary_index=0,
+                        delta=summary,
+                    ),
+                    _codex_event(
+                        "response.reasoning_summary_text.done",
+                        output_index=index,
+                        summary_index=0,
+                        text=summary,
+                    ),
+                    _codex_event(
+                        "response.reasoning_summary_part.done",
+                        output_index=index,
+                        summary_index=0,
+                        part={"type": "summary_text", "text": summary},
+                    ),
+                ]
+            )
+        if raw:
+            events.extend(
+                [
+                    _codex_event(
+                        "response.content_part.added",
+                        output_index=index,
+                        content_index=0,
+                        part={"type": "reasoning_text"},
+                    ),
+                    _codex_event(
+                        "response.reasoning_text.delta",
+                        output_index=index,
+                        content_index=0,
+                        delta=raw,
+                    ),
+                    _codex_event(
+                        "response.reasoning_text.done",
+                        output_index=index,
+                        content_index=0,
+                        text=raw,
+                    ),
+                    _codex_event(
+                        "response.content_part.done",
+                        output_index=index,
+                        content_index=0,
+                        part={"type": "reasoning_text"},
+                    ),
+                ]
+            )
+        events.append(
+            _codex_event(
+                "response.output_item.done",
+                output_index=index,
+                item={
+                    "type": "reasoning",
+                    "id": item_id,
+                    "status": "completed",
+                    "summary": (
+                        [{"type": "summary_text", "text": summary}]
+                        if summary
+                        else []
+                    ),
+                    "content": (
+                        [{"type": "reasoning_text", "text": raw}] if raw else []
+                    ),
+                },
+            )
+        )
+    events.append(_codex_event("response.completed"))
+    return events
 
 
 class GateBackend(CompletionBackend):
@@ -1307,6 +1432,52 @@ async def test_anthropic_redacted_thinking_reaches_tui_stream(tmp_path: Path) ->
     rendered = output.getvalue()
     assert "✱ thought · redacted" in rendered
     assert "no response" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["output-items", "summary-and-raw"])
+async def test_codex_thought_blocks_reach_tui_as_separate_units(
+    tmp_path: Path, case: str
+) -> None:
+    if case == "output-items":
+        events = _codex_reasoning_events([("first", ""), ("second", "")])
+        expected = ("first", "second")
+    else:
+        events = _codex_reasoning_events([("summary", "raw")])
+        expected = ("summary", "raw")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_codex_sse(events),
+            request=request,
+        )
+
+    credentials = CodexCredentialStore(tmp_path / "codex.json")
+    credentials.save(OAuthTokens(_codex_access_token(), "refresh-fixture", 4_000_000_000))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            CodexBackend(
+                client=client,
+                token_store=credentials,
+                base_url="https://test.invalid/codex/responses",
+            ),
+            ConversationStore(tmp_path / "sessions"),
+        ),
+        provider="codex",
+        model=DEFAULT_CODEX_MODEL,
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._consume_turn("hello")
+    await client.aclose()
+
+    rendered = output.getvalue()
+    assert rendered.count("✱ thought ·") == 2
+    assert all(text in rendered for text in expected)
 
 
 @pytest.mark.asyncio

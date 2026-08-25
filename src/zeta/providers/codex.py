@@ -774,7 +774,7 @@ def _translate_delta(
             return StreamEvent(
                 StreamEventType.MESSAGE_UPDATE,
                 content=ThinkingContent(delta),
-                data={"index": content_index},
+                data={"index": (index, "raw", content_index)},
             )
         summary_index = payload.get("summary_index")
         if type(summary_index) is not int or summary_index < 0:
@@ -797,7 +797,7 @@ def _translate_delta(
         return StreamEvent(
             StreamEventType.MESSAGE_UPDATE,
             content=ThinkingContent(delta),
-            data={"index": summary_index},
+            data={"index": (index, "summary", summary_index)},
         )
     content_index = _content_index(payload)
     expected_kind = (
