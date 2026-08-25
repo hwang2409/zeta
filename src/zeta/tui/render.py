@@ -49,23 +49,6 @@ RECEIPT_TOOLS = frozenset(
     {"read", "glob", "grep", "search", "find", "list", "websearch"}
 )
 SUMMARY_TOOLS = frozenset({"glob", "grep", "search", "find", "websearch"})
-ABBREVIATIONS = frozenset(
-    {
-        "e.g",
-        "i.e",
-        "etc",
-        "mr",
-        "mrs",
-        "ms",
-        "dr",
-        "vs",
-        "no",
-        "fig",
-        "prof",
-        "sr",
-        "jr",
-    }
-)
 OSC_RE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b]*(?:\x07|\x1b\\)")
 ESC_RE = re.compile(r"\x1b(?:[PX^_].*?\x1b\\|\][^\x07]*(?:\x07|\x1b\\))")
 CSI_UNSUPPORTED_RE = re.compile(
@@ -356,38 +339,39 @@ def render_tool_progress(call: ToolCall, content: str) -> Panel:
     return _tool_panel(call, body)
 
 
-def collapse_thought(value: str) -> str:
-    """Keep the first sentence of provider reasoning for the transcript."""
-
-    normalized = " ".join(value.replace("\n", " ").split())
-    if not normalized:
-        return ""
-    for index, character in enumerate(normalized):
-        if character not in ".!?":
-            continue
-        if character == ".":
-            token = normalized[: index + 1].rsplit(" ", 1)[-1]
-            normalized_token = token.rstrip(".,!?;:").lower()
-            if normalized_token in ABBREVIATIONS or re.fullmatch(
-                r"(?:[a-z]\.){2,}", token.lower()
-            ):
-                continue
-        end = index + 1
-        while end < len(normalized) and normalized[end] in "\"'”’)]}":
-            end += 1
-        if end == len(normalized) or normalized[end].isspace():
-            return _truncate(normalized[:end], MAX_RESULT)
-    return _truncate(normalized, MAX_RESULT)
-
-
-def format_thought(value: str, duration: float | None = None) -> Text:
-    summary = collapse_thought(value)
+def format_thought(duration: float | None = None) -> Text:
     parts = ["✱ thought"]
-    if summary:
-        parts.append(summary)
     if duration is not None:
         parts.append(f"{duration:.1f}s")
     return Text(" · ".join(parts), style=THOUGHT)
+
+
+def render_thought(value: str, duration: float | None = None) -> Text:
+    """Render a complete thinking block with its full trace."""
+
+    if value == "redacted":
+        return Text(
+            f"✱ thought · redacted"
+            f"{f' · {duration:.1f}s' if duration is not None else ''}",
+            style=THOUGHT,
+        )
+    trace = Text(
+        _strip_terminal_controls(value),
+        style=THOUGHT,
+    )
+    rendered = Text.assemble(format_thought(duration), "\n", trace)
+    return rendered
+
+
+def render_thought_live(value: str) -> Text:
+    """Render the in-progress thinking trace without its completion header."""
+
+    if value == "redacted":
+        return render_thought(value)
+    return Text(
+        _strip_terminal_controls(value),
+        style=THOUGHT,
+    )
 
 
 def _duration(data: dict[str, Any]) -> float | None:
@@ -563,9 +547,9 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         return None
     if event.type is StreamEventType.MESSAGE_UPDATE:
         if isinstance(event.content, ThinkingContent):
-            return format_thought(event.content.text, _duration(event.data))
+            return render_thought(event.content.text, _duration(event.data))
         if isinstance(event.content, RedactedThinkingContent):
-            return format_thought("redacted", _duration(event.data))
+            return render_thought("redacted", _duration(event.data))
         if isinstance(event.content, ToolUseContent):
             return None
         if isinstance(event.content, TextContent) or event.delta is not None:
