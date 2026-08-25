@@ -52,6 +52,7 @@ from zeta.tui.render import (
     render_event,
     render_line,
     render_thought,
+    render_thought_live,
     render_tool_progress,
     tool_render_mode,
     _render_tool_output,
@@ -1308,6 +1309,79 @@ def test_thought_stream_is_visible_before_completion(tmp_path: Path) -> None:
     rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
     assert rendered[0].startswith("✱ thought · ")
     assert rendered[1:] == ["first", "second"]
+
+
+def test_adjacent_signed_thought_blocks_keep_separate_units(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    for content in (
+        ThinkingContent("block-one", "sig-1"),
+        ThinkingContent("block-two", "sig-2"),
+    ):
+        app._consume_text(
+            StreamEvent(StreamEventType.MESSAGE_UPDATE, content=content)
+        )
+    app._flush_pending_stream()
+
+    rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
+    assert sum(line.startswith("✱ thought ·") for line in rendered) == 2
+    assert rendered.count("block-one") == 1
+    assert rendered.count("block-two") == 1
+
+
+def test_thought_commit_keeps_logical_lines_for_resize(tmp_path: Path) -> None:
+    source = "logical-line-that-reflows"
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._consume_text(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=ThinkingContent(source),
+        )
+    )
+    app._flush_pending_stream()
+
+    assert any(
+        source in getattr(unit, "plain", "")
+        for unit in app._transcript.units
+        if unit
+    )
+    narrow = [Text.from_ansi(line).plain for line in app._transcript.lines(18)]
+    wide = [Text.from_ansi(line).plain for line in app._transcript.lines(80)]
+    assert len([line for line in narrow if line]) > len(wide)
+    assert wide[-1] == source
+
+
+def test_thought_updates_keep_active_unit_after_interleaved_output(
+    tmp_path: Path,
+) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._presenter.start_thinking(render_thought_live("partial"))
+    app._transcript.append(Text("tool output"))
+    app._presenter.update_thinking(render_thought_live("complete"))
+    app._presenter.finish_thinking(render_thought("complete", 1.0))
+
+    rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
+    assert sum(line.startswith("✱ thought ·") for line in rendered) == 1
+    assert rendered.count("complete") == 1
+    assert "partial" not in rendered
+    assert "tool output" in rendered
 
 
 def test_thought_duration_uses_local_monotonic_lifecycle_clock(

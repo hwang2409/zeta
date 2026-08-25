@@ -265,12 +265,8 @@ def render_thought(value: str, duration: float | None = None) -> Text:
     trace = Text(
         _strip_terminal_controls(value),
         style=THOUGHT,
-        no_wrap=True,
-        overflow="ignore",
     )
     rendered = Text.assemble(format_thought(duration), "\n", trace)
-    rendered.no_wrap = True
-    rendered.overflow = "ignore"
     return rendered
 
 
@@ -282,8 +278,6 @@ def render_thought_live(value: str) -> Text:
     return Text(
         _strip_terminal_controls(value),
         style=THOUGHT,
-        no_wrap=True,
-        overflow="ignore",
     )
 
 
