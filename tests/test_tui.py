@@ -275,6 +275,11 @@ def fast_vi_timeouts(session: PromptSession[str]) -> None:
     session.app.timeoutlen = 0.02
 
 
+def paced_vi_timeouts(session: PromptSession[str]) -> None:
+    session.app.ttimeoutlen = 0.02
+    session.app.timeoutlen = 0.5
+
+
 def renderable_plain(renderable: object) -> str:
     if hasattr(renderable, "plain"):
         return renderable.plain
@@ -2352,7 +2357,7 @@ async def test_full_screen_vi_escape_enters_normal_mode_with_low_latency() -> No
             multiline=True,
         )
         assert session.app.ttimeoutlen <= 0.1
-        assert session.app.timeoutlen <= 0.1
+        assert session.app.timeoutlen >= 0.5
         task = asyncio.create_task(session.prompt_async(" ❯ "))
         await asyncio.sleep(0)
         started = time.monotonic()
@@ -2365,6 +2370,40 @@ async def test_full_screen_vi_escape_enters_normal_mode_with_low_latency() -> No
         await task
 
     assert elapsed < 0.1
+
+
+@pytest.mark.asyncio
+async def test_vi_composer_paced_dd_and_gg_commands() -> None:
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+            ),
+            multiline=True,
+        )
+        paced_vi_timeouts(session)
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("first line\nsecond line")
+        await wait_until(lambda: session.app.current_buffer.text == "first line\nsecond line")
+        pipe.send_text("\x1b")
+        await wait_until(
+            lambda: session.app.vi_state.input_mode.value == "vi-navigation"
+        )
+        pipe.send_text("d")
+        await asyncio.sleep(0.1)
+        pipe.send_text("d")
+        await wait_until(lambda: session.app.current_buffer.text == "first line\n")
+        pipe.send_text("g")
+        await asyncio.sleep(0.1)
+        pipe.send_text("g")
+        await wait_until(lambda: session.app.current_buffer.cursor_position == 0)
+        session.app.exit()
+        await task
 
 
 @pytest.mark.asyncio

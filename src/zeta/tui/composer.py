@@ -6,6 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from prompt_toolkit.application import get_app
+from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.filters import Condition, vi_insert_mode
 from prompt_toolkit.formatted_text import FormattedText
@@ -25,6 +26,20 @@ SHIFT_ENTER_SEQUENCES = frozenset(
         "\x1b[27;6;13~",
     }
 )
+
+
+class VimCursorShapeConfig(CursorShapeConfig):
+    """Use a beam in insert mode and a block in every other vi mode."""
+
+    def get_cursor_shape(self, application: object) -> CursorShape:
+        if getattr(application, "editing_mode", None) is not EditingMode.VI:
+            return CursorShape._NEVER_CHANGE
+        if getattr(application.vi_state, "input_mode", None) in {
+            InputMode.INSERT,
+            InputMode.INSERT_MULTIPLE,
+        }:
+            return CursorShape.BEAM
+        return CursorShape.BLOCK
 
 
 def vim_state_label(vim_mode: bool) -> str | None:
@@ -84,6 +99,7 @@ def build_key_bindings(
     """Build the small key map used by the full-screen composer."""
 
     bindings = KeyBindings()
+    escape_chord_pending = False
 
     @Condition
     def vi_insert_history_navigation() -> bool:
@@ -99,6 +115,11 @@ def build_key_bindings(
 
     @bindings.add("enter")
     def submit(event: KeyPressEvent) -> None:
+        nonlocal escape_chord_pending
+        if escape_chord_pending:
+            escape_chord_pending = False
+            insert_newline(event)
+            return
         if event.data in SHIFT_ENTER_SEQUENCES:
             insert_newline(event)
             return
@@ -113,16 +134,24 @@ def build_key_bindings(
     def newline(event: KeyPressEvent) -> None:
         insert_newline(event)
 
-    @bindings.add("escape", "enter")
-    def alt_enter(event: KeyPressEvent) -> None:
-        insert_newline(event)
-
     native_escape = next(
         binding
         for binding in load_vi_bindings().bindings
         if binding.keys == (Keys.Escape,)
     )
-    bindings.add(Keys.Escape)(native_escape)
+
+    def clear_escape_chord() -> None:
+        nonlocal escape_chord_pending
+        escape_chord_pending = False
+
+    @bindings.add(Keys.Escape, filter=native_escape.filter, eager=True)
+    def escape(event: KeyPressEvent) -> None:
+        nonlocal escape_chord_pending
+        native_escape.call(event)
+        escape_chord_pending = True
+        loop = event.app.loop
+        if loop is not None:
+            loop.call_later(0.1, clear_escape_chord)
 
     @bindings.add("up", filter=vi_insert_history_navigation)
     def history_up(event: KeyPressEvent) -> None:

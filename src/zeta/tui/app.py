@@ -43,7 +43,13 @@ from ..types import (
     TextContent,
     ThinkingContent,
 )
-from .composer import build_key_bindings, history_for, parse_input, vim_state_label
+from .composer import (
+    VimCursorShapeConfig,
+    build_key_bindings,
+    history_for,
+    parse_input,
+    vim_state_label,
+)
 from .composer import status_formatted_text
 from .layout import CONTENT_MARGIN, content_width, resume_picker_line
 from .render import (
@@ -85,7 +91,9 @@ class FullScreenPromptSession(PromptSession[str]):
         self, editing_mode: EditingMode, erase_when_done: bool
     ) -> Application[str]:
         application = super()._create_application(editing_mode, erase_when_done)
-        application.ttimeoutlen = application.timeoutlen = 0.02
+        application.ttimeoutlen = 0.02
+        application.timeoutlen = 0.5
+        application.cursor = VimCursorShapeConfig()
         application.full_screen = True
         application.renderer.full_screen = True
         application.erase_when_done = False
@@ -363,6 +371,9 @@ class TUIApp:
             self._on_vim_mode_change(enabled)
         self.vim_mode = enabled
         if (session := self._active_session or self._session) is not None:
+            if self.vim_mode and not enabled:
+                session.app.output.reset_cursor_shape()
+                session.app.output.flush()
             session.editing_mode = EditingMode.VI if enabled else EditingMode.EMACS
             session.app.vi_state.reset()
         self._invalidate_prompt()
