@@ -22,7 +22,7 @@ from rich.text import Text
 from ..types import StreamEvent, StreamEventType, ToolCall
 from .layout import CONTENT_MARGIN
 from .render import render_event, render_tool_progress
-from .theme import ASSISTANT_ROLE, RICH_THEME
+from .theme import RICH_THEME
 
 
 class _ToolUnit:
@@ -405,12 +405,7 @@ class TranscriptPresenter:
         if renderable is None:
             return False
         if not self._assistant_unit_open:
-            first_renderable = (
-                Group(Text("zeta", style=ASSISTANT_ROLE), renderable)
-                if self._full_screen_active()
-                else renderable
-            )
-            self.print_unit(first_renderable)
+            self.print_unit(renderable)
             self._assistant_unit_open = True
         else:
             self.print(renderable)
