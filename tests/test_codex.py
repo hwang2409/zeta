@@ -70,6 +70,33 @@ def test_codex_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
     )
 
 
+def test_codex_uses_one_metadata_text_fallback_for_valid_images() -> None:
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
+    )
+    block = {
+        "type": "image",
+        "data": base64.b64encode(png).decode(),
+        "mimeType": "image/png",
+        "caption": "plot",
+    }
+    payload = build_responses_payload(
+        [
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult("call-1", "stale", content_blocks=[block]),
+            )
+        ],
+        [],
+        model="codex-test",
+    )
+
+    assert payload["input"][0]["output"] == (
+        "[image block] media_type=image/png dimensions=1x1 bytes=70 caption=plot"
+    )
+
+
 def access_token(account_id: str = "account-test") -> str:
     def encode(value: object) -> str:
         return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")

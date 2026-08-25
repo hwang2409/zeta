@@ -92,7 +92,10 @@ def _tool_content(event: StreamEvent) -> str:
     if result is None:
         return ""
     blocks = result.content_blocks or []
-    return flatten_tool_content(blocks) if blocks else result.content
+    if not blocks:
+        return result.content
+    tool_name = event.tool_call.name if event.tool_call is not None else "tool"
+    return flatten_tool_content(blocks, detailed_images=True, tool_name=tool_name)
 
 
 def tool_render_mode(event: StreamEvent) -> ToolRenderMode:

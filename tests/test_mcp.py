@@ -28,7 +28,7 @@ from zeta.types import TextContent, ToolCall
 mount_module = importlib.import_module("zeta.mcp.mount")
 
 
-def test_mcp_non_text_blocks_use_readable_flattening() -> None:
+def test_mcp_non_text_blocks_keep_the_standard_content_shape() -> None:
     result = translate_call_result(
         {
             "content": [
@@ -45,9 +45,15 @@ def test_mcp_non_text_blocks_use_readable_flattening() -> None:
         }
     )
 
-    assert [block["text"] for block in result["content"]] == [
-        "[image block]",
-        "[resource: file:///tmp/note.txt]",
+    assert result["content"] == [
+        {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+        {
+            "type": "resource",
+            "resource": {
+                "uri": "file:///tmp/note.txt",
+                "blob": "bm90ZQ==",
+            },
+        },
     ]
 
 

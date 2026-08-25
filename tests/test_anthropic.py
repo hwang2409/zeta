@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import subprocess
 from pathlib import Path
@@ -13,6 +14,7 @@ from zeta.providers.anthropic import (
     AnthropicBackend,
     AnthropicCredentialStore,
     AnthropicHTTPError,
+    ANTHROPIC_MAX_IMAGE_BYTES,
     AnthropicStreamError,
     OAuthTokens,
     build_authorization_url,
@@ -69,6 +71,71 @@ data: {"type":"message_stop"}
 
 def client_for(handler):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def png_block(*, caption: str | None = None, data: bytes | None = None) -> dict[str, object]:
+    png = data or bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
+    )
+    block: dict[str, object] = {
+        "type": "image",
+        "data": base64.b64encode(png).decode(),
+        "mimeType": "image/png",
+    }
+    if caption is not None:
+        block["caption"] = caption
+    return block
+
+
+def test_anthropic_sends_supported_tool_images_as_native_blocks() -> None:
+    payload = build_messages_payload(
+        [
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult(
+                    "call-1",
+                    "stale",
+                    content_blocks=[
+                        {"type": "text", "text": "answer", "truncated": False, "full_size": 6},
+                        png_block(caption="plot"),
+                    ],
+                ),
+            )
+        ],
+        [],
+        model="claude-test",
+        max_tokens=100,
+    )
+
+    content = payload["messages"][0]["content"][0]["content"]
+    assert content[0] == {"type": "text", "text": "answer"}
+    assert content[1] == {"type": "text", "text": "caption: plot"}
+    assert content[2]["type"] == "image"
+    assert content[2]["source"]["media_type"] == "image/png"
+
+
+@pytest.mark.parametrize(
+    ("block", "note"),
+    [
+        (png_block(data=b"x" * (ANTHROPIC_MAX_IMAGE_BYTES + 1)), "limit is"),
+        ({**png_block(), "mimeType": "image/tiff"}, "unsupported media type"),
+    ],
+)
+def test_anthropic_falls_back_for_images_outside_native_limits(
+    block: dict[str, object], note: str
+) -> None:
+    payload = build_messages_payload(
+        [Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("call-1", "stale", content_blocks=[block]))],
+        [],
+        model="claude-test",
+        max_tokens=100,
+    )
+
+    content = payload["messages"][0]["content"][0]["content"]
+    assert isinstance(content, str)
+    assert note in content
+    assert block["data"] not in content
 
 
 @pytest.mark.asyncio

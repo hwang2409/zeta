@@ -87,6 +87,19 @@ def test_validate_tool_result_requires_one_resource_payload(
         )
 
 
+def test_validate_tool_result_rejects_invalid_image_base64() -> None:
+    with pytest.raises(ValueError, match="valid base64"):
+        validate_tool_result(
+            {
+                "content": [
+                    {"type": "image", "data": "not base64!", "mimeType": "image/png"}
+                ],
+                "isError": False,
+                "structuredContent": None,
+            }
+        )
+
+
 @pytest.mark.asyncio
 async def test_success_result_uses_mcp_content_shape(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, register_builtin=False)

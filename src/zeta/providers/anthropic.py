@@ -28,7 +28,11 @@ from .usage import normalize_usage
 from ..types import (
     CompletionBackend,
     ContentBlock,
+    SUPPORTED_IMAGE_MEDIA_TYPES,
+    decoded_image_bytes,
     flatten_tool_content,
+    image_description,
+    image_dimensions,
     Message,
     MessageRole,
     RedactedThinkingContent,
@@ -37,6 +41,7 @@ from ..types import (
     TextContent,
     ThinkingContent,
     ToolCall,
+    ToolResult,
     ToolSchema,
     ToolUseContent,
 )
@@ -884,6 +889,69 @@ def _wire_content(blocks: Sequence[ContentBlock]) -> list[dict[str, Any]]:
     return result
 
 
+ANTHROPIC_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+def _wire_tool_result_content(result: ToolResult) -> str | list[dict[str, Any]]:
+    """Encode tool images natively, with text fallback for API limits."""
+
+    if result.content_blocks is None:
+        return result.content
+    has_native_image = False
+    wire_blocks: list[dict[str, Any]] = []
+    for block in result.content_blocks:
+        if block["type"] == "text":
+            text = flatten_tool_content([block])
+            wire_blocks.append({"type": "text", "text": text})
+            continue
+        if block["type"] != "image":
+            wire_blocks.append(
+                {"type": "text", "text": flatten_tool_content([block])}
+            )
+            continue
+        image = block
+        data = decoded_image_bytes(image)
+        dimensions = image_dimensions(image, data)
+        if image["mimeType"] not in SUPPORTED_IMAGE_MEDIA_TYPES:
+            reason = f"unsupported media type {image['mimeType']}"
+        elif data is None:
+            reason = "invalid base64 payload"
+        elif len(data) > ANTHROPIC_MAX_IMAGE_BYTES:
+            reason = (
+                f"image is {len(data)} bytes; limit is "
+                f"{ANTHROPIC_MAX_IMAGE_BYTES} bytes"
+            )
+        elif dimensions is None:
+            reason = None
+        else:
+            caption = image.get("caption")
+            if caption:
+                wire_blocks.append({"type": "text", "text": f"caption: {caption}"})
+            wire_blocks.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image["mimeType"],
+                        "data": image["data"],
+                    },
+                }
+            )
+            has_native_image = True
+            continue
+        wire_blocks.append({
+            "type": "text",
+            "text": image_description(
+                image,
+                detailed=reason is not None,
+                reason=reason,
+            ),
+        })
+    if has_native_image:
+        return wire_blocks
+    return "\n".join(block["text"] for block in wire_blocks)
+
+
 def build_messages_payload(
     messages: Sequence[Message],
     tool_schemas: Sequence[ToolSchema],
@@ -907,18 +975,12 @@ def build_messages_payload(
         if message.role is MessageRole.TOOL_RESULT:
             if message.tool_result is None:
                 raise AnthropicHTTPError("tool result message is missing its result")
-            content = [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": message.tool_result.tool_call_id,
-                    "content": (
-                        flatten_tool_content(message.tool_result.content_blocks)
-                        if message.tool_result.content_blocks is not None
-                        else message.tool_result.content
-                    ),
-                    "is_error": message.tool_result.is_error,
-                }
-            ]
+            content = [{
+                "type": "tool_result",
+                "tool_use_id": message.tool_result.tool_call_id,
+                "content": _wire_tool_result_content(message.tool_result),
+                "is_error": message.tool_result.is_error,
+            }]
             wire_messages.append({"role": "user", "content": content})
             continue
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"

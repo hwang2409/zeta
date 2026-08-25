@@ -1,4 +1,5 @@
 from pathlib import Path
+import base64
 from tempfile import TemporaryDirectory
 from time import perf_counter
 
@@ -210,6 +211,49 @@ async def test_compaction_strips_thinking_from_input_and_summary(context_root: P
         isinstance(block, TextContent)
         for message in replayed
         for block in message.content
+    )
+
+
+@pytest.mark.asyncio
+async def test_compaction_summary_replaces_image_base64_with_placeholder(
+    context_root: Path,
+) -> None:
+    image_data = base64.b64encode(b"\xff\xd8\xff").decode()
+    store = ConversationStore(context_root)
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(
+                "call-1",
+                "stale",
+                content_blocks=[
+                    {
+                        "type": "image",
+                        "data": image_data,
+                        "mimeType": "image/jpeg",
+                        "caption": "a test image",
+                    }
+                ],
+            ),
+        )
+    )
+    store.append_message(text(MessageRole.USER, "tail"))
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
+    assembler = ContextAssembler(
+        store,
+        token_budget=90,
+        retained_tail=1,
+        token_counter=lambda message: 100 if message.role is MessageRole.TOOL_RESULT else 1,
+        backend=backend,
+    )
+
+    await assembler.assemble()
+
+    summary_prompt = backend.calls[0][0][0].content[0].text
+    assert image_data not in summary_prompt
+    assert (
+        "[image block] media_type=image/jpeg bytes=3 caption=a test image"
+        in summary_prompt
     )
 
 
