@@ -995,6 +995,77 @@ async def test_anthropic_redacted_thinking_reaches_tui_stream(tmp_path: Path) ->
     assert "no response" not in rendered
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redacted_first", [True, False])
+async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
+    tmp_path: Path, redacted_first: bool
+) -> None:
+    blocks = (
+        [("redacted_thinking", '"data":"opaque"'), ("thinking", '"thinking":"plan"')]
+        if redacted_first
+        else [("thinking", '"thinking":"plan"'), ("redacted_thinking", '"data":"opaque"')]
+    )
+    lines = [
+        'data: {"type":"message_start","message":{}}',
+        "",
+    ]
+    for index, (kind, value) in enumerate(blocks):
+        lines.extend(
+            [
+                f'data: {{"type":"content_block_start","index":{index},"content_block":{{"type":"{kind}",{value}}}}}',
+                "",
+            ]
+        )
+        if kind == "thinking":
+            lines.extend(
+                [
+                    f'data: {{"type":"content_block_delta","index":{index},"delta":{{"type":"thinking_delta","thinking":"plan"}}}}',
+                    "",
+                    f'data: {{"type":"content_block_delta","index":{index},"delta":{{"type":"signature_delta","signature":"sig-{index}"}}}}',
+                    "",
+                ]
+            )
+        lines.extend(
+            [
+                f'data: {{"type":"content_block_stop","index":{index}}}',
+                "",
+            ]
+        )
+    lines.extend(['data: {"type":"message_stop"}', ""])
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text="\n".join(lines),
+            request=request,
+        )
+
+    credentials = AnthropicCredentialStore(tmp_path / "zeta.json")
+    credentials.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend = AnthropicBackend(
+        client=client,
+        token_store=credentials,
+        base_url="https://test.invalid/v1/messages",
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._consume_turn("hello")
+    await client.aclose()
+
+    rendered = output.getvalue()
+    assert rendered.count("✱ thought · redacted") == 1
+    assert rendered.count("✱ thought · plan") == 1
+    assert "redactedplan" not in rendered
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [

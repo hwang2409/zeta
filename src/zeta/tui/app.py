@@ -726,7 +726,7 @@ class TUIApp:
         get_app().invalidate()
 
     def _flush_stream_kind(self) -> None:
-        if self._stream_kind == "thinking":
+        if self._stream_kind in {"thinking", "redacted-thinking"}:
             if self._thinking_text:
                 self._print_committed([self._thinking_text], thinking=True)
         elif self._stream_kind == "assistant":
@@ -740,14 +740,14 @@ class TUIApp:
     def _flush_markdown(self) -> None:
         for renderable in self._markdown_stream.flush():
             self._print_assistant(renderable)
-
     def _flush_pending_stream(self) -> None:
         self._flush_stream_kind()
         self._flush_markdown()
         self._presenter.reset_assistant_unit()
 
     def _consume_text(self, event: StreamEvent) -> None:
-        thinking = event.content is not None and event.content.type.value == "redacted_thinking"
+        redacted = event.content is not None and event.content.type.value == "redacted_thinking"
+        thinking = redacted
         value = "redacted" if thinking else event.delta
         if isinstance(event.content, TextContent):
             value = event.content.text
@@ -757,7 +757,7 @@ class TUIApp:
         if not value:
             return
         self._streaming = True
-        stream_kind = "thinking" if thinking else "assistant"
+        stream_kind = "redacted-thinking" if redacted else "thinking" if thinking else "assistant"
         if self._stream_kind is not None and self._stream_kind != stream_kind:
             self._flush_pending_stream()
         self._stream_kind = stream_kind
