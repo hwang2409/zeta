@@ -46,12 +46,8 @@ from ..types import (
 from .composer import VimCursorShapeConfig, build_key_bindings, history_for
 from .composer import parse_input, status_formatted_text, vim_state_label
 from .layout import CONTENT_MARGIN, content_width, resume_picker_line
-from .render import (
-    MarkdownStream,
-    format_status,
-    format_thought,
-    render_event,
-)
+from .render import MarkdownStream, format_status
+from .render import render_event, render_thought, render_thought_live
 from .theme import (
     ACCENT,
     BODY,
@@ -703,7 +699,9 @@ class TUIApp:
         if thinking:
             value = "\n".join(lines)
             if value:
-                self._print_unit(format_thought(value, self._thinking_duration))
+                self._presenter.finish_thinking(
+                    render_thought(value, self._thinking_duration)
+                )
                 self._turn_had_visible_output = True
             return
         for line in lines:
@@ -764,11 +762,13 @@ class TUIApp:
         if thinking:
             if self._thinking_started_at is None:
                 self._thinking_started_at = time.monotonic()
+                self._presenter.start_thinking(render_thought_live(value))
             self._thinking_text += value
             self._thinking_duration = max(
                 0.0, time.monotonic() - self._thinking_started_at
             )
             self._partial = self._thinking_text
+            self._presenter.update_thinking(render_thought_live(self._thinking_text))
             return
         buffer = self._assistant_lines
         committed = buffer.feed(value)
