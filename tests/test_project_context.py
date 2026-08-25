@@ -41,7 +41,14 @@ def test_packaged_identity_loads_from_clean_wheel_install(tmp_path: Path) -> Non
     environment["PYTHONPATH"] = str(install_dir)
 
     result = subprocess.run(
-        [sys.executable, "-c", "from zeta.prompts import load_identity; print(load_identity())"],
+        [
+            sys.executable,
+            "-c",
+            "from zeta.prompts import load_identity; "
+            "from zeta.skills import discover_packaged_skills; "
+            "print(load_identity()); "
+            "print(discover_packaged_skills().load('review'))",
+        ],
         cwd=tmp_path,
         env=environment,
         check=True,
@@ -51,6 +58,8 @@ def test_packaged_identity_loads_from_clean_wheel_install(tmp_path: Path) -> Non
 
     assert result.stdout.startswith("You are zeta, a coding agent")
     assert "Honesty:" in result.stdout
+    assert "Available skills:" in result.stdout
+    assert "Review the requested code change." in result.stdout
 
 
 def test_project_context_loads_in_fixed_order_and_labels_sources(tmp_path: Path) -> None:
@@ -78,6 +87,17 @@ def test_project_context_loads_in_fixed_order_and_labels_sources(tmp_path: Path)
     )
     assert "home rules" in context.system_prompt
     assert "repo rules" in context.system_prompt
+
+
+def test_project_context_skill_index_is_static_for_the_process() -> None:
+    from zeta.prompts import load_identity
+
+    first = load_identity()
+    second = load_identity()
+
+    assert first == second
+    assert first.index("You are zeta") < first.index("<zeta-skills>")
+    assert first.index("<zeta-skills>") < first.index("</zeta-skills>")
 
 
 def test_project_context_uses_repo_claude_only_without_agents(tmp_path: Path) -> None:
