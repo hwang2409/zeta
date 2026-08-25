@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 from rich.cells import cell_len
 from rich.console import RenderableType
-from rich.markdown import Markdown
+from rich.markdown import Markdown, TableElement
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
@@ -245,7 +245,7 @@ def _tool_panel(call: ToolCall, body: Text, *, error: bool = False) -> Panel:
         border_style=ERROR if error else CARD_BORDER,
         style=CARD_BG,
         padding=(0, 1),
-        expand=False,
+        expand=True,
     )
 
 
@@ -306,10 +306,27 @@ def _duration(data: dict[str, Any]) -> float | None:
     return None
 
 
+class _ExpandedMarkdownTable(TableElement):
+    """Keep Rich's native markdown tables on the shared content width."""
+
+    def __rich_console__(self, console: Any, options: Any):
+        for renderable in super().__rich_console__(console, options):
+            if isinstance(renderable, Table):
+                renderable.expand = True
+            yield renderable
+
+
+class _ZetaMarkdown(Markdown):
+    elements = {
+        **Markdown.elements,
+        "table_open": _ExpandedMarkdownTable,
+    }
+
+
 def render_markdown(value: str) -> RenderableType:
     """Render assistant text with Rich markdown and fenced-code highlighting."""
 
-    return Markdown(
+    return _ZetaMarkdown(
         value,
         code_theme=CODE_THEME,
         hyperlinks=False,
@@ -391,7 +408,7 @@ class MarkdownStream:
         header = self._table_cells(lines[0])
         if header is None:
             return render_lines()
-        table = Table(show_header=True, header_style=ACCENT)
+        table = Table(show_header=True, header_style=ACCENT, expand=True)
         for cell in header:
             table.add_column(cell)
         for line in lines[separator_index + 1 :]:

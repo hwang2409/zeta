@@ -43,6 +43,7 @@ from ..types import (
     ThinkingContent,
 )
 from .composer import build_key_bindings, history_for, parse_input
+from .layout import CONTENT_MARGIN, content_width
 from .render import (
     MarkdownStream,
     format_status,
@@ -243,7 +244,7 @@ class TUIApp:
     def _transcript_lines(self) -> list[str]:
         """Expose rendered lines for diagnostics while keeping logical units in the widget."""
 
-        width = get_app().output.get_size().columns
+        width = content_width(get_app().output.get_size().columns)
         return self._transcript.lines(width)
 
     @property
@@ -434,7 +435,7 @@ class TUIApp:
 
     def _status_toolbar(self) -> FormattedText:
         terminal_width = get_app().output.get_size().columns
-        width = max(1, terminal_width - 4)
+        width = content_width(terminal_width)
         usage = dict(self._usage)
         usage.setdefault(
             "cache_read_input_tokens",
@@ -480,7 +481,12 @@ class TUIApp:
             if self._full_screen_active():
                 self._append_transcript(renderable)
             else:
-                self.console.print(Padding(renderable, (0, 2, 0, 2)))
+                self.console.print(
+                    Padding(
+                        renderable,
+                        (0, CONTENT_MARGIN, 0, CONTENT_MARGIN),
+                    )
+                )
 
     def _print_unit(self, renderable: RenderableType | None) -> None:
         self._presenter.print_unit(renderable)
@@ -845,9 +851,9 @@ class TUIApp:
         )
         padded = VSplit(
             [
-                Window(width=2, char=" "),
+                Window(width=CONTENT_MARGIN, char=" "),
                 content,
-                Window(width=2, char=" "),
+                Window(width=CONTENT_MARGIN, char=" "),
             ],
         )
         root.children[:] = [
