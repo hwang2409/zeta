@@ -180,6 +180,7 @@ class TranscriptWidget(UIControl):
             file=output,
             force_terminal=True,
             color_system="truecolor",
+            no_color=False,
             width=max(1, width),
             theme=RICH_THEME,
         )

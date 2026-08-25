@@ -75,6 +75,25 @@ from zeta.types import (
 )
 
 
+def _test_console(output: StringIO | None = None, *, width: int = 80) -> Console:
+    return Console(
+        file=output if output is not None else StringIO(),
+        force_terminal=True,
+        color_system="truecolor",
+        no_color=False,
+        width=width,
+        theme=RICH_THEME,
+    )
+
+
+def _contains_background_sgr(value: str) -> bool:
+    return any(
+        parameter == "48"
+        for sequence in re.findall(r"\x1b\[([0-9;]*)m", value)
+        for parameter in sequence.split(";")
+    )
+
+
 class GateBackend(CompletionBackend):
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -837,7 +856,7 @@ def test_render_helpers_use_the_zeta_palette() -> None:
     )
 
     assert markdown.style == BODY
-    assert code.background_color is None
+    assert code.background_color == "default"
     assert start is not None
     assert any(ACCENT in str(span.style) for span in renderable_spans(start))
 
@@ -1295,7 +1314,7 @@ def test_truncated_response_notice_is_dim() -> None:
     ).print(rendered)
     escaped = output.getvalue()
     assert escaped.count(rendered.plain) == 1
-    assert not re.search(r"\x1b\[[0-9;]*48(?:;[0-9;]*)?m", escaped)
+    assert not _contains_background_sgr(escaped)
 
 
 @pytest.mark.asyncio
@@ -2192,13 +2211,7 @@ def test_full_screen_footer_fits_content_column(
 
 def test_rich_rendering_does_not_paint_terminal_background() -> None:
     output = StringIO()
-    console = Console(
-        file=output,
-        force_terminal=True,
-        color_system="truecolor",
-        width=80,
-        theme=RICH_THEME,
-    )
+    console = _test_console(output)
     console.print(render_line("# heading\n\n`inline`"))
     console.print(render_code("print('hi')", "python"))
     console.print(
@@ -2210,7 +2223,19 @@ def test_rich_rendering_does_not_paint_terminal_background() -> None:
         )
     )
 
-    assert not re.search(r"\x1b\[[0-9;]*48(?:;[0-9;]*)?m", output.getvalue())
+    assert not _contains_background_sgr(output.getvalue())
+
+
+def test_test_console_forces_truecolor_output() -> None:
+    output = StringIO()
+    console = _test_console(output)
+
+    console.print(Text("probe", style=ACCENT))
+
+    assert console.is_terminal
+    assert console.color_system == "truecolor"
+    assert not console.no_color
+    assert "\x1b[" in output.getvalue()
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
@@ -2289,7 +2314,7 @@ def test_full_screen_pty_keeps_padded_margins_clean(
         ).stdout
         assert any(line.startswith("  ▌ hello") for line in plain)
         assert all(not line[:2].strip() for line in plain)
-        assert not re.search(r"\x1b\[[0-9;]*48(?:;[0-9;]*)?m", escaped)
+        assert not _contains_background_sgr(escaped)
     finally:
         subprocess.run(["tmux", "kill-session", "-t", session], check=False)
 
@@ -2354,7 +2379,7 @@ def test_full_screen_transcript_preserves_markdown_list_line(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
         provider="fake",
         model="offline",
-        console=Console(file=StringIO(), force_terminal=False),
+        console=_test_console(),
     )
     app._active_session = app._make_session()
     output = SimpleNamespace(get_size=lambda: Size(rows=24, columns=40))
@@ -2363,7 +2388,7 @@ def test_full_screen_transcript_preserves_markdown_list_line(
     app._append_transcript(render_line("1. first item"))
 
     assert app._transcript_lines
-    assert app._transcript_lines[0].strip() == "1. first item"
+    assert Text.from_ansi(app._transcript_lines[0]).plain.strip() == "1. first item"
 
 
 def test_full_screen_transcript_reflows_logical_text_at_narrow_widths(
@@ -2629,7 +2654,7 @@ async def test_full_screen_separates_user_and_assistant_units(tmp_path: Path) ->
     assert units[2] is not None
     assert renderable_plain(units[0]) == "▌ prompt"
     rendered = app._transcript.render(80)
-    assert "answer" in rendered
+    assert "answer" in Text.from_ansi(rendered).plain
 
 
 @pytest.mark.asyncio
