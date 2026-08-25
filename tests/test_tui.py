@@ -48,6 +48,7 @@ from zeta.tui.render import (
     tool_render_mode,
 )
 from zeta.tui.theme import ACCENT, BODY, CODE_BG
+from zeta.tui.transcript import TranscriptWidget
 from zeta.types import (
     CompletionBackend,
     ErrorInfo,
@@ -300,6 +301,35 @@ def test_render_event_shows_tool_output_update() -> None:
 
     assert rendered is not None
     assert rendered.plain == "  ↳ [stdout] hello\n"
+
+
+def test_transcript_follows_tail_until_scrolled_up() -> None:
+    transcript = TranscriptWidget()
+    for index in range(8):
+        transcript.append(Text(f"line {index}"))
+
+    transcript.create_content(80, 3)
+    assert transcript.follow_tail
+    tail_offset = transcript.scroll_offset
+
+    transcript.append(Text("new tail"))
+    transcript.create_content(80, 3)
+    assert transcript.follow_tail
+    assert transcript.scroll_offset == tail_offset + 1
+
+    transcript.page_up()
+    held_offset = transcript.scroll_offset
+    assert not transcript.follow_tail
+    transcript.append(Text("while scrolled"))
+    transcript.create_content(80, 3)
+    assert transcript.scroll_offset == held_offset
+    assert not transcript.follow_tail
+
+    transcript.page_down()
+    transcript.page_down()
+    transcript.create_content(80, 3)
+    assert transcript.follow_tail
+    assert transcript.scroll_offset == len(transcript.lines(80)) - 3
 
 
 def test_tool_output_strips_terminal_controls() -> None:

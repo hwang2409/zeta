@@ -78,10 +78,12 @@ class FullScreenPromptSession(PromptSession[str]):
         self.app.output.quit_alternate_screen()
         self.app.output.show_cursor()
         self.app.output.flush()
-        try:
-            os.write(sys.__stdout__.fileno(), b"\x1b[?1049l\x1b[?25h")
-        except OSError:
-            pass
+        stdout = sys.__stdout__
+        if stdout.isatty():
+            try:
+                os.write(stdout.fileno(), b"\x1b[?1049l\x1b[?25h")
+            except OSError:
+                pass
 
 
 def _zeta_home() -> Path:
@@ -344,6 +346,7 @@ class TUIApp:
                     and asyncio.current_task().cancelling() > 0
                 )
                 self.loop.abort()
+                self._abort_approval(request_id)
                 self.loop.finalize_canceled(request_id)
                 if resume_task is not None:
                     resume_task.cancel()
@@ -365,6 +368,8 @@ class TUIApp:
             on_interrupt=self.abort_active,
             on_exit=self.request_exit,
             on_submit=self._submit_input,
+            on_page_up=self._transcript.page_up,
+            on_page_down=self._transcript.page_down,
         )
         return FullScreenPromptSession(
             message=[("class:prompt", " ❯ ")],
@@ -391,12 +396,19 @@ class TUIApp:
         if self._active_task is not None and not self._active_task.done():
             tool_running = self._loop_state == "tool-running"
             self.loop.abort()
+            for request in self.pending_approvals:
+                self._abort_approval(request.request_id)
+                self.loop.finalize_canceled(request.request_id)
             self._loop_state = "interrupted"
             self._invalidate_prompt()
             if tool_running and not self._resuming_tool:
                 self._abort_requested = True
             else:
                 self._active_task.cancel()
+
+    def _abort_approval(self, request_id: str) -> None:
+        if self._approval_policy is not None:
+            self._approval_policy.abort(request_id)
 
     def _status_toolbar(self) -> FormattedText:
         width = get_app().output.get_size().columns
@@ -515,14 +527,24 @@ class TUIApp:
         else:
             self._tool_region.update(self._tool_region_text)
 
-    def _handle_resumed_tool_event(self, event: StreamEvent) -> None:
+    def _handle_tool_event(self, event: StreamEvent) -> bool:
+        if event.type is StreamEventType.TOOL_APPROVAL_START:
+            self._reset_stream_state()
+            self._loop_state = "approval"
+            self._present_pending_approvals()
+            return False
+        if event.type is StreamEventType.TOOL_APPROVAL_END:
+            self._loop_state = "streaming"
+            return False
         if event.type is StreamEventType.TOOL_EXECUTION_START:
+            self._reset_stream_state()
+            self._assistant_unit_open = False
             self._loop_state = "tool-running"
             if event.tool_call is not None:
                 self._active_tool_calls.add(event.tool_call.id)
             rendered = render_event(event)
             if rendered is None:
-                return
+                return False
             if self._full_screen_active() and event.tool_call is not None:
                 if self._printed_units:
                     self._append_transcript_blank()
@@ -534,19 +556,38 @@ class TUIApp:
                 self._printed_units = True
             else:
                 self._print_unit(rendered)
-            return
+            self._turn_had_visible_output = True
+            return False
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
+            self._update_tool_region(event)
+            if event.delta and event.delta.strip():
+                self._turn_had_visible_output = True
+            return False
         if event.type is not StreamEventType.TOOL_EXECUTION_END:
-            return
-        self._loop_state = "idle"
+            return False
+
+        aborted = self._abort_requested or self._loop_state == "interrupted"
+        self._loop_state = "interrupted" if aborted else (
+            "idle" if self._resuming_tool else "streaming"
+        )
         if event.tool_call is not None:
             self._active_tool_calls.discard(event.tool_call.id)
         rendered = render_event(event)
-        if rendered is None:
-            return
-        if self._full_screen_active() and event.tool_call is not None:
-            self._transcript.finish_tool(event.tool_call.id, rendered)
-        else:
-            self._print(rendered)
+        if rendered is not None:
+            if self._full_screen_active() and event.tool_call is not None:
+                self._transcript.finish_tool(event.tool_call.id, rendered)
+            else:
+                self._pending_tool_renders.append(rendered)
+            self._turn_had_visible_output = True
+        stop_after_tool = self._abort_requested
+        self._abort_requested = False
+        if not self._active_tool_calls:
+            self._commit_tool_region()
+        return stop_after_tool
+
+    def _handle_resumed_tool_event(self, event: StreamEvent) -> None:
+        self._handle_tool_event(event)
+        self._invalidate_prompt()
 
     def _submit_input(self, value: str) -> None:
         self._input_queue.put_nowait(value)
@@ -738,64 +779,14 @@ class TUIApp:
             async for event in self.loop.run_turn(user_text):
                 self._update_usage(event)
                 self._prepare_stream_event(event)
-                stop_after_tool = False
+                stop_after_tool = self._handle_tool_event(event)
                 if self.verbose:
                     self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style=DIM))
                 if event.type is StreamEventType.MESSAGE_UPDATE:
                     self._consume_text(event)
                     self._invalidate_prompt()
                     continue
-                if event.type is StreamEventType.TOOL_APPROVAL_START:
-                    self._reset_stream_state()
-                    self._loop_state = "approval"
-                    self._present_pending_approvals()
-                elif event.type is StreamEventType.TOOL_APPROVAL_END:
-                    self._loop_state = "streaming"
-                elif event.type is StreamEventType.TOOL_EXECUTION_START:
-                    self._reset_stream_state()
-                    self._assistant_unit_open = False
-                    self._loop_state = "tool-running"
-                    if event.tool_call is not None:
-                        self._active_tool_calls.add(event.tool_call.id)
-                    rendered = render_event(event)
-                    if self._full_screen_active() and event.tool_call is not None and rendered is not None:
-                        if self._printed_units:
-                            self._append_transcript_blank()
-                        self._transcript.start_tool(
-                            event.tool_call.id,
-                            event.tool_call,
-                            rendered,
-                        )
-                        self._printed_units = True
-                    else:
-                        self._print_unit(rendered)
-                    if rendered is not None:
-                        self._turn_had_visible_output = True
-                elif event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
-                    self._update_tool_region(event)
-                    if event.delta and event.delta.strip():
-                        self._turn_had_visible_output = True
-                elif event.type is StreamEventType.TOOL_EXECUTION_END:
-                    aborted = self._abort_requested
-                    self._loop_state = "interrupted" if aborted else "streaming"
-                    if event.tool_call is not None:
-                        self._active_tool_calls.discard(event.tool_call.id)
-                    rendered = render_event(event)
-                    if rendered is not None:
-                        if self._full_screen_active() and event.tool_call is not None:
-                            self._transcript.finish_tool(event.tool_call.id, rendered)
-                        else:
-                            self._pending_tool_renders.append(rendered)
-                        self._turn_had_visible_output = True
-                    if self._abort_requested:
-                        self._abort_requested = False
-                        stop_after_tool = True
-                        self._loop_state = "interrupted"
-                    else:
-                        stop_after_tool = False
-                    if not self._active_tool_calls:
-                        self._commit_tool_region()
-                elif event.type is StreamEventType.TURN_START:
+                if event.type is StreamEventType.TURN_START:
                     self._spinner_frame = 0
                     self._spinner_reset.set()
                     self._streaming = True

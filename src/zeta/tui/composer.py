@@ -70,6 +70,8 @@ def build_key_bindings(
     on_interrupt: Callable[[], None],
     on_exit: Callable[[], None],
     on_submit: Callable[[str], None] | None = None,
+    on_page_up: Callable[[], None] | None = None,
+    on_page_down: Callable[[], None] | None = None,
 ) -> KeyBindings:
     """Build the small key map used by the full-screen composer."""
 
@@ -97,6 +99,20 @@ def build_key_bindings(
     def exit_prompt(event: KeyPressEvent) -> None:
         on_exit()
         event.app.exit(exception=EOFError())
+
+    if on_page_up is not None:
+
+        @bindings.add("pageup")
+        def page_up(event: KeyPressEvent) -> None:
+            del event
+            on_page_up()
+
+    if on_page_down is not None:
+
+        @bindings.add("pagedown")
+        def page_down(event: KeyPressEvent) -> None:
+            del event
+            on_page_down()
 
     return bindings
 

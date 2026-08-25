@@ -179,6 +179,8 @@ class AgentLoop:
         state = self.store.approval_states().get(request_id)
         if state is None or state[1] is None:
             return False
+        if self._existing_tool_result(state[0].id) is not None:
+            return False
         self.tool_registry.start_batch()
         return True
 
@@ -224,6 +226,9 @@ class AgentLoop:
         if state is None or state[1] is None:
             return None
         tool_call = state[0]
+        existing = self._existing_tool_result(tool_call.id)
+        if existing is not None:
+            return existing
         if not prepared:
             self.tool_registry.start_batch()
         abort_signal = self.tool_registry.abort_signal
@@ -247,7 +252,15 @@ class AgentLoop:
                 _lifecycle_sink=lifecycle,
             )
         except asyncio.CancelledError:
-            self.finalize_canceled(request_id)
+            result = self.finalize_canceled(request_id)
+            if event_sink is not None and result is not None:
+                event_sink(
+                    StreamEvent(
+                        StreamEventType.TOOL_EXECUTION_END,
+                        tool_call=tool_call,
+                        tool_result=result,
+                    )
+                )
             raise
         except Exception as exc:
             result = ToolResult(tool_call.id, str(exc), is_error=True)
@@ -273,11 +286,17 @@ class AgentLoop:
         if state is None:
             return None
         tool_call = state[0]
+        existing = self._existing_tool_result(tool_call.id)
+        if existing is not None:
+            return existing
+        return self._finalize_tool_results([tool_call], [None])[0]
+
+    def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None:
         for message in reversed(self.store.messages()):
             result = message.tool_result
-            if result is not None and result.tool_call_id == tool_call.id:
+            if result is not None and result.tool_call_id == tool_call_id:
                 return result
-        return self._finalize_tool_results([tool_call], [None])[0]
+        return None
 
     async def _run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
         await self._ensure_mcp_servers()
@@ -596,11 +615,19 @@ class AgentLoop:
         calls: Sequence[ToolCall],
         slots: Sequence[ToolResult | None],
     ) -> list[ToolResult]:
-        results = [
-            result or ToolResult(call.id, "tool execution canceled", is_error=True)
-            for call, result in zip(calls, slots, strict=True)
-        ]
-        for result in results:
+        results: list[ToolResult] = []
+        new_results: list[ToolResult] = []
+        for call, slot in zip(calls, slots, strict=True):
+            result = self._existing_tool_result(call.id)
+            if result is None:
+                result = slot or ToolResult(
+                    call.id,
+                    "tool execution canceled",
+                    is_error=True,
+                )
+                new_results.append(result)
+            results.append(result)
+        for result in new_results:
             self.store.append_message(
                 Message(
                     MessageRole.TOOL_RESULT,
