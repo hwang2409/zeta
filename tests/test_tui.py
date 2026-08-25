@@ -1358,7 +1358,80 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
         assert process.wait(timeout=5) == 0
         assert b"\x1b[?1049h" in output
         assert b"\x1b[?1049l" in output
+        assert b"\x1b[0 q" in output
         assert output.count(b"\x1b[?1049h") == 1
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master_fd)
+
+
+def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
+    tmp_path: Path,
+) -> None:
+    master_fd, slave_fd = pty.openpty()
+    env = os.environ.copy()
+    env["ZETA_HOME"] = str(tmp_path / "zeta-home")
+    env["TERM"] = "xterm-256color"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from zeta.tui.app import main; raise SystemExit(main(['--provider', 'fake']))",
+        ],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    output = bytearray()
+
+    def read_until(needle: bytes, start: int = 0) -> None:
+        deadline = time.monotonic() + 5
+        while needle not in output[start:] and time.monotonic() < deadline:
+            ready, _, _ = select.select(
+                [master_fd],
+                [],
+                [],
+                max(0, deadline - time.monotonic()),
+            )
+            if ready:
+                try:
+                    output.extend(os.read(master_fd, 4096))
+                except OSError:
+                    break
+        assert needle in output[start:]
+
+    try:
+        read_until(b" > ")
+        read_until(b"\x1b[6 q")
+
+        os.write(master_fd, b"\x1b")
+        read_until(b"\x1b[2 q")
+
+        start = len(output)
+        os.write(master_fd, b"i")
+        read_until(b"\x1b[6 q", start)
+        time.sleep(0.1)
+
+        start = len(output)
+        os.write(master_fd, b"/vim off\r")
+        read_until(b"vim mode: off", start)
+        read_until(b"\x1b[0 q", start)
+
+        os.write(master_fd, b"\x04")
+        deadline = time.monotonic() + 5
+        while process.poll() is None and time.monotonic() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 0.1)
+            if ready:
+                try:
+                    output.extend(os.read(master_fd, 4096))
+                except OSError:
+                    break
+        assert process.wait(timeout=5) == 0
     finally:
         if process.poll() is None:
             process.kill()
@@ -2409,6 +2482,36 @@ async def test_vi_composer_normal_enter_submits_without_losing_buffer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_full_screen_vi_escape_enter_chord_keeps_insert_mode() -> None:
+    submitted: list[str] = []
+    with create_pipe_input() as pipe:
+        session: FullScreenPromptSession | None = None
+
+        def submit(value: str) -> None:
+            submitted.append(value)
+            assert session is not None
+            session.app.exit()
+
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=EditingMode.VI,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_submit=submit,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("line one\x1b\rline two\r")
+        await task
+
+    assert submitted == ["line one\nline two"]
+
+
+@pytest.mark.asyncio
 async def test_full_screen_vi_escape_enters_normal_mode_with_low_latency() -> None:
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
@@ -2462,7 +2565,7 @@ async def test_vi_composer_paced_dd_and_gg_commands() -> None:
         pipe.send_text("d")
         await asyncio.sleep(0.1)
         pipe.send_text("d")
-        await wait_until(lambda: session.app.current_buffer.text == "first line\n")
+        await wait_until(lambda: session.app.current_buffer.text == "first line")
         pipe.send_text("g")
         await asyncio.sleep(0.1)
         pipe.send_text("g")

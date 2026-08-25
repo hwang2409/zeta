@@ -43,14 +43,8 @@ from ..types import (
     TextContent,
     ThinkingContent,
 )
-from .composer import (
-    VimCursorShapeConfig,
-    build_key_bindings,
-    history_for,
-    parse_input,
-    vim_state_label,
-)
-from .composer import status_formatted_text
+from .composer import VimCursorShapeConfig, build_key_bindings, history_for
+from .composer import parse_input, status_formatted_text, vim_state_label
 from .layout import CONTENT_MARGIN, content_width, resume_picker_line
 from .render import (
     MarkdownStream,
@@ -91,12 +85,8 @@ class FullScreenPromptSession(PromptSession[str]):
         self, editing_mode: EditingMode, erase_when_done: bool
     ) -> Application[str]:
         application = super()._create_application(editing_mode, erase_when_done)
-        application.ttimeoutlen = 0.02
-        application.timeoutlen = 0.5
-        application.cursor = VimCursorShapeConfig()
-        application.full_screen = True
-        application.renderer.full_screen = True
-        application.erase_when_done = False
+        application.ttimeoutlen, application.timeoutlen, application.cursor = 0.02, 0.5, VimCursorShapeConfig()
+        application.full_screen, application.renderer.full_screen, application.erase_when_done = True, True, False
         return application
 
     def restore_terminal(self) -> None:
@@ -366,11 +356,12 @@ class TUIApp:
         if requested not in {"on", "off", "toggle"}:
             return "vim mode unchanged: use /vim on, /vim off, or /vim toggle"
         enabled = not self.vim_mode if requested == "toggle" else requested == "on"
+        was_enabled = self.vim_mode
         if self._on_vim_mode_change is not None:
             self._on_vim_mode_change(enabled)
         self.vim_mode = enabled
         if (session := self._active_session or self._session) is not None:
-            if self.vim_mode and not enabled:
+            if was_enabled and not enabled:
                 session.app.output.reset_cursor_shape()
                 session.app.output.flush()
             session.editing_mode = EditingMode.VI if enabled else EditingMode.EMACS
@@ -985,9 +976,7 @@ class TUIApp:
             ],
         )
         padded = VSplit([Window(width=CONTENT_MARGIN, char=" "), content, Window(width=CONTENT_MARGIN, char=" ")])
-        root.children[:] = [
-            padded,
-        ]
+        root.children[:] = [padded]
 
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run the alternate-screen app until Ctrl-D or an exit request."""
