@@ -901,6 +901,30 @@ def test_command_syntax_has_no_background_sgr() -> None:
     assert "\x1b[48" not in output.getvalue()
 
 
+def test_tool_card_renders_nested_arguments_without_json_escapes() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall(
+                "tool-1",
+                "custom",
+                {
+                    "payload": {"path": "/tmp/a\nb", "quote": "don't"},
+                    "count": 3,
+                },
+            ),
+            tool_result=ToolResult("tool-1", ""),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "count=3" in plain
+    assert "path=/tmp/a b" in plain
+    assert "quote=don't" in plain
+    assert r"\n" not in plain
+
+
 def test_tool_card_omits_empty_output_sections_and_exit_codes() -> None:
     rendered = render_event(
         StreamEvent(
@@ -957,6 +981,48 @@ def test_tool_card_renders_only_nonempty_output_sections() -> None:
     plain = renderable_plain(rendered)
     assert "stderr:\nerr" in plain
     assert "stdout:" not in plain
+
+
+def test_tool_card_renders_nonempty_result_section_without_misnesting() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-2", "exec", {"command": "run"}),
+            tool_result=ToolResult(
+                "tool-2",
+                "stdout:\nout\nstderr:\nresult:\nanswer",
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "stdout:\nout" in plain
+    assert "result:\nanswer" in plain
+    assert "stderr:" not in plain
+
+
+@pytest.mark.parametrize("position", ["leading", "middle", "trailing"])
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_tool_card_omits_exit_codes_in_any_section_position(
+    position: str, exit_code: int
+) -> None:
+    sections = {
+        "leading": f"exit_code: {exit_code}\nstdout:\nout",
+        "middle": f"stdout:\nout\nexit_code: {exit_code}\nstderr:\nerr",
+        "trailing": f"stdout:\nout\nexit_code: {exit_code}",
+    }
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-3", "exec", {"command": "run"}),
+            tool_result=ToolResult("tool-3", sections[position]),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "exit_code:" not in plain
 
 
 def test_render_event_error_is_visible() -> None:

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import re
-import shlex
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -82,23 +80,22 @@ def _truncate(value: str, limit: int) -> str:
     return value[: max(0, limit - 3)] + "..."
 
 
+def _readable_argument(value: Any) -> str:
+    if isinstance(value, dict):
+        pairs = " ".join(
+            f"{key}={_readable_argument(nested)}"
+            for key, nested in sorted(value.items(), key=lambda item: str(item[0]))
+        )
+        return "{" + pairs + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_readable_argument(item) for item in value) + "]"
+    return str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+
+
 def _arguments(arguments: dict[str, Any]) -> str:
     parts: list[str] = []
     for key in sorted(arguments):
-        value = arguments[key]
-        if isinstance(value, str):
-            rendered = shlex.quote(value)
-        else:
-            try:
-                rendered = json.dumps(
-                    value,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            except (TypeError, ValueError):
-                rendered = str(value)
-        parts.append(f"{key}={rendered}")
+        parts.append(f"{key}={_readable_argument(arguments[key])}")
     return _truncate(" ".join(parts), MAX_ARGUMENTS)
 
 
@@ -253,8 +250,9 @@ def _split_tool_output(
     """Split standard command receipts without hiding generic tool output."""
 
     lines = content.splitlines()
+    section_labels = {"stdout:", "stderr:", "result:"}
     if not any(
-        line in {"stdout:", "stderr:"} or line.startswith("exit_code:")
+        line in section_labels or line.startswith("exit_code:")
         for line in lines
     ):
         return [], content
@@ -268,11 +266,11 @@ def _split_tool_output(
             sections.append((current_label, "\n".join(current_lines)))
 
     for line in lines:
-        if line in {"stdout:", "stderr:"}:
+        if line in section_labels:
             flush()
             current_label = line[:-1]
             current_lines = []
-        elif line.startswith("exit_code:") and current_label is None:
+        elif line.startswith("exit_code:"):
             continue
         elif current_label is not None:
             current_lines.append(line)
