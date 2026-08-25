@@ -25,6 +25,7 @@ from rich.padding import Padding
 from rich.text import Text
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
+from ..core.project_context import ProjectContext, discover_repo_root, load_project_context
 from ..core.slash import SlashStatus, create_slash_registry
 from ..loop import AgentLoop
 from ..core.session import SessionError, SessionManager, env_home
@@ -186,6 +187,7 @@ class TUIApp:
         session: PromptSession[str] | None = None,
         history_path: str | Path | None = None,
         approval_policy: ApprovalPolicy | None = None,
+        context_files: Sequence[str] = (),
     ) -> None:
         self.loop = loop
         self.provider = provider
@@ -213,6 +215,7 @@ class TUIApp:
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
         self._approval_policy = approval_policy
+        self._context_files = tuple(context_files)
         self._slash_commands = create_slash_registry()
         self._compaction_shown = False
         self._turn_had_visible_output = False
@@ -275,6 +278,7 @@ class TUIApp:
             output_tokens_this_session=(
                 self.loop.context_assembler.output_tokens_this_session
             ),
+            context_files=self._context_files,
         )
 
     def _present_pending_approvals(self) -> None:
@@ -904,13 +908,38 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         provider = provider_override or metadata.provider
         model = model_override or metadata.model
         store = opened.store
+        if metadata.system_prompt:
+            project_context = ProjectContext(
+                metadata.system_prompt,
+                tuple(Path(path) for path in metadata.context_files),
+            )
+        else:
+            project_context = load_project_context(
+                repo_root=discover_repo_root(Path(metadata.cwd)),
+                zeta_home=home,
+            )
+            persisted = manager.persist_context_snapshot(
+                metadata,
+                system_prompt=project_context.system_prompt,
+                context_files=[str(path) for path in project_context.files],
+            )
+            project_context = ProjectContext(
+                persisted.system_prompt,
+                tuple(Path(path) for path in persisted.context_files),
+            )
     else:
         provider = args.provider or "fake"
         backend, selected_model = build_backend(provider, args.model, home=home)
+        project_context = load_project_context(
+            repo_root=discover_repo_root(Path.cwd()),
+            zeta_home=home,
+        )
         opened = manager.create(
             provider=provider,
             model=selected_model,
             cwd=Path.cwd(),
+            system_prompt=project_context.system_prompt,
+            context_files=[str(path) for path in project_context.files],
         )
         metadata = opened.metadata
         store = opened.store
@@ -951,6 +980,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         "token_budget": effective_token_budget,
         "retained_tail": metadata.retained_tail,
         "on_completion_success": completion_success,
+        "system_prompt": project_context.system_prompt,
     }
     if max_turns_override is not None and max_turns_override > 0:
         loop_kwargs["max_turns"] = max_turns_override
@@ -962,6 +992,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         verbose=args.verbose,
         history_path=home / "history",
         approval_policy=approval_policy,
+        context_files=[str(path) for path in project_context.files],
     )
 
 

@@ -10,6 +10,7 @@ from .core.approval import ApprovalPolicy
 from .core.context import ContextAssembler
 from .core.store import ConversationStore
 from .mcp import MCPMount, mount_mcp_servers
+from .prompts import load_identity
 from .tools import ToolHandler, ToolRegistry
 from .tools.registry import validate_tool_result
 from .types import (
@@ -96,7 +97,7 @@ class AgentLoop:
         tool_schemas: Sequence[ToolSchema] | None = None,
         max_turns: int = 50,
         context_assembler: ContextAssembler | None = None,
-        system_prompt: str | Message = "",
+        system_prompt: str | Message | None = None,
         token_budget: int = 200_000,
         retained_tail: int = 8,
         on_completion_success: Callable[[], None] | None = None,
@@ -158,6 +159,8 @@ class AgentLoop:
             if tool_schemas is not None else self.tool_registry.schemas
         )
         self.max_turns = max_turns
+        if system_prompt is None:
+            system_prompt = load_identity()
         self.context_assembler = context_assembler or ContextAssembler(
             store,
             token_budget=token_budget,
