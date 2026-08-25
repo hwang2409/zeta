@@ -205,7 +205,8 @@ def _render_tool_output(content: str, extra_lines: list[str] | None = None) -> T
     for index, line in enumerate(visible):
         if index:
             rendered.append("\n")
-        rendered.append(_safe_text(line, style=BODY))
+        style = DIM if line.startswith("[image block]") else BODY
+        rendered.append(_safe_text(line, style=style))
     if truncated:
         rendered.append(f"\n… +{len(lines) - MAX_TOOL_LINES} lines", style=AFFORDANCE)
     return rendered

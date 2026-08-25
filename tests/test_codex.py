@@ -66,7 +66,8 @@ def test_codex_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
     )
 
     assert payload["input"][0]["output"] == (
-        "[image block]\n[resource: file:///tmp/note.txt]"
+        "[image block] media_type=image/png bytes=5\n"
+        "[resource: file:///tmp/note.txt]"
     )
 
 
@@ -94,6 +95,24 @@ def test_codex_uses_one_metadata_text_fallback_for_valid_images() -> None:
 
     assert payload["input"][0]["output"] == (
         "[image block] media_type=image/png dimensions=1x1 bytes=70 caption=plot"
+    )
+
+
+def test_codex_describes_images_without_known_dimensions() -> None:
+    block = {
+        "type": "image",
+        "data": base64.b64encode(b"\xff\xd8\xff").decode(),
+        "mimeType": "image/jpeg",
+        "caption": "photo",
+    }
+    payload = build_responses_payload(
+        [Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("call-1", "stale", content_blocks=[block]))],
+        [],
+        model="codex-test",
+    )
+
+    assert payload["input"][0]["output"] == (
+        "[image block] media_type=image/jpeg bytes=3 caption=photo"
     )
 
 

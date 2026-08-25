@@ -1,3 +1,4 @@
+import base64
 import hashlib
 from pathlib import Path
 
@@ -93,6 +94,29 @@ def test_validate_tool_result_rejects_invalid_image_base64() -> None:
             {
                 "content": [
                     {"type": "image", "data": "not base64!", "mimeType": "image/png"}
+                ],
+                "isError": False,
+                "structuredContent": None,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "data"),
+    [("image/png", b"not a png"), ("image/jpeg", b"\x89PNG\r\n\x1a\n")],
+)
+def test_validate_tool_result_rejects_image_media_mismatch(
+    mime_type: str, data: bytes
+) -> None:
+    with pytest.raises(ValueError, match="does not match media type"):
+        validate_tool_result(
+            {
+                "content": [
+                    {
+                        "type": "image",
+                        "data": base64.b64encode(data).decode(),
+                        "mimeType": mime_type,
+                    }
                 ],
                 "isError": False,
                 "structuredContent": None,
@@ -206,7 +230,12 @@ async def test_mixed_mcp_content_caps_text_and_preserves_other_blocks(
 ) -> None:
     image = {
         "type": "image",
-        "data": "aGVsbG8=",
+        "data": base64.b64encode(
+            bytes.fromhex(
+                "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+                "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
+            )
+        ).decode(),
         "mimeType": "image/png",
         "annotations": {"audience": ["user"]},
     }

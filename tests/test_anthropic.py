@@ -33,6 +33,7 @@ from zeta.types import (
     ToolCall,
     ToolResult,
     ToolUseContent,
+    image_dimensions,
 )
 from zeta.prompts import load_identity
 
@@ -86,6 +87,69 @@ def png_block(*, caption: str | None = None, data: bytes | None = None) -> dict[
     if caption is not None:
         block["caption"] = caption
     return block
+
+
+def webp_data(chunk_type: bytes, chunk_data: bytes) -> bytes:
+    body = b"WEBP" + chunk_type + len(chunk_data).to_bytes(4, "little") + chunk_data
+    return b"RIFF" + (len(body) + 4).to_bytes(4, "little") + body
+
+
+@pytest.mark.parametrize(
+    ("chunk_type", "chunk_data", "dimensions"),
+    [
+        (b"VP8X", b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", (1, 1)),
+        (b"VP8L", b"/\x00\x00\x00\x00", (1, 1)),
+        (b"VP8 ", b"\x00\x00\x00\x9d\x01\x2a\x01\x00\x01\x00", (1, 1)),
+    ],
+)
+def test_image_dimensions_supports_webp_headers(
+    chunk_type: bytes, chunk_data: bytes, dimensions: tuple[int, int]
+) -> None:
+    data = webp_data(chunk_type, chunk_data)
+    block = {
+        "type": "image",
+        "data": base64.b64encode(data).decode(),
+        "mimeType": "image/webp",
+    }
+    assert image_dimensions(block) == dimensions
+
+
+def test_anthropic_sends_valid_image_without_dimensions_natively() -> None:
+    block = {
+        "type": "image",
+        "data": base64.b64encode(b"\xff\xd8\xff").decode(),
+        "mimeType": "image/jpeg",
+    }
+    payload = build_messages_payload(
+        [Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("call-1", "stale", content_blocks=[block]))],
+        [],
+        model="claude-test",
+        max_tokens=100,
+    )
+
+    content = payload["messages"][0]["content"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0]["type"] == "image"
+
+
+def test_anthropic_falls_back_for_oversized_image_dimensions() -> None:
+    data = bytearray(bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
+    ))
+    data[16:20] = (8001).to_bytes(4, "big")
+    block = png_block(data=bytes(data))
+    payload = build_messages_payload(
+        [Message(MessageRole.TOOL_RESULT, tool_result=ToolResult("call-1", "stale", content_blocks=[block]))],
+        [],
+        model="claude-test",
+        max_tokens=100,
+    )
+
+    content = payload["messages"][0]["content"][0]["content"]
+    assert isinstance(content, str)
+    assert "dimensions are 8001x1" in content
+    assert "limit is 8000x8000" in content
 
 
 def test_anthropic_sends_supported_tool_images_as_native_blocks() -> None:
@@ -548,7 +612,8 @@ def test_anthropic_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
     )
 
     assert payload["messages"][0]["content"][0]["content"] == (
-        "[image block]\n[resource: file:///tmp/note.txt]"
+        "[image block] media_type=image/png bytes=5 fallback=invalid image data\n"
+        "[resource: file:///tmp/note.txt]"
     )
 
 
