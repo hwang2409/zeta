@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 import zeta.providers.anthropic as anthropic_module
+import zeta.providers.stream_diagnostics as diagnostics_module
 from zeta.providers.anthropic import (
     AnthropicAuthError,
     AnthropicBackend,
@@ -915,7 +916,10 @@ async def test_network_eof_salvage_records_exception_and_headers(tmp_path: Path)
                 "",
             ):
                 yield line
-            raise httpx.ReadError("peer closed", request=request)
+            raise httpx.ReadError(
+                "peer closed; Bearer bearer-secret api-key=api-secret token=token-secret",
+                request=request,
+            )
 
     class Stream:
         async def __aenter__(self):
@@ -944,7 +948,11 @@ async def test_network_eof_salvage_records_exception_and_headers(tmp_path: Path)
     record = json.loads(
         (tmp_path / "logs" / "stream-diagnostics.jsonl").read_text().strip()
     )
-    assert record["cause"] == "ReadError: peer closed"
+    assert record["cause"].startswith("ReadError: peer closed")
+    assert "bearer-secret" not in record["cause"]
+    assert "api-secret" not in record["cause"]
+    assert "token-secret" not in record["cause"]
+    assert "[redacted]" in record["cause"]
     assert record["request_id"] == "req-123"
     assert record["model"] == "header-model"
     assert record["sse_events_received"] == 3
@@ -956,15 +964,36 @@ def test_stream_diagnostic_log_rotates_at_size_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "logs" / "stream-diagnostics.jsonl"
-    monkeypatch.setattr(anthropic_module, "STREAM_DIAGNOSTICS_MAX_BYTES", 160)
+    monkeypatch.setattr(diagnostics_module, "STREAM_DIAGNOSTICS_MAX_BYTES", 160)
 
-    anthropic_module._write_stream_diagnostic(path, {"cause": "x" * 100})
-    anthropic_module._write_stream_diagnostic(path, {"cause": "y" * 100})
+    diagnostics_module.write_stream_diagnostic(path, {"cause": "x" * 100})
+    diagnostics_module.write_stream_diagnostic(path, {"cause": "y" * 100})
 
     assert path.exists()
     assert path.with_name("stream-diagnostics.jsonl.1").exists()
     assert path.stat().st_size <= 160
     assert path.with_name("stream-diagnostics.jsonl.1").stat().st_size <= 160
+
+
+def test_stream_diagnostic_redacts_secrets_and_bounds_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "logs" / "stream-diagnostics.jsonl"
+    monkeypatch.setattr(diagnostics_module, "STREAM_DIAGNOSTICS_MAX_BYTES", 256)
+
+    diagnostics_module.write_stream_diagnostic(
+        path,
+        {
+            "cause": "ReadError: Bearer very-secret-token api-key=another-secret "
+            + "x" * 1000
+        },
+    )
+
+    assert path.stat().st_size <= 256
+    record = json.loads(path.read_text())
+    assert "very-secret-token" not in record["cause"]
+    assert "another-secret" not in record["cause"]
+    assert "[redacted]" in record["cause"]
 
 
 @pytest.mark.asyncio

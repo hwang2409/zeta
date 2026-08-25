@@ -17,6 +17,7 @@ from urllib.parse import urlencode
 import httpx
 
 from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
+from .stream_diagnostics import StreamDiagnostics
 from .transport import (
     cleanup_transport,
     is_control_exception,
@@ -47,7 +48,6 @@ AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 API_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_REDIRECT_URI = "http://localhost:53692/callback"
-STREAM_DIAGNOSTICS_MAX_BYTES = 1024 * 1024
 OAUTH_BETA = "oauth-2025-04-20"
 CLAUDE_CODE_BETA = "claude-code-20250219"
 OAUTH_SCOPES = (
@@ -82,27 +82,6 @@ class AnthropicStreamError(AnthropicBackendError):
     """Raised when an Anthropic SSE stream is invalid or ends early."""
 
     code = "stream_error"
-
-
-def _write_stream_diagnostic(path: Path, record: Mapping[str, Any]) -> None:
-    """Append one bounded, local-only record without affecting stream handling."""
-
-    try:
-        encoded = (json.dumps(record, separators=(",", ":")) + "\n").encode()
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(path.parent, 0o700)
-        if (
-            path.exists()
-            and path.stat().st_size + len(encoded) > STREAM_DIAGNOSTICS_MAX_BYTES
-        ):
-            rotated = path.with_name(f"{path.name}.1")
-            rotated.unlink(missing_ok=True)
-            path.replace(rotated)
-        with path.open("ab") as handle:
-            handle.write(encoded)
-        os.chmod(path, 0o600)
-    except OSError:
-        return
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
@@ -520,43 +499,16 @@ async def _decode_response(
     last_event_at = started_at
     bytes_received = 0
     sse_events_received = 0
-    diagnostics_written = False
-
-    def write_diagnostic(
-        cause: str,
-        *,
-        open_block_count: int,
-        closed_block_count: int,
-    ) -> None:
-        nonlocal diagnostics_written
-        if diagnostics_path is None or diagnostics_written:
-            return
-        headers = getattr(response, "headers", {})
-        request_id = headers.get("request-id") or headers.get("x-request-id")
-        response_model = (
-            headers.get("model")
-            or headers.get("x-model")
-            or headers.get("anthropic-model")
-            or model
-        )
-        now = time.monotonic()
-        _write_stream_diagnostic(
+    diagnostics = (
+        StreamDiagnostics(
             diagnostics_path,
-            {
-                "timestamp": time.time(),
-                "cause": cause,
-                "stream_age_seconds": max(0.0, now - started_at),
-                "bytes_received": bytes_received,
-                "sse_events_received": sse_events_received,
-                "idle_gap_seconds": max(0.0, now - last_event_at),
-                "open_blocks": open_block_count,
-                "closed_blocks": closed_block_count,
-                "stop_reason": stop_reason,
-                "request_id": request_id,
-                "model": response_model,
-            },
+            headers=getattr(response, "headers", {}),
+            model=model,
+            started_at=started_at,
         )
-        diagnostics_written = True
+        if diagnostics_path is not None
+        else None
+    )
 
     def salvage(cause: str) -> StreamEvent:
         open_blocks = set(active_blocks)
@@ -568,11 +520,16 @@ async def _decode_response(
             truncated=True,
             open_blocks=open_blocks,
         )
-        write_diagnostic(
-            cause,
-            open_block_count=open_block_count,
-            closed_block_count=closed_block_count,
-        )
+        if diagnostics is not None:
+            diagnostics.record(
+                cause,
+                bytes_received=bytes_received,
+                sse_events_received=sse_events_received,
+                last_event_at=last_event_at,
+                open_blocks=open_block_count,
+                closed_blocks=closed_block_count,
+                stop_reason=stop_reason,
+            )
         return StreamEvent(
             translated.type,
             message=translated.message,
@@ -609,11 +566,16 @@ async def _decode_response(
                 len(active_blocks),
                 len(stopped_blocks),
             )
-            write_diagnostic(
-                "message_stop",
-                open_block_count=open_count,
-                closed_block_count=closed_count,
-            )
+            if diagnostics is not None:
+                diagnostics.record(
+                    "message_stop",
+                    bytes_received=bytes_received,
+                    sse_events_received=sse_events_received,
+                    last_event_at=last_event_at,
+                    open_blocks=open_count,
+                    closed_blocks=closed_count,
+                    stop_reason=stop_reason,
+                )
         return translated
 
     try:
