@@ -245,7 +245,7 @@ def _tool_panel(call: ToolCall, body: Text, *, error: bool = False) -> Panel:
         border_style=ERROR if error else CARD_BORDER,
         style=CARD_BG,
         padding=(0, 1),
-        expand=True,
+        expand=False,
     )
 
 
@@ -507,7 +507,7 @@ def format_status(
     spinner_active: bool | None = None,
     model_window: int | None = None,
 ) -> Text:
-    """Format the tinted footer shown below the composer identity row."""
+    """Format the compact status bar shown below the composer."""
 
     show_spinner = streaming if spinner_active is None else spinner_active
     usage = usage or {}
@@ -532,21 +532,23 @@ def format_status(
         "interrupted",
         "compacting",
     } else "streaming"
-    if show_spinner and state not in {"tool-running", "interrupted", "compacting"}:
-        left = f"{SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]}  ctrl+c interrupt"
+    if show_spinner and state not in {"interrupted", "compacting"}:
+        state_text = f"{SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]} {state}"
     else:
-        left = state
-    right_segments = [context_text, "/status", "ctrl+d quit"]
+        state_text = state
+    left = f"{state_text}  {context_text}"
+    right_segments = ["/status", "ctrl+c interrupt", "ctrl+d quit"]
     if session_id:
         right_segments.append(session_id[:8])
     if width is None:
         value = f"{left}  {' · '.join(right_segments)}"
     else:
         value = left
-        for count in range(len(right_segments), 0, -1):
-            candidate = f"{left}  {' · '.join(right_segments[:count])}"
-            if cell_len(candidate) <= width:
-                value = candidate
+        for start in range(len(right_segments)):
+            right = " · ".join(right_segments[start:])
+            gap = width - cell_len(left) - cell_len(right)
+            if gap >= 2:
+                value = f"{left}{' ' * gap}{right}"
                 break
         if cell_len(value) > width:
             fitted = Text(value, no_wrap=True, overflow="ellipsis")

@@ -17,9 +17,9 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
-from prompt_toolkit.styles import Style
+from prompt_toolkit.styles import DynamicStyle, Style
 from prompt_toolkit.layout import Dimension
-from prompt_toolkit.layout.containers import HSplit
+from prompt_toolkit.layout.containers import HSplit, VSplit, Window
 from rich.console import Console, RenderableType
 from rich.padding import Padding
 from rich.text import Text
@@ -49,7 +49,17 @@ from .render import (
     format_thought,
     render_event,
 )
-from .theme import ACCENT, BODY, CHROME, DIM, ERROR, RICH_THEME, SURFACE, USER_ROLE
+from .theme import (
+    ACCENT,
+    BODY,
+    CHROME,
+    COMPOSER_BORDER,
+    COMPOSER_FOCUS,
+    DIM,
+    ERROR,
+    RICH_THEME,
+    USER_ROLE,
+)
 from .transcript import TranscriptPresenter, TranscriptWidget
 
 
@@ -372,18 +382,31 @@ class TUIApp:
             on_page_down=self._transcript.page_down,
         )
         return FullScreenPromptSession(
-            message=[("class:prompt", " ❯ ")],
+            message=[("class:prompt", " > ")],
+            placeholder=[("class:placeholder", "type a message...")],
             history=history_for(self._history_path),
             key_bindings=bindings,
             multiline=True,
             bottom_toolbar=self._status_toolbar,
             erase_when_done=True,
-            style=Style.from_dict(
-                {
-                    "": f"fg:{BODY} bg:{SURFACE}",
-                    "prompt": f"fg:{ACCENT} bold bg:{SURFACE}",
-                    "status-bar": f"noreverse fg:{CHROME} bg:{SURFACE}",
-                }
+            show_frame=True,
+            style=DynamicStyle(
+                lambda: Style.from_dict(
+                    {
+                        "": f"fg:{BODY}",
+                        "prompt": f"fg:{ACCENT} bold",
+                        "placeholder": f"italic fg:{DIM}",
+                        "status-bar": f"noreverse fg:{CHROME}",
+                        "frame": "",
+                        "frame.border": (
+                            f"fg:{COMPOSER_FOCUS}"
+                            if get_app().current_buffer.name == "DEFAULT_BUFFER"
+                            else f"fg:{COMPOSER_BORDER}"
+                        ),
+                        "text-area": f"fg:{BODY}",
+                        "text-area.prompt": f"fg:{ACCENT} bold",
+                    }
+                )
             ),
         )
 
@@ -410,7 +433,8 @@ class TUIApp:
             self._approval_policy.abort(request_id)
 
     def _status_toolbar(self) -> FormattedText:
-        width = get_app().output.get_size().columns
+        terminal_width = get_app().output.get_size().columns
+        width = max(1, terminal_width - 4)
         usage = dict(self._usage)
         usage.setdefault(
             "cache_read_input_tokens",
@@ -756,8 +780,9 @@ class TUIApp:
     async def _read_prompt(self, session: PromptSession[str]) -> str | None:
         try:
             value = await session.prompt_async(
-                [("class:prompt", " ❯ ")],
+                [("class:prompt", " > ")],
                 bottom_toolbar=self._status_toolbar,
+                placeholder=[("class:placeholder", "type a message...")],
             )
         except EOFError:
             return None
@@ -809,12 +834,24 @@ class TUIApp:
         composer_rows = list(root.children)
         footer = composer_rows.pop()
         transcript = self._transcript.window()
+        content = HSplit(
+            [
+                transcript,
+                HSplit(
+                    [*composer_rows, footer],
+                    height=Dimension(min=4, max=10),
+                ),
+            ],
+        )
+        padded = VSplit(
+            [
+                Window(width=2, char=" "),
+                content,
+                Window(width=2, char=" "),
+            ],
+        )
         root.children[:] = [
-            transcript,
-            HSplit(
-                [*composer_rows, footer],
-                height=Dimension(min=2, max=8),
-            ),
+            padded,
         ]
 
     async def run(self, session: PromptSession[str] | None = None) -> None:

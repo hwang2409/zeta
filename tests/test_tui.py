@@ -5,9 +5,11 @@ import os
 import pty
 import re
 import select
+import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import replace
 from io import StringIO
@@ -46,7 +48,7 @@ from zeta.tui.render import (
     render_tool_progress,
     tool_render_mode,
 )
-from zeta.tui.theme import ACCENT, BODY, CODE_BG
+from zeta.tui.theme import ACCENT, BODY, RICH_THEME
 from zeta.tui.transcript import TranscriptWidget
 from zeta.types import (
     CompletionBackend,
@@ -787,7 +789,7 @@ def test_render_helpers_use_the_zeta_palette() -> None:
     )
 
     assert markdown.style == BODY
-    assert code.background_color == CODE_BG
+    assert code.background_color is None
     assert start is not None
     styled_text = start if hasattr(start, "spans") else start.renderable
     assert any(ACCENT in str(span.style) for span in styled_text.spans)
@@ -956,7 +958,10 @@ def test_special_status_states_override_spinner(state: str) -> None:
         spinner_frame=2,
     )
 
-    assert rendered.plain.startswith(state)
+    if state == "tool-running":
+        assert rendered.plain.startswith("● tool-running")
+    else:
+        assert rendered.plain.startswith(state)
     assert "esc interrupt" not in rendered.plain
 
 
@@ -1246,7 +1251,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     try:
         output = bytearray()
         deadline = time.monotonic() + 5
-        while "❯ ".encode() not in output and time.monotonic() < deadline:
+        while " > ".encode() not in output and time.monotonic() < deadline:
             ready, _, _ = select.select(
                 [master_fd],
                 [],
@@ -1255,7 +1260,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
             )
             if ready:
                 output.extend(os.read(master_fd, 4096))
-        assert "❯ ".encode() in output
+        assert " > ".encode() in output
 
         os.write(master_fd, b"\x04")
         deadline = time.monotonic() + 5
@@ -1336,7 +1341,7 @@ def test_footer_builder_formats_context_usage_and_hints() -> None:
     )
 
     assert footer.plain == (
-        "idle  18.6K (9%) · /status · ctrl+d quit · abcdef12"
+        "idle  18.6K (9%)  /status · ctrl+c interrupt · ctrl+d quit · abcdef12"
     )
 
 
@@ -1436,11 +1441,210 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     app._install_full_screen_layout(session)
 
     root = session.layout.container
-    assert len(root.children) == 2
-    assert root.children[0].__class__.__name__ == "Window"
-    bottom = root.children[1]
+    assert len(root.children) == 1
+    padded = root.children[0]
+    assert padded.__class__.__name__ == "VSplit"
+    assert padded.children[0].__class__.__name__ == "Window"
+    content = padded.children[1]
+    assert content.__class__.__name__ == "HSplit"
+    assert content.children[0].__class__.__name__ == "Window"
+    bottom = content.children[1]
     assert bottom.__class__.__name__ == "HSplit"
     assert bottom.children[-1].__class__.__name__ == "ConditionalContainer"
+
+
+@pytest.mark.parametrize(
+    ("terminal_width", "right_segments"),
+    [(120, ("/status", "ctrl+c interrupt", "ctrl+d quit", "abcdef12")),
+     (80, ("/status", "ctrl+c interrupt", "ctrl+d quit", "abcdef12")),
+     (40, ("abcdef12",))],
+)
+def test_full_screen_footer_fits_content_column(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_width: int,
+    right_segments: tuple[str, ...],
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions", session_id="abcdef123456"),
+        ),
+        provider="fake",
+        model="offline",
+    )
+    output = SimpleNamespace(
+        get_size=lambda: Size(rows=24, columns=terminal_width),
+    )
+    monkeypatch.setattr("zeta.tui.app.get_app", lambda: SimpleNamespace(output=output))
+
+    footer = "".join(value for _, value in app._status_toolbar())
+    content_width = terminal_width - 4
+
+    assert cell_len(footer) <= content_width
+    assert all(segment in footer for segment in right_segments)
+    if terminal_width == 40:
+        assert all(
+            segment not in footer
+            for segment in ("/status", "ctrl+c interrupt")
+        )
+
+
+def test_rich_rendering_does_not_paint_terminal_background() -> None:
+    output = StringIO()
+    console = Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        width=80,
+        theme=RICH_THEME,
+    )
+    console.print(render_markdown("# heading\n\n`inline`"))
+    console.print(render_code("print('hi')", "python"))
+    console.print(
+        render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_START,
+                tool_call=ToolCall("call-1", "bash", {"cmd": "pwd"}),
+            )
+        )
+    )
+
+    assert not re.search(r"\x1b\[[0-9;]*48(?:;[0-9;]*)?m", output.getvalue())
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+@pytest.mark.parametrize(("columns", "rows"), [(200, 45), (80, 24)])
+def test_full_screen_pty_keeps_padded_margins_clean(
+    tmp_path: Path, columns: int, rows: int
+) -> None:
+    session = f"zeta-pty-{uuid.uuid4().hex[:10]}"
+    zeta = Path(sys.executable).with_name("zeta")
+    env = os.environ.copy()
+    env["ZETA_HOME"] = str(tmp_path / "zeta-home")
+    env["TERM"] = "xterm-256color"
+    subprocess.run(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-x",
+            str(columns),
+            "-y",
+            str(rows),
+            str(zeta),
+            "--provider",
+            "fake",
+        ],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        check=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            capture = subprocess.run(
+                ["tmux", "capture-pane", "-t", session, "-p"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            if " > type a message..." in capture:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("zeta did not render the full-screen prompt")
+
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session, "hello", "Enter"],
+            check=True,
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            capture = subprocess.run(
+                ["tmux", "capture-pane", "-t", session, "-p"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            if "you said: hello" in capture:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("fake provider response did not render")
+
+        plain = subprocess.run(
+            ["tmux", "capture-pane", "-t", session, "-p"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        escaped = subprocess.run(
+            ["tmux", "capture-pane", "-e", "-t", session, "-p"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert any(line.startswith("  ▌ hello") for line in plain)
+        assert all(not line[:2].strip() for line in plain)
+        assert not re.search(r"\x1b\[[0-9;]*48(?:;[0-9;]*)?m", escaped)
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", session], check=False)
+
+
+@pytest.mark.parametrize(("width", "height"), [(120, 40), (80, 24), (40, 12)])
+def test_transcript_visual_snapshot_is_compact_and_bottom_aligned(
+    width: int, height: int
+) -> None:
+    transcript = TranscriptWidget()
+    call = ToolCall("visual", "bash", {"cmd": "pwd"})
+    transcript.append(Text.assemble(("▌ ", ACCENT), ("inspect the session", BODY)))
+    transcript.append_blank()
+    transcript.append(render_markdown("## result\n\n1. first item\n2. second item"))
+    transcript.append_blank()
+    transcript.append(
+        render_event(
+            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        )
+    )
+    transcript.append_blank()
+    transcript.append(
+        render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(call.id, "done"),
+            )
+        )
+    )
+    transcript.append_blank()
+    transcript.append(
+        Text(
+            "[approval pending] request-1: bash; type approve request-1 or deny request-1",
+            style=ACCENT,
+        )
+    )
+
+    lines = transcript.lines(width)
+    plain_lines = [Text.from_ansi(line).plain for line in lines]
+    assert all(line == line.rstrip() for line in plain_lines)
+    assert all(len(line) <= width for line in plain_lines)
+    assert all(line.strip() != "|" for line in plain_lines)
+
+    content = transcript.create_content(width, height)
+    visible = [
+        "".join(fragment[1] for fragment in content.get_line(index))
+        for index in range(content.line_count)
+    ]
+    parsed = transcript._parsed_lines(width)
+    prefix = max(0, height - len(parsed))
+    assert visible[prefix:] == [
+        "".join(fragment[1] for fragment in line) for line in parsed
+    ]
+    assert all(not line for line in visible[:prefix])
+    assert "request-1" in visible[-1]
 
 
 def test_full_screen_transcript_drops_markdown_list_placeholder_row(
@@ -1698,7 +1902,9 @@ async def test_full_screen_separates_user_and_assistant_units(tmp_path: Path) ->
     assert units[1] is None
     assert units[2] is not None
     assert renderable_plain(units[0]) == "▌ prompt"
-    assert "answer" in app._transcript.render(80)
+    rendered = app._transcript.render(80)
+    assert "zeta" in rendered
+    assert "answer" in rendered
 
 
 @pytest.mark.asyncio
@@ -1780,29 +1986,29 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path:
 
   ✱ thought · Plan the inspection.
 
-  ╭──────────────────────────────────────────────────────────────────╮
-  │ $ seq 24                                                         │
-  │ running…                                                         │
-  ╰──────────────────────────────────────────────────────────────────╯
-  ╭──────────────────────────────────────────────────────────────────╮
-  │ $ seq 24                                                         │
-  │ line-0                                                           │
-  │ line-1                                                           │
-  │ line-2                                                           │
-  │ line-3                                                           │
-  │ line-4                                                           │
-  │ line-5                                                           │
-  │ line-6                                                           │
-  │ line-7                                                           │
-  │ line-8                                                           │
-  │ line-9                                                           │
-  │ line-10                                                          │
-  │ line-11                                                          │
-  │ line-12                                                          │
-  │ line-13                                                          │
-  │ line-14                                                          │
-  │ … +9 lines                                                       │
-  ╰──────────────────────────────────────────────────────────────────╯
+  ╭──────────╮
+  │ $ seq 24 │
+  │ running… │
+  ╰──────────╯
+  ╭────────────╮
+  │ $ seq 24   │
+  │ line-0     │
+  │ line-1     │
+  │ line-2     │
+  │ line-3     │
+  │ line-4     │
+  │ line-5     │
+  │ line-6     │
+  │ line-7     │
+  │ line-8     │
+  │ line-9     │
+  │ line-10    │
+  │ line-11    │
+  │ line-12    │
+  │ line-13    │
+  │ line-14    │
+  │ … +9 lines │
+  ╰────────────╯
 
   ⏺ read README.md [limit=120] · running
   ⏺ read README.md [limit=120]

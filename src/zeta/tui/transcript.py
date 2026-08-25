@@ -21,7 +21,7 @@ from rich.text import Text
 
 from ..types import StreamEvent, StreamEventType, ToolCall
 from .render import render_event, render_tool_progress
-from .theme import RICH_THEME
+from .theme import ASSISTANT_ROLE, RICH_THEME
 
 
 class _ToolUnit:
@@ -183,8 +183,10 @@ class TranscriptWidget(UIControl):
             theme=RICH_THEME,
         )
         renderable = value.renderable if isinstance(value, _ToolUnit) else value
-        console.print(Padding(renderable, (0, 2, 0, 2)))
-        rendered = output.getvalue().rstrip("\n")
+        console.print(renderable)
+        rendered = "\n".join(
+            line.rstrip(" ") for line in output.getvalue().splitlines()
+        )
         self._render_cache[key] = (width, revision, rendered)
         return rendered
 
@@ -257,10 +259,7 @@ class TranscriptWidget(UIControl):
     def _strip_padding(line: str) -> str:
         if "\x1b" in line:
             line = Text.from_ansi(line).plain
-        plain = line
-        if plain.startswith("  "):
-            plain = plain[2:]
-        return plain.rstrip()
+        return line.rstrip()
 
     @staticmethod
     def _anchor_index(
@@ -315,10 +314,12 @@ class TranscriptWidget(UIControl):
         if self._follow_tail:
             self._scroll_offset = tail
         self._line_locations = locations
-        cursor_y = min(self._scroll_offset, len(lines) - 1)
+        prefix_lines = max(0, self._viewport_height - len(lines))
+        visible_lines = ([[] for _ in range(prefix_lines)] + lines)
+        cursor_y = min(prefix_lines + self._scroll_offset, len(visible_lines) - 1)
         return UIContent(
-            get_line=lambda index: lines[index],
-            line_count=len(lines),
+            get_line=lambda index: visible_lines[index],
+            line_count=len(visible_lines),
             cursor_position=Point(x=0, y=cursor_y),
             show_cursor=False,
         )
@@ -403,7 +404,12 @@ class TranscriptPresenter:
         if renderable is None:
             return False
         if not self._assistant_unit_open:
-            self.print_unit(renderable)
+            first_renderable = (
+                Group(Text("zeta", style=ASSISTANT_ROLE), renderable)
+                if self._full_screen_active()
+                else renderable
+            )
+            self.print_unit(first_renderable)
             self._assistant_unit_open = True
         else:
             self.print(renderable)
