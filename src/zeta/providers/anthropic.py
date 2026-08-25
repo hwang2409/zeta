@@ -476,10 +476,9 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
     stop_reason: str | None = None
     finished = False
     message_state = "not-started"
-    async for line in response.aiter_lines():
-        record = decoder.feed(line)
-        if record is None:
-            continue
+
+    def process_record(record: tuple[str, dict[str, Any]]) -> StreamEvent | None:
+        nonlocal message_state, stop_reason
         event, payload = record
         event_type = payload.get("type", event)
         if type(event_type) is str:
@@ -487,12 +486,19 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
         translated = _translate_event(
             event, payload, blocks, active_blocks, stopped_blocks, usage
         )
+        if translated is None and payload.get("type") == "message_delta":
+            delta = payload.get("delta")
+            if not isinstance(delta, Mapping):
+                raise AnthropicStreamError("Anthropic message delta is invalid")
+            stop_reason = delta.get("stop_reason")
+        return translated
+
+    async for line in response.aiter_lines():
+        record = decoder.feed(line)
+        if record is None:
+            continue
+        translated = process_record(record)
         if translated is None:
-            if payload.get("type") == "message_delta":
-                delta = payload.get("delta")
-                if not isinstance(delta, Mapping):
-                    raise AnthropicStreamError("Anthropic message delta is invalid")
-                stop_reason = delta.get("stop_reason")
             continue
         if translated.type is StreamEventType.MESSAGE_END:
             translated = StreamEvent(
@@ -507,13 +513,8 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
             finished = True
         yield translated
     record = decoder.finish()
-    if record is not None and record[1].get("type") != "done":
-        event_type = record[1].get("type", record[0])
-        if type(event_type) is str:
-            message_state = _advance_message_state(message_state, event_type)
-        translated = _translate_event(
-            record[0], record[1], blocks, active_blocks, stopped_blocks, usage
-        )
+    if record is not None:
+        translated = process_record(record)
         if translated is not None:
             if translated.type is StreamEventType.MESSAGE_END:
                 translated = StreamEvent(
@@ -740,26 +741,28 @@ def _finish_message(
     for index in sorted(blocks):
         block = blocks[index]
         if block.kind == "text":
+            if index in open_blocks and not block.text:
+                continue
             content.append(TextContent(block.text))
         elif block.kind == "thinking":
-            if not block.signature or index in open_blocks:
-                if not truncated:
-                    raise AnthropicStreamError(
-                        "Anthropic thinking block is missing its signature"
-                    )
+            if index in open_blocks:
                 content.append(ThinkingContent(block.text))
+            elif not block.signature:
+                raise AnthropicStreamError(
+                    "Anthropic thinking block is missing its signature"
+                )
             else:
                 content.append(ThinkingContent(block.text, block.signature))
         elif block.kind == "redacted_thinking":
             content.append(RedactedThinkingContent(block.redacted_data))
         else:
-            if block.input_json:
-                arguments = _parse_partial_object(block.input_json)
-                if truncated and not _is_complete_object(block.input_json):
+            if index in open_blocks:
+                if not block.input_json or not _is_complete_object(block.input_json):
                     dropped_tool_calls += 1
                     continue
-                if not truncated:
-                    arguments = _parse_complete_object(block.input_json)
+                arguments = _parse_complete_object(block.input_json)
+            elif block.input_json:
+                arguments = _parse_complete_object(block.input_json)
             else:
                 arguments = block.initial_input or {}
             if not block.call_id or not block.name:
