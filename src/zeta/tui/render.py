@@ -470,6 +470,15 @@ def render_event(event: StreamEvent) -> RenderableType | None:
     Text deltas return None. The app owns their newline buffer and status bar.
     """
 
+    if event.type is StreamEventType.MESSAGE_END and event.data.get("truncated"):
+        dropped = event.data.get("dropped_tool_calls")
+        if type(dropped) is int and dropped:
+            noun = "tool call" if dropped == 1 else "tool calls"
+            return Text(
+                f"response truncated (stream ended early; dropped {dropped} incomplete {noun})",
+                style=DIM,
+            )
+        return Text("response truncated (stream ended early)", style=DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
         if event.tool_call.name.lower() in RECEIPT_TOOLS:
             suffix = _receipt_arguments(event.tool_call, "")

@@ -275,7 +275,6 @@ class TUIApp:
     @property
     def _transcript_lines(self) -> list[str]:
         """Expose rendered lines for diagnostics while keeping logical units in the widget."""
-
         width = content_width(get_app().output.get_size().columns)
         return self._transcript.lines(width)
 
@@ -887,6 +886,7 @@ class TUIApp:
                 }:
                     rendered = render_event(event)
                     if rendered is not None:
+                        self._turn_had_visible_output |= event.type is StreamEventType.MESSAGE_END and bool(event.data.get("truncated"))
                         if event.type in {
                             StreamEventType.AGENT_END,
                             StreamEventType.ERROR,
