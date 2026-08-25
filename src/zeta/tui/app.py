@@ -846,6 +846,10 @@ class TUIApp:
                 }:
                     rendered = render_event(event)
                     if rendered is not None:
+                        if event.type is StreamEventType.MESSAGE_END and event.data.get(
+                            "truncated"
+                        ):
+                            self._turn_had_visible_output = True
                         if event.type in {
                             StreamEventType.AGENT_END,
                             StreamEventType.ERROR,

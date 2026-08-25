@@ -529,7 +529,24 @@ async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEven
                 return
             yield translated
     if not finished:
-        raise AnthropicStreamError("Anthropic stream ended before message_stop")
+        if message_state == "not-started":
+            raise AnthropicStreamError("Anthropic stream ended before message_start")
+        open_blocks = set(active_blocks)
+        active_blocks.clear()
+        translated = _finish_message(
+            blocks,
+            truncated=True,
+            open_blocks=open_blocks,
+        )
+        yield StreamEvent(
+            translated.type,
+            message=translated.message,
+            data={
+                **translated.data,
+                "usage": normalize_usage(usage),
+                "stop_reason": stop_reason,
+            },
+        )
 
 
 def _translate_event(
@@ -698,36 +715,66 @@ def _translate_event(
             raise AnthropicStreamError("Anthropic message usage is invalid")
         return None
     if event_type == "message_stop":
-        if active_blocks:
-            raise AnthropicStreamError("Anthropic message stop has open content blocks")
-        content: list[ContentBlock] = []
-        for index in sorted(blocks):
-            block = blocks[index]
-            if block.kind == "text":
-                content.append(TextContent(block.text))
-            elif block.kind == "thinking":
-                if not block.signature:
+        truncated = bool(active_blocks)
+        open_blocks = set(active_blocks)
+        if truncated:
+            active_blocks.clear()
+            stopped_blocks.update(blocks)
+        return _finish_message(
+            blocks,
+            truncated=truncated,
+            open_blocks=open_blocks,
+        )
+
+    return None
+
+
+def _finish_message(
+    blocks: Mapping[int, _BlockState],
+    *,
+    truncated: bool,
+    open_blocks: set[int],
+) -> StreamEvent:
+    content: list[ContentBlock] = []
+    dropped_tool_calls = 0
+    for index in sorted(blocks):
+        block = blocks[index]
+        if block.kind == "text":
+            content.append(TextContent(block.text))
+        elif block.kind == "thinking":
+            if not block.signature or index in open_blocks:
+                if not truncated:
                     raise AnthropicStreamError(
                         "Anthropic thinking block is missing its signature"
                     )
-                content.append(ThinkingContent(block.text, block.signature))
-            elif block.kind == "redacted_thinking":
-                content.append(RedactedThinkingContent(block.redacted_data))
+                content.append(ThinkingContent(block.text))
             else:
-                arguments = (
-                    _parse_complete_object(block.input_json)
-                    if block.input_json
-                    else block.initial_input or {}
-                )
-                if not block.call_id or not block.name:
-                    raise AnthropicStreamError("Anthropic tool call is incomplete")
-                content.append(ToolUseContent(ToolCall(block.call_id, block.name, arguments)))
-        return StreamEvent(
-            StreamEventType.MESSAGE_END,
-            message=Message(MessageRole.ASSISTANT, content),
-            data={},
-        )
-    return None
+                content.append(ThinkingContent(block.text, block.signature))
+        elif block.kind == "redacted_thinking":
+            content.append(RedactedThinkingContent(block.redacted_data))
+        else:
+            if block.input_json:
+                arguments = _parse_partial_object(block.input_json)
+                if truncated and not _is_complete_object(block.input_json):
+                    dropped_tool_calls += 1
+                    continue
+                if not truncated:
+                    arguments = _parse_complete_object(block.input_json)
+            else:
+                arguments = block.initial_input or {}
+            if not block.call_id or not block.name:
+                raise AnthropicStreamError("Anthropic tool call is incomplete")
+            content.append(ToolUseContent(ToolCall(block.call_id, block.name, arguments)))
+    data: dict[str, Any] = {}
+    if truncated:
+        data["truncated"] = True
+        if dropped_tool_calls:
+            data["dropped_tool_calls"] = dropped_tool_calls
+    return StreamEvent(
+        StreamEventType.MESSAGE_END,
+        message=Message(MessageRole.ASSISTANT, content),
+        data=data,
+    )
 
 
 def _advance_message_state(state: str, event_type: str) -> str:
@@ -770,6 +817,14 @@ def _parse_partial_object(value: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _is_complete_object(value: str) -> bool:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict)
+
+
 def _parse_complete_object(value: str) -> dict[str, Any]:
     try:
         parsed = json.loads(value)
@@ -787,9 +842,7 @@ def _wire_content(blocks: Sequence[ContentBlock]) -> list[dict[str, Any]]:
             result.append({"type": "text", "text": block.text})
         elif isinstance(block, ThinkingContent):
             if not block.signature:
-                raise AnthropicHTTPError(
-                    "thinking block is missing its Anthropic signature"
-                )
+                continue
             result.append(
                 {
                     "type": "thinking",
@@ -849,7 +902,9 @@ def build_messages_payload(
             wire_messages.append({"role": "user", "content": content})
             continue
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
-        wire_messages.append({"role": role, "content": _wire_content(message.content)})
+        content = _wire_content(message.content)
+        if content or role != "assistant":
+            wire_messages.append({"role": role, "content": content})
 
     if system:
         system[-1]["cache_control"] = {"type": "ephemeral"}

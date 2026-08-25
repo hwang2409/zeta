@@ -48,7 +48,7 @@ from zeta.tui.render import (
     render_tool_progress,
     tool_render_mode,
 )
-from zeta.tui.theme import ACCENT, BODY, RICH_THEME
+from zeta.tui.theme import ACCENT, BODY, DIM, RICH_THEME
 from zeta.tui.transcript import TranscriptWidget
 from zeta.types import (
     CompletionBackend,
@@ -988,6 +988,19 @@ def test_markdown_stream_requires_matching_four_backtick_fence() -> None:
     closing = stream.consume("````")
     assert closing[0].plain == "````"
     assert stream.language is None
+
+
+def test_truncated_response_notice_is_dim() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            data={"truncated": True},
+        )
+    )
+
+    assert isinstance(rendered, Text)
+    assert rendered.plain == "response truncated (stream ended early)"
+    assert rendered.style == DIM
 
 
 def test_markdown_stream_keeps_text_after_fence_inside_code_block() -> None:
