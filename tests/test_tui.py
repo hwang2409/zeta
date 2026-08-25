@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.enums import EditingMode
@@ -35,6 +36,7 @@ from zeta.core.approval import ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
+from zeta.providers.anthropic import AnthropicBackend, AnthropicCredentialStore, OAuthTokens
 from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.composer import (
@@ -944,6 +946,53 @@ def test_redacted_thought_renders_as_collapsed_line_with_duration() -> None:
 
     assert isinstance(rendered, Text)
     assert rendered.plain == "✱ thought · redacted · 1.2s"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_redacted_thinking_reaches_tui_stream(tmp_path: Path) -> None:
+    stream = "\n".join(
+        [
+            'data: {"type":"message_start","message":{}}',
+            "",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque"}}',
+            "",
+            'data: {"type":"content_block_stop","index":0}',
+            "",
+            'data: {"type":"message_stop"}',
+            "",
+        ]
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=stream,
+            request=request,
+        )
+
+    credentials = AnthropicCredentialStore(tmp_path / "zeta.json")
+    credentials.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend = AnthropicBackend(
+        client=client,
+        token_store=credentials,
+        base_url="https://test.invalid/v1/messages",
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._consume_turn("hello")
+    await client.aclose()
+
+    rendered = output.getvalue()
+    assert "✱ thought · redacted" in rendered
+    assert "no response" not in rendered
 
 
 @pytest.mark.parametrize(

@@ -635,6 +635,12 @@ def _translate_event(
         else:
             raise AnthropicStreamError("unsupported Anthropic content block type")
         active_blocks.add(index)
+        if kind == "redacted_thinking":
+            return StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=RedactedThinkingContent(data),
+                data={"index": index},
+            )
         return None
     if event_type == "content_block_delta":
         index = _index(payload)

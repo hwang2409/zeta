@@ -18,7 +18,6 @@ from ..types import (
     StreamEvent,
     StreamEventType,
     TextContent,
-    ThinkingContent,
     ToolUseContent,
 )
 
@@ -71,9 +70,23 @@ def _digest(messages: Sequence[Message]) -> str:
 def _text_from_message(message: Message) -> str:
     parts: list[str] = []
     for block in message.content:
-        if isinstance(block, (TextContent, ThinkingContent)):
+        if isinstance(block, TextContent):
             parts.append(block.text)
     return "".join(parts)
+
+
+def _strip_thinking(message: Message) -> Message:
+    content = [
+        block
+        for block in message.content
+        if isinstance(block, (TextContent, ToolUseContent))
+    ]
+    return Message(
+        message.role,
+        content,
+        tool_result=message.tool_result,
+        metadata=dict(message.metadata),
+    )
 
 
 def _has_tool_call(message: Message) -> bool:
@@ -108,8 +121,9 @@ class CompactionPolicy:
         completion_backend = backend or self.backend
         if completion_backend is None:
             raise SummaryCompletionError("compaction requires a completion backend")
+        sanitized_messages = [_strip_thinking(message) for message in messages]
         source = json.dumps(
-            [message.to_dict() for message in messages],
+            [message.to_dict() for message in sanitized_messages],
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -125,7 +139,7 @@ class CompactionPolicy:
         )
         summary_messages: list[Message] = []
         if system_prompt is not None:
-            summary_messages.append(system_prompt)
+            summary_messages.append(_strip_thinking(system_prompt))
         summary_messages.append(prompt)
 
         partial: list[ContentBlock] = []

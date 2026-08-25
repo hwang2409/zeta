@@ -747,8 +747,8 @@ class TUIApp:
         self._presenter.reset_assistant_unit()
 
     def _consume_text(self, event: StreamEvent) -> None:
-        value = event.delta
-        thinking = False
+        thinking = event.content is not None and event.content.type.value == "redacted_thinking"
+        value = "redacted" if thinking else event.delta
         if isinstance(event.content, TextContent):
             value = event.content.text
         elif isinstance(event.content, ThinkingContent):
