@@ -1025,6 +1025,30 @@ def test_tool_card_omits_exit_codes_in_any_section_position(
     assert "exit_code:" not in plain
 
 
+@pytest.mark.parametrize("position", ["leading", "middle", "trailing"])
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_tool_card_preserves_unlabeled_output_around_exit_codes(
+    position: str, exit_code: int
+) -> None:
+    outputs = {
+        "leading": f"exit_code: {exit_code}\nbefore\nafter",
+        "middle": f"before\nexit_code: {exit_code}\nafter",
+        "trailing": f"before\nafter\nexit_code: {exit_code}",
+    }
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-4", "exec", {"command": "run"}),
+            tool_result=ToolResult("tool-4", outputs[position]),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "before\nafter" in plain
+    assert "exit_code:" not in plain
+
+
 def test_render_event_error_is_visible() -> None:
     rendered = render_event(
         StreamEvent(

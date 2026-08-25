@@ -251,11 +251,11 @@ def _split_tool_output(
 
     lines = content.splitlines()
     section_labels = {"stdout:", "stderr:", "result:"}
-    if not any(
-        line in section_labels or line.startswith("exit_code:")
-        for line in lines
-    ):
-        return [], content
+    if not any(line in section_labels for line in lines):
+        generic = "\n".join(
+            line for line in lines if not line.startswith("exit_code:")
+        )
+        return [], generic
 
     sections: list[tuple[str, str]] = []
     current_label: str | None = None
