@@ -12,6 +12,7 @@ from zeta.core.context import ContextAssembler
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.loop import _validated_tool_result
+from zeta.prompts import load_identity
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 from zeta.types import (
     CompletionBackend,
@@ -42,6 +43,16 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
         MessageRole.USER,
         MessageRole.ASSISTANT,
     ]
+
+
+@pytest.mark.asyncio
+async def test_default_system_prompt_is_zeta_identity(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
+    store = ConversationStore(tmp_path)
+
+    await collect(AgentLoop(backend, store).run_turn("hi"))
+
+    assert backend.calls[0][0][0].content[0].text == load_identity()
 
 
 @pytest.mark.asyncio

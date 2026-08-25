@@ -31,6 +31,7 @@ from zeta.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.prompts import load_identity
 
 
 SSE = """event: message_start
@@ -127,6 +128,41 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
         ThinkingContent("plan", "sig-1"),
         TextContent("hello"),
     ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_sends_one_zeta_identity_after_oauth_spoof(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=SSE,
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    backend = AnthropicBackend(
+        client=client,
+        token_store=store,
+        base_url="https://test.invalid/v1/messages",
+    )
+    loop = AgentLoop(backend, ConversationStore(tmp_path / "sessions"))
+
+    async for _ in loop.run_turn("hi"):
+        pass
+
+    payload = json.loads(requests[0].content)
+    assert payload["system"][0]["text"].startswith("You are Claude Code")
+    assert payload["system"][1]["text"] == load_identity()
+    assert sum(block["text"].startswith("You are zeta") for block in payload["system"]) == 1
     await client.aclose()
 
 

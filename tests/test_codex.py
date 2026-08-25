@@ -1151,6 +1151,12 @@ def test_payload_maps_plan_messages_and_tools() -> None:
     ]
 
 
+def test_empty_codex_instructions_keep_provider_fallback() -> None:
+    payload = build_responses_payload([], [], model=DEFAULT_CODEX_MODEL)
+
+    assert payload["instructions"] == "You are a helpful assistant."
+
+
 def test_codex_http_error_includes_safe_truncated_body() -> None:
     body = json.dumps(
         {

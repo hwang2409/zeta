@@ -15,6 +15,7 @@ from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
+from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionError, SessionManager
 from zeta.tui.app import TUIApp, create_app
 from zeta.cli import build_parser, main
@@ -48,6 +49,191 @@ def test_fresh_cli_session_writes_versioned_directory(
     assert metadata["session_id"] == app.loop.store.session_id
     assert metadata["provider"] == "fake"
     assert metadata["cwd"] == str(tmp_path)
+
+
+def test_fresh_session_injects_context_and_lists_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    (tmp_path / "AGENTS.md").write_text("repo rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(_args())
+    system_prompt = app.loop.context_assembler.system_prompt.content[0].text
+
+    assert "You are zeta" in system_prompt
+    assert "repo rules" in system_prompt
+    assert str((tmp_path / "AGENTS.md").resolve()) in app.slash_status().context_files
+
+
+def test_resume_restores_context_snapshot_across_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    original = tmp_path / "original"
+    other = tmp_path / "other"
+    original.mkdir()
+    other.mkdir()
+    original_context = original / "AGENTS.md"
+    original_context.write_text("original rules", encoding="utf-8")
+    (other / "AGENTS.md").write_text("new directory rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(original)
+
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    original_context.write_text("changed rules", encoding="utf-8")
+    monkeypatch.chdir(other)
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+    )
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+
+    assert "original rules" in prompt
+    assert "changed rules" not in prompt
+    assert "new directory rules" not in prompt
+    assert resumed.slash_status().context_files == (str(original_context.resolve()),)
+
+
+def test_legacy_resume_persists_context_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    context_file = tmp_path / "AGENTS.md"
+    context_file.write_text("legacy rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    metadata_path = home / "sessions" / opened.store.session_id / "meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("system_prompt")
+    metadata.pop("context_files")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
+    )
+    saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    assert saved["system_prompt"] == resumed.loop.context_assembler.system_prompt.content[0].text
+    assert saved["context_files"] == [str(context_file.resolve())]
+
+
+def test_legacy_resume_uses_persisted_snapshot_on_second_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    context_file = tmp_path / "AGENTS.md"
+    context_file.write_text("first rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    metadata_path = home / "sessions" / opened.store.session_id / "meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("system_prompt")
+    metadata.pop("context_files")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    create_app(
+        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
+    )
+    context_file.write_text("second rules", encoding="utf-8")
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
+    )
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+
+    assert "first rules" in prompt
+    assert "second rules" not in prompt
+
+
+def test_partial_context_metadata_is_replaced_with_fallback_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    context_file = tmp_path / "AGENTS.md"
+    context_file.write_text("first rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    metadata_path = home / "sessions" / session_id / "meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("context_files")
+    context_file.write_text("replacement rules", encoding="utf-8")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+    )
+    saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+
+    assert "replacement rules" in prompt
+    assert saved["context_files"] == [str(context_file.resolve())]
+
+
+def test_concurrent_legacy_resumes_adopt_the_persisted_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    session_id = opened.store.session_id
+    metadata_path = home / "sessions" / session_id / "meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("system_prompt")
+    metadata.pop("context_files")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    barrier = threading.Barrier(2)
+    load_count = 0
+    load_count_lock = threading.Lock()
+
+    def load_context(*, repo_root: Path, zeta_home: Path) -> ProjectContext:
+        del repo_root, zeta_home
+        nonlocal load_count
+        with load_count_lock:
+            index = load_count
+            load_count += 1
+        barrier.wait()
+        return ProjectContext(f"fallback {index}", (tmp_path / f"context-{index}.md",))
+
+    monkeypatch.setattr("zeta.tui.app.load_project_context", load_context)
+    apps: list[TUIApp] = []
+    errors: list[Exception] = []
+
+    def resume() -> None:
+        try:
+            apps.append(
+                create_app(
+                    build_parser().parse_args(
+                        ["--resume", session_id, "--provider", "fake"]
+                    )
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=resume)
+    second = threading.Thread(target=resume)
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+
+    assert errors == []
+    assert load_count == 2
+    saved = SessionManager(home).open(session_id).metadata
+    prompts = [app.loop.context_assembler.system_prompt.content[0].text for app in apps]
+    context_files = [app.slash_status().context_files for app in apps]
+    assert saved.system_prompt in {"fallback 0", "fallback 1"}
+    assert prompts == [saved.system_prompt, saved.system_prompt]
+    assert context_files == [tuple(saved.context_files), tuple(saved.context_files)]
 
 
 def test_session_bash_cwd_round_trips_through_store_state(
