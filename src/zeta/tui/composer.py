@@ -5,64 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
-from rich.cells import cell_len
-from rich.text import Text
-
-
-def _fit(value: str, width: int) -> str:
-    if width <= 0:
-        return ""
-    text = Text(value, no_wrap=True, overflow="ellipsis")
-    text.truncate(width, overflow="ellipsis")
-    return text.plain
 
 def parse_input(value: str) -> str | None:
     """Return a usable user turn, or None for blank input."""
 
     stripped = value.strip()
     return stripped or None
-
-
-def format_composer_info(
-    provider: str,
-    model: str,
-    *,
-    width: int | None = None,
-) -> FormattedText:
-    """Build the dim identity row below the input line."""
-
-    left = "zeta"
-    right = f"{provider} · {model}"
-    if width is None:
-        return FormattedText(
-            [
-                ("class:composer-info", left),
-                ("class:composer-info", "  "),
-                ("class:composer-info", right),
-            ]
-        )
-    if width <= 0:
-        return FormattedText()
-    if cell_len(left) + 2 + cell_len(right) <= width:
-        spaces = width - cell_len(left) - cell_len(right)
-        return FormattedText(
-            [
-                ("class:composer-info", left),
-                ("class:composer-info", " " * spaces),
-                ("class:composer-info", right),
-            ]
-        )
-    if width <= cell_len(left) + 2:
-        return FormattedText([("class:composer-info", _fit(left, width))])
-    right = _fit(right, width - cell_len(left) - 2).rstrip(" ·")
-    value = f"{left}  {right}" if right else _fit(left, width)
-    return FormattedText(
-        [("class:composer-info", _fit(value, width))]
-    )
 
 
 def build_key_bindings(

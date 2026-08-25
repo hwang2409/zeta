@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from io import StringIO
 
 from prompt_toolkit.data_structures import Point
@@ -11,12 +13,13 @@ from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.layout.dimension import AnyDimension, Dimension
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
-from rich.console import Console, RenderableType
+from rich.console import Console, Group, RenderableType
+from rich.live import Live
 from rich.padding import Padding
 from rich.text import Text
 
-from ..types import ToolCall
-from .render import render_tool_progress
+from ..types import StreamEvent, StreamEventType, ToolCall
+from .render import render_event, render_tool_progress
 from .theme import RICH_THEME
 
 
@@ -42,44 +45,63 @@ class _ToolUnit:
         self.revision += 1
 
 
+class _TranscriptUnit:
+    def __init__(self, key: int, value: RenderableType | _ToolUnit) -> None:
+        self.key = key
+        self.value = value
+
+
 class TranscriptWidget(UIControl):
     """Render logical transcript units at the current width and stay at the bottom."""
 
     def __init__(self) -> None:
-        self._units: list[RenderableType | None | _ToolUnit] = []
+        self._units: list[_TranscriptUnit | None] = []
         self._tools: dict[str, _ToolUnit] = {}
         self._render_cache: dict[int, tuple[int, int, str]] = {}
+        self._parsed_cache: dict[int, tuple[int, list[list[tuple[str, str]]]]] = {}
+        self._revision = 0
+        self._next_key = 0
         self._follow_tail = True
         self._scroll_offset = 0
         self._viewport_height = 1
         self._content_width = 80
+        self._last_width: int | None = None
+        self._line_locations: list[tuple[_TranscriptUnit | None, int]] = []
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
-        return tuple(self._units)
+        return tuple(unit.value if unit is not None else None for unit in self._units)
+
+    def _append_unit(self, value: RenderableType | _ToolUnit) -> None:
+        self._units.append(_TranscriptUnit(self._next_key, value))
+        self._next_key += 1
+        self._revision += 1
 
     def append(self, renderable: RenderableType) -> None:
-        self._units.append(renderable)
+        self._append_unit(renderable)
 
     def append_blank(self) -> None:
         self._units.append(None)
+        self._revision += 1
 
     def start_tool(
         self, call_id: str, call: ToolCall, renderable: RenderableType
     ) -> None:
         unit = _ToolUnit(call, renderable)
-        self._units.append(unit)
+        self._append_unit(unit)
         self._tools[call_id] = unit
 
     def update_tool(self, call_id: str, rendered: RenderableType) -> None:
         unit = self._tools.get(call_id)
         if unit is not None:
             unit.update(rendered)
+            self._revision += 1
 
     def finish_tool(self, call_id: str, rendered: RenderableType) -> None:
         unit = self._tools.pop(call_id, None)
         if unit is not None:
             unit.finish(rendered)
+            self._revision += 1
         else:
             self.append(rendered)
 
@@ -87,8 +109,20 @@ class TranscriptWidget(UIControl):
         if not self._tools:
             return
         active = set(self._tools.values())
-        self._units[:] = [unit for unit in self._units if unit not in active]
+        removed_keys = {
+            unit.key
+            for unit in self._units
+            if unit is not None and unit.value in active
+        }
+        self._units[:] = [
+            unit
+            for unit in self._units
+            if unit is None or unit.value not in active
+        ]
+        for key in removed_keys:
+            self._render_cache.pop(key, None)
         self._tools.clear()
+        self._revision += 1
 
     @property
     def follow_tail(self) -> bool:
@@ -99,7 +133,7 @@ class TranscriptWidget(UIControl):
         return self._scroll_offset
 
     def _set_scroll_offset(self, value: int) -> None:
-        line_count = len(self.lines(self._content_width))
+        line_count = len(self._parsed_lines(self._content_width))
         tail = max(0, line_count - self._viewport_height)
         self._scroll_offset = min(max(0, value), tail)
         self._follow_tail = self._scroll_offset >= tail
@@ -118,9 +152,10 @@ class TranscriptWidget(UIControl):
     def scroll_down(self) -> None:
         self._set_scroll_offset(self._scroll_offset + 3)
 
-    def _render_unit(self, unit: RenderableType | _ToolUnit, width: int) -> str:
-        revision = unit.revision if isinstance(unit, _ToolUnit) else 0
-        key = id(unit)
+    def _render_unit(self, unit: _TranscriptUnit, width: int) -> str:
+        value = unit.value
+        revision = value.revision if isinstance(value, _ToolUnit) else 0
+        key = unit.key
         cached = self._render_cache.get(key)
         if cached is not None and cached[0] == width and cached[1] == revision:
             return cached[2]
@@ -132,7 +167,7 @@ class TranscriptWidget(UIControl):
             width=max(1, width),
             theme=RICH_THEME,
         )
-        renderable = unit.renderable if isinstance(unit, _ToolUnit) else unit
+        renderable = value.renderable if isinstance(value, _ToolUnit) else value
         console.print(Padding(renderable, (0, 2, 0, 2)))
         rendered = output.getvalue().rstrip("\n")
         self._render_cache[key] = (width, revision, rendered)
@@ -154,18 +189,86 @@ class TranscriptWidget(UIControl):
     def lines(self, width: int) -> list[str]:
         return self.render(width).splitlines()
 
-    def create_content(self, width: int, height: int | None) -> UIContent:
-        self._content_width = max(1, width)
-        self._viewport_height = max(1, height or 1)
+    def _parsed_lines(self, width: int) -> list[list[tuple[str, str]]]:
+        cached = self._parsed_cache.get(width)
+        if cached is not None and cached[0] == self._revision:
+            return cached[1]
         fragments = to_formatted_text(ANSI(self.render(width)))
         lines = list(split_lines(fragments)) or [[]]
+        self._parsed_cache[width] = (self._revision, lines)
+        return lines
+
+    def _locations(self, width: int) -> list[tuple[_TranscriptUnit | None, int]]:
+        raw_lines: list[tuple[str, _TranscriptUnit | None, int]] = []
+        for unit in self._units:
+            if unit is None:
+                raw_lines.append(("", None, 0))
+                continue
+            lines = self._render_unit(unit, width).splitlines() or [""]
+            raw_lines.extend((line, unit, index) for index, line in enumerate(lines))
+        while raw_lines and not Text.from_ansi(raw_lines[0][0]).plain.strip():
+            raw_lines.pop(0)
+        return [(unit, line_index) for _, unit, line_index in raw_lines]
+
+    @staticmethod
+    def _anchor_index(
+        locations: list[tuple[_TranscriptUnit | None, int]],
+        anchor: tuple[_TranscriptUnit | None, int],
+    ) -> int | None:
+        for index, location in enumerate(locations):
+            if location == anchor:
+                return index
+        unit, line_index = anchor
+        if unit is None:
+            return None
+        candidates = [
+            (index, offset)
+            for index, (candidate, offset) in enumerate(locations)
+            if candidate is unit
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: abs(item[1] - line_index))[0]
+
+    def create_content(self, width: int, height: int | None) -> UIContent:
+        width = max(1, width)
+        height = max(1, height or 1)
+        old_anchor: tuple[_TranscriptUnit | None, int] | None = None
+        resized = self._last_width is not None and self._last_width != width
+        if resized and not self._follow_tail:
+            old_locations = self._locations(self._last_width or width)
+            if old_locations:
+                old_anchor = old_locations[
+                    min(self._scroll_offset, len(old_locations) - 1)
+                ]
+        self._content_width = max(1, width)
+        self._viewport_height = height
+        lines = self._parsed_lines(width)
+        locations = self._locations(width)
         if self._follow_tail:
             self._scroll_offset = max(0, len(lines) - self._viewport_height)
+        elif old_anchor is not None:
+            anchor_index = self._anchor_index(locations, old_anchor)
+            self._scroll_offset = (
+                anchor_index
+                if anchor_index is not None
+                else min(
+                    self._scroll_offset,
+                    max(0, len(lines) - self._viewport_height),
+                )
+            )
         else:
             self._scroll_offset = min(
                 self._scroll_offset,
                 max(0, len(lines) - self._viewport_height),
             )
+        tail = max(0, len(lines) - self._viewport_height)
+        if not self._follow_tail and self._scroll_offset >= tail:
+            self._follow_tail = True
+        if self._follow_tail:
+            self._scroll_offset = tail
+        self._last_width = width
+        self._line_locations = locations
         cursor_y = min(self._scroll_offset, len(lines) - 1)
         return UIContent(
             get_line=lambda index: lines[index],
@@ -194,3 +297,190 @@ class TranscriptWidget(UIControl):
             wrap_lines=False,
             get_vertical_scroll=self.vertical_scroll,
         )
+
+
+@dataclass(frozen=True)
+class ToolEventPresentation:
+    visible_output: bool = False
+    stop_after_tool: bool = False
+
+
+class TranscriptPresenter:
+    """Own transcript output and tool-card presentation for the TUI."""
+
+    def __init__(
+        self,
+        transcript: TranscriptWidget,
+        console: Console,
+        full_screen_active: Callable[[], bool],
+        print_callback: Callable[[RenderableType | None], None],
+    ) -> None:
+        self.transcript = transcript
+        self.console = console
+        self._full_screen_active = full_screen_active
+        self._print_callback = print_callback
+        self._printed_units = False
+        self._assistant_unit_open = False
+        self._active_tool_calls: set[str] = set()
+        self._pending_tool_renders: list[RenderableType] = []
+        self._tool_region: Live | None = None
+        self._tool_region_text: Text | None = None
+        self._tool_region_call: ToolCall | None = None
+
+    @property
+    def tool_region(self) -> Live | None:
+        return self._tool_region
+
+    def _append(self, renderable: RenderableType) -> None:
+        self.transcript.append(renderable)
+
+    def append_blank(self) -> None:
+        self.transcript.append_blank()
+
+    def print(self, renderable: RenderableType | None) -> None:
+        if renderable is None:
+            return
+        self._print_callback(renderable)
+
+    def print_unit(self, renderable: RenderableType | None) -> None:
+        if renderable is None:
+            return
+        if self._printed_units:
+            if self._full_screen_active():
+                self._append_blank()
+            else:
+                self.console.print()
+        self.print(renderable)
+        self._printed_units = True
+
+    def print_assistant(self, renderable: RenderableType | None) -> bool:
+        if renderable is None:
+            return False
+        if not self._assistant_unit_open:
+            self.print_unit(renderable)
+            self._assistant_unit_open = True
+        else:
+            self.print(renderable)
+        plain = getattr(renderable, "plain", None)
+        return plain is None or bool(plain.strip())
+
+    def reset_assistant_unit(self) -> None:
+        self._assistant_unit_open = False
+
+    def update_tool_region(self, event: StreamEvent) -> bool:
+        rendered = render_event(event)
+        if not isinstance(rendered, Text):
+            return False
+        if self._full_screen_active():
+            if event.tool_call is not None:
+                self.transcript.update_tool(event.tool_call.id, rendered)
+            return bool(event.delta and event.delta.strip())
+        if self._tool_region is None:
+            self._tool_region_text = Text()
+            self._tool_region_call = event.tool_call
+            self._tool_region = Live(
+                Padding(
+                    render_tool_progress(
+                        self._tool_region_call,
+                        self._tool_region_text.plain,
+                    ),
+                    (0, 2, 0, 2),
+                )
+                if self._tool_region_call is not None
+                else self._tool_region_text,
+                console=self.console,
+                transient=True,
+                refresh_per_second=20,
+            )
+        if self._tool_region_text is None:
+            return False
+        if self._tool_region_text:
+            self._tool_region_text.append("\n")
+        self._tool_region_text.append(rendered)
+        if self._tool_region_call is not None:
+            self._tool_region.update(
+                Padding(
+                    render_tool_progress(
+                        self._tool_region_call,
+                        self._tool_region_text.plain,
+                    ),
+                    (0, 2, 0, 2),
+                )
+            )
+        else:
+            self._tool_region.update(self._tool_region_text)
+        return bool(event.delta and event.delta.strip())
+
+    def handle_tool_event(
+        self,
+        event: StreamEvent,
+        *,
+        aborted: bool,
+    ) -> ToolEventPresentation | None:
+        if event.type is StreamEventType.TOOL_EXECUTION_START:
+            self.reset_assistant_unit()
+            if event.tool_call is not None:
+                self._active_tool_calls.add(event.tool_call.id)
+            rendered = render_event(event)
+            if rendered is None:
+                return ToolEventPresentation()
+            if self._full_screen_active() and event.tool_call is not None:
+                if self._printed_units:
+                    self._append_blank()
+                self.transcript.start_tool(
+                    event.tool_call.id,
+                    event.tool_call,
+                    rendered,
+                )
+                self._printed_units = True
+            else:
+                self.print_unit(rendered)
+            return ToolEventPresentation(visible_output=True)
+        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
+            return ToolEventPresentation(
+                visible_output=self.update_tool_region(event)
+            )
+        if event.type is not StreamEventType.TOOL_EXECUTION_END:
+            return None
+
+        if event.tool_call is not None:
+            self._active_tool_calls.discard(event.tool_call.id)
+        rendered = render_event(event)
+        if rendered is not None:
+            if self._full_screen_active() and event.tool_call is not None:
+                self.transcript.finish_tool(event.tool_call.id, rendered)
+            else:
+                self._pending_tool_renders.append(rendered)
+        if not self._active_tool_calls:
+            self.commit_tool_region()
+        return ToolEventPresentation(
+            visible_output=rendered is not None,
+            stop_after_tool=aborted,
+        )
+
+    def commit_tool_region(self) -> None:
+        final_renders = self._pending_tool_renders
+        self._pending_tool_renders = []
+        if self._tool_region is not None:
+            if final_renders:
+                self._tool_region.update(Group(*final_renders))
+            self._tool_region.stop()
+            self._tool_region = None
+            self._tool_region_text = None
+            self._tool_region_call = None
+        for rendered in final_renders:
+            self.print(rendered)
+        self.reset_assistant_unit()
+
+    def discard_tool_region(self) -> None:
+        self._pending_tool_renders.clear()
+        if self._full_screen_active():
+            self.transcript.discard_tools()
+        if self._tool_region is not None:
+            self._tool_region.stop()
+            self._tool_region = None
+            self._tool_region_text = None
+            self._tool_region_call = None
+
+    def clear_active_tool_calls(self) -> None:
+        self._active_tool_calls.clear()

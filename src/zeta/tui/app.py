@@ -20,8 +20,7 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 from prompt_toolkit.layout import Dimension
 from prompt_toolkit.layout.containers import HSplit
-from rich.console import Console, Group, RenderableType
-from rich.live import Live
+from rich.console import Console, RenderableType
 from rich.padding import Padding
 from rich.text import Text
 
@@ -41,7 +40,6 @@ from ..types import (
     StreamEventType,
     TextContent,
     ThinkingContent,
-    ToolCall,
 )
 from .composer import build_key_bindings, history_for, parse_input
 from .render import (
@@ -49,10 +47,9 @@ from .render import (
     format_status,
     format_thought,
     render_event,
-    render_tool_progress,
 )
 from .theme import ACCENT, BODY, CHROME, DIM, ERROR, RICH_THEME, SURFACE, USER_ROLE
-from .transcript import TranscriptWidget
+from .transcript import TranscriptPresenter, TranscriptWidget
 
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -211,23 +208,22 @@ class TUIApp:
         self._spinner_active = False
         self._spinner_frame = 0
         self._spinner_reset = asyncio.Event()
-        self._active_tool_calls: set[str] = set()
-        self._pending_tool_renders: list[RenderableType] = []
-        self._tool_region: Live | None = None
-        self._tool_region_text: Text | None = None
-        self._tool_region_call: ToolCall | None = None
         self._abort_requested = False
         self._resuming_tool = False
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
         self._approval_policy = approval_policy
         self._slash_commands = create_slash_registry()
-        self._printed_units = False
-        self._assistant_unit_open = False
         self._compaction_shown = False
         self._turn_had_visible_output = False
         self._active_session: PromptSession[str] | None = None
         self._transcript = TranscriptWidget()
+        self._presenter = TranscriptPresenter(
+            self._transcript,
+            self.console,
+            self._full_screen_active,
+            lambda renderable: self._print(renderable),
+        )
         self._input_queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     @property
@@ -383,7 +379,6 @@ class TUIApp:
                     "": f"fg:{BODY} bg:{SURFACE}",
                     "prompt": f"fg:{ACCENT} bold bg:{SURFACE}",
                     "status-bar": f"noreverse fg:{CHROME} bg:{SURFACE}",
-                    "composer-info": f"noreverse fg:{CHROME} bg:{SURFACE}",
                 }
             ),
         )
@@ -446,12 +441,11 @@ class TUIApp:
         return isinstance(self._active_session, FullScreenPromptSession)
 
     def _append_transcript(self, renderable: RenderableType | None) -> None:
-        if renderable is None:
-            return
-        self._transcript.append(renderable)
+        if renderable is not None:
+            self._transcript.append(renderable)
 
     def _append_transcript_blank(self) -> None:
-        self._transcript.append_blank()
+        self._presenter.append_blank()
 
     def _print(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
@@ -461,71 +455,11 @@ class TUIApp:
                 self.console.print(Padding(renderable, (0, 2, 0, 2)))
 
     def _print_unit(self, renderable: RenderableType | None) -> None:
-        if renderable is None:
-            return
-        if self._printed_units:
-            if self._full_screen_active():
-                self._append_transcript_blank()
-            else:
-                self.console.print()
-        self._print(renderable)
-        self._printed_units = True
+        self._presenter.print_unit(renderable)
 
     def _print_assistant(self, renderable: RenderableType | None) -> None:
-        if renderable is None:
-            return
-        if not self._assistant_unit_open:
-            self._print_unit(renderable)
-            self._assistant_unit_open = True
-        else:
-            self._print(renderable)
-        plain = getattr(renderable, "plain", None)
-        if plain is None or plain.strip():
+        if self._presenter.print_assistant(renderable):
             self._turn_had_visible_output = True
-
-    def _update_tool_region(self, event: StreamEvent) -> None:
-        rendered = render_event(event)
-        if not isinstance(rendered, Text):
-            return
-        if self._full_screen_active():
-            if event.tool_call is not None:
-                self._transcript.update_tool(event.tool_call.id, rendered)
-            return
-        if self._tool_region is None:
-            self._tool_region_text = Text()
-            self._tool_region_call = event.tool_call
-            self._tool_region = Live(
-                Padding(
-                    render_tool_progress(
-                        self._tool_region_call,
-                        self._tool_region_text.plain,
-                    ),
-                    (0, 2, 0, 2),
-                )
-                if self._tool_region_call is not None
-                else self._tool_region_text,
-                console=self.console,
-                transient=True,
-                refresh_per_second=20,
-            )
-
-        if self._tool_region_text is None:
-            return
-        if self._tool_region_text:
-            self._tool_region_text.append("\n")
-        self._tool_region_text.append(rendered)
-        if self._tool_region_call is not None:
-            self._tool_region.update(
-                Padding(
-                    render_tool_progress(
-                        self._tool_region_call,
-                        self._tool_region_text.plain,
-                    ),
-                    (0, 2, 0, 2),
-                )
-            )
-        else:
-            self._tool_region.update(self._tool_region_text)
 
     def _handle_tool_event(self, event: StreamEvent) -> bool:
         if event.type is StreamEventType.TOOL_APPROVAL_START:
@@ -538,29 +472,20 @@ class TUIApp:
             return False
         if event.type is StreamEventType.TOOL_EXECUTION_START:
             self._reset_stream_state()
-            self._assistant_unit_open = False
             self._loop_state = "tool-running"
-            if event.tool_call is not None:
-                self._active_tool_calls.add(event.tool_call.id)
-            rendered = render_event(event)
-            if rendered is None:
-                return False
-            if self._full_screen_active() and event.tool_call is not None:
-                if self._printed_units:
-                    self._append_transcript_blank()
-                self._transcript.start_tool(
-                    event.tool_call.id,
-                    event.tool_call,
-                    rendered,
-                )
-                self._printed_units = True
-            else:
-                self._print_unit(rendered)
-            self._turn_had_visible_output = True
+            presentation = self._presenter.handle_tool_event(
+                event,
+                aborted=False,
+            )
+            if presentation is not None and presentation.visible_output:
+                self._turn_had_visible_output = True
             return False
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
-            self._update_tool_region(event)
-            if event.delta and event.delta.strip():
+            presentation = self._presenter.handle_tool_event(
+                event,
+                aborted=False,
+            )
+            if presentation is not None and presentation.visible_output:
                 self._turn_had_visible_output = True
             return False
         if event.type is not StreamEventType.TOOL_EXECUTION_END:
@@ -570,19 +495,16 @@ class TUIApp:
         self._loop_state = "interrupted" if aborted else (
             "idle" if self._resuming_tool else "streaming"
         )
-        if event.tool_call is not None:
-            self._active_tool_calls.discard(event.tool_call.id)
-        rendered = render_event(event)
-        if rendered is not None:
-            if self._full_screen_active() and event.tool_call is not None:
-                self._transcript.finish_tool(event.tool_call.id, rendered)
-            else:
-                self._pending_tool_renders.append(rendered)
+        presentation = self._presenter.handle_tool_event(
+            event,
+            aborted=aborted,
+        )
+        if presentation is not None and presentation.visible_output:
             self._turn_had_visible_output = True
-        stop_after_tool = self._abort_requested
+        stop_after_tool = (
+            presentation is not None and presentation.stop_after_tool
+        )
         self._abort_requested = False
-        if not self._active_tool_calls:
-            self._commit_tool_region()
         return stop_after_tool
 
     def _handle_resumed_tool_event(self, event: StreamEvent) -> None:
@@ -611,29 +533,12 @@ class TUIApp:
             self._print_user(model_input)
             self._start_turn(model_input)
 
-    def _commit_tool_region(self) -> None:
-        final_renders = self._pending_tool_renders
-        self._pending_tool_renders = []
-        if self._tool_region is not None:
-            if final_renders:
-                self._tool_region.update(Group(*final_renders))
-            self._tool_region.stop()
-            self._tool_region = None
-            self._tool_region_text = None
-            self._tool_region_call = None
-        for rendered in final_renders:
-            self._print(rendered)
-        self._assistant_unit_open = False
-
     def _discard_tool_region(self) -> None:
-        self._pending_tool_renders.clear()
-        if self._full_screen_active():
-            self._transcript.discard_tools()
-        if self._tool_region is not None:
-            self._tool_region.stop()
-            self._tool_region = None
-            self._tool_region_text = None
-            self._tool_region_call = None
+        self._presenter.discard_tool_region()
+
+    @property
+    def _tool_region(self):
+        return self._presenter.tool_region
 
     def _print_committed(self, lines: list[str], *, thinking: bool = False) -> None:
         if thinking:
@@ -680,7 +585,7 @@ class TUIApp:
     def _flush_pending_stream(self) -> None:
         self._flush_stream_kind()
         self._flush_markdown()
-        self._assistant_unit_open = False
+        self._presenter.reset_assistant_unit()
 
     def _consume_text(self, event: StreamEvent) -> None:
         value = event.delta
@@ -727,7 +632,7 @@ class TUIApp:
         self._thinking_started_at = None
 
     def _print_user(self, user_text: str) -> None:
-        self._assistant_unit_open = False
+        self._presenter.reset_assistant_unit()
         self._print_unit(Text.assemble(("▌ ", USER_ROLE), (user_text, BODY)))
 
     def _print_system(self, output: str) -> None:
@@ -835,7 +740,7 @@ class TUIApp:
             self._loop_state = "idle"
             self._print_unit(Text(f"[error] {exc}", style=ERROR))
         finally:
-            self._active_tool_calls.clear()
+            self._presenter.clear_active_tool_calls()
             self._discard_tool_region()
             self._abort_requested = False
             self._streaming = False

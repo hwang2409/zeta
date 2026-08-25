@@ -32,7 +32,6 @@ from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import (
     build_key_bindings,
-    format_composer_info,
     history_for,
     parse_input,
 )
@@ -330,6 +329,52 @@ def test_transcript_follows_tail_until_scrolled_up() -> None:
     transcript.create_content(80, 3)
     assert transcript.follow_tail
     assert transcript.scroll_offset == len(transcript.lines(80)) - 3
+
+
+def test_transcript_resize_preserves_anchor_and_tail_reentry() -> None:
+    transcript = TranscriptWidget()
+    for index in range(8):
+        transcript.append(Text(f"item-{index} abcdefgh"))
+
+    transcript.create_content(20, 3)
+    transcript.page_up()
+    transcript.create_content(20, 3)
+    wide_anchor = transcript._line_locations[transcript.scroll_offset][0]
+    transcript.create_content(10, 3)
+    assert transcript._line_locations[transcript.scroll_offset][0] is wide_anchor
+    assert not transcript.follow_tail
+
+    transcript = TranscriptWidget()
+    for index in range(8):
+        transcript.append(Text(f"item-{index} abcdefgh"))
+    transcript.create_content(10, 3)
+    transcript.page_up()
+    transcript.create_content(10, 3)
+    transcript.create_content(20, 3)
+    assert transcript.follow_tail
+    transcript.append(Text("new tail"))
+    transcript.create_content(20, 3)
+    assert transcript.scroll_offset == len(transcript._parsed_lines(20)) - 3
+
+
+def test_transcript_cache_uses_stable_keys_after_tool_discard() -> None:
+    transcript = TranscriptWidget()
+    call = ToolCall("old", "read", {"path": "old.txt"})
+    transcript.start_tool(call.id, call, Text("old"))
+    transcript.render(80)
+    old_unit = transcript._units[-1]
+    assert old_unit is not None
+    old_key = old_unit.key
+
+    transcript.discard_tools()
+    assert old_key not in transcript._render_cache
+
+    replacement = ToolCall("new", "read", {"path": "new.txt"})
+    transcript.start_tool(replacement.id, replacement, Text("new"))
+    new_unit = transcript._units[-1]
+    assert new_unit is not None
+    assert new_unit.key != old_key
+    assert "new" in transcript.render(80)
 
 
 def test_tool_output_strips_terminal_controls() -> None:
@@ -1155,23 +1200,6 @@ def test_status_includes_provider_state_and_usage() -> None:
 
     assert "streaming" in status.plain
     assert "2 (0%)" in status.plain
-
-
-def test_composer_info_builder_aligns_identity_row() -> None:
-    info = format_composer_info("openai", "gpt-5.4", width=40)
-    plain = "".join(value for _, value in info)
-
-    assert plain.startswith("zeta")
-    assert plain.endswith("openai · gpt-5.4")
-    assert len(plain) == 40
-
-
-def test_composer_info_crops_optional_fields_to_width() -> None:
-    for width in (10, 20, 22):
-        info = format_composer_info("provider", "a-very-long-model", width=width)
-        plain = "".join(value for _, value in info)
-        assert len(plain) <= width
-        assert not plain.endswith(" ·")
 
 
 def test_footer_builder_formats_context_usage_and_hints() -> None:

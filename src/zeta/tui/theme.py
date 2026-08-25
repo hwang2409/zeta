@@ -8,12 +8,9 @@ from rich.theme import Theme
 SURFACE = "#181918"
 TINT = "#20211f"
 ACCENT = "#ff8a1f"
-WARM_ACCENT = "#c8cbc4"
 DIM = "#8e938b"
 BODY = "#f1f2ed"
 ERROR = "bold #ff5c57"
-OK = "#a8c76f"
-USER_PREFIX = f"bold {ACCENT}"
 CODE_BG = "#252724"
 CODE_THEME = "monokai"
 CHROME = DIM
