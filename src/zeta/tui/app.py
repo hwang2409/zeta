@@ -51,26 +51,17 @@ from .render import (
 )
 from .theme import ACCENT, BODY, CHROME, DIM, ERROR, RICH_THEME, SURFACE, USER_ROLE
 from .transcript import TranscriptPresenter, TranscriptWidget
+from .models import load_model_catalog as _load_model_catalog, validate_model_name
 
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
-MODEL_CATALOGS = {
-    "fake": frozenset({"offline", "faster"}),
-    "claude": frozenset(
-        {"claude-haiku-4-5", "claude-opus-4-1", DEFAULT_CLAUDE_MODEL}
-    ),
-    "codex": frozenset({DEFAULT_CODEX_MODEL, "gpt-5.6-luna"}),
-}
 RECENT_SESSION_LIMIT = 20
 SPINNER_INTERVAL = 0.2
 
 
 def _validate_model_name(provider: str, model: str) -> None:
-    if not model or any(character.isspace() for character in model):
-        raise ValueError("model must be one nonempty word")
-    if model not in MODEL_CATALOGS.get(provider, frozenset()):
-        raise ValueError(f"model {model!r} is not valid for {provider}")
+    validate_model_name(provider, model)
 
 
 class FullScreenPromptSession(PromptSession[str]):
@@ -206,6 +197,7 @@ class TUIApp:
         approval_policy: ApprovalPolicy | None = None,
         context_files: Sequence[str] = (),
         on_model_change: Callable[[str], None] | None = None,
+        model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
     ) -> None:
         self.loop = loop
         self.provider = provider
@@ -235,6 +227,9 @@ class TUIApp:
         self._approval_policy = approval_policy
         self._context_files = tuple(context_files)
         self._on_model_change = on_model_change
+        self._model_catalog_loader = model_catalog_loader or _load_model_catalog
+        self._model_catalog_loaded = False
+        self._model_catalog: frozenset[str] | None = None
         self._slash_commands = create_slash_registry()
         self._compaction_shown = False
         self._turn_had_visible_output = False
@@ -312,6 +307,20 @@ class TUIApp:
             _validate_model_name(self.provider, model)
         except ValueError as exc:
             return f"model unchanged: {exc}"
+        if not self._model_catalog_loaded:
+            self._model_catalog_loaded = True
+            try:
+                self._model_catalog = self._model_catalog_loader(self.provider)
+            except Exception:
+                self._model_catalog = None
+        if self._model_catalog is None:
+            catalog_warning = f"model catalog unavailable for {self.provider} — using anyway"
+        elif model not in self._model_catalog:
+            catalog_warning = (
+                f"model not found in {self.provider} catalog — using anyway"
+            )
+        else:
+            catalog_warning = None
         previous = self.model
         try:
             self.loop.set_model(model)
@@ -321,6 +330,8 @@ class TUIApp:
             self.loop.set_model(previous)
             return f"model unchanged: {exc}"
         self.model = model
+        if catalog_warning is not None:
+            return f"model: {model} ({catalog_warning})"
         return f"model: {model}"
 
     async def slash_compact(self) -> str:

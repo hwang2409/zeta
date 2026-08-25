@@ -329,7 +329,7 @@ def test_model_swap_persists_and_restores_on_resume(
     assert resumed.model == "faster"
 
 
-def test_invalid_model_swap_keeps_the_current_model(tmp_path: Path) -> None:
+def test_unknown_model_swap_warns_and_changes_the_model(tmp_path: Path) -> None:
     backend = FakeBackend([])
     app = TUIApp(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
@@ -339,11 +339,13 @@ def test_invalid_model_swap_keeps_the_current_model(tmp_path: Path) -> None:
 
     output = create_slash_registry().dispatch(app, "/model offline")
 
-    assert output == "model unchanged: model 'offline' is not valid for claude"
-    assert app.model == "claude-sonnet-4-6"
+    assert output == "model: offline (model not found in claude catalog — using anyway)"
+    assert app.model == "offline"
 
 
-def test_unknown_model_prefix_is_rejected_before_state_change(tmp_path: Path) -> None:
+def test_unknown_model_with_provider_prefix_warns_before_state_change(
+    tmp_path: Path,
+) -> None:
     home = tmp_path / "zeta-home"
     manager = SessionManager(home)
     opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
@@ -358,10 +360,74 @@ def test_unknown_model_prefix_is_rejected_before_state_change(tmp_path: Path) ->
     )
 
     assert output == (
-        "model unchanged: model 'claude-definitely-not-real' is not valid for claude"
+        "model: claude-definitely-not-real "
+        "(model not found in claude catalog — using anyway)"
     )
-    assert app.model == "claude-sonnet-4-6"
+    assert app.model == "claude-definitely-not-real"
     assert manager.open(opened.store.session_id).metadata.model == "claude-sonnet-4-6"
+
+
+def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="claude",
+        model="claude-sonnet-4-6",
+        model_catalog_loader=lambda provider: frozenset({"claude-opus-4-7"}),
+    )
+
+    output = create_slash_registry().dispatch(app, "/model claude-opus-4-7")
+
+    assert output == "model: claude-opus-4-7"
+
+
+def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def load_catalog(provider: str) -> frozenset[str]:
+        calls.append(provider)
+        return frozenset({"claude-opus-4-7"})
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="claude",
+        model="claude-sonnet-4-6",
+        model_catalog_loader=load_catalog,
+    )
+
+    first = create_slash_registry().dispatch(app, "/model claude-new")
+    second = create_slash_registry().dispatch(app, "/model claude-other")
+
+    assert first == "model: claude-new (model not found in claude catalog — using anyway)"
+    assert second == (
+        "model: claude-other (model not found in claude catalog — using anyway)"
+    )
+    assert calls == ["claude"]
+
+
+def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="codex",
+        model="gpt-5.4",
+        model_catalog_loader=lambda provider: None,
+    )
+
+    output = create_slash_registry().dispatch(app, "/model gpt-5.6-sol")
+
+    assert output == "model: gpt-5.6-sol (model catalog unavailable for codex — using anyway)"
+
+
+def test_wrong_provider_model_prefix_is_rejected(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="claude",
+        model="claude-sonnet-4-6",
+        model_catalog_loader=lambda provider: frozenset(),
+    )
+
+    output = create_slash_registry().dispatch(app, "/model gpt-5.6-sol")
+
+    assert output == "model unchanged: model 'gpt-5.6-sol' has a wrong-provider prefix for claude"
 
 
 @pytest.mark.asyncio
@@ -477,6 +543,48 @@ def test_session_preview_strips_c1_controls_and_truncates_by_cell_width(
     assert "\u009b" not in preview
     assert cell_len(preview) <= 80
     assert preview.endswith("...")
+
+
+def test_session_preview_strips_zero_width_and_bidi_controls_before_capping(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened.store.append_message(
+        Message(
+            MessageRole.USER,
+            [
+                TextContent(
+                    "start" + "\u0301" * 100_000 + "\u200d" * 100_000
+                    + "\u202e end"
+                )
+            ],
+        )
+    )
+
+    preview = manager.list_session_previews()[0].preview
+
+    assert "\u200d" not in preview
+    assert "\u202e" not in preview
+    assert len(preview) <= 512
+
+
+def test_session_preview_keeps_combining_and_emoji_text_safe(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened.store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("cafe\u0301 family 👩\u200d💻 \u2066safe\u2069")],
+        )
+    )
+
+    preview = manager.list_session_previews()[0].preview
+
+    assert "cafe\u0301" in preview
+    assert "👩💻" in preview
+    assert "\u2066" not in preview
+    assert "\u2069" not in preview
 
 
 def test_session_preview_picker_limits_recent_sessions(
@@ -625,7 +733,7 @@ async def test_forced_override_commits_after_first_successful_request(
         )
     )
     assert create_slash_registry().dispatch(app, "/model claude-opus-4-1") == (
-        "model: claude-opus-4-1"
+        "model: claude-opus-4-1 (model not found in claude catalog — using anyway)"
     )
     assert json.loads(
         (home / "sessions" / session_id / "meta.json").read_text()

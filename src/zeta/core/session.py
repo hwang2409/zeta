@@ -42,6 +42,12 @@ _ANSI_SEQUENCE = re.compile(
     r"|(?:\x1b\][^\x07]*(?:\x07|\x1b\\)|\x9d[^\x07]*(?:\x07|\x1b\\))"
     r"|\x1b[ -/]*[@-~]"
 )
+_PREVIEW_CODEPOINT_LIMIT = 512
+_PREVIEW_STRIPPED_CHARACTERS = frozenset(
+    chr(codepoint)
+    for start, end in ((0x200B, 0x200D), (0x202A, 0x202E), (0x2066, 0x2069))
+    for codepoint in range(start, end + 1)
+) | {"\ufeff"}
 
 
 def _preview_text(value: str, *, limit: int = 80) -> str:
@@ -49,8 +55,12 @@ def _preview_text(value: str, *, limit: int = 80) -> str:
     clean = "".join(
         character
         for character in clean
-        if character in "\t\n\r" or unicodedata.category(character) != "Cc"
+        if (
+            character not in _PREVIEW_STRIPPED_CHARACTERS
+            and (character in "\t\n\r" or unicodedata.category(character) != "Cc")
+        )
     )
+    clean = clean[:_PREVIEW_CODEPOINT_LIMIT]
     clean = " ".join(clean.split())
     if cell_len(clean) <= limit:
         return clean
