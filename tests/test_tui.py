@@ -956,7 +956,10 @@ def test_special_status_states_override_spinner(state: str) -> None:
         spinner_frame=2,
     )
 
-    assert rendered.plain.startswith(state)
+    if state == "tool-running":
+        assert rendered.plain.startswith("● tool-running")
+    else:
+        assert rendered.plain.startswith(state)
     assert "esc interrupt" not in rendered.plain
 
 
@@ -1246,7 +1249,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     try:
         output = bytearray()
         deadline = time.monotonic() + 5
-        while "❯ ".encode() not in output and time.monotonic() < deadline:
+        while " > ".encode() not in output and time.monotonic() < deadline:
             ready, _, _ = select.select(
                 [master_fd],
                 [],
@@ -1255,7 +1258,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
             )
             if ready:
                 output.extend(os.read(master_fd, 4096))
-        assert "❯ ".encode() in output
+        assert " > ".encode() in output
 
         os.write(master_fd, b"\x04")
         deadline = time.monotonic() + 5
@@ -1336,7 +1339,7 @@ def test_footer_builder_formats_context_usage_and_hints() -> None:
     )
 
     assert footer.plain == (
-        "idle  18.6K (9%) · /status · ctrl+d quit · abcdef12"
+        "idle  18.6K (9%)  /status · ctrl+c interrupt · ctrl+d quit · abcdef12"
     )
 
 
@@ -1436,11 +1439,69 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     app._install_full_screen_layout(session)
 
     root = session.layout.container
-    assert len(root.children) == 2
-    assert root.children[0].__class__.__name__ == "Window"
-    bottom = root.children[1]
+    assert len(root.children) == 1
+    centered = root.children[0]
+    assert centered.__class__.__name__ == "VSplit"
+    assert centered.children[0].__class__.__name__ == "Window"
+    content = centered.children[1]
+    assert content.__class__.__name__ == "HSplit"
+    assert content.children[0].__class__.__name__ == "Window"
+    bottom = content.children[1]
     assert bottom.__class__.__name__ == "HSplit"
     assert bottom.children[-1].__class__.__name__ == "ConditionalContainer"
+
+
+@pytest.mark.parametrize(("width", "height"), [(120, 40), (80, 24), (40, 12)])
+def test_transcript_visual_snapshot_is_compact_and_bottom_aligned(
+    width: int, height: int
+) -> None:
+    transcript = TranscriptWidget()
+    call = ToolCall("visual", "bash", {"cmd": "pwd"})
+    transcript.append(Text.assemble(("▌ ", ACCENT), ("inspect the session", BODY)))
+    transcript.append_blank()
+    transcript.append(render_markdown("## result\n\n1. first item\n2. second item"))
+    transcript.append_blank()
+    transcript.append(
+        render_event(
+            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        )
+    )
+    transcript.append_blank()
+    transcript.append(
+        render_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(call.id, "done"),
+            )
+        )
+    )
+    transcript.append_blank()
+    transcript.append(
+        Text(
+            "[approval pending] request-1: bash; type approve request-1 or deny request-1",
+            style=ACCENT,
+        )
+    )
+
+    lines = transcript.lines(width)
+    plain_lines = [Text.from_ansi(line).plain for line in lines]
+    assert all(line == line.rstrip() for line in plain_lines)
+    assert all(len(line) <= width for line in plain_lines)
+    assert all(line.strip() != "|" for line in plain_lines)
+
+    content = transcript.create_content(width, height)
+    visible = [
+        "".join(fragment[1] for fragment in content.get_line(index))
+        for index in range(content.line_count)
+    ]
+    parsed = transcript._parsed_lines(width)
+    prefix = max(0, height - len(parsed))
+    assert visible[prefix:] == [
+        "".join(fragment[1] for fragment in line) for line in parsed
+    ]
+    assert all(not line for line in visible[:prefix])
+    assert "request-1" in visible[-1]
 
 
 def test_full_screen_transcript_drops_markdown_list_placeholder_row(
@@ -1698,7 +1759,9 @@ async def test_full_screen_separates_user_and_assistant_units(tmp_path: Path) ->
     assert units[1] is None
     assert units[2] is not None
     assert renderable_plain(units[0]) == "▌ prompt"
-    assert "answer" in app._transcript.render(80)
+    rendered = app._transcript.render(80)
+    assert "zeta" in rendered
+    assert "answer" in rendered
 
 
 @pytest.mark.asyncio
@@ -1780,29 +1843,29 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path:
 
   ✱ thought · Plan the inspection.
 
-  ╭──────────────────────────────────────────────────────────────────╮
-  │ $ seq 24                                                         │
-  │ running…                                                         │
-  ╰──────────────────────────────────────────────────────────────────╯
-  ╭──────────────────────────────────────────────────────────────────╮
-  │ $ seq 24                                                         │
-  │ line-0                                                           │
-  │ line-1                                                           │
-  │ line-2                                                           │
-  │ line-3                                                           │
-  │ line-4                                                           │
-  │ line-5                                                           │
-  │ line-6                                                           │
-  │ line-7                                                           │
-  │ line-8                                                           │
-  │ line-9                                                           │
-  │ line-10                                                          │
-  │ line-11                                                          │
-  │ line-12                                                          │
-  │ line-13                                                          │
-  │ line-14                                                          │
-  │ … +9 lines                                                       │
-  ╰──────────────────────────────────────────────────────────────────╯
+  ╭──────────╮
+  │ $ seq 24 │
+  │ running… │
+  ╰──────────╯
+  ╭────────────╮
+  │ $ seq 24   │
+  │ line-0     │
+  │ line-1     │
+  │ line-2     │
+  │ line-3     │
+  │ line-4     │
+  │ line-5     │
+  │ line-6     │
+  │ line-7     │
+  │ line-8     │
+  │ line-9     │
+  │ line-10    │
+  │ line-11    │
+  │ line-12    │
+  │ line-13    │
+  │ line-14    │
+  │ … +9 lines │
+  ╰────────────╯
 
   ⏺ read README.md [limit=120] · running
   ⏺ read README.md [limit=120]

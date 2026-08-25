@@ -5,8 +5,8 @@ from __future__ import annotations
 from rich.theme import Theme
 
 
-SURFACE = "#181918"
-TINT = "#20211f"
+SURFACE = "#0b0c0a"
+TINT = "#151713"
 ACCENT = "#ff8a1f"
 DIM = "#8e938b"
 BODY = "#f1f2ed"
@@ -16,11 +16,14 @@ CODE_THEME = "monokai"
 CHROME = DIM
 CARD_BG = f"on {TINT}"
 CARD_BORDER = "#50544d"
+COMPOSER_BORDER = "#50544d"
+COMPOSER_FOCUS = ACCENT
 COMMAND = f"bold {ACCENT}"
 RECEIPT = CHROME
 THOUGHT = f"italic {CHROME}"
 AFFORDANCE = f"dim {DIM}"
 USER_ROLE = ACCENT
+ASSISTANT_ROLE = CHROME
 
 RICH_THEME = Theme(
     {
