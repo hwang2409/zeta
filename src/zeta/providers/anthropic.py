@@ -17,7 +17,7 @@ from urllib.parse import urlencode
 import httpx
 
 from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
-from .stream_diagnostics import StreamDiagnostics
+from .stream_diagnostics import Cause, StreamDiagnostics
 from .transport import (
     cleanup_transport,
     is_control_exception,
@@ -510,7 +510,7 @@ async def _decode_response(
         else None
     )
 
-    def salvage(cause: str) -> StreamEvent:
+    def salvage(cause: Cause) -> StreamEvent:
         open_blocks = set(active_blocks)
         open_block_count = len(open_blocks)
         closed_block_count = len(stopped_blocks)
@@ -604,7 +604,7 @@ async def _decode_response(
     except httpx.HTTPError as exc:
         if finished or message_state == "not-started":
             raise
-        yield salvage(f"{type(exc).__name__}: {exc}")
+        yield salvage(type(exc))
         return
 
     record = decoder.finish()

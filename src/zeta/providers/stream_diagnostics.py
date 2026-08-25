@@ -4,28 +4,16 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeAlias
 
 
 STREAM_DIAGNOSTICS_MAX_BYTES = 1024 * 1024
-_CAUSE_MAX_BYTES = 300
-_SECRET_PATTERN = re.compile(
-    r"(?i)(?:\b(?:bearer|api[-_ ]?key|(?:access|refresh|auth(?:entication)?)?[-_ ]?token)"
-    r"\b(?:\s*[:=]\s*|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s]+)|"
-    r"\bsk-[^\s]+)"
-)
-
-
-def sanitize_cause(cause: str) -> str:
-    """Return a short cause message with credential-like values removed."""
-
-    excerpt = cause[: _CAUSE_MAX_BYTES * 4]
-    excerpt = _SECRET_PATTERN.sub("[redacted]", excerpt)
-    return " ".join(excerpt.split())[:_CAUSE_MAX_BYTES]
+_TEXT_MAX_BYTES = 300
+Cause: TypeAlias = str | type[BaseException]
+_CAUSE_SENTINELS = frozenset({"clean-eof", "message_stop"})
 
 
 class StreamDiagnostics:
@@ -47,7 +35,7 @@ class StreamDiagnostics:
 
     def record(
         self,
-        cause: str,
+        cause: Cause,
         *,
         bytes_received: int,
         sse_events_received: int,
@@ -113,8 +101,16 @@ def write_stream_diagnostic(
 
 def _encode_record(record: Mapping[str, Any], cap: int) -> bytes:
     record = dict(record)
-    if isinstance(record.get("cause"), str):
-        record["cause"] = sanitize_cause(record["cause"])
+    cause = record.get("cause")
+    if isinstance(cause, str):
+        if cause in _CAUSE_SENTINELS:
+            record["cause"] = cause
+        else:
+            record.pop("cause", None)
+    elif isinstance(cause, type) and issubclass(cause, BaseException):
+        record["cause"] = f"{cause.__module__}.{cause.__qualname__}"
+    else:
+        record.pop("cause", None)
     bounded = {
         key: _bound_value(value, cap)
         for key, value in record.items()
@@ -132,14 +128,16 @@ def _encode_record(record: Mapping[str, Any], cap: int) -> bytes:
         encoded = _json_line(bounded)
     if len(encoded) <= cap:
         return encoded
-    fallback = {"cause": _truncate(str(record.get("cause", "")), max(0, cap // 4))}
+    fallback = {}
+    if isinstance(record.get("cause"), str):
+        fallback["cause"] = _truncate(record["cause"], max(0, cap // 4))
     encoded = _json_line(fallback)
     return encoded if len(encoded) <= cap else b""
 
 
 def _bound_value(value: Any, cap: int) -> Any:
     if isinstance(value, str):
-        return _truncate(value, min(_CAUSE_MAX_BYTES, cap))
+        return _truncate(value, min(_TEXT_MAX_BYTES, cap))
     return value
 
 

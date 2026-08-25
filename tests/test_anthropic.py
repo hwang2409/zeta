@@ -948,11 +948,11 @@ async def test_network_eof_salvage_records_exception_and_headers(tmp_path: Path)
     record = json.loads(
         (tmp_path / "logs" / "stream-diagnostics.jsonl").read_text().strip()
     )
-    assert record["cause"].startswith("ReadError: peer closed")
+    assert record["cause"] == "httpx.ReadError"
+    assert "peer closed" not in record["cause"]
     assert "bearer-secret" not in record["cause"]
     assert "api-secret" not in record["cause"]
     assert "token-secret" not in record["cause"]
-    assert "[redacted]" in record["cause"]
     assert record["request_id"] == "req-123"
     assert record["model"] == "header-model"
     assert record["sse_events_received"] == 3
@@ -966,8 +966,12 @@ def test_stream_diagnostic_log_rotates_at_size_cap(
     path = tmp_path / "logs" / "stream-diagnostics.jsonl"
     monkeypatch.setattr(diagnostics_module, "STREAM_DIAGNOSTICS_MAX_BYTES", 160)
 
-    diagnostics_module.write_stream_diagnostic(path, {"cause": "x" * 100})
-    diagnostics_module.write_stream_diagnostic(path, {"cause": "y" * 100})
+    diagnostics_module.write_stream_diagnostic(
+        path, {"cause": "clean-eof", "model": "x" * 1000}
+    )
+    diagnostics_module.write_stream_diagnostic(
+        path, {"cause": "message_stop", "model": "y" * 1000}
+    )
 
     assert path.exists()
     assert path.with_name("stream-diagnostics.jsonl.1").exists()
@@ -975,7 +979,7 @@ def test_stream_diagnostic_log_rotates_at_size_cap(
     assert path.with_name("stream-diagnostics.jsonl.1").stat().st_size <= 160
 
 
-def test_stream_diagnostic_redacts_secrets_and_bounds_record(
+def test_stream_diagnostic_omits_exception_message_and_bounds_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "logs" / "stream-diagnostics.jsonl"
@@ -991,64 +995,51 @@ def test_stream_diagnostic_redacts_secrets_and_bounds_record(
 
     assert path.stat().st_size <= 256
     record = json.loads(path.read_text())
-    assert "very-secret-token" not in record["cause"]
-    assert "another-secret" not in record["cause"]
-    assert "[redacted]" in record["cause"]
+    assert "cause" not in record
+    assert "very-secret-token" not in path.read_text()
+    assert "another-secret" not in path.read_text()
 
 
-def test_stream_diagnostic_redacts_bare_provider_keys(
+def test_stream_diagnostic_omits_free_form_cause(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "logs" / "stream-diagnostics.jsonl"
-    anthropic_key = "sk-ant-api03-anthropic-secret"
-    openai_key = "sk-openai-secret"
+    message = "stream failed with sk-ant-api03-anthropic-secret"
 
     diagnostics_module.write_stream_diagnostic(
         path,
         {
-            "cause": f"stream failed with {anthropic_key} then retried with {openai_key}",
+            "cause": message,
         },
     )
 
     record = json.loads(path.read_text())
-    assert anthropic_key not in record["cause"]
-    assert openai_key not in record["cause"]
-    assert record["cause"] == "stream failed with [redacted] then retried with [redacted]"
+    assert "cause" not in record
+    assert message not in path.read_text()
 
 
-@pytest.mark.parametrize(
-    "provider_key",
-    [
-        "sk-proj-AbC123_def456-Ghi789",
-        "sk-proj-abc.def",
-        "sk-proj-abc+def",
-        "sk-proj-AbC123_def456-Ghi789+/=",
-        "sk-proj-tail.",
-    ],
-)
-def test_stream_diagnostic_redacts_entire_provider_key_token(
-    tmp_path: Path, provider_key: str
-) -> None:
+def test_stream_diagnostic_omits_quoted_exception_message(tmp_path: Path) -> None:
     path = tmp_path / "logs" / "stream-diagnostics.jsonl"
+    message = 'Bearer "prefix_SECRET_SUFFIX"TAIL'
 
     diagnostics_module.write_stream_diagnostic(
-        path, {"cause": f"stream failed with {provider_key}"}
+        path, {"cause": f"ReadError: {message}"}
     )
 
     record = json.loads(path.read_text())
-    assert provider_key not in record["cause"]
-    assert record["cause"] == "stream failed with [redacted]"
+    assert "cause" not in record
+    assert message not in path.read_text()
 
 
-def test_stream_diagnostic_keeps_words_without_provider_key_prefix(
+def test_stream_diagnostic_keeps_closed_cause_sentinel(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "logs" / "stream-diagnostics.jsonl"
 
-    diagnostics_module.write_stream_diagnostic(path, {"cause": "skip sketch"})
+    diagnostics_module.write_stream_diagnostic(path, {"cause": "clean-eof"})
 
     record = json.loads(path.read_text())
-    assert record["cause"] == "skip sketch"
+    assert record["cause"] == "clean-eof"
 
 
 @pytest.mark.asyncio
