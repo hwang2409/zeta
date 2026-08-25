@@ -18,8 +18,10 @@ from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import set_app
 from prompt_toolkit.input import PipeInput, create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.data_structures import Size
 from rich.cells import cell_len
 from rich.console import Console
@@ -1453,6 +1455,40 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     bottom = content.children[1]
     assert bottom.__class__.__name__ == "HSplit"
     assert bottom.children[-1].__class__.__name__ == "ConditionalContainer"
+
+
+@pytest.mark.asyncio
+async def test_full_screen_steady_state_paint_does_not_clear_screen(
+    tmp_path: Path,
+) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        history_path=tmp_path / "history",
+    )
+    session = app._make_session()
+    app._install_full_screen_layout(session)
+    output_text = StringIO()
+    output = Vt100_Output(
+        output_text,
+        lambda: Size(rows=45, columns=200),
+    )
+    session.app.output = output
+    session.app.renderer.output = output
+    session.app.renderer.full_screen = True
+
+    with set_app(session.app):
+        session.app.renderer.render(session.app, session.app.layout)
+        output_text.seek(0)
+        output_text.truncate(0)
+        app._spinner_active = True
+        app._spinner_frame = 1
+        session.app.renderer.render(session.app, session.app.layout)
+
+    steady_state = output_text.getvalue()
+    assert "\x1b[J" not in steady_state
+    assert "\x1b[2J" not in steady_state
 
 
 @pytest.mark.parametrize(
