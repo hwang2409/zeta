@@ -211,7 +211,11 @@ class AgentLoop:
         await self._ensure_mcp_servers()
 
     async def resume_pending_tool(
-        self, request_id: str, *, prepared: bool = False
+        self,
+        request_id: str,
+        *,
+        prepared: bool = False,
+        event_sink: Callable[[StreamEvent], None] | None = None,
     ) -> ToolResult | None:
         """Finish a durable approval request before starting another turn."""
 
@@ -223,11 +227,24 @@ class AgentLoop:
         if not prepared:
             self.tool_registry.start_batch()
         abort_signal = self.tool_registry.abort_signal
+
+        def lifecycle(kind: str) -> None:
+            if event_sink is None:
+                return
+            event_type = {
+                "approval_start": StreamEventType.TOOL_APPROVAL_START,
+                "approval_end": StreamEventType.TOOL_APPROVAL_END,
+                "execution_start": StreamEventType.TOOL_EXECUTION_START,
+            }.get(kind)
+            if event_type is not None:
+                event_sink(StreamEvent(event_type, tool_call=tool_call))
+
         try:
             result = await self.tool_registry.execute(
                 tool_call,
                 abort_signal=abort_signal,
                 _scope_signal=abort_signal,
+                _lifecycle_sink=lifecycle,
             )
         except asyncio.CancelledError:
             self.finalize_canceled(request_id)
@@ -236,8 +253,18 @@ class AgentLoop:
             result = ToolResult(tool_call.id, str(exc), is_error=True)
         result = _validated_tool_result(result, tool_call.id)
         if result.content == "tool execution canceled" and result.is_error:
-            return self.finalize_canceled(request_id)
-        return self._finalize_tool_results([tool_call], [result])[0]
+            result = self.finalize_canceled(request_id)
+        else:
+            result = self._finalize_tool_results([tool_call], [result])[0]
+        if event_sink is not None and result is not None:
+            event_sink(
+                StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END,
+                    tool_call=tool_call,
+                    tool_result=result,
+                )
+            )
+        return result
 
     def finalize_canceled(self, request_id: str) -> ToolResult | None:
         """Persist one canceled result for a durable approval request."""
@@ -367,16 +394,40 @@ class AgentLoop:
                 return
 
             completed_tool_indexes: set[int] = set()
-            # cap advisory output at 128 events; drop the oldest update when full.
-            # final tool results stay in separate byte-complete handler buffers.
-            stream_updates: asyncio.Queue[StreamEvent] = asyncio.Queue(maxsize=128)
+            # Cap advisory output at 128 events; final results stay complete.
+            stream_updates: asyncio.Queue[StreamEvent] = asyncio.Queue(
+                maxsize=128 + len(calls) * 3
+            )
 
             def enqueue_tool_update(event: StreamEvent) -> None:
-                try:
-                    stream_updates.put_nowait(event)
-                except asyncio.QueueFull:
-                    stream_updates.get_nowait()
-                    stream_updates.put_nowait(event)
+                retained: list[StreamEvent] = []
+                while not stream_updates.empty():
+                    retained.append(stream_updates.get_nowait())
+                update_count = sum(
+                    item.type is StreamEventType.TOOL_EXECUTION_UPDATE
+                    for item in retained
+                )
+                if update_count >= 128:
+                    first_update = next(
+                        index
+                        for index, item in enumerate(retained)
+                        if item.type is StreamEventType.TOOL_EXECUTION_UPDATE
+                    )
+                    del retained[first_update]
+                for queued in retained:
+                    stream_updates.put_nowait(queued)
+                stream_updates.put_nowait(event)
+
+            def enqueue_tool_lifecycle(kind: str, tool_call: ToolCall) -> None:
+                event_type = {
+                    "approval_start": StreamEventType.TOOL_APPROVAL_START,
+                    "approval_end": StreamEventType.TOOL_APPROVAL_END,
+                    "execution_start": StreamEventType.TOOL_EXECUTION_START,
+                }.get(kind)
+                if event_type is not None:
+                    stream_updates.put_nowait(
+                        StreamEvent(event_type, tool_call=tool_call)
+                    )
 
             active_task: asyncio.Task[StructuredToolResult] | None = None
             parallel_tasks: dict[
@@ -402,16 +453,16 @@ class AgentLoop:
                                     break
                                 parallel_calls.append(next_call)
                     if len(parallel_calls) > 1:
-                        for tool_call in parallel_calls:
-                            yield StreamEvent(
-                                StreamEventType.TOOL_EXECUTION_START,
-                                tool_call=tool_call,
-                            )
                         parallel_tasks = {
                             asyncio.create_task(
                                 self.tool_registry.execute(
                                     tool_call,
                                     _stream_sink=enqueue_tool_update,
+                                    _lifecycle_sink=(
+                                        lambda kind, call=tool_call: enqueue_tool_lifecycle(
+                                            kind, call
+                                        )
+                                    ),
                                 )
                             ): (call_index + offset, tool_call)
                             for offset, tool_call in enumerate(parallel_calls)
@@ -457,14 +508,15 @@ class AgentLoop:
                         continue
 
                     tool_call = calls[call_index]
-                    yield StreamEvent(
-                        StreamEventType.TOOL_EXECUTION_START,
-                        tool_call=tool_call,
-                    )
                     active_task = asyncio.create_task(
                         self.tool_registry.execute(
                             tool_call,
                             _stream_sink=enqueue_tool_update,
+                            _lifecycle_sink=(
+                                lambda kind, call=tool_call: enqueue_tool_lifecycle(
+                                    kind, call
+                                )
+                            ),
                         )
                     )
                     try:

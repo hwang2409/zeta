@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from io import StringIO
 import os
 import sys
 import time
@@ -17,11 +16,10 @@ from typing import Any
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.formatted_text import ANSI, FormattedText
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 from prompt_toolkit.layout import Dimension
-from prompt_toolkit.layout.controls import FormattedTextControl
-from prompt_toolkit.layout.containers import HSplit, Window
+from prompt_toolkit.layout.containers import HSplit
 from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.padding import Padding
@@ -54,6 +52,7 @@ from .render import (
     render_tool_progress,
 )
 from .theme import ACCENT, BODY, CHROME, DIM, ERROR, RICH_THEME, SURFACE, USER_ROLE
+from .transcript import TranscriptWidget
 
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -216,6 +215,7 @@ class TUIApp:
         self._tool_region_text: Text | None = None
         self._tool_region_call: ToolCall | None = None
         self._abort_requested = False
+        self._resuming_tool = False
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
         self._approval_policy = approval_policy
@@ -225,8 +225,15 @@ class TUIApp:
         self._compaction_shown = False
         self._turn_had_visible_output = False
         self._active_session: PromptSession[str] | None = None
-        self._transcript_lines: list[str] = []
+        self._transcript = TranscriptWidget()
         self._input_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    @property
+    def _transcript_lines(self) -> list[str]:
+        """Expose rendered lines for diagnostics while keeping logical units in the widget."""
+
+        width = get_app().output.get_size().columns
+        return self._transcript.lines(width)
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
@@ -316,7 +323,9 @@ class TUIApp:
 
             async def resume() -> Any:
                 return await self.loop.resume_pending_tool(
-                    request_id, prepared=True
+                    request_id,
+                    prepared=True,
+                    event_sink=self._handle_resumed_tool_event,
                 )
 
             resume_task: asyncio.Task[Any] | None = None
@@ -325,9 +334,10 @@ class TUIApp:
                 if not self.loop.prepare_resume_pending_tool(request_id):
                     self._present_pending_approvals()
                     return True
+                self._resuming_tool = True
                 resume_task = asyncio.create_task(resume())
                 self._active_task = resume_task
-                result = await asyncio.shield(resume_task)
+                await asyncio.shield(resume_task)
             except asyncio.CancelledError:
                 parent_cancelled = (
                     asyncio.current_task() is not None
@@ -344,21 +354,9 @@ class TUIApp:
                     raise
                 return True
             finally:
+                self._resuming_tool = False
                 if resume_task is not None and self._active_task is resume_task:
                     self._active_task = None
-            request = next(
-                request for request in pending if request.request_id == request_id
-            )
-            if result is not None:
-                self._print(
-                    render_event(
-                        StreamEvent(
-                            StreamEventType.TOOL_EXECUTION_END,
-                            tool_call=request.tool_call,
-                            tool_result=result,
-                        )
-                    )
-                )
         self._present_pending_approvals()
         return True
 
@@ -395,7 +393,7 @@ class TUIApp:
             self.loop.abort()
             self._loop_state = "interrupted"
             self._invalidate_prompt()
-            if tool_running:
+            if tool_running and not self._resuming_tool:
                 self._abort_requested = True
             else:
                 self._active_task.cancel()
@@ -432,36 +430,16 @@ class TUIApp:
             ]
         )
 
-    def _transcript_content(self) -> ANSI | str:
-        if not self._transcript_lines:
-            return ""
-        rows = get_app().output.get_size().rows
-        visible = self._transcript_lines[-max(1, rows - 2) :]
-        return ANSI("\n".join(visible))
-
     def _full_screen_active(self) -> bool:
         return isinstance(self._active_session, FullScreenPromptSession)
 
     def _append_transcript(self, renderable: RenderableType | None) -> None:
         if renderable is None:
             return
-        width = max(1, get_app().output.get_size().columns - 4)
-        output = StringIO()
-        transcript_console = Console(
-            file=output,
-            force_terminal=True,
-            color_system="truecolor",
-            width=width,
-            theme=RICH_THEME,
-        )
-        transcript_console.print(Padding(renderable, (0, 2, 0, 2)))
-        lines = output.getvalue().rstrip("\n").splitlines()
-        while lines and not Text.from_ansi(lines[0]).plain.strip():
-            lines.pop(0)
-        self._transcript_lines.extend(lines)
+        self._transcript.append(renderable)
 
     def _append_transcript_blank(self) -> None:
-        self._transcript_lines.append("")
+        self._transcript.append_blank()
 
     def _print(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
@@ -498,12 +476,8 @@ class TUIApp:
         if not isinstance(rendered, Text):
             return
         if self._full_screen_active():
-            if self._tool_region_text is None:
-                self._tool_region_text = Text()
-                self._tool_region_call = event.tool_call
-            if self._tool_region_text:
-                self._tool_region_text.append("\n")
-            self._tool_region_text.append(rendered)
+            if event.tool_call is not None:
+                self._transcript.update_tool(event.tool_call.id, rendered)
             return
         if self._tool_region is None:
             self._tool_region_text = Text()
@@ -540,6 +514,39 @@ class TUIApp:
             )
         else:
             self._tool_region.update(self._tool_region_text)
+
+    def _handle_resumed_tool_event(self, event: StreamEvent) -> None:
+        if event.type is StreamEventType.TOOL_EXECUTION_START:
+            self._loop_state = "tool-running"
+            if event.tool_call is not None:
+                self._active_tool_calls.add(event.tool_call.id)
+            rendered = render_event(event)
+            if rendered is None:
+                return
+            if self._full_screen_active() and event.tool_call is not None:
+                if self._printed_units:
+                    self._append_transcript_blank()
+                self._transcript.start_tool(
+                    event.tool_call.id,
+                    event.tool_call,
+                    rendered,
+                )
+                self._printed_units = True
+            else:
+                self._print_unit(rendered)
+            return
+        if event.type is not StreamEventType.TOOL_EXECUTION_END:
+            return
+        self._loop_state = "idle"
+        if event.tool_call is not None:
+            self._active_tool_calls.discard(event.tool_call.id)
+        rendered = render_event(event)
+        if rendered is None:
+            return
+        if self._full_screen_active() and event.tool_call is not None:
+            self._transcript.finish_tool(event.tool_call.id, rendered)
+        else:
+            self._print(rendered)
 
     def _submit_input(self, value: str) -> None:
         self._input_queue.put_nowait(value)
@@ -579,6 +586,8 @@ class TUIApp:
 
     def _discard_tool_region(self) -> None:
         self._pending_tool_renders.clear()
+        if self._full_screen_active():
+            self._transcript.discard_tools()
         if self._tool_region is not None:
             self._tool_region.stop()
             self._tool_region = None
@@ -736,15 +745,30 @@ class TUIApp:
                     self._consume_text(event)
                     self._invalidate_prompt()
                     continue
-                if event.type is StreamEventType.TOOL_EXECUTION_START:
+                if event.type is StreamEventType.TOOL_APPROVAL_START:
+                    self._reset_stream_state()
+                    self._loop_state = "approval"
+                    self._present_pending_approvals()
+                elif event.type is StreamEventType.TOOL_APPROVAL_END:
+                    self._loop_state = "streaming"
+                elif event.type is StreamEventType.TOOL_EXECUTION_START:
                     self._reset_stream_state()
                     self._assistant_unit_open = False
                     self._loop_state = "tool-running"
                     if event.tool_call is not None:
                         self._active_tool_calls.add(event.tool_call.id)
-                    self._present_pending_approvals()
                     rendered = render_event(event)
-                    self._print_unit(rendered)
+                    if self._full_screen_active() and event.tool_call is not None and rendered is not None:
+                        if self._printed_units:
+                            self._append_transcript_blank()
+                        self._transcript.start_tool(
+                            event.tool_call.id,
+                            event.tool_call,
+                            rendered,
+                        )
+                        self._printed_units = True
+                    else:
+                        self._print_unit(rendered)
                     if rendered is not None:
                         self._turn_had_visible_output = True
                 elif event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
@@ -758,7 +782,10 @@ class TUIApp:
                         self._active_tool_calls.discard(event.tool_call.id)
                     rendered = render_event(event)
                     if rendered is not None:
-                        self._pending_tool_renders.append(rendered)
+                        if self._full_screen_active() and event.tool_call is not None:
+                            self._transcript.finish_tool(event.tool_call.id, rendered)
+                        else:
+                            self._pending_tool_renders.append(rendered)
                         self._turn_had_visible_output = True
                     if self._abort_requested:
                         self._abort_requested = False
@@ -787,6 +814,8 @@ class TUIApp:
                         self._print_unit(Text("no response", style=CHROME))
                         self._turn_had_visible_output = True
                 if event.type not in {
+                    StreamEventType.TOOL_APPROVAL_START,
+                    StreamEventType.TOOL_APPROVAL_END,
                     StreamEventType.TOOL_EXECUTION_UPDATE,
                     StreamEventType.TOOL_EXECUTION_END,
                     StreamEventType.TOOL_EXECUTION_START,
@@ -879,11 +908,7 @@ class TUIApp:
         root = session.layout.container
         composer_rows = list(root.children)
         footer = composer_rows.pop()
-        transcript = Window(
-            FormattedTextControl(self._transcript_content),
-            height=Dimension(weight=1, min=1),
-            wrap_lines=False,
-        )
+        transcript = self._transcript.window()
         root.children[:] = [
             transcript,
             HSplit(

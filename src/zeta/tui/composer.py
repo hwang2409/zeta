@@ -78,6 +78,7 @@ def build_key_bindings(
     @bindings.add("enter")
     def submit(event: KeyPressEvent) -> None:
         if on_submit is not None:
+            event.current_buffer.append_to_history()
             on_submit(event.current_buffer.text)
             event.current_buffer.reset()
         else:

@@ -21,6 +21,7 @@ from zeta.cli import build_parser, main
 from zeta.types import (
     Message,
     MessageRole,
+    StreamEventType,
     TextContent,
     ToolCall,
     ToolResult,
@@ -359,11 +360,17 @@ async def test_resume_pending_tool_executes_and_persists_result(
     else:
         assert policy.deny(call.id)
 
-    result = await loop.resume_pending_tool(call.id)
+    events = []
+    result = await loop.resume_pending_tool(call.id, event_sink=events.append)
 
     assert result is not None
     assert opened.store.messages()[-1].tool_result == result
     assert executed == (["done"] if decision == "allow" else [])
+    assert [event.type for event in events] == (
+        [StreamEventType.TOOL_EXECUTION_START, StreamEventType.TOOL_EXECUTION_END]
+        if decision == "allow"
+        else [StreamEventType.TOOL_EXECUTION_END]
+    )
 
 
 @pytest.mark.asyncio

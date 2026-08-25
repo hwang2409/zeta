@@ -186,6 +186,8 @@ def _tool_receipt(event: StreamEvent) -> Text:
     return Text(
         f"{prefix}{call.name}{f' {suffix}' if suffix else ''}",
         style=RECEIPT,
+        overflow="ellipsis",
+        no_wrap=True,
     )
 
 
@@ -525,15 +527,16 @@ def format_status(
     state = loop_state if loop_state in {
         "streaming",
         "tool-running",
+        "approval",
         "idle",
         "interrupted",
         "compacting",
     } else "streaming"
     if show_spinner and state not in {"tool-running", "interrupted", "compacting"}:
-        left = f"{SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]}  esc interrupt"
+        left = f"{SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]}  ctrl+c interrupt"
     else:
         left = state
-    right_segments = [context_text, "/status", "ctrl+c quit"]
+    right_segments = [context_text, "/status", "ctrl+d quit"]
     if session_id:
         right_segments.append(session_id[:8])
     if width is None:

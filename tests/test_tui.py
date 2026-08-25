@@ -23,13 +23,19 @@ from rich.cells import cell_len
 from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
+from rich.text import Text
 
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import TUIApp
-from zeta.tui.composer import build_key_bindings, format_composer_info, parse_input
+from zeta.tui.composer import (
+    build_key_bindings,
+    format_composer_info,
+    history_for,
+    parse_input,
+)
 from zeta.tui.render import (
     MarkdownStream,
     collapse_thought,
@@ -1149,7 +1155,7 @@ def test_footer_builder_formats_context_usage_and_hints() -> None:
     )
 
     assert footer.plain == (
-        "idle  18.6K (9%) · /status · ctrl+c quit · abcdef12"
+        "idle  18.6K (9%) · /status · ctrl+d quit · abcdef12"
     )
 
 
@@ -1168,10 +1174,10 @@ def test_status_bar_includes_session_context_and_streaming_indicator() -> None:
     )
 
     assert len(status.plain) <= 120
-    assert "esc interrupt" in status.plain
+    assert "ctrl+c interrupt" in status.plain
     assert "42 (0%)" in status.plain
     assert "/status" in status.plain
-    assert "ctrl+c quit" in status.plain
+    assert "ctrl+d quit" in status.plain
 
 
 def test_status_bar_drops_whole_segments_at_narrow_widths() -> None:
@@ -1206,9 +1212,9 @@ def test_status_bar_fits_segments_and_pulses() -> None:
     ]
 
     assert all(len(status.plain) <= width for status, width in zip(statuses, (80, 120, 200)))
-    assert all("esc interrupt" in status.plain and "5 (0%)" in status.plain for status in statuses)
+    assert all("ctrl+c interrupt" in status.plain and "5 (0%)" in status.plain for status in statuses)
     assert all(marker in statuses[index].plain for index, marker in enumerate(("·", "•", "●")))
-    assert all(value in statuses[1].plain for value in ("/status", "ctrl+c quit"))
+    assert all(value in statuses[1].plain for value in ("/status", "ctrl+d quit"))
     assert all(value in statuses[2].plain for value in ("abc12345", "/status"))
 
     narrow = format_status(
@@ -1222,7 +1228,7 @@ def test_status_bar_fits_segments_and_pulses() -> None:
         width=80,
     )
     assert len(narrow.plain) <= 80
-    assert "esc interrupt" in narrow.plain
+    assert "ctrl+c interrupt" in narrow.plain
     assert "5 (0%)" in narrow.plain
 
     cleared = format_status(
@@ -1273,6 +1279,30 @@ def test_full_screen_transcript_drops_markdown_list_placeholder_row(
 
     assert app._transcript_lines
     assert app._transcript_lines[0].strip() == "1 first item"
+
+
+def test_full_screen_transcript_reflows_logical_text_at_narrow_widths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    columns = 40
+    output = SimpleNamespace(get_size=lambda: Size(rows=12, columns=columns))
+    monkeypatch.setattr("zeta.tui.app.get_app", lambda: SimpleNamespace(output=output))
+
+    app._append_transcript(Text("abcdefghijk"))
+    wide_lines = app._transcript_lines
+    columns = 8
+    narrow_lines = app._transcript_lines
+
+    assert wide_lines
+    assert narrow_lines
+    plain = Text.from_ansi("\n".join(narrow_lines)).plain.replace(" ", "").replace("\n", "")
+    assert "abcdefghijk" in plain
 
 
 def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
@@ -1702,6 +1732,63 @@ async def test_composer_submits_enter_and_keeps_ctrl_j_multiline() -> None:
         pipe.send_text("line two")
         pipe.send_text("\r")
         assert await task == "line one\nline two"
+
+
+@pytest.mark.asyncio
+async def test_composer_submit_writes_file_history_and_up_replays_it(
+    tmp_path: Path,
+) -> None:
+    history = history_for(tmp_path / "history")
+    submitted: list[str] = []
+
+    with create_pipe_input() as pipe:
+        first_session: PromptSession[str] | None = None
+
+        def submit_first(value: str) -> None:
+            submitted.append(value)
+            assert first_session is not None
+            first_session.app.exit()
+
+        first_session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            history=history,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_submit=submit_first,
+            ),
+            multiline=True,
+        )
+        first_task = asyncio.create_task(first_session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("remember me\r")
+        await first_task
+
+        second_session: PromptSession[str] | None = None
+
+        def submit_second(value: str) -> None:
+            submitted.append(value)
+            assert second_session is not None
+            second_session.app.exit()
+
+        second_session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_submit=submit_second,
+            ),
+            multiline=True,
+        )
+        second_task = asyncio.create_task(second_session.prompt_async(" ❯ "))
+        await asyncio.sleep(0)
+        pipe.send_text("\x1b[A\r")
+        await second_task
+
+    assert submitted == ["remember me", "remember me"]
 
 
 @pytest.mark.parametrize("value", ["", "  \n  "])

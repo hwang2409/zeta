@@ -99,6 +99,7 @@ class ToolStreamPublisher(Protocol):
 
 
 ToolStreamSink = Callable[[StreamEvent], None]
+ToolLifecycleSink = Callable[[str], None]
 
 
 @dataclass(slots=True)
@@ -472,6 +473,7 @@ class ToolRegistry:
         _scope_signal: ToolAbortSignal | None = None,
         _boundary_signal: ToolAbortSignal | None = None,
         _stream_sink: ToolStreamSink | None = None,
+        _lifecycle_sink: ToolLifecycleSink | None = None,
     ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
         if _boundary_signal is not None and _signal_is_set(_boundary_signal):
@@ -516,6 +518,7 @@ class ToolRegistry:
             arguments,
             signal_state,
             lambda current: self._next_abort_generation(current, _scope_signal),
+            _lifecycle_sink,
         )
         if gate_result is not None:
             return _normalize_result(
@@ -528,6 +531,8 @@ class ToolRegistry:
                     _legacy_result(_canceled_result(tool_call.id)),
                     self.max_output_chars,
                 )
+        if _lifecycle_sink is not None:
+            _lifecycle_sink("execution_start")
         stream_publisher = (
             _ToolCallStreamPublisher(tool_call, execution_signal, _stream_sink)
             if _stream_sink is not None
