@@ -26,7 +26,6 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.data_structures import Size
 from rich.cells import cell_len
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -50,7 +49,7 @@ from zeta.tui.render import (
     format_thought,
     render_code,
     render_event,
-    render_markdown,
+    render_line,
     render_tool_progress,
     tool_render_mode,
 )
@@ -795,7 +794,7 @@ def test_render_event_shows_non_text_tool_block_placeholders() -> None:
 
 
 def test_render_helpers_use_the_zeta_palette() -> None:
-    markdown = render_markdown("# heading")
+    markdown = render_line("# heading")
     code = render_code("print('hi')", "python")
     start = render_event(
         StreamEvent(
@@ -1531,7 +1530,77 @@ def test_markdown_stream_renders_complete_table() -> None:
     assert isinstance(output[0], Table)
     assert output[0].columns[0].header == "name"
     assert output[0].columns[1].header == "value"
-    assert isinstance(output[1], Markdown)
+    assert isinstance(output[1], Text)
+
+
+def test_markdown_stream_preserves_model_line_structure(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    source = [
+        "pick what sounds fun:",
+        "",
+        "1. **take a walk** — get some air.",
+        "2. **read a book** — settle in.",
+        "3. **make a meal** — try a recipe.",
+        "4. **play a game** — choose one.",
+        "5. **call a friend** — catch up.",
+    ]
+
+    app._print_committed(source)
+    app._flush_markdown()
+
+    rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
+    assert rendered == [
+        "pick what sounds fun:",
+        "",
+        "1. take a walk — get some air.",
+        "2. read a book — settle in.",
+        "3. make a meal — try a recipe.",
+        "4. play a game — choose one.",
+        "5. call a friend — catch up.",
+    ]
+
+
+def test_markdown_stream_keeps_model_blank_lines_without_inserting_more(
+    tmp_path: Path,
+) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    source = ["intro", "", "1. first", "", "", "2. second", "after"]
+
+    app._print_committed(source)
+    app._flush_markdown()
+
+    rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
+    assert rendered == source
+
+
+def test_render_line_styles_inline_markdown_without_relayout() -> None:
+    rendered = render_line("1. **bold** and *italic* `code`")
+
+    assert rendered.plain == "1. bold and italic code"
+    assert any("bold" in str(span.style) for span in rendered.spans)
+    assert any("italic" in str(span.style) for span in rendered.spans)
+
+
+def test_markdown_stream_keeps_code_fence_rows_and_highlighting() -> None:
+    stream = MarkdownStream()
+    output = []
+    for line in ("```python", "print('hi')", "```"):
+        output.extend(stream.consume(line))
+
+    assert [getattr(item, "plain", None) for item in output[:1]] == ["```python"]
+    assert isinstance(output[1], Syntax)
+    assert output[1].code == "print('hi')"
+    assert output[2].plain == "```"
 
 
 def test_status_includes_provider_state_and_usage() -> None:
@@ -1769,7 +1838,7 @@ def test_rich_rendering_does_not_paint_terminal_background() -> None:
         width=80,
         theme=RICH_THEME,
     )
-    console.print(render_markdown("# heading\n\n`inline`"))
+    console.print(render_line("# heading\n\n`inline`"))
     console.print(render_code("print('hi')", "python"))
     console.print(
         render_event(
@@ -1872,7 +1941,7 @@ def test_transcript_visual_snapshot_is_compact_and_bottom_aligned(
     call = ToolCall("visual", "bash", {"cmd": "pwd"})
     transcript.append(Text.assemble(("▌ ", ACCENT), ("inspect the session", BODY)))
     transcript.append_blank()
-    transcript.append(render_markdown("## result\n\n1. first item\n2. second item"))
+    transcript.append(render_line("## result\n\n1. first item\n2. second item"))
     transcript.append_blank()
     transcript.append(
         render_event(
@@ -1917,7 +1986,7 @@ def test_transcript_visual_snapshot_is_compact_and_bottom_aligned(
     assert "request-1" in visible[-1]
 
 
-def test_full_screen_transcript_drops_markdown_list_placeholder_row(
+def test_full_screen_transcript_preserves_markdown_list_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = TUIApp(
@@ -1930,10 +1999,10 @@ def test_full_screen_transcript_drops_markdown_list_placeholder_row(
     output = SimpleNamespace(get_size=lambda: Size(rows=24, columns=40))
     monkeypatch.setattr("zeta.tui.app.get_app", lambda: SimpleNamespace(output=output))
 
-    app._append_transcript(render_markdown("1. first item"))
+    app._append_transcript(render_line("1. first item"))
 
     assert app._transcript_lines
-    assert app._transcript_lines[0].strip() == "1 first item"
+    assert app._transcript_lines[0].strip() == "1. first item"
 
 
 def test_full_screen_transcript_reflows_logical_text_at_narrow_widths(
@@ -2301,9 +2370,7 @@ def test_transcript_units_share_the_padded_content_edges(terminal_width: int) ->
     call = ToolCall("visual", "bash", {"cmd": "printf output"})
     transcript.append(Text("assistant prose that wraps at the shared edge."))
     transcript.append(
-        render_markdown(
-            "> quoted markdown\n\n```python\nprint(\"hello\")\n```"
-        )
+        Text("> quoted markdown\n\n```python\nprint(\"hello\")\n```")
     )
     transcript.append(
         render_event(

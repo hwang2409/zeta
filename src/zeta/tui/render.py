@@ -9,7 +9,6 @@ from typing import Any, Literal
 
 from rich.cells import cell_len
 from rich.console import RenderableType
-from rich.markdown import Markdown, TableElement
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
@@ -307,33 +306,36 @@ def _duration(data: dict[str, Any]) -> float | None:
     return None
 
 
-class _ExpandedMarkdownTable(TableElement):
-    """Keep Rich's native markdown tables on the shared content width."""
-
-    def __rich_console__(self, console: Any, options: Any):
-        for renderable in super().__rich_console__(console, options):
-            if isinstance(renderable, Table):
-                renderable.expand = True
-            yield renderable
+_INLINE_MARKER = re.compile(r"(\*\*|__|`|(?<!\*)\*(?!\*)|(?<!_)_(?!_))")
 
 
-class _ZetaMarkdown(Markdown):
-    elements = {
-        **Markdown.elements,
-        "table_open": _ExpandedMarkdownTable,
-    }
+def render_line(value: str) -> Text:
+    """Keep one model line intact while styling common inline markdown."""
 
-
-def render_markdown(value: str) -> RenderableType:
-    """Render assistant text with Rich markdown and fenced-code highlighting."""
-
-    return _ZetaMarkdown(
-        value,
-        code_theme=CODE_THEME,
-        hyperlinks=False,
-        inline_code_theme="monokai",
-        style=BODY,
-    )
+    rendered = Text(style=BODY)
+    markers = list(_INLINE_MARKER.finditer(value))
+    cursor = 0
+    marker_stack: list[tuple[str, str]] = []
+    for marker in markers:
+        if marker.start() > cursor:
+            style = marker_stack[-1][1] if marker_stack else BODY
+            rendered.append(value[cursor : marker.start()], style=style)
+        token = marker.group()
+        if marker_stack and marker_stack[-1][0] == token:
+            marker_stack.pop()
+        elif token == "`":
+            marker_stack.append((token, BODY))
+        elif token in {"**", "__"}:
+            marker_stack.append((token, f"bold {BODY}"))
+        else:
+            marker_stack.append((token, f"italic {BODY}"))
+        cursor = marker.end()
+    if marker_stack:
+        return Text(value, style=BODY)
+    if cursor < len(value):
+        style = marker_stack[-1][1] if marker_stack else BODY
+        rendered.append(value[cursor:], style=style)
+    return rendered
 
 
 def render_code(value: str, language: str = "text") -> Syntax:
@@ -398,7 +400,7 @@ class MarkdownStream:
             return []
 
         def render_lines() -> list[RenderableType]:
-            return [render_markdown(line) if line else Text("") for line in lines]
+            return [render_line(line) if line else Text("") for line in lines]
 
         separator_index = next(
             (index for index, line in enumerate(lines) if self._is_table_separator(line)),
@@ -437,7 +439,7 @@ class MarkdownStream:
         if self._table_cells(line) is not None:
             self.table_lines = [line]
             return []
-        return [render_markdown(line) if line else Text("")]
+        return [render_line(line) if line else Text("")]
 
     def consume(self, line: str) -> list[RenderableType]:
         if self.language is not None:
