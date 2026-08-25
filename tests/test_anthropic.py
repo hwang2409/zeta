@@ -24,6 +24,7 @@ from zeta.types import (
     Message,
     MessageRole,
     RedactedThinkingContent,
+    StreamEvent,
     StreamEventType,
     TextContent,
     ThinkingContent,
@@ -842,20 +843,345 @@ async def test_request_entry_transport_failure_is_typed(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_truncated_stream_is_typed(tmp_path: Path) -> None:
+async def test_early_stream_end_is_salvaged(tmp_path: Path) -> None:
+    events = await _collect_anthropic_events(
+        tmp_path,
+        'data: {"type":"message_start","message":{}}\n',
+    )
+
+    assert events[-1].type is StreamEventType.MESSAGE_END
+    assert events[-1].data["truncated"] is True
+    assert events[-1].message == Message(MessageRole.ASSISTANT)
+
+
+@pytest.mark.asyncio
+async def test_message_stop_salvages_open_text_block(tmp_path: Path) -> None:
+    events = await _collect_anthropic_events(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+    assert events[-1].message == Message(
+        MessageRole.ASSISTANT, [TextContent("partial")]
+    )
+    assert events[-1].data["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_message_stop_salvages_parseable_open_tool_block(tmp_path: Path) -> None:
+    events = await _collect_anthropic_events(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"read"}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"README.md\\"}"}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+    assert events[-1].message == Message(
+        MessageRole.ASSISTANT,
+        [ToolUseContent(ToolCall("call-1", "read", {"path": "README.md"}))],
+    )
+    assert events[-1].data["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_message_stop_drops_unparseable_open_tool_block(tmp_path: Path) -> None:
+    events = await _collect_anthropic_events(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"read"}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"README.md\\""}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+    assert events[-1].message == Message(MessageRole.ASSISTANT)
+    assert events[-1].data == {
+        "truncated": True,
+        "dropped_tool_calls": 1,
+        "usage": {},
+        "stop_reason": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_message_stop_salvages_mixed_open_blocks(tmp_path: Path) -> None:
+    events = await _collect_anthropic_events(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}',
+                "",
+                'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call-1","name":"read"}}',
+                "",
+                'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"README.md\\""}}',
+                "",
+                'data: {"type":"content_block_start","index":2,"content_block":{"type":"redacted_thinking","data":"opaque"}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+    assert events[-1].message == Message(
+        MessageRole.ASSISTANT,
+        [TextContent("partial"), RedactedThinkingContent("opaque")],
+    )
+    assert events[-1].data["dropped_tool_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_eof_after_empty_text_start_omits_text_block(tmp_path: Path) -> None:
+    events = await _collect_anthropic_events(
+        tmp_path,
+        'data: {"type":"message_start","message":{}}\n\n'
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n',
+    )
+
+    assert events[-1].message == Message(MessageRole.ASSISTANT)
+    assert events[-1].data["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_eof_after_tool_start_drops_tool_call(tmp_path: Path) -> None:
+    events = await _collect_anthropic_events(
+        tmp_path,
+        'data: {"type":"message_start","message":{}}\n\n'
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"read"}}\n',
+    )
+
+    assert events[-1].message == Message(MessageRole.ASSISTANT)
+    assert events[-1].data["dropped_tool_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_eof_keeps_open_redacted_thinking(tmp_path: Path) -> None:
+    events = await _collect_anthropic_events(
+        tmp_path,
+        'data: {"type":"message_start","message":{}}\n\n'
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque"}}\n',
+    )
+
+    assert events[-1].message == Message(
+        MessageRole.ASSISTANT, [RedactedThinkingContent("opaque")]
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_stop_keeps_unsigned_thinking_for_display(tmp_path: Path) -> None:
+    events = await _collect_anthropic_events(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"partial-sig"}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+    assert events[-1].message == Message(
+        MessageRole.ASSISTANT, [ThinkingContent("plan")]
+    )
+    assert events[-1].data["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_early_stream_end_salvages_block_without_message_stop(tmp_path: Path) -> None:
+    events = await _collect_anthropic_events(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cut off"}}',
+            ]
+        ),
+    )
+
+    assert events[-1].message == Message(
+        MessageRole.ASSISTANT, [TextContent("cut off")]
+    )
+    assert events[-1].data["truncated"] is True
+
+
+def test_salvaged_context_omits_unsigned_thinking_on_replay() -> None:
+    payload = build_messages_payload(
+        [
+            Message(MessageRole.USER, [TextContent("continue")]),
+            Message(
+                MessageRole.ASSISTANT,
+                [ThinkingContent("partial plan"), TextContent("partial answer")],
+            ),
+        ],
+        [],
+        model="claude-test",
+        max_tokens=100,
+    )
+
+    assert payload["messages"][-1] == {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "partial answer"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_closed_unsigned_thinking_remains_strict(tmp_path: Path) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+                "",
+                'data: {"type":"content_block_stop","index":0}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_closed_unsigned_thinking_with_open_sibling_remains_strict(
+    tmp_path: Path,
+) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+                "",
+                'data: {"type":"content_block_stop","index":0}',
+                "",
+                'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_closed_malformed_tool_with_open_sibling_remains_strict(
+    tmp_path: Path,
+) -> None:
+    await _assert_malformed_stream_raises(
+        tmp_path,
+        "\n".join(
+            [
+                'data: {"type":"message_start","message":{}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"read"}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"README.md\\""}}',
+                "",
+                'data: {"type":"content_block_stop","index":0}',
+                "",
+                'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}',
+                "",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_eof_message_delta_preserves_stop_reason_and_usage(tmp_path: Path) -> None:
+    events = await _collect_anthropic_events(
+        tmp_path,
+        'data: {"type":"message_start","message":{}}\n\n'
+        'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":7}}',
+    )
+
+    assert events[-1].data["stop_reason"] == "max_tokens"
+    assert events[-1].data["usage"] == {"output_tokens": 7}
+
+
+@pytest.mark.asyncio
+async def test_two_turn_replay_omits_empty_salvaged_text_block(tmp_path: Path) -> None:
+    truncated = (
+        'data: {"type":"message_start","message":{}}\n\n'
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n'
+    )
+    requests: list[dict[str, object]] = []
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        stream = truncated if len(requests) == 1 else SSE
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text='data: {"type":"message_start","message":{}}\n',
+            text=stream,
             request=request,
         )
 
-    store = AnthropicCredentialStore(tmp_path / "zeta.json")
-    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    store = ConversationStore(tmp_path / "sessions")
+    token_store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    token_store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
-    with pytest.raises(AnthropicStreamError):
-        [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+    loop = AgentLoop(
+        AnthropicBackend(client=client, token_store=token_store),
+        store,
+        tool_schemas=[],
+    )
+
+    [event async for event in loop.run_turn("first")]
+    [event async for event in loop.run_turn("second")]
+
+    assert len(requests) == 2
+    assert all(
+        message != {"role": "assistant", "content": []}
+        for message in requests[1]["messages"]
+    )
+    assert requests[1]["messages"][-1]["content"][-1]["text"] == "second"
     await client.aclose()
 
 
@@ -1272,6 +1598,26 @@ async def _assert_malformed_stream_raises(tmp_path: Path, stream: str) -> None:
     await client.aclose()
 
 
+async def _collect_anthropic_events(tmp_path: Path, stream: str) -> list[StreamEvent]:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=stream,
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(client=client, token_store=store).complete([], [])
+    ]
+    await client.aclose()
+    return events
+
+
 async def consume_loop_turn(loop: AgentLoop, thinking_started: asyncio.Event) -> None:
     async for event in loop.run_turn("start"):
         if event.type.name == "MESSAGE_UPDATE" and event.content is not None:
@@ -1388,8 +1734,8 @@ async def test_delta_after_block_stop_is_rejected(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_message_stop_with_open_block_is_rejected(tmp_path: Path) -> None:
-    await _assert_malformed_stream_raises(
+async def test_message_stop_with_open_block_is_salvaged(tmp_path: Path) -> None:
+    events = await _collect_anthropic_events(
         tmp_path,
         "\n".join(
             [
@@ -1402,6 +1748,9 @@ async def test_message_stop_with_open_block_is_rejected(tmp_path: Path) -> None:
             ]
         ),
     )
+
+    assert events[-1].message == Message(MessageRole.ASSISTANT)
+    assert events[-1].data["truncated"] is True
 
 
 @pytest.mark.asyncio

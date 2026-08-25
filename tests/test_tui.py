@@ -52,7 +52,7 @@ from zeta.tui.render import (
     render_tool_progress,
     tool_render_mode,
 )
-from zeta.tui.theme import ACCENT, BODY, RICH_THEME
+from zeta.tui.theme import ACCENT, BODY, DIM, RICH_THEME
 from zeta.tui.transcript import TranscriptWidget
 from zeta.types import (
     CompletionBackend,
@@ -992,6 +992,71 @@ def test_markdown_stream_requires_matching_four_backtick_fence() -> None:
     closing = stream.consume("````")
     assert closing[0].plain == "````"
     assert stream.language is None
+
+
+def test_truncated_response_notice_is_dim() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            data={"truncated": True},
+        )
+    )
+
+    assert isinstance(rendered, Text)
+    assert rendered.plain == "response truncated (stream ended early)"
+    assert rendered.style == DIM
+
+    transcript = TranscriptWidget()
+    transcript.append(rendered)
+    for width in (40, 80):
+        lines = transcript.lines(width)
+        assert sum(line.count(rendered.plain) for line in lines) == 1
+        assert all(cell_len(Text.from_ansi(line).plain) <= width for line in lines)
+
+    output = StringIO()
+    Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        width=40,
+        theme=RICH_THEME,
+    ).print(rendered)
+    escaped = output.getvalue()
+    assert escaped.count(rendered.plain) == 1
+    assert not re.search(r"\x1b\[[0-9;]*48(?:;[0-9;]*)?m", escaped)
+
+
+@pytest.mark.asyncio
+async def test_truncated_response_notice_is_printed_once(tmp_path: Path) -> None:
+    class TruncatedBackend(CompletionBackend):
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT),
+                data={"truncated": True},
+            )
+
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            TruncatedBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            tool_schemas=[],
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._consume_turn("hello")
+
+    assert output.getvalue().count("response truncated (stream ended early)") == 1
+    assert "no response" not in output.getvalue()
 
 
 def test_markdown_stream_keeps_text_after_fence_inside_code_block() -> None:

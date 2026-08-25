@@ -25,6 +25,7 @@ from zeta.types import (
     ToolCall,
     ToolResult,
     ToolSchema,
+    ThinkingContent,
 )
 
 
@@ -44,6 +45,20 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
         MessageRole.USER,
         MessageRole.ASSISTANT,
     ]
+
+
+@pytest.mark.asyncio
+async def test_unsigned_thinking_is_not_persisted_with_assistant_message(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn([ThinkingContent("partial"), TextContent("answer")])]
+    )
+    store = ConversationStore(tmp_path)
+
+    await collect(AgentLoop(backend, store).run_turn("hi"))
+
+    assert store.messages()[-1].content == [TextContent("answer")]
 
 
 @pytest.mark.asyncio

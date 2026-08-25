@@ -413,7 +413,7 @@ class AgentLoop:
                 if request is not None:
                     approval_requests.append((request.request_id, request.tool_call))
             self.store.append_message_with_approval_requests(
-                assistant_message,
+                _durable_message(assistant_message),
                 approval_requests,
             )
             if not calls:
@@ -656,7 +656,7 @@ class AgentLoop:
         assistant_message: Message | None,
     ) -> None:
         if assistant_message is not None:
-            self.store.append_message(assistant_message)
+            self.store.append_message(_durable_message(assistant_message))
         else:
             durable_blocks = [
                 block
@@ -702,3 +702,19 @@ class AgentLoop:
             if isinstance(block, ToolUseContent)
         ]
         self._finalize_tool_results(calls, [None] * len(calls))
+
+
+def _durable_message(message: Message) -> Message:
+    content = [
+        block
+        for block in message.content
+        if not isinstance(block, ThinkingContent) or block.signature
+    ]
+    if len(content) == len(message.content):
+        return message
+    return Message(
+        message.role,
+        content,
+        tool_result=message.tool_result,
+        metadata=dict(message.metadata),
+    )
