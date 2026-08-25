@@ -8,12 +8,14 @@ from pathlib import Path
 from prompt_toolkit.application import get_app
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.filters import Condition, vi_insert_mode
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
+from rich.text import Text
 
 
 SHIFT_ENTER_SEQUENCES = frozenset(
@@ -43,6 +45,27 @@ def vim_state_label(vim_mode: bool) -> str | None:
     return "NORMAL" if mode is InputMode.NAVIGATION else "INSERT"
 
 
+def status_formatted_text(status: Text) -> FormattedText:
+    """Convert Rich status spans into prompt-toolkit fragments."""
+
+    fragments: list[tuple[str, str]] = []
+    boundaries = {0, len(status.plain)}
+    for span in status.spans:
+        boundaries.update((span.start, span.end))
+    ordered_boundaries = sorted(boundaries)
+    for start, end in zip(ordered_boundaries, ordered_boundaries[1:]):
+        styles = ["class:status-bar"]
+        if status.style:
+            styles.append(str(status.style))
+        styles.extend(
+            str(span.style)
+            for span in status.spans
+            if span.start <= start and end <= span.end
+        )
+        fragments.append((" ".join(styles), status.plain[start:end]))
+    return FormattedText(fragments)
+
+
 def parse_input(value: str) -> str | None:
     """Return a usable user turn, or None for blank input."""
 
@@ -63,9 +86,13 @@ def build_key_bindings(
     bindings = KeyBindings()
 
     @Condition
-    def vi_insert_empty() -> bool:
+    def vi_insert_history_navigation() -> bool:
         app = get_app()
-        return vi_insert_mode() and not app.current_buffer.text
+        buffer = app.current_buffer
+        return vi_insert_mode() and (
+            not buffer.text
+            or buffer.working_index < len(buffer._working_lines) - 1
+        )
 
     def insert_newline(event: KeyPressEvent) -> None:
         event.current_buffer.insert_text("\n")
@@ -97,11 +124,11 @@ def build_key_bindings(
     )
     bindings.add(Keys.Escape)(native_escape)
 
-    @bindings.add("up", filter=vi_insert_empty)
+    @bindings.add("up", filter=vi_insert_history_navigation)
     def history_up(event: KeyPressEvent) -> None:
         event.current_buffer.auto_up()
 
-    @bindings.add("down", filter=vi_insert_empty)
+    @bindings.add("down", filter=vi_insert_history_navigation)
     def history_down(event: KeyPressEvent) -> None:
         event.current_buffer.auto_down()
 

@@ -29,7 +29,7 @@ from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.project_context import ProjectContext, discover_repo_root, load_project_context
 from ..core.slash import SlashStatus, create_slash_registry
 from ..loop import AgentLoop
-from ..core.session import SessionError, SessionManager, _preview_text, env_home
+from ..core.session import SessionError, SessionManager, env_home
 from ..providers.anthropic import AnthropicBackend
 from ..providers.anthropic import AnthropicCredentialStore
 from ..providers.codex import CodexBackend
@@ -44,7 +44,8 @@ from ..types import (
     ThinkingContent,
 )
 from .composer import build_key_bindings, history_for, parse_input, vim_state_label
-from .layout import CONTENT_MARGIN, content_width
+from .composer import status_formatted_text
+from .layout import CONTENT_MARGIN, content_width, resume_picker_line
 from .render import (
     MarkdownStream,
     format_status,
@@ -84,6 +85,7 @@ class FullScreenPromptSession(PromptSession[str]):
         self, editing_mode: EditingMode, erase_when_done: bool
     ) -> Application[str]:
         application = super()._create_application(editing_mode, erase_when_done)
+        application.ttimeoutlen = application.timeoutlen = 0.02
         application.full_screen = True
         application.renderer.full_screen = True
         application.erase_when_done = False
@@ -105,10 +107,6 @@ class FullScreenPromptSession(PromptSession[str]):
 
 def _zeta_home() -> Path:
     return env_home()
-
-
-def _resume_picker_line(value: str, width: int) -> str:
-    return " " * CONTENT_MARGIN + _preview_text(value, limit=width)
 
 
 class FakeInteractiveBackend(CompletionBackend):
@@ -354,10 +352,9 @@ class TUIApp:
         return f"model: {model}"
 
     def slash_vim(self, args: str) -> str:
-        """Show or change the composer's Vim editing mode."""
+        requested = args.strip().lower()
         if not args:
             return f"vim mode: {'on' if self.vim_mode else 'off'}"
-        requested = args.strip().lower()
         if requested not in {"on", "off", "toggle"}:
             return "vim mode unchanged: use /vim on, /vim off, or /vim toggle"
         enabled = not self.vim_mode if requested == "toggle" else requested == "on"
@@ -589,7 +586,7 @@ class TUIApp:
             model_window=self.loop.context_assembler.token_budget,
             vim_state=vim_state_label(self.vim_mode),
         )
-        return FormattedText([("class:status-bar", status.plain)])
+        return status_formatted_text(status)
 
     def _full_screen_active(self) -> bool:
         return isinstance(self._active_session, FullScreenPromptSession)
@@ -606,12 +603,7 @@ class TUIApp:
             if self._full_screen_active():
                 self._append_transcript(renderable)
             else:
-                self.console.print(
-                    Padding(
-                        renderable,
-                        (0, CONTENT_MARGIN, 0, CONTENT_MARGIN),
-                    )
-                )
+                self.console.print(Padding(renderable, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN)))
 
     def _print_unit(self, renderable: RenderableType | None) -> None:
         self._presenter.print_unit(renderable)
@@ -974,13 +966,7 @@ class TUIApp:
                 ),
             ],
         )
-        padded = VSplit(
-            [
-                Window(width=CONTENT_MARGIN, char=" "),
-                content,
-                Window(width=CONTENT_MARGIN, char=" "),
-            ],
-        )
+        padded = VSplit([Window(width=CONTENT_MARGIN, char=" "), content, Window(width=CONTENT_MARGIN, char=" ")])
         root.children[:] = [
             padded,
         ]
@@ -1056,19 +1042,11 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             if not previews:
                 raise SessionError("no prior zeta session found")
             width = content_width(get_terminal_size(fallback=(80, 24)).columns)
-            print(_resume_picker_line("recent zeta sessions:", width))
+            print(resume_picker_line("recent zeta sessions:", width))
             for index, preview in enumerate(previews, start=1):
-                print(
-                    _resume_picker_line(
-                        f"{index}. {preview.updated_at} "
-                        f"{preview.session_id[:8]} {preview.preview}",
-                        width,
-                    )
-                )
+                print(resume_picker_line(f"{index}. {preview.updated_at} {preview.session_id[:8]} {preview.preview}", width))
             try:
-                choice = input(
-                    _resume_picker_line("select a session:", width - 1) + " "
-                ).strip()
+                choice = input(resume_picker_line("select a session:", width - 1) + " ").strip()
                 selected = int(choice)
                 if not 1 <= selected <= len(previews):
                     raise ValueError("selection out of range")
