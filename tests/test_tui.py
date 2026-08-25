@@ -1002,6 +1002,77 @@ def test_tool_card_renders_nonempty_result_section_without_misnesting() -> None:
     assert "stderr:" not in plain
 
 
+def test_tool_card_preserves_timeout_preamble_before_stdout() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-5", "exec", {"command": "sleep 1"}),
+            tool_result=ToolResult(
+                "tool-5",
+                "command timed out\nstdout:\npartial output",
+                is_error=True,
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "command timed out" in plain
+    assert "stdout:\npartial output" in plain
+    assert plain.index("command timed out") < plain.index("stdout:")
+
+
+def test_tool_card_preserves_preamble_without_sections() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-6", "exec", {"command": "sleep 1"}),
+            tool_result=ToolResult("tool-6", "command timed out", is_error=True),
+        )
+    )
+
+    assert rendered is not None
+    assert "command timed out" in renderable_plain(rendered)
+
+
+def test_tool_card_preserves_preamble_before_multiple_sections() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-7", "exec", {"command": "run"}),
+            tool_result=ToolResult(
+                "tool-7",
+                "warning\nstdout:\nout\nstderr:\nerr",
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "warning" in plain
+    assert "stdout:\nout" in plain
+    assert "stderr:\nerr" in plain
+    assert plain.index("warning") < plain.index("stdout:") < plain.index("stderr:")
+
+
+def test_tool_card_keeps_trailing_text_in_active_section() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("tool-8", "exec", {"command": "run"}),
+            tool_result=ToolResult(
+                "tool-8",
+                "stdout:\nout\nstderr:\nerr\ntrailing detail",
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "stderr:\nerr\ntrailing detail" in plain
+    assert "result:" not in plain
+
+
 @pytest.mark.parametrize("position", ["leading", "middle", "trailing"])
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_tool_card_omits_exit_codes_in_any_section_position(

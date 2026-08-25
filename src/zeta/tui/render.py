@@ -258,6 +258,7 @@ def _split_tool_output(
         return [], generic
 
     sections: list[tuple[str, str]] = []
+    generic_lines: list[str] = []
     current_label: str | None = None
     current_lines: list[str] = []
 
@@ -274,8 +275,10 @@ def _split_tool_output(
             continue
         elif current_label is not None:
             current_lines.append(line)
+        else:
+            generic_lines.append(line)
     flush()
-    return sections, ""
+    return sections, "\n".join(generic_lines)
 
 
 def _tool_body(event: StreamEvent) -> Text | None:
@@ -294,6 +297,9 @@ def _tool_body(event: StreamEvent) -> Text | None:
     rendered = Text(style=BODY, overflow="ellipsis", no_wrap=True)
 
     visible_sections = [(label, value) for label, value in sections if value.strip()]
+    if generic.strip():
+        rendered.append_text(_render_tool_output(generic, extra_lines))
+        extra_lines = []
     if sections:
         for label, value in visible_sections:
             if rendered:
@@ -301,10 +307,6 @@ def _tool_body(event: StreamEvent) -> Text | None:
             rendered.append(f"{label}:\n", style=DIM)
             rendered.append_text(_render_tool_output(value, extra_lines))
             extra_lines = []
-    elif generic.strip():
-        if rendered:
-            rendered.append("\n\n")
-        rendered.append_text(_render_tool_output(generic, extra_lines))
 
     return rendered if rendered else None
 
