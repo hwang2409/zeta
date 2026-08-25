@@ -411,6 +411,44 @@ def test_transcript_resize_cycles_have_zero_anchor_drift() -> None:
         assert transcript._line_locations[transcript.scroll_offset] == initial_anchor
 
 
+def test_transcript_same_width_repaint_preserves_blank_anchor() -> None:
+    transcript = TranscriptWidget()
+    for index in range(20):
+        transcript.append(Text(f"line-{index}"))
+        transcript.append_blank()
+
+    transcript.create_content(80, 3)
+    transcript._set_scroll_offset(33)
+    initial_anchor = transcript._anchor
+    assert initial_anchor is not None
+    assert initial_anchor[0] is not None
+    assert initial_anchor[0].value is None
+
+    transcript.create_content(80, 3)
+
+    assert transcript.scroll_offset == 33
+    assert transcript._line_locations[transcript.scroll_offset] == initial_anchor
+
+
+def test_transcript_resize_cycles_preserve_blank_anchor() -> None:
+    transcript = TranscriptWidget()
+    for index in range(20):
+        transcript.append(Text(f"line-{index} " + "x" * 40))
+        transcript.append_blank()
+
+    transcript.create_content(80, 3)
+    transcript._set_scroll_offset(33)
+    initial_anchor = transcript._anchor
+    assert initial_anchor is not None
+    assert initial_anchor[0] is not None
+    assert initial_anchor[0].value is None
+
+    for width in (20, 80, 20, 80):
+        transcript.create_content(width, 3)
+        assert transcript._anchor == initial_anchor
+        assert transcript._line_locations[transcript.scroll_offset] == initial_anchor
+
+
 def test_transcript_resize_preserves_anchor_in_unbroken_unit() -> None:
     source = "".join(f"{index:03}" for index in range(500))
     transcript = TranscriptWidget()

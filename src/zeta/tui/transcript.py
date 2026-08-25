@@ -47,7 +47,9 @@ class _ToolUnit:
 
 
 class _TranscriptUnit:
-    def __init__(self, key: int, value: RenderableType | _ToolUnit) -> None:
+    def __init__(
+        self, key: int, value: RenderableType | _ToolUnit | None
+    ) -> None:
         self.key = key
         self.value = value
 
@@ -79,7 +81,7 @@ class TranscriptWidget(UIControl):
         self._revision += 1
         self._parsed_cache.clear()
 
-    def _append_unit(self, value: RenderableType | _ToolUnit) -> None:
+    def _append_unit(self, value: RenderableType | _ToolUnit | None) -> None:
         self._units.append(_TranscriptUnit(self._next_key, value))
         self._next_key += 1
         self._bump_revision()
@@ -88,8 +90,7 @@ class TranscriptWidget(UIControl):
         self._append_unit(renderable)
 
     def append_blank(self) -> None:
-        self._units.append(None)
-        self._bump_revision()
+        self._append_unit(None)
 
     def start_tool(
         self, call_id: str, call: ToolCall, renderable: RenderableType
@@ -166,6 +167,8 @@ class TranscriptWidget(UIControl):
 
     def _render_unit(self, unit: _TranscriptUnit, width: int) -> str:
         value = unit.value
+        if value is None:
+            return ""
         revision = value.revision if isinstance(value, _ToolUnit) else 0
         key = unit.key
         cached = self._render_cache.get(key)
