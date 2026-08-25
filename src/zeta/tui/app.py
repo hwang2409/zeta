@@ -456,7 +456,7 @@ class TUIApp:
         )
         transcript_console.print(Padding(renderable, (0, 2, 0, 2)))
         lines = output.getvalue().rstrip("\n").splitlines()
-        while lines and not lines[0].strip():
+        while lines and not Text.from_ansi(lines[0]).plain.strip():
             lines.pop(0)
         self._transcript_lines.extend(lines)
 

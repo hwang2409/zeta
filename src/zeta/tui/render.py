@@ -522,8 +522,14 @@ def format_status(
         value = str(context_tokens)
     context_text = f"{value} ({percent}%)"
 
-    state = loop_state if loop_state in {"streaming", "idle", "interrupted", "compacting"} else "streaming"
-    if show_spinner and state not in {"interrupted", "compacting"}:
+    state = loop_state if loop_state in {
+        "streaming",
+        "tool-running",
+        "idle",
+        "interrupted",
+        "compacting",
+    } else "streaming"
+    if show_spinner and state not in {"tool-running", "interrupted", "compacting"}:
         left = f"{SPINNER_FRAMES[spinner_frame % len(SPINNER_FRAMES)]}  esc interrupt"
     else:
         left = state

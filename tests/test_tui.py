@@ -724,7 +724,9 @@ def test_thought_sentence_detection_handles_initialisms_and_quotes(
     assert collapse_thought(value) == expected
 
 
-@pytest.mark.parametrize("state", ["streaming", "idle", "interrupted", "compacting"])
+@pytest.mark.parametrize(
+    "state", ["streaming", "tool-running", "idle", "interrupted", "compacting"]
+)
 def test_status_bar_supports_all_session_states(state: str) -> None:
     rendered = format_status(
         "fake",
@@ -739,7 +741,7 @@ def test_status_bar_supports_all_session_states(state: str) -> None:
     assert "abcdef12" in rendered.plain
 
 
-@pytest.mark.parametrize("state", ["interrupted", "compacting"])
+@pytest.mark.parametrize("state", ["tool-running", "interrupted", "compacting"])
 def test_special_status_states_override_spinner(state: str) -> None:
     rendered = format_status(
         "fake",
