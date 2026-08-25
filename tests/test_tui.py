@@ -880,6 +880,24 @@ def test_command_tool_card_highlights_extracted_command() -> None:
     assert '{"command"' not in plain
 
 
+@pytest.mark.parametrize("width", [80, 200])
+def test_command_tool_card_keeps_header_left_aligned(width: int) -> None:
+    command = "cat /tmp/example.txt"
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("bash-1", "bash", {"cmd": command}),
+            tool_result=ToolResult("bash-1", ""),
+        )
+    )
+
+    assert rendered is not None
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=width).print(rendered.renderable)
+
+    assert output.getvalue().splitlines()[0] == f"bash {command}"
+
+
 def test_command_syntax_has_no_background_sgr() -> None:
     rendered = render_event(
         StreamEvent(
