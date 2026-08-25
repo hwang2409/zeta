@@ -208,8 +208,11 @@ class ContextAssembler:
     def digest(self) -> str | None:
         return self.last_context.digest if self.last_context is not None else None
 
-    def needs_compaction(self) -> bool:
+    def needs_compaction(self, *, force: bool = False) -> bool:
         """Return whether the next assembly must compact the active branch."""
+
+        if force:
+            return True
 
         branch = self.store.replay()
         items = self._visible_items(branch)
@@ -287,14 +290,16 @@ class ContextAssembler:
         self,
         *,
         backend: CompletionBackend | None = None,
+        force: bool = False,
     ) -> list[Message]:
-        context = await self.assemble_context(backend=backend)
+        context = await self.assemble_context(backend=backend, force=force)
         return list(context.messages)
 
     async def assemble_context(
         self,
         *,
         backend: CompletionBackend | None = None,
+        force: bool = False,
     ) -> AssembledContext:
         branch = self.store.replay()
         branch_id = self._branch_id(branch)
@@ -308,9 +313,10 @@ class ContextAssembler:
         committed_tokens = self._count(committed_messages)
         all_messages = [*system_messages, *(item.message for item in items)]
         total_tokens = self._total_tokens(all_messages)
-        if not self.compaction_policy.should_compact(
+        should_compact = force or self.compaction_policy.should_compact(
             total_tokens, self.token_budget
-        ):
+        )
+        if not should_compact:
             return self._save(
                 all_messages,
                 False,
@@ -324,6 +330,8 @@ class ContextAssembler:
 
         candidates = list(items[:boundary])
         if not candidates:
+            if force:
+                return self._save(all_messages, False)
             raise BudgetExceeded("context exceeds budget and has no compactible range")
         source_entries = {
             item.entry.id: item.entry

@@ -196,6 +196,49 @@ def test_empty_message_does_nothing() -> None:
     assert registry.input_for_model("") == ""
 
 
+def test_model_command_shows_and_changes_the_model() -> None:
+    class ModelSession:
+        def __init__(self) -> None:
+            self.model = "offline"
+
+        def slash_status(self) -> SlashStatus:
+            return session().status
+
+        def slash_model(self, args: str) -> str:
+            if args:
+                self.model = args
+            return f"model: {self.model}"
+
+        async def slash_compact(self) -> str:
+            return "compact: nothing to compact"
+
+    model_session = ModelSession()
+    registry = create_slash_registry()
+
+    assert registry.dispatch(model_session, "/model") == "model: offline"
+    assert registry.dispatch(model_session, "/model faster") == "model: faster"
+
+
+@pytest.mark.asyncio
+async def test_compact_command_uses_async_dispatch() -> None:
+    class CompactSession:
+        def slash_status(self) -> SlashStatus:
+            return session().status
+
+        def slash_model(self, args: str) -> str:
+            del args
+            return "model: offline"
+
+        async def slash_compact(self) -> str:
+            return "compacted entries 1–2; tokens after: 3"
+
+    output = await create_slash_registry().dispatch_async(
+        CompactSession(), "/compact"
+    )
+
+    assert output == "compacted entries 1–2; tokens after: 3"
+
+
 @pytest.mark.asyncio
 async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> None:
     backend = FakeBackend([])

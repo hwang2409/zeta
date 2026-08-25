@@ -4,12 +4,14 @@ import asyncio
 import hashlib
 import json
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.cells import cell_len
 from rich.console import Console
 
 from zeta.core.approval import ApprovalPolicy
@@ -18,6 +20,8 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionError, SessionManager
+from zeta.core.slash import create_slash_registry
+from zeta.core.store import ConversationStore
 from zeta.tui.app import TUIApp, create_app
 from zeta.cli import build_parser, main
 from zeta.types import (
@@ -306,6 +310,409 @@ def test_resume_reopens_an_explicit_session(
     assert resumed.loop.store.session_id == session_id
 
 
+def test_model_swap_persists_and_restores_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    first = create_app(_args())
+
+    output = create_slash_registry().dispatch(first, "/model faster")
+    assert output == "model: faster"
+    assert first.model == "faster"
+    assert SessionManager(home).open(first.loop.store.session_id).metadata.model == "faster"
+
+    resumed = create_app(
+        build_parser().parse_args(
+            ["--resume", first.loop.store.session_id, "--provider", "fake"]
+        )
+    )
+    assert resumed.model == "faster"
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_swap_warns_and_changes_the_model(tmp_path: Path) -> None:
+    backend = FakeBackend([])
+    app = TUIApp(
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        provider="claude",
+        model="claude-sonnet-4-6",
+        model_catalog_loader=lambda provider: frozenset({"claude-sonnet-4-6"}),
+    )
+
+    output = create_slash_registry().dispatch(app, "/model offline")
+    await wait_until(lambda: app._model_catalog_loaded)
+
+    assert output == "model: offline (model catalog unavailable for claude — using anyway)"
+    assert app.model == "offline"
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_with_provider_prefix_warns_before_state_change(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "zeta-home"
+    manager = SessionManager(home)
+    opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), opened.store),
+        provider="claude",
+        model="claude-sonnet-4-6",
+        model_catalog_loader=lambda provider: frozenset({"claude-sonnet-4-6"}),
+    )
+
+    output = create_slash_registry().dispatch(
+        app, "/model claude-definitely-not-real"
+    )
+    await wait_until(lambda: app._model_catalog_loaded)
+
+    assert output == (
+        "model: claude-definitely-not-real "
+        "(model catalog unavailable for claude — using anyway)"
+    )
+    assert app.model == "claude-definitely-not-real"
+    assert manager.open(opened.store.session_id).metadata.model == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="claude",
+        model="claude-sonnet-4-6",
+        model_catalog_loader=lambda provider: frozenset({"claude-opus-4-7"}),
+    )
+
+    first = create_slash_registry().dispatch(app, "/model claude-opus-4-7")
+    await wait_until(lambda: app._model_catalog_loaded)
+    output = create_slash_registry().dispatch(app, "/model claude-opus-4-7")
+
+    assert first == (
+        "model: claude-opus-4-7 "
+        "(model catalog unavailable for claude — using anyway)"
+    )
+    assert output == "model: claude-opus-4-7"
+
+
+@pytest.mark.asyncio
+async def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def load_catalog(provider: str) -> frozenset[str]:
+        calls.append(provider)
+        return frozenset({"claude-opus-4-7"})
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="claude",
+        model="claude-sonnet-4-6",
+        model_catalog_loader=load_catalog,
+    )
+
+    first = create_slash_registry().dispatch(app, "/model claude-new")
+    await wait_until(lambda: app._model_catalog_loaded)
+    second = create_slash_registry().dispatch(app, "/model claude-other")
+
+    assert first == (
+        "model: claude-new "
+        "(model catalog unavailable for claude — using anyway)"
+    )
+    assert second == (
+        "model: claude-other (model not found in claude catalog — using anyway)"
+    )
+    assert calls == ["claude"]
+
+
+@pytest.mark.asyncio
+async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def load_catalog(provider: str) -> frozenset[str]:
+        del provider
+        started.set()
+        release.wait(timeout=1)
+        return frozenset({"claude-opus-4-7"})
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="claude",
+        model="claude-sonnet-4-6",
+        model_catalog_loader=load_catalog,
+    )
+
+    began = time.monotonic()
+    first = create_slash_registry().dispatch(app, "/model claude-opus-4-7")
+    elapsed = time.monotonic() - began
+
+    try:
+        assert elapsed < 0.25
+        assert first == (
+            "model: claude-opus-4-7 "
+            "(model catalog unavailable for claude — using anyway)"
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+    finally:
+        release.set()
+
+    await wait_until(lambda: app._model_catalog_loaded)
+    assert create_slash_registry().dispatch(app, "/model claude-opus-4-7") == (
+        "model: claude-opus-4-7"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="codex",
+        model="gpt-5.4",
+        model_catalog_loader=lambda provider: None,
+    )
+
+    output = create_slash_registry().dispatch(app, "/model gpt-5.6-sol")
+    await wait_until(lambda: app._model_catalog_loaded)
+
+    assert output == "model: gpt-5.6-sol (model catalog unavailable for codex — using anyway)"
+
+
+def test_wrong_provider_model_prefix_is_rejected(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="claude",
+        model="claude-sonnet-4-6",
+        model_catalog_loader=lambda provider: frozenset(),
+    )
+
+    output = create_slash_registry().dispatch(app, "/model gpt-5.6-sol")
+
+    assert output == "model unchanged: model 'gpt-5.6-sol' has a wrong-provider prefix for claude"
+
+
+@pytest.mark.asyncio
+async def test_model_swap_is_rejected_during_active_turn(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_task = asyncio.create_task(asyncio.sleep(1))
+
+    try:
+        output = create_slash_registry().dispatch(app, "/model faster")
+    finally:
+        app._active_task.cancel()
+        await asyncio.gather(app._active_task, return_exceptions=True)
+
+    assert output == "model unchanged: cannot change model while a turn or approval is active"
+    assert app.model == "offline"
+
+
+def test_model_swap_is_rejected_with_pending_approval(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    policy = ApprovalPolicy(store=store)
+    call = ToolCall("pending-model-swap", "echo", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+    )
+
+    output = create_slash_registry().dispatch(app, "/model faster")
+
+    assert output == "model unchanged: cannot change model while a turn or approval is active"
+    assert app.model == "offline"
+
+
+@pytest.mark.asyncio
+async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("summary")])])
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("first")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("answer")]))
+    assembler = ContextAssembler(
+        store,
+        backend=backend,
+        token_budget=1000,
+        retained_tail=1,
+        system_prompt="stable identity",
+        token_counter=lambda message: 10,
+    )
+    app = TUIApp(
+        AgentLoop(backend, store, context_assembler=assembler),
+        provider="fake",
+        model="offline",
+    )
+
+    output = await create_slash_registry().dispatch_async(app, "/compact")
+
+    assert output is not None
+    assert output.startswith("compacted entries ")
+    assert store.compaction_marker_count() == 1
+    assert backend.calls[0][0][0].content[0].text == "stable identity"
+
+
+def test_session_previews_are_ordered_and_ansi_safe(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    older = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    newer = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    older.store.append_message(
+        Message(MessageRole.USER, [TextContent("older message")])
+    )
+    newer.store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("\x1b[31mnew\x1b[0m\nmessage with controls")],
+        )
+    )
+    older.metadata.updated_at = "2020-01-01T00:00:00+00:00"
+    newer.metadata.updated_at = "2030-01-01T00:00:00+00:00"
+    manager._write(older.metadata)
+    manager._write(newer.metadata)
+
+    previews = manager.list_session_previews()
+
+    assert [item.session_id for item in previews] == [
+        newer.store.session_id,
+        older.store.session_id,
+    ]
+    assert previews[0].preview == "new message with controls"
+    assert "\x1b" not in previews[0].preview
+
+
+def test_session_preview_strips_c1_controls_and_truncates_by_cell_width(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened.store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("wide \u009b31m" + "界" * 40 + "\u009b0m tail")],
+        )
+    )
+
+    preview = manager.list_session_previews()[0].preview
+
+    assert "\u009b" not in preview
+    assert cell_len(preview) <= 80
+    assert preview.endswith("...")
+
+
+def test_session_preview_strips_zero_width_and_bidi_controls_before_capping(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened.store.append_message(
+        Message(
+            MessageRole.USER,
+            [
+                TextContent(
+                    "start" + "\u0301" * 100_000 + "\u200d" * 100_000
+                    + "\u202e end"
+                )
+            ],
+        )
+    )
+
+    preview = manager.list_session_previews()[0].preview
+
+    assert "\u200d" not in preview
+    assert "\u202e" not in preview
+    assert len(preview) <= 512
+
+
+def test_session_preview_keeps_combining_and_emoji_text_safe(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened.store.append_message(
+        Message(
+            MessageRole.USER,
+            [TextContent("cafe\u0301 family 👩\u200d💻 \u2066safe\u2069")],
+        )
+    )
+
+    preview = manager.list_session_previews()[0].preview
+
+    assert "cafe\u0301" in preview
+    assert "👩💻" in preview
+    assert "\u2066" not in preview
+    assert "\u2069" not in preview
+
+
+def test_session_preview_picker_limits_recent_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    sessions = [create_app(_args()).loop.store.session_id for _ in range(21)]
+    manager = SessionManager(home)
+    for index, session_id in enumerate(sessions):
+        metadata = manager.open(session_id).metadata
+        metadata.updated_at = f"2030-01-01T00:00:{index:02d}+00:00"
+        manager._write(metadata)
+
+    previews = manager.list_session_previews()
+
+    assert len(previews) == 20
+    assert previews[0].session_id == sessions[-1]
+
+
+def test_resume_picker_rejects_zero_and_negative_choices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    create_app(_args())
+
+    for choice in ("0", "-1"):
+        monkeypatch.setattr("builtins.input", lambda prompt, choice=choice: choice)
+        with pytest.raises(SessionError, match="invalid resume session selection"):
+            create_app(build_parser().parse_args(["--resume", "--provider", "fake"]))
+
+
+def test_resume_picker_matches_direct_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    first = create_app(_args())
+    second = create_app(_args())
+    first.loop.store.append_message(
+        Message(MessageRole.USER, [TextContent("first session")])
+    )
+    second.loop.store.append_message(
+        Message(MessageRole.USER, [TextContent("second session")])
+    )
+    manager = SessionManager(home)
+    first_metadata = manager.open(first.loop.store.session_id).metadata
+    second_metadata = manager.open(second.loop.store.session_id).metadata
+    first_metadata.updated_at = "2020-01-01T00:00:00+00:00"
+    second_metadata.updated_at = "2030-01-01T00:00:00+00:00"
+    manager._write(first_metadata)
+    manager._write(second_metadata)
+    monkeypatch.setattr("builtins.input", lambda prompt: "2")
+
+    picked = create_app(
+        build_parser().parse_args(["--resume", "--provider", "fake"])
+    )
+    direct = create_app(
+        build_parser().parse_args(
+            ["--resume", first.loop.store.session_id, "--provider", "fake"]
+        )
+    )
+
+    assert picked.loop.store.session_id == direct.loop.store.session_id
+
+
 def test_resume_rejects_an_unknown_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -362,6 +769,7 @@ async def test_forced_override_commits_after_first_successful_request(
 ) -> None:
     home = tmp_path / "zeta-home"
     monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider: None)
     first = create_app(_args())
     session_id = first.loop.store.session_id
     backend = FakeBackend([ScriptedTurn(content=[TextContent("ok")])])
@@ -384,6 +792,13 @@ async def test_forced_override_commits_after_first_successful_request(
             ]
         )
     )
+    assert create_slash_registry().dispatch(app, "/model claude-opus-4-1") == (
+        "model: claude-opus-4-1 "
+        "(model catalog unavailable for claude — using anyway)"
+    )
+    assert json.loads(
+        (home / "sessions" / session_id / "meta.json").read_text()
+    )["model"] == "offline"
     app._invalidate_prompt = lambda: None
     await app._consume_turn("hello")
 
@@ -391,7 +806,7 @@ async def test_forced_override_commits_after_first_successful_request(
         (home / "sessions" / session_id / "meta.json").read_text()
     )
     assert metadata["provider"] == "claude"
-    assert metadata["model"] == "claude-sonnet-4-6"
+    assert metadata["model"] == "claude-opus-4-1"
     assert metadata["override_audit"]
 
 
