@@ -2364,7 +2364,7 @@ def test_completed_message_replaces_streaming_unit_once(
 
 
 def test_mixed_assistant_tool_transcript_commits_each_text_once(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     call = ToolCall("mixed-1", "read", {"path": "README.md"})
     app = TUIApp(
@@ -2373,11 +2373,21 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
         model="offline",
     )
     app._active_session = app._make_session()
+    calls: list[str] = []
+    real_renderer = render_markdown
+
+    def spy(value: str):
+        calls.append(value)
+        return real_renderer(value)
+
+    monkeypatch.setattr("zeta.tui.app.render_markdown", spy)
+    before = "**before tool**"
+    after = "**after tool**"
     events = [
         StreamEvent(StreamEventType.MESSAGE_START),
         StreamEvent(
             StreamEventType.MESSAGE_UPDATE,
-            content=TextContent("before tool"),
+            content=TextContent(before),
         ),
         StreamEvent(
             StreamEventType.MESSAGE_UPDATE,
@@ -2387,7 +2397,7 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
             StreamEventType.MESSAGE_END,
             message=Message(
                 MessageRole.ASSISTANT,
-                [TextContent("before tool"), ToolUseContent(call)],
+                [TextContent(before), ToolUseContent(call)],
             ),
         ),
         StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call),
@@ -2399,11 +2409,11 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
         StreamEvent(StreamEventType.MESSAGE_START),
         StreamEvent(
             StreamEventType.MESSAGE_UPDATE,
-            content=TextContent("after tool"),
+            content=TextContent(after),
         ),
         StreamEvent(
             StreamEventType.MESSAGE_END,
-            message=Message(MessageRole.ASSISTANT, [TextContent("after tool")]),
+            message=Message(MessageRole.ASSISTANT, [TextContent(after)]),
         ),
     ]
     for event in events:
@@ -2419,6 +2429,12 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
     )
     assert plain.count("before tool") == 1
     assert plain.count("after tool") == 1
+    assert calls == [before, after]
+    assert type(app._transcript.units[0]).__name__ == "MarkdownDocument"
+    before_line = next(
+        line for line in app._transcript.lines(80) if "before tool" in line
+    )
+    assert "\x1b[1;" in before_line
 
 
 def test_hostile_markdown_is_bounded_and_falls_back_or_renders() -> None:

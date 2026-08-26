@@ -707,7 +707,7 @@ class TUIApp:
                 self._print_committed([self._thinking_text], thinking=True)
         elif self._stream_kind == "assistant":
             if self._assistant_text:
-                self._presenter.finish_assistant(Text(self._assistant_text, style=BODY))
+                self._presenter.finish_assistant(render_markdown(self._assistant_text))
                 self._assistant_message_finished = True
             self._assistant_text = ""
         self._stream_kind = self._stream_identity = None
