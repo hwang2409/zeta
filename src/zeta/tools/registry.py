@@ -46,7 +46,9 @@ from ._process import BackgroundTaskRegistry
 
 AbortSignal = ToolAbortSignal
 MAX_STRUCTURED_CONTENT_DEPTH = 32
-ToolHook = Callable[[str, dict[str, Any]], bool | Awaitable[bool] | None]
+ToolHook = Callable[
+    [str, dict[str, Any]], bool | str | Awaitable[bool | str] | None
+]
 ToolHandlerResult = str | StructuredToolResult | ToolResult
 ToolHandler = Callable[
     ..., ToolHandlerResult | Awaitable[ToolHandlerResult]
@@ -454,6 +456,10 @@ class ToolRegistry:
         """Stop session-owned background processes."""
 
         await self.background_tasks.close()
+
+    def set_pre_execute_hook(self, hook: ToolHook | None) -> None:
+        self.pre_execute_hook = hook
+        self._approval_gate.hook = hook
 
     def update_bash_cwd(self, cwd: str) -> None:
         if self._session_store is not None:

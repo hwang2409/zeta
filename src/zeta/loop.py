@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 
 from .core.approval import ApprovalPolicy
 from .core.context import ContextAssembler
+from .core.hooks import HookManager
 from .core.store import ConversationStore
 from .mcp import MCPMount, mount_mcp_servers
 from .prompts import load_identity
@@ -101,6 +102,7 @@ class AgentLoop:
         token_budget: int = 200_000,
         retained_tail: int = 8,
         on_completion_success: Callable[[], None] | None = None,
+        hooks: HookManager | None = None,
     ) -> None:
         self.backend = backend
         self.store = store
@@ -170,6 +172,11 @@ class AgentLoop:
             on_completion_success=on_completion_success,
         )
         self.on_completion_success = on_completion_success
+        self.hooks = hooks
+        if self.hooks is not None:
+            self.hooks.bind_session(store.session_id)
+            if self.tool_registry.pre_execute_hook is None:
+                self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
 
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
@@ -203,10 +210,17 @@ class AgentLoop:
     async def close(self) -> None:
         """Close session-owned transports and background processes."""
 
+        if self.hooks is not None:
+            self.hooks.stop()
+            await self.hooks.close()
         if self._mcp_mount is not None:
             await self._mcp_mount.close()
             self._mcp_mount = None
         await self.tool_registry.background_tasks.close()
+
+    def session_start(self) -> None:
+        if self.hooks is not None:
+            self.hooks.session_start()
 
     async def _ensure_mcp_servers(self) -> None:
         if self._mcp_mount_attempted:
@@ -313,6 +327,8 @@ class AgentLoop:
         return None
 
     async def _run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
+        if self.hooks is not None:
+            self.hooks.user_prompt_submit(user_text)
         await self._ensure_mcp_servers()
         self.store.append_message(
             Message(MessageRole.USER, [TextContent(user_text)])
@@ -630,7 +646,7 @@ class AgentLoop:
         slots: Sequence[ToolResult | None],
     ) -> list[ToolResult]:
         results: list[ToolResult] = []
-        new_results: list[ToolResult] = []
+        new_results: list[tuple[ToolCall, ToolResult]] = []
         for call, slot in zip(calls, slots, strict=True):
             result = self._existing_tool_result(call.id)
             if result is None:
@@ -639,9 +655,9 @@ class AgentLoop:
                     "tool execution canceled",
                     is_error=True,
                 )
-                new_results.append(result)
+                new_results.append((call, result))
             results.append(result)
-        for result in new_results:
+        for call, result in new_results:
             self.store.append_message(
                 Message(
                     MessageRole.TOOL_RESULT,
@@ -649,6 +665,8 @@ class AgentLoop:
                     tool_result=result,
                 )
             )
+            if self.hooks is not None:
+                self.hooks.post_tool(call.name, result.content)
         return results
 
     def _persist_partial(
