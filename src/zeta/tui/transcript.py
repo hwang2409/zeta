@@ -389,6 +389,8 @@ class TranscriptPresenter:
         self._tool_region_call: ToolCall | None = None
         self._thinking_live: Live | None = None
         self._thinking_unit: _TranscriptUnit | None = None
+        self._assistant_live: Live | None = None
+        self._assistant_unit: _TranscriptUnit | None = None
 
     @property
     def tool_region(self) -> Live | None:
@@ -422,13 +424,52 @@ class TranscriptPresenter:
     def print_assistant(self, renderable: RenderableType | None) -> bool:
         if renderable is None:
             return False
-        if not self._assistant_unit_open:
-            self.print_unit(renderable)
-            self._assistant_unit_open = True
-        else:
-            self.print(renderable)
+        self.update_assistant(renderable)
         plain = getattr(renderable, "plain", None)
         return plain is None or bool(plain.strip())
+
+    def update_assistant(self, rendered: RenderableType) -> None:
+        """Replace the one mutable unit used by an in-flight assistant message."""
+
+        if self._full_screen_active():
+            if self._assistant_unit is None:
+                self._assistant_unit = self.print_unit(rendered)
+            else:
+                self._assistant_unit = self.transcript.replace(
+                    self._assistant_unit, rendered
+                )
+        else:
+            if self._assistant_live is None:
+                self._assistant_live = Live(
+                    Padding(rendered, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN)),
+                    console=self.console,
+                    transient=True,
+                    refresh_per_second=20,
+                )
+                self._assistant_live.start()
+            else:
+                self._assistant_live.update(
+                    Padding(rendered, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN))
+                )
+        self._assistant_unit_open = True
+
+    def finish_assistant(self, rendered: RenderableType) -> None:
+        """Commit the completed assistant message into its existing unit."""
+
+        if self._full_screen_active():
+            if self._assistant_unit is None:
+                self._assistant_unit = self.print_unit(rendered)
+            else:
+                self._assistant_unit = self.transcript.replace(
+                    self._assistant_unit, rendered
+                )
+        else:
+            if self._assistant_live is not None:
+                self._assistant_live.stop()
+                self._assistant_live = None
+            self.print_unit(rendered)
+        self._assistant_unit = None
+        self._assistant_unit_open = False
 
     def reset_assistant_unit(self) -> None:
         self._assistant_unit_open = False

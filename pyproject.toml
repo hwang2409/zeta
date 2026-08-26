@@ -5,6 +5,8 @@ description = "zeta: custom agent harness: own loop, plan-authenticated provider
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
+    "markdown-it-py>=3.0",
+    "mdit-py-plugins>=0.4",
     "prompt_toolkit>=3.0.48",
     "pyyaml>=6.0",
     "rich>=13.9",

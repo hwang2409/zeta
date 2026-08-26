@@ -46,7 +46,7 @@ from ..types import (
 from .composer import VimCursorShapeConfig, build_key_bindings, history_for
 from .composer import parse_input, status_formatted_text, vim_state_label
 from .layout import CONTENT_MARGIN, content_width, resume_picker_line
-from .render import MarkdownStream, format_status
+from .render import format_status, render_markdown
 from .render import render_event, render_thought, render_thought_live
 from .stream import stream_key
 from .theme import (
@@ -173,24 +173,6 @@ def build_backend(
     raise ValueError(f"unsupported provider: {provider}")
 
 
-class _LineBuffer:
-    def __init__(self) -> None:
-        self.value = ""
-
-    def feed(self, value: str) -> list[str]:
-        self.value += value
-        lines = self.value.split("\n")
-        self.value = lines.pop()
-        return lines
-
-    def flush(self) -> list[str]:
-        if not self.value:
-            return []
-        line = self.value
-        self.value = ""
-        return [line]
-
-
 class TUIApp:
     """Full-screen transcript, persistent composer, and follow-up queue."""
 
@@ -221,11 +203,10 @@ class TUIApp:
         self._exit_requested = False
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
-        self._assistant_lines = _LineBuffer()
+        self._assistant_text = ""
         self._thinking_text = ""
         self._thinking_duration: float | None = None
         self._thinking_started_at: float | None = None
-        self._markdown_stream = MarkdownStream()
         self._stream_kind: str | None = None
         self._stream_identity: tuple[str, object] | None = None
         self._partial = ""
@@ -601,9 +582,6 @@ class TUIApp:
         if renderable is not None:
             self._transcript.append(renderable)
 
-    def _append_transcript_blank(self) -> None:
-        self._presenter.append_blank()
-
     def _print(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
             if self._full_screen_active():
@@ -706,15 +684,12 @@ class TUIApp:
                 )
                 self._turn_had_visible_output = True
             return
-        for line in lines:
-            if not line:
-                if self._full_screen_active():
-                    self._append_transcript_blank()
-                else:
-                    self.console.print()
-                continue
-            for renderable in self._markdown_stream.consume(line):
-                self._print_assistant(renderable)
+        if not lines:
+            return
+        value = "\n".join(lines)
+        self._assistant_text += value
+        self._presenter.update_assistant(Text(self._assistant_text, style=BODY))
+        self._turn_had_visible_output |= bool(value.strip())
 
     def _update_usage(self, event: StreamEvent) -> None:
         usage = event.data.get("usage")
@@ -730,15 +705,37 @@ class TUIApp:
             if self._thinking_text:
                 self._print_committed([self._thinking_text], thinking=True)
         elif self._stream_kind == "assistant":
-            self._print_committed(self._assistant_lines.flush())
+            if self._assistant_text:
+                self._presenter.finish_assistant(Text(self._assistant_text, style=BODY))
+            self._assistant_text = ""
         self._stream_kind = self._stream_identity = None
         self._partial = self._thinking_text = ""
-        self._thinking_duration = None
-        self._thinking_started_at = None
+        self._thinking_duration = self._thinking_started_at = None
 
     def _flush_markdown(self) -> None:
-        for renderable in self._markdown_stream.flush():
-            self._print_assistant(renderable)
+        if self._assistant_text:
+            self._presenter.finish_assistant(render_markdown(self._assistant_text))
+            self._assistant_text = ""
+
+    def _finish_message(self, event: StreamEvent) -> None:
+        value = self._assistant_text
+        if not value and event.message is not None:
+            value = "".join(
+                block.text
+                for block in event.message.content
+                if isinstance(block, TextContent)
+            )
+        if value and self._stream_kind == "assistant":
+            self._presenter.finish_assistant(render_markdown(value))
+            self._turn_had_visible_output |= bool(value.strip())
+            self._assistant_text = ""
+        elif value and self._stream_kind is None:
+            self._presenter.finish_assistant(render_markdown(value))
+            self._turn_had_visible_output |= bool(value.strip())
+        elif self._stream_kind in {"thinking", "redacted-thinking"}:
+            self._flush_stream_kind()
+        self._stream_kind = self._stream_identity = None
+        self._reset_stream_buffers()
     def _flush_pending_stream(self) -> None:
         self._flush_stream_kind()
         self._flush_markdown()
@@ -776,10 +773,10 @@ class TUIApp:
             self._partial = self._thinking_text
             self._presenter.update_thinking(render_thought_live(self._thinking_text))
             return
-        buffer = self._assistant_lines
-        committed = buffer.feed(value)
-        self._partial = buffer.value
-        self._print_committed(committed, thinking=thinking)
+        self._assistant_text += value
+        self._partial = self._assistant_text
+        self._presenter.update_assistant(Text(self._assistant_text, style=BODY))
+        self._turn_had_visible_output |= bool(value.strip())
 
     def _finish_stream(self) -> None:
         self._flush_pending_stream()
@@ -791,7 +788,7 @@ class TUIApp:
         self._streaming = False
 
     def _reset_stream_buffers(self) -> None:
-        self._assistant_lines.value = ""
+        self._assistant_text = ""
         self._thinking_text = ""
         self._thinking_duration = None
         self._thinking_started_at = None
@@ -811,6 +808,8 @@ class TUIApp:
             self._start_turn(user_text)
 
     def _prepare_stream_event(self, event: StreamEvent) -> None:
+        if event.type is StreamEventType.MESSAGE_END:
+            return
         if event.type is not StreamEventType.MESSAGE_UPDATE:
             self._flush_pending_stream()
             return
@@ -861,6 +860,7 @@ class TUIApp:
                 elif event.type is StreamEventType.COMPACTION_END:
                     self._loop_state = "streaming"
                 elif event.type is StreamEventType.MESSAGE_END:
+                    self._finish_message(event)
                     self._streaming = False
                 elif event.type is StreamEventType.AGENT_END:
                     self._reset_stream_state()

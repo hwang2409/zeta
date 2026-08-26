@@ -48,12 +48,12 @@ from zeta.tui.composer import (
 )
 from zeta.tui.layout import content_width
 from zeta.tui.render import (
-    MarkdownStream,
     format_status,
     format_thought,
     render_code,
     render_event,
     render_line,
+    render_markdown,
     render_thought,
     render_thought_live,
     render_tool_progress,
@@ -1604,31 +1604,6 @@ def test_special_status_states_override_spinner(state: str) -> None:
     assert "esc interrupt" not in rendered.plain
 
 
-def test_markdown_stream_highlights_complete_fence() -> None:
-    stream = MarkdownStream()
-    output = []
-    output.extend(stream.consume("```python"))
-    output.extend(stream.consume("print('hi')"))
-    assert len(output) == 2
-    assert type(output[1]).__name__ == "Syntax"
-    output.extend(stream.consume("```"))
-
-    assert len(output) == 3
-
-
-def test_markdown_stream_requires_matching_four_backtick_fence() -> None:
-    stream = MarkdownStream()
-
-    assert stream.consume("````python")
-    inner = stream.consume("```")
-    assert type(inner[0]).__name__ == "Syntax"
-    assert stream.language == "python"
-
-    closing = stream.consume("````")
-    assert closing[0].plain == "````"
-    assert stream.language is None
-
-
 def test_truncated_response_notice_is_dim() -> None:
     rendered = render_event(
         StreamEvent(
@@ -1694,18 +1669,6 @@ async def test_truncated_response_notice_is_printed_once(tmp_path: Path) -> None
     assert "no response" not in output.getvalue()
 
 
-def test_markdown_stream_keeps_text_after_fence_inside_code_block() -> None:
-    stream = MarkdownStream()
-    stream.consume("```python")
-
-    output = stream.consume("```still code")
-
-    assert len(output) == 1
-    assert isinstance(output[0], Syntax)
-    assert output[0].code == "```still code"
-    assert stream.language == "python"
-
-
 def test_stream_kind_switch_flushes_assistant_before_thinking(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
@@ -1735,10 +1698,9 @@ def test_stream_kind_switch_flushes_assistant_before_thinking(tmp_path: Path) ->
         )
     )
 
-    assert rendered[0].plain == "| name | value |"
-    assert rendered[1].plain == "| --- | --- |"
-    assert rendered[2].plain.startswith("✱ thought · ")
-    assert rendered[2].plain.endswith("\nplan\n")
+    assert rendered[0].plain == "| name | value |\n| --- | --- |"
+    assert rendered[1].plain.startswith("✱ thought · ")
+    assert rendered[1].plain.endswith("\nplan\n")
 
 
 def test_thought_stream_is_visible_before_completion(tmp_path: Path) -> None:
@@ -1876,21 +1838,31 @@ def test_thought_duration_uses_local_monotonic_lifecycle_clock(
 
 
 def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
-    output = StringIO()
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
         provider="fake",
         model="offline",
-        console=Console(file=output, force_terminal=False),
     )
 
-    app._print_committed(["first paragraph", "second paragraph"])
-    app._print_committed(["```python", "print('hi')", "```"])
-    rendered = "\n".join(line.rstrip() for line in output.getvalue().splitlines())
-
-    assert "  first paragraph\n  second paragraph" in rendered
-    assert "first paragraph\n\nsecond paragraph" not in rendered
-    assert "print('hi')\n\n" not in rendered
+    app._active_session = app._make_session()
+    app._consume_text(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("first paragraph\nsecond paragraph\n```python\nprint('hi')\n```"),
+        )
+    )
+    app._finish_message(
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(
+                MessageRole.ASSISTANT,
+                [TextContent("first paragraph\nsecond paragraph\n```python\nprint('hi')\n```")],
+            ),
+        )
+    )
+    rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
+    assert rendered[:2] == ["first paragraph second paragraph", ""]
+    assert "print('hi')" in "\n".join(rendered)
 
 
 @pytest.mark.asyncio
@@ -1914,7 +1886,7 @@ async def test_error_flushes_assistant_before_error(tmp_path: Path) -> None:
     line_index = next(
         index
         for index, item in enumerate(rendered)
-        if getattr(item, "plain", None) == "| name | value |"
+        if getattr(item, "plain", "").startswith("| name | value |")
     )
     error_index = next(
         index
@@ -1946,7 +1918,7 @@ async def test_verbose_error_flushes_before_raw_error(tmp_path: Path) -> None:
     line_index = next(
         index
         for index, item in enumerate(rendered)
-        if getattr(item, "plain", None) == "| name | value |"
+        if getattr(item, "plain", "").startswith("| name | value |")
     )
     raw_error_index = next(
         index
@@ -2014,7 +1986,7 @@ async def test_verbose_transition_flushes_before_raw_event(
     line_index = next(
         index
         for index, item in enumerate(rendered)
-        if getattr(item, "plain", None) == "| name | value |"
+        if getattr(item, "plain", "").startswith("| name | value |")
     )
     raw_index = next(
         index
@@ -2258,18 +2230,117 @@ def test_tui_import_does_not_load_cli() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_markdown_stream_renders_table_lines_verbatim() -> None:
-    stream = MarkdownStream()
+def test_completed_markdown_fixture_renders_the_capability_set() -> None:
+    source = dedent(
+        """
+        # heading
 
-    lines = [
-        "| name | value |",
-        "| --- | --- |",
-        "| one | two |",
-    ]
-    output = [item for line in lines for item in stream.consume(line)]
+        **bold** *italic* ***both*** ~~strike~~ `code` [link](https://example.com)
 
-    assert [item.plain for item in output] == lines
-    assert all(isinstance(item, Text) for item in output)
+        - [x] done
+          - nested
+        1. ordered
+        2. second
+
+        > quote
+        >
+        > > nested quote
+
+        | left | center | right |
+        | :--- | :----: | ----: |
+        | one | two | 3 |
+
+        ```python
+        print("python")
+        ```
+
+        ```ts
+        const value = 1
+        ```
+
+        ```diff
+        - old
+        + new
+        ```
+
+        ---
+
+        escaped \\*literal\\* and a hard break\\
+        next line
+        """
+    ).strip()
+    output = StringIO()
+    rendered_console = _test_console(output, width=72)
+    rendered_console.print(render_markdown(source))
+    rendered = output.getvalue()
+    plain = Text.from_ansi(rendered).plain
+
+    assert "heading" in plain
+    assert "bold" in plain and "italic" in plain and "both" in plain
+    assert "strike" in plain and "code" in plain
+    assert "link (https://example.com)" in plain
+    assert "[x] done" in plain and "nested" in plain
+    assert "│ quote" in plain and "│ │ nested quote" in plain
+    assert "left" in plain and "center" in plain and "right" in plain
+    assert "print(\"python\")" in plain and "const value = 1" in plain
+    assert "old" in plain and "new" in plain
+    assert "literal*" in plain and "hard break\nnext line" in plain
+    assert "\x1b[9m" in rendered
+    assert not _contains_background_sgr(rendered)
+
+
+def test_completed_message_replaces_streaming_unit_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    source = "# completed\n\n- item"
+    calls: list[str] = []
+    real_renderer = render_markdown
+
+    def spy(value: str):
+        calls.append(value)
+        return real_renderer(value)
+
+    monkeypatch.setattr("zeta.tui.app.render_markdown", spy)
+    app._consume_text(
+        StreamEvent(StreamEventType.MESSAGE_UPDATE, content=TextContent(source))
+    )
+    unit = app._transcript._units[0]
+    assert isinstance(unit.value, Text)
+    assert unit.value.plain == source
+
+    app._finish_message(
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent(source)]),
+        )
+    )
+
+    assert calls == [source]
+    assert app._transcript._units[0] is unit
+    assert type(unit.value).__name__ == "MarkdownDocument"
+    assert "completed" in "\n".join(app._transcript.lines(80))
+
+
+def test_hostile_markdown_is_bounded_and_falls_back_or_renders() -> None:
+    source = "\n".join(
+        [
+            "*" * 10000,
+            "`" * 10000,
+            *(f"- item {index}" for index in range(10000)),
+            ">" * 500 + " tail",
+        ]
+    )
+    started = time.monotonic()
+    document = render_markdown(source)
+    output = StringIO()
+    _test_console(output, width=80).print(document)
+    assert time.monotonic() - started < 5
 
 
 def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:
@@ -2287,15 +2358,15 @@ def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:
             content=TextContent(source),
         )
     )
-    app._flush_pending_stream()
+    app._finish_message(
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent(source)]),
+        )
+    )
 
     rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
-    assert rendered == [
-        "foo_bar_baz",
-        "*literal*",
-        "a_b_c",
-        "**bold** mid _text_",
-    ]
+    assert rendered == ["foo_bar_baz *literal* a_b_c bold mid text"]
 
 
 def test_markdown_stream_preserves_model_line_structure(tmp_path: Path) -> None:
@@ -2322,11 +2393,11 @@ def test_markdown_stream_preserves_model_line_structure(tmp_path: Path) -> None:
     assert rendered == [
         "pick what sounds fun:",
         "",
-        "1. **take a walk** — get some air.",
-        "2. **read a book** — settle in.",
-        "3. **make a meal** — try a recipe.",
-        "4. **play a game** — choose one.",
-        "5. **call a friend** — catch up.",
+        "1. take a walk — get some air.",
+        "2. read a book — settle in.",
+        "3. make a meal — try a recipe.",
+        "4. play a game — choose one.",
+        "5. call a friend — catch up.",
     ]
 
 
@@ -2345,7 +2416,7 @@ def test_markdown_stream_keeps_model_blank_lines_without_inserting_more(
     app._flush_markdown()
 
     rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
-    assert rendered == source
+    assert rendered == ["intro", "", "1. first", "", "2. second after"]
 
 
 @pytest.mark.parametrize("value", ["*unclosed", "**unclosed", "_unclosed", "__unclosed"])
@@ -2358,7 +2429,7 @@ def test_render_line_keeps_unmatched_emphasis_literal(value: str) -> None:
 def test_render_line_keeps_emphasis_markers_literal() -> None:
     rendered = render_line("1. **bold** and *italic* foo_bar_baz")
 
-    assert rendered.plain == "1. **bold** and *italic* foo_bar_baz"
+    assert rendered.plain == "1. bold and italic foo_bar_baz"
 
 
 def test_render_line_styles_code_span() -> None:
@@ -2422,18 +2493,6 @@ def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
     )
 
     assert result.stdout.strip() == "finished"
-
-
-def test_markdown_stream_keeps_code_fence_rows_and_highlighting() -> None:
-    stream = MarkdownStream()
-    output = []
-    for line in ("```python", "print('hi')", "```"):
-        output.extend(stream.consume(line))
-
-    assert [getattr(item, "plain", None) for item in output[:1]] == ["```python"]
-    assert isinstance(output[1], Syntax)
-    assert output[1].code == "print('hi')"
-    assert output[2].plain == "```"
 
 
 def test_status_includes_provider_state_and_usage() -> None:
