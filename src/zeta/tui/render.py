@@ -397,6 +397,7 @@ _MARKDOWN = (
     .use(tasklists_plugin)
 )
 _MAX_MARKDOWN_SECONDS = 1.0
+_MAX_MARKDOWN_TABLE_ROWS = 1_000
 
 
 @dataclass(slots=True)
@@ -565,6 +566,7 @@ def _render_list(
     console: Console,
     width: int,
     depth: int = 0,
+    deadline: float | None = None,
 ) -> Text:
     ordered = node.token.type == "ordered_list_open"
     start = int(node.token.attrGet("start") or 1)
@@ -577,6 +579,8 @@ def _render_list(
     rendered = Text()
     indent = "  " * depth
     for item_index, item in enumerate(items):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("markdown painting exceeded its time budget")
         paragraphs = [
             child for child in item.children if child.token.type == "paragraph_open"
         ]
@@ -602,15 +606,20 @@ def _render_list(
             if child.token.type in {"bullet_list_open", "ordered_list_open"}:
                 rendered.append("\n")
                 rendered.append_text(
-                    _render_list(child, console, width, depth + 1)
+                    _render_list(child, console, width, depth + 1, deadline)
                 )
     return rendered
 
 
-def _table_rows(node: _MarkdownNode) -> tuple[list[_MarkdownNode], list[list[_MarkdownNode]]]:
+def _table_rows(
+    node: _MarkdownNode,
+    deadline: float | None = None,
+) -> tuple[list[_MarkdownNode], list[list[_MarkdownNode]]]:
     headers: list[_MarkdownNode] = []
     body: list[list[_MarkdownNode]] = []
     for section in node.children:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("markdown painting exceeded its time budget")
         if section.token.type == "thead_open":
             rows = [child for child in section.children if child.token.type == "tr_open"]
             if rows:
@@ -621,6 +630,8 @@ def _table_rows(node: _MarkdownNode) -> tuple[list[_MarkdownNode], list[list[_Ma
                 ]
         elif section.token.type == "tbody_open":
             for row in section.children:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("markdown painting exceeded its time budget")
                 if row.token.type == "tr_open":
                     body.append(
                         [
@@ -632,8 +643,10 @@ def _table_rows(node: _MarkdownNode) -> tuple[list[_MarkdownNode], list[list[_Ma
     return headers, body
 
 
-def _render_table(node: _MarkdownNode) -> Table:
-    headers, body = _table_rows(node)
+def _render_table(node: _MarkdownNode, deadline: float | None = None) -> Table:
+    headers, body = _table_rows(node, deadline)
+    if len(body) > _MAX_MARKDOWN_TABLE_ROWS:
+        raise TimeoutError("markdown table exceeded its time budget")
     table = Table(
         box=box.SQUARE,
         border_style=CHROME,
@@ -643,12 +656,16 @@ def _render_table(node: _MarkdownNode) -> Table:
         show_lines=False,
     )
     for cell in headers:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("markdown painting exceeded its time budget")
         align = (cell.token.attrGet("style") or "").split(":")[-1]
         table.add_column(
             header=_inline_child(cell),
             justify=align if align in {"left", "center", "right"} else "left"
         )
     for row in body:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("markdown painting exceeded its time budget")
         cells = [_inline_child(cell) for cell in row]
         cells.extend(Text() for _ in range(len(headers) - len(cells)))
         table.add_row(*cells)
@@ -656,10 +673,15 @@ def _render_table(node: _MarkdownNode) -> Table:
 
 
 def _render_blocks(
-    nodes: list[_MarkdownNode], console: Console, width: int
+    nodes: list[_MarkdownNode],
+    console: Console,
+    width: int,
+    deadline: float | None = None,
 ) -> list[RenderableType]:
     rendered: list[RenderableType] = []
     for node in nodes:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("markdown painting exceeded its time budget")
         token_type = node.token.type
         if token_type == "paragraph_open":
             rendered.append(_inline_child(node))
@@ -678,19 +700,27 @@ def _render_blocks(
             )
             rendered.append(heading)
         elif token_type in {"bullet_list_open", "ordered_list_open"}:
-            rendered.append(_render_list(node, console, width))
+            rendered.append(_render_list(node, console, width, deadline=deadline))
         elif token_type == "blockquote_open":
-            inner = _with_blank_lines(_render_blocks(node.children, console, width))
+            inner = _with_blank_lines(
+                _render_blocks(node.children, console, width, deadline)
+            )
             rendered.append(
                 _Prefixed(Group(*inner), "│ " * 1, f"dim {DIM}")
             )
         elif token_type == "fence":
             language = (node.token.info.strip() or "text").split()[0]
             rendered.append(render_code(node.token.content, language))
+        elif token_type in {"code_block", "html_block"}:
+            rendered.append(
+                Text(_strip_terminal_controls(node.token.content), style=BODY)
+            )
         elif token_type == "hr":
             rendered.append(Text("─" * max(1, width), style=DIM, overflow="crop"))
         elif token_type == "table_open":
-            rendered.append(_render_table(node))
+            rendered.append(_render_table(node, deadline))
+        else:
+            raise ValueError(f"unhandled markdown block: {token_type}")
     return rendered
 
 
@@ -712,9 +742,12 @@ class MarkdownDocument:
         width = max(1, options.max_width)
         started = time.monotonic()
         try:
-            blocks = _render_blocks(self.nodes, console, width)
-            if time.monotonic() - started > _MAX_MARKDOWN_SECONDS:
-                raise TimeoutError("markdown painting exceeded its time budget")
+            blocks = _render_blocks(
+                self.nodes,
+                console,
+                width,
+                started + _MAX_MARKDOWN_SECONDS,
+            )
         except Exception:
             yield Text(_strip_terminal_controls(self.source), style=BODY)
             return

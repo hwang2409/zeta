@@ -652,6 +652,29 @@ def test_transcript_resize_preserves_anchor_in_unbroken_unit() -> None:
     assert transcript._line_locations[transcript.scroll_offset] == initial_anchor
 
 
+def test_transcript_completion_swap_preserves_scrolled_anchor() -> None:
+    source = "\n".join(f"token-{index:03}" for index in range(200))
+    transcript = TranscriptWidget()
+    unit = transcript.append(Text(source))
+
+    transcript.create_content(30, 5)
+    transcript._set_scroll_offset(65)
+    transcript.create_content(30, 5)
+    assert (
+        Text.from_ansi(transcript.lines(30)[transcript.scroll_offset]).plain
+        == "token-065"
+    )
+
+    transcript.replace(unit, render_markdown(source))
+    transcript.create_content(30, 5)
+    visible = transcript.lines(30)[
+        transcript.scroll_offset : transcript.scroll_offset + 5
+    ]
+
+    assert "token-065" in " ".join(Text.from_ansi(line).plain for line in visible)
+    assert transcript._line_locations[transcript.scroll_offset][0] is unit
+
+
 def test_transcript_parsed_cache_is_bounded_and_revision_scoped() -> None:
     transcript = TranscriptWidget()
     transcript.append(Text("line"))
@@ -2289,6 +2312,19 @@ def test_completed_markdown_fixture_renders_the_capability_set() -> None:
     assert not _contains_background_sgr(rendered)
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [("<div>raw html</div>", "<div>raw html</div>"), ("    indented code", "indented code")],
+)
+def test_completed_markdown_keeps_visible_literal_blocks(
+    source: str, expected: str
+) -> None:
+    output = StringIO()
+    _test_console(output).print(render_markdown(source))
+
+    assert expected in Text.from_ansi(output.getvalue()).plain
+
+
 def test_completed_message_replaces_streaming_unit_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2327,6 +2363,64 @@ def test_completed_message_replaces_streaming_unit_once(
     assert "completed" in "\n".join(app._transcript.lines(80))
 
 
+def test_mixed_assistant_tool_transcript_commits_each_text_once(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("mixed-1", "read", {"path": "README.md"})
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    events = [
+        StreamEvent(StreamEventType.MESSAGE_START),
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("before tool"),
+        ),
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=ToolUseContent(call),
+        ),
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(
+                MessageRole.ASSISTANT,
+                [TextContent("before tool"), ToolUseContent(call)],
+            ),
+        ),
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call),
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(call.id, "tool result"),
+        ),
+        StreamEvent(StreamEventType.MESSAGE_START),
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("after tool"),
+        ),
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("after tool")]),
+        ),
+    ]
+    for event in events:
+        app._prepare_stream_event(event)
+        app._handle_tool_event(event)
+        if event.type is StreamEventType.MESSAGE_UPDATE:
+            app._consume_text(event)
+        elif event.type is StreamEventType.MESSAGE_END:
+            app._finish_message(event)
+
+    plain = "\n".join(
+        Text.from_ansi(line).plain for line in app._transcript.lines(80)
+    )
+    assert plain.count("before tool") == 1
+    assert plain.count("after tool") == 1
+
+
 def test_hostile_markdown_is_bounded_and_falls_back_or_renders() -> None:
     source = "\n".join(
         [
@@ -2341,6 +2435,18 @@ def test_hostile_markdown_is_bounded_and_falls_back_or_renders() -> None:
     output = StringIO()
     _test_console(output, width=80).print(document)
     assert time.monotonic() - started < 5
+
+
+def test_large_markdown_table_falls_back_within_render_budget() -> None:
+    source = "| name | value |\n| --- | --- |\n" + "\n".join(
+        f"| row-{index} | value |" for index in range(10_000)
+    )
+    started = time.monotonic()
+    output = StringIO()
+    _test_console(output).print(render_markdown(source))
+
+    assert time.monotonic() - started < 2
+    assert "| row-9999 | value |" in Text.from_ansi(output.getvalue()).plain
 
 
 def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:

@@ -204,6 +204,7 @@ class TUIApp:
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
         self._assistant_text = ""
+        self._assistant_message_finished = False
         self._thinking_text = ""
         self._thinking_duration: float | None = None
         self._thinking_started_at: float | None = None
@@ -707,6 +708,7 @@ class TUIApp:
         elif self._stream_kind == "assistant":
             if self._assistant_text:
                 self._presenter.finish_assistant(Text(self._assistant_text, style=BODY))
+                self._assistant_message_finished = True
             self._assistant_text = ""
         self._stream_kind = self._stream_identity = None
         self._partial = self._thinking_text = ""
@@ -719,19 +721,16 @@ class TUIApp:
 
     def _finish_message(self, event: StreamEvent) -> None:
         value = self._assistant_text
-        if not value and event.message is not None:
+        if not value and not self._assistant_message_finished and event.message is not None:
             value = "".join(
                 block.text
                 for block in event.message.content
                 if isinstance(block, TextContent)
             )
-        if value and self._stream_kind == "assistant":
+        if value and self._stream_kind in {"assistant", None}:
             self._presenter.finish_assistant(render_markdown(value))
             self._turn_had_visible_output |= bool(value.strip())
-            self._assistant_text = ""
-        elif value and self._stream_kind is None:
-            self._presenter.finish_assistant(render_markdown(value))
-            self._turn_had_visible_output |= bool(value.strip())
+            self._assistant_message_finished = True
         elif self._stream_kind in {"thinking", "redacted-thinking"}:
             self._flush_stream_kind()
         self._stream_kind = self._stream_identity = None
@@ -788,10 +787,8 @@ class TUIApp:
         self._streaming = False
 
     def _reset_stream_buffers(self) -> None:
-        self._assistant_text = ""
-        self._thinking_text = ""
-        self._thinking_duration = None
-        self._thinking_started_at = None
+        self._assistant_text = self._thinking_text = ""
+        self._thinking_duration = self._thinking_started_at = None
 
     def _print_user(self, user_text: str) -> None:
         self._presenter.reset_assistant_unit()
@@ -808,6 +805,10 @@ class TUIApp:
             self._start_turn(user_text)
 
     def _prepare_stream_event(self, event: StreamEvent) -> None:
+        if event.type is StreamEventType.MESSAGE_START:
+            self._flush_pending_stream()
+            self._assistant_message_finished = False
+            return
         if event.type is StreamEventType.MESSAGE_END:
             return
         if event.type is not StreamEventType.MESSAGE_UPDATE:
@@ -1181,7 +1182,6 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         vim_mode=metadata.vim_mode,
         on_vim_mode_change=lambda enabled: manager.record_vim_mode(metadata, enabled=enabled),
     )
-
 
 __all__ = [
     "FakeInteractiveBackend",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -255,10 +256,16 @@ class TranscriptWidget(UIControl):
             for line in rendered_lines:
                 content = self._strip_padding(line)
                 offset = source.find(content, source_offset)
+                matched_length = len(content)
                 if offset < 0:
-                    offset = source_offset
+                    match = re.search(r"[\w]+(?:[-'][\w]+)*", content)
+                    if match is not None:
+                        offset = source.find(match.group(), source_offset)
+                        matched_length = len(match.group())
+                    if offset < 0:
+                        offset = source_offset
                 raw_lines.append((line, unit, offset))
-                source_offset = offset + len(content)
+                source_offset = offset + matched_length
         while raw_lines and not raw_lines[0][0].strip():
             raw_lines.pop(0)
         return [(unit, text_offset) for _, unit, text_offset in raw_lines]
@@ -473,6 +480,7 @@ class TranscriptPresenter:
 
     def reset_assistant_unit(self) -> None:
         self._assistant_unit_open = False
+        self._assistant_unit = None
 
     def start_thinking(self, rendered: Text) -> None:
         self.reset_assistant_unit()
