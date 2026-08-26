@@ -23,10 +23,17 @@ class TodoWidget(UIControl):
     def __init__(self, store: ConversationStore) -> None:
         self.store = store
 
-    def _render_lines(self, width: int) -> list[StyleAndTextTuples]:
+    def _render_lines(
+        self, width: int, max_height: int | None = None
+    ) -> list[StyleAndTextTuples]:
         items = self.store.todo_items()
-        lines = [self._render_item(item, width) for item in items[:VISIBLE_ROWS]]
-        remaining = len(items) - VISIBLE_ROWS
+        if max_height is not None and max_height <= 0:
+            return []
+        visible_rows = min(VISIBLE_ROWS, len(items))
+        if len(items) > VISIBLE_ROWS and max_height is not None:
+            visible_rows = min(visible_rows, max(0, max_height - 1))
+        lines = [self._render_item(item, width) for item in items[:visible_rows]]
+        remaining = len(items) - visible_rows
         if remaining > 0:
             lines.append([(f"fg:{DIM}", f"+{remaining} more")])
         return lines
@@ -47,7 +54,7 @@ class TodoWidget(UIControl):
         return [(f"fg:{glyph_style}", prefix), (f"fg:{BODY}", content)]
 
     def create_content(self, width: int, height: int) -> UIContent:
-        lines = self._render_lines(max(1, width))[: max(0, height)]
+        lines = self._render_lines(max(1, width), max_height=height)
 
         def get_line(index: int) -> StyleAndTextTuples:
             return lines[index]

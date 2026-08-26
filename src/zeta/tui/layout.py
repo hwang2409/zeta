@@ -44,7 +44,7 @@ def full_screen_content(
         Condition(lambda: bool(store.todo_items())),
     )
     bottom = HSplit(
-        [todo_panel, *composer_rows, footer], height=Dimension(min=4, max=10)
+        [todo_panel, *composer_rows, footer], height=Dimension(min=4, max=11)
     )
     content = HSplit([transcript, bottom])
     return VSplit(

@@ -15,6 +15,8 @@ class TodoItem(TypedDict):
 
 
 TODO_STATUSES: tuple[TodoStatus, ...] = ("pending", "in_progress", "completed")
+MAX_TODO_ITEMS = 50
+MAX_TODO_CONTENT_LENGTH = 500
 
 
 def parse_todo_items(value: object) -> list[TodoItem]:
@@ -22,6 +24,8 @@ def parse_todo_items(value: object) -> list[TodoItem]:
 
     if type(value) is not list:
         raise ValueError("todo items must be an array")
+    if len(value) > MAX_TODO_ITEMS:
+        raise ValueError(f"todo list cannot contain more than {MAX_TODO_ITEMS} items")
 
     normalized: list[TodoItem] = []
     for index, item in enumerate(value):
@@ -32,6 +36,11 @@ def parse_todo_items(value: object) -> list[TodoItem]:
         content = item.get("content")
         if type(content) is not str or not content.strip():
             raise ValueError(f"todo item {index} content must be nonempty")
+        if len(content) > MAX_TODO_CONTENT_LENGTH:
+            raise ValueError(
+                f"todo item {index} content cannot exceed "
+                f"{MAX_TODO_CONTENT_LENGTH} characters"
+            )
         status = item.get("status")
         if type(status) is not str:
             raise ValueError(f"todo item {index} status must be a string")
