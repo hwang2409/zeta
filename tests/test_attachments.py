@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from prompt_toolkit import PromptSession
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
@@ -16,6 +20,7 @@ from zeta.tui.composer import (
     ATTACHMENT_MAX_TEXT_BYTES,
     AttachmentError,
     attachment_refs,
+    build_key_bindings,
     build_user_message,
 )
 from zeta.types import ImageContent, MessageRole, TextContent
@@ -24,6 +29,34 @@ PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
     "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
 )
+
+
+async def run_ctrl_v(app: TUIApp, value: str) -> list[str]:
+    submitted: list[str] = []
+    session: PromptSession[str] | None = None
+
+    def submit(text: str) -> None:
+        submitted.append(text)
+        assert session is not None
+        session.app.exit()
+
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_submit=submit,
+                on_paste=app._paste_from_keybinding,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0)
+        pipe.send_text(value + "\r")
+        await task
+    return submitted
 
 
 def webp_data(chunk_type: bytes, chunk_data: bytes) -> bytes:
@@ -158,6 +191,89 @@ def test_paste_image_queues_a_session_attachment(
 
     assert path.parent == tmp_path
     assert path.read_bytes() == PNG
+
+
+@pytest.mark.asyncio
+async def test_ctrl_v_queues_one_image_and_preserves_composer_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    monkeypatch.setattr(composer.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(composer.shutil, "which", lambda _: "/usr/bin/pngpaste")
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        Path(command[1]).write_bytes(PNG)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(composer.subprocess, "run", fake_run)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+
+    submitted = await run_ctrl_v(app, "draft\x16more")
+
+    assert submitted == ["draftmore"]
+    assert len(app._pending_attachments) == 1
+    assert notices[0].startswith("pending image:")
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_ctrl_v_empty_clipboard_preserves_input_without_queueing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    monkeypatch.setattr(composer.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(composer.shutil, "which", lambda _: "/usr/bin/pngpaste")
+    monkeypatch.setattr(
+        composer.subprocess,
+        "run",
+        lambda _command, **_: SimpleNamespace(returncode=1),
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+
+    submitted = await run_ctrl_v(app, "draft\x16more")
+
+    assert submitted == ["draftmore"]
+    assert app._pending_attachments == []
+    assert notices == []
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_ctrl_v_non_macos_uses_paste_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    monkeypatch.setattr(composer.platform, "system", lambda: "Linux")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+
+    submitted = await run_ctrl_v(app, "draft\x16")
+
+    assert submitted == ["draft"]
+    assert notices == [
+        "paste unavailable: image paste is only available on macOS"
+    ]
+    await app.loop.close()
 
 
 @pytest.mark.asyncio

@@ -15,8 +15,8 @@ reference. This includes `@./file`, `@../file`, and `@~/file`. Bare words such
 as `@user` and `@dataclass` stay as prompt text. Missing path-like files show
 a notice and block that message.
 
-Use `/paste` to queue a macOS clipboard image for the next message. Attachment
-paths follow the read-tool policy: there is no attachment-specific sandbox;
+Use `/paste` or Ctrl+V to queue a macOS clipboard image for the next message.
+Attachment paths follow the read-tool policy: there is no attachment-specific sandbox;
 absolute paths, home paths, and symlink targets are allowed. Repeated
 references to one resolved path produce one attachment block.
 
