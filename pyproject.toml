@@ -33,3 +33,6 @@ packages = ["src/zeta"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "environment_sensitive: test behavior that depends on terminal environment",
+]
