@@ -19,8 +19,6 @@ from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import DynamicStyle, Style
-from prompt_toolkit.layout import Dimension
-from prompt_toolkit.layout.containers import HSplit, VSplit, Window
 from rich.console import Console, RenderableType
 from rich.padding import Padding
 from rich.text import Text
@@ -29,6 +27,7 @@ from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.hooks import load_hooks_for_provider
 from ..core.project_context import ProjectContext, discover_repo_root, load_project_context
 from ..core.slash import SlashStatus, create_slash_registry
+from ..core.todo import todo_count_tuple
 from ..loop import AgentLoop
 from ..core.session import SessionError, SessionManager, env_home
 from ..providers.anthropic import AnthropicBackend
@@ -47,7 +46,7 @@ from ..types import (
 from .composer import VimCursorShapeConfig, build_key_bindings, history_for
 from .composer import parse_input, status_formatted_text, vim_state_label
 from .background import background_notice
-from .layout import CONTENT_MARGIN, content_width, resume_picker_line
+from .layout import CONTENT_MARGIN, content_width, full_screen_content, resume_picker_line
 from .render import (
     format_status,
     format_thought,
@@ -67,6 +66,7 @@ from .theme import (
     USER_ROLE,
 )
 from .transcript import TranscriptPresenter, TranscriptWidget
+from .todo import TodoWidget
 from .models import MODEL_CATALOGS, load_model_catalog as _load_model_catalog
 from .models import validate_model_name
 
@@ -246,6 +246,7 @@ class TUIApp:
         self._active_session: PromptSession[str] | None = None
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
+        self._todo_widget = TodoWidget(self.loop.store)
         self._presenter = TranscriptPresenter(
             self._transcript,
             self.console,
@@ -278,6 +279,7 @@ class TUIApp:
             f"{request.request_id} ({request.tool_call.name})"
             for request in self.pending_approvals
         )
+        items = self.loop.store.todo_items()
         return SlashStatus(
             session_id=self.loop.store.session_id,
             provider=self.provider,
@@ -304,6 +306,7 @@ class TUIApp:
             context_files=self._context_files,
             vim_mode=self.vim_mode,
             hooks=(() if self._hooks is None else self._hooks.status_entries),
+            todo_counts=todo_count_tuple(items) if items else None,
         )
     def slash_model(self, args: str) -> str:
         """Show or change the model for future completions."""
@@ -961,18 +964,15 @@ class TUIApp:
         root = session.layout.container
         composer_rows = list(root.children)
         footer = composer_rows.pop()
-        transcript = self._transcript.window()
-        content = HSplit(
-            [
-                transcript,
-                HSplit(
-                    [*composer_rows, footer],
-                    height=Dimension(min=4, max=10),
-                ),
-            ],
-        )
-        padded = VSplit([Window(width=CONTENT_MARGIN, char=" "), content, Window(width=CONTENT_MARGIN, char=" ")])
-        root.children[:] = [padded]
+        root.children[:] = [
+            full_screen_content(
+                self._transcript.window(),
+                composer_rows,
+                footer,
+                self._todo_widget,
+                self.loop.store,
+            )
+        ]
 
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run the alternate-screen app until Ctrl-D or an exit request."""
