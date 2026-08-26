@@ -18,8 +18,6 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
-from prompt_toolkit.layout import Dimension
-from prompt_toolkit.layout.containers import HSplit, VSplit, Window
 from prompt_toolkit.styles import DynamicStyle, Style
 from rich.console import Console, RenderableType
 from rich.padding import Padding
@@ -47,6 +45,7 @@ from ..types import (
     ThinkingContent,
 )
 from .background import background_notice
+from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
     VimCursorShapeConfig,
@@ -57,10 +56,14 @@ from .composer import (
     vim_state_label,
 )
 from .fake_backend import FakeInteractiveBackend
-from .layout import CONTENT_MARGIN, content_width, full_screen_content, resume_picker_line
+from .layout import (
+    CONTENT_MARGIN,
+    content_width,
+    full_screen_content,
+    resume_picker_line,
+)
 from .models import MODEL_CATALOGS, validate_model_name
 from .models import load_model_catalog as _load_model_catalog
-from .checkpoints import CheckpointTranscriptMixin
 from .render import (
     format_status,
     render_event,
@@ -79,8 +82,8 @@ from .theme import (
     ERROR,
     RICH_THEME,
 )
-from .transcript import TranscriptPresenter, TranscriptWidget
 from .todo import TodoWidget
+from .transcript import TranscriptPresenter, TranscriptWidget
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
