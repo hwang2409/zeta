@@ -146,7 +146,9 @@ class ToolUseContent:
         return {"type": self.type.value, "tool_call": self.tool_call.to_dict()}
 
 
-ContentBlock = TextContent | ThinkingContent | RedactedThinkingContent | ToolUseContent
+ContentBlock = (
+    ImageContent | TextContent | ThinkingContent | RedactedThinkingContent | ToolUseContent
+)
 TextBlock = TextContent
 ThinkingBlock = ThinkingContent
 RedactedThinkingBlock = RedactedThinkingContent
@@ -602,8 +604,8 @@ def content_from_dict(value: Mapping[str, Any]) -> ContentBlock:
         size = value.get("size")
         if path is not None and (type(path) is not str or not path):
             raise ValueError("text content path must be a nonempty string")
-        if size is not None and (type(size) is not int or size < 1):
-            raise ValueError("text content size must be a positive integer")
+        if size is not None and (type(size) is not int or size < 0):
+            raise ValueError("text content size must be a nonnegative integer")
         if (path is None) != (size is None):
             raise ValueError("text content path and size must be provided together")
         return TextContent(text, path, size)
@@ -626,8 +628,8 @@ def content_from_dict(value: Mapping[str, Any]) -> ContentBlock:
             )
         if path is not None and (type(path) is not str or not path):
             raise ValueError("image content path must be a nonempty string")
-        if size is not None and (type(size) is not int or size < 1):
-            raise ValueError("image content size must be a positive integer")
+        if size is not None and (type(size) is not int or size < 0):
+            raise ValueError("image content size must be a nonnegative integer")
         return ImageContent(data, mime_type, path, size)
     if content_type is ContentType.THINKING:
         text = value.get("text")

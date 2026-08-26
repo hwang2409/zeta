@@ -79,6 +79,7 @@ __all__ = [
     "ContextAssembler",
     "ErrorInfo",
     "FakeBackend",
+    "ImageContent",
     "Message",
     "MessageRole",
     "META_VERSION",

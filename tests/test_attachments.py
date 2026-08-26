@@ -26,21 +26,42 @@ PNG = bytes.fromhex(
 )
 
 
-def test_attachment_refs_support_quoted_paths(tmp_path: Path) -> None:
-    refs = attachment_refs('read @notes.txt and @"a b.txt"', tmp_path)
+def webp_data(chunk_type: bytes, chunk_data: bytes) -> bytes:
+    chunk = chunk_type + len(chunk_data).to_bytes(4, "little") + chunk_data
+    return b"RIFF" + (len(chunk) + 4).to_bytes(4, "little") + b"WEBP" + chunk
 
-    assert [ref.token for ref in refs] == ["@notes.txt", '@"a b.txt"']
+
+WEBP_FIXTURES = (
+    webp_data(b"VP8 ", b"\x00\x00\x00\x9d\x01\x2a\x01\x00\x01\x00"),
+    webp_data(b"VP8L", b"\x2f\x00\x00\x00\x00"),
+    webp_data(b"VP8X", b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"),
+    webp_data(
+        b"VP8 ", b"\x00\x00\x00\x9d\x01\x2a\x01\x00\x01\x00" + b"\x00" * 80
+    ),
+)
+
+
+def test_attachment_refs_support_quoted_paths(tmp_path: Path) -> None:
+    refs = attachment_refs('read @./notes.txt and @"a b.txt"', tmp_path)
+
+    assert [ref.token for ref in refs] == ["@./notes.txt", '@"a b.txt"']
     assert refs[1].path == (tmp_path / "a b.txt").resolve()
+
+
+def test_attachment_refs_leave_bare_at_words_as_text(tmp_path: Path) -> None:
+    assert attachment_refs("mention @dataclass and @user", tmp_path) == ()
+    with pytest.raises(AttachmentError, match="does not exist"):
+        build_user_message("read @./missing.txt", tmp_path)
 
 
 def test_build_user_message_inlines_text_and_preserves_prompt(tmp_path: Path) -> None:
     path = tmp_path / "notes.txt"
     path.write_text("hello", encoding="utf-8")
 
-    message = build_user_message("summarize @notes.txt", tmp_path)
+    message = build_user_message("summarize @./notes.txt", tmp_path)
 
     assert message.role is MessageRole.USER
-    assert message.content[0] == TextContent("summarize @notes.txt")
+    assert message.content[0] == TextContent("summarize @./notes.txt")
     attachment = message.content[1]
     assert isinstance(attachment, TextContent)
     assert attachment.path == str(path.resolve())
@@ -50,23 +71,60 @@ def test_build_user_message_inlines_text_and_preserves_prompt(tmp_path: Path) ->
 
 def test_build_user_message_rejects_missing_large_and_binary_files(tmp_path: Path) -> None:
     with pytest.raises(AttachmentError, match="does not exist"):
-        build_user_message("@missing.txt", tmp_path)
+        build_user_message("@./missing.txt", tmp_path)
 
     large = tmp_path / "large.txt"
     large.write_bytes(b"a" * (ATTACHMENT_MAX_TEXT_BYTES + 1))
     with pytest.raises(AttachmentError, match="limit"):
-        build_user_message("@large.txt", tmp_path)
+        build_user_message("@./large.txt", tmp_path)
 
     binary = tmp_path / "data.bin"
     binary.write_bytes(b"header\x00payload")
     with pytest.raises(AttachmentError, match="binary"):
-        build_user_message("@data.bin", tmp_path)
+        build_user_message("@./data.bin", tmp_path)
+
+
+def test_empty_text_attachment_persists_and_replays(tmp_path: Path) -> None:
+    path = tmp_path / "empty.txt"
+    path.write_bytes(b"")
+    message = build_user_message("read @./empty.txt", tmp_path)
+    attachment = message.content[1]
+    assert isinstance(attachment, TextContent)
+    assert attachment.size == 0
+
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    store.append_message(message)
+    reopened = ConversationStore(
+        tmp_path / "sessions", session_id=store.session_id, cwd=tmp_path
+    )
+
+    assert reopened.messages() == [message]
+    assert reopened.replay()
+
+
+@pytest.mark.parametrize("data", WEBP_FIXTURES)
+def test_webp_attachment_variants_are_detected(tmp_path: Path, data: bytes) -> None:
+    path = tmp_path / "image.data"
+    path.write_bytes(data)
+
+    message = build_user_message("inspect @./image.data", tmp_path)
+
+    assert isinstance(message.content[1], ImageContent)
+    assert message.content[1].mime_type == "image/webp"
+
+
+def test_corrupt_webp_attachment_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "corrupt.data"
+    path.write_bytes(webp_data(b"VP8 ", b"\x00" * 9))
+
+    with pytest.raises(AttachmentError, match="binary"):
+        build_user_message("inspect @./corrupt.data", tmp_path)
 
 
 def test_image_attachment_round_trips_and_uses_provider_boundaries(tmp_path: Path) -> None:
     path = tmp_path / "renamed.data"
     path.write_bytes(PNG)
-    message = build_user_message("inspect @renamed.data", tmp_path)
+    message = build_user_message("inspect @./renamed.data", tmp_path)
     image = message.content[1]
     assert isinstance(image, ImageContent)
     assert image.mime_type == "image/png"
@@ -113,12 +171,65 @@ async def test_app_submits_attachment_on_the_same_user_message(tmp_path: Path) -
         model="offline",
     )
 
-    await app._handle_prompt_value("use @prompt.txt")
+    await app._handle_prompt_value("use @./prompt.txt")
     assert app._active_task is not None
     await app._active_task
 
     message = store.messages()[0]
-    assert message.content[0] == TextContent("use @prompt.txt")
+    assert message.content[0] == TextContent("use @./prompt.txt")
     assert isinstance(message.content[1], TextContent)
     assert message.content[1].text.endswith("\ncontext")
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_path_like_attachment_blocks_with_notice(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        provider="fake",
+        model="offline",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+
+    await app._handle_prompt_value("read @./missing.txt")
+
+    assert app._active_task is None
+    assert store.messages() == []
+    assert notices == ["attachment rejected: file does not exist: " + str(tmp_path / "missing.txt")]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_deleted_pending_paste_is_dropped_once(tmp_path: Path) -> None:
+    pending = tmp_path / "clipboard.png"
+    pending.write_bytes(PNG)
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        provider="fake",
+        model="offline",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+    app._pending_attachments.append(pending)
+    pending.unlink()
+
+    await app._handle_prompt_value("first")
+    assert app._active_task is not None
+    await app._active_task
+    await app._handle_prompt_value("second")
+    assert app._active_task is not None
+    await app._active_task
+
+    users = [
+        message for message in store.messages() if message.role is MessageRole.USER
+    ]
+    assert [message.content for message in users] == [
+        [TextContent("first")],
+        [TextContent("second")],
+    ]
+    assert len(notices) == 1
+    assert notices[0].startswith("pending attachment dropped:")
     await app.loop.close()

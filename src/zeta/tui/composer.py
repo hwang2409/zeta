@@ -58,13 +58,22 @@ class AttachmentRef:
 
 
 def attachment_refs(value: str, base_dir: str | Path) -> tuple[AttachmentRef, ...]:
-    """Parse local ``@path`` references while preserving their source tokens."""
+    """Parse quoted or path-like local ``@`` references.
+
+    Bare words such as ``@user`` and ``@dataclass`` remain prompt text.
+    """
 
     base = Path(base_dir)
     refs: list[AttachmentRef] = []
     for match in ATTACHMENT_TOKEN_RE.finditer(value):
         raw_path = match.group(1) or match.group(2)
         if raw_path is None:
+            continue
+        quoted = match.group(1) is not None
+        if not quoted and not (
+            "/" in raw_path
+            or raw_path.startswith(("./", "../", "~/"))
+        ):
             continue
         path = Path(raw_path).expanduser()
         if not path.is_absolute():
@@ -74,14 +83,17 @@ def attachment_refs(value: str, base_dir: str | Path) -> tuple[AttachmentRef, ..
 
 
 def _image_media_type(data: bytes) -> str | None:
+    if (
+        len(data) >= 16
+        and data[:4] == b"RIFF"
+        and data[8:12] == b"WEBP"
+        and data[12:16] in {b"VP8 ", b"VP8L", b"VP8X"}
+    ):
+        return "image/webp"
     candidates = (
         ("image/png", data.startswith(b"\x89PNG\r\n\x1a\n")),
         ("image/jpeg", data.startswith(b"\xff\xd8\xff")),
         ("image/gif", data.startswith((b"GIF87a", b"GIF89a"))),
-        (
-            "image/webp",
-            len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP",
-        ),
     )
     for media_type, matches in candidates:
         if matches and image_signature_matches(media_type, data):
@@ -97,13 +109,15 @@ def _read_attachment(path: Path) -> TextContent | ImageContent:
     try:
         size = path.stat().st_size
         with path.open("rb") as handle:
-            prefix = handle.read(32)
+            prefix = handle.read(64)
     except OSError as exc:
         raise AttachmentError(f"cannot read {path}: {exc}") from exc
     media_type = _image_media_type(prefix)
     try:
         if media_type is not None:
             data = path.read_bytes()
+            if not image_signature_matches(media_type, data):
+                raise AttachmentError(f"binary file is not an image: {path}")
             return ImageContent(
                 base64.b64encode(data).decode("ascii"),
                 media_type,
@@ -132,7 +146,7 @@ def build_user_message(
     base_dir: str | Path,
     pending_paths: tuple[Path, ...] = (),
 ) -> Message:
-    """Resolve composer references into one durable user message."""
+    """Resolve references into one message, deduplicating resolved paths."""
 
     paths: list[Path] = []
     for ref in attachment_refs(value, base_dir):
@@ -237,8 +251,16 @@ class ComposerAttachmentMixin:
                 tuple(self._pending_attachments),
             )
         except AttachmentError as exc:
-            self._print_system(f"attachment rejected: {exc}")
-            return None
+            if not self._pending_attachments:
+                self._print_system(f"attachment rejected: {exc}")
+                return None
+            self._pending_attachments.clear()
+            self._print_system(f"pending attachment dropped: {exc}")
+            try:
+                return build_user_message(value, self.loop.store.cwd)
+            except AttachmentError as retry_exc:
+                self._print_system(f"attachment rejected: {retry_exc}")
+                return None
         return message
 
     def _print_user(self, user: str | Message) -> None:
