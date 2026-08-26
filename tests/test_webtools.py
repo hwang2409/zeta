@@ -12,7 +12,7 @@ import zeta.tools.websearch as websearch
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.store import ConversationStore
 from zeta.tools import ToolRegistry
-from zeta.types import ToolCall
+from zeta.types import ToolCall, flatten_tool_content
 
 _ASYNC_CLIENT = httpx.AsyncClient
 
@@ -535,6 +535,7 @@ async def test_fetch_output_is_paginated(
     block = result["content"][0]
     assert block["truncated"] is True
     assert block["full_size"] == 50_100
+    assert block["full_size_chars"] == 50_100
     assert block["text"] == "x" * 10_000
     assert block["next_offset"] == 10_000
 
@@ -645,6 +646,72 @@ async def test_fetch_pagination_repeats_notices_without_advancing_offset(
         offset = block["next_offset"]
 
     assert "".join(body_pages) == body
+
+
+@pytest.mark.asyncio
+async def test_fetch_pagination_reports_utf8_bytes_and_character_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = await _execute_fetch(
+        tmp_path,
+        monkeypatch,
+        httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            text="éé",
+        ),
+        arguments={"url": "example.com", "offset": 0},
+        max_output_chars=2,
+    )
+
+    block = result["content"][0]
+    assert block["text"] == "é"
+    assert block["full_size"] == 4
+    assert block["full_size_chars"] == 2
+    assert block["next_offset"] == 1
+    assert flatten_tool_content([block]) == (
+        "é\n[truncated: full_size_chars=2 chars; next_offset=1]"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_pagination_rejects_cap_that_cannot_fit_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            text="readable body",
+            request=request,
+        )
+
+    _mock_client(monkeypatch, handler)
+    monkeypatch.setattr(
+        fetch_tool.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (
+                fetch_tool.socket.AF_INET,
+                fetch_tool.socket.SOCK_STREAM,
+                6,
+                "",
+                ("192.168.1.5", 0),
+            )
+        ],
+    )
+    result = await ToolRegistry(tmp_path, max_output_chars=34).execute(
+        ToolCall(
+            "fetch-1",
+            "fetch",
+            {"url": "http://printer.local", "offset": 0},
+        )
+    )
+
+    block = result["content"][0]
+    assert result["isError"] is True
+    assert "output limit too small" in block["text"]
+    assert "next_offset" not in block
 
 
 @pytest.mark.asyncio

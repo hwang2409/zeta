@@ -290,11 +290,12 @@ def _page_block(
 ) -> ToolTextBlock:
     """Build one readable-text page that fits the provider output limit."""
 
-    full_size = len(body)
-    if offset >= full_size:
+    full_size_chars = len(body)
+    full_size = len(body.encode("utf-8"))
+    if offset >= full_size_chars:
         page_end = offset
     else:
-        page_chars = min(limit, full_size - offset)
+        page_chars = min(limit, full_size_chars - offset)
         low = 0
         high = page_chars
         while low < high:
@@ -309,7 +310,8 @@ def _page_block(
 
     page = body[offset:page_end]
     block = text_block(notice + page, full_size=full_size)
-    block["truncated"] = page_end < full_size
+    block["full_size_chars"] = full_size_chars
+    block["truncated"] = page_end < full_size_chars
     if block["truncated"]:
         block["next_offset"] = page_end
     return block
@@ -487,9 +489,12 @@ async def _fetch(
     if notice:
         notice += "\n\n"
     effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
-    return _success_result(
-        _page_block(notice, body, offset=offset, limit=effective_limit)
-    )
+    block = _page_block(notice, body, offset=offset, limit=effective_limit)
+    if block["truncated"] and block.get("next_offset", offset) <= offset:
+        return _truncated_error_result(
+            "output limit too small for notice", full_size=len(body.encode("utf-8"))
+        )
+    return _success_result(block)
 
 
 def register(registry: ToolRegistry) -> None:

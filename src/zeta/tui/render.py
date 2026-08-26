@@ -275,13 +275,30 @@ def _tool_body(event: StreamEvent) -> Text | None:
     result = event.tool_result
     extra_lines: list[str] = []
     if result is not None and result.content_blocks:
-        sizes = [
+        char_sizes = [
+            block["full_size_chars"]
+            for block in result.content_blocks
+            if (
+                block.get("type") == "text"
+                and block.get("truncated")
+                and "full_size_chars" in block
+            )
+        ]
+        byte_sizes = [
             block["full_size"]
             for block in result.content_blocks
-            if block.get("type") == "text" and block.get("truncated")
+            if (
+                block.get("type") == "text"
+                and block.get("truncated")
+                and "full_size_chars" not in block
+            )
         ]
-        if sizes:
-            extra_lines.append(f"[truncated; full_size={max(sizes)}]")
+        if char_sizes:
+            extra_lines.append(
+                f"[truncated; full_size_chars={max(char_sizes)} chars]"
+            )
+        if byte_sizes:
+            extra_lines.append(f"[truncated; full_size={max(byte_sizes)} bytes]")
     rendered = Text(style=BODY, overflow="ellipsis", no_wrap=True)
 
     visible_sections = [(label, value) for label, value in sections if value.strip()]

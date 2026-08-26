@@ -1,7 +1,8 @@
 """Tool registration and MCP-compatible execution results.
 
 Text blocks always include ``truncated`` and ``full_size``. ``full_size`` is
-the original UTF-8 byte length before a character cap is applied.
+the original UTF-8 byte length before a character cap is applied. Fetch pages
+also include ``full_size_chars`` for their readable-text character length.
 """
 
 from __future__ import annotations
@@ -275,6 +276,8 @@ def _normalize_result(
         if "annotations" in block:
             normalized["annotations"] = block["annotations"]
         normalized["truncated"] = block["truncated"] or shown != block["text"]
+        if "full_size_chars" in block:
+            normalized["full_size_chars"] = block["full_size_chars"]
         if "next_offset" in block:
             normalized["next_offset"] = block["next_offset"]
         remaining -= len(shown)

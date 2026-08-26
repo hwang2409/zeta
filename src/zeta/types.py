@@ -130,12 +130,13 @@ class ToolAnnotations(TypedDict, total=False):
 
 
 class ToolTextBlock(TypedDict):
-    """MCP text content; metadata is always present, even when not capped."""
+    """MCP text content; size metadata is measured in explicit units."""
 
     type: Literal["text"]
     text: str
     truncated: bool
     full_size: int
+    full_size_chars: NotRequired[int]
     next_offset: NotRequired[int]
     annotations: NotRequired[ToolAnnotations]
 
@@ -195,7 +196,12 @@ def validate_tool_content_block(index: int, block: object) -> ToolContentBlock:
     block_type = block.get("type")
     if block_type == "text":
         required_keys = {"type", "text", "truncated", "full_size"}
-        allowed_keys = {*required_keys, "next_offset", "annotations"}
+        allowed_keys = {
+            *required_keys,
+            "full_size_chars",
+            "next_offset",
+            "annotations",
+        }
         if not required_keys <= set(block) or not set(block) <= allowed_keys:
             raise ValueError(f"{prefix} has an invalid text shape")
         if type(block["text"]) is not str:
@@ -204,6 +210,11 @@ def validate_tool_content_block(index: int, block: object) -> ToolContentBlock:
             raise ValueError(f"{prefix}.truncated must be a boolean")
         if type(block["full_size"]) is not int or block["full_size"] < 0:
             raise ValueError(f"{prefix}.full_size must be nonnegative")
+        if "full_size_chars" in block and (
+            type(block["full_size_chars"]) is not int
+            or block["full_size_chars"] < 0
+        ):
+            raise ValueError(f"{prefix}.full_size_chars must be nonnegative")
         if "next_offset" in block and (
             type(block["next_offset"]) is not int or block["next_offset"] < 0
         ):
@@ -214,6 +225,8 @@ def validate_tool_content_block(index: int, block: object) -> ToolContentBlock:
             "truncated": block["truncated"],
             "full_size": block["full_size"],
         }
+        if "full_size_chars" in block:
+            normalized["full_size_chars"] = block["full_size_chars"]
         if "next_offset" in block:
             normalized["next_offset"] = block["next_offset"]
         if "annotations" in block:
@@ -493,11 +506,23 @@ def flatten_tool_content(
         if block["type"] == "text":
             text = block["text"]
             if block["truncated"]:
-                shown_bytes = len(text.encode("utf-8"))
-                text = (
-                    f"{text}\n[truncated: {shown_bytes} of "
-                    f"{block['full_size']} bytes]"
-                )
+                if "full_size_chars" in block:
+                    next_offset = block.get("next_offset")
+                    continuation = (
+                        f"; next_offset={next_offset}"
+                        if next_offset is not None
+                        else ""
+                    )
+                    text = (
+                        f"{text}\n[truncated: full_size_chars="
+                        f"{block['full_size_chars']} chars{continuation}]"
+                    )
+                else:
+                    shown_bytes = len(text.encode("utf-8"))
+                    text = (
+                        f"{text}\n[truncated: {shown_bytes} of "
+                        f"{block['full_size']} bytes]"
+                    )
             values.append(text)
         elif block["type"] == "image":
             values.append(
