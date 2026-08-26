@@ -19,6 +19,7 @@ class SlashStatus:
     tokens_in_current_context: int | None
     compaction_marker_count: int
     pending_approvals: tuple[str, ...]
+    checkpoint_count: int = 0
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     uncached_input_tokens: int = 0
@@ -39,6 +40,10 @@ class SlashSession(Protocol):
     def slash_paste(self, args: str) -> str: ...
 
     async def slash_compact(self) -> str: ...
+
+    def slash_checkpoint(self, args: str) -> str: ...
+
+    def slash_fork(self, args: str) -> str: ...
 
 
 SlashResult = str | Awaitable[str]
@@ -131,6 +136,7 @@ def _format_status(status: SlashStatus) -> str:
             f"tokens_used_this_session: {status.tokens_used_this_session}",
             f"tokens_in_current_context: {context_tokens}",
             f"compaction_marker_count: {status.compaction_marker_count}",
+            f"checkpoint_count: {status.checkpoint_count}",
             f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",
             f"prompt_cache_read: {status.cache_read_input_tokens}",
             f"prompt_cache_write: {status.cache_creation_input_tokens}",
@@ -171,6 +177,14 @@ def _run_paste(session: SlashSession, args: str) -> str:
     return session.slash_paste(args)
 
 
+def _run_checkpoint(session: SlashSession, args: str) -> str:
+    return session.slash_checkpoint(args)
+
+
+def _run_fork(session: SlashSession, args: str) -> str:
+    return session.slash_fork(args)
+
+
 def create_slash_registry() -> SlashCommandRegistry:
     """Create the built-in registry."""
 
@@ -180,4 +194,6 @@ def create_slash_registry() -> SlashCommandRegistry:
     registry.register(SlashCommand("vim", _run_vim))
     registry.register(SlashCommand("paste", _run_paste))
     registry.register(SlashCommand("compact", _run_compact))
+    registry.register(SlashCommand("checkpoint", _run_checkpoint))
+    registry.register(SlashCommand("fork", _run_fork))
     return registry

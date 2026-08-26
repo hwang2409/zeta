@@ -492,6 +492,8 @@ class ContextAssembler:
                 emitted_marker_ids.add(marker.id)
             if entry.type == "compaction":
                 continue
+            if entry.type in {"warning", "checkpoint", "fork"}:
+                continue
             if entry.type != "message":
                 continue
             if any(start <= entry.seq <= end for start, end in compacted_ranges):
