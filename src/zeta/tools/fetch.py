@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 import socket
-from collections.abc import Mapping
+import zlib
+from collections.abc import AsyncIterator, Mapping
 from html.parser import HTMLParser
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from typing import Any
@@ -33,6 +34,25 @@ _PRIVATE_NETWORKS = (
 )
 _CLOUD_METADATA_ADDRESS = ip_address("169.254.169.254")
 _PRIVATE_TARGET_EXTENSION = "zeta_private_target"
+
+
+class _DecompressedResponseTooLarge(ValueError):
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(f"response too large: more than {max_bytes} bytes decompressed")
+        self.max_bytes = max_bytes
+
+
+class _CompressedResponseTruncated(ValueError):
+    def __init__(self) -> None:
+        super().__init__("response truncated: compressed stream ended early")
+
+
+async def _raw_response_chunks(response: httpx.Response) -> AsyncIterator[bytes]:
+    if response.is_stream_consumed:
+        yield response.content
+        return
+    async for chunk in response.aiter_raw():
+        yield chunk
 
 
 def _normalize_address(
@@ -146,18 +166,76 @@ async def get_response(
                         raise ValueError(
                             f"request failed: HTTP {response.status_code} {reason}"
                         )
+                    content_encoding = response.headers.get("content-encoding", "")
+                    encodings = tuple(
+                        encoding.strip().lower()
+                        for encoding in content_encoding.split(",")
+                        if encoding.strip()
+                    )
+                    if len(encodings) > 1:
+                        raise ValueError(
+                            "request failed: multiple content encodings are not supported"
+                        )
+                    encoding = encodings[0] if encodings else "identity"
+                    decoder = (
+                        zlib.decompressobj(wbits=47)
+                        if encoding in {"gzip", "deflate"}
+                        else None
+                    )
+                    compressed_prefix = bytearray() if encoding == "deflate" else None
                     chunks: list[bytes] = []
                     received = 0
-                    async for chunk in response.aiter_bytes():
+                    decompressed = 0
+                    async for chunk in _raw_response_chunks(response):
                         received += len(chunk)
                         if received > max_bytes:
                             raise ValueError(
                                 f"response too large: more than {max_bytes} bytes received"
                             )
-                        chunks.append(chunk)
+                        if decoder is None:
+                            chunks.append(chunk)
+                            continue
+                        if compressed_prefix is not None:
+                            compressed_prefix.extend(chunk)
+                        pending = chunk
+                        while pending:
+                            remaining = max_bytes - decompressed
+                            try:
+                                decoded = decoder.decompress(
+                                    pending,
+                                    max_length=remaining + 1,
+                                )
+                            except zlib.error:
+                                if compressed_prefix is None:
+                                    raise
+                                decoder = zlib.decompressobj(wbits=-15)
+                                chunks.clear()
+                                decompressed = 0
+                                pending = bytes(compressed_prefix)
+                                compressed_prefix = None
+                                continue
+                            decompressed += len(decoded)
+                            if decompressed > max_bytes:
+                                raise _DecompressedResponseTooLarge(max_bytes)
+                            if decoded:
+                                chunks.append(decoded)
+                            pending = decoder.unconsumed_tail
+                    if decoder is not None:
+                        remaining = max_bytes - decompressed
+                        decoded = decoder.flush(remaining + 1)
+                        decompressed += len(decoded)
+                        if decompressed > max_bytes:
+                            raise _DecompressedResponseTooLarge(max_bytes)
+                        if decoded:
+                            chunks.append(decoded)
+                        if not decoder.eof:
+                            raise _CompressedResponseTruncated()
+                    headers = response.headers.copy()
+                    headers.pop("content-encoding", None)
+                    headers.pop("content-length", None)
                     return httpx.Response(
                         response.status_code,
-                        headers=response.headers,
+                        headers=headers,
                         content=b"".join(chunks),
                         request=httpx.Request("GET", current_url),
                         extensions={
@@ -201,6 +279,22 @@ def output_block(value: str, *, limit: int = MAX_OUTPUT_BYTES) -> ToolTextBlock:
             high = middle - 1
     shown = value[:low] + OUTPUT_TRUNCATION_MARKER
     return text_block(shown, full_size=len(encoded))
+
+
+def _truncated_error_result(
+    message: str, *, full_size: int
+) -> StructuredToolResult:
+    message = f"{message}{OUTPUT_TRUNCATION_MARKER}"
+    block = text_block(
+        message,
+        full_size=max(len(message.encode("utf-8")), full_size),
+    )
+    block["truncated"] = True
+    return {
+        "content": [block],
+        "isError": True,
+        "structuredContent": None,
+    }
 
 
 class _ReadableHTMLParser(HTMLParser):
@@ -333,11 +427,16 @@ async def _fetch(
 ) -> StructuredToolResult:
     url = _normalize_url(arguments["url"])
     max_bytes = arguments.get("max_bytes", MAX_RESPONSE_BYTES)
-    response = await get_response(
-        url,
-        user_agent="zeta/fetch (web tool)",
-        max_bytes=max_bytes,
-    )
+    try:
+        response = await get_response(
+            url,
+            user_agent="zeta/fetch (web tool)",
+            max_bytes=max_bytes,
+        )
+    except _DecompressedResponseTooLarge as exc:
+        return _truncated_error_result(str(exc), full_size=exc.max_bytes + 1)
+    except _CompressedResponseTruncated as exc:
+        return _truncated_error_result(str(exc), full_size=max_bytes + 1)
     final_url = str(response.request.url) if response.request is not None else url
     body = _readable_content(
         final_url,
