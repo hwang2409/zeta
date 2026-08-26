@@ -9,7 +9,15 @@ from pathlib import Path
 
 import pytest
 
-from zeta.core.hooks import Hook, HookConfigError, HookManager, load_hooks
+from zeta.core.hooks import (
+    HOOK_EVENT_PAYLOAD_LIMIT,
+    HOOK_EVENT_STRING_LIMIT,
+    Hook,
+    HookConfigError,
+    HookManager,
+    _bound_event,
+    load_hooks,
+)
 from zeta.cli import build_parser
 from zeta.tui.app import create_app
 from zeta.tools import ToolRegistry
@@ -45,6 +53,17 @@ def test_empty_tools_filter_is_rejected_for_non_tool_events(tmp_path: Path) -> N
 
     with pytest.raises(HookConfigError, match="tools only applies to tool events"):
         load_hooks(tmp_path)
+
+
+def test_hook_event_mapping_keys_are_bounded_with_metadata() -> None:
+    key = "k" * (HOOK_EVENT_STRING_LIMIT + 1)
+
+    event = _bound_event({"args": {key: "value"}})
+
+    bounded_key = next(iter(event["args"]))
+    assert len(bounded_key) == HOOK_EVENT_STRING_LIMIT
+    assert event["_truncated"] is True
+    assert event["_truncations"][0]["path"] == "$.args[key 0]"
 
 
 @pytest.mark.asyncio
@@ -138,6 +157,32 @@ async def test_hook_event_payload_is_bounded_with_metadata(tmp_path: Path) -> No
         "$.args.command",
         "$.args.items",
     }
+
+
+@pytest.mark.asyncio
+async def test_oversized_hook_payload_is_bounded_with_metadata(tmp_path: Path) -> None:
+    marker = tmp_path / "event.json"
+    command = _python_command(
+        f"import pathlib,sys; pathlib.Path({str(marker)!r}).write_bytes(sys.stdin.buffer.read())"
+    )
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\n',
+    )
+    manager = load_hooks(tmp_path)
+    args = {
+        f"{index:02d}-{'k' * (HOOK_EVENT_STRING_LIMIT + 1)}": "v"
+        * (HOOK_EVENT_STRING_LIMIT + 1)
+        for index in range(64)
+    }
+
+    assert await manager.pre_tool("exec", args) is True
+
+    payload = marker.read_bytes()
+    event = json.loads(payload)
+    assert len(payload) <= HOOK_EVENT_PAYLOAD_LIMIT
+    assert event["_truncated"] is True
+    assert {entry["kind"] for entry in event["_truncations"]} == {"payload"}
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,7 @@ HOOK_OUTPUT_LIMIT = 2048
 HOOK_EVENT_STRING_LIMIT = 4096
 HOOK_EVENT_COLLECTION_LIMIT = 64
 HOOK_EVENT_DEPTH_LIMIT = 8
+HOOK_EVENT_PAYLOAD_LIMIT = 64 * 1024
 HOOK_ACTIVE_ENV = "ZETA_HOOK_ACTIVE"
 HOOK_TRUNCATION_MARKER = "...[truncated]"
 _ANSI_ESCAPE_RE = re.compile(
@@ -230,9 +231,7 @@ class HookManager:
         creation_task: asyncio.Task[asyncio.subprocess.Process] | None = None
         process_group_id: int | None = None
         try:
-            output = json.dumps(
-                _bound_event(event), separators=(",", ":")
-            ).encode() + b"\n"
+            output = _event_payload(event)
             creation_task = asyncio.create_task(
                 asyncio.create_subprocess_exec(
                     "sh",
@@ -347,7 +346,14 @@ def _bound_event(event: Mapping[str, Any]) -> dict[str, Any]:
                 if index >= HOOK_EVENT_COLLECTION_LIMIT:
                     truncated = True
                     break
-                bounded[key] = bound(item, f"{path}.{key}", depth + 1)
+                key_path = f"{path}[key {index}]"
+                bounded_key = bound(key, key_path, depth + 1)
+                item_path = (
+                    f"{path}.{bounded_key}"
+                    if isinstance(bounded_key, str)
+                    else f"{path}[{index}]"
+                )
+                bounded[bounded_key] = bound(item, item_path, depth + 1)
             if truncated:
                 truncations.append(
                     {
@@ -380,6 +386,28 @@ def _bound_event(event: Mapping[str, Any]) -> dict[str, Any]:
         bounded_event["_truncated"] = True
         bounded_event["_truncations"] = truncations
     return bounded_event
+
+
+def _event_payload(event: Mapping[str, Any]) -> bytes:
+    bounded_event = _bound_event(event)
+    output = json.dumps(bounded_event, separators=(",", ":")).encode() + b"\n"
+    if len(output) <= HOOK_EVENT_PAYLOAD_LIMIT:
+        return output
+
+    minimal_event = {
+        "event": bounded_event["event"],
+        "session_id": bounded_event["session_id"],
+        "_truncated": True,
+        "_truncations": [
+            {
+                "path": "$",
+                "kind": "payload",
+                "original_length": len(output),
+                "limit": HOOK_EVENT_PAYLOAD_LIMIT,
+            }
+        ],
+    }
+    return json.dumps(minimal_event, separators=(",", ":")).encode() + b"\n"
 
 
 def _sanitize_text(text: str, *, truncated: bool = False) -> str:
