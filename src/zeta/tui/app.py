@@ -47,8 +47,12 @@ from ..types import (
 from .composer import VimCursorShapeConfig, build_key_bindings, history_for
 from .composer import parse_input, status_formatted_text, vim_state_label
 from .layout import CONTENT_MARGIN, content_width, resume_picker_line
-from .render import format_status, render_markdown
-from .render import render_event, render_thought, render_thought_live
+from .render import (
+    format_status,
+    format_thought,
+    render_event,
+)
+from .render import render_markdown, render_thought, render_thought_live
 from .stream import stream_key
 from .theme import (
     ACCENT,
@@ -70,6 +74,10 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 RECENT_SESSION_LIMIT = 20
 SPINNER_INTERVAL = 0.2
+
+
+def _validate_model_name(provider: str, model: str) -> None:
+    validate_model_name(provider, model)
 
 
 class FullScreenPromptSession(PromptSession[str]):
@@ -191,8 +199,9 @@ class TUIApp:
         model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
     ) -> None:
         self.loop = loop
-        if loop.hooks is not None:
-            loop.hooks.notice_sink = self._print_hook_notice
+        self._hooks = loop.hooks
+        if self._hooks is not None:
+            self._hooks.notice_sink = self._print_hook_notice
         self.provider = provider
         self.model = model
         self.verbose = verbose
@@ -291,7 +300,7 @@ class TUIApp:
             ),
             context_files=self._context_files,
             vim_mode=self.vim_mode,
-            hooks=(() if self.loop.hooks is None else self.loop.hooks.status_entries),
+            hooks=(() if self._hooks is None else self._hooks.status_entries),
         )
 
     def slash_model(self, args: str) -> str:
@@ -303,7 +312,7 @@ class TUIApp:
             return "model unchanged: cannot change model while a turn or approval is active"
         model = args.strip()
         try:
-            validate_model_name(self.provider, model)
+            _validate_model_name(self.provider, model)
         except ValueError as exc:
             return f"model unchanged: {exc}"
         if not self._model_catalog_loaded:
@@ -593,10 +602,6 @@ class TUIApp:
     def _print_unit(self, renderable: RenderableType | None) -> None:
         self._presenter.print_unit(renderable)
 
-    def _print_assistant(self, renderable: RenderableType | None) -> None:
-        if self._presenter.print_assistant(renderable):
-            self._turn_had_visible_output = True
-
     def _handle_tool_event(self, event: StreamEvent) -> bool:
         if event.type is StreamEventType.TOOL_APPROVAL_START:
             self._reset_stream_state()
@@ -677,20 +682,18 @@ class TUIApp:
         return self._presenter.tool_region
 
     def _print_committed(self, lines: list[str], *, thinking: bool = False) -> None:
+        value = "\n".join(lines)
         if thinking:
-            value = "\n".join(lines)
             if value:
                 self._presenter.finish_thinking(
                     render_thought(value, self._thinking_duration)
                 )
                 self._turn_had_visible_output = True
             return
-        if not lines:
-            return
-        value = "\n".join(lines)
-        self._assistant_text += value
-        self._presenter.update_assistant(Text(self._assistant_text, style=BODY))
-        self._turn_had_visible_output |= bool(value.strip())
+        if value:
+            self._assistant_text += value
+            self._presenter.update_assistant(Text(self._assistant_text, style=BODY))
+            self._turn_had_visible_output |= bool(value.strip())
 
     def _update_usage(self, event: StreamEvent) -> None:
         usage = event.data.get("usage")
@@ -702,31 +705,27 @@ class TUIApp:
         get_app().invalidate()
 
     def _flush_stream_kind(self) -> None:
-        if self._stream_kind in {"thinking", "redacted-thinking"}:
-            if self._thinking_text:
-                self._print_committed([self._thinking_text], thinking=True)
-        elif self._stream_kind == "assistant":
-            if self._assistant_text:
-                self._presenter.finish_assistant(render_markdown(self._assistant_text))
-                self._assistant_message_finished = True
+        if self._stream_kind in {"thinking", "redacted-thinking"} and self._thinking_text:
+            self._print_committed([self._thinking_text], thinking=True)
+        elif self._stream_kind == "assistant" and self._assistant_text:
+            self._presenter.finish_assistant(render_markdown(self._assistant_text))
+            self._assistant_message_finished = True
             self._assistant_text = ""
         self._stream_kind = self._stream_identity = None
         self._partial = self._thinking_text = ""
         self._thinking_duration = self._thinking_started_at = None
 
     def _flush_markdown(self) -> None:
-        if self._assistant_text:
-            self._presenter.finish_assistant(render_markdown(self._assistant_text))
-            self._assistant_text = ""
+        if self._assistant_text: self._presenter.finish_assistant(render_markdown(self._assistant_text)); self._assistant_text = ""
 
     def _finish_message(self, event: StreamEvent) -> None:
-        value = self._assistant_text
-        if not value and not self._assistant_message_finished and event.message is not None:
-            value = "".join(
-                block.text
-                for block in event.message.content
-                if isinstance(block, TextContent)
-            )
+        if self._assistant_message_finished:
+            return
+        value = self._assistant_text or "".join(
+            block.text
+            for block in (event.message.content if event.message is not None else ())
+            if isinstance(block, TextContent)
+        )
         if value and self._stream_kind in {"assistant", None}:
             self._presenter.finish_assistant(render_markdown(value))
             self._turn_had_visible_output |= bool(value.strip())
@@ -735,10 +734,9 @@ class TUIApp:
             self._flush_stream_kind()
         self._stream_kind = self._stream_identity = None
         self._reset_stream_buffers()
+
     def _flush_pending_stream(self) -> None:
-        self._flush_stream_kind()
-        self._flush_markdown()
-        self._presenter.reset_assistant_unit()
+        self._flush_stream_kind(); self._flush_markdown(); self._presenter.reset_assistant_unit()
 
     def _consume_text(self, event: StreamEvent) -> None:
         incoming_kind, incoming_identity = stream_key(event)
@@ -777,14 +775,8 @@ class TUIApp:
         self._presenter.update_assistant(Text(self._assistant_text, style=BODY))
         self._turn_had_visible_output |= bool(value.strip())
 
-    def _finish_stream(self) -> None:
-        self._flush_pending_stream()
-        self._reset_stream_state()
-
     def _reset_stream_state(self) -> None:
-        self._reset_stream_buffers()
-        self._partial = ""
-        self._streaming = False
+        self._reset_stream_buffers(); self._partial = ""; self._streaming = False
 
     def _reset_stream_buffers(self) -> None:
         self._assistant_text = self._thinking_text = ""
@@ -895,12 +887,12 @@ class TUIApp:
                 if event.type is StreamEventType.TOOL_EXECUTION_END and stop_after_tool:
                     break
         except asyncio.CancelledError:
-            self._finish_stream()
+            self._flush_pending_stream(); self._reset_stream_state()
             self._loop_state = "interrupted"
             self._print_unit(Text("[aborted]", style=ERROR))
             raise
         except Exception as exc:
-            self._finish_stream()
+            self._flush_pending_stream(); self._reset_stream_state()
             self._loop_state = "idle"
             self._print_unit(Text(f"[error] {exc}", style=ERROR))
         finally:
@@ -1127,6 +1119,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         store = opened.store
     if resuming:
         backend, selected_model = build_backend(provider, model, home=home)
+    hooks = load_hooks_for_provider(home, provider)
     approval_default = (
         ApprovalDecision.ALLOW if getattr(args, "yolo", False) else ApprovalDecision.ASK
     )
@@ -1166,7 +1159,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
     max_turns_override = getattr(args, "max_turns", None)
     loop_kwargs: dict[str, Any] = {
         "approval_policy": approval_policy,
-        "hooks": load_hooks_for_provider(home, provider),
+        "hooks": hooks,
         "token_budget": effective_token_budget,
         "retained_tail": metadata.retained_tail,
         "on_completion_success": completion_success,
@@ -1188,7 +1181,14 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         on_vim_mode_change=lambda enabled: manager.record_vim_mode(metadata, enabled=enabled),
     )
 
-__all__ = ["FakeInteractiveBackend", "TUIApp", "create_app", "build_backend", "main"]
+
+__all__ = [
+    "FakeInteractiveBackend",
+    "TUIApp",
+    "create_app",
+    "build_backend",
+    "main",
+]
 
 
 def __getattr__(name: str) -> object:

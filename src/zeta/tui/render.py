@@ -633,6 +633,8 @@ def _table_rows(
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError("markdown painting exceeded its time budget")
                 if row.token.type == "tr_open":
+                    if len(body) >= _MAX_MARKDOWN_TABLE_ROWS:
+                        raise TimeoutError("markdown table exceeded its time budget")
                     body.append(
                         [
                             cell
