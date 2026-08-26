@@ -44,6 +44,10 @@ async def test_background_start_poll_and_kill_round_trip(tmp_path: Path) -> None
     )
     assert output["structuredContent"]["output"] == "hello\n"
     assert output["structuredContent"]["running"] is False
+    visible = output["content"][0]["text"]
+    assert "cursor:" in visible
+    assert "running: False" in visible
+    assert "exit_code: 0" in visible
 
     long_running = await registry.execute(
         ToolCall("start-2", "run_background", {"command": "sleep 30"})
@@ -74,6 +78,47 @@ async def test_background_output_cursor_and_ring_overflow(tmp_path: Path) -> Non
     assert first["cursor"] == 12
     second = await tasks.output(task_id, since=first["cursor"])
     assert second["output"] == "cdef"
+    await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_background_output_caps_at_utf8_boundary(tmp_path: Path) -> None:
+    tasks = BackgroundTaskRegistry(call_limit=4)
+    task_id, _ = await tasks.start(
+        _python("import sys; sys.stdout.buffer.write('ab€x'.encode())"),
+        tmp_path,
+    )
+    await _wait_for_exit(tasks, task_id)
+
+    first = await tasks.output(task_id)
+    assert first["output"].startswith("ab")
+    assert "�" not in first["output"]
+    assert first["cursor"] == 2
+    second = await tasks.output(task_id, since=first["cursor"])
+    assert second["output"] == "€x"
+    await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_background_task_stays_running_for_detached_group_member(
+    tmp_path: Path,
+) -> None:
+    tasks = BackgroundTaskRegistry()
+    task_id, pid = await tasks.start(
+        _python(
+            "import subprocess,sys; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
+        ),
+        tmp_path,
+    )
+    await asyncio.sleep(0.1)
+    assert (await tasks.output(task_id))["running"] is True
+    assert _group_exists(pid)
+
+    result = await tasks.kill(task_id)
+    assert result["running"] is False
+    assert not _group_exists(pid)
     await tasks.close()
 
 

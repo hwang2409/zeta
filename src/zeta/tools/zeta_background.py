@@ -57,7 +57,13 @@ async def _task_output(
     )
     output = result["output"]
     note = result.get("note")
-    content = output if output else (note or "")
+    metadata = (
+        f"task_id: {result['task_id']}\n"
+        f"cursor: {result['cursor']}\n"
+        f"running: {result['running']}\n"
+        f"exit_code: {result['exit_code']}\n"
+    )
+    content = metadata + (output if output else (note or ""))
     return _result(content, result)
 
 

@@ -132,7 +132,7 @@ class BackgroundTaskRegistry:
         available = output[offset:]
         capped = len(available) > self.call_limit
         if capped:
-            available = available[: self.call_limit]
+            available = _utf8_chunk(available, self.call_limit)
         next_cursor = start + len(available)
         text = available.decode(errors="replace")
         if marker:
@@ -178,6 +178,8 @@ class BackgroundTaskRegistry:
         try:
             await process.wait()
             await reader
+            while _group_exists(process.pid):
+                await asyncio.sleep(0.01)
         except asyncio.CancelledError:
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
@@ -322,6 +324,27 @@ def _command_headline(command: str, limit: int = 80) -> str:
     if len(headline) <= limit:
         return headline
     return headline[: max(0, limit - 3)] + "..."
+
+
+def _utf8_chunk(data: bytes, limit: int) -> bytes:
+    """Cap UTF-8 output without ending inside a character."""
+    candidate = data[:limit]
+    try:
+        candidate.decode()
+    except UnicodeDecodeError as exc:
+        if exc.reason == "unexpected end of data" and exc.end == len(candidate):
+            candidate = candidate[: exc.start]
+    if candidate:
+        return candidate
+    for end in range(1, len(data) + 1):
+        try:
+            data[:end].decode()
+        except UnicodeDecodeError as exc:
+            if exc.reason != "unexpected end of data" or exc.end != end:
+                return data[:end]
+        else:
+            return data[:end]
+    return data
 
 
 def _group_exists(process_id: int) -> bool:
