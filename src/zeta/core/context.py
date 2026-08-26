@@ -7,6 +7,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil
+from pathlib import Path
 from typing import Any
 
 from .store import ConversationEntry, ConversationStore
@@ -14,6 +15,7 @@ from ..types import (
     CompletionBackend,
     ContentBlock,
     flatten_tool_content,
+    ImageContent,
     Message,
     MessageRole,
     StreamEvent,
@@ -80,7 +82,7 @@ def _strip_thinking(message: Message) -> Message:
     content = [
         block
         for block in message.content
-        if isinstance(block, (TextContent, ToolUseContent))
+        if isinstance(block, (ImageContent, TextContent, ToolUseContent))
     ]
     return Message(
         message.role,
@@ -94,6 +96,20 @@ def _summary_message(message: Message) -> dict[str, Any]:
     """Serialize a message without copying image base64 into a summary prompt."""
 
     value = message.to_dict()
+    content = value.get("content")
+    if isinstance(content, list):
+        for index, block in enumerate(message.content):
+            if not isinstance(block, ImageContent):
+                continue
+            filename = Path(block.path).name if block.path else "clipboard image"
+            size = block.size if block.size is not None else "unknown"
+            content[index] = {
+                "type": "text",
+                "text": (
+                    f"[image attachment] filename={filename} "
+                    f"media_type={block.mime_type} bytes={size}"
+                ),
+            }
     tool_result = value.get("tool_result")
     if not isinstance(tool_result, dict):
         return value

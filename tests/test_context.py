@@ -17,6 +17,7 @@ from zeta.core.store import ConversationStore
 from zeta.types import (
     Message,
     MessageRole,
+    ImageContent,
     RedactedThinkingContent,
     TextContent,
     ToolCall,
@@ -253,6 +254,48 @@ async def test_compaction_summary_replaces_image_base64_with_placeholder(
     assert image_data not in summary_prompt
     assert (
         "[image block] media_type=image/jpeg bytes=3 caption=a test image"
+        in summary_prompt
+    )
+
+
+@pytest.mark.asyncio
+async def test_compaction_summary_replaces_message_image_with_placeholder(
+    context_root: Path,
+) -> None:
+    raw_image = b"\xff\xd8\xffimage bytes"
+    image_data = base64.b64encode(raw_image).decode()
+    store = ConversationStore(context_root)
+    store.append_message(
+        Message(
+            MessageRole.USER,
+            [
+                ImageContent(
+                    image_data, "image/jpeg", "/tmp/reference.png", len(raw_image)
+                )
+            ],
+        )
+    )
+    store.append_message(text(MessageRole.USER, "tail"))
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
+    assembler = ContextAssembler(
+        store,
+        token_budget=90,
+        retained_tail=1,
+        token_counter=lambda message: (
+            100
+            if message.role is MessageRole.USER
+            and any(isinstance(block, ImageContent) for block in message.content)
+            else 1
+        ),
+        backend=backend,
+    )
+
+    await assembler.assemble()
+
+    summary_prompt = backend.calls[0][0][0].content[0].text
+    assert image_data not in summary_prompt
+    assert (
+        "[image attachment] filename=reference.png media_type=image/jpeg bytes=14"
         in summary_prompt
     )
 

@@ -8,6 +8,18 @@ provider APIs (pi-style). No claude/codex CLI or app-server subprocesses.
 Experimental. Isolated from the Wiki app; Wiki may consume it later as a
 dependency behind a flag.
 
+## composer attachments
+
+Use `@"a b.txt"` for a quoted path, or `@path/to/file` for a path-like
+reference. This includes `@./file`, `@../file`, and `@~/file`. Bare words such
+as `@user` and `@dataclass` stay as prompt text. Missing path-like files show
+a notice and block that message.
+
+Use `/paste` to queue a macOS clipboard image for the next message. Attachment
+paths follow the read-tool policy: there is no attachment-specific sandbox;
+absolute paths, home paths, and symlink targets are allowed. Repeated
+references to one resolved path produce one attachment block.
+
 ## Layout
 
 - `src/zeta/` — the package

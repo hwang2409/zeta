@@ -6,16 +6,18 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..types import (
+    SUPPORTED_IMAGE_MEDIA_TYPES,
     ContentBlock,
+    ImageContent,
     Message,
     MessageRole,
     RedactedThinkingContent,
     TextContent,
     ThinkingContent,
+    ToolImageBlock,
     ToolResult,
     ToolSchema,
     ToolUseContent,
-    SUPPORTED_IMAGE_MEDIA_TYPES,
     decoded_image_bytes,
     flatten_tool_content,
     image_description,
@@ -23,9 +25,58 @@ from ..types import (
     image_signature_matches,
 )
 
-
 ANTHROPIC_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 ANTHROPIC_MAX_IMAGE_DIMENSION = 8000
+
+
+def _image_block_from_content(content: ImageContent) -> ToolImageBlock:
+    block: ToolImageBlock = {
+        "type": "image",
+        "data": content.data,
+        "mimeType": content.mime_type,
+    }
+    if content.path is not None:
+        block["path"] = content.path
+    if content.size is not None:
+        block["size"] = content.size
+    return block
+
+
+def _image_wire_block(
+    image: ToolImageBlock,
+) -> tuple[dict[str, Any] | None, str | None]:
+    data = decoded_image_bytes(image)
+    dimensions = image_dimensions(image, data)
+    if image["mimeType"] not in SUPPORTED_IMAGE_MEDIA_TYPES:
+        return None, f"unsupported media type {image['mimeType']}"
+    if data is None:
+        return None, "invalid base64 payload"
+    if len(data) > ANTHROPIC_MAX_IMAGE_BYTES:
+        return None, (
+            f"image is {len(data)} bytes; limit is "
+            f"{ANTHROPIC_MAX_IMAGE_BYTES} bytes"
+        )
+    if not image_signature_matches(image["mimeType"], data):
+        return None, "invalid image data"
+    if dimensions is not None and any(
+        dimension > ANTHROPIC_MAX_IMAGE_DIMENSION for dimension in dimensions
+    ):
+        return None, (
+            f"image dimensions are {dimensions[0]}x{dimensions[1]}; "
+            f"limit is {ANTHROPIC_MAX_IMAGE_DIMENSION}x"
+            f"{ANTHROPIC_MAX_IMAGE_DIMENSION}"
+        )
+    return (
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image["mimeType"],
+                "data": image["data"],
+            },
+        },
+        None,
+    )
 
 
 def _wire_content(blocks: Sequence[ContentBlock]) -> list[dict[str, Any]]:
@@ -33,6 +84,18 @@ def _wire_content(blocks: Sequence[ContentBlock]) -> list[dict[str, Any]]:
     for block in blocks:
         if isinstance(block, TextContent):
             result.append({"type": "text", "text": block.text})
+        elif isinstance(block, ImageContent):
+            image = _image_block_from_content(block)
+            wire, reason = _image_wire_block(image)
+            if wire is not None:
+                result.append(wire)
+            else:
+                result.append(
+                    {
+                        "type": "text",
+                        "text": image_description(image, detailed=True, reason=reason),
+                    }
+                )
         elif isinstance(block, ThinkingContent):
             if not block.signature:
                 continue
@@ -76,41 +139,12 @@ def _wire_tool_result_content(result: ToolResult) -> str | list[dict[str, Any]]:
             )
             continue
         image = block
-        data = decoded_image_bytes(image)
-        dimensions = image_dimensions(image, data)
-        if image["mimeType"] not in SUPPORTED_IMAGE_MEDIA_TYPES:
-            reason = f"unsupported media type {image['mimeType']}"
-        elif data is None:
-            reason = "invalid base64 payload"
-        elif len(data) > ANTHROPIC_MAX_IMAGE_BYTES:
-            reason = (
-                f"image is {len(data)} bytes; limit is "
-                f"{ANTHROPIC_MAX_IMAGE_BYTES} bytes"
-            )
-        elif not image_signature_matches(image["mimeType"], data):
-            reason = "invalid image data"
-        elif dimensions is not None and any(
-            dimension > ANTHROPIC_MAX_IMAGE_DIMENSION for dimension in dimensions
-        ):
-            reason = (
-                f"image dimensions are {dimensions[0]}x{dimensions[1]}; "
-                f"limit is {ANTHROPIC_MAX_IMAGE_DIMENSION}x"
-                f"{ANTHROPIC_MAX_IMAGE_DIMENSION}"
-            )
-        else:
+        wire, reason = _image_wire_block(image)
+        if wire is not None:
             caption = image.get("caption")
             if caption:
                 wire_blocks.append({"type": "text", "text": f"caption: {caption}"})
-            wire_blocks.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": image["mimeType"],
-                        "data": image["data"],
-                    },
-                }
-            )
+            wire_blocks.append(wire)
             has_native_image = True
             continue
         wire_blocks.append(
