@@ -42,6 +42,7 @@ from ..types import (
     ToolTextBlock,
     validate_tool_content_block,
 )
+from ._process import BackgroundTaskRegistry
 
 AbortSignal = ToolAbortSignal
 MAX_STRUCTURED_CONTENT_DEPTH = 32
@@ -289,6 +290,7 @@ class ToolDefinition:
     handler: ToolHandler
     parallel_safe: bool = False
     validate_arguments: bool = True
+    requires_approval: bool = True
 
     def schema(self) -> ToolSchema:
         return {
@@ -306,6 +308,7 @@ def _copy_definition(definition: ToolDefinition) -> ToolDefinition:
         handler=definition.handler,
         parallel_safe=definition.parallel_safe,
         validate_arguments=definition.validate_arguments,
+        requires_approval=definition.requires_approval,
     )
 
 
@@ -359,6 +362,9 @@ class ToolRegistry:
             self.approval_policy.bind_store(approval_store)
         self.max_output_chars = max_output_chars
         self._session_store = session_store
+        self.background_tasks = BackgroundTaskRegistry(
+            session_dir=session_store.session_dir if session_store is not None else None,
+        )
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
         )
@@ -396,6 +402,7 @@ class ToolRegistry:
         schema: Mapping[str, Any] | None = None,
         parallel_safe: bool = False,
         validate_arguments: bool = True,
+        requires_approval: bool = True,
     ) -> ToolDefinition:
         if type(name) is not str or not name:
             raise ValueError("tool name must be a nonempty string")
@@ -419,6 +426,7 @@ class ToolRegistry:
             handler=handler,
             parallel_safe=parallel_safe,
             validate_arguments=validate_arguments,
+            requires_approval=requires_approval,
         )
         self._tools[name] = definition
         return _copy_definition(definition)
@@ -441,7 +449,13 @@ class ToolRegistry:
 
     def bind_session_store(self, store: ConversationStore) -> None:
         self._session_store = store
+        self.background_tasks.bind_session_dir(store.session_dir)
         self.bash_cwd = store.bash_cwd
+
+    async def close(self) -> None:
+        """Stop session-owned background processes."""
+
+        await self.background_tasks.close()
 
     def set_pre_execute_hook(self, hook: ToolHook | None) -> None:
         self.pre_execute_hook = hook
@@ -462,6 +476,8 @@ class ToolRegistry:
         definition = self._tools.get(tool_call.name)
         if definition is None:
             self._abort_approval(tool_call)
+            return None
+        if not definition.requires_approval:
             return None
         if definition.validate_arguments:
             try:
@@ -525,6 +541,7 @@ class ToolRegistry:
             signal_state,
             lambda current: self._next_abort_generation(current, _scope_signal),
             _lifecycle_sink,
+            skip_approval=not definition.requires_approval,
         )
         if gate_result is not None:
             return _normalize_result(

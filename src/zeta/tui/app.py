@@ -46,6 +46,7 @@ from ..types import (
 )
 from .composer import VimCursorShapeConfig, build_key_bindings, history_for
 from .composer import parse_input, status_formatted_text, vim_state_label
+from .background import background_notice
 from .layout import CONTENT_MARGIN, content_width, resume_picker_line
 from .line_buffer import LineBuffer
 from .render import (
@@ -201,6 +202,9 @@ class TUIApp:
         model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
     ) -> None:
         self.loop = loop
+        self.loop.tool_registry.background_tasks.set_notice_sink(
+            lambda message: background_notice(self, message)
+        )
         self._hooks = loop.hooks
         if self._hooks is not None:
             self._hooks.notice_sink = self._print_hook_notice
@@ -251,7 +255,6 @@ class TUIApp:
             lambda renderable: self._print(renderable),
         )
         self._input_queue: asyncio.Queue[str | None] = asyncio.Queue()
-
     @property
     def _transcript_lines(self) -> list[str]:
         """Expose rendered lines for diagnostics while keeping logical units in the widget."""
@@ -304,7 +307,6 @@ class TUIApp:
             vim_mode=self.vim_mode,
             hooks=(() if self._hooks is None else self._hooks.status_entries),
         )
-
     def slash_model(self, args: str) -> str:
         """Show or change the model for future completions."""
 
@@ -339,7 +341,6 @@ class TUIApp:
         if catalog_warning is not None:
             return f"model: {model} ({catalog_warning})"
         return f"model: {model}"
-
     def slash_vim(self, args: str) -> str:
         requested = args.strip().lower()
         if not args:
@@ -359,7 +360,6 @@ class TUIApp:
             session.app.vi_state.reset()
         self._invalidate_prompt()
         return f"vim mode: {'on' if self.vim_mode else 'off'}"
-
     def _start_model_catalog_load(self) -> None:
         if self._model_catalog_task is not None:
             return
@@ -490,7 +490,6 @@ class TUIApp:
                     self._active_task = None
         self._present_pending_approvals()
         return True
-
     def _prompt_style(self) -> Style:
         focused = get_app().current_buffer.name == "DEFAULT_BUFFER"
         style = self._prompt_styles.get(focused)
@@ -584,6 +583,7 @@ class TUIApp:
             spinner_active=self._spinner_active,
             model_window=self.loop.context_assembler.token_budget,
             vim_state=vim_state_label(self.vim_mode),
+            background_count=self.loop.tool_registry.background_tasks.running_count,
         )
         return status_formatted_text(status)
 

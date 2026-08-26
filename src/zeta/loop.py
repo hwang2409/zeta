@@ -208,7 +208,7 @@ class AgentLoop:
         return self._run_turn(user_text)
 
     async def close(self) -> None:
-        """Close session-owned MCP transports."""
+        """Close session-owned transports and background processes."""
 
         if self.hooks is not None:
             self.hooks.stop()
@@ -216,6 +216,7 @@ class AgentLoop:
         if self._mcp_mount is not None:
             await self._mcp_mount.close()
             self._mcp_mount = None
+        await self.tool_registry.background_tasks.close()
 
     def session_start(self) -> None:
         if self.hooks is not None:
