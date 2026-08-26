@@ -103,12 +103,15 @@ async def get_response(
     Private, loopback, link-local, and RFC1918 targets are allowed because zeta
     is a local-first tool. They produce a notice in the returned fetch output.
     The cloud metadata address 169.254.169.254 is always refused.
+    Environment proxies are disabled because they would bypass validated-address
+    connection pinning.
     """
 
     try:
         async with httpx.AsyncClient(
             timeout=HTTP_TIMEOUT_SECONDS,
             follow_redirects=False,
+            trust_env=False,
             headers={"User-Agent": user_agent},
         ) as client:
             current_url = url

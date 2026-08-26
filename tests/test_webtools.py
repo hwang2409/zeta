@@ -15,7 +15,12 @@ from zeta.types import ToolCall
 _ASYNC_CLIENT = httpx.AsyncClient
 
 
-def _mock_client(monkeypatch: pytest.MonkeyPatch, handler):
+def _mock_client(
+    monkeypatch: pytest.MonkeyPatch,
+    handler,
+    *,
+    client_kwargs: dict[str, object] | None = None,
+):
     transport = httpx.MockTransport(handler)
     monkeypatch.setattr(
         fetch_tool.socket,
@@ -24,11 +29,12 @@ def _mock_client(monkeypatch: pytest.MonkeyPatch, handler):
             (fetch_tool.socket.AF_INET, fetch_tool.socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
         ],
     )
-    monkeypatch.setattr(
-        fetch_tool.httpx,
-        "AsyncClient",
-        lambda **kwargs: _ASYNC_CLIENT(transport=transport, **kwargs),
-    )
+    def make_client(**kwargs):
+        if client_kwargs is not None:
+            client_kwargs.update(kwargs)
+        return _ASYNC_CLIENT(transport=transport, **kwargs)
+
+    monkeypatch.setattr(fetch_tool.httpx, "AsyncClient", make_client)
 
 
 async def _execute_fetch(
@@ -306,15 +312,18 @@ async def test_fetch_pins_connection_to_first_validated_address(
         requests.append(request)
         return httpx.Response(200, text="local", request=request)
 
-    _mock_client(monkeypatch, handler)
+    client_kwargs: dict[str, object] = {}
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid")
+    _mock_client(monkeypatch, handler, client_kwargs=client_kwargs)
     monkeypatch.setattr(fetch_tool.socket, "getaddrinfo", getaddrinfo)
     result = await ToolRegistry(tmp_path).execute(
-        ToolCall("fetch-1", "fetch", {"url": "http://example.com/"})
+        ToolCall("fetch-1", "fetch", {"url": "https://example.com/"})
     )
 
     assert result["isError"] is False
     assert lookup_count == 1
-    assert str(requests[0].url) == "http://192.168.1.5/"
+    assert client_kwargs["trust_env"] is False
+    assert str(requests[0].url) == "https://192.168.1.5/"
     assert requests[0].headers["host"] == "example.com"
     assert requests[0].extensions["sni_hostname"] == "example.com"
     assert (
