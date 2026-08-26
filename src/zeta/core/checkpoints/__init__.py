@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Iterable
+from typing import Any
 
 from ...types import Message, MessageRole, TextContent, ToolUseContent
-
-if TYPE_CHECKING:
-    from ..store import ConversationEntry
 
 
 def _now() -> str:
@@ -17,6 +16,73 @@ def _now() -> str:
 
 class ConversationIntegrityError(ValueError):
     """Raised when a session file violates the conversation schema."""
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationEntry:
+    seq: int
+    id: str
+    parent_id: str | None
+    lane: str
+    type: str
+    data: dict[str, Any]
+
+    @property
+    def entry_type(self) -> str:
+        return self.type
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "seq": self.seq,
+            "id": self.id,
+            "parent_id": self.parent_id,
+            "lane": self.lane,
+            "type": self.type,
+            "data": self.data,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ConversationEntry:
+        seq = value.get("seq")
+        entry_id = value.get("id")
+        parent_id = value.get("parent_id")
+        lane = value.get("lane")
+        entry_type = value.get("type")
+        data = value.get("data")
+        if type(seq) is not int:
+            raise ConversationIntegrityError("conversation seq must be an integer")
+        if type(entry_id) is not str or not entry_id:
+            raise ConversationIntegrityError("conversation id must be a nonempty string")
+        if parent_id is not None and (type(parent_id) is not str or not parent_id):
+            raise ConversationIntegrityError(
+                "conversation parent_id must be null or a nonempty string"
+            )
+        if type(lane) is not str or lane != "main":
+            raise ConversationIntegrityError("conversation lane must be 'main'")
+        if type(entry_type) is not str or not entry_type:
+            raise ConversationIntegrityError("conversation type must be a nonempty string")
+        if type(data) is not dict:
+            raise ConversationIntegrityError("conversation data must be an object")
+        normalized_data = dict(data)
+        created_at = normalized_data.get("created_at")
+        if entry_type == "checkpoint" and type(created_at) is str:
+            try:
+                timestamp = datetime.fromisoformat(created_at)
+            except ValueError:
+                pass
+            else:
+                if timestamp.tzinfo is None:
+                    normalized_data["created_at"] = timestamp.replace(
+                        tzinfo=UTC
+                    ).isoformat()
+        return cls(
+            seq=seq,
+            id=entry_id,
+            parent_id=parent_id,
+            lane=lane,
+            type=entry_type,
+            data=normalized_data,
+        )
 
 
 class CheckpointForkMixin:

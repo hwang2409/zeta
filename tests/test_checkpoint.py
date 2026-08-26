@@ -1,11 +1,13 @@
 import json
 from io import StringIO
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 from rich.console import Console
 from rich.text import Text
 
+from zeta.core.checkpoints import CheckpointForkMixin
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationIntegrityError, ConversationStore
@@ -23,6 +25,23 @@ from zeta.types import (
 
 def message(role: MessageRole, text: str) -> Message:
     return Message(role, [TextContent(text)])
+
+
+def test_checkpoint_method_type_hints_resolve_conversation_entry() -> None:
+    methods = (
+        CheckpointForkMixin._validate_checkpoint_or_fork_payload,
+        CheckpointForkMixin._validate_fork_entry,
+        CheckpointForkMixin.append_checkpoint,
+        CheckpointForkMixin.append_fork,
+        CheckpointForkMixin.is_turn_boundary,
+        CheckpointForkMixin.list_checkpoints,
+        CheckpointForkMixin._default_checkpoint_label,
+        CheckpointForkMixin._message_preview,
+        CheckpointForkMixin._resolve_checkpoint,
+    )
+
+    for method in methods:
+        assert get_type_hints(method)
 
 
 def test_checkpoint_and_fork_switch_the_active_branch(tmp_path: Path) -> None:
