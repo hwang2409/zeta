@@ -152,7 +152,10 @@ async def test_fetch_validates_each_redirect_and_uses_final_url_notice(
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        response = responses[str(request.url)]
+        requested_url = (
+            f"{request.url.scheme}://{request.headers['host']}{request.url.path}"
+        )
+        response = responses[requested_url]
         response.request = request
         return response
 
@@ -232,6 +235,92 @@ async def test_fetch_allows_private_target_with_notice_and_blocks_metadata(
     assert "target resolves to a private or loopback address" in allowed["content"][0]["text"]
     assert blocked["isError"] is True
     assert "cloud metadata" in blocked["content"][0]["text"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://[::ffff:169.254.169.254]/",
+        "http://[::169.254.169.254]/",
+    ],
+)
+def test_fetch_blocks_mapped_cloud_metadata_addresses(url: str) -> None:
+    with pytest.raises(ValueError, match="cloud metadata"):
+        fetch_tool._validate_target(url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://[::ffff:192.168.1.5]/",
+        "http://[::192.168.1.5]/",
+    ],
+)
+async def test_fetch_notices_mapped_private_addresses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    result = await _execute_fetch(
+        tmp_path,
+        monkeypatch,
+        httpx.Response(200, headers={"content-type": "text/plain"}, text="local"),
+        arguments={"url": url},
+    )
+
+    assert result["isError"] is False
+    assert (
+        "target resolves to a private or loopback address"
+        in result["content"][0]["text"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_pins_connection_to_first_validated_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lookups = iter(
+        [
+            ("192.168.1.5",),
+            ("93.184.216.34",),
+        ]
+    )
+    lookup_count = 0
+
+    def getaddrinfo(*args, **kwargs):
+        nonlocal lookup_count
+        lookup_count += 1
+        address = next(lookups)[0]
+        return [
+            (
+                fetch_tool.socket.AF_INET,
+                fetch_tool.socket.SOCK_STREAM,
+                6,
+                "",
+                (address, 0),
+            )
+        ]
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text="local", request=request)
+
+    _mock_client(monkeypatch, handler)
+    monkeypatch.setattr(fetch_tool.socket, "getaddrinfo", getaddrinfo)
+    result = await ToolRegistry(tmp_path).execute(
+        ToolCall("fetch-1", "fetch", {"url": "http://example.com/"})
+    )
+
+    assert result["isError"] is False
+    assert lookup_count == 1
+    assert str(requests[0].url) == "http://192.168.1.5/"
+    assert requests[0].headers["host"] == "example.com"
+    assert requests[0].extensions["sni_hostname"] == "example.com"
+    assert (
+        "target resolves to a private or loopback address"
+        in result["content"][0]["text"]
+    )
 
 
 @pytest.mark.asyncio
@@ -333,6 +422,28 @@ async def test_websearch_parses_saved_duckduckgo_fixture(
             }
         ]
     }
+
+
+@pytest.mark.asyncio
+async def test_websearch_output_keeps_registry_truncation_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = (
+        '<a class="result__a" href="https://example.com/one">First result</a>'
+        '<div class="result__snippet">A short description.</div>'
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/html"}, text=body)
+
+    _mock_client(monkeypatch, handler)
+    result = await ToolRegistry(tmp_path, max_output_chars=64).execute(
+        ToolCall("search-1", "websearch", {"query": "zeta"})
+    )
+
+    block = result["content"][0]
+    assert block["truncated"] is True
+    assert block["text"].endswith("\n...[output truncated]")
 
 
 @pytest.mark.asyncio

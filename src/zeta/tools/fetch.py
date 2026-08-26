@@ -32,6 +32,22 @@ _PRIVATE_NETWORKS = (
     ip_network("fe80::/10"),
 )
 _CLOUD_METADATA_ADDRESS = ip_address("169.254.169.254")
+_PRIVATE_TARGET_EXTENSION = "zeta_private_target"
+
+
+def _normalize_address(
+    address: IPv4Address | IPv6Address,
+) -> IPv4Address | IPv6Address:
+    if not isinstance(address, IPv6Address):
+        return address
+    if address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    if address.packed[:12] == b"\x00" * 12 and address not in {
+        IPv6Address("::"),
+        IPv6Address("::1"),
+    }:
+        return IPv4Address(int(address))
+    return address
 
 
 def _target_addresses(url: str) -> tuple[IPv4Address | IPv6Address, ...]:
@@ -39,7 +55,7 @@ def _target_addresses(url: str) -> tuple[IPv4Address | IPv6Address, ...]:
     if hostname is None:
         raise ValueError("URL must use http or https and include a host")
     try:
-        return (ip_address(hostname),)
+        return (_normalize_address(ip_address(hostname)),)
     except ValueError:
         parsed = urlsplit(url)
         try:
@@ -50,14 +66,29 @@ def _target_addresses(url: str) -> tuple[IPv4Address | IPv6Address, ...]:
             )
         except socket.gaierror as exc:
             raise ValueError(f"request failed: could not resolve host {hostname}") from exc
-        return tuple(ip_address(info[4][0]) for info in infos)
+        return tuple(_normalize_address(ip_address(info[4][0])) for info in infos)
+
+
+def _classify_target(
+    addresses: tuple[IPv4Address | IPv6Address, ...],
+) -> bool:
+    if _CLOUD_METADATA_ADDRESS in addresses:
+        raise ValueError("refusing cloud metadata target 169.254.169.254")
+    return any(
+        address in network for address in addresses for network in _PRIVATE_NETWORKS
+    )
 
 
 def _validate_target(url: str) -> bool:
-    addresses = _target_addresses(url)
-    if _CLOUD_METADATA_ADDRESS in addresses:
-        raise ValueError("refusing cloud metadata target 169.254.169.254")
-    return any(address in network for address in addresses for network in _PRIVATE_NETWORKS)
+    return _classify_target(_target_addresses(url))
+
+
+def _host_header(url: str) -> str:
+    return httpx.URL(url).netloc.decode("ascii")
+
+
+def _pinned_url(url: str, address: IPv4Address | IPv6Address) -> str:
+    return str(httpx.URL(url).copy_with(host=str(address)))
 
 
 async def get_response(
@@ -84,11 +115,15 @@ async def get_response(
             redirects_followed = 0
             while True:
                 _validate_url(current_url)
-                _validate_target(current_url)
+                addresses = _target_addresses(current_url)
+                private_target = _classify_target(addresses)
+                address = addresses[0]
                 async with client.stream(
                     "GET",
-                    current_url,
+                    _pinned_url(current_url, address),
                     params=params if redirects_followed == 0 else None,
+                    headers={"Host": _host_header(current_url)},
+                    extensions={"sni_hostname": urlsplit(current_url).hostname},
                 ) as response:
                     if response.is_redirect:
                         location = response.headers.get("location")
@@ -121,8 +156,11 @@ async def get_response(
                         response.status_code,
                         headers=response.headers,
                         content=b"".join(chunks),
-                        request=response.request or httpx.Request("GET", current_url),
-                        extensions=response.extensions,
+                        request=httpx.Request("GET", current_url),
+                        extensions={
+                            **response.extensions,
+                            _PRIVATE_TARGET_EXTENSION: private_target,
+                        },
                     )
     except httpx.TooManyRedirects as exc:
         raise ValueError(
@@ -306,7 +344,7 @@ async def _fetch(
     notices: list[str] = []
     if urlsplit(final_url).scheme == "http":
         notices.append("notice: http URL is not encrypted")
-    if _validate_target(final_url):
+    if response.extensions.get(_PRIVATE_TARGET_EXTENSION, False):
         notices.append("notice: target resolves to a private or loopback address")
     notice = "\n".join(notices)
     if notice:

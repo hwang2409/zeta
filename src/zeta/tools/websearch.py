@@ -9,7 +9,13 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from ..core.abort import AbortSignal
 from ..types import StructuredToolResult
-from .fetch import MAX_RESPONSE_BYTES, get_response, output_block, response_text
+from .fetch import (
+    MAX_OUTPUT_BYTES,
+    MAX_RESPONSE_BYTES,
+    get_response,
+    output_block,
+    response_text,
+)
 from .registry import ToolRegistry, _success_result
 
 DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
@@ -128,13 +134,13 @@ async def _websearch(
     arguments: dict[str, Any],
     _abort_signal: AbortSignal,
 ) -> StructuredToolResult:
-    del registry
     query = arguments["query"]
     max_results = arguments.get("max_results", 8)
     results = await _ddg_search(query, max_results)
     serialized = json.dumps(results, ensure_ascii=False, indent=2)
+    effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
     return _success_result(
-        output_block(serialized),
+        output_block(serialized, limit=effective_limit),
         structured_content={"results": results},
     )
 
