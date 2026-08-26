@@ -281,6 +281,42 @@ def output_block(value: str, *, limit: int = MAX_OUTPUT_BYTES) -> ToolTextBlock:
     return text_block(shown, full_size=len(encoded))
 
 
+def _page_block(
+    notice: str,
+    body: str,
+    *,
+    offset: int,
+    limit: int,
+) -> ToolTextBlock:
+    """Build one readable-text page that fits the provider output limit."""
+
+    full_size_chars = len(body)
+    full_size = len(body.encode("utf-8"))
+    if offset >= full_size_chars:
+        page_end = offset
+    else:
+        page_chars = min(limit, full_size_chars - offset)
+        low = 0
+        high = page_chars
+        while low < high:
+            middle = (low + high + 1) // 2
+            page = body[offset : offset + middle]
+            value = notice + page
+            if len(value) <= limit and len(value.encode("utf-8")) <= limit:
+                low = middle
+            else:
+                high = middle - 1
+        page_end = offset + low
+
+    page = body[offset:page_end]
+    block = text_block(notice + page, full_size=full_size)
+    block["full_size_chars"] = full_size_chars
+    block["truncated"] = page_end < full_size_chars
+    if block["truncated"]:
+        block["next_offset"] = page_end
+    return block
+
+
 def _truncated_error_result(
     message: str, *, full_size: int
 ) -> StructuredToolResult:
@@ -427,6 +463,7 @@ async def _fetch(
 ) -> StructuredToolResult:
     url = _normalize_url(arguments["url"])
     max_bytes = arguments.get("max_bytes", MAX_RESPONSE_BYTES)
+    offset = arguments.get("offset", 0)
     try:
         response = await get_response(
             url,
@@ -452,7 +489,12 @@ async def _fetch(
     if notice:
         notice += "\n\n"
     effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
-    return _success_result(output_block(notice + body, limit=effective_limit))
+    block = _page_block(notice, body, offset=offset, limit=effective_limit)
+    if block["truncated"] and block.get("next_offset", offset) <= offset:
+        return _truncated_error_result(
+            "output limit too small for notice", full_size=len(body.encode("utf-8"))
+        )
+    return _success_result(block)
 
 
 def register(registry: ToolRegistry) -> None:
@@ -463,7 +505,8 @@ def register(registry: ToolRegistry) -> None:
             "Fetch a URL and return readable text. Network access requires approval; "
             "HTTP URLs are allowed with a notice. Private, loopback, link-local, "
             "and RFC1918 targets are allowed with a notice for local-first use; "
-            "the cloud metadata address 169.254.169.254 is refused."
+            "the cloud metadata address 169.254.169.254 is refused. If truncated, "
+            "call again with offset=next_offset to continue."
         ),
         parameters={
             "type": "object",
@@ -473,6 +516,11 @@ def register(registry: ToolRegistry) -> None:
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_RESPONSE_BYTES,
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Readable-text character offset for continuation.",
                 },
             },
             "required": ["url"],

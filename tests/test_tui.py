@@ -949,7 +949,7 @@ def test_render_event_shows_tool_result_truncation_metadata() -> None:
     )
 
     assert rendered is not None
-    assert "[truncated; full_size=8]" in renderable_plain(rendered)
+    assert "[truncated; full_size=8 bytes]" in renderable_plain(rendered)
 
 
 def test_render_event_shows_non_text_tool_block_placeholders() -> None:

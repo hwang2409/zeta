@@ -1,7 +1,8 @@
 """Tool registration and MCP-compatible execution results.
 
 Text blocks always include ``truncated`` and ``full_size``. ``full_size`` is
-the original UTF-8 byte length before a character cap is applied.
+the original UTF-8 byte length before a character cap is applied. Fetch pages
+also include ``full_size_chars`` for their readable-text character length.
 """
 
 from __future__ import annotations
@@ -269,14 +270,16 @@ def _normalize_result(
         if block["type"] != "text":
             content.append(block)
             continue
-        full_size = max(block["full_size"], len(block["text"].encode("utf-8")))
+        full_size = block["full_size"]
         shown = block["text"][:remaining]
         normalized = text_block(shown, full_size=full_size)
         if "annotations" in block:
             normalized["annotations"] = block["annotations"]
-        normalized["truncated"] |= (
-            block["truncated"] or shown != block["text"]
-        )
+        normalized["truncated"] = block["truncated"] or shown != block["text"]
+        if "full_size_chars" in block:
+            normalized["full_size_chars"] = block["full_size_chars"]
+        if "next_offset" in block:
+            normalized["next_offset"] = block["next_offset"]
         remaining -= len(shown)
         content.append(normalized)
     return {**result, "content": content}
@@ -1050,6 +1053,7 @@ def _schema_equal(left: Any, right: Any) -> bool:
 
 
 _SCHEMA_KEYS = {
+    "description",
     "type",
     "properties",
     "required",
@@ -1078,6 +1082,9 @@ def _validate_schema_definition(schema: Mapping[str, Any], path: str) -> None:
         type(expected_type) is not str or expected_type not in _SCHEMA_TYPES
     ):
         raise ValueError(f"unsupported schema type at {path}")
+    description = schema.get("description")
+    if description is not None and type(description) is not str:
+        raise ValueError(f"schema description must be a string at {path}")
     properties = schema.get("properties")
     if properties is not None:
         if not isinstance(properties, Mapping):
