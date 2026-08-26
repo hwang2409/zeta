@@ -41,9 +41,16 @@ class CodexStreamError(CodexBackendError):
 
     code = "stream_error"
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        retry_reason: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.retry_reason = retry_reason
 
 
 __all__ = [

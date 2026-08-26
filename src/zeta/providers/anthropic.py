@@ -601,6 +601,8 @@ async def _decode_response(
         except AnthropicStreamError:
             if message_state == "not-started":
                 raise
+            if message_state == "stopped":
+                return None, False
             return salvage(AnthropicStreamError), True
 
     try:

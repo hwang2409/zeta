@@ -1209,6 +1209,52 @@ async def test_post_start_provider_error_salvages_once(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_error_after_message_stop_is_ignored(tmp_path: Path) -> None:
+    stream = "\n".join(
+        [
+            'data: {"type":"message_start","message":{}}',
+            "",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            "",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"complete"}}',
+            "",
+            'data: {"type":"content_block_stop","index":0}',
+            "",
+            'data: {"type":"message_stop"}',
+            "",
+            'data: {"type":"error","error":{"type":"overloaded_error","message":"duplicate"}}',
+            "",
+        ]
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=stream,
+            request=request,
+        )
+
+    diagnostics_path = tmp_path / "logs" / "stream-diagnostics.jsonl"
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(
+            client=client,
+            token_store=store,
+            diagnostics_path=diagnostics_path,
+        ).complete([], [])
+    ]
+
+    assert [event.type for event in events].count(StreamEventType.MESSAGE_END) == 1
+    assert events[-1].data.get("truncated") is None
+    assert not diagnostics_path.exists()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_sse_error_redacts_bearer_authorization(tmp_path: Path) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

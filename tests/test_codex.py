@@ -770,6 +770,57 @@ async def test_rate_limit_retries_before_response_created(
 
 
 @pytest.mark.asyncio
+async def test_stream_rate_limit_retry_notice_preserves_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=sse(
+                    [
+                        event(
+                            "error",
+                            error={
+                                "type": "rate_limit_error",
+                                "message": "slow down",
+                            },
+                        )
+                    ]
+                ),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(message_stream()),
+            request=request,
+        )
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+        ).complete([], [])
+    ]
+
+    retry = next(item for item in events if item.type is StreamEventType.RETRY)
+    assert len(requests) == 2
+    assert retry.data["text"].endswith("429 rate limited")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_disconnect_after_headers_retries_before_first_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

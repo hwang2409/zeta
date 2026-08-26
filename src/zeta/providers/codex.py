@@ -563,6 +563,11 @@ def _translate_event(
         raise CodexStreamError(
             "Codex response reported an error",
             retryable=error_type in {"overloaded_error", "rate_limit_error"},
+            retry_reason=(
+                error_type
+                if error_type in {"overloaded_error", "rate_limit_error"}
+                else None
+            ),
         )
     if event_type == "response.created":
         if response_state != "not-started":
