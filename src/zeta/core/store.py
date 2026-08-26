@@ -3,90 +3,30 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import json
 import os
 import tempfile
 import uuid
 import warnings
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any
 
-import fcntl
-
-from ..types import Message, MessageRole, ToolCall, ToolUseContent
+from ..types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
 from .todo import TodoItem, parse_todo_items
-
+from .checkpoints import (
+    CheckpointForkMixin,
+    ConversationEntry,
+    ConversationIntegrityError,
+    _now,
+)
 
 SCHEMA = "zeta.conversation.v1"
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
-
-
-class ConversationIntegrityError(ValueError):
-    """Raised when a session file violates the conversation schema."""
-
-
-@dataclass(frozen=True, slots=True)
-class ConversationEntry:
-    seq: int
-    id: str
-    parent_id: str | None
-    lane: str
-    type: str
-    data: dict[str, Any]
-
-    @property
-    def entry_type(self) -> str:
-        return self.type
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "seq": self.seq,
-            "id": self.id,
-            "parent_id": self.parent_id,
-            "lane": self.lane,
-            "type": self.type,
-            "data": self.data,
-        }
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> ConversationEntry:
-        seq = value.get("seq")
-        entry_id = value.get("id")
-        parent_id = value.get("parent_id")
-        lane = value.get("lane")
-        entry_type = value.get("type")
-        data = value.get("data")
-        if type(seq) is not int:
-            raise ConversationIntegrityError("conversation seq must be an integer")
-        if type(entry_id) is not str or not entry_id:
-            raise ConversationIntegrityError("conversation id must be a nonempty string")
-        if parent_id is not None and (type(parent_id) is not str or not parent_id):
-            raise ConversationIntegrityError(
-                "conversation parent_id must be null or a nonempty string"
-            )
-        if type(lane) is not str or lane != "main":
-            raise ConversationIntegrityError("conversation lane must be 'main'")
-        if type(entry_type) is not str or not entry_type:
-            raise ConversationIntegrityError("conversation type must be a nonempty string")
-        if type(data) is not dict:
-            raise ConversationIntegrityError("conversation data must be an object")
-        return cls(
-            seq=seq,
-            id=entry_id,
-            parent_id=parent_id,
-            lane=lane,
-            type=entry_type,
-            data=data,
-        )
-
-
-class ConversationStore:
+class ConversationStore(CheckpointForkMixin):
     def __init__(
         self,
         session_dir: str | Path | None = None,
@@ -201,6 +141,8 @@ class ConversationStore:
         self._validate_entries()
         for entry in self._entries:
             self._validate_entry_payload(entry)
+            if entry.type == "fork":
+                self._validate_fork_entry(entry)
 
         if torn_offset is not None:
             with self.path.open("r+b") as handle:
@@ -445,6 +387,8 @@ class ConversationStore:
             elif entry.type == "warning":
                 if type(entry.data.get("message")) is not str:
                     raise ValueError("warning message must be a string")
+            elif entry.type in {"checkpoint", "fork"}:
+                self._validate_checkpoint_or_fork_payload(entry)
             elif entry.type == "approval_resolution":
                 request_id = entry.data.get("request_id")
                 decision = entry.data.get("decision")

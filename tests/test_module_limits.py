@@ -5,7 +5,8 @@ ROOT = Path(__file__).parents[1] / "src" / "zeta"
 # the codex stream parser is a legitimate provider module at this size.
 MAX_FILE_LINES = 1200
 # Built-in todo state and tool modules keep their layer-specific boundaries.
-MAX_FILES_PER_DIRECTORY = 13
+# Bumped on 2026-08-26 for three concurrent TUI feature modules.
+MAX_FILES_PER_DIRECTORY = 14
 
 
 def test_module_limits() -> None:

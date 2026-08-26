@@ -18,8 +18,6 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
-from prompt_toolkit.layout import Dimension
-from prompt_toolkit.layout.containers import HSplit, VSplit, Window
 from prompt_toolkit.styles import DynamicStyle, Style
 from rich.console import Console, RenderableType
 from rich.padding import Padding
@@ -47,6 +45,7 @@ from ..types import (
     ThinkingContent,
 )
 from .background import background_notice
+from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
     VimCursorShapeConfig,
@@ -57,7 +56,12 @@ from .composer import (
     vim_state_label,
 )
 from .fake_backend import FakeInteractiveBackend
-from .layout import CONTENT_MARGIN, content_width, full_screen_content, resume_picker_line
+from .layout import (
+    CONTENT_MARGIN,
+    content_width,
+    full_screen_content,
+    resume_picker_line,
+)
 from .models import MODEL_CATALOGS, validate_model_name
 from .models import load_model_catalog as _load_model_catalog
 from .render import (
@@ -78,8 +82,8 @@ from .theme import (
     ERROR,
     RICH_THEME,
 )
-from .transcript import TranscriptPresenter, TranscriptWidget
 from .todo import TodoWidget
+from .transcript import TranscriptPresenter, TranscriptWidget
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
@@ -147,7 +151,7 @@ def build_backend(
     raise ValueError(f"unsupported provider: {provider}")
 
 
-class TUIApp(ComposerAttachmentMixin):
+class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
     """Full-screen transcript, persistent composer, and follow-up queue."""
 
     def __init__(
@@ -224,6 +228,7 @@ class TUIApp(ComposerAttachmentMixin):
             lambda renderable: self._print(renderable),
         )
         self._input_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._fork_rebuilt = False
     @property
     def _transcript_lines(self) -> list[str]:
         """Expose rendered lines for diagnostics while keeping logical units in the widget."""
@@ -266,6 +271,7 @@ class TUIApp(ComposerAttachmentMixin):
             tokens_in_current_context=self.loop.context_assembler.token_count,
             compaction_marker_count=self.loop.store.compaction_marker_count(),
             pending_approvals=pending,
+            checkpoint_count=self.loop.store.checkpoint_count(),
             cache_read_input_tokens=(
                 self.loop.context_assembler.cache_read_input_tokens_this_session
             ),
@@ -283,6 +289,7 @@ class TUIApp(ComposerAttachmentMixin):
             hooks=(() if self._hooks is None else self._hooks.status_entries),
             todo_counts=todo_count_tuple(items) if items else None,
         )
+
     def slash_model(self, args: str) -> str:
         """Show or change the model for future completions."""
 
@@ -358,33 +365,6 @@ class TUIApp(ComposerAttachmentMixin):
         finally:
             self._model_catalog_loaded = True
             self._model_catalog_task = None
-
-    async def slash_compact(self) -> str:
-        """Force one compaction through the context assembler."""
-
-        if self.active:
-            return "compact unavailable while a turn is running"
-        before = self.loop.store.compaction_marker_count()
-        try:
-            context = await self.loop.context_assembler.assemble_context(
-                backend=self.loop.backend,
-                force=True,
-            )
-        except Exception as exc:
-            return f"compact failed: {exc}"
-        after = self.loop.store.compaction_marker_count()
-        if after == before:
-            return "compact: nothing to compact"
-        marker = next(
-            entry
-            for entry in reversed(self.loop.store.replay())
-            if entry.type == "compaction"
-        )
-        return (
-            "compacted entries "
-            f"{marker.data['source_seq_start']}–{marker.data['source_seq_end']}; "
-            f"tokens after: {context.token_count}"
-        )
 
     def _present_pending_approvals(self) -> None:
         for request in self.pending_approvals:
@@ -644,7 +624,10 @@ class TUIApp(ComposerAttachmentMixin):
             return
         slash_output = await self._slash_commands.dispatch_async(self, parsed)
         if slash_output is not None:
-            self._print_system(slash_output)
+            if self._fork_rebuilt:
+                self._fork_rebuilt = False
+            else:
+                self._print_system(slash_output)
             return
         model_input = self._slash_commands.input_for_model(parsed)
         user_message = self._prepare_user_message(model_input)

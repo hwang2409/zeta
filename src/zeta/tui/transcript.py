@@ -106,6 +106,19 @@ class TranscriptWidget(UIControl):
     def append_blank(self) -> None:
         self._append_unit(None)
 
+    def clear(self) -> None:
+        """Remove all rendered transcript units."""
+
+        self._units.clear()
+        self._tools.clear()
+        self._render_cache.clear()
+        self._parsed_cache.clear()
+        self._line_locations.clear()
+        self._anchor = None
+        self._scroll_offset = 0
+        self._follow_tail = True
+        self._bump_revision()
+
     def start_tool(
         self, call_id: str, call: ToolCall, renderable: RenderableType
     ) -> None:
@@ -640,3 +653,19 @@ class TranscriptPresenter:
 
     def clear_active_tool_calls(self) -> None:
         self._active_tool_calls.clear()
+
+    def clear(self) -> None:
+        """Reset presentation state before rebuilding the transcript."""
+
+        self._tool_region = None
+        self._tool_region_text = None
+        self._tool_region_call = None
+        self._pending_tool_renders.clear()
+        self._active_tool_calls.clear()
+        self._thinking_live = None
+        self._assistant_live = None
+        self._thinking_unit = None
+        self._assistant_unit = None
+        self._assistant_unit_open = False
+        self._printed_units = False
+        self.transcript.clear()
