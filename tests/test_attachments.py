@@ -202,6 +202,49 @@ async def test_missing_path_like_attachment_blocks_with_notice(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_missing_path_preserves_pending_paste_for_retry(tmp_path: Path) -> None:
+    pending = tmp_path / "clipboard.png"
+    pending.write_bytes(PNG)
+    fixed = tmp_path / "fixed.txt"
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        provider="fake",
+        model="offline",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+    app._pending_attachments.append(pending)
+
+    await app._handle_prompt_value("read @./missing.txt")
+
+    assert app._active_task is None
+    assert app._pending_attachments == [pending]
+    assert notices == ["attachment rejected: file does not exist: " + str(tmp_path / "missing.txt")]
+
+    fixed.write_text("context", encoding="utf-8")
+    await app._handle_prompt_value("read @./fixed.txt")
+    assert app._active_task is not None
+    await app._active_task
+
+    users = [
+        message for message in store.messages() if message.role is MessageRole.USER
+    ]
+    assert len(users) == 1
+    assert [
+        block.path
+        for block in users[0].content
+        if isinstance(block, (ImageContent, TextContent))
+    ] == [
+        None,
+        str(fixed.resolve()),
+        str(pending.resolve()),
+    ]
+    assert app._pending_attachments == []
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
 async def test_deleted_pending_paste_is_dropped_once(tmp_path: Path) -> None:
     pending = tmp_path / "clipboard.png"
     pending.write_bytes(PNG)

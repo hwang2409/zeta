@@ -245,23 +245,23 @@ class ComposerAttachmentMixin:
 
     def _prepare_user_message(self, value: str) -> Message | None:
         try:
-            message = build_user_message(
-                value,
-                self.loop.store.cwd,
-                tuple(self._pending_attachments),
-            )
+            message = build_user_message(value, self.loop.store.cwd)
         except AttachmentError as exc:
-            if not self._pending_attachments:
-                self._print_system(f"attachment rejected: {exc}")
-                return None
-            self._pending_attachments.clear()
-            self._print_system(f"pending attachment dropped: {exc}")
+            self._print_system(f"attachment rejected: {exc}")
+            return None
+
+        valid_pending: list[Path] = []
+        for path in self._pending_attachments:
             try:
-                return build_user_message(value, self.loop.store.cwd)
-            except AttachmentError as retry_exc:
-                self._print_system(f"attachment rejected: {retry_exc}")
-                return None
-        return message
+                build_user_message(value, self.loop.store.cwd, (path,))
+            except AttachmentError as exc:
+                self._print_system(f"pending attachment dropped: {exc}")
+            else:
+                valid_pending.append(path)
+        self._pending_attachments[:] = valid_pending
+        if not valid_pending:
+            return message
+        return build_user_message(value, self.loop.store.cwd, tuple(valid_pending))
 
     def _print_user(self, user: str | Message) -> None:
         self._presenter.reset_assistant_unit()
