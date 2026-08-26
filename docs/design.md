@@ -85,11 +85,12 @@ the harness-native distillation.
 | ZETA-27 | Session ergonomics: `/model` (swap model in place), `/compact` (force compaction now), `--resume` picker listing recent sessions with first-message preview. | ZETA-7, ZETA-19 |
 | ZETA-28 | Native non-text tool content transport: send supported image blocks to Anthropic tool_result natively, use one metadata-rich text fallback for Codex and provider-limit cases, persist image blocks, and render bounded TUI placeholders. Replaces the ZETA-24 flatten fallback. | ZETA-24 |
 | ZETA-29 | Full-screen alternate-buffer TUI parity round 2 (OpenCode chrome): transcript viewport, pinned composer/footer, tool-call cards with truncation affordance, one-line tool receipts, styled thought lines with duration, vertical rhythm, status-bar state, and theme consolidation. Todo widget + inline images out of scope. | ZETA-20 |
+| ZETA-30 | User-configurable lifecycle hooks: load flat `~/.zeta/hooks.toml` at session start and run shell commands at session_start, user_prompt_submit, pre_tool, post_tool, and stop. Pre-tool hooks can deny with exit 2; other hook failures fail open with a dim notice. Hooks receive event JSON on stdin, inherit the environment plus `ZETA_SESSION_ID`, enforce bounded process-group timeouts, and appear in `/status`. Fake-provider runs disable hooks unless `ZETA_HOME` explicitly opts into an isolated home. | ZETA-19 |
 
 ## Deferred / open followups (not yet ticketed)
 
 - **Prompt-cache management**: ZETA-23 landed usage observability, cache-aware accounting, and /status hit rate. Explicit breakpoint tuning and richer observability UI remain deferred.
-- **Sub-agents, hooks, slash-command DSL**: skills half is now ticketed as ZETA-26; sub-agents and hooks stay deferred until ZETA-19's primitive is in and one or two real slash commands surface a shape.
+- **Sub-agents, slash-command DSL**: skills half is now ticketed as ZETA-26; sub-agents and a slash-command DSL remain deferred.
 - **Rejected (not planned)**: third providers beyond Anthropic + Codex; thinking-mode / reasoning-effort controls in the assistant; sandbox for `exec`/`bash` (LLM is trusted; user retains approval policy for consequential ops).
 
 Gate: `uv run pytest -q`. Review flow: same luna implementer -> sol reviewer

@@ -26,6 +26,7 @@ from rich.padding import Padding
 from rich.text import Text
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
+from ..core.hooks import load_hooks_for_provider
 from ..core.project_context import ProjectContext, discover_repo_root, load_project_context
 from ..core.slash import SlashStatus, create_slash_registry
 from ..loop import AgentLoop
@@ -69,10 +70,6 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 RECENT_SESSION_LIMIT = 20
 SPINNER_INTERVAL = 0.2
-
-
-def _validate_model_name(provider: str, model: str) -> None:
-    validate_model_name(provider, model)
 
 
 class FullScreenPromptSession(PromptSession[str]):
@@ -194,6 +191,8 @@ class TUIApp:
         model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
     ) -> None:
         self.loop = loop
+        if loop.hooks is not None:
+            loop.hooks.notice_sink = self._print_hook_notice
         self.provider = provider
         self.model = model
         self.verbose = verbose
@@ -292,6 +291,7 @@ class TUIApp:
             ),
             context_files=self._context_files,
             vim_mode=self.vim_mode,
+            hooks=(() if self.loop.hooks is None else self.loop.hooks.status_entries),
         )
 
     def slash_model(self, args: str) -> str:
@@ -303,7 +303,7 @@ class TUIApp:
             return "model unchanged: cannot change model while a turn or approval is active"
         model = args.strip()
         try:
-            _validate_model_name(self.provider, model)
+            validate_model_name(self.provider, model)
         except ValueError as exc:
             return f"model unchanged: {exc}"
         if not self._model_catalog_loaded:
@@ -797,6 +797,9 @@ class TUIApp:
     def _print_system(self, output: str) -> None:
         self._print_unit(Text(f"system · {output}", style=CHROME))
 
+    def _print_hook_notice(self, output: str) -> None:
+        self._print_unit(Text(f"hook · {output}", style=DIM))
+
     def _start_queued_turn(self) -> None:
         if self._queued:
             user_text = self._queued.popleft()
@@ -986,6 +989,7 @@ class TUIApp:
         self._active_session = session
         if isinstance(session, FullScreenPromptSession):
             self._install_full_screen_layout(session)
+        self.loop.session_start()
         self._present_pending_approvals()
         prompt_task: asyncio.Task[str | None] | None = None
         try:
@@ -1162,6 +1166,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
     max_turns_override = getattr(args, "max_turns", None)
     loop_kwargs: dict[str, Any] = {
         "approval_policy": approval_policy,
+        "hooks": load_hooks_for_provider(home, provider),
         "token_budget": effective_token_budget,
         "retained_tail": metadata.retained_tail,
         "on_completion_success": completion_success,
@@ -1183,13 +1188,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         on_vim_mode_change=lambda enabled: manager.record_vim_mode(metadata, enabled=enabled),
     )
 
-__all__ = [
-    "FakeInteractiveBackend",
-    "TUIApp",
-    "create_app",
-    "build_backend",
-    "main",
-]
+__all__ = ["FakeInteractiveBackend", "TUIApp", "create_app", "build_backend", "main"]
 
 
 def __getattr__(name: str) -> object:

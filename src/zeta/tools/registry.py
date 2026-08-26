@@ -45,7 +45,9 @@ from ..types import (
 
 AbortSignal = ToolAbortSignal
 MAX_STRUCTURED_CONTENT_DEPTH = 32
-ToolHook = Callable[[str, dict[str, Any]], bool | Awaitable[bool] | None]
+ToolHook = Callable[
+    [str, dict[str, Any]], bool | str | Awaitable[bool | str] | None
+]
 ToolHandlerResult = str | StructuredToolResult | ToolResult
 ToolHandler = Callable[
     ..., ToolHandlerResult | Awaitable[ToolHandlerResult]
@@ -440,6 +442,10 @@ class ToolRegistry:
     def bind_session_store(self, store: ConversationStore) -> None:
         self._session_store = store
         self.bash_cwd = store.bash_cwd
+
+    def set_pre_execute_hook(self, hook: ToolHook | None) -> None:
+        self.pre_execute_hook = hook
+        self._approval_gate.hook = hook
 
     def update_bash_cwd(self, cwd: str) -> None:
         if self._session_store is not None:
