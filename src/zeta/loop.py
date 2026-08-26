@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 
 from .core.approval import ApprovalPolicy
 from .core.context import ContextAssembler
@@ -18,7 +18,6 @@ from .types import (
     CompletionBackend,
     ContentBlock,
     ErrorInfo,
-    flatten_tool_content,
     Message,
     MessageRole,
     StreamEvent,
@@ -30,6 +29,7 @@ from .types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    flatten_tool_content,
 )
 
 
@@ -204,8 +204,13 @@ class AgentLoop:
         self.tool_registry.start_batch()
         return True
 
-    def run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
-        return self._run_turn(user_text)
+    def run_turn(
+        self,
+        user_text: str,
+        *,
+        user_message: Message | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        return self._run_turn(user_text, user_message=user_message)
 
     async def close(self) -> None:
         """Close session-owned transports and background processes."""
@@ -326,13 +331,20 @@ class AgentLoop:
                 return result
         return None
 
-    async def _run_turn(self, user_text: str) -> AsyncIterator[StreamEvent]:
+    async def _run_turn(
+        self,
+        user_text: str,
+        *,
+        user_message: Message | None = None,
+    ) -> AsyncIterator[StreamEvent]:
         if self.hooks is not None:
             self.hooks.user_prompt_submit(user_text)
         await self._ensure_mcp_servers()
-        self.store.append_message(
-            Message(MessageRole.USER, [TextContent(user_text)])
-        )
+        if user_message is None:
+            user_message = Message(MessageRole.USER, [TextContent(user_text)])
+        elif user_message.role is not MessageRole.USER:
+            raise ValueError("user_message must have the user role")
+        self.store.append_message(user_message)
         yield StreamEvent(StreamEventType.AGENT_START)
 
         for turn_number in range(1, self.max_turns + 1):

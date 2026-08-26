@@ -9,7 +9,7 @@ import os
 import sys
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from shutil import get_terminal_size
 from typing import Any
@@ -18,6 +18,8 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.layout import Dimension
+from prompt_toolkit.layout.containers import HSplit, VSplit, Window
 from prompt_toolkit.styles import DynamicStyle, Style
 from rich.console import Console, RenderableType
 from rich.padding import Padding
@@ -25,34 +27,46 @@ from rich.text import Text
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.hooks import load_hooks_for_provider
-from ..core.project_context import ProjectContext, discover_repo_root, load_project_context
+from ..core.project_context import (
+    ProjectContext,
+    discover_repo_root,
+    load_project_context,
+)
+from ..core.session import SessionError, SessionManager, env_home
 from ..core.slash import SlashStatus, create_slash_registry
 from ..core.todo import todo_count_tuple
 from ..loop import AgentLoop
-from ..core.session import SessionError, SessionManager, env_home
-from ..providers.anthropic import AnthropicBackend
-from ..providers.anthropic import AnthropicCredentialStore
-from ..providers.codex import CodexBackend
-from ..providers.codex import CodexCredentialStore
+from ..providers.anthropic import AnthropicBackend, AnthropicCredentialStore
+from ..providers.codex import CodexBackend, CodexCredentialStore
 from ..types import (
     CompletionBackend,
     Message,
-    MessageRole,
     StreamEvent,
     StreamEventType,
     TextContent,
     ThinkingContent,
 )
-from .composer import VimCursorShapeConfig, build_key_bindings, history_for
-from .composer import parse_input, status_formatted_text, vim_state_label
 from .background import background_notice
+from .composer import (
+    ComposerAttachmentMixin,
+    VimCursorShapeConfig,
+    build_key_bindings,
+    history_for,
+    parse_input,
+    status_formatted_text,
+    vim_state_label,
+)
+from .fake_backend import FakeInteractiveBackend
 from .layout import CONTENT_MARGIN, content_width, full_screen_content, resume_picker_line
+from .models import MODEL_CATALOGS, validate_model_name
+from .models import load_model_catalog as _load_model_catalog
 from .render import (
     format_status,
-    format_thought,
     render_event,
+    render_markdown,
+    render_thought,
+    render_thought_live,
 )
-from .render import render_markdown, render_thought, render_thought_live
 from .stream import stream_key
 from .theme import (
     ACCENT,
@@ -63,13 +77,9 @@ from .theme import (
     DIM,
     ERROR,
     RICH_THEME,
-    USER_ROLE,
 )
 from .transcript import TranscriptPresenter, TranscriptWidget
 from .todo import TodoWidget
-from .models import MODEL_CATALOGS, load_model_catalog as _load_model_catalog
-from .models import validate_model_name
-
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
@@ -110,48 +120,6 @@ def _zeta_home() -> Path:
     return env_home()
 
 
-class FakeInteractiveBackend(CompletionBackend):
-    """Small streaming backend for offline CLI smoke tests."""
-
-    def __init__(self, *, delay: float = 0.03, model: str = "offline") -> None:
-        self.delay = delay
-        self.model = model
-        self.calls: list[list[Message]] = []
-
-    async def complete(
-        self,
-        messages: Sequence[Message],
-        tool_schemas: Sequence[dict[str, Any]],
-    ) -> AsyncIterator[StreamEvent]:
-        self.calls.append(list(messages))
-        prompt = ""
-        for message in reversed(messages):
-            if message.role is MessageRole.USER:
-                prompt = "".join(
-                    block.text for block in message.content if isinstance(block, TextContent)
-                )
-                break
-        response = (
-            f"you said: {prompt}\n\n"
-            "the fake provider is streaming this response offline.\n"
-            "try queueing another message while this turn runs."
-        )
-        yield StreamEvent(StreamEventType.MESSAGE_START)
-        for chunk in _chunks(response, 9):
-            if self.delay:
-                await asyncio.sleep(self.delay)
-            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=chunk)
-        yield StreamEvent(
-            StreamEventType.MESSAGE_END,
-            message=Message(MessageRole.ASSISTANT, [TextContent(response)]),
-            data={"usage": {"input_tokens": len(prompt), "output_tokens": len(response)}},
-        )
-
-
-def _chunks(value: str, size: int) -> list[str]:
-    return [value[index : index + size] for index in range(0, len(value), size)]
-
-
 def build_backend(
     provider: str,
     model: str | None,
@@ -179,7 +147,7 @@ def build_backend(
     raise ValueError(f"unsupported provider: {provider}")
 
 
-class TUIApp:
+class TUIApp(ComposerAttachmentMixin):
     """Full-screen transcript, persistent composer, and follow-up queue."""
 
     def __init__(
@@ -211,7 +179,9 @@ class TUIApp:
         self.verbose = verbose
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
-        self._queued: deque[str] = deque()
+        self._queued: deque[Message] = deque()
+        self._pending_attachments: list[Path] = []
+        self._replay_rendered = False
         self._exit_requested = False
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
@@ -262,7 +232,12 @@ class TUIApp:
 
     @property
     def queued_messages(self) -> tuple[str, ...]:
-        return tuple(self._queued)
+        return tuple(
+            block.text
+            for message in self._queued
+            for block in message.content[:1]
+            if isinstance(block, TextContent)
+        )
 
     @property
     def active(self) -> bool:
@@ -361,6 +336,7 @@ class TUIApp:
             session.app.vi_state.reset()
         self._invalidate_prompt()
         return f"vim mode: {'on' if self.vim_mode else 'off'}"
+
     def _start_model_catalog_load(self) -> None:
         if self._model_catalog_task is not None:
             return
@@ -586,7 +562,9 @@ class TUIApp:
             vim_state=vim_state_label(self.vim_mode),
             background_count=self.loop.tool_registry.background_tasks.running_count,
         )
-        return status_formatted_text(status)
+        fragments = status_formatted_text(status)
+        fragments.extend(self._pending_attachment_fragments())
+        return fragments
 
     def _full_screen_active(self) -> bool:
         return isinstance(self._active_session, FullScreenPromptSession)
@@ -669,13 +647,18 @@ class TUIApp:
             self._print_system(slash_output)
             return
         model_input = self._slash_commands.input_for_model(parsed)
+        user_message = self._prepare_user_message(model_input)
+        if user_message is None:
+            return
         if self.pending_approvals:
             self._present_pending_approvals()
         elif self.active:
-            self._queued.append(model_input)
+            self._pending_attachments.clear()
+            self._queued.append(user_message)
         else:
-            self._print_user(model_input)
-            self._start_turn(model_input)
+            self._pending_attachments.clear()
+            self._print_user(user_message)
+            self._start_turn(model_input, user_message=user_message)
 
     def _discard_tool_region(self) -> None:
         self._presenter.discard_tool_region()
@@ -785,22 +768,11 @@ class TUIApp:
         self._assistant_text = self._thinking_text = ""
         self._thinking_duration = self._thinking_started_at = None
 
-    def _print_user(self, user_text: str) -> None:
-        self._presenter.reset_assistant_unit()
-        self._print_unit(Text.assemble(("▌ ", USER_ROLE), (user_text, BODY)))
-
     def _print_system(self, output: str) -> None:
         self._print_unit(Text(f"system · {output}", style=CHROME))
 
     def _print_hook_notice(self, output: str) -> None:
         self._print_unit(Text(f"hook · {output}", style=DIM))
-
-    def _start_queued_turn(self) -> None:
-        if self._queued:
-            user_text = self._queued.popleft()
-            self._print_user(user_text)
-            self._print(Text("[queued]", style=DIM))
-            self._start_turn(user_text)
 
     def _prepare_stream_event(self, event: StreamEvent) -> None:
         if event.type is StreamEventType.MESSAGE_START:
@@ -830,7 +802,12 @@ class TUIApp:
             else:
                 self._spinner_reset.clear()
 
-    async def _consume_turn(self, user_text: str) -> None:
+    async def _consume_turn(
+        self,
+        user_text: str,
+        *,
+        user_message: Message | None = None,
+    ) -> None:
         self._abort_requested = False
         self._turn_had_visible_output = False
         self._loop_state = "streaming"
@@ -838,7 +815,10 @@ class TUIApp:
         self._spinner_active = True
         spinner_task = asyncio.create_task(self._pulse_spinner())
         try:
-            async for event in self.loop.run_turn(user_text):
+            async for event in self.loop.run_turn(
+                user_text,
+                user_message=user_message,
+            ):
                 self._update_usage(event)
                 self._prepare_stream_event(event)
                 stop_after_tool = self._handle_tool_event(event)
@@ -982,6 +962,7 @@ class TUIApp:
         if isinstance(session, FullScreenPromptSession):
             self._install_full_screen_layout(session)
         self.loop.session_start()
+        self._replay_attachment_messages()
         self._present_pending_approvals()
         prompt_task: asyncio.Task[str | None] | None = None
         try:
@@ -1023,10 +1004,6 @@ class TUIApp:
                 session.restore_terminal()
             await self.loop.close()
             self._active_session = None
-
-    def _start_turn(self, user_text: str) -> None:
-        self._active_task = asyncio.create_task(self._consume_turn(user_text))
-
 
 def create_app(args: argparse.Namespace) -> TUIApp:
     home = _zeta_home()

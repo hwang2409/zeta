@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import platform
+import re
+import shutil
+import subprocess
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
@@ -19,6 +27,14 @@ from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
 from rich.text import Text
 
+from ..types import (
+    ImageContent,
+    Message,
+    MessageRole,
+    TextContent,
+    image_signature_matches,
+)
+from .theme import BODY, USER_ROLE
 
 SHIFT_ENTER_SEQUENCES = frozenset(
     {
@@ -27,6 +43,269 @@ SHIFT_ENTER_SEQUENCES = frozenset(
         "\x1b[27;6;13~",
     }
 )
+ATTACHMENT_MAX_TEXT_BYTES = 200 * 1024
+ATTACHMENT_TOKEN_RE = re.compile(r'(?<!\S)@(?:"([^"\n]+)"|([^\s]+))')
+
+
+class AttachmentError(ValueError):
+    """Raised when a composer attachment cannot be read or decoded."""
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentRef:
+    token: str
+    path: Path
+
+
+def attachment_refs(value: str, base_dir: str | Path) -> tuple[AttachmentRef, ...]:
+    """Parse local ``@path`` references while preserving their source tokens."""
+
+    base = Path(base_dir)
+    refs: list[AttachmentRef] = []
+    for match in ATTACHMENT_TOKEN_RE.finditer(value):
+        raw_path = match.group(1) or match.group(2)
+        if raw_path is None:
+            continue
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = base / path
+        refs.append(AttachmentRef(match.group(0), path.resolve()))
+    return tuple(refs)
+
+
+def _image_media_type(data: bytes) -> str | None:
+    candidates = (
+        ("image/png", data.startswith(b"\x89PNG\r\n\x1a\n")),
+        ("image/jpeg", data.startswith(b"\xff\xd8\xff")),
+        ("image/gif", data.startswith((b"GIF87a", b"GIF89a"))),
+        (
+            "image/webp",
+            len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP",
+        ),
+    )
+    for media_type, matches in candidates:
+        if matches and image_signature_matches(media_type, data):
+            return media_type
+    return None
+
+
+def _read_attachment(path: Path) -> TextContent | ImageContent:
+    if not path.exists():
+        raise AttachmentError(f"file does not exist: {path}")
+    if not path.is_file():
+        raise AttachmentError(f"directory attachments are not supported: {path}")
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            prefix = handle.read(32)
+    except OSError as exc:
+        raise AttachmentError(f"cannot read {path}: {exc}") from exc
+    media_type = _image_media_type(prefix)
+    try:
+        if media_type is not None:
+            data = path.read_bytes()
+            return ImageContent(
+                base64.b64encode(data).decode("ascii"),
+                media_type,
+                str(path),
+                size,
+            )
+        if size > ATTACHMENT_MAX_TEXT_BYTES:
+            raise AttachmentError(
+                f"text file is {size} bytes; limit is {ATTACHMENT_MAX_TEXT_BYTES} bytes: {path}"
+            )
+        data = path.read_bytes()
+    except OSError as exc:
+        raise AttachmentError(f"cannot read {path}: {exc}") from exc
+    if b"\x00" in data:
+        raise AttachmentError(f"binary file is not an image: {path}")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise AttachmentError(f"binary file is not an image: {path}") from None
+    labeled = f"[file: {path} · {size} bytes]\n{text}"
+    return TextContent(labeled, str(path), size)
+
+
+def build_user_message(
+    value: str,
+    base_dir: str | Path,
+    pending_paths: tuple[Path, ...] = (),
+) -> Message:
+    """Resolve composer references into one durable user message."""
+
+    paths: list[Path] = []
+    for ref in attachment_refs(value, base_dir):
+        if ref.path not in paths:
+            paths.append(ref.path)
+    for path in pending_paths:
+        resolved = path.resolve()
+        if resolved not in paths:
+            paths.append(resolved)
+    blocks = [TextContent(value)]
+    blocks.extend(_read_attachment(path) for path in paths)
+    return Message(MessageRole.USER, blocks)
+
+
+def paste_image(session_dir: str | Path) -> Path:
+    """Save a macOS clipboard image in the session directory."""
+
+    if platform.system() != "Darwin":
+        raise AttachmentError("image paste is only available on macOS")
+    destination = Path(session_dir) / f"clipboard-{uuid4().hex}.png"
+    pngpaste = shutil.which("pngpaste")
+    if pngpaste is not None:
+        result = subprocess.run(
+            [pngpaste, str(destination)],
+            capture_output=True,
+            check=False,
+        )
+    else:
+        script = """
+use framework "AppKit"
+on run argv
+    set destination to item 1 of argv
+    set imageData to current application's NSPasteboard's generalPasteboard()'s dataForType:(current application's NSPasteboardTypePNG)
+    if imageData is missing value then return "empty"
+    imageData's writeToFile:destination atomically:true
+    return "ok"
+end run
+"""
+        result = subprocess.run(
+            ["osascript", "-e", script, str(destination)],
+            capture_output=True,
+            check=False,
+        )
+    if result.returncode != 0 or not destination.is_file():
+        destination.unlink(missing_ok=True)
+        raise AttachmentError("clipboard does not contain an image")
+    try:
+        if not destination.read_bytes():
+            raise AttachmentError("clipboard does not contain an image")
+    except OSError as exc:
+        destination.unlink(missing_ok=True)
+        raise AttachmentError(f"cannot read clipboard image: {exc}") from exc
+    return destination
+
+
+class ComposerAttachmentMixin:
+    """Attachment behavior shared by the TUI composition root."""
+
+    @staticmethod
+    def _display_attachment_path(path: Path) -> str:
+        value = str(path)
+        if len(value) <= 80:
+            return value
+        return f".../{path.name}"[-80:]
+
+    def slash_paste(self, args: str) -> str:
+        if args.strip():
+            return "paste unavailable: /paste does not take arguments"
+        try:
+            path = paste_image(self.loop.store.session_dir)
+            attachment = build_user_message(
+                "paste", self.loop.store.cwd, (path,)
+            ).content[1]
+        except AttachmentError as exc:
+            return f"paste unavailable: {exc}"
+        if not isinstance(attachment, ImageContent):
+            return "paste unavailable: clipboard image could not be decoded"
+        self._pending_attachments.append(path)
+        return f"pending image: {path} · {attachment.size or 0} bytes"
+
+    def _pending_attachment_fragments(self) -> FormattedText:
+        fragments: FormattedText = []
+        for path in self._pending_attachments:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            label = self._display_attachment_path(path)
+            fragments.append(
+                (
+                    "class:status-bar",
+                    f"\n[pending attachment: {label} · {size} bytes]",
+                )
+            )
+        return fragments
+
+    def _prepare_user_message(self, value: str) -> Message | None:
+        try:
+            message = build_user_message(
+                value,
+                self.loop.store.cwd,
+                tuple(self._pending_attachments),
+            )
+        except AttachmentError as exc:
+            self._print_system(f"attachment rejected: {exc}")
+            return None
+        return message
+
+    def _print_user(self, user: str | Message) -> None:
+        self._presenter.reset_assistant_unit()
+        if isinstance(user, str):
+            self._print_unit(Text.assemble(("▌ ", USER_ROLE), (user, BODY)))
+            return
+        prompt = next(
+            (
+                block.text
+                for block in user.content
+                if isinstance(block, TextContent) and block.path is None
+            ),
+            "",
+        )
+        rendered = Text.assemble(("▌ ", USER_ROLE), (prompt, BODY))
+        for block in user.content:
+            if isinstance(block, TextContent) and block.path is not None:
+                label = self._display_attachment_path(Path(block.path))
+                rendered.append(
+                    f"\n  file · {label} · {block.size or 0} bytes",
+                    style="dim",
+                )
+            elif isinstance(block, ImageContent):
+                label = self._display_attachment_path(Path(block.path)) if block.path else "clipboard"
+                rendered.append(
+                    f"\n  image · {label} · {block.size or 0} bytes",
+                    style="dim",
+                )
+        self._print_unit(rendered)
+
+    def _replay_attachment_messages(self) -> None:
+        if self._replay_rendered:
+            return
+        self._replay_rendered = True
+        for entry in self.loop.store.replay():
+            if entry.type != "message":
+                continue
+            message = Message.from_dict(entry.data["message"])
+            if message.role is MessageRole.USER and any(
+                isinstance(block, (ImageContent, TextContent)) and block.path is not None
+                for block in message.content
+            ):
+                self._print_user(message)
+
+    def _start_queued_turn(self) -> None:
+        if not self._queued:
+            return
+        user_message = self._queued.popleft()
+        user_text = next(
+            block.text
+            for block in user_message.content
+            if isinstance(block, TextContent) and block.path is None
+        )
+        self._print_user(user_message)
+        self._print(Text("[queued]", style="dim"))
+        self._start_turn(user_text, user_message=user_message)
+
+    def _start_turn(
+        self,
+        user_text: str,
+        *,
+        user_message: Message | None = None,
+    ) -> None:
+        self._active_task = asyncio.create_task(
+            self._consume_turn(user_text, user_message=user_message)
+        )
 
 
 class VimCursorShapeConfig(CursorShapeConfig):

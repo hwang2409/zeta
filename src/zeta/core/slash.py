@@ -36,6 +36,8 @@ class SlashSession(Protocol):
 
     def slash_vim(self, args: str) -> str: ...
 
+    def slash_paste(self, args: str) -> str: ...
+
     async def slash_compact(self) -> str: ...
 
 
@@ -165,6 +167,10 @@ async def _run_compact(session: SlashSession, args: str) -> str:
     return await session.slash_compact()
 
 
+def _run_paste(session: SlashSession, args: str) -> str:
+    return session.slash_paste(args)
+
+
 def create_slash_registry() -> SlashCommandRegistry:
     """Create the built-in registry."""
 
@@ -172,5 +178,6 @@ def create_slash_registry() -> SlashCommandRegistry:
     registry.register(SlashCommand("status", _run_status))
     registry.register(SlashCommand("model", _run_model))
     registry.register(SlashCommand("vim", _run_vim))
+    registry.register(SlashCommand("paste", _run_paste))
     registry.register(SlashCommand("compact", _run_compact))
     return registry

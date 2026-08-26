@@ -8,13 +8,16 @@ from typing import Any
 
 from ..types import (
     ContentBlock,
-    flatten_tool_content,
+    ImageContent,
     Message,
     MessageRole,
     TextContent,
     ThinkingContent,
+    ToolImageBlock,
     ToolSchema,
     ToolUseContent,
+    flatten_tool_content,
+    image_description,
 )
 from .codex_errors import CodexHTTPError
 
@@ -24,6 +27,24 @@ def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str
     for block in blocks:
         if isinstance(block, TextContent):
             result.append({"type": "output_text" if output else "input_text", "text": block.text})
+        elif isinstance(block, ImageContent):
+            if output:
+                raise CodexHTTPError("image content is not valid assistant output")
+            image: ToolImageBlock = {
+                "type": "image",
+                "data": block.data,
+                "mimeType": block.mime_type,
+            }
+            if block.path is not None:
+                image["path"] = block.path
+            if block.size is not None:
+                image["size"] = block.size
+            result.append(
+                {
+                    "type": "input_text",
+                    "text": image_description(image, detailed=True),
+                }
+            )
         elif isinstance(block, ThinkingContent):
             if output:
                 reasoning: dict[str, Any] = {

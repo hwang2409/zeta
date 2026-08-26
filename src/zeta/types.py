@@ -6,16 +6,14 @@ import base64
 import binascii
 import math
 import struct
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import (
     Any,
-    AsyncIterator,
     Literal,
-    Mapping,
     NotRequired,
     Protocol,
-    Sequence,
     TypedDict,
 )
 
@@ -32,6 +30,7 @@ class MessageRole(StrEnum):
 
 class ContentType(StrEnum):
     TEXT = "text"
+    IMAGE = "image"
     THINKING = "thinking"
     REDACTED_THINKING = "redacted_thinking"
     TOOL_USE = "tool_use"
@@ -40,13 +39,44 @@ class ContentType(StrEnum):
 @dataclass(frozen=True, slots=True)
 class TextContent:
     text: str
+    path: str | None = None
+    size: int | None = None
 
     @property
     def type(self) -> ContentType:
         return ContentType.TEXT
 
     def to_dict(self) -> dict[str, Any]:
-        return {"type": self.type.value, "text": self.text}
+        result: dict[str, Any] = {"type": self.type.value, "text": self.text}
+        if self.path is not None:
+            result["path"] = self.path
+        if self.size is not None:
+            result["size"] = self.size
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class ImageContent:
+    data: str
+    mime_type: str
+    path: str | None = None
+    size: int | None = None
+
+    @property
+    def type(self) -> ContentType:
+        return ContentType.IMAGE
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "type": self.type.value,
+            "data": self.data,
+            "mimeType": self.mime_type,
+        }
+        if self.path is not None:
+            result["path"] = self.path
+        if self.size is not None:
+            result["size"] = self.size
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +188,8 @@ class ToolImageBlock(TypedDict):
     caption: NotRequired[str]
     width: NotRequired[int]
     height: NotRequired[int]
+    path: NotRequired[str]
+    size: NotRequired[int]
     annotations: NotRequired[ToolAnnotations]
 
 
@@ -236,7 +268,15 @@ def validate_tool_content_block(index: int, block: object) -> ToolContentBlock:
         return normalized
     if block_type == "image":
         required_keys = {"type", "data", "mimeType"}
-        allowed_keys = {*required_keys, "annotations", "caption", "width", "height"}
+        allowed_keys = {
+            *required_keys,
+            "annotations",
+            "caption",
+            "width",
+            "height",
+            "path",
+            "size",
+        }
         if not required_keys <= set(block) or not set(block) <= allowed_keys:
             raise ValueError(f"{prefix} has an invalid image shape")
         if type(block.get("data")) is not str:
@@ -260,13 +300,16 @@ def validate_tool_content_block(index: int, block: object) -> ToolContentBlock:
             "data": block["data"],
             "mimeType": block["mimeType"],
         }
-        for key in ("caption", "width", "height"):
+        for key in ("caption", "path", "width", "height", "size"):
             if key not in block:
                 continue
             value = block[key]
             if key == "caption":
                 if type(value) is not str:
                     raise ValueError(f"{prefix}.caption must be a string")
+            elif key == "path":
+                if type(value) is not str or not value:
+                    raise ValueError(f"{prefix}.path must be a nonempty string")
             elif type(value) is not int or value < 1:
                 raise ValueError(f"{prefix}.{key} must be a positive integer")
             normalized_image[key] = value
@@ -487,6 +530,9 @@ def image_description(
     if dimensions:
         parts.append(f"dimensions={dimensions[0]}x{dimensions[1]}")
     parts.append(f"bytes={len(data) if data is not None else 'unknown'}")
+    path = block.get("path")
+    if path:
+        parts.append(f"path={path}")
     caption = block.get("caption")
     if caption:
         parts.append(f"caption={caption}")
@@ -552,7 +598,37 @@ def content_from_dict(value: Mapping[str, Any]) -> ContentBlock:
         text = value.get("text")
         if type(text) is not str:
             raise ValueError("text content text must be a string")
-        return TextContent(text)
+        path = value.get("path")
+        size = value.get("size")
+        if path is not None and (type(path) is not str or not path):
+            raise ValueError("text content path must be a nonempty string")
+        if size is not None and (type(size) is not int or size < 1):
+            raise ValueError("text content size must be a positive integer")
+        if (path is None) != (size is None):
+            raise ValueError("text content path and size must be provided together")
+        return TextContent(text, path, size)
+    if content_type is ContentType.IMAGE:
+        data = value.get("data")
+        mime_type = value.get("mimeType")
+        path = value.get("path")
+        size = value.get("size")
+        if type(data) is not str or not data:
+            raise ValueError("image content data must be nonempty base64")
+        if type(mime_type) is not str or not mime_type:
+            raise ValueError("image content mimeType must be nonempty")
+        try:
+            decoded = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("image content data must be valid base64") from None
+        if not image_signature_matches(mime_type, decoded):
+            raise ValueError(
+                f"image content data does not match media type {mime_type}"
+            )
+        if path is not None and (type(path) is not str or not path):
+            raise ValueError("image content path must be a nonempty string")
+        if size is not None and (type(size) is not int or size < 1):
+            raise ValueError("image content size must be a positive integer")
+        return ImageContent(data, mime_type, path, size)
     if content_type is ContentType.THINKING:
         text = value.get("text")
         if type(text) is not str:
