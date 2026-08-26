@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -255,10 +256,16 @@ class TranscriptWidget(UIControl):
             for line in rendered_lines:
                 content = self._strip_padding(line)
                 offset = source.find(content, source_offset)
+                matched_length = len(content)
                 if offset < 0:
-                    offset = source_offset
+                    match = re.search(r"[\w]+(?:[-'][\w]+)*", content)
+                    if match is not None:
+                        offset = source.find(match.group(), source_offset)
+                        matched_length = len(match.group())
+                    if offset < 0:
+                        offset = source_offset
                 raw_lines.append((line, unit, offset))
-                source_offset = offset + len(content)
+                source_offset = offset + matched_length
         while raw_lines and not raw_lines[0][0].strip():
             raw_lines.pop(0)
         return [(unit, text_offset) for _, unit, text_offset in raw_lines]
@@ -389,6 +396,8 @@ class TranscriptPresenter:
         self._tool_region_call: ToolCall | None = None
         self._thinking_live: Live | None = None
         self._thinking_unit: _TranscriptUnit | None = None
+        self._assistant_live: Live | None = None
+        self._assistant_unit: _TranscriptUnit | None = None
 
     @property
     def tool_region(self) -> Live | None:
@@ -422,16 +431,56 @@ class TranscriptPresenter:
     def print_assistant(self, renderable: RenderableType | None) -> bool:
         if renderable is None:
             return False
-        if not self._assistant_unit_open:
-            self.print_unit(renderable)
-            self._assistant_unit_open = True
-        else:
-            self.print(renderable)
+        self.update_assistant(renderable)
         plain = getattr(renderable, "plain", None)
         return plain is None or bool(plain.strip())
 
+    def update_assistant(self, rendered: RenderableType) -> None:
+        """Replace the one mutable unit used by an in-flight assistant message."""
+
+        if self._full_screen_active():
+            if self._assistant_unit is None:
+                self._assistant_unit = self.print_unit(rendered)
+            else:
+                self._assistant_unit = self.transcript.replace(
+                    self._assistant_unit, rendered
+                )
+        else:
+            if self._assistant_live is None:
+                self._assistant_live = Live(
+                    Padding(rendered, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN)),
+                    console=self.console,
+                    transient=True,
+                    refresh_per_second=20,
+                )
+                self._assistant_live.start()
+            else:
+                self._assistant_live.update(
+                    Padding(rendered, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN))
+                )
+        self._assistant_unit_open = True
+
+    def finish_assistant(self, rendered: RenderableType) -> None:
+        """Commit the completed assistant message into its existing unit."""
+
+        if self._full_screen_active():
+            if self._assistant_unit is None:
+                self._assistant_unit = self.print_unit(rendered)
+            else:
+                self._assistant_unit = self.transcript.replace(
+                    self._assistant_unit, rendered
+                )
+        else:
+            if self._assistant_live is not None:
+                self._assistant_live.stop()
+                self._assistant_live = None
+            self.print_unit(rendered)
+        self._assistant_unit = None
+        self._assistant_unit_open = False
+
     def reset_assistant_unit(self) -> None:
         self._assistant_unit_open = False
+        self._assistant_unit = None
 
     def start_thinking(self, rendered: Text) -> None:
         self.reset_assistant_unit()

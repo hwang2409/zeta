@@ -48,14 +48,12 @@ from .composer import VimCursorShapeConfig, build_key_bindings, history_for
 from .composer import parse_input, status_formatted_text, vim_state_label
 from .background import background_notice
 from .layout import CONTENT_MARGIN, content_width, resume_picker_line
-from .line_buffer import LineBuffer
 from .render import (
-    MarkdownStream,
     format_status,
     format_thought,
     render_event,
 )
-from .render import render_thought, render_thought_live
+from .render import render_markdown, render_thought, render_thought_live
 from .stream import stream_key
 from .theme import (
     ACCENT,
@@ -217,11 +215,11 @@ class TUIApp:
         self._exit_requested = False
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
-        self._assistant_lines = LineBuffer()
+        self._assistant_text = ""
+        self._assistant_message_finished = False
         self._thinking_text = ""
         self._thinking_duration: float | None = None
         self._thinking_started_at: float | None = None
-        self._markdown_stream = MarkdownStream()
         self._stream_kind: str | None = None
         self._stream_identity: tuple[str, object] | None = None
         self._partial = ""
@@ -594,9 +592,6 @@ class TUIApp:
         if renderable is not None:
             self._transcript.append(renderable)
 
-    def _append_transcript_blank(self) -> None:
-        self._presenter.append_blank()
-
     def _print(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
             if self._full_screen_active():
@@ -606,10 +601,6 @@ class TUIApp:
 
     def _print_unit(self, renderable: RenderableType | None) -> None:
         self._presenter.print_unit(renderable)
-
-    def _print_assistant(self, renderable: RenderableType | None) -> None:
-        if self._presenter.print_assistant(renderable):
-            self._turn_had_visible_output = True
 
     def _handle_tool_event(self, event: StreamEvent) -> bool:
         if event.type is StreamEventType.TOOL_APPROVAL_START:
@@ -691,23 +682,18 @@ class TUIApp:
         return self._presenter.tool_region
 
     def _print_committed(self, lines: list[str], *, thinking: bool = False) -> None:
+        value = "\n".join(lines)
         if thinking:
-            value = "\n".join(lines)
             if value:
                 self._presenter.finish_thinking(
                     render_thought(value, self._thinking_duration)
                 )
                 self._turn_had_visible_output = True
             return
-        for line in lines:
-            if not line:
-                if self._full_screen_active():
-                    self._append_transcript_blank()
-                else:
-                    self.console.print()
-                continue
-            for renderable in self._markdown_stream.consume(line):
-                self._print_assistant(renderable)
+        if value:
+            self._assistant_text += value
+            self._presenter.update_assistant(Text(self._assistant_text, style=BODY))
+            self._turn_had_visible_output |= bool(value.strip())
 
     def _update_usage(self, event: StreamEvent) -> None:
         usage = event.data.get("usage")
@@ -719,23 +705,38 @@ class TUIApp:
         get_app().invalidate()
 
     def _flush_stream_kind(self) -> None:
-        if self._stream_kind in {"thinking", "redacted-thinking"}:
-            if self._thinking_text:
-                self._print_committed([self._thinking_text], thinking=True)
-        elif self._stream_kind == "assistant":
-            self._print_committed(self._assistant_lines.flush())
+        if self._stream_kind in {"thinking", "redacted-thinking"} and self._thinking_text:
+            self._print_committed([self._thinking_text], thinking=True)
+        elif self._stream_kind == "assistant" and self._assistant_text:
+            self._presenter.finish_assistant(render_markdown(self._assistant_text))
+            self._assistant_message_finished = True
+            self._assistant_text = ""
         self._stream_kind = self._stream_identity = None
         self._partial = self._thinking_text = ""
-        self._thinking_duration = None
-        self._thinking_started_at = None
+        self._thinking_duration = self._thinking_started_at = None
 
     def _flush_markdown(self) -> None:
-        for renderable in self._markdown_stream.flush():
-            self._print_assistant(renderable)
+        if self._assistant_text: self._presenter.finish_assistant(render_markdown(self._assistant_text)); self._assistant_text = ""
+
+    def _finish_message(self, event: StreamEvent) -> None:
+        if self._assistant_message_finished:
+            return
+        value = self._assistant_text or "".join(
+            block.text
+            for block in (event.message.content if event.message is not None else ())
+            if isinstance(block, TextContent)
+        )
+        if value and self._stream_kind in {"assistant", None}:
+            self._presenter.finish_assistant(render_markdown(value))
+            self._turn_had_visible_output |= bool(value.strip())
+            self._assistant_message_finished = True
+        elif self._stream_kind in {"thinking", "redacted-thinking"}:
+            self._flush_stream_kind()
+        self._stream_kind = self._stream_identity = None
+        self._reset_stream_buffers()
+
     def _flush_pending_stream(self) -> None:
-        self._flush_stream_kind()
-        self._flush_markdown()
-        self._presenter.reset_assistant_unit()
+        self._flush_stream_kind(); self._flush_markdown(); self._presenter.reset_assistant_unit()
 
     def _consume_text(self, event: StreamEvent) -> None:
         incoming_kind, incoming_identity = stream_key(event)
@@ -769,25 +770,17 @@ class TUIApp:
             self._partial = self._thinking_text
             self._presenter.update_thinking(render_thought_live(self._thinking_text))
             return
-        buffer = self._assistant_lines
-        committed = buffer.feed(value)
-        self._partial = buffer.value
-        self._print_committed(committed, thinking=thinking)
-
-    def _finish_stream(self) -> None:
-        self._flush_pending_stream()
-        self._reset_stream_state()
+        self._assistant_text += value
+        self._partial = self._assistant_text
+        self._presenter.update_assistant(Text(self._assistant_text, style=BODY))
+        self._turn_had_visible_output |= bool(value.strip())
 
     def _reset_stream_state(self) -> None:
-        self._reset_stream_buffers()
-        self._partial = ""
-        self._streaming = False
+        self._reset_stream_buffers(); self._partial = ""; self._streaming = False
 
     def _reset_stream_buffers(self) -> None:
-        self._assistant_lines.value = ""
-        self._thinking_text = ""
-        self._thinking_duration = None
-        self._thinking_started_at = None
+        self._assistant_text = self._thinking_text = ""
+        self._thinking_duration = self._thinking_started_at = None
 
     def _print_user(self, user_text: str) -> None:
         self._presenter.reset_assistant_unit()
@@ -807,6 +800,12 @@ class TUIApp:
             self._start_turn(user_text)
 
     def _prepare_stream_event(self, event: StreamEvent) -> None:
+        if event.type is StreamEventType.MESSAGE_START:
+            self._flush_pending_stream()
+            self._assistant_message_finished = False
+            return
+        if event.type is StreamEventType.MESSAGE_END:
+            return
         if event.type is not StreamEventType.MESSAGE_UPDATE:
             self._flush_pending_stream()
             return
@@ -857,6 +856,7 @@ class TUIApp:
                 elif event.type is StreamEventType.COMPACTION_END:
                     self._loop_state = "streaming"
                 elif event.type is StreamEventType.MESSAGE_END:
+                    self._finish_message(event)
                     self._streaming = False
                 elif event.type is StreamEventType.AGENT_END:
                     self._reset_stream_state()
@@ -887,12 +887,12 @@ class TUIApp:
                 if event.type is StreamEventType.TOOL_EXECUTION_END and stop_after_tool:
                     break
         except asyncio.CancelledError:
-            self._finish_stream()
+            self._flush_pending_stream(); self._reset_stream_state()
             self._loop_state = "interrupted"
             self._print_unit(Text("[aborted]", style=ERROR))
             raise
         except Exception as exc:
-            self._finish_stream()
+            self._flush_pending_stream(); self._reset_stream_state()
             self._loop_state = "idle"
             self._print_unit(Text(f"[error] {exc}", style=ERROR))
         finally:
