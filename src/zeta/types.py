@@ -147,7 +147,11 @@ class ToolUseContent:
 
 
 ContentBlock = (
-    ImageContent | TextContent | ThinkingContent | RedactedThinkingContent | ToolUseContent
+    ImageContent
+    | TextContent
+    | ThinkingContent
+    | RedactedThinkingContent
+    | ToolUseContent
 )
 TextBlock = TextContent
 ThinkingBlock = ThinkingContent

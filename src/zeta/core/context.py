@@ -102,9 +102,7 @@ def _summary_message(message: Message) -> dict[str, Any]:
             if not isinstance(block, ImageContent):
                 continue
             filename = Path(block.path).name if block.path else "clipboard image"
-            size = block.size
-            if size is None:
-                size = "unknown"
+            size = block.size if block.size is not None else "unknown"
             content[index] = {
                 "type": "text",
                 "text": (
