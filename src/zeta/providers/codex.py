@@ -821,7 +821,11 @@ def _translate_delta(
             block.text += delta
             item.raw_text += delta
             item.thinking += delta
-            return StreamEvent(StreamEventType.MESSAGE_UPDATE, content=ThinkingContent(delta))
+            return StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=ThinkingContent(delta),
+                data={"index": (index, "raw", content_index)},
+            )
         summary_index = payload.get("summary_index")
         if type(summary_index) is not int or summary_index < 0:
             raise CodexStreamError("Codex reasoning summary index is invalid")
@@ -840,7 +844,11 @@ def _translate_delta(
         block.text += delta
         item.summary_text += delta
         item.thinking += delta
-        return StreamEvent(StreamEventType.MESSAGE_UPDATE, content=ThinkingContent(delta))
+        return StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=ThinkingContent(delta),
+            data={"index": (index, "summary", summary_index)},
+        )
     content_index = _content_index(payload)
     expected_kind = (
         "refusal" if event_type == "response.refusal.delta" else "output_text"

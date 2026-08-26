@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
 import pty
 import re
@@ -36,6 +38,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.providers.anthropic import AnthropicBackend, AnthropicCredentialStore, OAuthTokens
+from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
 from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.composer import (
@@ -46,12 +49,13 @@ from zeta.tui.composer import (
 from zeta.tui.layout import content_width
 from zeta.tui.render import (
     MarkdownStream,
-    collapse_thought,
     format_status,
     format_thought,
     render_code,
     render_event,
     render_line,
+    render_thought,
+    render_thought_live,
     render_tool_progress,
     tool_render_mode,
     _render_tool_output,
@@ -92,6 +96,128 @@ def _contains_background_sgr(value: str) -> bool:
         for sequence in re.findall(r"\x1b\[([0-9;]*)m", value)
         for parameter in sequence.split(";")
     )
+
+
+def _codex_access_token() -> str:
+    def encode(value: object) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+    return ".".join(
+        (
+            encode({"alg": "none"}),
+            encode(
+                {
+                    "exp": 4_000_000_000,
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "account-test"
+                    },
+                }
+            ),
+            encode({"signature": "fixture"}),
+        )
+    )
+
+
+def _codex_sse(events: list[dict[str, object]]) -> str:
+    return "".join(
+        f"event: {value['type']}\ndata: {json.dumps(value)}\n\n" for value in events
+    )
+
+
+def _codex_event(event_type: str, **values: object) -> dict[str, object]:
+    return {"type": event_type, **values}
+
+
+def _codex_reasoning_events(items: list[tuple[str, str]]) -> list[dict[str, object]]:
+    events = [_codex_event("response.created", response={"id": "response-test"})]
+    for index, (summary, raw) in enumerate(items):
+        item_id = f"reasoning-{index}"
+        events.append(
+            _codex_event(
+                "response.output_item.added",
+                output_index=index,
+                item={"type": "reasoning", "id": item_id},
+            )
+        )
+        if summary:
+            events.extend(
+                [
+                    _codex_event(
+                        "response.reasoning_summary_part.added",
+                        output_index=index,
+                        summary_index=0,
+                        part={"type": "summary_text"},
+                    ),
+                    _codex_event(
+                        "response.reasoning_summary_text.delta",
+                        output_index=index,
+                        summary_index=0,
+                        delta=summary,
+                    ),
+                    _codex_event(
+                        "response.reasoning_summary_text.done",
+                        output_index=index,
+                        summary_index=0,
+                        text=summary,
+                    ),
+                    _codex_event(
+                        "response.reasoning_summary_part.done",
+                        output_index=index,
+                        summary_index=0,
+                        part={"type": "summary_text", "text": summary},
+                    ),
+                ]
+            )
+        if raw:
+            events.extend(
+                [
+                    _codex_event(
+                        "response.content_part.added",
+                        output_index=index,
+                        content_index=0,
+                        part={"type": "reasoning_text"},
+                    ),
+                    _codex_event(
+                        "response.reasoning_text.delta",
+                        output_index=index,
+                        content_index=0,
+                        delta=raw,
+                    ),
+                    _codex_event(
+                        "response.reasoning_text.done",
+                        output_index=index,
+                        content_index=0,
+                        text=raw,
+                    ),
+                    _codex_event(
+                        "response.content_part.done",
+                        output_index=index,
+                        content_index=0,
+                        part={"type": "reasoning_text"},
+                    ),
+                ]
+            )
+        events.append(
+            _codex_event(
+                "response.output_item.done",
+                output_index=index,
+                item={
+                    "type": "reasoning",
+                    "id": item_id,
+                    "status": "completed",
+                    "summary": (
+                        [{"type": "summary_text", "text": summary}]
+                        if summary
+                        else []
+                    ),
+                    "content": (
+                        [{"type": "reasoning_text", "text": raw}] if raw else []
+                    ),
+                },
+            )
+        )
+    events.append(_codex_event("response.completed"))
+    return events
 
 
 class GateBackend(CompletionBackend):
@@ -1248,15 +1374,22 @@ def test_live_tool_preview_reuses_the_fifteen_line_limit() -> None:
     assert "… +5 lines" in plain
 
 
-def test_thought_collapses_to_first_sentence_and_keeps_duration() -> None:
-    assert collapse_thought("Plan first. Hide the rest.") == "Plan first."
-    assert collapse_thought("Use e.g. this value. Hide the rest.") == "Use e.g. this value."
-    assert collapse_thought("") == ""
-    assert collapse_thought("No final punctuation") == "No final punctuation"
-    rendered = format_thought("Plan first. Hide the rest.", 2.7)
+def test_thought_renders_full_trace_with_header_and_duration() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=ThinkingContent("Plan first.\nHide the rest."),
+            data={"duration": 2.7},
+        )
+    )
 
-    assert rendered.plain == "✱ thought · Plan first. · 2.7s"
-    assert "italic" in str(rendered.style)
+    assert isinstance(rendered, Text)
+    assert rendered.plain == "✱ thought · 2.7s\nPlan first.\nHide the rest."
+    assert all("italic" in span.style for span in rendered.spans)
+
+
+def test_thought_header_has_duration_only() -> None:
+    assert format_thought(2.7).plain == "✱ thought · 2.7s"
 
 
 def test_redacted_thought_renders_as_collapsed_line_with_duration() -> None:
@@ -1317,6 +1450,52 @@ async def test_anthropic_redacted_thinking_reaches_tui_stream(tmp_path: Path) ->
     rendered = output.getvalue()
     assert "✱ thought · redacted" in rendered
     assert "no response" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["output-items", "summary-and-raw"])
+async def test_codex_thought_blocks_reach_tui_as_separate_units(
+    tmp_path: Path, case: str
+) -> None:
+    if case == "output-items":
+        events = _codex_reasoning_events([("first", ""), ("second", "")])
+        expected = ("first", "second")
+    else:
+        events = _codex_reasoning_events([("summary", "raw")])
+        expected = ("summary", "raw")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_codex_sse(events),
+            request=request,
+        )
+
+    credentials = CodexCredentialStore(tmp_path / "codex.json")
+    credentials.save(OAuthTokens(_codex_access_token(), "refresh-fixture", 4_000_000_000))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            CodexBackend(
+                client=client,
+                token_store=credentials,
+                base_url="https://test.invalid/codex/responses",
+            ),
+            ConversationStore(tmp_path / "sessions"),
+        ),
+        provider="codex",
+        model=DEFAULT_CODEX_MODEL,
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._consume_turn("hello")
+    await client.aclose()
+
+    rendered = output.getvalue()
+    assert rendered.count("✱ thought ·") == 2
+    assert all(text in rendered for text in expected)
 
 
 @pytest.mark.asyncio
@@ -1386,22 +1565,8 @@ async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
 
     rendered = output.getvalue()
     assert rendered.count("✱ thought · redacted") == 1
-    assert rendered.count("✱ thought · plan") == 1
-    assert "redactedplan" not in rendered
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ('Use U.S. defaults. Hide the rest.', "Use U.S. defaults."),
-        ('Run at 5 p.m. today. Hide the rest.', "Run at 5 p.m. today."),
-        ('It said "Done." Then continue.', 'It said "Done."'),
-    ],
-)
-def test_thought_sentence_detection_handles_initialisms_and_quotes(
-    value: str, expected: str
-) -> None:
-    assert collapse_thought(value) == expected
+    assert rendered.count("✱ thought ·") == 2
+    assert rendered.count("\n  plan") == 1
 
 
 @pytest.mark.parametrize(
@@ -1585,8 +1750,116 @@ def test_stream_kind_switch_flushes_assistant_before_thinking(tmp_path: Path) ->
 
     assert rendered[0].plain == "| name | value |"
     assert rendered[1].plain == "| --- | --- |"
-    assert rendered[2].plain.startswith("✱ thought · plan · ")
-    assert rendered[2].plain.endswith("s")
+    assert rendered[2].plain.startswith("✱ thought · ")
+    assert rendered[2].plain.endswith("\nplan\n")
+
+
+def test_thought_stream_is_visible_before_completion(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._consume_text(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=ThinkingContent("first\n"),
+        )
+    )
+    assert [Text.from_ansi(line).plain for line in app._transcript.lines(120)] == [
+        "first"
+    ]
+
+    app._consume_text(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=ThinkingContent("second"),
+        )
+    )
+    assert [Text.from_ansi(line).plain for line in app._transcript.lines(120)] == [
+        "first",
+        "second",
+    ]
+
+    app._flush_pending_stream()
+    rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
+    assert rendered[0].startswith("✱ thought · ")
+    assert rendered[1:] == ["first", "second"]
+
+
+def test_adjacent_signed_thought_blocks_keep_separate_units(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    for content in (
+        ThinkingContent("block-one", "sig-1"),
+        ThinkingContent("block-two", "sig-2"),
+    ):
+        app._consume_text(
+            StreamEvent(StreamEventType.MESSAGE_UPDATE, content=content)
+        )
+    app._flush_pending_stream()
+
+    rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
+    assert sum(line.startswith("✱ thought ·") for line in rendered) == 2
+    assert rendered.count("block-one") == 1
+    assert rendered.count("block-two") == 1
+
+
+def test_thought_commit_keeps_logical_lines_for_resize(tmp_path: Path) -> None:
+    source = "logical-line-that-reflows"
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._consume_text(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=ThinkingContent(source),
+        )
+    )
+    app._flush_pending_stream()
+
+    assert any(
+        source in getattr(unit, "plain", "")
+        for unit in app._transcript.units
+        if unit
+    )
+    narrow = [Text.from_ansi(line).plain for line in app._transcript.lines(18)]
+    wide = [Text.from_ansi(line).plain for line in app._transcript.lines(80)]
+    assert len([line for line in narrow if line]) > len(wide)
+    assert wide[-1] == source
+
+
+def test_thought_updates_keep_active_unit_after_interleaved_output(
+    tmp_path: Path,
+) -> None:
+    app = TUIApp(
+        AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._presenter.start_thinking(render_thought_live("partial"))
+    app._transcript.append(Text("tool output"))
+    app._presenter.update_thinking(render_thought_live("complete"))
+    app._presenter.finish_thinking(render_thought("complete", 1.0))
+
+    rendered = [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
+    assert sum(line.startswith("✱ thought ·") for line in rendered) == 1
+    assert rendered.count("complete") == 1
+    assert "partial" not in rendered
+    assert "tool output" in rendered
 
 
 def test_thought_duration_uses_local_monotonic_lifecycle_clock(
@@ -1594,15 +1867,13 @@ def test_thought_duration_uses_local_monotonic_lifecycle_clock(
 ) -> None:
     ticks = iter((10.0, 10.25))
     monkeypatch.setattr("zeta.tui.app.time.monotonic", lambda: next(ticks))
+    output = StringIO()
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
         provider="fake",
         model="offline",
-        console=Console(file=StringIO(), force_terminal=False),
+        console=Console(file=output, force_terminal=False),
     )
-    rendered: list[object] = []
-    app._print = rendered.append
-
     app._consume_text(
         StreamEvent(
             StreamEventType.MESSAGE_UPDATE,
@@ -1611,7 +1882,10 @@ def test_thought_duration_uses_local_monotonic_lifecycle_clock(
     )
     app._flush_pending_stream()
 
-    assert rendered[0].plain == "✱ thought · plan · 0.2s"
+    rendered = "\n".join(
+        line.strip() for line in Text.from_ansi(output.getvalue()).plain.splitlines()
+    )
+    assert "✱ thought · 0.2s\nplan" in rendered
 
 
 def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
@@ -2892,7 +3166,11 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path:
     backend = FakeBackend(
         [
             ScriptedTurn(
-                content=[ThinkingContent("Plan the inspection. More reasoning stays collapsed.")],
+                content=[
+                    ThinkingContent(
+                        "Plan the inspection.\nMore reasoning stays visible."
+                    )
+                ],
                 tool_calls=[bash],
             ),
             ScriptedTurn(tool_calls=[read]),
@@ -2919,17 +3197,13 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(tmp_path:
     snapshot = "\n".join(
         line.rstrip() for line in output.getvalue().splitlines()
     ).strip()
-    snapshot = re.sub(
-        r"(✱ thought · Plan the inspection\.) · \d+\.\ds",
-        r"\1",
-        snapshot,
-    )
     lines = snapshot.splitlines()
     panel_lines = [
         line for line in lines if line.startswith(("  ╭", "  │", "  ╰"))
     ]
     assert "▌ inspect the session" in snapshot
-    assert "✱ thought · Plan the inspection." in snapshot
+    assert "✱ thought ·" in snapshot
+    assert "Plan the inspection.\n  More reasoning stays visible." in snapshot
     assert "⏺ read README.md [limit=120]" in snapshot
     assert "finished" in snapshot
     assert len(panel_lines) == 23
