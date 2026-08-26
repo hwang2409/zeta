@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import signal
 import tomllib
 from collections.abc import Callable, Mapping
@@ -26,6 +27,20 @@ HOOK_EVENTS = frozenset(
 )
 DEFAULT_TIMEOUT_SECONDS = 10.0
 MAX_TIMEOUT_SECONDS = 60.0
+HOOK_OUTPUT_LIMIT = 2048
+HOOK_EVENT_STRING_LIMIT = 4096
+HOOK_EVENT_COLLECTION_LIMIT = 64
+HOOK_EVENT_DEPTH_LIMIT = 8
+HOOK_ACTIVE_ENV = "ZETA_HOOK_ACTIVE"
+HOOK_TRUNCATION_MARKER = "...[truncated]"
+_ANSI_ESCAPE_RE = re.compile(
+    r"(?:\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b\][^\x07]*(?:\x07|\x1b\\)"
+    r"|\x1b[@-_]"
+    r"|\x9b[0-?]*[ -/]*[@-~]"
+    r"|\x9d[^\x07]*(?:\x07|\x1b\\))",
+    re.DOTALL,
+)
 
 
 class HookConfigError(ValueError):
@@ -58,7 +73,7 @@ class _CommandResult:
 def load_hooks(home: str | Path, *, enabled: bool = True) -> HookManager:
     """Load the flat hooks.toml file below one zeta home."""
 
-    if not enabled:
+    if not enabled or os.environ.get(HOOK_ACTIVE_ENV) == "1":
         return HookManager((), session_id="")
     path = Path(home) / "hooks.toml"
     if not path.exists():
@@ -119,7 +134,7 @@ def _parse_hooks(document: object, path: Path) -> tuple[Hook, ...]:
         raw_tools = entry.get("tools", [])
         if type(raw_tools) is not list or any(type(tool) is not str or not tool for tool in raw_tools):
             raise HookConfigError(f"invalid hook config {path}: hook {index} tools is invalid")
-        if raw_tools and event not in {"pre_tool", "post_tool"}:
+        if "tools" in entry and event not in {"pre_tool", "post_tool"}:
             raise HookConfigError(f"invalid hook config {path}: hook {index} tools only applies to tool events")
         hooks.append(
             Hook(
@@ -209,34 +224,65 @@ class HookManager:
         event = {"event": hook.event, "session_id": self.session_id, **payload}
         environment = os.environ.copy()
         environment["ZETA_SESSION_ID"] = self.session_id
+        environment[HOOK_ACTIVE_ENV] = "1"
         process: asyncio.subprocess.Process | None = None
+        stderr_task: asyncio.Task[str] | None = None
+        creation_task: asyncio.Task[asyncio.subprocess.Process] | None = None
+        process_group_id: int | None = None
         try:
-            process = await asyncio.create_subprocess_exec(
-                "sh",
-                "-c",
-                hook.command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=environment,
-                start_new_session=True,
+            output = json.dumps(
+                _bound_event(event), separators=(",", ":")
+            ).encode() + b"\n"
+            creation_task = asyncio.create_task(
+                asyncio.create_subprocess_exec(
+                    "sh",
+                    "-c",
+                    hook.command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=environment,
+                    start_new_session=True,
+                )
             )
-            output = json.dumps(event, separators=(",", ":")).encode() + b"\n"
+            process = await asyncio.shield(creation_task)
+            process_group_id = os.getpgid(process.pid)
+            assert process.stderr is not None
+            stderr_task = asyncio.create_task(_read_stderr(process.stderr))
             try:
-                _, stderr = await asyncio.wait_for(
-                    process.communicate(output), timeout=hook.timeout_seconds
+                returncode, stderr = await asyncio.wait_for(
+                    _finish_process(process, output, stderr_task),
+                    timeout=hook.timeout_seconds,
                 )
             except asyncio.TimeoutError:
-                _kill_process_group(process.pid)
-                await process.communicate()
+                await _cleanup_process(process, stderr_task, process_group_id)
                 return _CommandResult(None, "", timed_out=True)
-            return _CommandResult(process.returncode, stderr.decode(errors="replace"))
-        except OSError as exc:
-            return _CommandResult(None, str(exc))
+            return _CommandResult(returncode, stderr)
+        except asyncio.CancelledError:
+            if process is None and creation_task is not None:
+                try:
+                    process = await asyncio.shield(creation_task)
+                except BaseException:
+                    process = None
+            if process is not None:
+                cleanup = asyncio.create_task(
+                    _cleanup_process(process, stderr_task, process_group_id)
+                )
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    await cleanup
+            raise
+        except BaseException as exc:
+            if process is not None:
+                await _cleanup_process(process, stderr_task, process_group_id)
+            if isinstance(exc, OSError):
+                return _CommandResult(None, _sanitize_text(str(exc)))
+            raise
 
     def _notice(self, message: str) -> None:
         if self.notice_sink is not None:
-            self.notice_sink(" ".join(message.splitlines()) or "hook failed")
+            self.notice_sink(_sanitize_text(message).replace("\n", " ") or "hook failed")
 
     @staticmethod
     def _failure_message(event: str, result: _CommandResult) -> str:
@@ -247,8 +293,148 @@ class HookManager:
         return f"hook {event} failed with exit {result.returncode}"
 
 
-def _kill_process_group(pid: int) -> None:
+def _kill_process_group(pid: int, process_group_id: int | None = None) -> None:
     try:
-        os.killpg(pid, signal.SIGKILL)
+        os.killpg(
+            process_group_id if process_group_id is not None else os.getpgid(pid),
+            signal.SIGKILL,
+        )
     except ProcessLookupError:
         pass
+
+
+def _bound_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    truncations: list[dict[str, Any]] = []
+
+    def bound(value: Any, path: str, depth: int) -> Any:
+        if isinstance(value, str):
+            if len(value) <= HOOK_EVENT_STRING_LIMIT:
+                return value
+            truncations.append(
+                {
+                    "path": path,
+                    "kind": "string",
+                    "original_length": len(value),
+                    "limit": HOOK_EVENT_STRING_LIMIT,
+                }
+            )
+            return value[:HOOK_EVENT_STRING_LIMIT]
+        if depth >= HOOK_EVENT_DEPTH_LIMIT:
+            if isinstance(value, Mapping):
+                truncations.append(
+                    {
+                        "path": path,
+                        "kind": "mapping",
+                        "original_length": len(value),
+                        "limit": 0,
+                    }
+                )
+                return {}
+            if isinstance(value, (list, tuple)):
+                truncations.append(
+                    {
+                        "path": path,
+                        "kind": "collection",
+                        "original_length": len(value),
+                        "limit": 0,
+                    }
+                )
+                return []
+        if isinstance(value, Mapping):
+            bounded: dict[Any, Any] = {}
+            truncated = False
+            for index, (key, item) in enumerate(value.items()):
+                if index >= HOOK_EVENT_COLLECTION_LIMIT:
+                    truncated = True
+                    break
+                bounded[key] = bound(item, f"{path}.{key}", depth + 1)
+            if truncated:
+                truncations.append(
+                    {
+                        "path": path,
+                        "kind": "mapping",
+                        "original_length": len(value),
+                        "limit": HOOK_EVENT_COLLECTION_LIMIT,
+                    }
+                )
+            return bounded
+        if isinstance(value, (list, tuple)):
+            bounded = [
+                bound(item, f"{path}[{index}]", depth + 1)
+                for index, item in enumerate(value[:HOOK_EVENT_COLLECTION_LIMIT])
+            ]
+            if len(value) > HOOK_EVENT_COLLECTION_LIMIT:
+                truncations.append(
+                    {
+                        "path": path,
+                        "kind": "collection",
+                        "original_length": len(value),
+                        "limit": HOOK_EVENT_COLLECTION_LIMIT,
+                    }
+                )
+            return bounded
+        return value
+
+    bounded_event = bound(event, "$", 0)
+    if truncations:
+        bounded_event["_truncated"] = True
+        bounded_event["_truncations"] = truncations
+    return bounded_event
+
+
+def _sanitize_text(text: str, *, truncated: bool = False) -> str:
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    text = "".join(
+        char
+        for char in text
+        if char == "\n" or not (ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F)
+    )
+    if truncated or len(text) > HOOK_OUTPUT_LIMIT:
+        return text[: HOOK_OUTPUT_LIMIT - len(HOOK_TRUNCATION_MARKER)] + HOOK_TRUNCATION_MARKER
+    return text
+
+
+async def _read_stderr(stream: asyncio.StreamReader) -> str:
+    output = bytearray()
+    truncated = False
+    while chunk := await stream.read(4096):
+        remaining = HOOK_OUTPUT_LIMIT - len(output)
+        if remaining > 0:
+            output.extend(chunk[:remaining])
+        if len(chunk) > remaining:
+            truncated = True
+    return _sanitize_text(output.decode(errors="replace"), truncated=truncated)
+
+
+async def _finish_process(
+    process: asyncio.subprocess.Process,
+    output: bytes,
+    stderr_task: asyncio.Task[str],
+) -> tuple[int | None, str]:
+    try:
+        assert process.stdin is not None
+        process.stdin.write(output)
+        await process.stdin.drain()
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
+    returncode = await process.wait()
+    stderr = await asyncio.shield(stderr_task)
+    return returncode, stderr
+
+
+async def _cleanup_process(
+    process: asyncio.subprocess.Process,
+    stderr_task: asyncio.Task[str] | None,
+    process_group_id: int | None,
+) -> None:
+    _kill_process_group(process.pid, process_group_id)
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    wait_task = asyncio.create_task(process.wait())
+    if stderr_task is None:
+        await wait_task
+    else:
+        await asyncio.gather(wait_task, stderr_task, return_exceptions=True)

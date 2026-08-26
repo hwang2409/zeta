@@ -36,6 +36,17 @@ def test_malformed_hooks_fail_loudly(tmp_path: Path) -> None:
         load_hooks(tmp_path)
 
 
+def test_empty_tools_filter_is_rejected_for_non_tool_events(tmp_path: Path) -> None:
+    hook = _python_command("pass")
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "stop"\ncommand = {json.dumps(hook)}\ntools = []\n',
+    )
+
+    with pytest.raises(HookConfigError, match="tools only applies to tool events"):
+        load_hooks(tmp_path)
+
+
 @pytest.mark.asyncio
 async def test_pre_hook_allow_deny_and_error(tmp_path: Path) -> None:
     deny = _python_command("import sys; sys.stderr.write('not safe\\n'); sys.exit(2)")
@@ -77,6 +88,56 @@ async def test_pre_hook_deny_reason_reaches_tool_result(tmp_path: Path) -> None:
 
     assert result["isError"] is True
     assert result["content"][0]["text"] == "blocked by policy"
+
+
+@pytest.mark.asyncio
+async def test_hook_output_is_bounded_and_sanitized(tmp_path: Path) -> None:
+    command = _python_command(
+        "import sys; sys.stdout.write('ignored' * 10000); "
+        "sys.stderr.write('\\x1b[31m' + 'x' * 3000 + '\\x1b[0m\\x00'); sys.exit(2)"
+    )
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\n',
+    )
+    notices: list[str] = []
+    manager = load_hooks(tmp_path)
+    manager.notice_sink = notices.append
+
+    reason = await manager.pre_tool("exec", {})
+
+    assert isinstance(reason, str)
+    assert len(reason) <= 2048
+    assert reason.endswith("...[truncated]")
+    assert chr(27) not in reason
+    assert chr(0) not in reason
+    assert notices[0].startswith("hook denied pre_tool: ")
+
+
+@pytest.mark.asyncio
+async def test_hook_event_payload_is_bounded_with_metadata(tmp_path: Path) -> None:
+    marker = tmp_path / "event.json"
+    command = _python_command(
+        f"import pathlib,sys; pathlib.Path({str(marker)!r}).write_text(sys.stdin.read())"
+    )
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(command)}\n',
+    )
+    manager = load_hooks(tmp_path)
+
+    assert await manager.pre_tool(
+        "exec", {"command": "x" * 5000, "items": list(range(100))}
+    ) is True
+
+    event = json.loads(marker.read_text(encoding="utf-8"))
+    assert len(event["args"]["command"]) == 4096
+    assert event["args"]["items"] == list(range(64))
+    assert event["_truncated"] is True
+    assert {entry["path"] for entry in event["_truncations"]} == {
+        "$.args.command",
+        "$.args.items",
+    }
 
 
 @pytest.mark.asyncio
@@ -137,6 +198,45 @@ async def test_timeout_kills_hook_process_group(tmp_path: Path) -> None:
     assert result.timed_out is True
     await asyncio.sleep(0.3)
     assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_kills_hook_process_group(tmp_path: Path) -> None:
+    marker = tmp_path / "child-canceled"
+    child = f"import pathlib,time; time.sleep(.2); pathlib.Path({str(marker)!r}).write_text('alive')"
+    parent = f"import subprocess,sys,time; subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(5)"
+    manager = HookManager((), session_id="session-1")
+    task = asyncio.create_task(
+        manager._run(Hook("session_start", _python_command(parent)), {})
+    )
+
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.3)
+
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_hook_subprocess_disables_nested_hook_loading(tmp_path: Path) -> None:
+    marker = tmp_path / "nested-hooks"
+    command = _python_command(
+        "import pathlib; "
+        "from zeta.core.hooks import load_hooks; "
+        f"pathlib.Path({str(marker)!r}).write_text(str(len(load_hooks({str(tmp_path)!r}).hooks)))"
+    )
+    _write_config(
+        tmp_path,
+        f'[[hook]]\nevent = "session_start"\ncommand = {json.dumps(command)}\n',
+    )
+    manager = load_hooks(tmp_path)
+
+    manager.session_start()
+    await manager.close()
+
+    assert marker.read_text(encoding="utf-8") == "0"
 
 
 def test_status_lists_hooks_and_fake_default_is_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
