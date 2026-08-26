@@ -4,11 +4,16 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from rich.text import Text
-
-from ..types import Message, MessageRole, TextContent
-from .render import render_markdown
-from .theme import DIM
+from ..types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolUseContent,
+)
+from .render import render_event, render_markdown
 
 
 def _age(created_at: str) -> str:
@@ -105,6 +110,7 @@ class CheckpointTranscriptMixin:
         """Re-render the visible transcript from the active durable branch."""
 
         self._presenter.clear()
+        tool_calls: dict[str, ToolCall] = {}
         for entry in self.loop.store.replay():
             if entry.type == "checkpoint":
                 self._print_system(
@@ -123,9 +129,22 @@ class CheckpointTranscriptMixin:
             text = self._message_text(message)
             if message.role is MessageRole.USER and text:
                 self._print_user(text)
-            elif message.role is MessageRole.ASSISTANT and text:
-                self._print_unit(render_markdown(text))
-            elif message.role is MessageRole.TOOL_RESULT and message.tool_result is not None:
+            elif message.role is MessageRole.ASSISTANT:
+                if text:
+                    self._print_unit(render_markdown(text))
+                for block in message.content:
+                    if isinstance(block, ToolUseContent):
+                        tool_calls[block.tool_call.id] = block.tool_call
+            elif (
+                message.role is MessageRole.TOOL_RESULT
+                and message.tool_result is not None
+            ):
                 self._print_unit(
-                    Text(f"tool · {message.tool_result.content}", style=DIM)
+                    render_event(
+                        StreamEvent(
+                            StreamEventType.TOOL_EXECUTION_END,
+                            tool_call=tool_calls.get(message.tool_result.tool_call_id),
+                            tool_result=message.tool_result,
+                        )
+                    )
                 )

@@ -76,13 +76,25 @@ class ConversationEntry:
             raise ConversationIntegrityError("conversation type must be a nonempty string")
         if type(data) is not dict:
             raise ConversationIntegrityError("conversation data must be an object")
+        normalized_data = dict(data)
+        created_at = normalized_data.get("created_at")
+        if entry_type == "checkpoint" and type(created_at) is str:
+            try:
+                timestamp = datetime.fromisoformat(created_at)
+            except ValueError:
+                pass
+            else:
+                if timestamp.tzinfo is None:
+                    normalized_data["created_at"] = timestamp.replace(
+                        tzinfo=UTC
+                    ).isoformat()
         return cls(
             seq=seq,
             id=entry_id,
             parent_id=parent_id,
             lane=lane,
             type=entry_type,
-            data=data,
+            data=normalized_data,
         )
 
 
@@ -452,6 +464,7 @@ class ConversationStore:
                 created_at = entry.data.get("created_at")
                 if type(label) is not str or not label.strip():
                     raise ValueError("checkpoint label must be a nonempty string")
+                self._validate_checkpoint_label(label.strip())
                 if type(created_at) is not str or not created_at:
                     raise ValueError("checkpoint created_at must be a string")
             elif entry.type == "fork":
@@ -557,6 +570,7 @@ class ConversationStore:
             resolved_label = label.strip() if label is not None else ""
             if not resolved_label:
                 resolved_label = self._default_checkpoint_label(branch)
+            self._validate_checkpoint_label(resolved_label)
             entry = self._append_row_unlocked(
                 "checkpoint",
                 {"label": resolved_label, "created_at": _now()},
@@ -645,9 +659,25 @@ class ConversationStore:
                 if isinstance(block, TextContent)
                 and block.text.strip()
             )
-            if text:
+            if text and not ConversationStore._is_numeric_selector(text):
                 return " ".join(text.split())[:48]
         return f"checkpoint {count}"
+
+    @staticmethod
+    def _is_numeric_selector(value: str) -> bool:
+        try:
+            int(value)
+        except ValueError:
+            return False
+        return True
+
+    @classmethod
+    def _validate_checkpoint_label(cls, label: str) -> None:
+        if cls._is_numeric_selector(label):
+            raise ValueError(
+                "checkpoint label cannot be numeric; numeric values are reserved "
+                "for sequence selectors"
+            )
 
     @staticmethod
     def _message_preview(entry: ConversationEntry) -> str | None:
@@ -667,6 +697,12 @@ class ConversationStore:
         branch: list[ConversationEntry],
     ) -> ConversationEntry:
         checkpoints = [entry for entry in branch if entry.type == "checkpoint"]
+        if ConversationStore._is_numeric_selector(selector):
+            sequence = int(selector)
+            sequence_matches = [entry for entry in checkpoints if entry.seq == sequence]
+            if sequence_matches:
+                return sequence_matches[0]
+            raise ValueError(f"checkpoint not found: {selector!r}")
         label_matches = [
             entry for entry in checkpoints if entry.data["label"] == selector
         ]
@@ -677,13 +713,6 @@ class ConversationStore:
             )
         if label_matches:
             return label_matches[0]
-        try:
-            sequence = int(selector)
-        except ValueError:
-            sequence = -1
-        sequence_matches = [entry for entry in checkpoints if entry.seq == sequence]
-        if sequence_matches:
-            return sequence_matches[0]
         raise ValueError(f"checkpoint not found: {selector!r}")
 
     def append_compaction_marker(
