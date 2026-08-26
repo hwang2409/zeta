@@ -64,10 +64,15 @@ def format_retry_delay(delay: float) -> str:
 
 def retry_error_label(error: RuntimeError) -> str:
     status_code = getattr(error, "status_code", None)
-    if status_code == 529 or getattr(error, "retryable", False):
-        return "529 overloaded"
-    if status_code == 429:
+    retry_reason = getattr(error, "retry_reason", None)
+    if status_code == 429 or retry_reason == "rate_limit_error":
         return "429 rate limited"
+    if (
+        status_code == 529
+        or retry_reason == "overloaded_error"
+        or getattr(error, "retryable", False)
+    ):
+        return "529 overloaded"
     if status_code is not None:
         return f"{status_code} server error"
     cause: BaseException | None = error.__cause__

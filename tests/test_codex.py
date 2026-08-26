@@ -770,6 +770,56 @@ async def test_rate_limit_retries_before_response_created(
 
 
 @pytest.mark.asyncio
+async def test_disconnect_after_headers_retries_before_first_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+
+    class DisconnectStream(httpx.AsyncByteStream):
+        def __init__(self, request: httpx.Request) -> None:
+            self.request = request
+
+        async def __aiter__(self):
+            raise httpx.ReadError("peer closed", request=self.request)
+            yield b""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=DisconnectStream(request),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(message_stream()),
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+        ).complete([], [])
+    ]
+
+    assert len(requests) == 2
+    assert [item.type for item in events].count(StreamEventType.RETRY) == 1
+    assert not (tmp_path / "logs" / "stream-diagnostics.jsonl").exists()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_responses_stream_maps_reasoning_and_tool_call_items(tmp_path: Path) -> None:
     stream = sse(
         [

@@ -23,13 +23,19 @@ from .anthropic_payload import (
     _validate_thinking_parameters,
     build_messages_payload as _build_messages_payload,
 )
+from .anthropic_errors import (
+    AnthropicAuthError,
+    AnthropicBackendError,
+    AnthropicHTTPError,
+    AnthropicStreamError,
+    http_error as _http_error,
+)
 from .stream_diagnostics import Cause, StreamDiagnostics
 from .transport import (
     cleanup_transport,
     format_retry_delay,
     is_control_exception,
     request_error,
-    retry_after_seconds,
     retry_provider_completion,
     retry_error_label,
     retryable_provider_error,
@@ -65,51 +71,6 @@ OAUTH_SCOPES = (
     "org:create_api_key user:profile user:inference user:sessions:claude_code "
     "user:mcp_servers user:file_upload"
 )
-
-
-class AnthropicBackendError(RuntimeError):
-    """Base class for errors that the agent loop can report as backend errors."""
-
-    code = "backend_error"
-
-
-class AnthropicAuthError(AnthropicBackendError):
-    """Raised when Claude subscription credentials are missing or invalid."""
-
-    code = "auth_error"
-
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-
-
-class AnthropicHTTPError(AnthropicBackendError):
-    """Raised when Anthropic returns an unsuccessful HTTP response."""
-
-    code = "http_error"
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int | None = None,
-        retry_after: float | None = None,
-        retryable: bool = False,
-    ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.retry_after = retry_after
-        self.retryable = retryable
-
-
-class AnthropicStreamError(AnthropicBackendError):
-    """Raised when an Anthropic SSE stream is invalid or ends early."""
-
-    code = "stream_error"
-
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
-        super().__init__(message)
-        self.retryable = retryable
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
@@ -530,38 +491,6 @@ async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes
     return bytes(body)
 
 
-def _http_error(
-    status_code: int,
-    body: bytes,
-    headers: Mapping[str, str] | None = None,
-) -> AnthropicHTTPError:
-    message = error_body_excerpt(body) or "request failed"
-    error_type = AnthropicAuthError if status_code in {401, 403} else AnthropicHTTPError
-    retry_after = retry_after_seconds(headers)
-    retryable = _is_overloaded_body(body)
-    if error_type is AnthropicAuthError:
-        return error_type(
-            f"Anthropic HTTP {status_code}: {message}", status_code=status_code
-        )
-    return error_type(
-        f"Anthropic HTTP {status_code}: {message}",
-        status_code=status_code,
-        retry_after=retry_after,
-        retryable=retryable,
-    )
-
-
-def _is_overloaded_body(body: bytes) -> bool:
-    try:
-        payload = json.loads(body)
-    except (json.JSONDecodeError, TypeError):
-        return False
-    if not isinstance(payload, Mapping):
-        return False
-    detail = payload.get("error")
-    return isinstance(detail, Mapping) and detail.get("type") == "overloaded_error"
-
-
 async def _decode_response(
     response: httpx.Response,
     *,
@@ -660,6 +589,20 @@ async def _decode_response(
                 )
         return translated
 
+    def process_provider_error(
+        record: tuple[str, dict[str, Any]],
+    ) -> tuple[StreamEvent | None, bool]:
+        event, payload = record
+        event_type = payload.get("type", event)
+        if event_type != "error":
+            return process_record(record), False
+        try:
+            return process_record(record), False
+        except AnthropicStreamError:
+            if message_state == "not-started":
+                raise
+            return salvage(AnthropicStreamError), True
+
     try:
         async for line in response.aiter_lines():
             bytes_received += len(line.encode()) + 1
@@ -668,7 +611,7 @@ async def _decode_response(
                 continue
             sse_events_received += 1
             last_event_at = time.monotonic()
-            translated = process_record(record)
+            translated, salvaged = process_provider_error(record)
             if translated is None:
                 continue
             if translated.type is StreamEventType.MESSAGE_END:
@@ -683,6 +626,8 @@ async def _decode_response(
                 )
                 finished = True
             yield translated
+            if salvaged:
+                return
     except httpx.HTTPError as exc:
         if finished or message_state == "not-started":
             raise
@@ -693,7 +638,7 @@ async def _decode_response(
     if record is not None:
         sse_events_received += 1
         last_event_at = time.monotonic()
-        translated = process_record(record)
+        translated, salvaged = process_provider_error(record)
         if translated is not None:
             if translated.type is StreamEventType.MESSAGE_END:
                 translated = StreamEvent(
@@ -708,6 +653,8 @@ async def _decode_response(
                 yield translated
                 return
             yield translated
+            if salvaged:
+                return
     if not finished:
         if message_state == "not-started":
             raise AnthropicStreamError("Anthropic stream ended before message_start")
@@ -732,9 +679,11 @@ def _translate_event(
         message = detail.get("message")
         if type(message) is not str:
             raise AnthropicStreamError("Anthropic stream error message is invalid")
+        reason = detail.get("type")
         raise AnthropicStreamError(
             error_body_excerpt(message.encode()) or "Anthropic stream error",
-            retryable=detail.get("type") in {"overloaded_error", "rate_limit_error"},
+            retryable=reason in {"overloaded_error", "rate_limit_error"},
+            retry_reason=reason if reason in {"overloaded_error", "rate_limit_error"} else None,
         )
     if event_type == "message_start":
         message = payload.get("message", {})
