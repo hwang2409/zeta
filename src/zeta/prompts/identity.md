@@ -11,6 +11,8 @@ Tools:
 - Prefer targeted reads and searches over dumping whole files.
 - After edits, verify: run the code, tests, or a type check when available.
 
+For multi-step tasks, use the todo tool to track progress. Mark one item `in_progress` before starting it, then mark it `completed` immediately after finishing it.
+
 Safety:
 - Destructive or hard-to-reverse actions (deleting files, git push, force operations, rewriting history, killing processes) require explicit user confirmation first.
 - Never invent, log, or exfiltrate secrets. Do not commit credentials.

@@ -455,6 +455,12 @@ class ToolRegistry:
         self.background_tasks.bind_session_dir(store.session_dir)
         self.bash_cwd = store.bash_cwd
 
+    @property
+    def session_store(self) -> ConversationStore:
+        if self._session_store is None:
+            raise ValueError("tool requires a bound session store")
+        return self._session_store
+
     async def close(self) -> None:
         """Stop session-owned background processes."""
 

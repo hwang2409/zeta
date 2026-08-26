@@ -17,6 +17,7 @@ from typing import Any, Iterable, Iterator, Mapping
 import fcntl
 
 from ..types import Message, MessageRole, ToolCall, ToolUseContent
+from .todo import TodoItem, parse_todo_items
 
 
 SCHEMA = "zeta.conversation.v1"
@@ -116,6 +117,7 @@ class ConversationStore:
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
+        self._todo_items: list[TodoItem] = []
         with self._append_lock():
             self._load()
             self._load_session_state()
@@ -228,12 +230,26 @@ class ConversationStore:
             raise ValueError("bash cwd must be a nonempty string")
         with self._append_lock():
             self._load()
-            self._write_session_state(resolved)
+            self._write_session_state(resolved, self._todo_items)
             self.bash_cwd = resolved
+
+    def todo_items(self) -> list[TodoItem]:
+        """Return a detached snapshot of the current session todo list."""
+
+        return [dict(item) for item in self._todo_items]
+
+    def set_todo_items(self, items: object) -> None:
+        """Replace the session todo list in one atomic state-file update."""
+
+        normalized = parse_todo_items(items)
+        with self._append_lock():
+            self._load()
+            self._write_session_state(self.bash_cwd, normalized)
+            self._todo_items = [dict(item) for item in normalized]
 
     def _load_session_state(self) -> None:
         if not self.state_path.exists():
-            self._write_session_state(self.cwd)
+            self._write_session_state(self.cwd, ())
             return
         try:
             value = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -246,9 +262,22 @@ class ConversationStore:
             raise ConversationIntegrityError(
                 f"session state bash cwd is invalid: {self.state_path}"
             )
+        try:
+            todo_items = parse_todo_items(value.get("todo_items", []))
+        except ValueError as exc:
+            raise ConversationIntegrityError(
+                f"session state todo list is invalid: {self.state_path}"
+            ) from exc
         self.bash_cwd = bash_cwd
+        self._todo_items = todo_items
 
-    def _write_session_state(self, bash_cwd: str) -> None:
+    def _write_session_state(
+        self, bash_cwd: str, todo_items: Iterable[TodoItem]
+    ) -> None:
+        state: dict[str, Any] = {"bash_cwd": bash_cwd}
+        normalized_items = [dict(item) for item in todo_items]
+        if normalized_items:
+            state["todo_items"] = normalized_items
         temporary = tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -260,7 +289,7 @@ class ConversationStore:
         temporary_path = Path(temporary.name)
         try:
             with temporary:
-                json.dump({"bash_cwd": bash_cwd}, temporary, separators=(",", ":"))
+                json.dump(state, temporary, separators=(",", ":"))
                 temporary.write("\n")
                 temporary.flush()
                 os.fsync(temporary.fileno())

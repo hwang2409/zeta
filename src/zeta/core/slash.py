@@ -26,6 +26,7 @@ class SlashStatus:
     context_files: tuple[str, ...] = ()
     vim_mode: bool = True
     hooks: tuple[str, ...] = ()
+    todo_counts: tuple[int, int, int] | None = None
 
 
 class SlashSession(Protocol):
@@ -119,8 +120,7 @@ def _format_status(status: SlashStatus) -> str:
         if cache_total == 0
         else f"{status.cache_read_input_tokens / cache_total * 100:.1f}%"
     )
-    return "\n".join(
-        (
+    lines = [
             f"session_id: {status.session_id}",
             f"provider: {status.provider}",
             f"model: {status.model}",
@@ -137,8 +137,14 @@ def _format_status(status: SlashStatus) -> str:
             f"output_tokens_this_session: {status.output_tokens_this_session}",
             "context_files: " + (", ".join(status.context_files) or "none"),
             "hooks: " + (", ".join(status.hooks) or "none"),
+        ]
+    if status.todo_counts is not None:
+        pending, in_progress, completed = status.todo_counts
+        lines.append(
+            "todo: "
+            f"pending={pending}, in_progress={in_progress}, completed={completed}"
         )
-    )
+    return "\n".join(lines)
 
 
 def _run_status(session: SlashSession, args: str) -> str:
