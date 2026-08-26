@@ -475,6 +475,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
             on_interrupt=self.abort_active,
             on_exit=self.request_exit,
             on_submit=self._submit_input,
+            on_paste=self._paste_from_keybinding,
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
         )
@@ -494,6 +495,11 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
     def request_exit(self) -> None:
         self._exit_requested = True
         self.abort_active()
+
+    def _paste_from_keybinding(self) -> None:
+        notice = self.slash_paste("")
+        if notice != "paste unavailable: clipboard does not contain an image":
+            self._print_system(notice)
 
     def abort_active(self) -> None:
         if self._active_task is not None and not self._active_task.done():

@@ -395,6 +395,7 @@ def build_key_bindings(
     on_interrupt: Callable[[], None],
     on_exit: Callable[[], None],
     on_submit: Callable[[str], None] | None = None,
+    on_paste: Callable[[], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
 ) -> KeyBindings:
@@ -444,6 +445,13 @@ def build_key_bindings(
     @bindings.add("c-j")
     def newline(event: KeyPressEvent) -> None:
         insert_newline(event)
+
+    if on_paste is not None:
+
+        @bindings.add("c-v")
+        def paste(event: KeyPressEvent) -> None:
+            del event
+            on_paste()
 
     @bindings.add("escape", "enter", filter=~full_screen_mode)
     def alt_enter(event: KeyPressEvent) -> None:
