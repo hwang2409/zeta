@@ -73,12 +73,59 @@ async def test_background_output_cursor_and_ring_overflow(tmp_path: Path) -> Non
     await _wait_for_exit(tasks, task_id)
 
     first = await tasks.output(task_id)
-    assert first["output"].startswith("[output truncated]\n")
+    assert first["output"].startswith("[output truncated; dropped 8 bytes]\n")
     assert "89ab" in first["output"]
     assert first["cursor"] == 12
     second = await tasks.output(task_id, since=first["cursor"])
     assert second["output"] == "cdef"
     await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_background_output_ring_trims_at_utf8_boundary(tmp_path: Path) -> None:
+    tasks = BackgroundTaskRegistry(output_limit=5)
+    task_id, _ = await tasks.start(
+        _python("import sys; sys.stdout.buffer.write('a€bc'.encode())"),
+        tmp_path,
+    )
+    await _wait_for_exit(tasks, task_id)
+
+    result = await tasks.output(task_id)
+    assert result["output"] == "[output truncated; dropped 1 bytes]\n€bc"
+    assert "�" not in result["output"]
+    await tasks.close()
+
+
+@pytest.mark.asyncio
+async def test_background_output_cursor_tracks_outer_tool_cap(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path, max_output_chars=10_000)
+    started = await registry.execute(
+        ToolCall(
+            "start",
+            "run_background",
+            {"command": "printf " + "x" * 20_000},
+        )
+    )
+    task_id = started["structuredContent"]["task_id"]
+    await _wait_for_exit(registry.background_tasks, task_id)
+
+    first = await registry.execute(
+        ToolCall("output", "task_output", {"task_id": task_id})
+    )
+    assert first["structuredContent"]["cursor"] == 9_931
+    assert len(first["structuredContent"]["output"]) == 9_931
+    assert len(first["content"][0]["text"]) == 9_999
+
+    second = await registry.execute(
+        ToolCall(
+            "output-2",
+            "task_output",
+            {"task_id": task_id, "since": first["structuredContent"]["cursor"]},
+        )
+    )
+    assert second["structuredContent"]["cursor"] == 19_862
+    assert len(second["structuredContent"]["output"]) == 9_931
+    await registry.close()
 
 
 @pytest.mark.asyncio

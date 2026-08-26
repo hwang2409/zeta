@@ -52,18 +52,31 @@ async def _task_output(
     registry: ToolRegistry,
     arguments: dict[str, Any],
 ) -> StructuredToolResult:
-    result = await registry.background_tasks.output(
-        arguments["task_id"], arguments.get("since")
-    )
-    output = result["output"]
-    note = result.get("note")
-    metadata = (
-        f"task_id: {result['task_id']}\n"
-        f"cursor: {result['cursor']}\n"
-        f"running: {result['running']}\n"
-        f"exit_code: {result['exit_code']}\n"
-    )
-    content = metadata + (output if output else (note or ""))
+    task_id = arguments["task_id"]
+    since = arguments.get("since")
+    output_limit = registry.max_output_chars
+    for _ in range(4):
+        result = await registry.background_tasks.output(
+            task_id,
+            since,
+            max_chars=output_limit,
+        )
+        output = result["output"]
+        note = result.get("note")
+        metadata = (
+            f"task_id: {result['task_id']}\n"
+            f"cursor: {result['cursor']}\n"
+            f"running: {result['running']}\n"
+            f"exit_code: {result['exit_code']}\n"
+        )
+        content = metadata + (output if output else (note or ""))
+        overflow = len(content) - registry.max_output_chars
+        if overflow <= 0:
+            break
+        next_limit = max(0, output_limit - overflow)
+        if next_limit == output_limit:
+            break
+        output_limit = next_limit
     return _result(content, result)
 
 

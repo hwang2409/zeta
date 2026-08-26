@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import os
 import signal
@@ -12,12 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 BACKGROUND_TASK_LIMIT = 8
 BACKGROUND_OUTPUT_LIMIT = 512 * 1024
 BACKGROUND_OUTPUT_CALL_LIMIT = 32 * 1024
 BACKGROUND_TERM_GRACE_SECONDS = 0.25
-_OUTPUT_TRUNCATION_MARKER = "[output truncated]\n"
 
 
 @dataclass(slots=True)
@@ -120,10 +119,18 @@ class BackgroundTaskRegistry:
         self._persist()
         return task_id, process.pid
 
-    async def output(self, task_id: str, since: int | None = None) -> dict[str, Any]:
+    async def output(
+        self,
+        task_id: str,
+        since: int | None = None,
+        *,
+        max_chars: int | None = None,
+    ) -> dict[str, Any]:
         record = self._record(task_id)
         if since is not None and (type(since) is not int or since < 0):
             raise ValueError("since must be a nonnegative integer")
+        if max_chars is not None and (type(max_chars) is not int or max_chars < 0):
+            raise ValueError("max_chars must be a nonnegative integer")
         requested = 0 if since is None else min(since, record.total_bytes)
         start = max(requested, record.base_cursor)
         marker = requested < record.base_cursor
@@ -133,10 +140,13 @@ class BackgroundTaskRegistry:
         capped = len(available) > self.call_limit
         if capped:
             available = _utf8_chunk(available, self.call_limit)
+        if max_chars is not None:
+            available = _utf8_char_chunk(available, max_chars)
         next_cursor = start + len(available)
         text = available.decode(errors="replace")
         if marker:
-            text = _OUTPUT_TRUNCATION_MARKER + text
+            dropped = record.base_cursor - requested
+            text = f"[output truncated; dropped {dropped} bytes]\n" + text
         if capped:
             text += "\n[output capped; call task_output again]\n"
         result: dict[str, Any] = {
@@ -238,8 +248,11 @@ class BackgroundTaskRegistry:
         record.total_bytes += len(chunk)
         overflow = len(record.output) - self.output_limit
         if overflow > 0:
-            del record.output[:overflow]
-            record.base_cursor += overflow
+            trim = overflow
+            while trim < len(record.output) and record.output[trim] & 0xC0 == 0x80:
+                trim += 1
+            del record.output[:trim]
+            record.base_cursor += trim
 
     def _record(self, task_id: str) -> _BackgroundRecord:
         if type(task_id) is not str or not task_id:
@@ -344,6 +357,27 @@ def _utf8_chunk(data: bytes, limit: int) -> bytes:
                 return data[:end]
         else:
             return data[:end]
+    return data
+
+
+def _utf8_char_chunk(data: bytes, limit: int) -> bytes:
+    """Cap decoded UTF-8 characters without advancing past retained bytes."""
+    if limit == 0:
+        return b""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    character_start = 0
+    characters = 0
+    for index, value in enumerate(data):
+        emitted = decoder.decode(bytes((value,)), final=False)
+        if not emitted:
+            continue
+        if characters + len(emitted) > limit:
+            return data[:character_start]
+        characters += len(emitted)
+        character_start = index + 1
+    emitted = decoder.decode(b"", final=True)
+    if characters + len(emitted) > limit:
+        return data[:character_start]
     return data
 
 
