@@ -83,7 +83,7 @@ async def test_background_output_cursor_and_ring_overflow(tmp_path: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_background_output_ring_trims_at_utf8_boundary(tmp_path: Path) -> None:
-    tasks = BackgroundTaskRegistry(output_limit=5)
+    tasks = BackgroundTaskRegistry(output_limit=4)
     task_id, _ = await tasks.start(
         _python("import sys; sys.stdout.buffer.write('a€bc'.encode())"),
         tmp_path,
@@ -91,8 +91,9 @@ async def test_background_output_ring_trims_at_utf8_boundary(tmp_path: Path) -> 
     await _wait_for_exit(tasks, task_id)
 
     result = await tasks.output(task_id)
-    assert result["output"] == "[output truncated; dropped 1 bytes]\n€bc"
+    assert result["output"] == "[output truncated; dropped 4 bytes]\nbc"
     assert "�" not in result["output"]
+    assert result["output"].encode().decode() == result["output"]
     await tasks.close()
 
 
