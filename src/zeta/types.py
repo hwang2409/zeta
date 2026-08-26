@@ -136,6 +136,7 @@ class ToolTextBlock(TypedDict):
     text: str
     truncated: bool
     full_size: int
+    next_offset: NotRequired[int]
     annotations: NotRequired[ToolAnnotations]
 
 
@@ -194,7 +195,7 @@ def validate_tool_content_block(index: int, block: object) -> ToolContentBlock:
     block_type = block.get("type")
     if block_type == "text":
         required_keys = {"type", "text", "truncated", "full_size"}
-        allowed_keys = {*required_keys, "annotations"}
+        allowed_keys = {*required_keys, "next_offset", "annotations"}
         if not required_keys <= set(block) or not set(block) <= allowed_keys:
             raise ValueError(f"{prefix} has an invalid text shape")
         if type(block["text"]) is not str:
@@ -203,12 +204,18 @@ def validate_tool_content_block(index: int, block: object) -> ToolContentBlock:
             raise ValueError(f"{prefix}.truncated must be a boolean")
         if type(block["full_size"]) is not int or block["full_size"] < 0:
             raise ValueError(f"{prefix}.full_size must be nonnegative")
+        if "next_offset" in block and (
+            type(block["next_offset"]) is not int or block["next_offset"] < 0
+        ):
+            raise ValueError(f"{prefix}.next_offset must be nonnegative")
         normalized: ToolTextBlock = {
             "type": "text",
             "text": block["text"],
             "truncated": block["truncated"],
             "full_size": block["full_size"],
         }
+        if "next_offset" in block:
+            normalized["next_offset"] = block["next_offset"]
         if "annotations" in block:
             normalized["annotations"] = _validate_annotations(
                 prefix, block["annotations"]

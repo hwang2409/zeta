@@ -522,19 +522,129 @@ async def test_fetch_pins_connection_to_first_validated_address(
 
 
 @pytest.mark.asyncio
-async def test_fetch_output_is_capped_with_marker(
+async def test_fetch_output_is_paginated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     result = await _execute_fetch(
         tmp_path,
         monkeypatch,
         httpx.Response(200, text="x" * 50_100),
+        max_output_chars=10_000,
     )
 
     block = result["content"][0]
     assert block["truncated"] is True
     assert block["full_size"] == 50_100
-    assert block["text"].endswith("\n...[output truncated]")
+    assert block["text"] == "x" * 10_000
+    assert block["next_offset"] == 10_000
+
+
+@pytest.mark.asyncio
+async def test_fetch_pagination_reassembles_extracted_readable_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    html = (
+        "<article><h1>Title</h1><p>Readable article text. "
+        + "word " * 12
+        + "</p></article>"
+    )
+    expected = fetch_tool._readable_content("https://example.com", "text/html", html)
+    offset = 0
+    pages: list[str] = []
+
+    while True:
+        result = await _execute_fetch(
+            tmp_path,
+            monkeypatch,
+            httpx.Response(200, headers={"content-type": "text/html"}, text=html),
+            arguments={"url": "example.com", "offset": offset},
+            max_output_chars=17,
+        )
+        block = result["content"][0]
+        pages.append(block["text"])
+        assert block["full_size"] == len(expected)
+        if not block["truncated"]:
+            break
+        assert block["next_offset"] == offset + len(block["text"])
+        offset = block["next_offset"]
+
+    assert len(pages) > 2
+    assert "".join(pages) == expected
+
+
+@pytest.mark.asyncio
+async def test_fetch_pagination_overshoot_returns_empty_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = "readable body"
+    result = await _execute_fetch(
+        tmp_path,
+        monkeypatch,
+        httpx.Response(200, headers={"content-type": "text/plain"}, text=body),
+        arguments={"url": "example.com", "offset": len(body) + 100},
+    )
+
+    block = result["content"][0]
+    assert block["text"] == ""
+    assert block["truncated"] is False
+    assert block["full_size"] == len(body)
+    assert "next_offset" not in block
+
+
+@pytest.mark.asyncio
+async def test_fetch_pagination_repeats_notices_without_advancing_offset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = "readable body " * 10
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            text=body,
+            request=request,
+        )
+
+    _mock_client(monkeypatch, handler)
+    monkeypatch.setattr(
+        fetch_tool.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (
+                fetch_tool.socket.AF_INET,
+                fetch_tool.socket.SOCK_STREAM,
+                6,
+                "",
+                ("192.168.1.5", 0),
+            )
+        ],
+    )
+    notice = (
+        "notice: http URL is not encrypted\n"
+        "notice: target resolves to a private or loopback address\n\n"
+    )
+    offset = 0
+    body_pages: list[str] = []
+
+    while True:
+        result = await ToolRegistry(tmp_path, max_output_chars=128).execute(
+            ToolCall(
+                "fetch-1",
+                "fetch",
+                {"url": "http://printer.local", "offset": offset},
+            )
+        )
+        block = result["content"][0]
+        assert block["text"].startswith(notice)
+        page = block["text"][len(notice) :]
+        body_pages.append(page)
+        assert page == body[offset : offset + len(page)]
+        if not block["truncated"]:
+            break
+        assert block["next_offset"] == offset + len(page)
+        offset = block["next_offset"]
+
+    assert "".join(body_pages) == body
 
 
 @pytest.mark.asyncio
