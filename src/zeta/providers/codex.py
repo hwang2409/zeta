@@ -24,11 +24,16 @@ from .codex_errors import (
     CodexStreamError,
 )
 from .codex_payload import build_responses_payload
+from .stream_diagnostics import StreamDiagnostics
 from .transport import (
     cleanup_transport,
+    format_retry_delay,
     is_control_exception,
     request_error,
-    retry_auth_completion,
+    retry_after_seconds,
+    retry_error_label,
+    retry_provider_completion,
+    retryable_provider_error,
     task_is_cancelling,
 )
 from .usage import normalize_usage
@@ -329,11 +334,17 @@ class CodexBackend(CompletionBackend):
         base_url: str = CODEX_API_URL,
         token_store: CodexCredentialStore | None = None,
         client: httpx.AsyncClient | None = None,
+        diagnostics_path: str | Path | None = None,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.token_store = token_store or CodexCredentialStore()
         self.client = client
+        self.diagnostics_path = (
+            Path(diagnostics_path)
+            if diagnostics_path is not None
+            else self.token_store.path.parent / "logs" / "stream-diagnostics.jsonl"
+        )
 
     def complete(
         self,
@@ -347,7 +358,7 @@ class CodexBackend(CompletionBackend):
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
-        attempts = retry_auth_completion(
+        attempts = retry_provider_completion(
             lambda: self._complete_once(messages, tool_schemas),
             lambda token: self._complete_once(messages, tool_schemas, token=token),
             self._refresh_token,
@@ -356,6 +367,10 @@ class CodexBackend(CompletionBackend):
                 "Codex authentication failed after token refresh; run `zeta login --provider codex`",
                 status_code=401,
             ),
+            lambda event: event.type is StreamEventType.MESSAGE_START,
+            retryable_provider_error,
+            self._retry_notice,
+            self._record_retry_exhausted,
         )
         try:
             async for event in attempts:
@@ -409,7 +424,7 @@ class CodexBackend(CompletionBackend):
             try:
                 if response.status_code >= 400:
                     body = await _read_error_body(response)
-                    raise _http_error(response.status_code, body)
+                    raise _http_error(response.status_code, body, response.headers)
                 async for event in _decode_response(response):
                     yield event
             except CodexBackendError as exc:
@@ -440,6 +455,28 @@ class CodexBackend(CompletionBackend):
             if primary_exception is not None:
                 raise primary_exception
 
+    def _retry_notice(
+        self, retry_number: int, delay: float, error: RuntimeError
+    ) -> StreamEvent:
+        return StreamEvent(
+            StreamEventType.RETRY,
+            data={
+                "text": (
+                    f"retrying ({retry_number}/3) in {format_retry_delay(delay)}s — "
+                    f"{retry_error_label(error)}"
+                ),
+                "retry": retry_number,
+                "delay": delay,
+            },
+        )
+
+    def _record_retry_exhausted(self, error: RuntimeError, retries: int) -> None:
+        StreamDiagnostics.record_retry_exhausted(
+            self.diagnostics_path,
+            error,
+            retries=retries,
+        )
+
 
 async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes:
     body = bytearray()
@@ -450,7 +487,11 @@ async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes
     return bytes(body)
 
 
-def _http_error(status_code: int, body: bytes) -> CodexBackendError:
+def _http_error(
+    status_code: int,
+    body: bytes,
+    headers: Mapping[str, str] | None = None,
+) -> CodexBackendError:
     error_type = CodexAuthError if status_code in {401, 403} else CodexHTTPError
     excerpt = error_body_excerpt(body)
     detail = f": {excerpt}" if excerpt else ""
@@ -459,7 +500,12 @@ def _http_error(status_code: int, body: bytes) -> CodexBackendError:
             f"Codex HTTP request failed ({status_code}){detail}",
             status_code=status_code,
         )
-    return error_type(f"Codex HTTP request failed ({status_code}){detail}")
+    retry_after = retry_after_seconds(headers)
+    return error_type(
+        f"Codex HTTP request failed ({status_code}){detail}",
+        status_code=status_code,
+        retry_after=retry_after,
+    )
 
 
 async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEvent]:
@@ -513,7 +559,16 @@ def _translate_event(
         detail = payload.get("error")
         if not isinstance(detail, Mapping) and not isinstance(payload.get("message"), str):
             raise CodexStreamError("Codex stream error payload is invalid")
-        raise CodexStreamError("Codex response reported an error")
+        error_type = detail.get("type") if isinstance(detail, Mapping) else None
+        raise CodexStreamError(
+            "Codex response reported an error",
+            retryable=error_type in {"overloaded_error", "rate_limit_error"},
+            retry_reason=(
+                error_type
+                if error_type in {"overloaded_error", "rate_limit_error"}
+                else None
+            ),
+        )
     if event_type == "response.created":
         if response_state != "not-started":
             raise CodexStreamError("Codex response.created is duplicated")

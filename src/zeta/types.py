@@ -645,6 +645,7 @@ class StreamEventType(StrEnum):
     MESSAGE_START = "message_start"
     MESSAGE_UPDATE = "message_update"
     MESSAGE_END = "message_end"
+    RETRY = "retry"
     TOOL_APPROVAL_START = "tool_approval_start"
     TOOL_APPROVAL_END = "tool_approval_end"
     TOOL_EXECUTION_START = "tool_execution_start"

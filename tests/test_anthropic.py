@@ -443,7 +443,7 @@ async def test_401_refresh_failure_propagates_without_retry(
 
 
 @pytest.mark.asyncio
-async def test_non_401_error_does_not_refresh_or_retry(
+async def test_server_error_retries_without_refresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     requests: list[httpx.Request] = []
@@ -460,13 +460,318 @@ async def test_non_401_error_does_not_refresh_or_retry(
         refreshes.append(client)
         return "fresh-access"
 
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
+
     monkeypatch.setattr(store, "refresh_token", refresh_token)
     client = client_for(handler)
     with pytest.raises(AnthropicHTTPError, match="500"):
         [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
 
-    assert len(requests) == 1
+    assert len(requests) == 4
     assert refreshes == []
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504, 529])
+async def test_each_retryable_status_retries_before_stream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    requests: list[httpx.Request] = []
+    sleeps: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(status_code, json={"error": {"message": "busy"}}, request=request)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=SSE, request=request)
+
+    async def no_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(
+            client=client,
+            token_store=store,
+            diagnostics_path=tmp_path / "logs" / "stream-diagnostics.jsonl",
+        ).complete([], [])
+    ]
+
+    assert len(requests) == 2
+    assert len(sleeps) == 1
+    assert [event.type for event in events].count(StreamEventType.RETRY) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_after_headers_retries_before_first_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
+
+    class DisconnectStream(httpx.AsyncByteStream):
+        def __init__(self, request: httpx.Request) -> None:
+            self.request = request
+
+        async def __aiter__(self):
+            raise httpx.ReadError("peer closed", request=self.request)
+            yield b""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=DisconnectStream(request),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=SSE,
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(
+            client=client,
+            token_store=store,
+            diagnostics_path=tmp_path / "logs" / "stream-diagnostics.jsonl",
+        ).complete([], [])
+    ]
+
+    assert len(requests) == 2
+    assert [event.type for event in events].count(StreamEventType.RETRY) == 1
+    assert not (tmp_path / "logs" / "stream-diagnostics.jsonl").exists()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retry_after_controls_wait_and_notice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    requests: list[httpx.Request] = []
+    sleeps: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                429,
+                headers={"retry-after": "4"},
+                json={"error": {"message": "busy"}},
+                request=request,
+            )
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=SSE, request=request)
+
+    async def no_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(client=client, token_store=store).complete([], [])
+    ]
+
+    retry = next(event for event in events if event.type is StreamEventType.RETRY)
+    assert sleeps == [4.0]
+    assert retry.data["text"] == "retrying (1/3) in 4s — 429 rate limited"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_rate_limit_retry_notice_uses_429_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=(
+                    'data: {"type":"error","error":{"type":"rate_limit_error",'
+                    '"message":"slow down"}}\n\n'
+                ),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=SSE,
+            request=request,
+        )
+
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(client=client, token_store=store).complete([], [])
+    ]
+
+    retry = next(event for event in events if event.type is StreamEventType.RETRY)
+    assert len(requests) == 2
+    assert retry.data["text"].endswith("429 rate limited")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retry_exhaustion_records_class_only_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, json={"error": {"message": "secret"}}, request=request)
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
+    diagnostics_path = tmp_path / "logs" / "stream-diagnostics.jsonl"
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    with pytest.raises(AnthropicHTTPError, match="503"):
+        [
+            event
+            async for event in AnthropicBackend(
+                client=client,
+                token_store=store,
+                diagnostics_path=diagnostics_path,
+            ).complete([], [])
+        ]
+
+    assert len(requests) == 4
+    records = [json.loads(line) for line in diagnostics_path.read_text().splitlines()]
+    assert records == [
+        {
+            "timestamp": records[0]["timestamp"],
+            "cause": "zeta.providers.anthropic_errors.AnthropicHTTPError",
+            "retries": 3,
+        }
+    ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_401_refresh_then_retryable_failure_uses_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    statuses = iter((401, 503, 200))
+    refreshes: list[httpx.AsyncClient] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        status_code = next(statuses)
+        if status_code == 200:
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=SSE, request=request)
+        return httpx.Response(status_code, json={"error": {"message": "busy"}}, request=request)
+
+    async def refresh_token(client: httpx.AsyncClient) -> str:
+        refreshes.append(client)
+        return "fresh-access"
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("stale-access", "refresh-test", 4_000_000_000))
+    monkeypatch.setattr(store, "refresh_token", refresh_token)
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(client=client, token_store=store).complete([], [])
+    ]
+
+    assert len(refreshes) == 1
+    assert len([event for event in events if event.type is StreamEventType.RETRY]) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 403, 404, 422])
+async def test_non_retryable_status_fails_fast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status_code, json={"error": {"message": "invalid"}}, request=request)
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    with pytest.raises((AnthropicHTTPError, AnthropicAuthError)):
+        [
+            event
+            async for event in AnthropicBackend(client=client, token_store=store).complete([], [])
+        ]
+
+    assert len(requests) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_aborts_retry_wait(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, json={"error": {"message": "busy"}}, request=request)
+
+    async def abort_wait(delay: float) -> None:
+        del delay
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", abort_wait)
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    with pytest.raises(asyncio.CancelledError):
+        [
+            event
+            async for event in AnthropicBackend(client=client, token_store=store).complete([], [])
+        ]
+
+    assert len(requests) == 1
     await client.aclose()
 
 
@@ -851,6 +1156,105 @@ async def test_anthropic_sse_error_redacts_authorization_marker(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_post_start_provider_error_salvages_once(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+    stream = "\n".join(
+        [
+            'data: {"type":"message_start","message":{}}',
+            "",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            "",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}',
+            "",
+            'data: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}',
+            "",
+        ]
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=stream,
+            request=request,
+        )
+
+    diagnostics_path = tmp_path / "logs" / "stream-diagnostics.jsonl"
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(
+            client=client,
+            token_store=store,
+            diagnostics_path=diagnostics_path,
+        ).complete([], [])
+    ]
+
+    assert len(requests) == 1
+    assert not any(event.type is StreamEventType.RETRY for event in events)
+    assert events[-1].type is StreamEventType.MESSAGE_END
+    assert events[-1].data["truncated"] is True
+    assert events[-1].message == Message(
+        MessageRole.ASSISTANT, [TextContent("partial")]
+    )
+    records = diagnostics_path.read_text().splitlines()
+    assert len(records) == 1
+    assert json.loads(records[0])["cause"] == (
+        "zeta.providers.anthropic_errors.AnthropicStreamError"
+    )
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_error_after_message_stop_is_ignored(tmp_path: Path) -> None:
+    stream = "\n".join(
+        [
+            'data: {"type":"message_start","message":{}}',
+            "",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            "",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"complete"}}',
+            "",
+            'data: {"type":"content_block_stop","index":0}',
+            "",
+            'data: {"type":"message_stop"}',
+            "",
+            'data: {"type":"error","error":{"type":"overloaded_error","message":"duplicate"}}',
+            "",
+        ]
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=stream,
+            request=request,
+        )
+
+    diagnostics_path = tmp_path / "logs" / "stream-diagnostics.jsonl"
+    store = AnthropicCredentialStore(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(
+            client=client,
+            token_store=store,
+            diagnostics_path=diagnostics_path,
+        ).complete([], [])
+    ]
+
+    assert [event.type for event in events].count(StreamEventType.MESSAGE_END) == 1
+    assert events[-1].data.get("truncated") is None
+    assert not diagnostics_path.exists()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_sse_error_redacts_bearer_authorization(tmp_path: Path) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1030,15 +1434,26 @@ async def test_http_failure_is_typed(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_request_entry_transport_failure_is_typed(tmp_path: Path) -> None:
+async def test_request_entry_transport_failure_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("secret connection details", request=request)
 
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", no_sleep)
     with pytest.raises(AnthropicHTTPError) as raised:
-        await anext(AnthropicBackend(client=client, token_store=store).complete([], []))
+        [
+            event
+            async for event in AnthropicBackend(
+                client=client, token_store=store
+            ).complete([], [])
+        ]
     assert "secret connection details" not in str(raised.value)
     await client.aclose()
 

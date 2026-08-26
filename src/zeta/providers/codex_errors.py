@@ -24,11 +24,33 @@ class CodexHTTPError(CodexBackendError):
 
     code = "http_error"
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
 
 class CodexStreamError(CodexBackendError):
     """Raised when a Responses SSE stream violates its lifecycle contract."""
 
     code = "stream_error"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        retry_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.retry_reason = retry_reason
 
 
 __all__ = [
