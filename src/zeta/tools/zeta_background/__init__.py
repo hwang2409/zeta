@@ -6,8 +6,8 @@ import os
 from pathlib import Path
 from typing import Any, TypedDict
 
-from ..types import StructuredToolResult
-from .registry import ToolRegistry, _success_result, text_block
+from ...types import StructuredToolResult
+from ..registry import ToolRegistry, _success_result, text_block
 
 
 class BackgroundArguments(TypedDict, total=False):
