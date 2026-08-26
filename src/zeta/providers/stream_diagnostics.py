@@ -72,6 +72,22 @@ class StreamDiagnostics:
         )
         self.written = True
 
+    @staticmethod
+    def record_retry_exhausted(
+        path: Path,
+        error: BaseException,
+        *,
+        retries: int,
+    ) -> None:
+        write_stream_diagnostic(
+            path,
+            {
+                "timestamp": time.time(),
+                "cause": type(error),
+                "retries": retries,
+            },
+        )
+
 
 def write_stream_diagnostic(
     path: Path,

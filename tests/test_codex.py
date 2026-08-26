@@ -695,7 +695,7 @@ async def test_401_refresh_failure_propagates_without_retry(
 
 
 @pytest.mark.asyncio
-async def test_non_401_error_does_not_refresh_or_retry(
+async def test_server_error_retries_without_refresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     requests: list[httpx.Request] = []
@@ -711,13 +711,162 @@ async def test_non_401_error_does_not_refresh_or_retry(
         refreshes.append(client)
         return access_token("fresh-account")
 
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+
     monkeypatch.setattr(store, "refresh_token", refresh_token)
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     with pytest.raises(CodexHTTPError, match="500"):
         [item async for item in CodexBackend(client=client, token_store=store).complete([], [])]
 
-    assert len(requests) == 1
+    assert len(requests) == 4
     assert refreshes == []
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_retries_before_response_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                429,
+                headers={"retry-after": "2"},
+                json={"error": {"message": "busy"}},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(message_stream()),
+            request=request,
+        )
+
+    sleeps: list[float] = []
+
+    async def no_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+        ).complete([], [])
+    ]
+
+    assert len(requests) == 2
+    assert sleeps == [2.0]
+    assert [item.type for item in events].count(StreamEventType.RETRY) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_rate_limit_retry_notice_preserves_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=sse(
+                    [
+                        event(
+                            "error",
+                            error={
+                                "type": "rate_limit_error",
+                                "message": "slow down",
+                            },
+                        )
+                    ]
+                ),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(message_stream()),
+            request=request,
+        )
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+        ).complete([], [])
+    ]
+
+    retry = next(item for item in events if item.type is StreamEventType.RETRY)
+    assert len(requests) == 2
+    assert retry.data["text"].endswith("429 rate limited")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_after_headers_retries_before_first_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
+
+    class DisconnectStream(httpx.AsyncByteStream):
+        def __init__(self, request: httpx.Request) -> None:
+            self.request = request
+
+        async def __aiter__(self):
+            raise httpx.ReadError("peer closed", request=self.request)
+            yield b""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=DisconnectStream(request),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(message_stream()),
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    events = [
+        item
+        async for item in CodexBackend(
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+        ).complete([], [])
+    ]
+
+    assert len(requests) == 2
+    assert [item.type for item in events].count(StreamEventType.RETRY) == 1
+    assert not (tmp_path / "logs" / "stream-diagnostics.jsonl").exists()
     await client.aclose()
 
 
@@ -1888,7 +2037,9 @@ async def test_codex_refresh_keeps_existing_token_when_response_does_not_rotate(
 
 
 @pytest.mark.asyncio
-async def test_http_failure_and_transport_failure_are_typed(tmp_path: Path) -> None:
+async def test_http_failure_and_transport_failure_are_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     async def http_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             401,
@@ -1908,10 +2059,17 @@ async def test_http_failure_and_transport_failure_are_typed(tmp_path: Path) -> N
         raise httpx.ConnectError("transport secret", request=request)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(transport_handler))
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", no_sleep)
     with pytest.raises(CodexHTTPError) as raised:
-        await anext(
-            CodexBackend(client=client, token_store=store_for(tmp_path / "transport.json")).complete([], [])
-        )
+        [
+            item
+            async for item in CodexBackend(
+                client=client, token_store=store_for(tmp_path / "transport.json")
+            ).complete([], [])
+        ]
     assert "transport secret" not in str(raised.value)
     await client.aclose()
 

@@ -26,6 +26,7 @@ from rich.padding import Padding
 from rich.text import Text
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
+from ..core.hooks import load_hooks_for_provider
 from ..core.project_context import ProjectContext, discover_repo_root, load_project_context
 from ..core.slash import SlashStatus, create_slash_registry
 from ..loop import AgentLoop
@@ -46,8 +47,14 @@ from ..types import (
 from .composer import VimCursorShapeConfig, build_key_bindings, history_for
 from .composer import parse_input, status_formatted_text, vim_state_label
 from .layout import CONTENT_MARGIN, content_width, resume_picker_line
-from .render import MarkdownStream, format_status
-from .render import render_event, render_thought, render_thought_live
+from .line_buffer import LineBuffer
+from .render import (
+    MarkdownStream,
+    format_status,
+    format_thought,
+    render_event,
+)
+from .render import render_thought, render_thought_live
 from .stream import stream_key
 from .theme import (
     ACCENT,
@@ -173,24 +180,6 @@ def build_backend(
     raise ValueError(f"unsupported provider: {provider}")
 
 
-class _LineBuffer:
-    def __init__(self) -> None:
-        self.value = ""
-
-    def feed(self, value: str) -> list[str]:
-        self.value += value
-        lines = self.value.split("\n")
-        self.value = lines.pop()
-        return lines
-
-    def flush(self) -> list[str]:
-        if not self.value:
-            return []
-        line = self.value
-        self.value = ""
-        return [line]
-
-
 class TUIApp:
     """Full-screen transcript, persistent composer, and follow-up queue."""
 
@@ -212,6 +201,9 @@ class TUIApp:
         model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
     ) -> None:
         self.loop = loop
+        self._hooks = loop.hooks
+        if self._hooks is not None:
+            self._hooks.notice_sink = self._print_hook_notice
         self.provider = provider
         self.model = model
         self.verbose = verbose
@@ -221,7 +213,7 @@ class TUIApp:
         self._exit_requested = False
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
-        self._assistant_lines = _LineBuffer()
+        self._assistant_lines = LineBuffer()
         self._thinking_text = ""
         self._thinking_duration: float | None = None
         self._thinking_started_at: float | None = None
@@ -310,6 +302,7 @@ class TUIApp:
             ),
             context_files=self._context_files,
             vim_mode=self.vim_mode,
+            hooks=(() if self._hooks is None else self._hooks.status_entries),
         )
 
     def slash_model(self, args: str) -> str:
@@ -803,6 +796,9 @@ class TUIApp:
     def _print_system(self, output: str) -> None:
         self._print_unit(Text(f"system · {output}", style=CHROME))
 
+    def _print_hook_notice(self, output: str) -> None:
+        self._print_unit(Text(f"hook · {output}", style=DIM))
+
     def _start_queued_turn(self) -> None:
         if self._queued:
             user_text = self._queued.popleft()
@@ -985,6 +981,7 @@ class TUIApp:
         self._active_session = session
         if isinstance(session, FullScreenPromptSession):
             self._install_full_screen_layout(session)
+        self.loop.session_start()
         self._present_pending_approvals()
         prompt_task: asyncio.Task[str | None] | None = None
         try:
@@ -1122,6 +1119,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         store = opened.store
     if resuming:
         backend, selected_model = build_backend(provider, model, home=home)
+    hooks = load_hooks_for_provider(home, provider)
     approval_default = (
         ApprovalDecision.ALLOW if getattr(args, "yolo", False) else ApprovalDecision.ASK
     )
@@ -1161,6 +1159,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
     max_turns_override = getattr(args, "max_turns", None)
     loop_kwargs: dict[str, Any] = {
         "approval_policy": approval_policy,
+        "hooks": hooks,
         "token_budget": effective_token_budget,
         "retained_tail": metadata.retained_tail,
         "on_completion_success": completion_success,

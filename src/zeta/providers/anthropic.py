@@ -23,12 +23,22 @@ from .anthropic_payload import (
     _validate_thinking_parameters,
     build_messages_payload as _build_messages_payload,
 )
+from .anthropic_errors import (
+    AnthropicAuthError,
+    AnthropicBackendError,
+    AnthropicHTTPError,
+    AnthropicStreamError,
+    http_error as _http_error,
+)
 from .stream_diagnostics import Cause, StreamDiagnostics
 from .transport import (
     cleanup_transport,
+    format_retry_delay,
     is_control_exception,
     request_error,
-    retry_auth_completion,
+    retry_provider_completion,
+    retry_error_label,
+    retryable_provider_error,
     task_is_cancelling,
 )
 from .usage import normalize_usage
@@ -61,34 +71,6 @@ OAUTH_SCOPES = (
     "org:create_api_key user:profile user:inference user:sessions:claude_code "
     "user:mcp_servers user:file_upload"
 )
-
-
-class AnthropicBackendError(RuntimeError):
-    """Base class for errors that the agent loop can report as backend errors."""
-
-    code = "backend_error"
-
-
-class AnthropicAuthError(AnthropicBackendError):
-    """Raised when Claude subscription credentials are missing or invalid."""
-
-    code = "auth_error"
-
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-
-
-class AnthropicHTTPError(AnthropicBackendError):
-    """Raised when Anthropic returns an unsuccessful HTTP response."""
-
-    code = "http_error"
-
-
-class AnthropicStreamError(AnthropicBackendError):
-    """Raised when an Anthropic SSE stream is invalid or ends early."""
-
-    code = "stream_error"
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
@@ -370,7 +352,7 @@ class AnthropicBackend(CompletionBackend):
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
-        attempts = retry_auth_completion(
+        attempts = retry_provider_completion(
             lambda: self._complete_once(messages, tool_schemas),
             lambda token: self._complete_once(messages, tool_schemas, token=token),
             self._refresh_token,
@@ -379,6 +361,10 @@ class AnthropicBackend(CompletionBackend):
                 "Anthropic authentication failed after token refresh; run `zeta login`",
                 status_code=401,
             ),
+            lambda event: event.type is StreamEventType.MESSAGE_START,
+            retryable_provider_error,
+            self._retry_notice,
+            self._record_retry_exhausted,
         )
         try:
             async for event in attempts:
@@ -439,7 +425,7 @@ class AnthropicBackend(CompletionBackend):
             try:
                 if response.status_code >= 400:
                     body = await _read_error_body(response)
-                    raise _http_error(response.status_code, body)
+                    raise _http_error(response.status_code, body, response.headers)
                 async for event in _decode_response(
                     response,
                     diagnostics_path=self.diagnostics_path,
@@ -473,6 +459,28 @@ class AnthropicBackend(CompletionBackend):
             if primary_exception is not None:
                 raise primary_exception
 
+    def _retry_notice(
+        self, retry_number: int, delay: float, error: RuntimeError
+    ) -> StreamEvent:
+        return StreamEvent(
+            StreamEventType.RETRY,
+            data={
+                "text": (
+                    f"retrying ({retry_number}/3) in {format_retry_delay(delay)}s — "
+                    f"{retry_error_label(error)}"
+                ),
+                "retry": retry_number,
+                "delay": delay,
+            },
+        )
+
+    def _record_retry_exhausted(self, error: RuntimeError, retries: int) -> None:
+        StreamDiagnostics.record_retry_exhausted(
+            self.diagnostics_path,
+            error,
+            retries=retries,
+        )
+
 
 async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes:
     body = bytearray()
@@ -481,16 +489,6 @@ async def _read_error_body(response: httpx.Response, limit: int = 8192) -> bytes
         if len(body) >= limit:
             break
     return bytes(body)
-
-
-def _http_error(status_code: int, body: bytes) -> AnthropicHTTPError:
-    message = error_body_excerpt(body) or "request failed"
-    error_type = AnthropicAuthError if status_code in {401, 403} else AnthropicHTTPError
-    if error_type is AnthropicAuthError:
-        return error_type(
-            f"Anthropic HTTP {status_code}: {message}", status_code=status_code
-        )
-    return error_type(f"Anthropic HTTP {status_code}: {message}")
 
 
 async def _decode_response(
@@ -591,6 +589,22 @@ async def _decode_response(
                 )
         return translated
 
+    def process_provider_error(
+        record: tuple[str, dict[str, Any]],
+    ) -> tuple[StreamEvent | None, bool]:
+        event, payload = record
+        event_type = payload.get("type", event)
+        if event_type != "error":
+            return process_record(record), False
+        try:
+            return process_record(record), False
+        except AnthropicStreamError:
+            if message_state == "not-started":
+                raise
+            if message_state == "stopped":
+                return None, False
+            return salvage(AnthropicStreamError), True
+
     try:
         async for line in response.aiter_lines():
             bytes_received += len(line.encode()) + 1
@@ -599,7 +613,7 @@ async def _decode_response(
                 continue
             sse_events_received += 1
             last_event_at = time.monotonic()
-            translated = process_record(record)
+            translated, salvaged = process_provider_error(record)
             if translated is None:
                 continue
             if translated.type is StreamEventType.MESSAGE_END:
@@ -614,6 +628,8 @@ async def _decode_response(
                 )
                 finished = True
             yield translated
+            if salvaged:
+                return
     except httpx.HTTPError as exc:
         if finished or message_state == "not-started":
             raise
@@ -624,7 +640,7 @@ async def _decode_response(
     if record is not None:
         sse_events_received += 1
         last_event_at = time.monotonic()
-        translated = process_record(record)
+        translated, salvaged = process_provider_error(record)
         if translated is not None:
             if translated.type is StreamEventType.MESSAGE_END:
                 translated = StreamEvent(
@@ -639,6 +655,8 @@ async def _decode_response(
                 yield translated
                 return
             yield translated
+            if salvaged:
+                return
     if not finished:
         if message_state == "not-started":
             raise AnthropicStreamError("Anthropic stream ended before message_start")
@@ -663,8 +681,11 @@ def _translate_event(
         message = detail.get("message")
         if type(message) is not str:
             raise AnthropicStreamError("Anthropic stream error message is invalid")
+        reason = detail.get("type")
         raise AnthropicStreamError(
-            error_body_excerpt(message.encode()) or "Anthropic stream error"
+            error_body_excerpt(message.encode()) or "Anthropic stream error",
+            retryable=reason in {"overloaded_error", "rate_limit_error"},
+            retry_reason=reason if reason in {"overloaded_error", "rate_limit_error"} else None,
         )
     if event_type == "message_start":
         message = payload.get("message", {})

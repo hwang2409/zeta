@@ -1661,6 +1661,19 @@ def test_truncated_response_notice_is_dim() -> None:
     assert not _contains_background_sgr(escaped)
 
 
+def test_retry_notice_is_dim() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.RETRY,
+            data={"text": "retrying (1/3) in 1s — 503 server error"},
+        )
+    )
+
+    assert isinstance(rendered, Text)
+    assert rendered.plain == "retrying (1/3) in 1s — 503 server error"
+    assert rendered.style == DIM
+
+
 @pytest.mark.asyncio
 async def test_truncated_response_notice_is_printed_once(tmp_path: Path) -> None:
     class TruncatedBackend(CompletionBackend):
