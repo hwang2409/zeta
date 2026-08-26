@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+import socket
 from collections.abc import Mapping
 from html.parser import HTMLParser
+from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
@@ -19,6 +21,43 @@ MAX_RESPONSE_BYTES = 2_000_000
 MAX_OUTPUT_BYTES = 50_000
 MAX_REDIRECTS = 5
 OUTPUT_TRUNCATION_MARKER = "\n...[output truncated]"
+_PRIVATE_NETWORKS = (
+    ip_network("10.0.0.0/8"),
+    ip_network("172.16.0.0/12"),
+    ip_network("192.168.0.0/16"),
+    ip_network("127.0.0.0/8"),
+    ip_network("169.254.0.0/16"),
+    ip_network("::1/128"),
+    ip_network("fc00::/7"),
+    ip_network("fe80::/10"),
+)
+_CLOUD_METADATA_ADDRESS = ip_address("169.254.169.254")
+
+
+def _target_addresses(url: str) -> tuple[IPv4Address | IPv6Address, ...]:
+    hostname = urlsplit(url).hostname
+    if hostname is None:
+        raise ValueError("URL must use http or https and include a host")
+    try:
+        return (ip_address(hostname),)
+    except ValueError:
+        parsed = urlsplit(url)
+        try:
+            infos = socket.getaddrinfo(
+                hostname,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as exc:
+            raise ValueError(f"request failed: could not resolve host {hostname}") from exc
+        return tuple(ip_address(info[4][0]) for info in infos)
+
+
+def _validate_target(url: str) -> bool:
+    addresses = _target_addresses(url)
+    if _CLOUD_METADATA_ADDRESS in addresses:
+        raise ValueError("refusing cloud metadata target 169.254.169.254")
+    return any(address in network for address in addresses for network in _PRIVATE_NETWORKS)
 
 
 async def get_response(
@@ -28,16 +67,63 @@ async def get_response(
     max_bytes: int = MAX_RESPONSE_BYTES,
     params: Mapping[str, str] | None = None,
 ) -> httpx.Response:
-    """Make one bounded request and turn transport failures into clear errors."""
+    """Make a bounded, manually redirected request.
+
+    Private, loopback, link-local, and RFC1918 targets are allowed because zeta
+    is a local-first tool. They produce a notice in the returned fetch output.
+    The cloud metadata address 169.254.169.254 is always refused.
+    """
 
     try:
         async with httpx.AsyncClient(
             timeout=HTTP_TIMEOUT_SECONDS,
-            follow_redirects=True,
-            max_redirects=MAX_REDIRECTS,
+            follow_redirects=False,
             headers={"User-Agent": user_agent},
         ) as client:
-            response = await client.get(url, params=params)
+            current_url = url
+            redirects_followed = 0
+            while True:
+                _validate_url(current_url)
+                _validate_target(current_url)
+                async with client.stream(
+                    "GET",
+                    current_url,
+                    params=params if redirects_followed == 0 else None,
+                ) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ValueError(
+                                "request failed: redirect response missing location"
+                            )
+                        if redirects_followed >= MAX_REDIRECTS:
+                            raise ValueError(
+                                f"request failed: redirect limit exceeded ({MAX_REDIRECTS})"
+                            )
+                        current_url = urljoin(current_url, location)
+                        redirects_followed += 1
+                        continue
+                    if response.status_code >= 400:
+                        reason = response.reason_phrase or "HTTP error"
+                        raise ValueError(
+                            f"request failed: HTTP {response.status_code} {reason}"
+                        )
+                    chunks: list[bytes] = []
+                    received = 0
+                    async for chunk in response.aiter_bytes():
+                        received += len(chunk)
+                        if received > max_bytes:
+                            raise ValueError(
+                                f"response too large: more than {max_bytes} bytes received"
+                            )
+                        chunks.append(chunk)
+                    return httpx.Response(
+                        response.status_code,
+                        headers=response.headers,
+                        content=b"".join(chunks),
+                        request=response.request or httpx.Request("GET", current_url),
+                        extensions=response.extensions,
+                    )
     except httpx.TooManyRedirects as exc:
         raise ValueError(
             f"request failed: redirect limit exceeded ({MAX_REDIRECTS})"
@@ -46,26 +132,7 @@ async def get_response(
         raise ValueError("request failed: request timed out") from exc
     except httpx.RequestError as exc:
         raise ValueError(f"request failed: {exc}") from exc
-
-    if response.status_code >= 400:
-        reason = response.reason_phrase or "HTTP error"
-        raise ValueError(f"request failed: HTTP {response.status_code} {reason}")
-
-    content_length = response.headers.get("content-length")
-    if content_length is not None:
-        try:
-            declared_length = int(content_length)
-        except ValueError:
-            declared_length = None
-        if declared_length is not None and declared_length > max_bytes:
-            raise ValueError(
-                f"response too large: {declared_length} bytes exceeds {max_bytes}"
-            )
-    if len(response.content) > max_bytes:
-        raise ValueError(
-            f"response too large: more than {max_bytes} bytes received"
-        )
-    return response
+    raise AssertionError("unreachable response loop")
 
 
 def response_text(response: httpx.Response) -> str:
@@ -186,6 +253,12 @@ def _normalize_url(raw_url: str) -> str:
     return url
 
 
+def _validate_url(url: str) -> None:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("URL must use http or https and include a host")
+
+
 def _readable_content(url: str, content_type: str, body: str) -> str:
     media_type = content_type.split(";", 1)[0].strip().lower()
     if media_type in {"text/html", "application/xhtml+xml"}:
@@ -217,7 +290,6 @@ async def _fetch(
     arguments: dict[str, Any],
     _abort_signal: AbortSignal,
 ) -> StructuredToolResult:
-    del registry
     url = _normalize_url(arguments["url"])
     max_bytes = arguments.get("max_bytes", MAX_RESPONSE_BYTES)
     response = await get_response(
@@ -225,15 +297,22 @@ async def _fetch(
         user_agent="zeta/fetch (web tool)",
         max_bytes=max_bytes,
     )
+    final_url = str(response.request.url) if response.request is not None else url
     body = _readable_content(
-        url,
+        final_url,
         response.headers.get("content-type", ""),
         response_text(response),
     )
-    notice = ""
-    if urlsplit(url).scheme == "http":
-        notice = "notice: http URL is not encrypted\n\n"
-    return _success_result(output_block(notice + body))
+    notices: list[str] = []
+    if urlsplit(final_url).scheme == "http":
+        notices.append("notice: http URL is not encrypted")
+    if _validate_target(final_url):
+        notices.append("notice: target resolves to a private or loopback address")
+    notice = "\n".join(notices)
+    if notice:
+        notice += "\n\n"
+    effective_limit = min(MAX_OUTPUT_BYTES, registry.max_output_chars)
+    return _success_result(output_block(notice + body, limit=effective_limit))
 
 
 def register(registry: ToolRegistry) -> None:
@@ -242,7 +321,9 @@ def register(registry: ToolRegistry) -> None:
         lambda arguments, abort_signal: _fetch(registry, arguments, abort_signal),
         description=(
             "Fetch a URL and return readable text. Network access requires approval; "
-            "HTTP URLs are allowed with a notice."
+            "HTTP URLs are allowed with a notice. Private, loopback, link-local, "
+            "and RFC1918 targets are allowed with a notice for local-first use; "
+            "the cloud metadata address 169.254.169.254 is refused."
         ),
         parameters={
             "type": "object",

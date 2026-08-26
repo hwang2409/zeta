@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from html.parser import HTMLParser
 from typing import Any, TypedDict
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -28,18 +27,50 @@ class _DuckDuckGoParser(HTMLParser):
         self.results: list[SearchResult] = []
         self._title: tuple[str, str] | None = None
         self._snippet: list[str] | None = None
-        self.saw_no_results = False
+        self._empty_container_depth = 0
+        self._empty_marker_seen = False
+        self._empty_message_depth = 0
+        self._empty_heading_depth = 0
+        self._empty_heading_text: list[str] = []
+        self.saw_empty_state = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
         classes = set((attributes.get("class") or "").split())
-        if tag == "a" and "result__a" in classes:
+        if tag == "div" and classes == {"no-results__container", "result__title"}:
+            self._empty_container_depth = 1
+        elif self._empty_container_depth:
+            self._empty_container_depth += 1
+            if tag == "span" and classes == {"no-results"}:
+                self._empty_marker_seen = True
+            elif tag == "div" and classes == {"no-results__message"}:
+                self._empty_message_depth = 1
+            elif self._empty_message_depth:
+                self._empty_message_depth += 1
+            if tag == "h1" and self._empty_message_depth:
+                self._empty_heading_depth = 1
+                self._empty_heading_text = []
+            elif self._empty_heading_depth:
+                self._empty_heading_depth += 1
+        elif tag == "a" and "result__a" in classes:
             href = _decode_result_url(attributes.get("href", ""))
             self._title = (href, "")
         elif tag in {"a", "div"} and "result__snippet" in classes:
             self._snippet = []
 
     def handle_endtag(self, tag: str) -> None:
+        if self._empty_heading_depth:
+            self._empty_heading_depth -= 1
+            if self._empty_heading_depth == 0:
+                heading = " ".join("".join(self._empty_heading_text).split())
+                self.saw_empty_state = self._empty_marker_seen and heading.startswith(
+                    "No results found for "
+                )
+        if self._empty_message_depth:
+            self._empty_message_depth -= 1
+        if self._empty_container_depth:
+            self._empty_container_depth -= 1
+            return
         if tag == "a" and self._title is not None:
             href, title = self._title
             if href and title.strip():
@@ -54,12 +85,13 @@ class _DuckDuckGoParser(HTMLParser):
             self._snippet = None
 
     def handle_data(self, data: str) -> None:
+        if self._empty_heading_depth:
+            self._empty_heading_text.append(data)
+            return
         if self._title is not None:
             self._title = (self._title[0], self._title[1] + data)
         if self._snippet is not None:
             self._snippet.append(data)
-        if re.search(r"no results", data, re.IGNORECASE):
-            self.saw_no_results = True
 
 
 def _decode_result_url(raw_url: str) -> str:
@@ -76,7 +108,7 @@ def parse_search_results(body: str, *, max_results: int) -> list[SearchResult]:
     parser = _DuckDuckGoParser()
     parser.feed(body)
     parser.close()
-    if not parser.results and not parser.saw_no_results:
+    if not parser.results and not parser.saw_empty_state:
         raise ValueError("search backend failed: could not parse results")
     return parser.results[:max_results]
 
