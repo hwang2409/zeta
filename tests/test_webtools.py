@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gzip
+import zlib
 from pathlib import Path
 
 import httpx
@@ -13,6 +15,24 @@ from zeta.tools import ToolRegistry
 from zeta.types import ToolCall
 
 _ASYNC_CLIENT = httpx.AsyncClient
+
+
+class _ChunkedByteStream(httpx.AsyncByteStream):
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+
+    async def __aiter__(self):
+        midpoint = max(1, len(self.content) // 2)
+        yield self.content[:midpoint]
+        yield self.content[midpoint:]
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _raw_deflate(value: bytes) -> bytes:
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    return compressor.compress(value) + compressor.flush()
 
 
 def _mock_client(
@@ -142,6 +162,128 @@ async def test_fetch_streams_body_and_ignores_lying_content_length(
 
     assert result["isError"] is True
     assert "more than 5 bytes" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_decodes_gzip_response_from_raw_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = await _execute_fetch(
+        tmp_path,
+        monkeypatch,
+        httpx.Response(
+            200,
+            headers={
+                "content-type": "text/plain",
+                "content-encoding": "gzip",
+            },
+            stream=_ChunkedByteStream(gzip.compress(b"compressed response")),
+        ),
+    )
+
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "compressed response"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("encoding", "compressed", "expected"),
+    [
+        ("gzip", gzip.compress(b"gzip response"), "gzip response"),
+        ("deflate", zlib.compress(b"zlib response"), "zlib response"),
+        (
+            "deflate",
+            _raw_deflate(b"raw response"),
+            "raw response",
+        ),
+    ],
+)
+async def test_fetch_decodes_supported_content_encodings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    encoding: str,
+    compressed: bytes,
+    expected: str,
+) -> None:
+    result = await _execute_fetch(
+        tmp_path,
+        monkeypatch,
+        httpx.Response(
+            200,
+            headers={
+                "content-type": "text/plain",
+                "content-encoding": encoding,
+            },
+            stream=_ChunkedByteStream(compressed),
+        ),
+    )
+
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_encoding", ["identity", "x-custom"])
+async def test_fetch_preserves_uncompressed_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    content_encoding: str,
+) -> None:
+    result = await _execute_fetch(
+        tmp_path,
+        monkeypatch,
+        httpx.Response(
+            200,
+            headers={"content-type": "text/plain", "content-encoding": content_encoding},
+            stream=_ChunkedByteStream(b"identity response"),
+        ),
+    )
+
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "identity response"
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_multiple_content_encodings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = await _execute_fetch(
+        tmp_path,
+        monkeypatch,
+        httpx.Response(
+            200,
+            headers={
+                "content-type": "text/plain",
+                "content-encoding": "gzip, br",
+            },
+            stream=_ChunkedByteStream(b"body"),
+        ),
+    )
+
+    assert result["isError"] is True
+    assert "multiple content encodings" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_aborts_when_decompressed_body_exceeds_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = await _execute_fetch(
+        tmp_path,
+        monkeypatch,
+        httpx.Response(
+            200,
+            headers={
+                "content-type": "text/plain",
+                "content-encoding": "gzip",
+            },
+            stream=_ChunkedByteStream(gzip.compress(b"x" * 100)),
+        ),
+        arguments={"url": "example.com", "max_bytes": 32},
+    )
+
+    assert result["isError"] is True
+    assert result["content"][0]["truncated"] is True
 
 
 @pytest.mark.asyncio
