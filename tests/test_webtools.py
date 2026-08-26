@@ -18,13 +18,14 @@ _ASYNC_CLIENT = httpx.AsyncClient
 
 
 class _ChunkedByteStream(httpx.AsyncByteStream):
-    def __init__(self, content: bytes) -> None:
+    def __init__(self, content: bytes, *, first_chunk_size: int | None = None) -> None:
         self.content = content
+        self.first_chunk_size = first_chunk_size
 
     async def __aiter__(self):
-        midpoint = max(1, len(self.content) // 2)
-        yield self.content[:midpoint]
-        yield self.content[midpoint:]
+        split_at = self.first_chunk_size or max(1, len(self.content) // 2)
+        yield self.content[:split_at]
+        yield self.content[split_at:]
 
     async def aclose(self) -> None:
         return None
@@ -220,6 +221,52 @@ async def test_fetch_decodes_supported_content_encodings(
 
     assert result["isError"] is False
     assert result["content"][0]["text"] == expected
+
+
+@pytest.mark.asyncio
+async def test_fetch_decodes_raw_deflate_with_one_byte_first_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = await _execute_fetch(
+        tmp_path,
+        monkeypatch,
+        httpx.Response(
+            200,
+            headers={
+                "content-type": "text/plain",
+                "content-encoding": "deflate",
+            },
+            stream=_ChunkedByteStream(
+                _raw_deflate(b"raw response"), first_chunk_size=1
+            ),
+        ),
+    )
+
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "raw response"
+
+
+@pytest.mark.asyncio
+async def test_fetch_marks_truncated_gzip_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    compressed = gzip.compress(b"truncated response")
+    result = await _execute_fetch(
+        tmp_path,
+        monkeypatch,
+        httpx.Response(
+            200,
+            headers={
+                "content-type": "text/plain",
+                "content-encoding": "gzip",
+            },
+            stream=_ChunkedByteStream(compressed[:-1]),
+        ),
+    )
+
+    assert result["isError"] is True
+    assert result["content"][0]["truncated"] is True
+    assert "stream ended early" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio
