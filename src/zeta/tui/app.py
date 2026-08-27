@@ -260,7 +260,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
 
     def slash_status(self) -> SlashStatus:
         pending = tuple(
-            f"{request.request_id} ({request.tool_call.name})"
+            f"{request.request_id} ({request.label or request.tool_call.name})"
             for request in self.pending_approvals
         )
         items = self.loop.store.todo_items()
@@ -376,7 +376,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
             self._print(
                 Text(
                     f"[approval pending] {request.request_id}: "
-                    f"{request.tool_call.name} {arguments}; "
+                    f"{request.label or request.tool_call.name} {arguments}; "
                     f"type approve {request.request_id} or deny {request.request_id}",
                     style="yellow",
                 )

@@ -447,42 +447,44 @@ class ToolRegistry:
     @property
     def active_tool_call(self) -> ToolCall | None:
         return self._active_tool_call
+
     @property
     def agent_runner(self) -> Callable[..., Awaitable[ToolHandlerResult]] | None:
         return self._agent_runner
+
     def set_agent_runner(
         self,
         runner: Callable[..., Awaitable[ToolHandlerResult]] | None,
     ) -> None:
         self._agent_runner = runner
+
     def clone_for_session(
         self,
         store: ConversationStore,
         *,
         exclude_names: set[str] | frozenset[str] = frozenset(),
     ) -> ToolRegistry:
-        clone = ToolRegistry(
-            store.cwd,
-            session_store=store,
-            max_output_chars=self.max_output_chars,
-            register_builtin=self._register_builtin,
+        clone = copy.copy(self)
+        clone._cwd_fd = os.dup(self._cwd_fd)
+        clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
+        clone._tools = {
+            name: _copy_definition(definition)
+            for name, definition in self._tools.items()
+            if name not in exclude_names
+        }
+        clone._session_store = store
+        clone.background_tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
         )
-        names = set(self._tools) - exclude_names
-        for name in list(clone._tools):
-            if name not in names:
-                clone.unregister(name)
-        for definition in self.definitions:
-            if definition.name in exclude_names or definition.name in clone._tools:
-                continue
-            clone.register(
-                definition.name,
-                definition.handler,
-                description=definition.description,
-                parameters=definition.parameters,
-                parallel_safe=definition.parallel_safe,
-                validate_arguments=definition.validate_arguments,
-                requires_approval=definition.requires_approval,
-            )
+        clone.bash_cwd = store.bash_cwd
+        clone.abort_signal = clone._abort_registry.new_generation()
+        clone._approval_gate = ApprovalGate(
+            clone.approval_policy,
+            clone.pre_execute_hook,
+        )
+        clone._agent_runner = None
+        clone._active_tool_call = None
+        clone._active_lifecycle_sink = None
         return clone
     def abort(self) -> None:
         self.abort_signal.abort()

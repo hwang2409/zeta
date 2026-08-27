@@ -103,6 +103,8 @@ def tool_render_mode(event: StreamEvent) -> ToolRenderMode:
 
     call = event.tool_call
     result = event.tool_result
+    if call is not None and call.name.lower() == "agent":
+        return "receipt"
     if call is None or result is None or call.name.lower() not in RECEIPT_TOOLS:
         return "card"
     if result.is_error or any(
@@ -354,9 +356,13 @@ def _tool_panel(
     )
 
 
-def render_tool_progress(call: ToolCall, content: str) -> Panel:
-    """Render streamed tool output inside the same card surface."""
+def render_tool_progress(call: ToolCall, content: str) -> RenderableType:
+    """Render streamed tool output for the transcript."""
 
+    if call.name.lower() == "agent":
+        lines = content.splitlines()
+        status = lines[-1] if lines else "running"
+        return _safe_text(status, style=RECEIPT)
     body = Text("running…", style=DIM) if not content else _render_tool_output(content)
     return _tool_panel(call, body)
 
@@ -806,6 +812,9 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         text = event.data.get("text")
         return Text(text if type(text) is str else "retrying", style=DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
+        if event.tool_call.name.lower() == "agent":
+            description = str(event.tool_call.arguments.get("description", "agent"))
+            return _safe_text(f"{description}: agent · running", style=RECEIPT)
         if event.tool_call.name.lower() in RECEIPT_TOOLS:
             suffix = _receipt_arguments(event.tool_call, "")
             return Text(

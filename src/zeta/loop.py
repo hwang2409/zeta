@@ -87,6 +87,7 @@ def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
         flatten_tool_content(structured_result["content"]),
         structured_result["isError"],
         content_blocks=structured_result["content"],
+        structured_content=structured_result["structuredContent"],
     )
 
 
@@ -206,7 +207,8 @@ class AgentLoop:
 
         for tool_call_id, marker in self.store.agent_children().items():
             tool_call = ToolCall.from_dict(marker["tool_call"])
-            if self._existing_tool_result(tool_call_id) is None:
+            existing_result = self._existing_tool_result(tool_call_id)
+            if existing_result is None:
                 self.store.append_message(
                     Message(
                         MessageRole.TOOL_RESULT,
@@ -226,7 +228,10 @@ class AgentLoop:
                     session_id=child_path.name,
                     cwd=self.store.cwd,
                 )
-                child_store.finish_agent_parent()
+                if existing_result is None:
+                    child_store.mark_agent_canceled(tool_call.id)
+                else:
+                    child_store.finish_agent_parent()
             self.store.finish_agent_child(tool_call.id)
 
     async def _run_agent_tool(
@@ -271,6 +276,11 @@ class AgentLoop:
             child_store,
             exclude_names={"agent"},
         )
+        parent_policy = self.tool_registry.approval_policy
+        if parent_policy is not None:
+            child_registry.set_approval_policy(
+                ChildApprovalPolicy(parent_policy, child_store, description)
+            )
         child_loop = AgentLoop(
             self.backend,
             child_store,
@@ -280,11 +290,6 @@ class AgentLoop:
             retained_tail=self.context_assembler.retained_tail,
             system_prompt=self.context_assembler.system_prompt,
         )
-        parent_policy = self.tool_registry.approval_policy
-        if parent_policy is not None:
-            child_registry.set_approval_policy(
-                ChildApprovalPolicy(parent_policy, child_store)  # type: ignore[arg-type]
-            )
 
         def publish(status: str) -> None:
             if publisher is not None:
@@ -293,6 +298,7 @@ class AgentLoop:
         async def consume() -> dict[str, object]:
             turns_used = 0
             final_message: Message | None = None
+            last_assistant_text = ""
             cap_hit = False
             error_message: str | None = None
             async for event in child_loop.run_turn(prompt):
@@ -315,6 +321,8 @@ class AgentLoop:
                     name = event.tool_call.name if event.tool_call is not None else "tool"
                     publish(f"tool: {name}")
                 elif event.type is StreamEventType.TURN_END:
+                    if event.message is not None:
+                        last_assistant_text = _assistant_text_snippet(event.message)
                     if event.data.get("tool_calls") == 0 and event.message is not None:
                         final_message = event.message
                 elif event.type is StreamEventType.ERROR and event.error is not None:
@@ -325,7 +333,9 @@ class AgentLoop:
             if cap_hit:
                 return agent_result(
                     f"agent error: child reached the {CHILD_TURN_CAP}-turn cap; "
-                    f"partial state is saved at {child_path}",
+                    f"partial state is saved at {child_path}; "
+                    f"last assistant text: {last_assistant_text or '[none]'}; "
+                    f"turns used: {turns_used}",
                     error=True,
                     turns_used=turns_used,
                     child_session_path=child_path,
@@ -344,12 +354,16 @@ class AgentLoop:
                     turns_used=turns_used,
                     child_session_path=child_path,
                 )
+            final_text = _assistant_text(final_message)
+            if not final_text.strip():
+                return agent_result(
+                    "agent error: child returned an empty final assistant message",
+                    error=True,
+                    turns_used=turns_used,
+                    child_session_path=child_path,
+                )
             return agent_result(
-                "".join(
-                    block.text
-                    for block in final_message.content
-                    if isinstance(block, TextContent)
-                ),
+                final_text,
                 error=False,
                 turns_used=turns_used,
                 child_session_path=child_path,
@@ -357,20 +371,32 @@ class AgentLoop:
 
         child_task = asyncio.create_task(consume())
         abort_task = asyncio.create_task(abort_signal.wait())
+        child_canceled = False
+
+        async def cancel_child() -> None:
+            nonlocal child_canceled
+            if child_canceled:
+                return
+            child_canceled = True
+            child_loop.abort()
+            if not child_task.done():
+                child_task.cancel()
+            await asyncio.gather(child_task, return_exceptions=True)
+            child_store.mark_agent_canceled(tool_call.id)
+
         try:
             done, _ = await asyncio.wait(
                 (child_task, abort_task),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if abort_task in done:
-                child_loop.abort()
-                child_task.cancel()
-                await asyncio.gather(child_task, return_exceptions=True)
+                await cancel_child()
                 raise asyncio.CancelledError()
             result = child_task.result()
-            child_store.finish_agent_parent()
-            self.store.finish_agent_child(tool_call.id)
             return result
+        except asyncio.CancelledError:
+            await cancel_child()
+            raise
         finally:
             if not abort_task.done():
                 abort_task.cancel()
@@ -938,3 +964,14 @@ def _durable_message(message: Message) -> Message:
         tool_result=message.tool_result,
         metadata=dict(message.metadata),
     )
+
+
+def _assistant_text(message: Message) -> str:
+    return "".join(
+        block.text for block in message.content if isinstance(block, TextContent)
+    )
+
+
+def _assistant_text_snippet(message: Message) -> str:
+    text = _assistant_text(message).replace("\r", " ").replace("\n", " ")
+    return text if len(text) <= 160 else f"{text[:157]}..."

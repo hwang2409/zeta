@@ -24,6 +24,7 @@ class ApprovalDecision(StrEnum):
 class ApprovalRequest:
     request_id: str
     tool_call: ToolCall
+    label: str | None = None
 
 
 class _AbortSignal(Protocol):
@@ -47,6 +48,7 @@ class ApprovalPolicy:
         self.always_deny = frozenset(always_deny)
         self.default = _decision(default)
         self._store = store
+        self._delegated: dict[str, tuple[ApprovalRequest, ConversationStore]] = {}
 
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
@@ -65,10 +67,28 @@ class ApprovalPolicy:
 
     def pending_requests(self) -> list[ApprovalRequest]:
         store = self._require_store()
-        return [
+        requests = [
             ApprovalRequest(request_id, tool_call)
             for request_id, tool_call in store.pending_approvals()
         ]
+        for request_id, (request, delegated_store) in list(self._delegated.items()):
+            state = delegated_store.approval_states().get(request_id)
+            if state is None or state[1] is not None:
+                self._delegated.pop(request_id, None)
+            else:
+                requests.append(request)
+        return requests
+
+    def register_delegated(
+        self,
+        request: ApprovalRequest,
+        store: ConversationStore,
+    ) -> None:
+        """Expose a child request without writing it into this store."""
+
+        if request.request_id in self._delegated:
+            return
+        self._delegated[request.request_id] = (request, store)
 
     def approve(self, request_id: str) -> bool:
         return self.resolve(request_id, ApprovalDecision.ALLOW)
@@ -77,22 +97,28 @@ class ApprovalPolicy:
         return self.resolve(request_id, ApprovalDecision.DENY)
 
     def abort(self, request_id: str) -> bool:
+        delegated = self._delegated.get(request_id)
+        if delegated is not None:
+            return delegated[1].resolve_approval(request_id, "abort")
         store = self._require_store()
         return store.resolve_approval(request_id, "abort")
 
     def abort_or_winner(self, request_id: str) -> ApprovalDecision | None:
+        delegated = self._delegated.get(request_id)
+        if delegated is not None:
+            delegated[1].resolve_approval(request_id, "abort")
+            state = delegated[1].approval_states().get(request_id)
+            return _resolved_decision(state[1] if state is not None else None)
         store = self._require_store()
         store.resolve_approval(request_id, "abort")
         state = store.approval_states().get(request_id)
-        if state is None:
-            return None
-        if state[1] == ApprovalDecision.ALLOW.value:
-            return ApprovalDecision.ALLOW
-        if state[1] == ApprovalDecision.DENY.value:
-            return ApprovalDecision.DENY
-        return None
+        return _resolved_decision(state[1] if state is not None else None)
 
     def durable_decision(self, request_id: str) -> str | None:
+        delegated = self._delegated.get(request_id)
+        if delegated is not None:
+            state = delegated[1].approval_states().get(request_id)
+            return None if state is None else state[1]
         state = self._require_store().approval_states().get(request_id)
         return None if state is None else state[1]
 
@@ -100,6 +126,9 @@ class ApprovalPolicy:
         resolved = _decision(decision)
         if resolved is ApprovalDecision.ASK:
             raise ValueError("approval resolution must allow or deny")
+        delegated = self._delegated.get(request_id)
+        if delegated is not None:
+            return delegated[1].resolve_approval(request_id, resolved.value)
         store = self._require_store()
         return store.resolve_approval(request_id, resolved.value)
 
@@ -184,6 +213,14 @@ def _decision(value: ApprovalDecision | str) -> ApprovalDecision:
         return ApprovalDecision(value)
     except ValueError as exc:
         raise ValueError(f"invalid approval decision: {value}") from exc
+
+
+def _resolved_decision(value: str | None) -> ApprovalDecision | None:
+    if value == ApprovalDecision.ALLOW.value:
+        return ApprovalDecision.ALLOW
+    if value == ApprovalDecision.DENY.value:
+        return ApprovalDecision.DENY
+    return None
 
 
 ApprovalHook = Callable[

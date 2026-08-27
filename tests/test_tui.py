@@ -30,6 +30,7 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.data_structures import Size
 from rich.cells import cell_len
 from rich.console import Console
+from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
@@ -1328,6 +1329,26 @@ def test_tool_render_mode_keeps_receipt_rule_in_one_place() -> None:
     assert tool_render_mode(long_read) == "card"
     assert tool_render_mode(search) == "receipt"
     assert tool_render_mode(generic) == "card"
+
+
+def test_agent_rendering_stays_on_one_status_line() -> None:
+    call = ToolCall(
+        "agent-1",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "done"),
+    )
+
+    rendered = render_event(event)
+    assert rendered is not None
+    assert not isinstance(rendered, Panel)
+    assert "agent" in renderable_plain(rendered)
+    progress = render_tool_progress(call, "task research: thinking")
+    assert not isinstance(progress, Panel)
 
 
 def test_long_single_line_read_uses_a_cropped_card() -> None:

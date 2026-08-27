@@ -660,6 +660,9 @@ class ToolResult:
     content: str
     is_error: bool = False
     content_blocks: list[ToolContentBlock] | None = field(default=None, compare=False)
+    structured_content: dict[str, StructuredContentValue] | None = field(
+        default=None, compare=False
+    )
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -669,6 +672,8 @@ class ToolResult:
         }
         if self.content_blocks is not None:
             result["content_blocks"] = self.content_blocks
+        if self.structured_content is not None:
+            result["structured_content"] = self.structured_content
         return result
 
     @classmethod
@@ -677,6 +682,7 @@ class ToolResult:
         content = value.get("content")
         is_error = value.get("is_error")
         content_blocks = value.get("content_blocks")
+        structured_content = value.get("structured_content")
         if type(tool_call_id) is not str or not tool_call_id:
             raise ValueError("tool result call id must be a nonempty string")
         if type(content) is not str:
@@ -697,11 +703,16 @@ class ToolResult:
                         f"tool result content block is invalid: {exc}"
                     ) from exc
             content_blocks = normalized_blocks
+        if structured_content is not None and type(structured_content) is not dict:
+            raise ValueError("tool result structured_content must be an object")
         return cls(
             tool_call_id=tool_call_id,
             content=content,
             is_error=is_error,
             content_blocks=content_blocks,
+            structured_content=(
+                dict(structured_content) if structured_content is not None else None
+            ),
         )
 
 

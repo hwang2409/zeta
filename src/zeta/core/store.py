@@ -61,6 +61,7 @@ class ConversationStore(CheckpointForkMixin):
         self._agent_counter = 0
         self._agent_children: dict[str, dict[str, Any]] = {}
         self._agent_parent: dict[str, Any] | None = None
+        self._agent_canceled: dict[str, Any] | None = None
         with self._append_lock():
             self._load()
             self._load_session_state()
@@ -261,6 +262,26 @@ class ConversationStore(CheckpointForkMixin):
             self._agent_parent = None
             self._write_session_state(self.bash_cwd, self._todo_items)
 
+    def mark_agent_canceled(self, parent_tool_call_id: str) -> None:
+        """Persist a child cancellation after its task has stopped."""
+
+        if not parent_tool_call_id:
+            raise ValueError("parent tool call id must be nonempty")
+        with self._append_lock():
+            self._load()
+            self._load_session_state()
+            self._agent_parent = None
+            self._agent_canceled = {
+                "tool_call_id": parent_tool_call_id,
+                "content": "tool execution canceled",
+            }
+            self._write_session_state(self.bash_cwd, self._todo_items)
+
+    def agent_canceled(self) -> dict[str, Any] | None:
+        """Return the durable cancellation marker, if one exists."""
+
+        return copy.deepcopy(self._agent_canceled)
+
     def _load_session_state(self) -> None:
         if not self.state_path.exists():
             self._write_session_state(self.cwd, ())
@@ -321,11 +342,22 @@ class ConversationStore(CheckpointForkMixin):
             raise ConversationIntegrityError(
                 f"session state parent marker is invalid: {self.state_path}"
             )
+        agent_canceled = value.get("agent_canceled")
+        if agent_canceled is not None and (
+            type(agent_canceled) is not dict
+            or type(agent_canceled.get("tool_call_id")) is not str
+            or not agent_canceled["tool_call_id"]
+            or agent_canceled.get("content") != "tool execution canceled"
+        ):
+            raise ConversationIntegrityError(
+                f"session state canceled marker is invalid: {self.state_path}"
+            )
         self.bash_cwd = bash_cwd
         self._todo_items = todo_items
         self._agent_counter = agent_counter
         self._agent_children = copy.deepcopy(agent_children)
         self._agent_parent = copy.deepcopy(agent_parent)
+        self._agent_canceled = copy.deepcopy(agent_canceled)
 
     def _write_session_state(
         self, bash_cwd: str, todo_items: Iterable[TodoItem]
@@ -340,6 +372,8 @@ class ConversationStore(CheckpointForkMixin):
             state["agent_children"] = copy.deepcopy(self._agent_children)
         if self._agent_parent is not None:
             state["agent_parent"] = copy.deepcopy(self._agent_parent)
+        if self._agent_canceled is not None:
+            state["agent_canceled"] = copy.deepcopy(self._agent_canceled)
         temporary = tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
