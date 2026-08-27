@@ -357,6 +357,23 @@ class ErrorThenSuccessBackend(CompletionBackend):
         )
 
 
+class GhostPreviewBackend(CompletionBackend):
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("ghost preview"),
+        )
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT),
+        )
+
+
 class EventBackend(CompletionBackend):
     def __init__(self, event: StreamEvent) -> None:
         self.event = event
@@ -4052,6 +4069,33 @@ async def test_empty_completion_prints_neutral_fallback(tmp_path: Path) -> None:
     rendered = app.console.file.getvalue()
     assert "empty turn" in rendered
     assert "no response" in rendered
+
+
+@pytest.mark.asyncio
+async def test_empty_completion_removes_preview_region_before_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    app = TUIApp(
+        AgentLoop(
+            GhostPreviewBackend(),
+            ConversationStore(tmp_path / "sessions"),
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._active_session = app._make_session()
+    app._print_user("prompt")
+
+    await app._consume_turn("prompt")
+
+    assert [Text.from_ansi(line).plain for line in app._transcript.lines(120)] == [
+        "▌ prompt",
+        "",
+        "no response",
+    ]
 
 
 @pytest.mark.asyncio

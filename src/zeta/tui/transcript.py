@@ -482,6 +482,7 @@ class TranscriptPresenter:
         self._assistant_live: Live | None = None
         self._assistant_unit: _TranscriptUnit | None = None
         self._assistant_message_units: list[_TranscriptUnit] = []
+        self._assistant_message_region: list[_TranscriptUnit] = []
 
     @property
     def tool_region(self) -> Live | None:
@@ -530,7 +531,9 @@ class TranscriptPresenter:
 
         if self._full_screen_active():
             if self._assistant_unit is None:
+                unit_start = len(self.transcript._units)
                 self._assistant_unit = self.print_unit(rendered)
+                self._assistant_message_region.extend(self.transcript._units[unit_start:])
                 if self._assistant_unit is not None:
                     self._assistant_message_units.append(self._assistant_unit)
             else:
@@ -590,7 +593,7 @@ class TranscriptPresenter:
                     if candidate is not unit:
                         self.transcript.remove(candidate)
             else:
-                for candidate in self._assistant_message_units:
+                for candidate in self._assistant_message_region:
                     self.transcript.remove(candidate)
         else:
             if self._assistant_live is not None:
@@ -599,6 +602,7 @@ class TranscriptPresenter:
             if rendered is not None:
                 self.print_unit(rendered)
         self._assistant_message_units.clear()
+        self._assistant_message_region.clear()
         self._assistant_unit = None
         self._assistant_unit_open = False
 
@@ -610,6 +614,7 @@ class TranscriptPresenter:
         """Forget the units owned by an incomplete assistant message."""
 
         self._assistant_message_units.clear()
+        self._assistant_message_region.clear()
         self.reset_assistant_unit()
 
     def start_thinking(self, rendered: Text) -> None:
@@ -820,6 +825,7 @@ class TranscriptPresenter:
         self._thinking_unit = None
         self._assistant_unit = None
         self._assistant_message_units.clear()
+        self._assistant_message_region.clear()
         self._assistant_unit_open = False
         self._printed_units = False
         self.transcript.clear()

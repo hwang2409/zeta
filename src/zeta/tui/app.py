@@ -769,7 +769,6 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         self._assistant_text += value
         self._partial = self._assistant_text
         self._presenter.update_assistant(Text(self._assistant_text, style=BODY))
-        self._turn_had_visible_output |= bool(value.strip())
 
     def _reset_stream_state(self) -> None:
         self._stream_kind = self._stream_identity = None
