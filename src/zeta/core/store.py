@@ -214,10 +214,11 @@ class ConversationStore(CheckpointForkMixin):
         *,
         child_session_path: str,
         description: str,
+        agent_type: str = "general",
     ) -> None:
         """Persist a running child marker before the child starts."""
 
-        if not child_session_path or not description:
+        if not child_session_path or not description or not agent_type:
             raise ValueError("child marker fields must be nonempty")
         with self._append_lock():
             self._load()
@@ -226,6 +227,7 @@ class ConversationStore(CheckpointForkMixin):
                 "tool_call": tool_call.to_dict(),
                 "child_session_path": child_session_path,
                 "description": description,
+                "agent_type": agent_type,
                 "turns_used": 0,
             }
             self._write_session_state(self.bash_cwd, self._todo_items)
@@ -260,15 +262,23 @@ class ConversationStore(CheckpointForkMixin):
             self._agent_children.pop(tool_call_id)
             self._write_session_state(self.bash_cwd, self._todo_items)
 
-    def mark_agent_parent(self, parent_tool_call_id: str) -> None:
+    def mark_agent_parent(
+        self,
+        parent_tool_call_id: str,
+        *,
+        agent_type: str = "general",
+    ) -> None:
         """Persist the parent call id in a child session before execution."""
 
-        if not parent_tool_call_id:
+        if not parent_tool_call_id or not agent_type:
             raise ValueError("parent tool call id must be nonempty")
         with self._append_lock():
             self._load()
             self._load_session_state()
-            self._agent_parent = {"tool_call_id": parent_tool_call_id}
+            self._agent_parent = {
+                "tool_call_id": parent_tool_call_id,
+                "agent_type": agent_type,
+            }
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     def finish_agent_parent(self) -> None:
@@ -344,6 +354,13 @@ class ConversationStore(CheckpointForkMixin):
                 or type(marker.get("description")) is not str
                 or not marker["description"]
                 or (
+                    "agent_type" in marker
+                    and (
+                        type(marker["agent_type"]) is not str
+                        or not marker["agent_type"]
+                    )
+                )
+                or (
                     "turns_used" in marker
                     and (
                         type(marker["turns_used"]) is not int
@@ -365,6 +382,13 @@ class ConversationStore(CheckpointForkMixin):
             type(agent_parent) is not dict
             or type(agent_parent.get("tool_call_id")) is not str
             or not agent_parent["tool_call_id"]
+            or (
+                "agent_type" in agent_parent
+                and (
+                    type(agent_parent["agent_type"]) is not str
+                    or not agent_parent["agent_type"]
+                )
+            )
         ):
             raise ConversationIntegrityError(
                 f"session state parent marker is invalid: {self.state_path}"

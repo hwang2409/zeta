@@ -44,6 +44,7 @@ from zeta.providers.anthropic import AnthropicBackend, AnthropicCredentialStore,
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
 from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import FullScreenPromptSession, TUIApp
+from zeta.tui.agent_card import AgentCard
 from zeta.tui.composer import (
     build_key_bindings,
     history_for,
@@ -1490,6 +1491,77 @@ def test_agent_receipts_show_success_and_canceled_status() -> None:
 
     assert "2 turns · 1.5s · ok" in render_agent_receipt(success).plain
     assert "0 turns · 0.4s · canceled" in render_agent_receipt(canceled).plain
+
+
+def test_typed_agent_cards_and_receipts_show_type() -> None:
+    call = ToolCall(
+        "typed-agent",
+        "agent",
+        {
+            "prompt": "inspect",
+            "description": "task research",
+            "agent_type": "explore",
+        },
+    )
+    progress = AgentCard.render_progress(call, "turn 1: thinking")
+    assert progress is not None
+    assert "explore · task research" in renderable_plain(progress)
+
+    receipt = AgentCard.render_receipt(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "done",
+                structured_content={
+                    "turns_used": 1,
+                    "child_session_path": "",
+                    "agent_type": "explore",
+                },
+            ),
+        )
+    )
+    assert receipt is not None
+    assert "explore · task research" in receipt.plain
+
+
+def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    call = ToolCall(
+        "replayed-agent",
+        "agent",
+        {
+            "prompt": "inspect",
+            "description": "task research",
+            "agent_type": "plan",
+        },
+    )
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
+    )
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult(
+                call.id,
+                "done",
+                structured_content={
+                    "turns_used": 2,
+                    "child_session_path": "",
+                    "agent_type": "plan",
+                },
+            ),
+        )
+    )
+    app = TUIApp(AgentLoop(FakeBackend([]), store), provider="fake", model="offline")
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "plan · task research" in rendered
 
 
 def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:

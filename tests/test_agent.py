@@ -28,11 +28,16 @@ async def _collect(events):
     return [event async for event in events]
 
 
-def _agent_call(call_id: str = "agent-1") -> ToolCall:
+def _agent_call(
+    call_id: str = "agent-1", agent_type: str | None = None
+) -> ToolCall:
+    arguments = {"prompt": "inspect the task", "description": "task research"}
+    if agent_type is not None:
+        arguments["agent_type"] = agent_type
     return ToolCall(
         call_id,
         "agent",
-        {"prompt": "inspect the task", "description": "task research"},
+        arguments,
     )
 
 
@@ -234,6 +239,120 @@ async def test_agent_returns_child_text_and_persists_child_session(tmp_path: Pat
     assert "agent" not in {
         schema["name"] for schema in backend.calls[1][1]
     }
+
+
+@pytest.mark.asyncio
+async def test_explore_child_has_read_only_tools_and_rejects_exec(
+    tmp_path: Path,
+) -> None:
+    child_exec = ToolCall("child-exec", "exec", {"command": "echo no"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call(agent_type="explore")]),
+            ScriptedTurn(tool_calls=[child_exec]),
+            ScriptedTurn([TextContent("explore complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    child_schemas = {schema["name"] for schema in backend.calls[1][1]}
+    assert child_schemas == {"fetch", "read", "skill", "websearch"}
+    child_messages = ConversationStore(
+        store.session_dir / "agents", session_id="1"
+    ).messages()
+    child_result = next(
+        message.tool_result for message in child_messages if message.tool_result
+    )
+    assert child_result.is_error
+    assert child_result.content == "unknown tool: exec"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_type", "turn_cap"),
+    [("explore", 15), ("plan", 20)],
+)
+async def test_typed_child_turn_cap_is_enforced(
+    tmp_path: Path, agent_type: str, turn_cap: int
+) -> None:
+    child_call = ToolCall("child-read", "read", {"path": "missing"})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[_agent_call(agent_type=agent_type)])]
+        + [
+            ScriptedTurn(
+                [TextContent(f"step-{turn}")],
+                tool_calls=[child_call],
+            )
+            for turn in range(1, turn_cap + 1)
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.is_error
+    assert f"{turn_cap}-turn cap" in result.content
+    assert result.structured_content == {
+        "turns_used": turn_cap,
+        "child_session_path": str(store.session_dir / "agents" / "1"),
+        "agent_type": agent_type,
+    }
+
+
+@pytest.mark.asyncio
+async def test_unknown_agent_type_returns_loud_error(tmp_path: Path) -> None:
+    call = _agent_call()
+    call = ToolCall(
+        call.id,
+        call.name,
+        {**call.arguments, "agent_type": "unknown"},
+    )
+    backend = FakeBackend([])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    result = await loop._run_agent_tool(
+        call,
+        call.arguments,
+        AbortGenerationRegistry().new_generation(),
+        None,
+    )
+
+    assert result["isError"] is True
+    assert "unknown agent_type" in result["content"][0]["text"]
+    assert not (store.session_dir / "agents").exists()
+
+
+@pytest.mark.asyncio
+async def test_typed_preamble_composes_with_child_system_prompt(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call(agent_type="explore")]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(
+        AgentLoop(
+            backend,
+            store,
+            max_turns=1,
+            system_prompt="existing child instructions",
+        ).run_turn("start")
+    )
+
+    child_system = backend.calls[1][0][0]
+    system_text = " ".join(
+        block.text for block in child_system.content if isinstance(block, TextContent)
+    )
+    assert "You are an explore sub-agent." in system_text
+    assert "existing child instructions" in system_text
 
 
 @pytest.mark.asyncio

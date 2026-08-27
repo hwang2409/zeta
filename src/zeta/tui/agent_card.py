@@ -76,6 +76,13 @@ class AgentCard:
         return str(description) if description is not None else call.name
 
     @classmethod
+    def _agent_type(cls, call: ToolCall) -> str:
+        agent_type = call.arguments.get("agent_type")
+        if type(agent_type) is str and agent_type != "general":
+            return agent_type
+        return ""
+
+    @classmethod
     def _turns_from_content(cls, content: str) -> int:
         turns = [
             int(match.group(1))
@@ -104,8 +111,10 @@ class AgentCard:
         expanded: bool = False,
     ) -> Text:
         affordance = "collapse: ctrl+x ctrl+o" if expanded else "expand: ctrl+x ctrl+o"
+        agent_type = cls._agent_type(call)
+        prefix = f"{agent_type} · " if agent_type else ""
         return Text(
-            f"{cls._description(call)} · {elapsed_seconds:.1f}s · "
+            f"{prefix}{cls._description(call)} · {elapsed_seconds:.1f}s · "
             f"{turns_used} turns · {affordance}",
             style=COMMAND,
             no_wrap=True,
@@ -234,8 +243,11 @@ class AgentCard:
         status = "canceled" if result.content == "tool execution canceled" else (
             "fail" if result.is_error else "ok"
         )
+        agent_type = cls._agent_type(call)
+        prefix = f"{agent_type} · " if agent_type else ""
         return Text(
-            f"{cls._description(call)} · {turns} turns · {max(0.0, elapsed or 0.0):.1f}s · "
+            f"{prefix}{cls._description(call)} · {turns} turns · "
+            f"{max(0.0, elapsed or 0.0):.1f}s · "
             f"{status} · expand: ctrl+x ctrl+o",
             style=ERROR if status == "fail" else RECEIPT,
             no_wrap=True,
