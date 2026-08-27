@@ -12,7 +12,16 @@ from rich.console import Console
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
-from zeta.core.slash import SlashStatus, create_slash_registry
+from zeta.core.slash import (
+    MODEL_CONTEXT_WINDOWS,
+    MODEL_PRICES,
+    CompactionSummary,
+    SlashStatus,
+    UsageSnapshot,
+    context_fill_percent,
+    create_slash_registry,
+    render_context_gauge,
+)
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.tui.app import TUIApp
@@ -165,6 +174,97 @@ def test_status_renders_cache_hit_rate_as_na_without_usage() -> None:
 
     assert output is not None
     assert "prompt_cache_hit_rate: n/a" in output
+
+
+def test_status_renders_usage_trend_cost_and_context_gauge() -> None:
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(
+            replace(
+                session().status,
+                provider="claude",
+                model="claude-sonnet-4-6",
+                uncached_input_tokens=100,
+                output_tokens_this_session=50,
+                cache_read_input_tokens=50,
+                cache_creation_input_tokens=25,
+                tokens_in_current_context=50,
+                model_window=100,
+                usage_history=(
+                    UsageSnapshot(1, input_tokens=100, cache_creation_input_tokens=25),
+                    UsageSnapshot(
+                        2,
+                        input_tokens=100,
+                        cache_read_input_tokens=50,
+                    ),
+                ),
+            )
+        ),
+        "/status",
+    )
+
+    assert output is not None
+    assert "cache_hit_trend: 1:0% 2:33%" in output
+    assert "estimated_cost_usd: $0.001159" in output
+    assert "window: 50 / 100" in output
+    assert "fill: [##########----------] 50%" in output
+
+
+def test_status_marks_unknown_model_cost_and_window() -> None:
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(
+            replace(
+                session().status,
+                provider="claude",
+                model="claude-future",
+                tokens_in_current_context=50,
+            )
+        ),
+        "/status",
+    )
+
+    assert output is not None
+    assert "estimated_cost_usd: unavailable (unknown model: claude-future)" in output
+    assert "fill: [????????????????????] unknown" in output
+
+
+@pytest.mark.parametrize(
+    ("tokens", "window", "expected"),
+    [(0, 100, 0), (100, 100, 100), (200, 100, 100), (-1, 100, 0), (50, 0, None)],
+)
+def test_context_fill_percent_boundaries(
+    tokens: int, window: int, expected: int | None
+) -> None:
+    assert context_fill_percent(tokens, window) == expected
+
+
+def test_context_gauge_unknown_window_is_bounded() -> None:
+    assert render_context_gauge(10, None, width=8) == "[????????] unknown"
+
+
+def test_status_renders_compaction_history_and_empty_state() -> None:
+    empty = create_slash_registry().dispatch(session(), "/status")
+    assert empty is not None
+    assert "compaction_history:\n  none" in empty
+
+    status = replace(
+        session().status,
+        compaction_history=(CompactionSummary(3, 4, 120),),
+    )
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(status), "/status"
+    )
+    assert output is not None
+    assert "compaction_history:\n  turn 3: 4 entries, 120 tokens saved" in output
+
+
+def test_price_table_covers_current_provider_models() -> None:
+    current_models = {
+        "claude": {"claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"},
+        "codex": {"gpt-5.4", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"},
+    }
+    for provider, models in current_models.items():
+        assert models <= MODEL_PRICES[provider].keys()
+        assert models <= MODEL_CONTEXT_WINDOWS[provider].keys()
 
 
 def test_unknown_command_passes_through_unchanged() -> None:
