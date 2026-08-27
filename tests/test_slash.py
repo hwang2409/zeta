@@ -17,7 +17,10 @@ from zeta.core.slash import (
     MODEL_PRICES,
     CompactionSummary,
     SlashStatus,
+    UNPRICED_MODEL_IDS,
+    UsageTracker,
     UsageSnapshot,
+    compaction_history,
     context_fill_percent,
     create_slash_registry,
     render_context_gauge,
@@ -28,7 +31,14 @@ from zeta.providers import PROVIDER_MODELS
 from zeta.providers.usage import normalize_usage
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings
-from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
+from zeta.types import (
+    Message,
+    MessageRole,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolUseContent,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,7 +169,7 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
         token_counter=token_count,
     )
     loop = AgentLoop(backend, store, context_assembler=assembler)
-    app = TUIApp(loop, provider="fake", model="offline")
+    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
 
     await app._consume_turn("first")
     await app._consume_turn("second")
@@ -172,6 +182,34 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
         (snapshot.turn, snapshot.input_tokens, snapshot.output_tokens)
         for snapshot in app.slash_status().usage_history
     ] == [(1, 10, 2), (2, 20, 5)]
+    assert "estimated_cost_usd: $0.035357" in output
+
+
+def test_usage_cost_keeps_all_turns_outside_bounded_trend() -> None:
+    class Counters:
+        uncached_input_tokens_this_session = 0
+        output_tokens_this_session = 0
+        cache_read_input_tokens_this_session = 0
+        cache_creation_input_tokens_this_session = 0
+
+    counters = Counters()
+    tracker = UsageTracker(counters)
+    for _ in range(9):
+        counters.uncached_input_tokens_this_session += 1_000_000
+        tracker.record(StreamEventType.TURN_END, "claude-sonnet-4-6")
+
+    status = replace(
+        session().status,
+        provider="claude",
+        model="claude-sonnet-4-6",
+        usage_history=tracker.history,
+        usage_cost_by_model=tracker.cost_by_model,
+    )
+    output = create_slash_registry().dispatch(FakeSlashSession(status), "/status")
+
+    assert output is not None
+    assert len(tracker.history) == 8
+    assert "estimated_cost_usd: $27.000000" in output
 
 
 def test_status_renders_cache_hit_rate_as_na_without_usage() -> None:
@@ -280,6 +318,15 @@ def test_price_table_covers_current_provider_models() -> None:
     for provider, models in PROVIDER_MODELS.items():
         assert models == MODEL_PRICES[provider].keys()
         assert models == MODEL_CONTEXT_WINDOWS[provider].keys()
+        for model in models:
+            pricing = MODEL_PRICES[provider][model]
+            window = MODEL_CONTEXT_WINDOWS[provider][model]
+            if model in UNPRICED_MODEL_IDS[provider]:
+                assert pricing is None
+                assert window is None
+            else:
+                assert pricing is not None
+                assert window is not None
 
 
 def test_codex_cache_writes_use_existing_usage_categories() -> None:
@@ -332,6 +379,30 @@ def test_cost_uses_the_model_for_each_turn() -> None:
     assert "estimated_cost_usd: $8.000000" in output
 
 
+def test_gpt_5_5_has_published_cost() -> None:
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(
+            replace(
+                session().status,
+                provider="codex",
+                model="gpt-5.5",
+                usage_history=(
+                    UsageSnapshot(
+                        1,
+                        input_tokens=1_000_000,
+                        output_tokens=1_000_000,
+                        model="gpt-5.5",
+                    ),
+                ),
+            )
+        ),
+        "/status",
+    )
+
+    assert output is not None
+    assert "estimated_cost_usd: $35.000000" in output
+
+
 def test_compaction_history_counts_folded_messages_only(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     for index in range(2):
@@ -354,6 +425,71 @@ def test_compaction_history_counts_folded_messages_only(tmp_path: Path) -> None:
     history = app.slash_status().compaction_history
     assert len(history) == 1
     assert history[0].entries_folded == 4
+
+
+def test_compaction_history_subtracts_both_replacements(tmp_path: Path) -> None:
+    def token_count(message: Message) -> int:
+        if message.role is MessageRole.COMPACTION:
+            return 3
+        if message.metadata.get("compaction_summary"):
+            return 1
+        return 9
+
+    store = ConversationStore(tmp_path / "sessions")
+    source = [
+        store.append_message(Message(MessageRole.USER, [TextContent("source")])),
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")])),
+        store.append_message(Message(MessageRole.USER, [TextContent("source 2")])),
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply 2")])),
+    ]
+    store.append_compaction_marker(
+        "summary",
+        source[0].seq,
+        source[-1].seq,
+        replaces=[entry.id for entry in source],
+    )
+
+    history = compaction_history(store.replay(), token_count)
+
+    assert history == (CompactionSummary(2, 4, 32),)
+
+
+def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> None:
+    def token_count(message: Message) -> int:
+        if message.role is MessageRole.COMPACTION:
+            return 3
+        if message.metadata.get("compaction_summary"):
+            return 1
+        return 9
+
+    store = ConversationStore(tmp_path / "sessions")
+    first_source = [
+        store.append_message(Message(MessageRole.USER, [TextContent("source")])),
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")])),
+    ]
+    first_marker = store.append_compaction_marker(
+        "first summary",
+        first_source[0].seq,
+        first_source[-1].seq,
+        replaces=[entry.id for entry in first_source],
+    )
+    second_source = [
+        store.append_message(Message(MessageRole.USER, [TextContent("new source")])),
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply")])),
+        store.append_message(Message(MessageRole.USER, [TextContent("new source 2")])),
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply 2")])),
+    ]
+    store.append_compaction_marker(
+        "second summary",
+        first_source[0].seq,
+        second_source[-1].seq,
+        replaces=[first_marker.id, *(entry.id for entry in second_source)],
+    )
+
+    history = compaction_history(store.replay(), token_count)
+
+    assert history[0] == CompactionSummary(1, 2, 14)
+    assert history[1] == CompactionSummary(3, 4, 36)
 
 
 def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:

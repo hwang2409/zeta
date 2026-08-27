@@ -53,22 +53,52 @@ class UsageTracker:
         self.source = source
         self._baseline = self._counters()
         self._history: deque[UsageSnapshot] = deque(maxlen=8)
+        self._cost_by_model: dict[str, UsageSnapshot] = {}
         self._completed_turns = 0
 
     @property
     def history(self) -> tuple[UsageSnapshot, ...]:
         return tuple(self._history)
 
+    @property
+    def cost_by_model(self) -> tuple[UsageSnapshot, ...]:
+        return tuple(self._cost_by_model.values())
+
     def record(self, event_type: StreamEventType, model: str) -> None:
         if event_type is StreamEventType.COMPACTION_END:
-            self._baseline = self._counters()
+            current = self._counters()
+            self._accumulate_cost(
+                usage_delta(current, self._baseline, 0, model)
+            )
+            self._baseline = current
         elif event_type is StreamEventType.TURN_END:
             current = self._counters()
             self._completed_turns += 1
-            self._history.append(
-                usage_delta(current, self._baseline, self._completed_turns, model)
-            )
+            snapshot = usage_delta(current, self._baseline, self._completed_turns, model)
+            self._history.append(snapshot)
+            self._accumulate_cost(snapshot)
             self._baseline = current
+
+    def _accumulate_cost(self, snapshot: UsageSnapshot) -> None:
+        if snapshot.model is None:
+            return
+        previous = self._cost_by_model.get(snapshot.model)
+        if previous is None:
+            self._cost_by_model[snapshot.model] = snapshot
+            return
+        self._cost_by_model[snapshot.model] = UsageSnapshot(
+            turn=previous.turn,
+            input_tokens=previous.input_tokens + snapshot.input_tokens,
+            output_tokens=previous.output_tokens + snapshot.output_tokens,
+            cache_read_input_tokens=(
+                previous.cache_read_input_tokens + snapshot.cache_read_input_tokens
+            ),
+            cache_creation_input_tokens=(
+                previous.cache_creation_input_tokens
+                + snapshot.cache_creation_input_tokens
+            ),
+            model=snapshot.model,
+        )
 
     def _counters(self) -> dict[str, int]:
         return {
@@ -98,27 +128,32 @@ class ModelPricing:
     cache_write: float | None
 
 
-# Keep this table small and explicit. Unknown models remain valid and show no
-# cost estimate. Prices are standard USD per million tokens.
+# Unknown models remain valid and show no cost estimate. Prices are standard
+# USD per million tokens.
+UNPRICED_MODEL_IDS: dict[str, frozenset[str]] = {
+    "claude": frozenset(),
+    "codex": frozenset({"gpt-5.3-codex-spark", "gpt-reserve"}),
+}
+
 MODEL_PRICES: dict[str, dict[str, ModelPricing | None]] = {
     "claude": {
-        "claude-fable-5": None,
-        "claude-haiku-4-5-20251001": None,
+        "claude-fable-5": ModelPricing(10.0, 50.0, 1.0, 12.5),
+        "claude-haiku-4-5-20251001": ModelPricing(1.0, 5.0, 0.1, 1.25),
         "claude-opus-4-6": ModelPricing(5.0, 25.0, 0.5, 6.25),
-        "claude-opus-4-5": None,
-        "claude-opus-4-7": None,
-        "claude-opus-4-8": None,
-        "claude-opus-5": None,
-        "claude-sonnet-4-5-20250929": None,
+        "claude-opus-4-5": ModelPricing(5.0, 25.0, 0.5, 6.25),
+        "claude-opus-4-7": ModelPricing(5.0, 25.0, 0.5, 6.25),
+        "claude-opus-4-8": ModelPricing(5.0, 25.0, 0.5, 6.25),
+        "claude-opus-5": ModelPricing(5.0, 25.0, 0.5, 6.25),
+        "claude-sonnet-4-5-20250929": ModelPricing(3.0, 15.0, 0.3, 3.75),
         "claude-sonnet-4-6": ModelPricing(3.0, 15.0, 0.3, 3.75),
-        "claude-sonnet-5": None,
+        "claude-sonnet-5": ModelPricing(2.0, 10.0, 0.2, 2.5),
         "claude-haiku-4-5": ModelPricing(1.0, 5.0, 0.1, 1.25),
     },
     "codex": {
-        "codex-auto-review": None,
+        "codex-auto-review": ModelPricing(2.5, 15.0, 0.25, None),
         "gpt-5.3-codex-spark": None,
-        "gpt-5.4-mini": None,
-        "gpt-5.5": None,
+        "gpt-5.4-mini": ModelPricing(0.75, 4.5, 0.075, None),
+        "gpt-5.5": ModelPricing(5.0, 30.0, 0.5, None),
         "gpt-5.6-sol": ModelPricing(4.0, 20.0, 0.4, 5.0),
         "gpt-5.6-terra": ModelPricing(2.0, 12.0, 0.2, 2.5),
         "gpt-5.6-luna": ModelPricing(0.2, 1.2, 0.02, 0.25),
@@ -129,23 +164,23 @@ MODEL_PRICES: dict[str, dict[str, ModelPricing | None]] = {
 
 MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int | None]] = {
     "claude": {
-        "claude-fable-5": None,
-        "claude-haiku-4-5-20251001": None,
-        "claude-opus-4-5": None,
+        "claude-fable-5": 1_000_000,
+        "claude-haiku-4-5-20251001": 200_000,
+        "claude-opus-4-5": 200_000,
         "claude-opus-4-6": 1_000_000,
-        "claude-opus-4-7": None,
-        "claude-opus-4-8": None,
-        "claude-opus-5": None,
-        "claude-sonnet-4-5-20250929": None,
+        "claude-opus-4-7": 1_000_000,
+        "claude-opus-4-8": 1_000_000,
+        "claude-opus-5": 1_000_000,
+        "claude-sonnet-4-5-20250929": 200_000,
         "claude-sonnet-4-6": 1_000_000,
-        "claude-sonnet-5": None,
+        "claude-sonnet-5": 1_000_000,
         "claude-haiku-4-5": 200_000,
     },
     "codex": {
-        "codex-auto-review": None,
+        "codex-auto-review": 1_050_000,
         "gpt-5.3-codex-spark": None,
-        "gpt-5.4-mini": None,
-        "gpt-5.5": None,
+        "gpt-5.4-mini": 400_000,
+        "gpt-5.5": 1_000_000,
         "gpt-5.6-sol": 1_050_000,
         "gpt-5.6-terra": 1_050_000,
         "gpt-5.6-luna": 1_050_000,
@@ -189,6 +224,41 @@ def compaction_summary(
 ) -> CompactionSummary:
     """Build display data from one durable compaction marker."""
 
+    source_messages, entries_folded = _compaction_source(marker, entries)
+    marker_message, summary = _compaction_replacements(marker)
+    source_tokens = sum(token_counter(message) for message in source_messages)
+    return CompactionSummary(
+        turn=turn,
+        entries_folded=entries_folded,
+        tokens_saved=max(
+            0,
+            source_tokens
+            - token_counter(marker_message)
+            - token_counter(summary),
+        ),
+    )
+
+
+def _compaction_source(
+    marker: ConversationEntry,
+    entries: Sequence[ConversationEntry],
+) -> tuple[list[Message], int]:
+    replaces = marker.data.get("replaces", [])
+    if replaces:
+        by_id = {entry.id: entry for entry in entries}
+        source_messages: list[Message] = []
+        entries_folded = 0
+        for entry_id in replaces:
+            entry = by_id.get(entry_id)
+            if entry is None:
+                continue
+            if entry.type == "message":
+                source_messages.append(Message.from_dict(entry.data["message"]))
+                entries_folded += 1
+            elif entry.type == "compaction":
+                source_messages.extend(_compaction_replacements(entry))
+        return source_messages, entries_folded
+
     start = marker.data["source_seq_start"]
     end = marker.data["source_seq_end"]
     folded_messages = [
@@ -198,16 +268,29 @@ def compaction_summary(
         and start <= entry.seq <= end
         and _is_folded_message(entry)
     ]
-    source_tokens = sum(token_counter(message) for message in folded_messages)
+    return folded_messages, len(folded_messages)
+
+
+def _compaction_replacements(
+    marker: ConversationEntry,
+) -> tuple[Message, Message]:
+    start = marker.data["source_seq_start"]
+    end = marker.data["source_seq_end"]
+    metadata = {
+        "source_seq_start": start,
+        "source_seq_end": end,
+    }
+    marker_message = Message(
+        MessageRole.COMPACTION,
+        [TextContent(f"[compaction marker: entries {start}–{end}]")],
+        metadata=metadata,
+    )
     summary = Message(
         MessageRole.ASSISTANT,
         [TextContent(marker.data["summary"])],
+        metadata={"compaction_summary": True, **metadata},
     )
-    return CompactionSummary(
-        turn=turn,
-        entries_folded=len(folded_messages),
-        tokens_saved=max(0, source_tokens - token_counter(summary)),
-    )
+    return marker_message, summary
 
 
 def _is_folded_message(entry: ConversationEntry) -> bool:
@@ -289,6 +372,7 @@ class SlashStatus:
     hooks: tuple[str, ...] = ()
     todo_counts: tuple[int, int, int] | None = None
     usage_history: tuple[UsageSnapshot, ...] = ()
+    usage_cost_by_model: tuple[UsageSnapshot, ...] = ()
     compaction_history: tuple[CompactionSummary, ...] = ()
     model_window: int | None = None
 
@@ -461,12 +545,13 @@ def _format_status(status: SlashStatus) -> str:
 def _format_estimated_cost(status: SlashStatus) -> str:
     """Estimate cost only when each turn has a known model and rate."""
 
-    if not status.usage_history:
+    usage = status.usage_cost_by_model or status.usage_history
+    if not usage:
         if MODEL_PRICES.get(status.provider, {}).get(status.model) is None:
             return f"unavailable (unknown model: {status.model})"
         return "unavailable (model attribution unavailable)"
     total = 0.0
-    for snapshot in status.usage_history:
+    for snapshot in usage:
         if snapshot.model is None:
             return "unavailable (model attribution unavailable)"
         pricing = MODEL_PRICES.get(status.provider, {}).get(snapshot.model)

@@ -32,7 +32,9 @@ from ..core.project_context import (
     load_project_context,
 )
 from ..core.session import SessionError, SessionManager, env_home
-from ..core.slash import MODEL_CONTEXT_WINDOWS, SlashStatus, UsageTracker, compaction_history, create_slash_registry
+from ..core.slash import (
+    MODEL_CONTEXT_WINDOWS, SlashStatus, UsageTracker, compaction_history, create_slash_registry
+)
 from ..core.todo import todo_count_tuple
 from ..loop import AgentLoop
 from ..providers.anthropic import AnthropicBackend, AnthropicCredentialStore
@@ -305,6 +307,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             hooks=(() if self._hooks is None else self._hooks.status_entries),
             todo_counts=todo_count_tuple(items) if items else None,
             usage_history=self._usage_tracker.history,
+            usage_cost_by_model=self._usage_tracker.cost_by_model,
             compaction_history=compaction_history_data,
             model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
         )
