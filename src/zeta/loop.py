@@ -117,6 +117,7 @@ class AgentLoop:
         self.store = store
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
+        self._agent_child_turns: dict[str, int] = {}
         self._recover_agent_children()
         if registry is not None and tools is not None:
             raise ValueError("pass only one tool registry")
@@ -282,6 +283,9 @@ class AgentLoop:
         child_path = str(child_store.session_dir)
         child_instance_id = f"{self.store.session_id}:{child_number}"
         self._agent_child_stores[tool_call.id] = child_store
+        self._agent_child_turns[tool_call.id] = 0
+        if publisher is not None:
+            publisher.set_metadata({"child_session_path": child_path})
         self.store.register_agent_child(
             tool_call,
             child_session_path=child_path,
@@ -315,8 +319,10 @@ class AgentLoop:
             if publisher is not None:
                 publisher.publish(f"{description}: {status}\n", "stdout")
 
+        turns_used = 0
+
         async def consume() -> dict[str, object]:
-            turns_used = 0
+            nonlocal turns_used
             final_message: Message | None = None
             last_assistant_text = ""
             cap_hit = False
@@ -903,12 +909,29 @@ class AgentLoop:
         new_results: list[tuple[ToolCall, ToolResult]] = []
         for call, slot in zip(calls, slots, strict=True):
             result = self._existing_tool_result(call.id)
+            stored_result = result
+            child_store = self._agent_child_stores.get(call.id)
+            candidate = result if result is not None else slot
+            if (
+                child_store is not None
+                and (candidate is None or candidate.content == "tool execution canceled")
+            ):
+                result = ToolResult(
+                    call.id,
+                    "tool execution canceled",
+                    is_error=True,
+                    structured_content={
+                        "turns_used": self._agent_child_turns.get(call.id, 0),
+                        "child_session_path": str(child_store.session_dir),
+                    },
+                )
             if result is None:
                 result = slot or ToolResult(
                     call.id,
                     "tool execution canceled",
                     is_error=True,
                 )
+            if stored_result is None:
                 new_results.append((call, result))
             results.append(result)
         for call, result in new_results:
@@ -926,6 +949,7 @@ class AgentLoop:
                 if child_store is not None:
                     child_store.finish_agent_parent()
                 self.store.finish_agent_child(call.id)
+                self._agent_child_turns.pop(call.id, None)
         return results
 
     def _persist_partial(

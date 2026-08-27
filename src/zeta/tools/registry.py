@@ -17,7 +17,7 @@ import os
 import pkgutil
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -101,6 +101,7 @@ class ToolStreamPublisher(Protocol):
     def publish(self, text: str, stream: ToolStream) -> None:
         """Publish one output chunk."""
 
+    def set_metadata(self, metadata: Mapping[str, object]) -> None: ...
 
 ToolStreamSink = Callable[[StreamEvent], None]
 ToolLifecycleSink = Callable[..., None]
@@ -114,6 +115,9 @@ class _ToolCallStreamPublisher:
     abort_signal: ToolAbortSignal
     sink: ToolStreamSink
     closed: bool = False
+    metadata: dict[str, object] = dataclass_field(default_factory=dict)
+
+    def set_metadata(self, metadata: Mapping[str, object]) -> None: self.metadata.update(metadata)
 
     def publish(self, text: str, stream: ToolStream) -> None:
         if self.closed or _signal_is_set(self.abort_signal):
@@ -123,7 +127,7 @@ class _ToolCallStreamPublisher:
                 StreamEventType.TOOL_EXECUTION_UPDATE,
                 tool_call=self.tool_call,
                 delta=text,
-                data={"stream": stream},
+                data={"stream": stream, **self.metadata},
             )
         )
 

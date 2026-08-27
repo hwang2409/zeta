@@ -339,6 +339,10 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     await task
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.content == "tool execution canceled"
+    assert result.structured_content == {
+        "turns_used": 0,
+        "child_session_path": str(store.session_dir / "agents" / "1"),
+    }
     child_state = (store.session_dir / "agents" / "1" / "session_state.json").read_text()
     assert '"agent_parent"' not in child_state
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")

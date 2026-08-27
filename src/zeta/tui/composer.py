@@ -538,7 +538,7 @@ def build_key_bindings(
 
     if on_toggle_agent is not None:
 
-        @bindings.add("c-o")
+        @bindings.add("c-x", "c-o")
         def toggle_agent(event: KeyPressEvent) -> None:
             del event
             on_toggle_agent()

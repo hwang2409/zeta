@@ -25,6 +25,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.data_structures import Size
@@ -1465,6 +1466,121 @@ def test_agent_cards_remain_in_sequential_order() -> None:
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert rendered.index("task 0") < rendered.index("task 1")
     assert len(transcript._agent_units) == 2
+
+
+def test_running_agent_card_can_expand_and_read_live_tail(tmp_path: Path) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("live tail")]))
+    call = ToolCall(
+        "agent-running-expand",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    update = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_UPDATE,
+        tool_call=call,
+        delta="turn 1: thinking",
+        data={"stream": "stdout", "child_session_path": str(child.session_dir)},
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(start))
+    transcript.update_tool(call.id, Text(update.delta), update)
+
+    assert transcript.toggle_latest_agent()
+    rendered = Text.from_ansi(transcript.render(120)).plain
+    assert "live tail" in rendered
+    assert "1 turns" in rendered
+
+
+def test_canceled_agent_card_can_expand_with_persisted_child_tail(tmp_path: Path) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.USER, [TextContent("cancelled task")]))
+    call = ToolCall(
+        "agent-canceled-expand",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "tool execution canceled",
+            is_error=True,
+            structured_content={
+                "turns_used": 1,
+                "child_session_path": str(child.session_dir),
+            },
+        ),
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(StreamEvent(
+        StreamEventType.TOOL_EXECUTION_START, tool_call=call
+    )))
+    transcript.finish_tool(call.id, render_event(event), event)
+
+    assert transcript.toggle_latest_agent()
+    assert "cancelled task" in Text.from_ansi(transcript.render(120)).plain
+
+
+def test_finished_agent_card_keeps_elapsed_time_after_clock_moves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.tui.agent_card as agent_card
+
+    clock = iter((100.0, 105.0, 205.0))
+    monkeypatch.setattr(agent_card.time, "monotonic", lambda: next(clock))
+    call = ToolCall(
+        "agent-clock",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("done")]))
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done",
+            structured_content={
+                "turns_used": 1,
+                "child_session_path": str(child.session_dir),
+            },
+        ),
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(StreamEvent(
+        StreamEventType.TOOL_EXECUTION_START, tool_call=call
+    )))
+    transcript.finish_tool(call.id, render_event(event), event)
+    assert transcript.toggle_latest_agent()
+
+    rendered = Text.from_ansi(transcript.render(120)).plain
+    assert "5.0s" in rendered
+    assert "105.0s" not in rendered
+
+
+def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
+    root = Path(__file__).parents[1] / "src" / "zeta" / "tui"
+    for name in ("render.py", "transcript.py"):
+        source = (root / name).read_text()
+        assert '== "agent"' not in source
+        assert "== 'agent'" not in source
+
+
+def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None:
+    bindings = build_key_bindings(
+        on_interrupt=lambda: None,
+        on_exit=lambda: None,
+        on_toggle_agent=lambda: None,
+    )
+    assert not bindings.get_bindings_for_keys((Keys.ControlO,))
+    assert bindings.get_bindings_for_keys((Keys.ControlX, Keys.ControlO))
+    for mode in (EditingMode.EMACS, EditingMode.VI):
+        session = PromptSession(key_bindings=bindings, editing_mode=mode)
+        assert not session.app.key_bindings.get_bindings_for_keys((Keys.ControlO,))
 
 
 def test_long_single_line_read_uses_a_cropped_card() -> None:
