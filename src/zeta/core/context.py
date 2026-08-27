@@ -267,7 +267,6 @@ class ContextAssembler:
         self._cache_creation_input_tokens_this_session = 0
         self._uncached_input_tokens_this_session = 0
         self._output_tokens_this_session = 0
-        self._usage_history: list[dict[str, Any]] = []
 
     @property
     def digest(self) -> str | None:
@@ -314,15 +313,8 @@ class ContextAssembler:
     def output_tokens_this_session(self) -> int:
         return self._output_tokens_this_session
 
-    @property
-    def usage_history(self) -> tuple[dict[str, Any], ...]:
-        """Return detached usage snapshots for status observability."""
-
-        return tuple(dict(usage) for usage in self._usage_history)
-
     def record_usage(self, usage: Mapping[str, Any]) -> None:
         self.last_usage = dict(usage)
-        self._usage_history.append(dict(usage))
         input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
         output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
         cache_read_tokens = usage.get("cache_read_input_tokens")

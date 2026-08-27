@@ -32,13 +32,7 @@ from ..core.project_context import (
     load_project_context,
 )
 from ..core.session import SessionError, SessionManager, env_home
-from ..core.slash import (
-    MODEL_CONTEXT_WINDOWS,
-    SlashStatus,
-    compaction_history,
-    create_slash_registry,
-    usage_history,
-)
+from ..core.slash import MODEL_CONTEXT_WINDOWS, SlashStatus, UsageTracker, compaction_history, create_slash_registry
 from ..core.todo import todo_count_tuple
 from ..loop import AgentLoop
 from ..providers.anthropic import AnthropicBackend, AnthropicCredentialStore
@@ -195,6 +189,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         self._exit_requested = False
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
+        self._usage_tracker = UsageTracker(self.loop.context_assembler)
         self._assistant_text = ""
         self._thinking_text = ""
         self._thinking_duration: float | None = None
@@ -288,8 +283,9 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             for request in self.pending_approvals
         )
         items = self.loop.store.todo_items()
-        usage_history_data = usage_history(context_assembler.usage_history)
-        compaction_history_data = compaction_history(self.loop.store.entries, context_assembler.token_counter)
+        compaction_history_data = compaction_history(
+            self.loop.store.replay(), context_assembler.token_counter
+        )
         return SlashStatus(
             session_id=self.loop.store.session_id,
             provider=self.provider,
@@ -308,7 +304,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             vim_mode=self.vim_mode,
             hooks=(() if self._hooks is None else self._hooks.status_entries),
             todo_counts=todo_count_tuple(items) if items else None,
-            usage_history=usage_history_data,
+            usage_history=self._usage_tracker.history,
             compaction_history=compaction_history_data,
             model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
         )

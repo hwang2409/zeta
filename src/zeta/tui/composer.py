@@ -96,6 +96,7 @@ class TurnConsumerMixin:
                 persist_user_message=persist_user_message,
             ):
                 self._update_usage(event)
+                self._usage_tracker.record(event.type, self.model)
                 self._prepare_stream_event(event)
                 stop_after_tool = self._handle_tool_event(event)
                 if self.verbose:

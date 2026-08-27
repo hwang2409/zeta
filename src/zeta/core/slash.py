@@ -2,23 +2,34 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections import deque
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from ..types import Message, MessageRole, StreamEventType, TextContent
 from .store import ConversationEntry
-from ..types import Message, MessageRole, TextContent
+
+
+class UsageCounterSource(Protocol):
+    """Cumulative usage counters exposed by the context assembler."""
+
+    uncached_input_tokens_this_session: int
+    output_tokens_this_session: int
+    cache_read_input_tokens_this_session: int
+    cache_creation_input_tokens_this_session: int
 
 
 @dataclass(frozen=True, slots=True)
 class UsageSnapshot:
-    """One provider completion's token usage."""
+    """One completed turn's token usage."""
 
     turn: int
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
+    model: str | None = None
 
     @property
     def cache_total(self) -> int:
@@ -33,6 +44,39 @@ class UsageSnapshot:
         if self.cache_total == 0:
             return None
         return self.cache_read_input_tokens / self.cache_total * 100
+
+
+class UsageTracker:
+    """Keep bounded usage deltas at real turn boundaries."""
+
+    def __init__(self, source: UsageCounterSource) -> None:
+        self.source = source
+        self._baseline = self._counters()
+        self._history: deque[UsageSnapshot] = deque(maxlen=8)
+        self._completed_turns = 0
+
+    @property
+    def history(self) -> tuple[UsageSnapshot, ...]:
+        return tuple(self._history)
+
+    def record(self, event_type: StreamEventType, model: str) -> None:
+        if event_type is StreamEventType.COMPACTION_END:
+            self._baseline = self._counters()
+        elif event_type is StreamEventType.TURN_END:
+            current = self._counters()
+            self._completed_turns += 1
+            self._history.append(
+                usage_delta(current, self._baseline, self._completed_turns, model)
+            )
+            self._baseline = current
+
+    def _counters(self) -> dict[str, int]:
+        return {
+            "input_tokens": self.source.uncached_input_tokens_this_session,
+            "output_tokens": self.source.output_tokens_this_session,
+            "cache_read_input_tokens": self.source.cache_read_input_tokens_this_session,
+            "cache_creation_input_tokens": self.source.cache_creation_input_tokens_this_session,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,58 +95,64 @@ class ModelPricing:
     input: float
     output: float
     cache_read: float
-    cache_write: float
+    cache_write: float | None
 
 
 # Keep this table small and explicit. Unknown models remain valid and show no
 # cost estimate. Prices are standard USD per million tokens.
 MODEL_PRICES: dict[str, dict[str, ModelPricing | None]] = {
     "claude": {
+        "claude-fable-5": None,
+        "claude-haiku-4-5-20251001": None,
         "claude-opus-4-6": ModelPricing(5.0, 25.0, 0.5, 6.25),
+        "claude-opus-4-5": None,
+        "claude-opus-4-7": None,
+        "claude-opus-4-8": None,
+        "claude-opus-5": None,
+        "claude-sonnet-4-5-20250929": None,
         "claude-sonnet-4-6": ModelPricing(3.0, 15.0, 0.3, 3.75),
+        "claude-sonnet-5": None,
         "claude-haiku-4-5": ModelPricing(1.0, 5.0, 0.1, 1.25),
     },
     "codex": {
+        "codex-auto-review": None,
+        "gpt-5.3-codex-spark": None,
+        "gpt-5.4-mini": None,
+        "gpt-5.5": None,
         "gpt-5.6-sol": ModelPricing(4.0, 20.0, 0.4, 5.0),
         "gpt-5.6-terra": ModelPricing(2.0, 12.0, 0.2, 2.5),
         "gpt-5.6-luna": ModelPricing(0.2, 1.2, 0.02, 0.25),
-        "gpt-5.4": ModelPricing(2.5, 15.0, 0.25, 3.125),
+        "gpt-5.4": ModelPricing(2.5, 15.0, 0.25, None),
+        "gpt-reserve": None,
     },
 }
 
 MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int | None]] = {
     "claude": {
+        "claude-fable-5": None,
+        "claude-haiku-4-5-20251001": None,
+        "claude-opus-4-5": None,
         "claude-opus-4-6": 1_000_000,
+        "claude-opus-4-7": None,
+        "claude-opus-4-8": None,
+        "claude-opus-5": None,
+        "claude-sonnet-4-5-20250929": None,
         "claude-sonnet-4-6": 1_000_000,
+        "claude-sonnet-5": None,
         "claude-haiku-4-5": 200_000,
     },
     "codex": {
+        "codex-auto-review": None,
+        "gpt-5.3-codex-spark": None,
+        "gpt-5.4-mini": None,
+        "gpt-5.5": None,
         "gpt-5.6-sol": 1_050_000,
         "gpt-5.6-terra": 1_050_000,
         "gpt-5.6-luna": 1_050_000,
         "gpt-5.4": 1_050_000,
+        "gpt-reserve": None,
     },
 }
-
-
-def usage_snapshot(usage: dict[str, object], turn: int) -> UsageSnapshot:
-    """Convert one normalized usage mapping into safe display values."""
-
-    def integer(*keys: str) -> int:
-        for key in keys:
-            value = usage.get(key)
-            if type(value) is int and value >= 0:
-                return value
-        return 0
-
-    return UsageSnapshot(
-        turn=turn,
-        input_tokens=integer("input_tokens", "prompt_tokens"),
-        output_tokens=integer("output_tokens", "completion_tokens"),
-        cache_read_input_tokens=integer("cache_read_input_tokens"),
-        cache_creation_input_tokens=integer("cache_creation_input_tokens"),
-    )
-
 
 def context_fill_percent(
     token_count: int | None,
@@ -141,28 +191,52 @@ def compaction_summary(
 
     start = marker.data["source_seq_start"]
     end = marker.data["source_seq_end"]
-    source_tokens = sum(
-        token_counter(Message.from_dict(entry.data["message"]))
+    folded_messages = [
+        Message.from_dict(entry.data["message"])
         for entry in entries
-        if entry.type == "message" and start <= entry.seq <= end
-    )
+        if entry.type == "message"
+        and start <= entry.seq <= end
+        and _is_folded_message(entry)
+    ]
+    source_tokens = sum(token_counter(message) for message in folded_messages)
     summary = Message(
         MessageRole.ASSISTANT,
         [TextContent(marker.data["summary"])],
     )
     return CompactionSummary(
         turn=turn,
-        entries_folded=max(0, end - start + 1),
+        entries_folded=len(folded_messages),
         tokens_saved=max(0, source_tokens - token_counter(summary)),
     )
 
 
-def usage_history(snapshots: Sequence[dict[str, object]]) -> tuple[UsageSnapshot, ...]:
-    """Convert ordered usage snapshots into turn-labelled display data."""
+def _is_folded_message(entry: ConversationEntry) -> bool:
+    """Return whether a message is source content, not a compaction replacement."""
 
-    return tuple(
-        usage_snapshot(snapshot, turn)
-        for turn, snapshot in enumerate(snapshots, 1)
+    message = Message.from_dict(entry.data["message"])
+    return message.role is not MessageRole.COMPACTION and not message.metadata.get(
+        "compaction_summary"
+    )
+
+
+def usage_delta(
+    current: Mapping[str, int],
+    previous: Mapping[str, int],
+    turn: int,
+    model: str,
+) -> UsageSnapshot:
+    """Build one turn snapshot from cumulative counter deltas."""
+
+    def delta(name: str) -> int:
+        return max(0, current.get(name, 0) - previous.get(name, 0))
+
+    return UsageSnapshot(
+        turn=turn,
+        model=model,
+        input_tokens=delta("input_tokens"),
+        output_tokens=delta("output_tokens"),
+        cache_read_input_tokens=delta("cache_read_input_tokens"),
+        cache_creation_input_tokens=delta("cache_creation_input_tokens"),
     )
 
 
@@ -172,6 +246,7 @@ def compaction_history(
 ) -> tuple[CompactionSummary, ...]:
     """Convert durable compaction markers into ordered display data."""
 
+    markers = [entry for entry in entries if entry.type == "compaction"]
     return tuple(
         compaction_summary(
             marker,
@@ -188,9 +263,7 @@ def compaction_history(
                 ),
             ),
         )
-        for turn, marker in enumerate(
-            (entry for entry in entries if entry.type == "compaction"), 1
-        )
+        for marker in markers
     )
 
 
@@ -317,19 +390,7 @@ def _format_status(status: SlashStatus) -> str:
         if cache_total == 0
         else f"{status.cache_read_input_tokens / cache_total * 100:.1f}%"
     )
-    pricing = MODEL_PRICES.get(status.provider, {}).get(status.model)
-    if pricing is None:
-        cost_text = f"unavailable (unknown model: {status.model})"
-    else:
-        cost = sum(
-            (
-                status.uncached_input_tokens * pricing.input,
-                status.output_tokens_this_session * pricing.output,
-                status.cache_read_input_tokens * pricing.cache_read,
-                status.cache_creation_input_tokens * pricing.cache_write,
-            )
-        ) / 1_000_000
-        cost_text = f"${cost:.6f}"
+    cost_text = _format_estimated_cost(status)
     trend = status.usage_history[-8:]
     trend_text = " ".join(
         f"{snapshot.turn}:{snapshot.cache_hit_rate:.0f}%"
@@ -395,6 +456,31 @@ def _format_status(status: SlashStatus) -> str:
             f"pending={pending}, in_progress={in_progress}, completed={completed}"
         )
     return "\n".join(lines)
+
+
+def _format_estimated_cost(status: SlashStatus) -> str:
+    """Estimate cost only when each turn has a known model and rate."""
+
+    if not status.usage_history:
+        if MODEL_PRICES.get(status.provider, {}).get(status.model) is None:
+            return f"unavailable (unknown model: {status.model})"
+        return "unavailable (model attribution unavailable)"
+    total = 0.0
+    for snapshot in status.usage_history:
+        if snapshot.model is None:
+            return "unavailable (model attribution unavailable)"
+        pricing = MODEL_PRICES.get(status.provider, {}).get(snapshot.model)
+        if pricing is None:
+            return f"unavailable (unknown model: {snapshot.model})"
+        if snapshot.cache_creation_input_tokens and pricing.cache_write is None:
+            return f"unavailable (cache-write price unavailable for model: {snapshot.model})"
+        total += (
+            snapshot.input_tokens * pricing.input
+            + snapshot.output_tokens * pricing.output
+            + snapshot.cache_read_input_tokens * pricing.cache_read
+            + snapshot.cache_creation_input_tokens * (pricing.cache_write or 0)
+        ) / 1_000_000
+    return f"${total:.6f}"
 
 
 def _run_status(session: SlashSession, args: str) -> str:
