@@ -29,6 +29,8 @@ from .types import (
     CompletionBackend,
     ContentBlock,
     ErrorInfo,
+    FAILED_TURN_ERROR,
+    FAILED_TURN_MARKER,
     Message,
     MessageRole,
     assistant_text,
@@ -674,7 +676,6 @@ class AgentLoop:
     ) -> AsyncIterator[StreamEvent]:
         if self.hooks is not None:
             self.hooks.user_prompt_submit(user_text)
-        await self._ensure_mcp_servers()
         if user_message is None:
             user_message = Message(MessageRole.USER, [TextContent(user_text)])
         elif user_message.role is not MessageRole.USER:
@@ -683,6 +684,17 @@ class AgentLoop:
             self.store.append_message(user_message)
         elif user_message not in self.store.messages():
             raise ValueError("cannot reuse a user message that is not persisted")
+        try:
+            await self._ensure_mcp_servers()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = _error_info(exc)
+            self._persist_partial_with_cancelled_tools([], None, failure=error)
+            yield StreamEvent(StreamEventType.AGENT_START)
+            yield StreamEvent(StreamEventType.ERROR, error=error)
+            yield StreamEvent(StreamEventType.AGENT_END)
+            return
         yield StreamEvent(StreamEventType.AGENT_START)
 
         for turn_number in range(1, self.max_turns + 1):
@@ -740,8 +752,29 @@ class AgentLoop:
                     if event.message is not None and event.type is StreamEventType.MESSAGE_END:
                         assistant_message = event.message
                     if event.type is StreamEventType.MESSAGE_END:
-                        completion_succeeded = True
+                        if event.data.get("truncated"):
+                            provider_error = ErrorInfo(
+                                "stream_error",
+                                "provider stream ended before completion",
+                            )
+                        else:
+                            completion_succeeded = True
                     yield event
+                    if provider_error is not None:
+                        yield StreamEvent(
+                            StreamEventType.ERROR,
+                            error=provider_error,
+                        )
+                        break
+                if provider_error is None and not completion_succeeded:
+                    provider_error = ErrorInfo(
+                        "stream_error",
+                        "provider stream ended before completion",
+                    )
+                    yield StreamEvent(
+                        StreamEventType.ERROR,
+                        error=provider_error,
+                    )
             except asyncio.CancelledError:
                 await _close_completion(completion)
                 self._persist_partial_for_control(partial_blocks, assistant_message)
@@ -755,12 +788,13 @@ class AgentLoop:
                 if _task_is_cancelling():
                     self._persist_partial_for_control(partial_blocks, assistant_message)
                     raise asyncio.CancelledError() from exc
+                error = _error_info(exc)
                 self._persist_partial_with_cancelled_tools(
-                    partial_blocks, assistant_message
+                    partial_blocks, assistant_message, failure=error
                 )
                 yield StreamEvent(
                     StreamEventType.ERROR,
-                    error=_error_info(exc),
+                    error=error,
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
@@ -770,7 +804,9 @@ class AgentLoop:
                 raise asyncio.CancelledError()
             if cleanup_error is not None:
                 self._persist_partial_with_cancelled_tools(
-                    partial_blocks, assistant_message
+                    partial_blocks,
+                    assistant_message,
+                    failure=_error_info(cleanup_error),
                 )
                 yield StreamEvent(
                     StreamEventType.ERROR,
@@ -780,7 +816,7 @@ class AgentLoop:
                 return
             if provider_error is not None:
                 self._persist_partial_with_cancelled_tools(
-                    partial_blocks, assistant_message
+                    partial_blocks, assistant_message, failure=provider_error
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
@@ -1078,17 +1114,29 @@ class AgentLoop:
         self,
         partial_blocks: list[ContentBlock],
         assistant_message: Message | None,
+        *,
+        failure: ErrorInfo | None = None,
     ) -> None:
-        if assistant_message is not None:
-            self.store.append_message(_durable_message(assistant_message))
-        else:
+        if assistant_message is None:
             durable_blocks = [
                 block
                 for block in partial_blocks
                 if not isinstance(block, ThinkingContent) or block.signature
             ]
-            if durable_blocks:
-                self.store.append_message(Message(MessageRole.ASSISTANT, durable_blocks))
+            if not durable_blocks and failure is None:
+                return
+            assistant_message = Message(MessageRole.ASSISTANT, durable_blocks)
+        if failure is not None:
+            metadata = dict(assistant_message.metadata)
+            metadata[FAILED_TURN_MARKER] = True
+            metadata[FAILED_TURN_ERROR] = failure.to_dict()
+            assistant_message = Message(
+                assistant_message.role,
+                assistant_message.content,
+                tool_result=assistant_message.tool_result,
+                metadata=metadata,
+            )
+        self.store.append_message(_durable_message(assistant_message))
 
     def _persist_partial_for_control(
         self,
@@ -1113,8 +1161,10 @@ class AgentLoop:
         self,
         partial_blocks: list[ContentBlock],
         assistant_message: Message | None,
+        *,
+        failure: ErrorInfo | None = None,
     ) -> None:
-        self._persist_partial(partial_blocks, assistant_message)
+        self._persist_partial(partial_blocks, assistant_message, failure=failure)
         blocks = (
             assistant_message.content
             if assistant_message is not None

@@ -38,7 +38,7 @@ from ..types import (
     TextContent,
     image_signature_matches,
 )
-from .render import render_event
+from .render import is_retryable_error, render_event
 from .theme import BODY, CHROME, DIM, ERROR, USER_ROLE
 
 SHIFT_ENTER_SEQUENCES = frozenset(
@@ -143,7 +143,9 @@ class TurnConsumerMixin:
                             StreamEventType.ERROR,
                         }:
                             self._print_unit(rendered)
-                            if event.type is StreamEventType.ERROR:
+                            if event.type is StreamEventType.ERROR and is_retryable_error(
+                                event.error
+                            ):
                                 turn_failed = True
                                 self._failed_turn = (user_text, retry_message)
                                 self._turn_had_visible_output = True
@@ -164,7 +166,6 @@ class TurnConsumerMixin:
             self._presenter.reset_assistant_unit()
             self._reset_stream_state()
             self._loop_state = "idle"
-            self._failed_turn = (user_text, retry_message)
             try:
                 message = str(exc).strip() or type(exc).__name__
             except Exception:

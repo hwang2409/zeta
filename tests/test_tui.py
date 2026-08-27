@@ -62,6 +62,7 @@ from zeta.tui.render import (
     render_thought,
     render_thought_live,
     render_tool_progress,
+    is_retryable_error,
     tool_render_mode,
     _render_tool_output,
 )
@@ -1457,6 +1458,23 @@ def test_render_error_card_bounds_and_labels_json_payload() -> None:
     assert "retry: ctrl+r" in plain
 
 
+@pytest.mark.parametrize("code", ["max_turns", "ui_error"])
+def test_non_provider_errors_are_not_retryable(code: str) -> None:
+    event = StreamEvent(
+        StreamEventType.ERROR,
+        error=ErrorInfo(code, "do not retry"),
+    )
+
+    rendered = render_event(event)
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert f"error · {code}" in plain
+    assert "provider failure" not in plain
+    assert "retry: ctrl+r" not in plain
+    assert is_retryable_error(event.error) is False
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("full_screen", [False, True])
 async def test_provider_failure_card_is_visible_in_both_modes(
@@ -1578,6 +1596,51 @@ async def test_retry_failure_renders_a_fresh_error_card(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_resumed_failed_turn_renders_and_retries_without_duplication(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("prompt")]))
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("partial response")],
+            metadata={
+                "turn_failed": True,
+                "turn_error": {"code": "backend_error", "message": "boom"},
+            },
+        )
+    )
+    output = StringIO()
+    backend = ErrorThenSuccessBackend()
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    app._rebuild_transcript()
+
+    assert app.retry_available()
+    rendered = Text.from_ansi(output.getvalue()).plain
+    assert "partial response" in rendered
+    assert "provider failure · backend_error" in rendered
+    assert "retry: ctrl+r" in rendered
+
+    app.retry_failed_turn()
+    assert app._active_task is not None
+    await app._active_task
+
+    assert [message.role for message in store.messages()].count(MessageRole.USER) == 1
+    assert [
+        message.role
+        for message in backend.request_messages[0]
+        if message.role is not MessageRole.SYSTEM
+    ] == [MessageRole.USER]
+
+
+@pytest.mark.asyncio
 async def test_draft_survives_provider_failure(tmp_path: Path) -> None:
     backend = WaitingFailureBackend()
     app = TUIApp(
@@ -1596,6 +1659,8 @@ async def test_draft_survives_provider_failure(tmp_path: Path) -> None:
     await task
 
     assert session.app.current_buffer.text == "draft while streaming"
+    failed_message = app.loop.store.messages()[-1]
+    assert failed_message.metadata["turn_failed"] is True
 
 
 def test_tool_render_mode_keeps_receipt_rule_in_one_place() -> None:

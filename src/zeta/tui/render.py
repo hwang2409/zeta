@@ -20,6 +20,7 @@ from rich import box
 from mdit_py_plugins.tasklists import tasklists_plugin
 
 from ..types import (
+    ErrorInfo,
     flatten_tool_content,
     RedactedThinkingContent,
     StreamEvent,
@@ -207,7 +208,7 @@ def _safe_text(value: str, *, style: str) -> Text:
 
 
 def render_error_card(event: StreamEvent) -> Panel:
-    """Render a bounded provider failure with its retry affordance."""
+    """Render a bounded error with a retry affordance when supported."""
 
     error = event.error
     code = error.code if error is not None and error.code else "backend_error"
@@ -219,9 +220,9 @@ def render_error_card(event: StreamEvent) -> Panel:
     except (json.JSONDecodeError, TypeError):
         is_json_payload = False
     reason = _truncate(reason, MAX_ERROR_REASON)
-    content: list[RenderableType] = [
-        Text(f"provider failure · {code}", style=ERROR),
-    ]
+    retryable = is_retryable_error(error)
+    title = "provider failure" if retryable else "error"
+    content: list[RenderableType] = [Text(f"{title} · {code}", style=ERROR)]
     if not is_json_payload:
         content.append(_safe_text(f"reason: {reason}", style=BODY))
     else:
@@ -237,7 +238,8 @@ def render_error_card(event: StreamEvent) -> Panel:
                 ),
             )
         )
-    content.append(Text("retry: ctrl+r", style=AFFORDANCE))
+    if retryable:
+        content.append(Text("retry: ctrl+r", style=AFFORDANCE))
     return Panel(
         Group(*content),
         border_style=ERROR,
@@ -245,6 +247,19 @@ def render_error_card(event: StreamEvent) -> Panel:
         padding=(0, 1),
         expand=True,
     )
+
+
+def is_retryable_error(error: ErrorInfo | None) -> bool:
+    """Return whether an error can succeed when the provider is retried."""
+
+    return error is not None and error.code in {
+        "auth_error",
+        "backend_error",
+        "http_error",
+        "stream_error",
+        "timeout",
+        "transport_error",
+    }
 
 
 def _tool_receipt(event: StreamEvent) -> Text:

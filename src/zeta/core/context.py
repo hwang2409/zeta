@@ -14,6 +14,7 @@ from .store import ConversationEntry, ConversationStore
 from ..types import (
     CompletionBackend,
     ContentBlock,
+    FAILED_TURN_MARKER,
     flatten_tool_content,
     ImageContent,
     Message,
@@ -485,6 +486,7 @@ class ContextAssembler:
         }
         items: list[_ContextItem] = []
         emitted_marker_ids: set[str] = set()
+        failed_tool_call_ids: set[str] = set()
         for entry in entries:
             marker = markers_by_start.get(entry.seq)
             if marker is not None:
@@ -496,9 +498,23 @@ class ContextAssembler:
                 continue
             if entry.type != "message":
                 continue
+            message = Message.from_dict(entry.data["message"])
+            if message.metadata.get(FAILED_TURN_MARKER):
+                failed_tool_call_ids.update(
+                    block.tool_call.id
+                    for block in message.content
+                    if isinstance(block, ToolUseContent)
+                )
+                continue
             if any(start <= entry.seq <= end for start, end in compacted_ranges):
                 continue
-            items.append(_ContextItem(entry, Message.from_dict(entry.data["message"])))
+            if (
+                message.role is MessageRole.TOOL_RESULT
+                and message.tool_result is not None
+                and message.tool_result.tool_call_id in failed_tool_call_ids
+            ):
+                continue
+            items.append(_ContextItem(entry, message))
         for marker in markers:
             if marker.id not in emitted_marker_ids:
                 items.extend(self._marker_items(marker))

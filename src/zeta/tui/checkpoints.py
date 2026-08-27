@@ -5,6 +5,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from ..types import (
+    ErrorInfo,
+    FAILED_TURN_ERROR,
+    FAILED_TURN_MARKER,
     Message,
     MessageRole,
     StreamEvent,
@@ -13,7 +16,7 @@ from ..types import (
     ToolUseContent,
     assistant_text,
 )
-from .render import render_event, render_markdown
+from .render import is_retryable_error, render_event, render_markdown
 
 
 def _age(created_at: str) -> str:
@@ -102,7 +105,9 @@ class CheckpointTranscriptMixin:
         """Re-render the visible transcript from the active durable branch."""
 
         self._presenter.clear()
+        self._failed_turn = None
         tool_calls: dict[str, ToolCall] = {}
+        last_user: Message | None = None
         for entry in self.loop.store.replay():
             if entry.type == "checkpoint":
                 self._print_system(
@@ -125,11 +130,24 @@ class CheckpointTranscriptMixin:
                 continue
             message = Message.from_dict(entry.data["message"])
             if message.role is MessageRole.USER:
+                last_user = message
                 self._print_user(message)
             elif message.role is MessageRole.ASSISTANT:
                 text = assistant_text(message)
                 if text:
                     self._print_unit(render_markdown(text))
+                if message.metadata.get(FAILED_TURN_MARKER):
+                    error_value = message.metadata.get(FAILED_TURN_ERROR)
+                    error = (
+                        ErrorInfo.from_dict(error_value)
+                        if isinstance(error_value, dict)
+                        else ErrorInfo("backend_error", "provider failure")
+                    )
+                    if is_retryable_error(error) and last_user is not None:
+                        self._failed_turn = (assistant_text(last_user), last_user)
+                    self._print_unit(
+                        render_event(StreamEvent(StreamEventType.ERROR, error=error))
+                    )
                 for block in message.content:
                     if isinstance(block, ToolUseContent):
                         tool_calls[block.tool_call.id] = block.tool_call

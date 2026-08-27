@@ -79,6 +79,28 @@ async def test_retained_tail_is_verbatim(context_root: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_assistant_output_is_excluded_from_retry_context(
+    context_root: Path,
+) -> None:
+    store = ConversationStore(context_root)
+    store.append_message(text(MessageRole.USER, "prompt"))
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("partial")],
+            metadata={
+                "turn_failed": True,
+                "turn_error": {"code": "stream_error", "message": "disconnected"},
+            },
+        )
+    )
+
+    assembled = await ContextAssembler(store).assemble()
+
+    assert [message.role for message in assembled] == [MessageRole.USER]
+
+
+@pytest.mark.asyncio
 async def test_compaction_requires_non_tail_content(context_root: Path) -> None:
     store = ConversationStore(context_root)
     store.append_message(text(MessageRole.USER, "tail"))

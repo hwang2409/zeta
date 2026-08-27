@@ -1255,7 +1255,10 @@ async def test_backend_error_is_typed_and_user_state_is_persisted(tmp_path: Path
     assert events[-2].type is StreamEventType.ERROR
     assert events[-2].error is not None
     assert events[-2].error.code == "backend_error"
-    assert len(store.messages()) == 1
+    messages = store.messages()
+    assert len(messages) == 2
+    assert messages[-1].metadata["turn_failed"] is True
+    assert messages[-1].metadata["turn_error"]["code"] == "backend_error"
 
 
 @pytest.mark.asyncio
@@ -1289,6 +1292,55 @@ async def test_provider_error_event_persists_partial_state_and_ends_turn(
     assert [message.content[0].text for message in store.messages()[1:]] == [
         "partial"
     ]
+    assert store.messages()[-1].metadata["turn_failed"] is True
+    assert store.messages()[-1].metadata["turn_error"]["code"] == "stream_error"
+
+
+@pytest.mark.asyncio
+async def test_clean_stream_exit_becomes_provider_failure(tmp_path: Path) -> None:
+    class IncompleteBackend(CompletionBackend):
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            yield StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=TextContent("partial"),
+            )
+
+    store = ConversationStore(tmp_path)
+    events = await collect(AgentLoop(IncompleteBackend(), store).run_turn("start"))
+
+    assert events[-2].type is StreamEventType.ERROR
+    assert events[-2].error == ErrorInfo(
+        "stream_error", "provider stream ended before completion"
+    )
+    assert StreamEventType.TURN_END not in [event.type for event in events]
+    assert store.turn_in_flight() is False
+    assert store.messages()[-1].metadata["turn_failed"] is True
+
+
+@pytest.mark.asyncio
+async def test_no_output_failure_closes_turn_and_persists_marker(tmp_path: Path) -> None:
+    class BrokenBackend(CompletionBackend):
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            raise RuntimeError("provider broke")
+            yield
+
+    store = ConversationStore(tmp_path)
+    await collect(AgentLoop(BrokenBackend(), store).run_turn("start"))
+
+    messages = store.messages()
+    assert messages[-1].content == []
+    assert messages[-1].metadata["turn_failed"] is True
+    assert store.turn_in_flight() is False
 
 
 @pytest.mark.asyncio
@@ -1312,6 +1364,9 @@ async def test_failed_child_returns_error_and_sibling_survives(tmp_path: Path) -
     assert "child connection dropped" in results[0].content
     assert results[1].content == "sibling complete"
     assert store.messages()[-1].content[0].text == "parent survived"
+    child_path = Path(results[0].structured_content["child_session_path"])
+    child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+    assert child_store.messages()[-1].metadata["turn_failed"] is True
 
 
 @pytest.mark.asyncio
@@ -1344,3 +1399,6 @@ async def test_child_setup_failure_does_not_cancel_parallel_sibling(
     assert results[0] is not None and results[0].is_error
     assert "child setup disconnected" in results[0].content
     assert results[1] is not None and results[1].content == "sibling complete"
+    child_path = Path(results[0].structured_content["child_session_path"])
+    child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+    assert child_store.turn_in_flight() is False
