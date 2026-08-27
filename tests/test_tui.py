@@ -1653,6 +1653,7 @@ def test_finished_agent_card_keeps_elapsed_time_after_clock_moves(
 
 def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
     root = Path(__file__).parents[1] / "src" / "zeta" / "tui"
+    allowed_path = Path("tui") / "agent_card.py"
     violations: list[str] = []
 
     def contains_agent_identifier(node: ast.AST) -> bool:
@@ -1662,7 +1663,7 @@ def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
         )
 
     for path in root.rglob("*.py"):
-        if path.name == "agent_card.py":
+        if path.relative_to(root.parent) == allowed_path:
             continue
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
@@ -1671,6 +1672,17 @@ def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
                 condition = node
             elif isinstance(node, (ast.If, ast.IfExp, ast.While)):
                 condition = node.test
+            elif isinstance(node, ast.Match):
+                if any(
+                    contains_agent_identifier(case.pattern)
+                    or (
+                        case.guard is not None
+                        and contains_agent_identifier(case.guard)
+                    )
+                    for case in node.cases
+                ):
+                    violations.append(f"{path}:{node.lineno}")
+                continue
             if condition is not None and contains_agent_identifier(condition):
                 violations.append(f"{path}:{node.lineno}")
 
