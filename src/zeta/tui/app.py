@@ -18,6 +18,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.styles import DynamicStyle, Style
 from rich.console import Console, RenderableType
 from rich.padding import Padding
@@ -185,6 +186,9 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         self._active_task: asyncio.Task[None] | None = None
         self._queued: deque[Message] = deque()
         self._pending_attachments: list[Path] = []
+        self._pending_attachment_tokens: dict[str, Path] = {}
+        self._next_image_token = 1
+        self._composer_insertions: list[str] = []
         self._replay_rendered = False
         self._exit_requested = False
         self._loop_state = "idle"
@@ -496,10 +500,21 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         self._exit_requested = True
         self.abort_active()
 
-    def _paste_from_keybinding(self) -> None:
-        notice = self.slash_paste("")
-        if notice != "paste unavailable: clipboard does not contain an image":
-            self._print_system(notice)
+    def _insert_paste_token(self, token: str) -> None:
+        if isinstance(self._active_session, FullScreenPromptSession):
+            self._active_session.app.current_buffer.insert_text(token)
+        else:
+            self._composer_insertions.append(token)
+
+    def _paste_from_keybinding(self, event: KeyPressEvent | None = None) -> None:
+        result = self.slash_paste("")
+        if result.startswith("[Image #"):
+            if event is None:
+                self._insert_paste_token(result)
+            else:
+                event.current_buffer.insert_text(result)
+        elif result != "paste unavailable: clipboard does not contain an image":
+            self._print_system(result)
 
     def abort_active(self) -> None:
         if self._active_task is not None and not self._active_task.done():
@@ -549,7 +564,6 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
             background_count=self.loop.tool_registry.background_tasks.running_count,
         )
         fragments = status_formatted_text(status)
-        fragments.extend(self._pending_attachment_fragments())
         return fragments
 
     def _full_screen_active(self) -> bool:
@@ -632,6 +646,8 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         if slash_output is not None:
             if self._fork_rebuilt:
                 self._fork_rebuilt = False
+            elif slash_output.startswith("[Image #"):
+                self._insert_paste_token(slash_output)
             else:
                 self._print_system(slash_output)
             return
@@ -642,10 +658,10 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         if self.pending_approvals:
             self._present_pending_approvals()
         elif self.active:
-            self._pending_attachments.clear()
+            self._clear_pending_attachments()
             self._queued.append(user_message)
         else:
-            self._pending_attachments.clear()
+            self._clear_pending_attachments()
             self._print_user(user_message)
             self._start_turn(model_input, user_message=user_message)
 
@@ -878,11 +894,19 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
             self._invalidate_prompt()
 
     async def _read_prompt(self, session: PromptSession[str]) -> str | None:
+        def insert_pending_tokens() -> None:
+            if self._composer_insertions:
+                session.app.current_buffer.insert_text(
+                    "".join(self._composer_insertions)
+                )
+                self._composer_insertions.clear()
+
         try:
             value = await session.prompt_async(
                 [("class:prompt", " > ")],
                 bottom_toolbar=self._status_toolbar,
                 placeholder=[("class:placeholder", "type a message...")],
+                pre_run=insert_pending_tokens,
             )
         except EOFError:
             return None
