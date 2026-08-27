@@ -51,7 +51,7 @@ MAX_RESULT = 180
 MAX_TOOL_LINES = 15
 SPINNER_FRAMES = ("·", "•", "●", "•")
 RECEIPT_TOOLS = frozenset(
-    {"read", "glob", "grep", "search", "find", "list", "websearch"}
+    {"agent", "read", "glob", "grep", "search", "find", "list", "websearch"}
 )
 SUMMARY_TOOLS = frozenset({"glob", "grep", "search", "find", "websearch"})
 OSC_RE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b]*(?:\x07|\x1b\\)")
@@ -103,8 +103,6 @@ def tool_render_mode(event: StreamEvent) -> ToolRenderMode:
 
     call = event.tool_call
     result = event.tool_result
-    if call is not None and call.name.lower() == "agent":
-        return "receipt"
     if call is None or result is None or call.name.lower() not in RECEIPT_TOOLS:
         return "card"
     if result.is_error or any(
@@ -812,9 +810,6 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         text = event.data.get("text")
         return Text(text if type(text) is str else "retrying", style=DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
-        if event.tool_call.name.lower() == "agent":
-            description = str(event.tool_call.arguments.get("description", "agent"))
-            return _safe_text(f"{description}: agent · running", style=RECEIPT)
         if event.tool_call.name.lower() in RECEIPT_TOOLS:
             suffix = _receipt_arguments(event.tool_call, "")
             return Text(

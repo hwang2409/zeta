@@ -188,9 +188,9 @@ async def _exec(
 
 
 def register(registry: ToolRegistry) -> None:
-    registry.register(
+    registry.register_session_tool(
         "exec",
-        lambda arguments, abort_signal: _exec(registry, arguments, abort_signal),
+        _exec,
         description=(
             "Run a shell command from the session cwd. "
             "This tool is not a sandbox."

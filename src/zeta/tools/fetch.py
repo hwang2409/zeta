@@ -498,9 +498,9 @@ async def _fetch(
 
 
 def register(registry: ToolRegistry) -> None:
-    registry.register(
+    registry.register_session_tool(
         "fetch",
-        lambda arguments, abort_signal: _fetch(registry, arguments, abort_signal),
+        _fetch,
         description=(
             "Fetch a URL and return readable text. Network access requires approval; "
             "HTTP URLs are allowed with a notice. Private, loopback, link-local, "

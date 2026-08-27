@@ -170,9 +170,9 @@ async def _read(
 
 
 def register(registry: ToolRegistry) -> None:
-    registry.register(
+    registry.register_session_tool(
         "read",
-        lambda arguments, abort_signal: _read(registry, arguments, abort_signal),
+        _read,
         description="Read a UTF-8 file. Relative paths use the session cwd.",
         parameters={
             "type": "object",

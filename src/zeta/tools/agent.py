@@ -22,10 +22,12 @@ class ChildApprovalPolicy:
         parent: ApprovalPolicy,
         child_store: ConversationStore,
         description: str,
+        child_instance_id: str,
     ) -> None:
         self.parent = parent
         self.child_store = child_store
         self.description = description
+        self.child_instance_id = child_instance_id
 
     def bind_store(self, store: ConversationStore) -> None:
         del store
@@ -78,7 +80,11 @@ class ChildApprovalPolicy:
             tool_call,
             label=f"{self.description}: {tool_call.name}",
         )
-        self.parent.register_delegated(request, self.child_store)
+        self.parent.register_delegated(
+            request,
+            self.child_store,
+            child_instance_id=self.child_instance_id,
+        )
         while True:
             state = self.child_store.approval_states().get(tool_call.id)
             if state is not None and state[1] is not None:
@@ -108,6 +114,9 @@ class ChildApprovalPolicy:
         state = self.child_store.approval_states().get(request_id)
         return _approval_decision(state[1] if state is not None else None)
 
+    def cleanup(self) -> None:
+        self.parent.cleanup_delegated(self.child_instance_id)
+
 
 def _approval_decision(value: str | None) -> ApprovalDecision | None:
     if value == ApprovalDecision.ALLOW.value:
@@ -134,26 +143,28 @@ def agent_result(
     }
 
 
-def register(registry: ToolRegistry) -> None:
-    async def handler(
-        arguments: dict[str, Any],
-        abort_signal: AbortSignal,
-        stream_publisher: ToolStreamPublisher | None = None,
-    ) -> dict[str, object]:
-        runner = registry.agent_runner
-        call = registry.active_tool_call
-        if runner is None or call is None:
-            return agent_result(
-                "agent error: agent tool is unavailable outside an agent loop",
-                error=True,
-                turns_used=0,
-                child_session_path="",
-            )
-        return await runner(call, arguments, abort_signal, stream_publisher)
+async def _agent(
+    registry: ToolRegistry,
+    arguments: dict[str, Any],
+    abort_signal: AbortSignal,
+    stream_publisher: ToolStreamPublisher | None = None,
+) -> dict[str, object]:
+    runner = registry.agent_runner
+    call = registry.active_tool_call
+    if runner is None or call is None:
+        return agent_result(
+            "agent error: agent tool is unavailable outside an agent loop",
+            error=True,
+            turns_used=0,
+            child_session_path="",
+        )
+    return await runner(call, arguments, abort_signal, stream_publisher)
 
-    registry.register(
+
+def register(registry: ToolRegistry) -> None:
+    registry.register_session_tool(
         "agent",
-        handler,
+        _agent,
         description=(
             "Delegate multi-step exploration or research that would pollute the "
             "main context. The child has its own bounded context and cannot "

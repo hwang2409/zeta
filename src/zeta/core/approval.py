@@ -25,6 +25,13 @@ class ApprovalRequest:
     request_id: str
     tool_call: ToolCall
     label: str | None = None
+    child_instance_id: str | None = None
+
+    @property
+    def key(self) -> str | tuple[str, str]:
+        if self.child_instance_id is None:
+            return self.request_id
+        return self.child_instance_id, self.request_id
 
 
 class _AbortSignal(Protocol):
@@ -48,7 +55,9 @@ class ApprovalPolicy:
         self.always_deny = frozenset(always_deny)
         self.default = _decision(default)
         self._store = store
-        self._delegated: dict[str, tuple[ApprovalRequest, ConversationStore]] = {}
+        self._delegated: dict[
+            tuple[str, str], tuple[ApprovalRequest, ConversationStore]
+        ] = {}
 
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
@@ -71,10 +80,12 @@ class ApprovalPolicy:
             ApprovalRequest(request_id, tool_call)
             for request_id, tool_call in store.pending_approvals()
         ]
-        for request_id, (request, delegated_store) in list(self._delegated.items()):
+        for (child_id, request_id), (request, delegated_store) in list(
+            self._delegated.items()
+        ):
             state = delegated_store.approval_states().get(request_id)
             if state is None or state[1] is not None:
-                self._delegated.pop(request_id, None)
+                self._delegated.pop((child_id, request_id), None)
             else:
                 requests.append(request)
         return requests
@@ -83,54 +94,146 @@ class ApprovalPolicy:
         self,
         request: ApprovalRequest,
         store: ConversationStore,
+        *,
+        child_instance_id: str | None = None,
     ) -> None:
         """Expose a child request without writing it into this store."""
 
-        if request.request_id in self._delegated:
+        child_id = child_instance_id or request.child_instance_id or store.session_id
+        key = (child_id, request.request_id)
+        if key in self._delegated:
             return
-        self._delegated[request.request_id] = (request, store)
+        self._delegated[key] = (
+            ApprovalRequest(
+                request.request_id,
+                request.tool_call,
+                request.label,
+                child_id,
+            ),
+            store,
+        )
 
-    def approve(self, request_id: str) -> bool:
-        return self.resolve(request_id, ApprovalDecision.ALLOW)
+    def cleanup_delegated(self, child_instance_id: str) -> None:
+        """Resolve and remove all delegated requests owned by one child."""
 
-    def deny(self, request_id: str) -> bool:
-        return self.resolve(request_id, ApprovalDecision.DENY)
+        for key, (request, store) in list(self._delegated.items()):
+            if key[0] != child_instance_id:
+                continue
+            try:
+                store.resolve_approval(request.request_id, ApprovalDecision.DENY.value)
+            except ValueError:
+                pass
+            finally:
+                self._delegated.pop(key, None)
 
-    def abort(self, request_id: str) -> bool:
-        delegated = self._delegated.get(request_id)
+    def approve(
+        self,
+        request_id: str | tuple[str, str],
+        *,
+        child_instance_id: str | None = None,
+    ) -> bool:
+        return self.resolve(
+            request_id,
+            ApprovalDecision.ALLOW,
+            child_instance_id=child_instance_id,
+        )
+
+    def deny(
+        self,
+        request_id: str | tuple[str, str],
+        *,
+        child_instance_id: str | None = None,
+    ) -> bool:
+        return self.resolve(
+            request_id,
+            ApprovalDecision.DENY,
+            child_instance_id=child_instance_id,
+        )
+
+    def abort(
+        self,
+        request_id: str | tuple[str, str],
+        *,
+        child_instance_id: str | None = None,
+    ) -> bool:
+        delegated = self._delegated_entry(request_id, child_instance_id)
         if delegated is not None:
-            return delegated[1].resolve_approval(request_id, "abort")
+            return delegated[1].resolve_approval(
+                delegated[0].request_id, "abort"
+            )
+        if isinstance(request_id, tuple):
+            return False
         store = self._require_store()
         return store.resolve_approval(request_id, "abort")
 
-    def abort_or_winner(self, request_id: str) -> ApprovalDecision | None:
-        delegated = self._delegated.get(request_id)
+    def abort_or_winner(
+        self,
+        request_id: str | tuple[str, str],
+        *,
+        child_instance_id: str | None = None,
+    ) -> ApprovalDecision | None:
+        delegated = self._delegated_entry(request_id, child_instance_id)
         if delegated is not None:
-            delegated[1].resolve_approval(request_id, "abort")
-            state = delegated[1].approval_states().get(request_id)
+            delegated[1].resolve_approval(delegated[0].request_id, "abort")
+            state = delegated[1].approval_states().get(delegated[0].request_id)
             return _resolved_decision(state[1] if state is not None else None)
+        if isinstance(request_id, tuple):
+            return None
         store = self._require_store()
         store.resolve_approval(request_id, "abort")
         state = store.approval_states().get(request_id)
         return _resolved_decision(state[1] if state is not None else None)
 
-    def durable_decision(self, request_id: str) -> str | None:
-        delegated = self._delegated.get(request_id)
+    def durable_decision(
+        self,
+        request_id: str | tuple[str, str],
+        *,
+        child_instance_id: str | None = None,
+    ) -> str | None:
+        delegated = self._delegated_entry(request_id, child_instance_id)
         if delegated is not None:
-            state = delegated[1].approval_states().get(request_id)
+            state = delegated[1].approval_states().get(delegated[0].request_id)
             return None if state is None else state[1]
+        if isinstance(request_id, tuple):
+            return None
         state = self._require_store().approval_states().get(request_id)
         return None if state is None else state[1]
 
-    def resolve(self, request_id: str, decision: ApprovalDecision | str) -> bool:
+    def resolve(
+        self,
+        request_id: str | tuple[str, str],
+        decision: ApprovalDecision | str,
+        *,
+        child_instance_id: str | None = None,
+    ) -> bool:
         resolved = _decision(decision)
         if resolved is ApprovalDecision.ASK:
             raise ValueError("approval resolution must allow or deny")
-        delegated = self._delegated.get(request_id)
+        delegated = self._delegated_entry(request_id, child_instance_id)
         if delegated is not None:
-            return delegated[1].resolve_approval(request_id, resolved.value)
+            return delegated[1].resolve_approval(
+                delegated[0].request_id, resolved.value
+            )
+        if isinstance(request_id, tuple):
+            return False
         store = self._require_store()
         return store.resolve_approval(request_id, resolved.value)
+
+    def _delegated_entry(
+        self,
+        request_id: str | tuple[str, str],
+        child_instance_id: str | None,
+    ) -> tuple[ApprovalRequest, ConversationStore] | None:
+        if isinstance(request_id, tuple):
+            return self._delegated.get(request_id)
+        if child_instance_id is not None:
+            return self._delegated.get((child_instance_id, request_id))
+        matches = [
+            delegated
+            for (child_id, delegated_id), delegated in self._delegated.items()
+            if delegated_id == request_id
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def prepare(self, tool_call: ToolCall) -> ApprovalRequest | None:
         """Build an ask request for atomic persistence with its assistant anchor."""

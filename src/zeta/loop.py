@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import warnings
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from .core.abort import AbortSignal as ToolAbortSignal
 from .core.approval import ApprovalPolicy
@@ -35,6 +35,9 @@ from .types import (
     ToolUseContent,
     flatten_tool_content,
 )
+
+
+TaskResult = TypeVar("TaskResult")
 
 
 async def _close_completion(
@@ -111,6 +114,7 @@ class AgentLoop:
     ) -> None:
         self.backend = backend
         self.store = store
+        self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
         self._recover_agent_children()
         if registry is not None and tools is not None:
@@ -202,6 +206,15 @@ class AgentLoop:
 
         self.tool_registry.abort()
 
+    def _create_task(
+        self,
+        coroutine: Coroutine[Any, Any, TaskResult],
+    ) -> asyncio.Task[TaskResult]:
+        task = asyncio.create_task(coroutine)
+        self._tracked_tasks.add(task)
+        task.add_done_callback(self._tracked_tasks.discard)
+        return task
+
     def _recover_agent_children(self) -> None:
         """Resolve child markers left by a process exit before resuming."""
 
@@ -266,6 +279,7 @@ class AgentLoop:
         )
         child_store.mark_agent_parent(tool_call.id)
         child_path = str(child_store.session_dir)
+        child_instance_id = f"{self.store.session_id}:{child_number}"
         self._agent_child_stores[tool_call.id] = child_store
         self.store.register_agent_child(
             tool_call,
@@ -277,10 +291,15 @@ class AgentLoop:
             exclude_names={"agent"},
         )
         parent_policy = self.tool_registry.approval_policy
+        child_policy: ChildApprovalPolicy | None = None
         if parent_policy is not None:
-            child_registry.set_approval_policy(
-                ChildApprovalPolicy(parent_policy, child_store, description)
+            child_policy = ChildApprovalPolicy(
+                parent_policy,
+                child_store,
+                description,
+                child_instance_id,
             )
+            child_registry.set_approval_policy(child_policy)
         child_loop = AgentLoop(
             self.backend,
             child_store,
@@ -369,8 +388,8 @@ class AgentLoop:
                 child_session_path=child_path,
             )
 
-        child_task = asyncio.create_task(consume())
-        abort_task = asyncio.create_task(abort_signal.wait())
+        child_task = self._create_task(consume())
+        abort_task = self._create_task(abort_signal.wait())
         child_canceled = False
 
         async def cancel_child() -> None:
@@ -398,6 +417,8 @@ class AgentLoop:
             await cancel_child()
             raise
         finally:
+            if child_policy is not None:
+                child_policy.cleanup()
             if not abort_task.done():
                 abort_task.cancel()
             await asyncio.gather(abort_task, return_exceptions=True)
@@ -425,6 +446,10 @@ class AgentLoop:
     async def close(self) -> None:
         """Close session-owned transports and background processes."""
 
+        tracked_tasks = tuple(self._tracked_tasks)
+        for task in tracked_tasks:
+            task.cancel()
+        await asyncio.gather(*tracked_tasks, return_exceptions=True)
         if self.hooks is not None:
             self.hooks.stop()
             await self.hooks.close()
@@ -725,7 +750,7 @@ class AgentLoop:
                                 parallel_calls.append(next_call)
                     if len(parallel_calls) > 1:
                         parallel_tasks = {
-                            asyncio.create_task(
+                            self._create_task(
                                 self.tool_registry.execute(
                                     tool_call,
                                     _stream_sink=enqueue_tool_update,
@@ -739,7 +764,7 @@ class AgentLoop:
                             for offset, tool_call in enumerate(parallel_calls)
                         }
                         while parallel_tasks:
-                            update_task = asyncio.create_task(stream_updates.get())
+                            update_task = self._create_task(stream_updates.get())
                             done, _ = await asyncio.wait(
                                 (*parallel_tasks, update_task),
                                 return_when=asyncio.FIRST_COMPLETED,
@@ -779,7 +804,7 @@ class AgentLoop:
                         continue
 
                     tool_call = calls[call_index]
-                    active_task = asyncio.create_task(
+                    active_task = self._create_task(
                         self.tool_registry.execute(
                             tool_call,
                             _stream_sink=enqueue_tool_update,
@@ -792,7 +817,7 @@ class AgentLoop:
                     )
                     try:
                         while True:
-                            update_task = asyncio.create_task(stream_updates.get())
+                            update_task = self._create_task(stream_updates.get())
                             done, _ = await asyncio.wait(
                                 (active_task, update_task),
                                 return_when=asyncio.FIRST_COMPLETED,

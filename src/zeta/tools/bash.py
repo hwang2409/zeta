@@ -205,14 +205,9 @@ async def _bash(
 
 
 def register(registry: ToolRegistry) -> None:
-    registry.register(
+    registry.register_session_tool(
         "bash",
-        lambda arguments, abort_signal, stream_publisher=None: _bash(
-            registry,
-            arguments,
-            abort_signal,
-            stream_publisher,
-        ),
+        _bash,
         description=(
             "Run a shell command. Session cwd persists after cd. "
             "Sandboxing is truly best-effort."

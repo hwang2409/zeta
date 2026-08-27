@@ -17,7 +17,8 @@ import os
 import pkgutil
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -47,16 +48,14 @@ from ._process import BackgroundTaskRegistry
 
 AbortSignal = ToolAbortSignal
 MAX_STRUCTURED_CONTENT_DEPTH = 32
-ToolHook = Callable[
-    [str, dict[str, Any]], bool | str | Awaitable[bool | str] | None
-]
+ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerResult = str | StructuredToolResult | ToolResult
-ToolHandler = Callable[
-    ..., ToolHandlerResult | Awaitable[ToolHandlerResult]
-]
+ToolHandler = Callable[..., ToolHandlerResult | Awaitable[ToolHandlerResult]]
+ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
 ToolStream = Literal["stdout", "stderr"]
 
-
+def _bind_handler(handler: ToolHandler, registry: ToolRegistry) -> ToolHandler:
+    return partial(handler, registry)
 def _discover_tool_modules() -> list[str]:
     package = importlib.import_module(__package__)
     modules = (
@@ -292,6 +291,7 @@ class ToolDefinition:
     description: str
     parameters: dict[str, Any]
     handler: ToolHandler
+    handler_factory: ToolHandlerFactory | None = None
     parallel_safe: bool = False
     validate_arguments: bool = True
     requires_approval: bool = True
@@ -304,16 +304,13 @@ class ToolDefinition:
         }
 
 
-def _copy_definition(definition: ToolDefinition) -> ToolDefinition:
-    return ToolDefinition(
-        name=definition.name,
-        description=definition.description,
-        parameters=copy.deepcopy(definition.parameters),
-        handler=definition.handler,
-        parallel_safe=definition.parallel_safe,
-        validate_arguments=definition.validate_arguments,
-        requires_approval=definition.requires_approval,
+def _copy_definition(definition: ToolDefinition, registry: ToolRegistry | None = None) -> ToolDefinition:
+    handler = (
+        definition.handler_factory(registry)
+        if registry is not None and definition.handler_factory is not None
+        else definition.handler
     )
+    return replace(definition, parameters=copy.deepcopy(definition.parameters), handler=handler)
 
 
 class ToolRegistry:
@@ -411,6 +408,7 @@ class ToolRegistry:
         parallel_safe: bool = False,
         validate_arguments: bool = True,
         requires_approval: bool = True,
+        handler_factory: ToolHandlerFactory | None = None,
     ) -> ToolDefinition:
         if type(name) is not str or not name:
             raise ValueError("tool name must be a nonempty string")
@@ -432,6 +430,7 @@ class ToolRegistry:
             description=description,
             parameters=normalized,
             handler=handler,
+            handler_factory=handler_factory,
             parallel_safe=parallel_safe,
             validate_arguments=validate_arguments,
             requires_approval=requires_approval,
@@ -440,6 +439,9 @@ class ToolRegistry:
         return _copy_definition(definition)
 
     register_tool = register
+
+    def register_session_tool(self, name: str, handler: ToolHandler, **kwargs: Any) -> ToolDefinition:
+        return self.register(name, _bind_handler(handler, self), handler_factory=partial(_bind_handler, handler), **kwargs)
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
@@ -468,7 +470,7 @@ class ToolRegistry:
         clone._cwd_fd = os.dup(self._cwd_fd)
         clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._tools = {
-            name: _copy_definition(definition)
+            name: _copy_definition(definition, clone)
             for name, definition in self._tools.items()
             if name not in exclude_names
         }

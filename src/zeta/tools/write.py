@@ -113,9 +113,9 @@ async def _write(
 
 
 def register(registry: ToolRegistry) -> None:
-    registry.register(
+    registry.register_session_tool(
         "write",
-        lambda arguments, abort_signal: _write(registry, arguments, abort_signal),
+        _write,
         description="Write UTF-8 text to a file. Relative paths use the session cwd.",
         parameters={
             "type": "object",
