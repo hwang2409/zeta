@@ -69,7 +69,6 @@ from .models import MODEL_CATALOGS, validate_model_name
 from .models import load_model_catalog as _load_model_catalog
 from .render import (
     format_status,
-    render_event,
     render_markdown,
     render_thought,
     render_thought_live,
@@ -82,7 +81,6 @@ from .theme import (
     COMPOSER_BORDER,
     COMPOSER_FOCUS,
     DIM,
-    ERROR,
     RICH_THEME,
 )
 from .todo import TodoWidget

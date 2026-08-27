@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import httpx
 
 import zeta.providers.anthropic as anthropic_module
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -18,10 +19,11 @@ from zeta.prompts import load_identity
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 from zeta.types import (
     CompletionBackend,
+    ErrorInfo,
     Message,
     MessageRole,
-    StreamEventType,
     StreamEvent,
+    StreamEventType,
     TextContent,
     ToolCall,
     ToolResult,
@@ -1283,6 +1285,7 @@ async def test_provider_error_event_persists_partial_state_and_ends_turn(
         StreamEventType.ERROR,
         StreamEventType.AGENT_END,
     ]
+    assert StreamEventType.TURN_END not in [event.type for event in events]
     assert [message.content[0].text for message in store.messages()[1:]] == [
         "partial"
     ]
@@ -1309,3 +1312,35 @@ async def test_failed_child_returns_error_and_sibling_survives(tmp_path: Path) -
     assert "child connection dropped" in results[0].content
     assert results[1].content == "sibling complete"
     assert store.messages()[-1].content[0].text == "parent survived"
+
+
+@pytest.mark.asyncio
+async def test_child_setup_failure_does_not_cancel_parallel_sibling(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(ParallelChildFailureBackend(), store)
+    original_ensure = AgentLoop._ensure_mcp_servers
+    child_ids: list[str] = []
+
+    async def fail_first_child(self: AgentLoop) -> None:
+        child_ids.append(self.store.session_id)
+        if self.store.session_id == "1":
+            raise httpx.ConnectError(
+                "child setup disconnected",
+                request=httpx.Request("GET", "https://test.invalid"),
+            )
+        await original_ensure(self)
+
+    with patch.object(AgentLoop, "_ensure_mcp_servers", fail_first_child):
+        await collect(loop.run_turn("delegate"))
+
+    assert "1" in child_ids
+    results = [
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    ]
+    assert results[0] is not None and results[0].is_error
+    assert "child setup disconnected" in results[0].content
+    assert results[1] is not None and results[1].content == "sibling complete"
