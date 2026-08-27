@@ -17,8 +17,6 @@ from zeta.tools.agent import ChildApprovalPolicy
 from zeta.tools.agent_presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
-    agent_type_description,
-    agent_type_names,
 )
 from zeta.types import (
     CompletionBackend,
@@ -261,7 +259,6 @@ def test_agent_schema_uses_preset_registry(
     custom = replace(
         AGENT_PRESETS["explore"],
         name="custom",  # type: ignore[arg-type]
-        selection_guidance="a custom subset, up to 1 turn",
     )
     monkeypatch.setitem(AGENT_PRESETS, "explore", custom)
     registry = ToolRegistry(tmp_path)
@@ -270,9 +267,14 @@ def test_agent_schema_uses_preset_registry(
 
     agent_schema = next(schema for schema in registry.schemas if schema["name"] == "agent")
     agent_type_schema = agent_schema["parameters"]["properties"]["agent_type"]
-    assert agent_type_schema["enum"] == agent_type_names()
-    assert agent_type_schema["description"] == agent_type_description()
-    assert custom.selection_guidance in agent_type_schema["description"]
+    assert agent_type_schema["enum"] == [
+        preset.name for preset in AGENT_PRESETS.values()
+    ]
+    expected_description = "Choose one of: " + "; ".join(
+        f"{preset.name}: {preset.selection_guidance}"
+        for preset in AGENT_PRESETS.values()
+    ) + "."
+    assert agent_type_schema["description"] == expected_description
 
 
 @pytest.mark.asyncio
