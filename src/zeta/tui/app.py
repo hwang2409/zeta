@@ -190,7 +190,6 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         self._pending_attachment_tokens: dict[str, Path] = {}
         self._next_image_token = 1
         self._composer_insertions: list[str] = []
-        self._replay_rendered = False
         self._exit_requested = False
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
@@ -985,7 +984,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         if isinstance(session, FullScreenPromptSession):
             self._install_full_screen_layout(session)
         self.loop.session_start()
-        self._replay_attachment_messages()
+        self._rebuild_transcript()
         self._present_pending_approvals()
         prompt_task: asyncio.Task[str | None] | None = None
         try:

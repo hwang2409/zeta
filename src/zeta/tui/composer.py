@@ -321,20 +321,6 @@ class ComposerAttachmentMixin:
                 )
         self._print_unit(rendered)
 
-    def _replay_attachment_messages(self) -> None:
-        if self._replay_rendered:
-            return
-        self._replay_rendered = True
-        for entry in self.loop.store.replay():
-            if entry.type != "message":
-                continue
-            message = Message.from_dict(entry.data["message"])
-            if message.role is MessageRole.USER and any(
-                isinstance(block, (ImageContent, TextContent)) and block.path is not None
-                for block in message.content
-            ):
-                self._print_user(message)
-
     def _start_queued_turn(self) -> None:
         if not self._queued:
             return
