@@ -27,6 +27,7 @@ from zeta.types import (
     ToolResult,
     ToolSchema,
     ThinkingContent,
+    ToolUseContent,
 )
 
 
@@ -45,6 +46,64 @@ def anthropic_request_bytes(
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
     return [event async for event in events]
+
+
+class ParallelChildFailureBackend(CompletionBackend):
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        prompt = next(
+            (
+                block.text
+                for block in reversed(messages[-1].content)
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        if prompt == "die":
+            yield StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=TextContent("child partial"),
+            )
+            raise ConnectionError("child connection dropped")
+        if prompt == "live":
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(
+                    MessageRole.ASSISTANT,
+                    [TextContent("sibling complete")],
+                ),
+            )
+            return
+        if any(message.tool_result is not None for message in messages):
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(
+                    MessageRole.ASSISTANT,
+                    [TextContent("parent survived")],
+                ),
+            )
+            return
+        calls = [
+            ToolCall(
+                "child-dies",
+                "agent",
+                {"prompt": "die", "description": "failing child"},
+            ),
+            ToolCall(
+                "child-lives",
+                "agent",
+                {"prompt": "live", "description": "healthy sibling"},
+            ),
+        ]
+        message = Message(
+            MessageRole.ASSISTANT,
+            [TextContent("delegating"), *(ToolUseContent(call) for call in calls)],
+        )
+        yield StreamEvent(StreamEventType.MESSAGE_END, message=message)
 
 
 @pytest.mark.asyncio
@@ -1195,3 +1254,58 @@ async def test_backend_error_is_typed_and_user_state_is_persisted(tmp_path: Path
     assert events[-2].error is not None
     assert events[-2].error.code == "backend_error"
     assert len(store.messages()) == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_error_event_persists_partial_state_and_ends_turn(
+    tmp_path: Path,
+) -> None:
+    class ErrorEventBackend(CompletionBackend):
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            yield StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=TextContent("partial"),
+            )
+            yield StreamEvent(
+                StreamEventType.ERROR,
+                error=ErrorInfo("stream_error", "provider disconnected"),
+            )
+
+    store = ConversationStore(tmp_path)
+    events = await collect(AgentLoop(ErrorEventBackend(), store).run_turn("start"))
+
+    assert [event.type for event in events][-2:] == [
+        StreamEventType.ERROR,
+        StreamEventType.AGENT_END,
+    ]
+    assert [message.content[0].text for message in store.messages()[1:]] == [
+        "partial"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_child_returns_error_and_sibling_survives(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    events = await collect(
+        AgentLoop(ParallelChildFailureBackend(), store).run_turn("delegate")
+    )
+
+    assert events[-1].type is StreamEventType.AGENT_END
+    results = [
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    ]
+    assert [result.tool_call_id for result in results] == [
+        "child-dies",
+        "child-lives",
+    ]
+    assert results[0].is_error
+    assert "child connection dropped" in results[0].content
+    assert results[1].content == "sibling complete"
+    assert store.messages()[-1].content[0].text == "parent survived"

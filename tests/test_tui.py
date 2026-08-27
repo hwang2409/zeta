@@ -332,6 +332,7 @@ class AbortThenSuccessBackend(CompletionBackend):
 class ErrorThenSuccessBackend(CompletionBackend):
     def __init__(self) -> None:
         self.calls = 0
+        self.request_messages: list[list[Message]] = []
 
     async def complete(
         self,
@@ -340,6 +341,7 @@ class ErrorThenSuccessBackend(CompletionBackend):
     ) -> AsyncIterator[StreamEvent]:
         call = self.calls
         self.calls += 1
+        self.request_messages.append(list(messages))
         yield StreamEvent(StreamEventType.MESSAGE_START)
         if call == 0:
             yield StreamEvent(
@@ -356,6 +358,52 @@ class ErrorThenSuccessBackend(CompletionBackend):
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, [TextContent(response)]),
         )
+
+
+class AlwaysErrorBackend(CompletionBackend):
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        raise TimeoutError("provider timeout")
+
+
+class WaitingFailureBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("partial response"),
+        )
+        self.started.set()
+        await self.release.wait()
+        raise ConnectionError("network disconnected")
+
+
+class RaisedErrorBackend(CompletionBackend):
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        raise self.error
+        yield
 
 
 class GhostPreviewBackend(CompletionBackend):
@@ -1388,7 +1436,166 @@ def test_render_event_error_is_visible() -> None:
     )
 
     assert rendered is not None
-    assert rendered.plain == "[error] provider stopped"
+    assert isinstance(rendered, Panel)
+    assert "provider failure · backend_error" in renderable_plain(rendered)
+    assert "reason: provider stopped" in renderable_plain(rendered)
+
+
+def test_render_error_card_bounds_and_labels_json_payload() -> None:
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.ERROR,
+            error=ErrorInfo("stream_error", '{"message":"' + "x" * 1_000 + '"}'),
+        )
+    )
+
+    assert isinstance(rendered, Panel)
+    plain = renderable_plain(rendered)
+    assert "provider failure · stream_error" in plain
+    assert "payload · json" in plain
+    assert len(plain) < 600
+    assert "retry: ctrl+r" in plain
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_screen", [False, True])
+async def test_provider_failure_card_is_visible_in_both_modes(
+    tmp_path: Path, full_screen: bool
+) -> None:
+    app = TUIApp(
+        AgentLoop(ErrorBackend(), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._active_session = app._make_session() if full_screen else None
+    rendered: list[object] = []
+    app._print = rendered.append
+
+    await app._consume_turn("prompt")
+
+    plain = "\n".join(renderable_plain(item) for item in rendered)
+    assert "| name | value |" in plain
+    assert "provider failure · backend_error" in plain
+    assert "reason: boom" in plain
+    assert "retry: ctrl+r" in plain
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError(
+            "connect failed", request=httpx.Request("GET", "https://test.invalid")
+        ),
+        httpx.ReadError(
+            "read failed", request=httpx.Request("GET", "https://test.invalid")
+        ),
+        TimeoutError("deadline exceeded"),
+        ValueError("malformed provider event"),
+    ],
+    ids=["connect", "read", "timeout", "malformed"],
+)
+async def test_transport_failure_shapes_render_error_cards(
+    tmp_path: Path, error: Exception
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            RaisedErrorBackend(error),
+            ConversationStore(tmp_path / "sessions"),
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    rendered: list[object] = []
+    app._print = rendered.append
+
+    await app._consume_turn("prompt")
+
+    plain = "\n".join(renderable_plain(item) for item in rendered)
+    assert "provider failure · " in plain
+    assert str(error) in plain
+
+
+@pytest.mark.asyncio
+async def test_retry_reuses_user_message_and_keeps_partial_output(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    backend = ErrorThenSuccessBackend()
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._active_session = None
+    app._print_user("prompt")
+
+    await app._consume_turn("prompt")
+    assert app.retry_available()
+    app.retry_failed_turn()
+    assert app._active_task is not None
+    await app._active_task
+
+    messages = store.messages()
+    assert [message.role for message in messages] == [
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.ASSISTANT,
+    ]
+    assert sum(message.role is MessageRole.USER for message in messages) == 1
+    assert [message.content[0].text for message in messages[1:]] == [
+        "partial response",
+        "second response",
+    ]
+    assert sum(
+        message.role is MessageRole.USER for message in backend.request_messages[1]
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_failure_renders_a_fresh_error_card(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(
+            AlwaysErrorBackend(),
+            ConversationStore(tmp_path / "sessions"),
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._active_session = None
+
+    await app._consume_turn("prompt")
+    app.retry_failed_turn()
+    assert app._active_task is not None
+    await app._active_task
+
+    rendered = Text.from_ansi(app.console.file.getvalue()).plain
+    assert rendered.count("provider failure · timeout") == 2
+
+
+@pytest.mark.asyncio
+async def test_draft_survives_provider_failure(tmp_path: Path) -> None:
+    backend = WaitingFailureBackend()
+    app = TUIApp(
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    session = app._make_session()
+    app._active_session = session
+    task = asyncio.create_task(app._consume_turn("prompt"))
+    app._active_task = task
+    await backend.started.wait()
+    session.app.current_buffer.insert_text("draft while streaming")
+    backend.release.set()
+    await task
+
+    assert session.app.current_buffer.text == "draft while streaming"
 
 
 def test_tool_render_mode_keeps_receipt_rule_in_one_place() -> None:
@@ -2466,7 +2673,7 @@ async def test_error_flushes_assistant_before_error(tmp_path: Path) -> None:
     error_index = next(
         index
         for index, item in enumerate(rendered)
-        if getattr(item, "plain", None) == "[error] boom"
+        if "provider failure · backend_error" in renderable_plain(item)
     )
     assert line_index < error_index
 
@@ -2504,7 +2711,7 @@ async def test_verbose_error_flushes_before_raw_error(tmp_path: Path) -> None:
     pretty_error_index = next(
         index
         for index, item in enumerate(rendered)
-        if getattr(item, "plain", None) == "[error] boom"
+        if "provider failure · backend_error" in renderable_plain(item)
     )
     assert line_index < raw_error_index < pretty_error_index
 
@@ -3590,7 +3797,7 @@ async def test_failed_turn_does_not_reorder_the_next_reply(
     markers = [
         rendered.index("▌ first prompt"),
         rendered.index("partial response"),
-        rendered.index("[error] boom"),
+        rendered.index("provider failure · backend_error"),
         rendered.index("▌ second prompt"),
         rendered.index("second response"),
     ]

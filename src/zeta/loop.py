@@ -9,6 +9,8 @@ from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequenc
 from pathlib import Path
 from typing import Any, TypeVar
 
+import httpx
+
 from .core.abort import AbortSignal as ToolAbortSignal
 from .core.approval import ApprovalPolicy
 from .core.context import ContextAssembler
@@ -44,6 +46,7 @@ from .types import (
 
 
 TaskResult = TypeVar("TaskResult")
+MAX_ERROR_MESSAGE = 400
 
 
 async def _close_completion(
@@ -64,6 +67,35 @@ async def _close_completion(
 def _task_is_cancelling() -> bool:
     task = asyncio.current_task()
     return task is not None and task.cancelling() > 0
+
+
+def _error_info(error: BaseException) -> ErrorInfo:
+    """Normalize provider and transport failures for the transcript."""
+
+    code = getattr(error, "code", None)
+    if type(code) is not str or not code:
+        if isinstance(error, TimeoutError):
+            code = "timeout"
+        elif isinstance(error, httpx.TransportError):
+            code = "transport_error"
+        else:
+            cause = error.__cause__
+            while cause is not None:
+                if isinstance(cause, httpx.TransportError):
+                    code = "transport_error"
+                    break
+                cause = cause.__cause__
+            else:
+                code = "backend_error"
+    try:
+        message = str(error).strip()
+    except Exception:
+        message = ""
+    if not message:
+        message = type(error).__name__
+    if len(message) > MAX_ERROR_MESSAGE:
+        message = f"{message[:MAX_ERROR_MESSAGE - 3]}..."
+    return ErrorInfo(code, message)
 
 
 def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
@@ -390,39 +422,44 @@ class AgentLoop:
             last_assistant_text = ""
             cap_hit = False
             error_message: str | None = None
-            async for event in child_loop.run_turn(prompt):
-                if event.type is StreamEventType.TURN_START:
-                    publish(f"turn {child_turns() + 1}: thinking")
-                elif event.type is StreamEventType.TOOL_APPROVAL_START:
-                    name = event.tool_call.name if event.tool_call is not None else "tool"
-                    publish(f"turn {child_turns() + 1}: approval pending: {name}")
-                    if lifecycle_sink is not None:
-                        lifecycle_sink("approval_start", event.tool_call)
-                elif event.type is StreamEventType.TOOL_APPROVAL_END:
-                    if lifecycle_sink is not None:
-                        lifecycle_sink("approval_end", event.tool_call)
-                elif event.type is StreamEventType.TOOL_EXECUTION_START:
-                    name = event.tool_call.name if event.tool_call is not None else "tool"
-                    arguments = (
-                        event.tool_call.arguments
-                        if event.tool_call is not None
-                        else {}
-                    )
-                    summary = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
-                    publish(f"turn {child_turns() + 1}: tool: {name} {summary}")
-                elif event.type is StreamEventType.TURN_END:
-                    turns = child_turns() + 1
-                    self._agent_child_turns[tool_call.id] = turns
-                    self.store.update_agent_child_turns(tool_call.id, turns)
-                    if event.message is not None:
-                        last_assistant_text = _assistant_text_snippet(event.message)
-                    if event.data.get("tool_calls") == 0 and event.message is not None:
-                        final_message = event.message
-                elif event.type is StreamEventType.ERROR and event.error is not None:
-                    if event.error.code == "max_turns":
-                        cap_hit = True
-                    else:
-                        error_message = event.error.message
+            try:
+                async for event in child_loop.run_turn(prompt):
+                    if event.type is StreamEventType.TURN_START:
+                        publish(f"turn {child_turns() + 1}: thinking")
+                    elif event.type is StreamEventType.TOOL_APPROVAL_START:
+                        name = event.tool_call.name if event.tool_call is not None else "tool"
+                        publish(f"turn {child_turns() + 1}: approval pending: {name}")
+                        if lifecycle_sink is not None:
+                            lifecycle_sink("approval_start", event.tool_call)
+                    elif event.type is StreamEventType.TOOL_APPROVAL_END:
+                        if lifecycle_sink is not None:
+                            lifecycle_sink("approval_end", event.tool_call)
+                    elif event.type is StreamEventType.TOOL_EXECUTION_START:
+                        name = event.tool_call.name if event.tool_call is not None else "tool"
+                        arguments = (
+                            event.tool_call.arguments
+                            if event.tool_call is not None
+                            else {}
+                        )
+                        summary = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
+                        publish(f"turn {child_turns() + 1}: tool: {name} {summary}")
+                    elif event.type is StreamEventType.TURN_END:
+                        turns = child_turns() + 1
+                        self._agent_child_turns[tool_call.id] = turns
+                        self.store.update_agent_child_turns(tool_call.id, turns)
+                        if event.message is not None:
+                            last_assistant_text = _assistant_text_snippet(event.message)
+                        if event.data.get("tool_calls") == 0 and event.message is not None:
+                            final_message = event.message
+                    elif event.type is StreamEventType.ERROR and event.error is not None:
+                        if event.error.code == "max_turns":
+                            cap_hit = True
+                        else:
+                            error_message = event.error.message
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error_message = _error_info(exc).message
             if cap_hit:
                 return child_result(
                     f"agent error: child reached the {CHILD_TURN_CAP}-turn cap; "
@@ -497,8 +534,13 @@ class AgentLoop:
         user_text: str,
         *,
         user_message: Message | None = None,
+        persist_user_message: bool = True,
     ) -> AsyncIterator[StreamEvent]:
-        return self._run_turn(user_text, user_message=user_message)
+        return self._run_turn(
+            user_text,
+            user_message=user_message,
+            persist_user_message=persist_user_message,
+        )
 
     async def close(self) -> None:
         """Close session-owned transports and background processes."""
@@ -628,6 +670,7 @@ class AgentLoop:
         user_text: str,
         *,
         user_message: Message | None = None,
+        persist_user_message: bool = True,
     ) -> AsyncIterator[StreamEvent]:
         if self.hooks is not None:
             self.hooks.user_prompt_submit(user_text)
@@ -636,7 +679,10 @@ class AgentLoop:
             user_message = Message(MessageRole.USER, [TextContent(user_text)])
         elif user_message.role is not MessageRole.USER:
             raise ValueError("user_message must have the user role")
-        self.store.append_message(user_message)
+        if persist_user_message:
+            self.store.append_message(user_message)
+        elif user_message not in self.store.messages():
+            raise ValueError("cannot reuse a user message that is not persisted")
         yield StreamEvent(StreamEventType.AGENT_START)
 
         for turn_number in range(1, self.max_turns + 1):
@@ -649,6 +695,7 @@ class AgentLoop:
             assistant_message: Message | None = None
             completion: AsyncIterator[StreamEvent] | None = None
             completion_succeeded = False
+            provider_error: ErrorInfo | None = None
             if self.context_assembler.needs_compaction():
                 yield StreamEvent(
                     StreamEventType.COMPACTION_START,
@@ -670,6 +717,21 @@ class AgentLoop:
                 )
                 async for event in completion:
                     self.context_assembler.observe_event(event)
+                    if event.type is StreamEventType.ERROR:
+                        provider_error = (
+                            event.error
+                            if isinstance(event.error, ErrorInfo)
+                            else ErrorInfo(
+                                "backend_error",
+                                "provider emitted an invalid error event",
+                            )
+                        )
+                        yield StreamEvent(
+                            StreamEventType.ERROR,
+                            error=provider_error,
+                            data=dict(event.data),
+                        )
+                        break
                     if event.type is StreamEventType.MESSAGE_UPDATE:
                         if event.content is not None:
                             partial_blocks.append(event.content)
@@ -698,7 +760,7 @@ class AgentLoop:
                 )
                 yield StreamEvent(
                     StreamEventType.ERROR,
-                    error=ErrorInfo("backend_error", str(exc)),
+                    error=_error_info(exc),
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
@@ -712,7 +774,13 @@ class AgentLoop:
                 )
                 yield StreamEvent(
                     StreamEventType.ERROR,
-                    error=ErrorInfo("backend_error", str(cleanup_error)),
+                    error=_error_info(cleanup_error),
+                )
+                yield StreamEvent(StreamEventType.AGENT_END)
+                return
+            if provider_error is not None:
+                self._persist_partial_with_cancelled_tools(
+                    partial_blocks, assistant_message
                 )
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
@@ -839,8 +907,18 @@ class AgentLoop:
                                 if task is update_task:
                                     continue
                                 index, tool_call = parallel_tasks.pop(task)
+                                try:
+                                    task_result = task.result()
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception as exc:
+                                    task_result = ToolResult(
+                                        tool_call.id,
+                                        str(exc),
+                                        is_error=True,
+                                    )
                                 parallel_results[index] = _validated_tool_result(
-                                    task.result(),
+                                    task_result,
                                     tool_call.id,
                                 )
                         while not stream_updates.empty():

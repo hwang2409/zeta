@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import platform
 import re
 import shutil
@@ -28,13 +29,17 @@ from prompt_toolkit.keys import Keys
 from rich.text import Text
 
 from ..types import (
+    ErrorInfo,
     ImageContent,
     Message,
     MessageRole,
+    StreamEvent,
+    StreamEventType,
     TextContent,
     image_signature_matches,
 )
-from .theme import BODY, USER_ROLE
+from .render import render_event
+from .theme import BODY, CHROME, DIM, ERROR, USER_ROLE
 
 SHIFT_ENTER_SEQUENCES = frozenset(
     {
@@ -45,6 +50,143 @@ SHIFT_ENTER_SEQUENCES = frozenset(
 )
 ATTACHMENT_MAX_TEXT_BYTES = 200 * 1024
 ATTACHMENT_TOKEN_RE = re.compile(r'(?<!\S)@(?:"([^"\n]+)"|([^\s]+))')
+SPINNER_INTERVAL = 0.2
+
+
+class TurnConsumerMixin:
+    """Consume loop events and preserve failed-turn recovery state."""
+
+    async def _pulse_spinner(self) -> None:
+        while True:
+            try:
+                await asyncio.wait_for(
+                    self._spinner_reset.wait(), timeout=SPINNER_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                if self._spinner_active:
+                    self._spinner_frame += 1
+                    if self._presenter.has_active_agent:
+                        self._presenter.refresh_active_agents()
+                    self._invalidate_prompt()
+            else:
+                self._spinner_reset.clear()
+
+    async def _consume_turn(
+        self,
+        user_text: str,
+        *,
+        user_message: Message | None = None,
+        persist_user_message: bool = True,
+    ) -> None:
+        self._abort_requested = False
+        self._turn_had_visible_output = False
+        self._loop_state = "streaming"
+        self._streaming = True
+        self._spinner_active = True
+        spinner_task = asyncio.create_task(self._pulse_spinner())
+        retry_message = user_message or Message(
+            role=MessageRole.USER,
+            content=[TextContent(user_text)],
+        )
+        turn_failed = False
+        try:
+            async for event in self.loop.run_turn(
+                user_text,
+                user_message=user_message,
+                persist_user_message=persist_user_message,
+            ):
+                self._update_usage(event)
+                self._prepare_stream_event(event)
+                stop_after_tool = self._handle_tool_event(event)
+                if self.verbose:
+                    self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style=DIM))
+                if event.type is StreamEventType.MESSAGE_UPDATE:
+                    self._consume_text(event)
+                    self._invalidate_prompt()
+                    continue
+                if event.type is StreamEventType.TURN_START:
+                    self._spinner_frame = 0
+                    self._spinner_reset.set()
+                    self._streaming = True
+                    self._compaction_shown = False
+                elif event.type is StreamEventType.COMPACTION_START:
+                    self._compaction_shown = True
+                    self._loop_state = "compacting"
+                elif event.type is StreamEventType.COMPACTION_END:
+                    self._loop_state = "streaming"
+                elif event.type is StreamEventType.MESSAGE_END:
+                    self._finish_message(event)
+                    self._streaming = False
+                elif event.type is StreamEventType.AGENT_END:
+                    self._reset_stream_state()
+                    self._loop_state = "idle"
+                    if not turn_failed:
+                        self._failed_turn = None
+                    if not self._turn_had_visible_output:
+                        self._print_unit(Text("no response", style=CHROME))
+                        self._turn_had_visible_output = True
+                if event.type not in {
+                    StreamEventType.TOOL_APPROVAL_START,
+                    StreamEventType.TOOL_APPROVAL_END,
+                    StreamEventType.TOOL_EXECUTION_UPDATE,
+                    StreamEventType.TOOL_EXECUTION_END,
+                    StreamEventType.TOOL_EXECUTION_START,
+                }:
+                    rendered = render_event(event)
+                    if rendered is not None:
+                        self._turn_had_visible_output |= (
+                            event.type is StreamEventType.MESSAGE_END
+                            and bool(event.data.get("truncated"))
+                        )
+                        if event.type in {
+                            StreamEventType.AGENT_END,
+                            StreamEventType.ERROR,
+                        }:
+                            self._print_unit(rendered)
+                            if event.type is StreamEventType.ERROR:
+                                turn_failed = True
+                                self._failed_turn = (user_text, retry_message)
+                                self._turn_had_visible_output = True
+                        else:
+                            self._print(rendered)
+                self._invalidate_prompt()
+                if event.type is StreamEventType.TOOL_EXECUTION_END and stop_after_tool:
+                    break
+        except asyncio.CancelledError:
+            self._flush_stream_kind(preserve_inline=True)
+            self._presenter.reset_assistant_unit()
+            self._reset_stream_state()
+            self._loop_state = "interrupted"
+            self._print_unit(Text("[aborted]", style=ERROR))
+            raise
+        except Exception as exc:
+            self._flush_stream_kind(preserve_inline=True)
+            self._presenter.reset_assistant_unit()
+            self._reset_stream_state()
+            self._loop_state = "idle"
+            self._failed_turn = (user_text, retry_message)
+            try:
+                message = str(exc).strip() or type(exc).__name__
+            except Exception:
+                message = "unexpected ui error"
+            self._print_unit(
+                render_event(
+                    StreamEvent(
+                        StreamEventType.ERROR,
+                        error=ErrorInfo("ui_error", message),
+                    )
+                )
+            )
+        finally:
+            self._presenter.clear_active_tool_calls()
+            self._discard_tool_region()
+            self._presenter.reset_assistant_message()
+            self._abort_requested = False
+            self._streaming = False
+            self._spinner_active = False
+            spinner_task.cancel()
+            await asyncio.gather(spinner_task, return_exceptions=True)
+            self._invalidate_prompt()
 
 
 class AttachmentError(ValueError):
@@ -339,9 +481,14 @@ class ComposerAttachmentMixin:
         user_text: str,
         *,
         user_message: Message | None = None,
+        persist_user_message: bool = True,
     ) -> None:
         self._active_task = asyncio.create_task(
-            self._consume_turn(user_text, user_message=user_message)
+            self._consume_turn(
+                user_text,
+                user_message=user_message,
+                persist_user_message=persist_user_message,
+            )
         )
 
 
@@ -414,6 +561,8 @@ def build_key_bindings(
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_toggle_agent: Callable[[], None] | None = None,
+    on_retry: Callable[[], None] | None = None,
+    retry_available: Callable[[], bool] | None = None,
 ) -> KeyBindings:
     """Build the small key map used by the full-screen composer."""
 
@@ -433,6 +582,13 @@ def build_key_bindings(
     @Condition
     def full_screen_mode() -> bool:
         return get_app().full_screen
+
+    @Condition
+    def retry_ready() -> bool:
+        return (
+            on_retry is not None
+            and (retry_available is None or retry_available())
+        )
 
     def insert_newline(event: KeyPressEvent) -> None:
         event.current_buffer.insert_text("\n")
@@ -461,6 +617,13 @@ def build_key_bindings(
     @bindings.add("c-j")
     def newline(event: KeyPressEvent) -> None:
         insert_newline(event)
+
+    if on_retry is not None:
+
+        @bindings.add("c-r", filter=retry_ready, eager=True)
+        def retry(event: KeyPressEvent) -> None:
+            del event
+            on_retry()
 
     if on_paste is not None:
 
