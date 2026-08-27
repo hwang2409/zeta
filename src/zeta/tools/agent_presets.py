@@ -62,7 +62,16 @@ def get_agent_preset(agent_type: object) -> AgentPreset | None:
 
     if type(agent_type) is not str:
         return None
-    return AGENT_PRESETS.get(agent_type)
+    return next(
+        (preset for preset in AGENT_PRESETS.values() if preset.name == agent_type),
+        None,
+    )
+
+
+def agent_type_names() -> list[str]:
+    """Return the current names from the preset registry."""
+
+    return [preset.name for preset in AGENT_PRESETS.values()]
 
 
 def agent_type_description() -> str:

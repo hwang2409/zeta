@@ -9,10 +9,10 @@ from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..types import Message, MessageRole, ToolCall, ToolUseContent
 from .agent_presets import (
-    AGENT_PRESETS,
     AgentType,
     GENERAL_PRESET,
     agent_type_description,
+    agent_type_names,
 )
 from .registry import (
     AbortSignal,
@@ -198,7 +198,7 @@ def register(registry: ToolRegistry) -> None:
                 "description": {"type": "string"},
                 "agent_type": {
                     "type": "string",
-                    "enum": list(AGENT_PRESETS),
+                    "enum": agent_type_names(),
                     "description": agent_type_description(),
                 },
             },

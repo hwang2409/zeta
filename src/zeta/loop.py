@@ -19,8 +19,8 @@ from .prompts import load_identity
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from .tools.agent import ChildApprovalPolicy, agent_result
 from .tools.agent_presets import (
-    AGENT_PRESETS,
     GENERAL_PRESET,
+    agent_type_names,
     compose_system_prompt,
     get_agent_preset,
 )
@@ -344,7 +344,7 @@ class AgentLoop:
             return self._child_result_payload(
                 tool_call.id,
                 "agent error: unknown agent_type "
-                f"{agent_type!r}; expected one of: {', '.join(AGENT_PRESETS)}",
+                f"{agent_type!r}; expected one of: {', '.join(agent_type_names())}",
                 error=True,
             )
         await self._ensure_mcp_servers()

@@ -18,6 +18,7 @@ from zeta.tools.agent_presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
     agent_type_description,
+    agent_type_names,
 )
 from zeta.types import (
     CompletionBackend,
@@ -258,18 +259,18 @@ def test_agent_schema_uses_preset_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     custom = replace(
-        GENERAL_PRESET,
+        AGENT_PRESETS["explore"],
         name="custom",  # type: ignore[arg-type]
         selection_guidance="a custom subset, up to 1 turn",
     )
-    monkeypatch.setitem(AGENT_PRESETS, custom.name, custom)
+    monkeypatch.setitem(AGENT_PRESETS, "explore", custom)
     registry = ToolRegistry(tmp_path)
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     AgentLoop(FakeBackend([]), store, registry=registry)
 
     agent_schema = next(schema for schema in registry.schemas if schema["name"] == "agent")
     agent_type_schema = agent_schema["parameters"]["properties"]["agent_type"]
-    assert agent_type_schema["enum"] == list(AGENT_PRESETS)
+    assert agent_type_schema["enum"] == agent_type_names()
     assert agent_type_schema["description"] == agent_type_description()
     assert custom.selection_guidance in agent_type_schema["description"]
 
