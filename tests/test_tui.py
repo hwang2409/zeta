@@ -70,6 +70,7 @@ from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
 from zeta.types import (
     CompletionBackend,
     ErrorInfo,
+    ImageContent,
     Message,
     MessageRole,
     RedactedThinkingContent,
@@ -3358,63 +3359,177 @@ async def test_run_keeps_empty_resumed_transcript_blank(
     assert "[error]" not in output.getvalue()
 
 
-@pytest.mark.asyncio
-async def test_resume_rebuild_matches_the_shared_renderer(tmp_path: Path) -> None:
+def _representative_fork_store(tmp_path: Path) -> ConversationStore:
     store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("user")]))
-    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("assistant")]))
-    output = StringIO()
-    app = TUIApp(
+    store.append_message(
+        Message(
+            MessageRole.USER,
+            [
+                TextContent("inspect notes.txt and [Image #1]"),
+                TextContent(
+                    "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
+                    "/tmp/notes.txt",
+                    12,
+                ),
+                ImageContent(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                    "image/png",
+                    "/tmp/image.png",
+                    68,
+                ),
+            ],
+        )
+    )
+    read_call = ToolCall("resume-read", "read", {"path": "README.md"})
+    agent_call = ToolCall(
+        "resume-agent",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [
+                TextContent("kept reply"),
+                ToolUseContent(read_call),
+                ToolUseContent(agent_call),
+            ],
+        )
+    )
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult(read_call.id, "stdout:\nread output"),
+        )
+    )
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child result")]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult(
+                agent_call.id,
+                "done",
+                structured_content={
+                    "turns_used": 2,
+                    "child_session_path": str(child.session_dir),
+                },
+            ),
+        )
+    )
+    store.append_compaction_marker("provider summary", 1, 4)
+    store._append_row("warning", {"message": "filtered warning"})
+    checkpoint = store.append_checkpoint("base")
+    store.append_message(Message(MessageRole.USER, [TextContent("abandoned branch")]))
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("abandoned reply")])
+    )
+    store.append_fork(str(checkpoint.seq))
+    store.append_message(Message(MessageRole.USER, [TextContent("new branch")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply")]))
+    store.append_checkpoint("saved")
+    return store
+
+
+def _display_session(
+    app: TUIApp, pipe: PipeInput, full_screen: bool
+) -> PromptSession[str]:
+    if not full_screen:
+        return app_session(app, pipe)
+    return FullScreenPromptSession(
+        input=pipe,
+        output=DummyOutput(),
+        key_bindings=build_key_bindings(
+            on_interrupt=app.abort_active,
+            on_exit=app.request_exit,
+        ),
+        multiline=True,
+    )
+
+
+def _rendered_display(app: TUIApp, output: StringIO, full_screen: bool) -> str:
+    return app._transcript.render(120) if full_screen else output.getvalue()
+
+
+def _test_tui_app(store: ConversationStore, output: StringIO) -> TUIApp:
+    return TUIApp(
         AgentLoop(FakeBackend([]), store),
         provider="fake",
         model="offline",
-        console=Console(file=output, force_terminal=True, color_system="truecolor"),
+        console=Console(
+            file=output,
+            force_terminal=True,
+            color_system="truecolor",
+        ),
     )
 
+
+async def _run_reopened_session(
+    store: ConversationStore, full_screen: bool
+) -> str:
+    reopened = ConversationStore(store.root_dir, session_id=store.session_id)
+    output = StringIO()
+    app = _test_tui_app(reopened, output)
     with create_pipe_input() as pipe:
-        session = FullScreenPromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            key_bindings=build_key_bindings(
-                on_interrupt=app.abort_active,
-                on_exit=app.request_exit,
-            ),
-            multiline=True,
-        )
+        session = _display_session(app, pipe, full_screen)
         run_task = asyncio.create_task(app.run(session))
         await asyncio.sleep(0.05)
         pipe.send_text("\x04")
-        await run_task
-
-    resumed = app._transcript.render(120)
-    app._active_session = session
-    app._rebuild_transcript()
-    assert app._transcript.render(120) == resumed
+        await asyncio.wait_for(run_task, timeout=2)
+    return _rendered_display(app, output, full_screen)
 
 
 @pytest.mark.asyncio
-async def test_resume_replays_only_the_forked_branch(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions")
-    store.append_message(Message(MessageRole.USER, [TextContent("kept")]))
-    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("kept reply")]))
-    checkpoint = store.append_checkpoint("saved")
-    store.append_message(Message(MessageRole.USER, [TextContent("abandoned")]))
-    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("abandoned reply")]))
-    store.append_fork(str(checkpoint.seq))
-    store.append_message(Message(MessageRole.USER, [TextContent("new branch")]))
+@pytest.mark.parametrize("full_screen", [False, True])
+async def test_resume_replay_matches_slash_fork_render(
+    tmp_path: Path, full_screen: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    store = _representative_fork_store(tmp_path)
+    fork_output = StringIO()
+    fork_app = _test_tui_app(store, fork_output)
+    with create_pipe_input() as pipe:
+        fork_app._active_session = _display_session(fork_app, pipe, full_screen)
+        assert fork_app.slash_fork("saved") == (
+            "forked to checkpoint 'saved' at seq 13"
+        )
+        forked = _rendered_display(fork_app, fork_output, full_screen)
 
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store),
-        provider="fake",
-        model="offline",
-    )
-    app._active_session = app._make_session()
-    app._rebuild_transcript()
+    resumed = await _run_reopened_session(store, full_screen)
+    assert resumed == forked
 
-    rendered = Text.from_ansi(app._transcript.render(120)).plain
-    assert "kept" in rendered
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_screen", [False, True])
+async def test_resume_replays_only_the_forked_branch(
+    tmp_path: Path, full_screen: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    store = _representative_fork_store(tmp_path)
+    fork_output = StringIO()
+    fork_app = _test_tui_app(store, fork_output)
+    with create_pipe_input() as pipe:
+        fork_app._active_session = _display_session(fork_app, pipe, full_screen)
+        assert fork_app.slash_fork("saved") == (
+            "forked to checkpoint 'saved' at seq 13"
+        )
+
+    rendered = Text.from_ansi(
+        await _run_reopened_session(store, full_screen)
+    ).plain
+    assert "kept reply" in rendered
     assert "new branch" in rendered
-    assert "abandoned" not in rendered
+    assert "abandoned branch" not in rendered
+    assert "filtered warning" not in rendered
+    assert "[compaction marker: entries 1–4]" in rendered
+    assert "checkpoint 'saved'" in rendered
+    assert "forked to checkpoint 'saved'" in rendered
+    assert "task research · 2 turns" in rendered
+    assert "read" in rendered
 
 
 @pytest.mark.asyncio
