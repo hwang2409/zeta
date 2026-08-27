@@ -61,6 +61,7 @@ class ConversationStore(CheckpointForkMixin):
         self._agent_counter = 0
         self._agent_children: dict[str, dict[str, Any]] = {}
         self._agent_parent: dict[str, Any] | None = None
+        self._agent_terminal: dict[str, Any] | None = None
         self._agent_canceled: dict[str, Any] | None = None
         with self._append_lock():
             self._load()
@@ -279,6 +280,8 @@ class ConversationStore(CheckpointForkMixin):
                 "tool_call_id": parent_tool_call_id,
                 "agent_type": agent_type,
             }
+            self._agent_terminal = None
+            self._agent_canceled = None
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     def finish_agent_parent(self) -> None:
@@ -289,6 +292,11 @@ class ConversationStore(CheckpointForkMixin):
             self._load_session_state()
             if self._agent_parent is None:
                 return
+            self._agent_terminal = {
+                key: value
+                for key, value in self._agent_parent.items()
+                if key in {"tool_call_id", "agent_type"}
+            }
             self._agent_parent = None
             self._write_session_state(self.bash_cwd, self._todo_items)
 
@@ -300,12 +308,29 @@ class ConversationStore(CheckpointForkMixin):
         with self._append_lock():
             self._load()
             self._load_session_state()
+            agent_type = (
+                self._agent_parent.get("agent_type")
+                if self._agent_parent is not None
+                else None
+            )
             self._agent_parent = None
+            self._agent_terminal = {"tool_call_id": parent_tool_call_id}
+            if type(agent_type) is str and agent_type:
+                self._agent_terminal["agent_type"] = agent_type
             self._agent_canceled = {
                 "tool_call_id": parent_tool_call_id,
                 "content": "tool execution canceled",
             }
             self._write_session_state(self.bash_cwd, self._todo_items)
+
+    def agent_type(self) -> str | None:
+        """Return the child type from its live or terminal marker."""
+
+        marker = self._agent_parent or self._agent_terminal
+        if marker is None:
+            return None
+        agent_type = marker.get("agent_type")
+        return agent_type if type(agent_type) is str and agent_type else None
 
     def agent_canceled(self) -> dict[str, Any] | None:
         """Return the durable cancellation marker, if one exists."""
@@ -393,6 +418,22 @@ class ConversationStore(CheckpointForkMixin):
             raise ConversationIntegrityError(
                 f"session state parent marker is invalid: {self.state_path}"
             )
+        agent_terminal = value.get("agent_terminal")
+        if agent_terminal is not None and (
+            type(agent_terminal) is not dict
+            or type(agent_terminal.get("tool_call_id")) is not str
+            or not agent_terminal["tool_call_id"]
+            or (
+                "agent_type" in agent_terminal
+                and (
+                    type(agent_terminal["agent_type"]) is not str
+                    or not agent_terminal["agent_type"]
+                )
+            )
+        ):
+            raise ConversationIntegrityError(
+                f"session state terminal marker is invalid: {self.state_path}"
+            )
         agent_canceled = value.get("agent_canceled")
         if agent_canceled is not None and (
             type(agent_canceled) is not dict
@@ -408,6 +449,7 @@ class ConversationStore(CheckpointForkMixin):
         self._agent_counter = agent_counter
         self._agent_children = copy.deepcopy(agent_children)
         self._agent_parent = copy.deepcopy(agent_parent)
+        self._agent_terminal = copy.deepcopy(agent_terminal)
         self._agent_canceled = copy.deepcopy(agent_canceled)
 
     def _write_session_state(
@@ -423,6 +465,8 @@ class ConversationStore(CheckpointForkMixin):
             state["agent_children"] = copy.deepcopy(self._agent_children)
         if self._agent_parent is not None:
             state["agent_parent"] = copy.deepcopy(self._agent_parent)
+        if self._agent_terminal is not None:
+            state["agent_terminal"] = copy.deepcopy(self._agent_terminal)
         if self._agent_canceled is not None:
             state["agent_canceled"] = copy.deepcopy(self._agent_canceled)
         temporary = tempfile.NamedTemporaryFile(

@@ -46,9 +46,8 @@ PLAN_PRESET = AgentPreset(
 )
 
 AGENT_PRESETS: dict[AgentType, AgentPreset] = {
-    "general": GENERAL_PRESET,
-    "explore": EXPLORE_PRESET,
-    "plan": PLAN_PRESET,
+    preset.name: preset
+    for preset in (GENERAL_PRESET, EXPLORE_PRESET, PLAN_PRESET)
 }
 
 
@@ -57,10 +56,7 @@ def get_agent_preset(agent_type: object) -> AgentPreset | None:
 
     if type(agent_type) is not str:
         return None
-    for name, preset in AGENT_PRESETS.items():
-        if agent_type == name:
-            return preset
-    return None
+    return AGENT_PRESETS.get(agent_type)
 
 
 def compose_system_prompt(

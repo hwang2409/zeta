@@ -18,7 +18,12 @@ from .mcp import MCPMount, mount_mcp_servers
 from .prompts import load_identity
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from .tools.agent import ChildApprovalPolicy, agent_result
-from .tools.agent_presets import compose_system_prompt, get_agent_preset
+from .tools.agent_presets import (
+    AGENT_PRESETS,
+    GENERAL_PRESET,
+    compose_system_prompt,
+    get_agent_preset,
+)
 from .tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
@@ -118,6 +123,7 @@ class AgentLoop:
         retained_tail: int = 8,
         on_completion_success: Callable[[], None] | None = None,
         hooks: HookManager | None = None,
+        skip_mcp_mount: bool = False,
     ) -> None:
         self.backend = backend
         self.store = store
@@ -163,7 +169,7 @@ class AgentLoop:
         else:
             raise TypeError("tools must be a mapping or ToolRegistry")
         self._mcp_mount: MCPMount | None = None
-        self._mcp_mount_attempted = False
+        self._mcp_mount_attempted = skip_mcp_mount
         self._provided_tool_schemas = tool_schemas is not None
         self.tool_registry.bind_session_store(store)
         if (
@@ -251,8 +257,8 @@ class AgentLoop:
             turns_used=turns,
             child_session_path=path,
             agent_type=(
-                agent_type
-                if agent_type in ("general", "explore", "plan")
+                preset.name
+                if (preset := get_agent_preset(agent_type)) is not None
                 else None
             ),
         )
@@ -320,7 +326,7 @@ class AgentLoop:
     ) -> dict[str, object]:
         prompt = arguments.get("prompt")
         description = arguments.get("description")
-        agent_type = arguments.get("agent_type", "general")
+        agent_type = arguments.get("agent_type", GENERAL_PRESET.name)
         if type(prompt) is not str or not prompt.strip():
             return self._child_result_payload(
                 tool_call.id,
@@ -338,9 +344,10 @@ class AgentLoop:
             return self._child_result_payload(
                 tool_call.id,
                 "agent error: unknown agent_type "
-                f"{agent_type!r}; expected one of: general, explore, plan",
+                f"{agent_type!r}; expected one of: {', '.join(AGENT_PRESETS)}",
                 error=True,
             )
+        await self._ensure_mcp_servers()
         child_number = self.store.allocate_agent_index()
         agents_root = self.store.session_dir / "agents"
         child_store = ConversationStore(
@@ -392,6 +399,7 @@ class AgentLoop:
                 self.context_assembler.system_prompt,
                 preset.preamble,
             ),
+            skip_mcp_mount=True,
         )
 
         lifecycle_sink = (
