@@ -66,7 +66,7 @@ from zeta.tui.render import (
     _render_tool_output,
 )
 from zeta.tui.theme import ACCENT, BODY, DIM, RICH_THEME
-from zeta.tui.transcript import TranscriptWidget
+from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
 from zeta.types import (
     CompletionBackend,
     ErrorInfo,
@@ -1553,6 +1553,65 @@ def test_agent_cards_remain_in_sequential_order() -> None:
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert rendered.index("task 0") < rendered.index("task 1")
     assert len(transcript._agent_units) == 2
+
+
+def test_non_full_screen_agent_cards_keep_interleaved_child_streams() -> None:
+    calls = [
+        ToolCall(
+            f"agent-{index}",
+            "agent",
+            {"prompt": "inspect", "description": f"task {index}"},
+        )
+        for index in (1, 2)
+    ]
+    output: list[object] = []
+    presenter = TranscriptPresenter(
+        TranscriptWidget(),
+        _test_console(),
+        lambda: False,
+        output.append,
+    )
+    for call in calls:
+        presenter.handle_tool_event(
+            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call),
+            aborted=False,
+        )
+    for index, call in enumerate(calls, start=1):
+        presenter.handle_tool_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_UPDATE,
+                tool_call=call,
+                delta=f"step-{index}",
+                data={"child_session_path": f"/tmp/child-{index}"},
+            ),
+            aborted=False,
+        )
+
+    units = presenter._tool_region_units
+    assert units["agent-1"].card._child_session_path == "/tmp/child-1"
+    assert units["agent-2"].card._child_session_path == "/tmp/child-2"
+    assert "step-1" in "\n".join(units["agent-1"].output)
+    assert "step-2" in "\n".join(units["agent-2"].output)
+
+    for index, call in enumerate(calls, start=1):
+        presenter.handle_tool_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=ToolResult(
+                    call.id,
+                    f"done-{index}",
+                    structured_content={
+                        "turns_used": index,
+                        "child_session_path": f"/tmp/child-{index}",
+                    },
+                ),
+            ),
+            aborted=False,
+        )
+    rendered = "\n".join(renderable_plain(item) for item in output)
+    assert "task 1" in rendered
+    assert "task 2" in rendered
 
 
 def test_running_agent_card_can_expand_and_read_live_tail(tmp_path: Path) -> None:

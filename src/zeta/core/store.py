@@ -199,9 +199,14 @@ class ConversationStore(CheckpointForkMixin):
         with self._append_lock():
             self._load()
             self._load_session_state()
-            self._agent_counter += 1
+            agents_root = self.session_dir / "agents"
+            agents_root.mkdir(parents=True, exist_ok=True)
+            candidate = self._agent_counter + 1
+            while (agents_root / str(candidate)).exists():
+                candidate += 1
+            self._agent_counter = candidate
             self._write_session_state(self.bash_cwd, self._todo_items)
-            return self._agent_counter
+            return candidate
 
     def register_agent_child(
         self,

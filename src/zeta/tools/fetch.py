@@ -508,6 +508,7 @@ def register(registry: ToolRegistry) -> None:
             "the cloud metadata address 169.254.169.254 is refused. If truncated, "
             "call again with offset=next_offset to continue."
         ),
+        parallel_safe=True,
         parameters={
             "type": "object",
             "properties": {
