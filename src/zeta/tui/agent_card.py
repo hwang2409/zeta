@@ -13,6 +13,7 @@ from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
 
+from ..tools.agent_presets import GENERAL_PRESET, get_agent_preset
 from ..types import StreamEvent, StreamEventType, ToolCall
 from .theme import BODY, CARD_BG, CARD_BORDER, COMMAND, DIM, ERROR, RECEIPT
 
@@ -77,10 +78,10 @@ class AgentCard:
 
     @classmethod
     def _agent_type(cls, call: ToolCall) -> str:
-        agent_type = call.arguments.get("agent_type")
-        if type(agent_type) is str and agent_type != "general":
-            return agent_type
-        return ""
+        preset = get_agent_preset(call.arguments.get("agent_type"))
+        if preset is None or preset.name == GENERAL_PRESET.name:
+            return ""
+        return preset.name
 
     @classmethod
     def _turns_from_content(cls, content: str) -> int:

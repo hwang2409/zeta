@@ -26,6 +26,10 @@ from .checkpoints import (
 SCHEMA = "zeta.conversation.v1"
 
 
+def _agent_type_metadata(agent_type: str | None) -> dict[str, str]:
+    return {} if agent_type is None else {"agent_type": agent_type}
+
+
 class ConversationStore(CheckpointForkMixin):
     def __init__(
         self,
@@ -61,7 +65,6 @@ class ConversationStore(CheckpointForkMixin):
         self._agent_counter = 0
         self._agent_children: dict[str, dict[str, Any]] = {}
         self._agent_parent: dict[str, Any] | None = None
-        self._agent_terminal: dict[str, Any] | None = None
         self._agent_canceled: dict[str, Any] | None = None
         with self._append_lock():
             self._load()
@@ -215,22 +218,23 @@ class ConversationStore(CheckpointForkMixin):
         *,
         child_session_path: str,
         description: str,
-        agent_type: str = "general",
+        agent_type: str | None = None,
     ) -> None:
         """Persist a running child marker before the child starts."""
 
-        if not child_session_path or not description or not agent_type:
+        if not child_session_path or not description or agent_type == "":
             raise ValueError("child marker fields must be nonempty")
         with self._append_lock():
             self._load()
             self._load_session_state()
-            self._agent_children[tool_call.id] = {
+            marker = {
                 "tool_call": tool_call.to_dict(),
                 "child_session_path": child_session_path,
                 "description": description,
-                "agent_type": agent_type,
                 "turns_used": 0,
             }
+            marker.update(_agent_type_metadata(agent_type))
+            self._agent_children[tool_call.id] = marker
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     def agent_children(self) -> dict[str, dict[str, Any]]:
@@ -267,20 +271,17 @@ class ConversationStore(CheckpointForkMixin):
         self,
         parent_tool_call_id: str,
         *,
-        agent_type: str = "general",
+        agent_type: str | None = None,
     ) -> None:
         """Persist the parent call id in a child session before execution."""
 
-        if not parent_tool_call_id or not agent_type:
+        if not parent_tool_call_id or agent_type == "":
             raise ValueError("parent tool call id must be nonempty")
         with self._append_lock():
             self._load()
             self._load_session_state()
-            self._agent_parent = {
-                "tool_call_id": parent_tool_call_id,
-                "agent_type": agent_type,
-            }
-            self._agent_terminal = None
+            self._agent_parent = {"tool_call_id": parent_tool_call_id}
+            self._agent_parent.update(_agent_type_metadata(agent_type))
             self._agent_canceled = None
             self._write_session_state(self.bash_cwd, self._todo_items)
 
@@ -292,12 +293,10 @@ class ConversationStore(CheckpointForkMixin):
             self._load_session_state()
             if self._agent_parent is None:
                 return
-            self._agent_terminal = {
-                key: value
-                for key, value in self._agent_parent.items()
-                if key in {"tool_call_id", "agent_type"}
-            }
-            self._agent_parent = None
+            if "agent_type" in self._agent_parent:
+                self._agent_parent["status"] = "finished"
+            else:
+                self._agent_parent = None
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     def mark_agent_canceled(self, parent_tool_call_id: str) -> None:
@@ -308,25 +307,19 @@ class ConversationStore(CheckpointForkMixin):
         with self._append_lock():
             self._load()
             self._load_session_state()
-            agent_type = (
-                self._agent_parent.get("agent_type")
-                if self._agent_parent is not None
-                else None
-            )
+            agent_type = self.agent_type()
             self._agent_parent = None
-            self._agent_terminal = {"tool_call_id": parent_tool_call_id}
-            if type(agent_type) is str and agent_type:
-                self._agent_terminal["agent_type"] = agent_type
             self._agent_canceled = {
                 "tool_call_id": parent_tool_call_id,
                 "content": "tool execution canceled",
             }
+            self._agent_canceled.update(_agent_type_metadata(agent_type))
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     def agent_type(self) -> str | None:
-        """Return the child type from its live or terminal marker."""
+        """Return the child type from its agent marker."""
 
-        marker = self._agent_parent or self._agent_terminal
+        marker = self._agent_parent or self._agent_canceled
         if marker is None:
             return None
         agent_type = marker.get("agent_type")
@@ -414,25 +407,13 @@ class ConversationStore(CheckpointForkMixin):
                     or not agent_parent["agent_type"]
                 )
             )
+            or (
+                "status" in agent_parent
+                and agent_parent["status"] != "finished"
+            )
         ):
             raise ConversationIntegrityError(
                 f"session state parent marker is invalid: {self.state_path}"
-            )
-        agent_terminal = value.get("agent_terminal")
-        if agent_terminal is not None and (
-            type(agent_terminal) is not dict
-            or type(agent_terminal.get("tool_call_id")) is not str
-            or not agent_terminal["tool_call_id"]
-            or (
-                "agent_type" in agent_terminal
-                and (
-                    type(agent_terminal["agent_type"]) is not str
-                    or not agent_terminal["agent_type"]
-                )
-            )
-        ):
-            raise ConversationIntegrityError(
-                f"session state terminal marker is invalid: {self.state_path}"
             )
         agent_canceled = value.get("agent_canceled")
         if agent_canceled is not None and (
@@ -440,6 +421,13 @@ class ConversationStore(CheckpointForkMixin):
             or type(agent_canceled.get("tool_call_id")) is not str
             or not agent_canceled["tool_call_id"]
             or agent_canceled.get("content") != "tool execution canceled"
+            or (
+                "agent_type" in agent_canceled
+                and (
+                    type(agent_canceled["agent_type"]) is not str
+                    or not agent_canceled["agent_type"]
+                )
+            )
         ):
             raise ConversationIntegrityError(
                 f"session state canceled marker is invalid: {self.state_path}"
@@ -449,7 +437,6 @@ class ConversationStore(CheckpointForkMixin):
         self._agent_counter = agent_counter
         self._agent_children = copy.deepcopy(agent_children)
         self._agent_parent = copy.deepcopy(agent_parent)
-        self._agent_terminal = copy.deepcopy(agent_terminal)
         self._agent_canceled = copy.deepcopy(agent_canceled)
 
     def _write_session_state(
@@ -465,8 +452,6 @@ class ConversationStore(CheckpointForkMixin):
             state["agent_children"] = copy.deepcopy(self._agent_children)
         if self._agent_parent is not None:
             state["agent_parent"] = copy.deepcopy(self._agent_parent)
-        if self._agent_terminal is not None:
-            state["agent_terminal"] = copy.deepcopy(self._agent_terminal)
         if self._agent_canceled is not None:
             state["agent_canceled"] = copy.deepcopy(self._agent_canceled)
         temporary = tempfile.NamedTemporaryFile(

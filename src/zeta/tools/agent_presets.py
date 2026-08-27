@@ -18,6 +18,7 @@ class AgentPreset:
     turn_cap: int
     tool_names: frozenset[str] | None
     preamble: str
+    selection_guidance: str
 
 
 GENERAL_PRESET = AgentPreset(
@@ -25,6 +26,7 @@ GENERAL_PRESET = AgentPreset(
     turn_cap=25,
     tool_names=None,
     preamble="",
+    selection_guidance="full tool set, up to 25 turns",
 )
 EXPLORE_PRESET = AgentPreset(
     name="explore",
@@ -34,6 +36,7 @@ EXPLORE_PRESET = AgentPreset(
         "You are an explore sub-agent. Use read-only tools to search and inspect. "
         "Summarize the useful findings and return them to the parent."
     ),
+    selection_guidance="read-only fetch, read, skill, and websearch tools, up to 15 turns",
 )
 PLAN_PRESET = AgentPreset(
     name="plan",
@@ -42,6 +45,9 @@ PLAN_PRESET = AgentPreset(
     preamble=(
         "You are a plan sub-agent. Inspect the task with read-only tools, then "
         "create or update a concise todo plan. Return the plan to the parent."
+    ),
+    selection_guidance=(
+        "read-only fetch, read, skill, todo, and websearch tools, up to 20 turns"
     ),
 )
 
@@ -57,6 +63,16 @@ def get_agent_preset(agent_type: object) -> AgentPreset | None:
     if type(agent_type) is not str:
         return None
     return AGENT_PRESETS.get(agent_type)
+
+
+def agent_type_description() -> str:
+    """Describe each registered preset for the agent tool schema."""
+
+    choices = "; ".join(
+        f"{preset.name}: {preset.selection_guidance}"
+        for preset in AGENT_PRESETS.values()
+    )
+    return f"Choose one of: {choices}."
 
 
 def compose_system_prompt(

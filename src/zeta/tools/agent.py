@@ -8,7 +8,12 @@ from typing import Any
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..types import Message, MessageRole, ToolCall, ToolUseContent
-from .agent_presets import AGENT_PRESETS, AgentType, GENERAL_PRESET
+from .agent_presets import (
+    AGENT_PRESETS,
+    AgentType,
+    GENERAL_PRESET,
+    agent_type_description,
+)
 from .registry import (
     AbortSignal,
     ToolExecutionContext,
@@ -184,7 +189,7 @@ def register(registry: ToolRegistry) -> None:
             "Delegate multi-step exploration or research that would pollute the "
             "main context. The child has its own bounded context and cannot "
             "spawn further agents. Built-in types: "
-            f"{', '.join(AGENT_PRESETS)}."
+            f"{agent_type_description()}"
         ),
         parameters={
             "type": "object",
@@ -194,7 +199,7 @@ def register(registry: ToolRegistry) -> None:
                 "agent_type": {
                     "type": "string",
                     "enum": list(AGENT_PRESETS),
-                    "description": f"Choose one of: {', '.join(AGENT_PRESETS)}.",
+                    "description": agent_type_description(),
                 },
             },
             "required": ["prompt", "description"],

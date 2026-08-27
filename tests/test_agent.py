@@ -1,5 +1,7 @@
 import asyncio
+import json
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,7 +14,11 @@ from zeta.loop import AgentLoop
 from zeta.mcp import MCPMount
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy
-from zeta.tools.agent_presets import AGENT_PRESETS
+from zeta.tools.agent_presets import (
+    AGENT_PRESETS,
+    GENERAL_PRESET,
+    agent_type_description,
+)
 from zeta.types import (
     CompletionBackend,
     Message,
@@ -248,15 +254,55 @@ async def test_agent_returns_child_text_and_persists_child_session(tmp_path: Pat
     } - {"agent"}
 
 
-def test_agent_schema_uses_preset_registry(tmp_path: Path) -> None:
+def test_agent_schema_uses_preset_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    custom = replace(
+        GENERAL_PRESET,
+        name="custom",  # type: ignore[arg-type]
+        selection_guidance="a custom subset, up to 1 turn",
+    )
+    monkeypatch.setitem(AGENT_PRESETS, custom.name, custom)
     registry = ToolRegistry(tmp_path)
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     AgentLoop(FakeBackend([]), store, registry=registry)
 
     agent_schema = next(schema for schema in registry.schemas if schema["name"] == "agent")
-    assert agent_schema["parameters"]["properties"]["agent_type"]["enum"] == list(
-        AGENT_PRESETS
+    agent_type_schema = agent_schema["parameters"]["properties"]["agent_type"]
+    assert agent_type_schema["enum"] == list(AGENT_PRESETS)
+    assert agent_type_schema["description"] == agent_type_description()
+    assert custom.selection_guidance in agent_type_schema["description"]
+
+
+@pytest.mark.asyncio
+async def test_general_agent_markers_keep_legacy_state_bytes(tmp_path: Path) -> None:
+    omitted = ConversationStore(tmp_path / "omitted", cwd=tmp_path)
+    explicit = ConversationStore(tmp_path / "explicit", cwd=tmp_path)
+    omitted_backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call(call_id="omitted")]),
+            ScriptedTurn([TextContent("done")]),
+        ]
     )
+    explicit_backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    _agent_call(call_id="explicit", agent_type=GENERAL_PRESET.name)
+                ]
+            ),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+
+    await _collect(AgentLoop(omitted_backend, omitted, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(explicit_backend, explicit, max_turns=1).run_turn("start"))
+
+    omitted_child_state = omitted.session_dir / "agents" / "1" / "session_state.json"
+    explicit_child_state = explicit.session_dir / "agents" / "1" / "session_state.json"
+    assert omitted_child_state.read_bytes() == explicit_child_state.read_bytes()
+    assert json.loads(omitted_child_state.read_text()) == {"bash_cwd": str(tmp_path)}
+    assert omitted.state_path.read_bytes() == explicit.state_path.read_bytes()
 
 
 @pytest.mark.asyncio
@@ -751,7 +797,11 @@ async def test_typed_child_type_survives_completion_and_reopen(tmp_path: Path) -
 
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     assert child.agent_type() == "explore"
-    assert '"agent_terminal"' in child.state_path.read_text()
+    assert json.loads(child.state_path.read_text())["agent_parent"] == {
+        "tool_call_id": "agent-1",
+        "agent_type": "explore",
+        "status": "finished",
+    }
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.structured_content is not None
     assert result.structured_content["agent_type"] == "explore"

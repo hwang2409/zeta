@@ -348,6 +348,9 @@ class AgentLoop:
                 error=True,
             )
         await self._ensure_mcp_servers()
+        stored_agent_type = (
+            None if preset.name == GENERAL_PRESET.name else preset.name
+        )
         child_number = self.store.allocate_agent_index()
         agents_root = self.store.session_dir / "agents"
         child_store = ConversationStore(
@@ -355,7 +358,7 @@ class AgentLoop:
             session_id=str(child_number),
             cwd=self.store.cwd,
         )
-        child_store.mark_agent_parent(tool_call.id, agent_type=preset.name)
+        child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
         child_path = str(child_store.session_dir)
         child_instance_id = f"{self.store.session_id}:{child_number}"
         self._agent_child_stores[tool_call.id] = child_store
@@ -367,7 +370,7 @@ class AgentLoop:
             tool_call,
             child_session_path=child_path,
             description=description,
-            agent_type=preset.name,
+            agent_type=stored_agent_type,
         )
         excluded_names = {"agent"}
         if preset.tool_names is not None:
