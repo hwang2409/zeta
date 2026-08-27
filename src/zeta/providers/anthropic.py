@@ -393,19 +393,13 @@ class AnthropicBackend(CompletionBackend):
         primary_exception: BaseException | None = None
         try:
             token = token if token is not None else await self.token_store.access_token(client)
-            payload = build_messages_payload(
+            payload = build_request_payload(
                 messages,
                 tool_schemas,
                 model=self.model,
                 max_tokens=self.max_tokens,
                 thinking_budget=self.thinking_budget,
             )
-            identity = {
-                "type": "text",
-                "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-                "cache_control": {"type": "ephemeral"},
-            }
-            payload["system"] = [identity, *payload.get("system", [])]
             headers = {
                 "accept": "text/event-stream",
                 "anthropic-beta": (
@@ -418,7 +412,10 @@ class AnthropicBackend(CompletionBackend):
             }
             stream_started_at = time.monotonic()
             stream_context = client.stream(
-                "POST", self.base_url, headers=headers, json=payload
+                "POST",
+                self.base_url,
+                headers=headers,
+                content=serialize_request_payload(payload),
             )
             response = await stream_context.__aenter__()
             entered = True
@@ -979,3 +976,31 @@ def build_messages_payload(
         )
     except ValueError as exc:
         raise AnthropicHTTPError(str(exc)) from exc
+
+
+def build_request_payload(
+    messages: Sequence[Message],
+    tool_schemas: Sequence[ToolSchema],
+    *,
+    model: str,
+    max_tokens: int,
+    thinking_budget: int = DEFAULT_THINKING_BUDGET,
+) -> dict[str, Any]:
+    payload = build_messages_payload(
+        messages,
+        tool_schemas,
+        model=model,
+        max_tokens=max_tokens,
+        thinking_budget=thinking_budget,
+    )
+    identity = {
+        "type": "text",
+        "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "cache_control": {"type": "ephemeral"},
+    }
+    payload["system"] = [identity, *payload.get("system", [])]
+    return payload
+
+
+def serialize_request_payload(payload: Mapping[str, Any]) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()

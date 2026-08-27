@@ -29,6 +29,7 @@ from zeta.providers.anthropic import (
 from zeta.types import (
     Message,
     MessageRole,
+    ImageContent,
     RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
@@ -70,6 +71,31 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 event: message_stop
 data: {"type":"message_stop"}
 """
+
+
+def request_payload(
+    messages: list[Message], tool_schemas: list[dict[str, object]]
+) -> dict[str, object]:
+    payload = build_messages_payload(
+        messages,
+        tool_schemas,
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+    payload["system"] = [
+        {
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+            "cache_control": {"type": "ephemeral"},
+        },
+        *payload.get("system", []),
+    ]
+    return payload
+
+
+def request_bytes(payload: dict[str, object]) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 def client_for(handler):
@@ -941,11 +967,9 @@ async def test_compaction_keeps_stable_cache_prefix_bytes(tmp_path: Path) -> Non
     ) == encode(
         {"system": after_payload["system"], "tools": after_payload["tools"]}
     )
-    assert not any(
-        "cache_control" in block
-        for message in after_payload["messages"]
-        for block in message["content"]
-    )
+    assert after_payload["messages"][1]["content"][0]["cache_control"] == {
+        "type": "ephemeral"
+    }
 
 
 def test_anthropic_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
@@ -1040,6 +1064,184 @@ async def test_backend_locks_cache_breakpoints_to_stable_boundaries(tmp_path: Pa
         if "cache_control" in block
     ] == [(0, 0)]
     await client.aclose()
+
+
+def _conversation_cache_locations(payload: dict[str, object]) -> list[tuple[int, int]]:
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    return [
+        (message_index, block_index)
+        for message_index, message in enumerate(messages)
+        for block_index, block in enumerate(message["content"])
+        if "cache_control" in block
+    ]
+
+
+def _content_prefix_without_cache_metadata(payload: dict[str, object]) -> bytes:
+    marker = b',"cache_control":{"type":"ephemeral"}'
+    return request_bytes(payload).replace(marker, b"")
+
+
+def test_compaction_changes_the_conversation_prefix_once() -> None:
+    system = Message(MessageRole.SYSTEM, [TextContent("stable")])
+    tools = [{"name": "read", "parameters": {"type": "object"}}]
+    before_compaction = [
+        system,
+        Message(MessageRole.USER, [TextContent("first")]),
+        Message(MessageRole.ASSISTANT, [TextContent("answer one")]),
+        Message(MessageRole.USER, [TextContent("second")]),
+    ]
+    next_turn = [
+        *before_compaction,
+        Message(MessageRole.ASSISTANT, [TextContent("answer two")]),
+        Message(MessageRole.USER, [TextContent("third")]),
+    ]
+    compacted = [
+        system,
+        Message(MessageRole.COMPACTION, [TextContent("[compaction]")]),
+        Message(MessageRole.ASSISTANT, [TextContent("stable summary")]),
+        Message(MessageRole.USER, [TextContent("second")]),
+    ]
+    after_compaction = [
+        *compacted,
+        Message(MessageRole.ASSISTANT, [TextContent("answer two")]),
+        Message(MessageRole.USER, [TextContent("third")]),
+    ]
+
+    payload_before = request_payload(before_compaction, tools)
+    payload_next = request_payload(next_turn, tools)
+    payload_compacted = request_payload(compacted, tools)
+    payload_after = request_payload(after_compaction, tools)
+
+    assert _conversation_cache_locations(payload_before) == [(1, 0)]
+    assert _conversation_cache_locations(payload_next) == [(3, 0)]
+    before_bytes = _content_prefix_without_cache_metadata(payload_before)
+    next_bytes = _content_prefix_without_cache_metadata(payload_next)
+    answer_end = before_bytes.find(b'"answer one"') + len('"answer one"')
+    assert next_bytes.startswith(before_bytes[:answer_end])
+    assert _conversation_cache_locations(payload_compacted) == [(1, 0)]
+    assert _content_prefix_without_cache_metadata(payload_compacted) != (
+        _content_prefix_without_cache_metadata(payload_next)
+    )
+    assert _conversation_cache_locations(payload_after) == [(3, 0)]
+    compacted_prefix = _content_prefix_without_cache_metadata(payload_compacted)
+    summary_end = compacted_prefix.find(b"stable summary") + len("stable summary")
+    assert _content_prefix_without_cache_metadata(payload_after).startswith(
+        compacted_prefix[:summary_end]
+    )
+    assert json.dumps(
+        {"system": payload_compacted["system"], "tools": payload_compacted["tools"]},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ) == json.dumps(
+        {"system": payload_after["system"], "tools": payload_after["tools"]},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ([ThinkingContent("plan", "signature")], []),
+        ([RedactedThinkingContent("redacted")], []),
+        ([TextContent(""), ThinkingContent("plan", "signature")], []),
+    ],
+)
+def test_conversation_breakpoint_skips_non_cacheable_final_blocks(
+    content: list[object], expected: list[tuple[int, int]]
+) -> None:
+    payload = build_messages_payload(
+        [
+            Message(MessageRole.ASSISTANT, content),
+            Message(MessageRole.USER, [TextContent("current")]),
+        ],
+        [],
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+
+    assert _conversation_cache_locations(payload) == expected
+
+
+def test_conversation_breakpoint_scans_back_across_messages() -> None:
+    payload = build_messages_payload(
+        [
+            Message(MessageRole.ASSISTANT, [TextContent("stable")]),
+            Message(
+                MessageRole.ASSISTANT,
+                [ThinkingContent("plan", "signature")],
+            ),
+            Message(MessageRole.USER, [TextContent("current")]),
+        ],
+        [],
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+
+    assert _conversation_cache_locations(payload) == [(0, 0)]
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            Message(
+                MessageRole.ASSISTANT,
+                [ToolUseContent(ToolCall("call-1", "read", {}))],
+            ),
+            [(0, 0)],
+        ),
+        (
+            Message(
+                MessageRole.TOOL_RESULT,
+                tool_result=ToolResult("call-1", "result"),
+            ),
+            [(0, 0)],
+        ),
+        (
+            Message(
+                MessageRole.ASSISTANT,
+                [
+                    ImageContent(
+                        png_block()["data"],
+                        "image/png",
+                    )
+                ],
+            ),
+            [(0, 0)],
+        ),
+    ],
+)
+def test_conversation_breakpoint_targets_each_cacheable_block_type(
+    message: Message, expected: list[tuple[int, int]]
+) -> None:
+    payload = build_messages_payload(
+        [message, Message(MessageRole.USER, [TextContent("current")])],
+        [],
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+
+    assert _conversation_cache_locations(payload) == expected
+
+
+def test_degenerate_empty_conversation_has_no_breakpoint() -> None:
+    payload = build_messages_payload(
+        [
+            Message(MessageRole.ASSISTANT, [TextContent("")]),
+            Message(MessageRole.USER, [TextContent("")]),
+        ],
+        [],
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+
+    assert _conversation_cache_locations(payload) == []
 
 
 def test_empty_system_prompt_is_omitted_from_payload() -> None:
@@ -1598,7 +1800,7 @@ async def test_network_eof_salvage_records_exception_and_headers(tmp_path: Path)
             return False
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             return Stream()
 
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
@@ -2086,7 +2288,7 @@ async def test_cancellation_survives_failing_owned_client_cleanup(
             raise RuntimeError("stream cleanup failed")
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             return Stream()
 
         async def aclose(self):
@@ -2126,7 +2328,7 @@ async def test_cancellation_during_owned_client_close_is_not_swallowed(
             return False
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             return Stream()
 
         async def aclose(self):
@@ -2167,7 +2369,7 @@ async def test_consumer_aclose_suppresses_failing_stream_cleanup(
             raise RuntimeError("stream cleanup failed")
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             return Stream()
 
         async def aclose(self):
@@ -2204,7 +2406,7 @@ async def test_response_cleanup_cancellation_wins_over_stream_error(
             await never.wait()
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             return Stream()
 
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
@@ -2241,7 +2443,7 @@ async def test_client_cleanup_cancellation_wins_over_stream_error(
             return False
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             return Stream()
 
         async def aclose(self):
@@ -2278,7 +2480,7 @@ async def test_response_cleanup_http_error_is_typed(tmp_path: Path) -> None:
             raise httpx.ConnectError("response cleanup secret")
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             return Stream()
 
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
@@ -2310,7 +2512,7 @@ async def test_client_cleanup_http_error_is_typed(tmp_path: Path) -> None:
             return False
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             return Stream()
 
         async def aclose(self):
@@ -2359,7 +2561,7 @@ async def test_cancel_mid_thinking_drops_partial_block_before_resume(
             return False
 
     class Client:
-        def stream(self, method, url, *, headers, json):
+        def stream(self, method, url, *, headers, content):
             nonlocal calls
             calls += 1
             if calls == 1:

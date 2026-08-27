@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Sequence
+from typing import AsyncIterator, Callable, Sequence
 
 from ..types import (
     CompletionBackend,
@@ -34,12 +34,17 @@ class FakeBackend(CompletionBackend):
         turns: Sequence[ScriptedTurn],
         *,
         close_error: Exception | None = None,
+        request_serializer: Callable[
+            [Sequence[Message], Sequence[ToolSchema]], bytes
+        ] | None = None,
     ) -> None:
         self.turns = list(turns)
         self.calls: list[tuple[list[Message], list[ToolSchema]]] = []
         self.completion_close_count = 0
         self.close_error = close_error
-        self._previous_request: tuple[bytes, ...] | None = None
+        self.request_serializer = request_serializer
+        self.request_bytes: list[bytes] = []
+        self._previous_request: bytes | None = None
 
     async def complete(
         self,
@@ -49,24 +54,25 @@ class FakeBackend(CompletionBackend):
         index = len(self.calls)
         self.calls.append((list(messages), list(tool_schemas)))
         turn = self.turns[index]
-        request = tuple(
-            json.dumps(
-                value,
+        if self.request_serializer is None:
+            request = json.dumps(
+                [
+                    *(message.to_dict() for message in messages),
+                    {"tools": list(tool_schemas)},
+                ],
                 ensure_ascii=False,
                 separators=(",", ":"),
                 sort_keys=True,
             ).encode()
-            for value in [
-                *(message.to_dict() for message in messages),
-                {"tools": list(tool_schemas)},
-            ]
-        )
+        else:
+            request = self.request_serializer(messages, tool_schemas)
+        self.request_bytes.append(request)
         usage = dict(turn.usage)
+        cache_read = _common_prefix_length(self._previous_request, request)
+        self._previous_request = request
         if usage:
-            cache_read = _common_prefix_length(self._previous_request, request)
-            self._previous_request = request
             usage["cache_read_input_tokens"] = cache_read
-            usage["cache_creation_input_tokens"] = sum(map(len, request)) - cache_read
+            usage["cache_creation_input_tokens"] = len(request) - cache_read
         blocks = [*turn.content, *(ToolUseContent(call) for call in turn.tool_calls)]
         try:
             yield StreamEvent(StreamEventType.MESSAGE_START)
@@ -88,13 +94,12 @@ class FakeBackend(CompletionBackend):
 
 
 def _common_prefix_length(
-    previous: tuple[bytes, ...] | None, current: tuple[bytes, ...]
+    previous: bytes | None, current: bytes
 ) -> int:
     if previous is None:
         return 0
-    length = 0
-    for previous_part, current_part in zip(previous, current):
-        if previous_part != current_part:
-            return length
-        length += len(previous_part)
+    length = min(len(previous), len(current))
+    for index in range(length):
+        if previous[index] != current[index]:
+            return index
     return length

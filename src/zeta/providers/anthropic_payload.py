@@ -171,7 +171,6 @@ def build_messages_payload(
     system: list[dict[str, Any]] = []
     wire_messages: list[dict[str, Any]] = []
     latest_user_wire_index: int | None = None
-    has_compaction = False
     for message in messages:
         if message.role is MessageRole.SYSTEM:
             content = _wire_content(message.content)
@@ -194,8 +193,6 @@ def build_messages_payload(
             ]
             wire_messages.append({"role": "user", "content": content})
             continue
-        if message.role is MessageRole.COMPACTION:
-            has_compaction = True
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
         content = _wire_content(message.content)
         if content or role != "assistant":
@@ -221,19 +218,23 @@ def build_messages_payload(
         payload["tools"] = tools
     # The active user turn can grow during tool calls, so cache only completed
     # conversation history before that turn.
-    if (
-        not has_compaction
-        and latest_user_wire_index is not None
-        and latest_user_wire_index > 0
-    ):
-        prefix_message = wire_messages[latest_user_wire_index - 1]
-        content = prefix_message["content"]
-        if isinstance(content, list) and content:
+    if latest_user_wire_index is not None:
+        for message in reversed(wire_messages[:latest_user_wire_index]):
+            content = message["content"]
+            if not isinstance(content, list):
+                continue
             for block in reversed(content):
-                if block.get("type") in _CACHEABLE_BLOCK_TYPES:
+                if _is_cacheable_block(block):
                     block["cache_control"] = {"type": "ephemeral"}
-                    break
+                    return payload
     return payload
+
+
+def _is_cacheable_block(block: Mapping[str, Any]) -> bool:
+    block_type = block.get("type")
+    if block_type not in _CACHEABLE_BLOCK_TYPES:
+        return False
+    return block_type != "text" or bool(block.get("text", "").strip())
 
 
 def _validate_thinking_parameters(max_tokens: int, thinking_budget: int) -> None:
