@@ -10,19 +10,22 @@ import pytest
 
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.stream_diagnostics as diagnostics_module
+from zeta.core.context import ContextAssembler
+from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.loop import AgentLoop
+from zeta.core.store import ConversationStore
+from zeta.prompts import load_identity
 from zeta.providers.anthropic import (
+    ANTHROPIC_MAX_IMAGE_BYTES,
     AnthropicAuthError,
     AnthropicBackend,
     AnthropicCredentialStore,
     AnthropicHTTPError,
-    ANTHROPIC_MAX_IMAGE_BYTES,
     AnthropicStreamError,
     OAuthTokens,
     build_authorization_url,
     build_messages_payload,
 )
-from zeta.core.loop import AgentLoop
-from zeta.core.store import ConversationStore
 from zeta.types import (
     Message,
     MessageRole,
@@ -36,8 +39,6 @@ from zeta.types import (
     ToolUseContent,
     image_dimensions,
 )
-from zeta.prompts import load_identity
-
 
 SSE = """event: message_start
 data: {"type":"message_start","message":{"id":"msg-1","model":"claude-test","role":"assistant","usage":{"input_tokens":12}}}
@@ -873,6 +874,7 @@ def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
     payload = build_messages_payload(
         [
             Message(MessageRole.SYSTEM, [TextContent("stable")]),
+            Message(MessageRole.ASSISTANT, [TextContent("previous answer")]),
             Message(MessageRole.USER, [TextContent("run")]),
         ],
         [{"name": "read", "description": "read a file", "parameters": {"type": "object"}}],
@@ -886,9 +888,48 @@ def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
     assert payload["tools"][0]["input_schema"] == {"type": "object"}
     assert payload["messages"][-1]["role"] == "user"
     assert payload["messages"][-1]["content"][0]["text"] == "run"
-    assert payload["messages"][-1]["content"][0]["cache_control"] == {
+    assert "cache_control" not in payload["messages"][-1]["content"][0]
+    assert payload["messages"][-2]["content"][0]["cache_control"] == {
         "type": "ephemeral"
     }
+
+
+@pytest.mark.asyncio
+async def test_compaction_keeps_system_cache_prefix_bytes(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
+    store.append_message(Message(MessageRole.USER, [TextContent("tail")]))
+    backend = FakeBackend([ScriptedTurn([TextContent("summary")])])
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        token_counter=lambda _: 10,
+        system_prompt="stable system",
+        backend=backend,
+    )
+
+    before = await assembler.assemble()
+    before_payload = build_messages_payload(
+        before,
+        [],
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+    after = await assembler.assemble(force=True)
+    after_payload = build_messages_payload(
+        after,
+        [],
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+
+    encode = lambda value: json.dumps(
+        value, ensure_ascii=False, separators=(",", ":")
+    ).encode()
+    assert encode(before_payload["system"]) == encode(after_payload["system"])
 
 
 def test_anthropic_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
@@ -929,7 +970,7 @@ def test_anthropic_flattens_non_text_tool_blocks_at_provider_boundary() -> None:
 
 
 @pytest.mark.asyncio
-async def test_backend_keeps_four_cache_breakpoints_governed(tmp_path: Path) -> None:
+async def test_backend_locks_cache_breakpoints_to_stable_boundaries(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -954,11 +995,8 @@ async def test_backend_keeps_four_cache_breakpoints_governed(tmp_path: Path) -> 
         async for event in backend.complete(
             [
                 Message(MessageRole.SYSTEM, [TextContent("stable")]),
+                Message(MessageRole.ASSISTANT, [TextContent("previous answer")]),
                 Message(MessageRole.USER, [TextContent("run")]),
-                Message(
-                    MessageRole.TOOL_RESULT,
-                    tool_result=ToolResult("call-1", "result"),
-                ),
             ],
             [{"name": "read", "parameters": {"type": "object"}}],
         )
@@ -969,20 +1007,22 @@ async def test_backend_keeps_four_cache_breakpoints_governed(tmp_path: Path) -> 
     assert payload["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert payload["system"][-1]["cache_control"] == {"type": "ephemeral"}
     assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
-    assert payload["messages"][-1]["content"][-1]["cache_control"] == {
+    assert payload["messages"][-2]["content"][-1]["cache_control"] == {
         "type": "ephemeral"
     }
-    assert sum(
-        isinstance(value, dict) and "cache_control" in value
-        for section in (payload["system"], payload["tools"], payload["messages"])
-        for value in section
-        if isinstance(value, dict)
-    ) == 3
-    assert sum(
-        isinstance(block, dict) and "cache_control" in block
-        for message in payload["messages"]
-        for block in message["content"]
-    ) == 1
+    assert "cache_control" not in payload["messages"][-1]["content"][-1]
+    assert [
+        (section_name, index)
+        for section_name in ("system", "tools")
+        for index, value in enumerate(payload[section_name])
+        if "cache_control" in value
+    ] == [("system", 0), ("system", 1), ("tools", 0)]
+    assert [
+        (message_index, block_index)
+        for message_index, message in enumerate(payload["messages"])
+        for block_index, block in enumerate(message["content"])
+        if "cache_control" in block
+    ] == [(0, 0)]
     await client.aclose()
 
 
@@ -1413,7 +1453,6 @@ def test_thinking_tool_turn_replays_assistant_blocks_before_tool_result() -> Non
                     "tool_use_id": "call-1",
                     "content": "contents",
                     "is_error": False,
-                    "cache_control": {"type": "ephemeral"},
                 }
             ],
         },

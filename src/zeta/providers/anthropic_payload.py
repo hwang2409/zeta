@@ -169,6 +169,7 @@ def build_messages_payload(
     _validate_thinking_parameters(max_tokens, thinking_budget)
     system: list[dict[str, Any]] = []
     wire_messages: list[dict[str, Any]] = []
+    latest_user_wire_index: int | None = None
     for message in messages:
         if message.role is MessageRole.SYSTEM:
             content = _wire_content(message.content)
@@ -194,6 +195,8 @@ def build_messages_payload(
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
         content = _wire_content(message.content)
         if content or role != "assistant":
+            if message.role is MessageRole.USER:
+                latest_user_wire_index = len(wire_messages)
             wire_messages.append({"role": role, "content": content})
 
     if system:
@@ -212,15 +215,13 @@ def build_messages_payload(
         payload["system"] = system
     if tools:
         payload["tools"] = tools
-    for message in reversed(wire_messages):
-        if message["role"] != "user":
-            continue
-        content = message["content"]
+    # The active user turn can grow during tool calls, so cache only completed
+    # conversation history before that turn.
+    if latest_user_wire_index is not None and latest_user_wire_index > 0:
+        prefix_message = wire_messages[latest_user_wire_index - 1]
+        content = prefix_message["content"]
         if isinstance(content, list) and content:
-            last_block = content[-1]
-            if last_block.get("type") in {"text", "tool_result"}:
-                last_block["cache_control"] = {"type": "ephemeral"}
-        break
+            content[-1]["cache_control"] = {"type": "ephemeral"}
     return payload
 
 

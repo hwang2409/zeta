@@ -10,6 +10,9 @@ import httpx
 import pytest
 
 import zeta.providers.codex as codex_module
+from zeta.core.context import ContextAssembler
+from zeta.core.slash import SlashStatus, _format_status
+from zeta.core.store import ConversationStore
 from zeta.providers.anthropic import OAuthTokens
 from zeta.providers.codex import (
     DEFAULT_CODEX_MODEL,
@@ -21,9 +24,6 @@ from zeta.providers.codex import (
     build_responses_payload,
     extract_account_id,
 )
-from zeta.core.context import ContextAssembler
-from zeta.core.slash import SlashStatus, _format_status
-from zeta.core.store import ConversationStore
 from zeta.types import (
     Message,
     MessageRole,
@@ -1344,6 +1344,40 @@ def test_payload_maps_plan_messages_and_tools() -> None:
         {"role": "user", "content": [{"type": "input_text", "text": "run"}]},
         {"type": "function_call_output", "call_id": "call-test", "output": "done"},
     ]
+
+
+def test_codex_instruction_and_tool_sections_are_byte_stable() -> None:
+    schema = {
+        "name": "read",
+        "description": "read a file",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    }
+    first = build_responses_payload(
+        [
+            Message(MessageRole.SYSTEM, [TextContent("stable instructions")]),
+            Message(MessageRole.USER, [TextContent("first")]),
+        ],
+        [schema],
+        model=DEFAULT_CODEX_MODEL,
+    )
+    second = build_responses_payload(
+        [
+            Message(MessageRole.SYSTEM, [TextContent("stable instructions")]),
+            Message(MessageRole.USER, [TextContent("second")]),
+        ],
+        [schema],
+        model=DEFAULT_CODEX_MODEL,
+    )
+
+    encode = lambda value: json.dumps(
+        value, ensure_ascii=False, separators=(",", ":")
+    ).encode()
+    assert encode(first["instructions"]) == encode(second["instructions"])
+    assert encode(first["tools"]) == encode(second["tools"])
 
 
 def test_empty_codex_instructions_keep_provider_fallback() -> None:

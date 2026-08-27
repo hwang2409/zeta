@@ -48,6 +48,48 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fake_usage_reports_cache_reads_on_consecutive_turns(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                [TextContent("first")],
+                usage={
+                    "input_tokens": 100,
+                    "cache_creation_input_tokens": 80,
+                    "output_tokens": 5,
+                },
+            ),
+            ScriptedTurn(
+                [TextContent("second")],
+                usage={
+                    "input_tokens": 20,
+                    "cache_read_input_tokens": 80,
+                    "output_tokens": 5,
+                },
+            ),
+            ScriptedTurn(
+                [TextContent("third")],
+                usage={
+                    "input_tokens": 20,
+                    "cache_read_input_tokens": 100,
+                    "output_tokens": 5,
+                },
+            ),
+        ]
+    )
+    loop = AgentLoop(backend, ConversationStore(tmp_path), tool_schemas=[])
+
+    await collect(loop.run_turn("first prompt"))
+    assert loop.context_assembler.cache_read_input_tokens_this_session == 0
+    await collect(loop.run_turn("second prompt"))
+    assert loop.context_assembler.cache_read_input_tokens_this_session == 80
+    await collect(loop.run_turn("third prompt"))
+
+    assert loop.context_assembler.cache_read_input_tokens_this_session == 180
+    assert loop.context_assembler.cache_creation_input_tokens_this_session == 80
+
+
+@pytest.mark.asyncio
 async def test_unsigned_thinking_is_not_persisted_with_assistant_message(
     tmp_path: Path,
 ) -> None:
