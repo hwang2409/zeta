@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import warnings
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
@@ -116,6 +117,7 @@ class AgentLoop:
         self.store = store
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
+        self._agent_child_turns: dict[str, int] = {}
         self._recover_agent_children()
         if registry is not None and tools is not None:
             raise ValueError("pass only one tool registry")
@@ -215,6 +217,51 @@ class AgentLoop:
         task.add_done_callback(self._tracked_tasks.discard)
         return task
 
+    def _child_result_payload(
+        self,
+        tool_call_id: str,
+        content: str,
+        *,
+        error: bool,
+        child_session_path: str | None = None,
+        turns_used: int | None = None,
+    ) -> dict[str, object]:
+        child_store = self._agent_child_stores.get(tool_call_id)
+        path = (
+            child_session_path
+            if child_session_path is not None
+            else str(child_store.session_dir) if child_store is not None else ""
+        )
+        turns = (
+            turns_used
+            if turns_used is not None
+            else self._agent_child_turns.get(tool_call_id, 0)
+        )
+        return agent_result(
+            content,
+            error=error,
+            turns_used=turns,
+            child_session_path=path,
+        )
+
+    def _canceled_agent_result(
+        self,
+        tool_call_id: str,
+        *,
+        child_session_path: str | None = None,
+        turns_used: int | None = None,
+    ) -> ToolResult:
+        return _validated_tool_result(
+            self._child_result_payload(
+                tool_call_id,
+                "tool execution canceled",
+                error=True,
+                child_session_path=child_session_path,
+                turns_used=turns_used,
+            ),
+            tool_call_id,
+        )
+
     def _recover_agent_children(self) -> None:
         """Resolve child markers left by a process exit before resuming."""
 
@@ -226,10 +273,10 @@ class AgentLoop:
                     Message(
                         MessageRole.TOOL_RESULT,
                         [TextContent("tool execution canceled")],
-                        tool_result=ToolResult(
+                        tool_result=self._canceled_agent_result(
                             tool_call_id,
-                            "tool execution canceled",
-                            is_error=True,
+                            child_session_path=marker["child_session_path"],
+                            turns_used=marker.get("turns_used", 0),
                         ),
                     )
                 )
@@ -257,18 +304,16 @@ class AgentLoop:
         prompt = arguments.get("prompt")
         description = arguments.get("description")
         if type(prompt) is not str or not prompt.strip():
-            return agent_result(
+            return self._child_result_payload(
+                tool_call.id,
                 "agent error: prompt must be a nonempty string",
                 error=True,
-                turns_used=0,
-                child_session_path="",
             )
         if type(description) is not str or not description.strip():
-            return agent_result(
+            return self._child_result_payload(
+                tool_call.id,
                 "agent error: description must be a nonempty string",
                 error=True,
-                turns_used=0,
-                child_session_path="",
             )
         child_number = self.store.allocate_agent_index()
         agents_root = self.store.session_dir / "agents"
@@ -281,6 +326,9 @@ class AgentLoop:
         child_path = str(child_store.session_dir)
         child_instance_id = f"{self.store.session_id}:{child_number}"
         self._agent_child_stores[tool_call.id] = child_store
+        self._agent_child_turns[tool_call.id] = 0
+        if publisher is not None:
+            publisher.set_metadata({"child_session_path": child_path})
         self.store.register_agent_child(
             tool_call,
             child_session_path=child_path,
@@ -314,19 +362,28 @@ class AgentLoop:
             if publisher is not None:
                 publisher.publish(f"{description}: {status}\n", "stdout")
 
+        def child_turns() -> int:
+            return self._agent_child_turns.get(tool_call.id, 0)
+
+        def child_result(text: str, *, error: bool) -> dict[str, object]:
+            return self._child_result_payload(
+                tool_call.id,
+                text,
+                error=error,
+                child_session_path=child_path,
+            )
+
         async def consume() -> dict[str, object]:
-            turns_used = 0
             final_message: Message | None = None
             last_assistant_text = ""
             cap_hit = False
             error_message: str | None = None
             async for event in child_loop.run_turn(prompt):
                 if event.type is StreamEventType.TURN_START:
-                    turns_used = max(turns_used, int(event.data.get("turn", 0)))
-                    publish("thinking")
+                    publish(f"turn {child_turns() + 1}: thinking")
                 elif event.type is StreamEventType.TOOL_APPROVAL_START:
                     name = event.tool_call.name if event.tool_call is not None else "tool"
-                    publish(f"approval pending: {name}")
+                    publish(f"turn {child_turns() + 1}: approval pending: {name}")
                     if self.tool_registry._active_lifecycle_sink is not None:
                         self.tool_registry._active_lifecycle_sink(
                             "approval_start", event.tool_call
@@ -338,8 +395,17 @@ class AgentLoop:
                         )
                 elif event.type is StreamEventType.TOOL_EXECUTION_START:
                     name = event.tool_call.name if event.tool_call is not None else "tool"
-                    publish(f"tool: {name}")
+                    arguments = (
+                        event.tool_call.arguments
+                        if event.tool_call is not None
+                        else {}
+                    )
+                    summary = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
+                    publish(f"turn {child_turns() + 1}: tool: {name} {summary}")
                 elif event.type is StreamEventType.TURN_END:
+                    turns = child_turns() + 1
+                    self._agent_child_turns[tool_call.id] = turns
+                    self.store.update_agent_child_turns(tool_call.id, turns)
                     if event.message is not None:
                         last_assistant_text = _assistant_text_snippet(event.message)
                     if event.data.get("tool_calls") == 0 and event.message is not None:
@@ -350,43 +416,26 @@ class AgentLoop:
                     else:
                         error_message = event.error.message
             if cap_hit:
-                return agent_result(
+                return child_result(
                     f"agent error: child reached the {CHILD_TURN_CAP}-turn cap; "
                     f"partial state is saved at {child_path}; "
                     f"last assistant text: {last_assistant_text or '[none]'}; "
-                    f"turns used: {turns_used}",
+                    f"turns used: {child_turns()}",
                     error=True,
-                    turns_used=turns_used,
-                    child_session_path=child_path,
                 )
             if error_message is not None:
-                return agent_result(
-                    f"agent error: {error_message}",
-                    error=True,
-                    turns_used=turns_used,
-                    child_session_path=child_path,
-                )
+                return child_result(f"agent error: {error_message}", error=True)
             if final_message is None:
-                return agent_result(
-                    "agent error: child ended without a final response",
-                    error=True,
-                    turns_used=turns_used,
-                    child_session_path=child_path,
+                return child_result(
+                    "agent error: child ended without a final response", error=True
                 )
             final_text = _assistant_text(final_message)
             if not final_text.strip():
-                return agent_result(
+                return child_result(
                     "agent error: child returned an empty final assistant message",
                     error=True,
-                    turns_used=turns_used,
-                    child_session_path=child_path,
                 )
-            return agent_result(
-                final_text,
-                error=False,
-                turns_used=turns_used,
-                child_session_path=child_path,
-            )
+            return child_result(final_text, error=False)
 
         child_task = self._create_task(consume())
         abort_task = self._create_task(abort_signal.wait())
@@ -896,12 +945,28 @@ class AgentLoop:
         new_results: list[tuple[ToolCall, ToolResult]] = []
         for call, slot in zip(calls, slots, strict=True):
             result = self._existing_tool_result(call.id)
-            if result is None:
-                result = slot or ToolResult(
+            stored_result = result
+            child_store = self._agent_child_stores.get(call.id)
+            candidate = result if result is not None else slot
+            if (
+                child_store is not None
+                and (candidate is None or candidate.content == "tool execution canceled")
+            ):
+                result = self._canceled_agent_result(
                     call.id,
-                    "tool execution canceled",
-                    is_error=True,
+                    child_session_path=str(child_store.session_dir),
                 )
+            if result is None:
+                result = slot
+                if result is None and call.name == "agent":
+                    result = self._canceled_agent_result(call.id)
+                if result is None:
+                    result = ToolResult(
+                        call.id,
+                        "tool execution canceled",
+                        is_error=True,
+                    )
+            if stored_result is None:
                 new_results.append((call, result))
             results.append(result)
         for call, result in new_results:
@@ -919,6 +984,7 @@ class AgentLoop:
                 if child_store is not None:
                     child_store.finish_agent_parent()
                 self.store.finish_agent_child(call.id)
+                self._agent_child_turns.pop(call.id, None)
         return results
 
     def _persist_partial(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import json
@@ -25,6 +26,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.data_structures import Size
@@ -53,6 +55,8 @@ from zeta.tui.render import (
     format_thought,
     render_code,
     render_event,
+    render_agent_progress,
+    render_agent_receipt,
     render_line,
     render_markdown,
     render_thought,
@@ -1346,9 +1350,352 @@ def test_agent_rendering_stays_on_one_status_line() -> None:
     rendered = render_event(event)
     assert rendered is not None
     assert not isinstance(rendered, Panel)
-    assert "agent" in renderable_plain(rendered)
+    assert "task research" in renderable_plain(rendered)
+    start = render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    assert isinstance(start, Panel)
     progress = render_tool_progress(call, "task research: thinking")
-    assert not isinstance(progress, Panel)
+    assert isinstance(progress, Panel)
+
+
+def test_agent_running_card_shows_step_elapsed_and_turns() -> None:
+    call = ToolCall(
+        "agent-running",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+
+    rendered = render_agent_progress(
+        call,
+        "task research: turn 3: tool: read {\"path\":\"README.md\"}",
+        elapsed_seconds=4.2,
+    )
+
+    plain = renderable_plain(rendered)
+    assert "task research · 4.2s · 3 turns" in plain
+    assert "tool: read" in plain
+    assert "README.md" in plain
+
+
+def test_agent_receipts_show_success_and_canceled_status() -> None:
+    call = ToolCall(
+        "agent-receipt",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    success = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done",
+            structured_content={"turns_used": 2, "child_session_path": ""},
+        ),
+        data={"elapsed_seconds": 1.5},
+    )
+    canceled = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "tool execution canceled", is_error=True),
+        data={"elapsed_seconds": 0.4},
+    )
+
+    assert "2 turns · 1.5s · ok" in render_agent_receipt(success).plain
+    assert "0 turns · 0.4s · canceled" in render_agent_receipt(canceled).plain
+
+
+def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    for index in range(25):
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"child line {index}")])
+        )
+    call = ToolCall(
+        "agent-expand",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done",
+            structured_content={
+                "turns_used": 3,
+                "child_session_path": str(child.session_dir),
+            },
+        ),
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    ))
+    transcript.finish_tool(call.id, render_event(event), event)
+
+    assert transcript.toggle_latest_agent()
+    rendered = Text.from_ansi(transcript.render(120)).plain
+    assert "child line 4" not in rendered
+    assert "child line 5" in rendered
+    assert "child line 24" in rendered
+    assert rendered.count("child line ") == 20
+
+
+def test_agent_cards_remain_in_sequential_order() -> None:
+    transcript = TranscriptWidget()
+    for index in range(2):
+        call = ToolCall(
+            f"agent-{index}",
+            "agent",
+            {"prompt": "inspect", "description": f"task {index}"},
+        )
+        event = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "done",
+                structured_content={"turns_used": index + 1, "child_session_path": ""},
+            ),
+        )
+        transcript.start_tool(call.id, call, render_event(
+            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        ))
+        transcript.finish_tool(call.id, render_event(event), event)
+
+    rendered = Text.from_ansi(transcript.render(120)).plain
+    assert rendered.index("task 0") < rendered.index("task 1")
+    assert len(transcript._agent_units) == 2
+
+
+def test_running_agent_card_can_expand_and_read_live_tail(tmp_path: Path) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("live tail")]))
+    call = ToolCall(
+        "agent-running-expand",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    update = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_UPDATE,
+        tool_call=call,
+        delta="turn 1: thinking",
+        data={"stream": "stdout", "child_session_path": str(child.session_dir)},
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(start))
+    transcript.update_tool(call.id, Text(update.delta), update)
+
+    assert transcript.toggle_latest_agent()
+    rendered = Text.from_ansi(transcript.render(120)).plain
+    assert "live tail" in rendered
+    assert "1 turns" in rendered
+
+
+def test_agent_card_toggle_is_symmetric_during_and_after_execution(
+    tmp_path: Path,
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("live tail")]))
+    call = ToolCall(
+        "agent-toggle",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    start = StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    update = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_UPDATE,
+        tool_call=call,
+        delta="turn 1: thinking",
+        data={"child_session_path": str(child.session_dir)},
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(start))
+    transcript.update_tool(call.id, Text(update.delta), update)
+
+    assert transcript.toggle_latest_agent()
+    assert "collapse: ctrl+x ctrl+o" in transcript.render(120)
+    assert transcript.toggle_latest_agent()
+    assert "expand: ctrl+x ctrl+o" in transcript.render(120)
+
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done",
+            structured_content={
+                "turns_used": 1,
+                "child_session_path": str(child.session_dir),
+            },
+        ),
+    )
+    transcript.finish_tool(call.id, render_event(event), event)
+    assert transcript.toggle_latest_agent()
+    assert "collapse: ctrl+x ctrl+o" in transcript.render(120)
+    assert transcript.toggle_latest_agent()
+    rendered = Text.from_ansi(transcript.render(120)).plain
+    assert "expand: ctrl+x ctrl+o" in rendered
+    assert "1 turns · 0.0s · ok" in rendered
+
+
+def test_canceled_agent_card_can_expand_with_persisted_child_tail(tmp_path: Path) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.USER, [TextContent("cancelled task")]))
+    call = ToolCall(
+        "agent-canceled-expand",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "tool execution canceled",
+            is_error=True,
+            structured_content={
+                "turns_used": 1,
+                "child_session_path": str(child.session_dir),
+            },
+        ),
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(StreamEvent(
+        StreamEventType.TOOL_EXECUTION_START, tool_call=call
+    )))
+    transcript.finish_tool(call.id, render_event(event), event)
+
+    assert transcript.toggle_latest_agent()
+    assert "cancelled task" in Text.from_ansi(transcript.render(120)).plain
+
+
+def test_recovered_canceled_agent_card_expands_with_child_tail(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="parent")
+    call = ToolCall(
+        "agent-recovered",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    child = ConversationStore(
+        store.session_dir / "agents", session_id="1", cwd=store.cwd
+    )
+    child.mark_agent_parent(call.id)
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("saved child tail")]))
+    store.allocate_agent_index()
+    store.register_agent_child(
+        call,
+        child_session_path=str(child.session_dir),
+        description="task research",
+    )
+    store.update_agent_child_turns(call.id, 2)
+
+    AgentLoop(FakeBackend([]), store, max_turns=1)
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=result,
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(
+        call.id,
+        call,
+        render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)),
+    )
+    transcript.finish_tool(call.id, render_event(event), event)
+
+    assert transcript.toggle_latest_agent()
+    rendered = Text.from_ansi(transcript.render(120)).plain
+    assert "saved child tail" in rendered
+    assert "2 turns" in rendered
+
+
+def test_finished_agent_card_keeps_elapsed_time_after_clock_moves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zeta.tui.agent_card as agent_card
+
+    clock = iter((100.0, 105.0, 205.0))
+    monkeypatch.setattr(agent_card.time, "monotonic", lambda: next(clock))
+    call = ToolCall(
+        "agent-clock",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("done")]))
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done",
+            structured_content={
+                "turns_used": 1,
+                "child_session_path": str(child.session_dir),
+            },
+        ),
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(StreamEvent(
+        StreamEventType.TOOL_EXECUTION_START, tool_call=call
+    )))
+    transcript.finish_tool(call.id, render_event(event), event)
+    assert transcript.toggle_latest_agent()
+
+    rendered = Text.from_ansi(transcript.render(120)).plain
+    assert "5.0s" in rendered
+    assert "105.0s" not in rendered
+
+
+def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
+    root = Path(__file__).parents[1] / "src" / "zeta" / "tui"
+    allowed_path = Path("tui") / "agent_card.py"
+    violations: list[str] = []
+
+    def docstring_constants(tree: ast.Module) -> set[ast.Constant]:
+        return {
+            node.body[0].value
+            for node in ast.walk(tree)
+            if isinstance(
+                node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+            )
+            and node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        }
+
+    for path in root.rglob("*.py"):
+        if path.relative_to(root.parent) == allowed_path:
+            continue
+        tree = ast.parse(path.read_text(), filename=str(path))
+        ignored = docstring_constants(tree)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and node.value == "agent"
+                and node not in ignored
+            ):
+                violations.append(f"{path}:{node.lineno}")
+
+    assert violations == []
+
+
+def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None:
+    bindings = build_key_bindings(
+        on_interrupt=lambda: None,
+        on_exit=lambda: None,
+        on_toggle_agent=lambda: None,
+    )
+    assert not bindings.get_bindings_for_keys((Keys.ControlO,))
+    assert bindings.get_bindings_for_keys((Keys.ControlX, Keys.ControlO))
+    for mode in (EditingMode.EMACS, EditingMode.VI):
+        session = PromptSession(key_bindings=bindings, editing_mode=mode)
+        assert not session.app.key_bindings.get_bindings_for_keys((Keys.ControlO,))
 
 
 def test_long_single_line_read_uses_a_cropped_card() -> None:

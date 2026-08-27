@@ -427,6 +427,7 @@ def build_key_bindings(
     on_paste: Callable[[KeyPressEvent], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
+    on_toggle_agent: Callable[[], None] | None = None,
 ) -> KeyBindings:
     """Build the small key map used by the full-screen composer."""
 
@@ -534,6 +535,13 @@ def build_key_bindings(
         def page_down(event: KeyPressEvent) -> None:
             del event
             on_page_down()
+
+    if on_toggle_agent is not None:
+
+        @bindings.add("c-x", "c-o")
+        def toggle_agent(event: KeyPressEvent) -> None:
+            del event
+            on_toggle_agent()
 
     return bindings
 

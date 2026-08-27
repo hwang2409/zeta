@@ -44,6 +44,7 @@ from .theme import (
     THOUGHT,
     VIM_STATE,
 )
+from .agent_card import AgentCard
 
 
 MAX_ARGUMENTS = 140
@@ -51,7 +52,7 @@ MAX_RESULT = 180
 MAX_TOOL_LINES = 15
 SPINNER_FRAMES = ("·", "•", "●", "•")
 RECEIPT_TOOLS = frozenset(
-    {"agent", "read", "glob", "grep", "search", "find", "list", "websearch"}
+    {"read", "glob", "grep", "search", "find", "list", "websearch"}
 )
 SUMMARY_TOOLS = frozenset({"glob", "grep", "search", "find", "websearch"})
 OSC_RE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b]*(?:\x07|\x1b\\)")
@@ -60,6 +61,11 @@ CSI_UNSUPPORTED_RE = re.compile(
     r"(?:\x1b\[|\x9b)[0-?]*[ -/]*(?!m)[@-~]"
 )
 ToolRenderMode = Literal["card", "receipt"]
+
+# Keep the renderer imports used by callers stable while dispatch stays in AgentCard.
+render_agent_expanded = AgentCard.render_expanded
+render_agent_progress = AgentCard.render_progress
+render_agent_receipt = AgentCard.render_receipt
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -354,13 +360,23 @@ def _tool_panel(
     )
 
 
-def render_tool_progress(call: ToolCall, content: str) -> RenderableType:
+def render_tool_progress(
+    call: ToolCall,
+    content: str,
+    *,
+    elapsed_seconds: float = 0.0,
+    turns_used: int | None = None,
+) -> RenderableType:
     """Render streamed tool output for the transcript."""
 
-    if call.name.lower() == "agent":
-        lines = content.splitlines()
-        status = lines[-1] if lines else "running"
-        return _safe_text(status, style=RECEIPT)
+    agent_render = AgentCard.render_progress(
+        call,
+        content,
+        elapsed_seconds=elapsed_seconds,
+        turns_used=turns_used,
+    )
+    if agent_render is not None:
+        return agent_render
     body = Text("running…", style=DIM) if not content else _render_tool_output(content)
     return _tool_panel(call, body)
 
@@ -810,6 +826,9 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         text = event.data.get("text")
         return Text(text if type(text) is str else "retrying", style=DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
+        agent_render = AgentCard.render_progress(event.tool_call, "")
+        if agent_render is not None:
+            return agent_render
         if event.tool_call.name.lower() in RECEIPT_TOOLS:
             suffix = _receipt_arguments(event.tool_call, "")
             return Text(
@@ -822,6 +841,9 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         label = f"[{stream}] " if stream in {"stdout", "stderr"} else ""
         return _safe_text(f"  ↳ {label}{event.delta}", style=DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:
+        agent_render = AgentCard.render_receipt(event)
+        if agent_render is not None:
+            return agent_render
         if tool_render_mode(event) == "receipt":
             return _tool_receipt(event)
         return _tool_card(event)

@@ -29,6 +29,12 @@ references to one resolved path produce one attachment block.
 - `tests/` — pytest suite (`uv run pytest -q`)
 - `docs/design.md` — architecture and ticket ladder
 
+## full-screen transcript keys
+
+- `pageup` and `pagedown` scroll the transcript.
+- `ctrl+x ctrl+o` expands or collapses the newest child card.
+- `ctrl+o` keeps its native prompt-toolkit behavior in the composer.
+
 ## Prior art
 
 - [pi](https://github.com/earendil-works/pi) (MIT) — reference for the

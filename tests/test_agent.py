@@ -309,6 +309,27 @@ async def test_agent_result_metadata_survives_parent_replay(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_agent_normal_completion_reports_all_child_turns(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call()]),
+            ScriptedTurn(
+                [TextContent("first")],
+                tool_calls=[ToolCall("child-read", "read", {"path": "missing"})],
+            ),
+            ScriptedTurn([TextContent("second")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result.structured_content is not None
+    assert result.structured_content["turns_used"] == 2
+
+
+@pytest.mark.asyncio
 async def test_empty_child_final_message_returns_error(tmp_path: Path) -> None:
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[_agent_call()]), ScriptedTurn()]
@@ -339,6 +360,10 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     await task
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.content == "tool execution canceled"
+    assert result.structured_content == {
+        "turns_used": 0,
+        "child_session_path": str(store.session_dir / "agents" / "1"),
+    }
     child_state = (store.session_dir / "agents" / "1" / "session_state.json").read_text()
     assert '"agent_parent"' not in child_state
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
@@ -347,6 +372,36 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
         "content": "tool execution canceled",
     }
     assert not store.agent_children()
+
+
+@pytest.mark.asyncio
+async def test_parent_abort_after_child_turn_reports_completed_turns(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call()]),
+            ScriptedTurn(
+                [TextContent("first")],
+                tool_calls=[ToolCall("child-read", "read", {"path": "missing"})],
+            ),
+            ScriptedTurn([TextContent("slow")], delay=5),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    async for event in loop.run_turn("start"):
+        if (
+            event.type is StreamEventType.TOOL_EXECUTION_UPDATE
+            and event.delta is not None
+            and "turn 2: thinking" in event.delta
+        ):
+            loop.abort()
+
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result.structured_content == {
+        "turns_used": 1,
+        "child_session_path": str(store.session_dir / "agents" / "1"),
+    }
 
 
 @pytest.mark.asyncio
@@ -385,10 +440,15 @@ def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
         child_session_path=str(child.session_dir),
         description="task research",
     )
+    store.update_agent_child_turns(call.id, 2)
 
     AgentLoop(FakeBackend([]), store, max_turns=1)
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.content == "tool execution canceled"
+    assert result.structured_content == {
+        "turns_used": 2,
+        "child_session_path": str(child.session_dir),
+    }
     assert not store.agent_children()
     assert '"agent_parent"' not in (child.state_path).read_text()
