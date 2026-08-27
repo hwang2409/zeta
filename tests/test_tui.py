@@ -297,6 +297,66 @@ class ErrorBackend(CompletionBackend):
         raise RuntimeError("boom")
 
 
+class AbortThenSuccessBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.calls = 0
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        call = self.calls
+        self.calls += 1
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        if call == 0:
+            yield StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=TextContent("partial response"),
+            )
+            self.started.set()
+            await asyncio.Event().wait()
+        response = "second response"
+        yield StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent(response),
+        )
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent(response)]),
+        )
+
+
+class ErrorThenSuccessBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        call = self.calls
+        self.calls += 1
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        if call == 0:
+            yield StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=TextContent("partial response"),
+            )
+            raise RuntimeError("boom")
+        response = "second response"
+        yield StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent(response),
+        )
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent(response)]),
+        )
+
+
 class EventBackend(CompletionBackend):
     def __init__(self, event: StreamEvent) -> None:
         self.event = event
@@ -2082,7 +2142,7 @@ async def test_truncated_response_notice_is_printed_once(tmp_path: Path) -> None
     assert "no response" not in output.getvalue()
 
 
-def test_stream_kind_switch_flushes_assistant_before_thinking(tmp_path: Path) -> None:
+def test_stream_kind_switch_keeps_partial_assistant_transient(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(GateBackend(), ConversationStore(tmp_path / "sessions")),
         provider="fake",
@@ -2111,9 +2171,9 @@ def test_stream_kind_switch_flushes_assistant_before_thinking(tmp_path: Path) ->
         )
     )
 
-    assert rendered[0].plain == "| name | value |\n| --- | --- |"
-    assert rendered[1].plain.startswith("✱ thought · ")
-    assert rendered[1].plain.endswith("\nplan\n")
+    assert rendered[0].plain.startswith("✱ thought · ")
+    assert rendered[0].plain.endswith("\nplan\n")
+    assert all("| name | value |" not in item.plain for item in rendered)
 
 
 def test_thought_stream_is_visible_before_completion(tmp_path: Path) -> None:
@@ -2286,6 +2346,7 @@ async def test_error_flushes_assistant_before_error(tmp_path: Path) -> None:
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
+    app._active_session = app._make_session()
     rendered = []
 
     def capture(renderable: object | None) -> None:
@@ -2318,6 +2379,7 @@ async def test_verbose_error_flushes_before_raw_error(tmp_path: Path) -> None:
         verbose=True,
         console=Console(file=StringIO(), force_terminal=False),
     )
+    app._active_session = app._make_session()
     rendered = []
 
     def capture(renderable: object | None) -> None:
@@ -2386,6 +2448,7 @@ async def test_verbose_transition_flushes_before_raw_event(
         verbose=True,
         console=Console(file=StringIO(), force_terminal=False),
     )
+    app._active_session = app._make_session()
     rendered = []
 
     def capture(renderable: object | None) -> None:
@@ -2913,53 +2976,11 @@ def test_markdown_stream_preserves_model_line_structure(tmp_path: Path) -> None:
     ]
 
 
-@pytest.mark.asyncio
-async def test_completed_markdown_spans_ignore_stream_chunk_boundaries(
-    tmp_path: Path,
+def test_completed_message_renders_final_message_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = (
-        "1. **Round 2 (parallel):** use **four** workers, then "
-        "**single `fallback`**."
-    )
-    code_start = source.index("`fallback`")
-    code_end = code_start + len("`fallback`")
-    segmentations = [
-        [source],
-        [source[: source.index("**single") + 2], source[source.index("**single") + 2 :]],
-        [source[: code_start + 1], source[code_start + 1 :]],
-        [source[: code_end - 1], source[code_end - 1 :]],
-        [source[index : index + 3] for index in range(0, len(source), 3)],
-        list(source),
-    ]
-
-    rendered_outputs: list[str] = []
-    for chunks in segmentations:
-        app = TUIApp(
-            AgentLoop(
-                FakeBackend(
-                    [ScriptedTurn(content=[TextContent(chunk) for chunk in chunks])]
-                ),
-                ConversationStore(tmp_path / str(len(rendered_outputs))),
-            ),
-            provider="fake",
-            model="offline",
-        )
-        app._active_session = app._make_session()
-
-        await app._consume_turn("prompt")
-
-        rendered = app._transcript.render(120)
-        rendered_outputs.append(rendered)
-        plain = Text.from_ansi(rendered).plain
-        assert "**" not in plain
-        assert plain == (
-            "1. Round 2 (parallel): use four workers, then single fallback."
-        )
-
-    assert rendered_outputs == [rendered_outputs[0]] * len(segmentations)
-
-
-def test_completed_message_renders_final_message_text(tmp_path: Path) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
     source = (
         "1. **Round 2 (parallel):** use **four** workers, then "
         "**single `fallback`**."
@@ -3097,11 +3118,15 @@ async def test_rebuild_transcript_matches_character_stream(
 ) -> None:
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setenv("COLORTERM", "truecolor")
-    source = "before **bold** after"
+    source_parts = [
+        TextContent("before **"),
+        ThinkingContent(""),
+        TextContent("bold** after"),
+    ]
     app = TUIApp(
         AgentLoop(
             FakeBackend(
-                [ScriptedTurn(content=[TextContent(character) for character in source])]
+                [ScriptedTurn(content=source_parts)]
             ),
             ConversationStore(tmp_path / "sessions"),
         ),
@@ -3117,6 +3142,174 @@ async def test_rebuild_transcript_matches_character_stream(
     app._rebuild_transcript()
     replayed = app._transcript.render(120)
     assert replayed == live
+
+
+@pytest.mark.asyncio
+async def test_aborted_turn_does_not_reorder_the_next_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    backend = AbortThenSuccessBackend()
+    app = TUIApp(
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    app._print_user("first prompt")
+    first_turn = asyncio.create_task(app._consume_turn("first prompt"))
+    app._active_task = first_turn
+    await backend.started.wait()
+
+    app.abort_active()
+    await asyncio.gather(first_turn, return_exceptions=True)
+    app._print_user("second prompt")
+    await app._consume_turn("second prompt")
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    markers = [
+        rendered.index("▌ first prompt"),
+        rendered.index("partial response"),
+        rendered.index("[aborted]"),
+        rendered.index("▌ second prompt"),
+        rendered.index("second response"),
+    ]
+    assert markers == sorted(markers)
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_does_not_reorder_the_next_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    app = TUIApp(
+        AgentLoop(
+            ErrorThenSuccessBackend(),
+            ConversationStore(tmp_path / "sessions"),
+        ),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    app._print_user("first prompt")
+    await app._consume_turn("first prompt")
+    app._print_user("second prompt")
+    await app._consume_turn("second prompt")
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    markers = [
+        rendered.index("▌ first prompt"),
+        rendered.index("partial response"),
+        rendered.index("[error] boom"),
+        rendered.index("▌ second prompt"),
+        rendered.index("second response"),
+    ]
+    assert markers == sorted(markers)
+
+
+def test_empty_final_message_removes_streamed_assistant_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    app._prepare_stream_event(StreamEvent(StreamEventType.MESSAGE_START))
+    app._consume_text(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("ghost **text**"),
+        )
+    )
+    app._finish_message(
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT),
+        )
+    )
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "ghost" not in rendered
+    assert "text" not in rendered
+
+
+@pytest.mark.parametrize("boundary", ["thinking", "tool"])
+def test_inline_message_commits_canonical_text_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    call = ToolCall("inline-split", "read", {"path": "README.md"})
+    middle = (
+        ThinkingContent("plan")
+        if boundary == "thinking"
+        else ToolUseContent(call)
+    )
+    message = Message(
+        MessageRole.ASSISTANT,
+        [TextContent("before **"), middle, TextContent("bold** after")],
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+    app._prepare_stream_event(StreamEvent(StreamEventType.MESSAGE_START))
+    for block in message.content:
+        event = StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        app._prepare_stream_event(event)
+        app._consume_text(event)
+    app._finish_message(StreamEvent(StreamEventType.MESSAGE_END, message=message))
+
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert plain.count("before bold after") == 1
+    assert "**" not in plain
+    if boundary == "thinking":
+        assert plain.count("plan") == 1
+
+
+def test_rebuild_user_attachment_hides_file_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        Message(
+            MessageRole.USER,
+            [
+                TextContent("inspect @notes.txt"),
+                TextContent(
+                    "[file: /tmp/notes.txt · 12 bytes]\nsecret contents",
+                    "/tmp/notes.txt",
+                    12,
+                ),
+            ],
+        )
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "▌ inspect @notes.txt" in rendered
+    assert "file · /tmp/notes.txt · 12 bytes" in rendered
+    assert "secret contents" not in rendered
 
 
 def test_markdown_stream_keeps_model_blank_lines_without_inserting_more(

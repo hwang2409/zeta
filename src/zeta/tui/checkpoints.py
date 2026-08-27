@@ -98,10 +98,6 @@ class CheckpointTranscriptMixin:
         self._fork_rebuilt = True
         return f"forked to checkpoint '{entry.data['label']}' at seq {entry.data['from_seq']}"
 
-    @staticmethod
-    def _message_text(message: Message) -> str:
-        return assistant_text(message)
-
     def _rebuild_transcript(self) -> None:
         """Re-render the visible transcript from the active durable branch."""
 
@@ -122,10 +118,10 @@ class CheckpointTranscriptMixin:
             if entry.type != "message":
                 continue
             message = Message.from_dict(entry.data["message"])
-            text = self._message_text(message)
-            if message.role is MessageRole.USER and text:
-                self._print_user(text)
+            if message.role is MessageRole.USER:
+                self._print_user(message)
             elif message.role is MessageRole.ASSISTANT:
+                text = assistant_text(message)
                 if text:
                     self._print_unit(render_markdown(text))
                 for block in message.content:

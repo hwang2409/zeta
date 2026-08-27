@@ -726,15 +726,13 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
             if event.message is not None
             else self._assistant_text
         )
-        if value:
-            self._presenter.finish_assistant_message(render_markdown(value))
-            self._turn_had_visible_output |= bool(value.strip())
+        self._presenter.finish_assistant_message(render_markdown(value) if value else None)
+        if value: self._turn_had_visible_output |= bool(value.strip())
         self._stream_kind = self._stream_identity = None
         self._reset_stream_buffers()
 
     def _flush_pending_stream(self) -> None:
-        self._flush_stream_kind()
-        self._presenter.reset_assistant_unit()
+        self._flush_stream_kind(); self._presenter.reset_assistant_unit()
 
     def _consume_text(self, event: StreamEvent) -> None:
         incoming_kind, incoming_identity = stream_key(event)
@@ -792,6 +790,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
     def _prepare_stream_event(self, event: StreamEvent) -> None:
         if event.type is StreamEventType.MESSAGE_START:
             self._flush_pending_stream()
+            self._presenter.reset_assistant_message()
             self._assistant_text = ""
             return
         if event.type is StreamEventType.MESSAGE_END:
@@ -897,6 +896,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         finally:
             self._presenter.clear_active_tool_calls()
             self._discard_tool_region()
+            self._presenter.reset_assistant_message()
             self._abort_requested = False
             self._streaming = False
             self._spinner_active = False
