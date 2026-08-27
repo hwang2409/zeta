@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,7 +23,14 @@ from rich.text import Text
 
 from ..types import StreamEvent, StreamEventType, ToolCall
 from .layout import CONTENT_MARGIN
-from .render import render_event, render_tool_progress
+from .render import (
+    render_agent_expanded,
+    render_agent_progress,
+    render_agent_receipt,
+    render_event,
+    render_tool_progress,
+    _agent_turns,
+)
 from .theme import RICH_THEME
 
 
@@ -33,18 +41,73 @@ class _ToolUnit:
         self.output: list[str] = []
         self.finished = False
         self.revision = 0
+        self.agent = call.name.lower() == "agent"
+        self.started_at = time.monotonic()
+        self.agent_turns = 0
+        self.agent_child_session_path = ""
+        self.agent_expanded = False
+        self.agent_receipt: RenderableType | None = None
 
     def update(self, rendered: RenderableType) -> None:
         text = getattr(rendered, "plain", None)
         if text is not None:
             self.output.append(text)
         if not self.finished:
-            self.renderable = render_tool_progress(self.call, "\n".join(self.output))
+            content = "\n".join(self.output)
+            self.agent_turns = max(self.agent_turns, _agent_turns(content))
+            self.renderable = render_tool_progress(
+                self.call,
+                content,
+                elapsed_seconds=time.monotonic() - self.started_at,
+                turns_used=self.agent_turns if self.agent else None,
+            )
         self.revision += 1
 
-    def finish(self, rendered: RenderableType) -> None:
+    def refresh(self) -> None:
+        if not self.agent or self.finished:
+            return
+        self.renderable = render_agent_progress(
+            self.call,
+            "\n".join(self.output),
+            elapsed_seconds=time.monotonic() - self.started_at,
+            turns_used=self.agent_turns,
+        )
+        self.revision += 1
+
+    def finish(self, rendered: RenderableType, event: StreamEvent | None = None) -> None:
         self.finished = True
-        self.renderable = rendered
+        if self.agent and event is not None:
+            result = event.tool_result
+            structured = result.structured_content if result is not None else None
+            turns = structured.get("turns_used") if structured else None
+            self.agent_turns = turns if type(turns) is int and turns >= 0 else self.agent_turns
+            child_path = structured.get("child_session_path") if structured else None
+            self.agent_child_session_path = child_path if isinstance(child_path, str) else ""
+            self.renderable = render_agent_receipt(
+                event,
+                elapsed_seconds=time.monotonic() - self.started_at,
+                turns_used=self.agent_turns,
+            )
+            self.agent_receipt = self.renderable
+        else:
+            self.renderable = rendered
+        self.revision += 1
+
+    def toggle_agent(self) -> None:
+        if not self.agent or not self.finished:
+            return
+        self.agent_expanded = not self.agent_expanded
+        if self.agent_expanded:
+            self.renderable = render_agent_expanded(
+                self.call,
+                elapsed_seconds=time.monotonic() - self.started_at,
+                turns_used=self.agent_turns,
+                child_session_path=self.agent_child_session_path,
+            )
+        else:
+            self.renderable = self.agent_receipt
+        if self.renderable is None:
+            return
         self.revision += 1
 
 
@@ -62,6 +125,7 @@ class TranscriptWidget(UIControl):
     def __init__(self) -> None:
         self._units: list[_TranscriptUnit | None] = []
         self._tools: dict[str, _ToolUnit] = {}
+        self._agent_units: dict[str, _ToolUnit] = {}
         self._render_cache: dict[int, tuple[int, int, str]] = {}
         self._parsed_cache: OrderedDict[int, list[list[tuple[str, str]]]] = (
             OrderedDict()
@@ -78,6 +142,10 @@ class TranscriptWidget(UIControl):
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
         return tuple(unit.value if unit is not None else None for unit in self._units)
+
+    @property
+    def has_active_agent(self) -> bool:
+        return any(unit.agent for unit in self._tools.values())
 
     def _bump_revision(self) -> None:
         self._revision += 1
@@ -111,6 +179,7 @@ class TranscriptWidget(UIControl):
 
         self._units.clear()
         self._tools.clear()
+        self._agent_units.clear()
         self._render_cache.clear()
         self._parsed_cache.clear()
         self._line_locations.clear()
@@ -125,6 +194,8 @@ class TranscriptWidget(UIControl):
         unit = _ToolUnit(call, renderable)
         self._append_unit(unit)
         self._tools[call_id] = unit
+        if unit.agent:
+            self._agent_units[call_id] = unit
 
     def update_tool(self, call_id: str, rendered: RenderableType) -> None:
         unit = self._tools.get(call_id)
@@ -132,10 +203,15 @@ class TranscriptWidget(UIControl):
             unit.update(rendered)
             self._bump_revision()
 
-    def finish_tool(self, call_id: str, rendered: RenderableType) -> None:
+    def finish_tool(
+        self,
+        call_id: str,
+        rendered: RenderableType,
+        event: StreamEvent | None = None,
+    ) -> None:
         unit = self._tools.pop(call_id, None)
         if unit is not None:
-            unit.finish(rendered)
+            unit.finish(rendered, event)
             self._bump_revision()
         else:
             self.append(rendered)
@@ -160,6 +236,16 @@ class TranscriptWidget(UIControl):
             self._render_cache.pop(key, None)
         self._tools.clear()
         self._bump_revision()
+
+    def toggle_latest_agent(self) -> bool:
+        """Toggle the newest completed child card and keep its tail bounded."""
+
+        for unit in reversed(tuple(self._agent_units.values())):
+            if unit.finished:
+                unit.toggle_agent()
+                self._bump_revision()
+                return True
+        return False
 
     @property
     def follow_tail(self) -> bool:
@@ -407,6 +493,7 @@ class TranscriptPresenter:
         self._tool_region: Live | None = None
         self._tool_region_text: Text | None = None
         self._tool_region_call: ToolCall | None = None
+        self._tool_region_started_at: float | None = None
         self._thinking_live: Live | None = None
         self._thinking_unit: _TranscriptUnit | None = None
         self._assistant_live: Live | None = None
@@ -415,6 +502,13 @@ class TranscriptPresenter:
     @property
     def tool_region(self) -> Live | None:
         return self._tool_region
+
+    @property
+    def has_active_agent(self) -> bool:
+        return self.transcript.has_active_agent or (
+            self._tool_region_call is not None
+            and self._tool_region_call.name.lower() == "agent"
+        )
 
     def _append(self, renderable: RenderableType) -> None:
         self.transcript.append(renderable)
@@ -552,6 +646,11 @@ class TranscriptPresenter:
                     render_tool_progress(
                         self._tool_region_call,
                         self._tool_region_text.plain,
+                        elapsed_seconds=(
+                            time.monotonic() - self._tool_region_started_at
+                            if self._tool_region_started_at is not None
+                            else 0.0
+                        ),
                     ),
                     (0, CONTENT_MARGIN, 0, CONTENT_MARGIN),
                 )
@@ -572,6 +671,11 @@ class TranscriptPresenter:
                     render_tool_progress(
                         self._tool_region_call,
                         self._tool_region_text.plain,
+                        elapsed_seconds=(
+                            time.monotonic() - self._tool_region_started_at
+                            if self._tool_region_started_at is not None
+                            else 0.0
+                        ),
                     ),
                     (0, CONTENT_MARGIN, 0, CONTENT_MARGIN),
                 )
@@ -579,6 +683,29 @@ class TranscriptPresenter:
         else:
             self._tool_region.update(self._tool_region_text)
         return bool(event.delta and event.delta.strip())
+
+    def refresh_active_agents(self) -> None:
+        """Refresh elapsed time without adding child events to the parent store."""
+
+        for unit in self._tools.values():
+            if unit.agent:
+                unit.refresh()
+        if self._tool_region_call is not None and self._tool_region_call.name.lower() == "agent":
+            if self._tool_region is not None and self._tool_region_text is not None:
+                self._tool_region.update(
+                    Padding(
+                        render_tool_progress(
+                            self._tool_region_call,
+                            self._tool_region_text.plain,
+                            elapsed_seconds=(
+                                time.monotonic() - self._tool_region_started_at
+                                if self._tool_region_started_at is not None
+                                else 0.0
+                            ),
+                        ),
+                        (0, CONTENT_MARGIN, 0, CONTENT_MARGIN),
+                    )
+                )
 
     def handle_tool_event(
         self,
@@ -604,6 +731,8 @@ class TranscriptPresenter:
                 self._printed_units = True
             else:
                 self.print_unit(rendered)
+            if event.tool_call is not None and event.tool_call.name.lower() == "agent":
+                self._tool_region_started_at = time.monotonic()
             return ToolEventPresentation(visible_output=True)
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
             return ToolEventPresentation(
@@ -614,10 +743,21 @@ class TranscriptPresenter:
 
         if event.tool_call is not None:
             self._active_tool_calls.discard(event.tool_call.id)
-        rendered = render_event(event)
+        rendered = (
+            render_agent_receipt(
+                event,
+                elapsed_seconds=(
+                    time.monotonic() - self._tool_region_started_at
+                    if self._tool_region_started_at is not None
+                    else 0.0
+                ),
+            )
+            if event.tool_call is not None and event.tool_call.name.lower() == "agent"
+            else render_event(event)
+        )
         if rendered is not None:
             if self._full_screen_active() and event.tool_call is not None:
-                self.transcript.finish_tool(event.tool_call.id, rendered)
+                self.transcript.finish_tool(event.tool_call.id, rendered, event)
             else:
                 self._pending_tool_renders.append(rendered)
         if not self._active_tool_calls:
@@ -637,6 +777,7 @@ class TranscriptPresenter:
             self._tool_region = None
             self._tool_region_text = None
             self._tool_region_call = None
+            self._tool_region_started_at = None
         for rendered in final_renders:
             self.print(rendered)
         self.reset_assistant_unit()
@@ -650,6 +791,7 @@ class TranscriptPresenter:
             self._tool_region = None
             self._tool_region_text = None
             self._tool_region_call = None
+            self._tool_region_started_at = None
 
     def clear_active_tool_calls(self) -> None:
         self._active_tool_calls.clear()
@@ -660,6 +802,7 @@ class TranscriptPresenter:
         self._tool_region = None
         self._tool_region_text = None
         self._tool_region_call = None
+        self._tool_region_started_at = None
         self._pending_tool_renders.clear()
         self._active_tool_calls.clear()
         self._thinking_live = None

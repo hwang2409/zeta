@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Literal
 
 from markdown_it import MarkdownIt
@@ -49,6 +52,7 @@ from .theme import (
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
 MAX_TOOL_LINES = 15
+MAX_AGENT_TAIL_LINES = 20
 SPINNER_FRAMES = ("·", "•", "●", "•")
 RECEIPT_TOOLS = frozenset(
     {"agent", "read", "glob", "grep", "search", "find", "list", "websearch"}
@@ -85,6 +89,183 @@ def _arguments(arguments: dict[str, Any]) -> str:
     for key in sorted(arguments):
         parts.append(f"{key}={_readable_argument(arguments[key])}")
     return _truncate(" ".join(parts), MAX_ARGUMENTS)
+
+
+def _agent_description(call: ToolCall) -> str:
+    description = call.arguments.get("description")
+    return str(description) if description is not None else call.name
+
+
+def _agent_turns(content: str) -> int:
+    turns = [
+        int(match.group(1))
+        for match in re.finditer(r"\bturn\s+(\d+)\b", content, re.IGNORECASE)
+    ]
+    return max(turns, default=0)
+
+
+def _agent_step(content: str) -> str:
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if not lines:
+        return "thinking"
+    line = lines[-1]
+    line = re.sub(r"^↳\s+(?:\[stdout\]|\[stderr\])\s+", "", line)
+    line = re.sub(r"^.*?:\s+turn\s+\d+:\s+", "", line, flags=re.IGNORECASE)
+    line = re.sub(r"^turn\s+\d+:\s+", "", line, flags=re.IGNORECASE)
+    return _truncate(line, MAX_RESULT)
+
+
+def _agent_elapsed(data: dict[str, Any]) -> float | None:
+    value = data.get("elapsed_seconds")
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value))
+    value = data.get("elapsed_ms")
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value) / 1000)
+    return None
+
+
+def _agent_turns_from_result(event: StreamEvent) -> int:
+    result = event.tool_result
+    if result is None or result.structured_content is None:
+        return 0
+    value = result.structured_content.get("turns_used")
+    return value if type(value) is int and value >= 0 else 0
+
+
+def _agent_header(
+    call: ToolCall,
+    *,
+    elapsed_seconds: float,
+    turns_used: int,
+    expanded: bool = False,
+) -> Text:
+    affordance = "collapse: ctrl+o" if expanded else "expand: ctrl+o"
+    return Text(
+        f"{_agent_description(call)} · {elapsed_seconds:.1f}s · "
+        f"{turns_used} turns · {affordance}",
+        style=COMMAND,
+        no_wrap=True,
+        overflow="ellipsis",
+    )
+
+
+def render_agent_progress(
+    call: ToolCall,
+    content: str,
+    *,
+    elapsed_seconds: float = 0.0,
+    turns_used: int | None = None,
+) -> Panel:
+    """Render the bounded live card for one child agent."""
+
+    turns = _agent_turns(content) if turns_used is None else turns_used
+    body = Text(_agent_step(content), style=BODY, no_wrap=True, overflow="ellipsis")
+    return Panel(
+        Group(_agent_header(call, elapsed_seconds=elapsed_seconds, turns_used=turns), body),
+        border_style=CARD_BORDER,
+        style=CARD_BG,
+        padding=(0, 1),
+        expand=True,
+    )
+
+
+def _child_tail_lines(child_session_path: str, limit: int) -> list[str]:
+    path = Path(child_session_path) / "conversation.jsonl"
+    lines: deque[str] = deque(maxlen=limit)
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for raw_line in handle:
+                try:
+                    row = json.loads(raw_line)
+                except (json.JSONDecodeError, RecursionError):
+                    continue
+                if not isinstance(row, dict) or row.get("type") != "message":
+                    continue
+                data = row.get("data")
+                message = data.get("message") if isinstance(data, dict) else None
+                if not isinstance(message, dict):
+                    continue
+                role = message.get("role", "message")
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type")
+                    if block_type == "text" and isinstance(block.get("text"), str):
+                        for text_line in block["text"].splitlines() or [""]:
+                            lines.append(f"{role}: {text_line}")
+                    elif block_type == "tool_use" and isinstance(block.get("tool_call"), dict):
+                        tool_call = block["tool_call"]
+                        name = tool_call.get("name", "tool")
+                        arguments = tool_call.get("arguments", {})
+                        if isinstance(name, str) and isinstance(arguments, dict):
+                            lines.append(f"tool: {name} {_arguments(arguments)}")
+    except OSError:
+        return []
+    return list(lines)
+
+
+def render_agent_expanded(
+    call: ToolCall,
+    *,
+    elapsed_seconds: float,
+    turns_used: int,
+    child_session_path: str,
+    limit: int = MAX_AGENT_TAIL_LINES,
+) -> Panel:
+    """Render the bounded child transcript tail for an expanded card."""
+
+    tail = _child_tail_lines(child_session_path, limit)
+    body = Text(
+        "\n".join(tail) if tail else "child transcript unavailable",
+        style=BODY if tail else DIM,
+        overflow="ellipsis",
+        no_wrap=True,
+    )
+    return Panel(
+        Group(
+            _agent_header(
+                call,
+                elapsed_seconds=elapsed_seconds,
+                turns_used=turns_used,
+                expanded=True,
+            ),
+            body,
+        ),
+        border_style=CARD_BORDER,
+        style=CARD_BG,
+        padding=(0, 1),
+        expand=True,
+    )
+
+
+def render_agent_receipt(
+    event: StreamEvent,
+    *,
+    elapsed_seconds: float | None = None,
+    turns_used: int | None = None,
+) -> Text:
+    """Render the collapsed one-line child receipt."""
+
+    call = event.tool_call
+    result = event.tool_result
+    assert call is not None
+    assert result is not None
+    elapsed = _agent_elapsed(event.data) if elapsed_seconds is None else elapsed_seconds
+    status = "canceled" if result.content == "tool execution canceled" else (
+        "fail" if result.is_error else "ok"
+    )
+    turns = _agent_turns_from_result(event) if turns_used is None else turns_used
+    return Text(
+        f"{_agent_description(call)} · {turns} turns · {max(0.0, elapsed or 0.0):.1f}s · "
+        f"{status} · expand: ctrl+o",
+        style=ERROR if status == "fail" else RECEIPT,
+        no_wrap=True,
+        overflow="ellipsis",
+    )
 
 
 def _tool_content(event: StreamEvent) -> str:
@@ -354,13 +535,22 @@ def _tool_panel(
     )
 
 
-def render_tool_progress(call: ToolCall, content: str) -> RenderableType:
+def render_tool_progress(
+    call: ToolCall,
+    content: str,
+    *,
+    elapsed_seconds: float = 0.0,
+    turns_used: int | None = None,
+) -> RenderableType:
     """Render streamed tool output for the transcript."""
 
     if call.name.lower() == "agent":
-        lines = content.splitlines()
-        status = lines[-1] if lines else "running"
-        return _safe_text(status, style=RECEIPT)
+        return render_agent_progress(
+            call,
+            content,
+            elapsed_seconds=elapsed_seconds,
+            turns_used=turns_used,
+        )
     body = Text("running…", style=DIM) if not content else _render_tool_output(content)
     return _tool_panel(call, body)
 
@@ -810,6 +1000,8 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         text = event.data.get("text")
         return Text(text if type(text) is str else "retrying", style=DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
+        if event.tool_call.name.lower() == "agent":
+            return render_agent_progress(event.tool_call, "")
         if event.tool_call.name.lower() in RECEIPT_TOOLS:
             suffix = _receipt_arguments(event.tool_call, "")
             return Text(
@@ -822,6 +1014,8 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         label = f"[{stream}] " if stream in {"stdout", "stderr"} else ""
         return _safe_text(f"  ↳ {label}{event.delta}", style=DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:
+        if event.tool_call is not None and event.tool_call.name.lower() == "agent":
+            return render_agent_receipt(event)
         if tool_render_mode(event) == "receipt":
             return _tool_receipt(event)
         return _tool_card(event)

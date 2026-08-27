@@ -53,6 +53,8 @@ from zeta.tui.render import (
     format_thought,
     render_code,
     render_event,
+    render_agent_progress,
+    render_agent_receipt,
     render_line,
     render_markdown,
     render_thought,
@@ -1346,9 +1348,123 @@ def test_agent_rendering_stays_on_one_status_line() -> None:
     rendered = render_event(event)
     assert rendered is not None
     assert not isinstance(rendered, Panel)
-    assert "agent" in renderable_plain(rendered)
+    assert "task research" in renderable_plain(rendered)
+    start = render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    assert isinstance(start, Panel)
     progress = render_tool_progress(call, "task research: thinking")
-    assert not isinstance(progress, Panel)
+    assert isinstance(progress, Panel)
+
+
+def test_agent_running_card_shows_step_elapsed_and_turns() -> None:
+    call = ToolCall(
+        "agent-running",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+
+    rendered = render_agent_progress(
+        call,
+        "task research: turn 3: tool: read {\"path\":\"README.md\"}",
+        elapsed_seconds=4.2,
+    )
+
+    plain = renderable_plain(rendered)
+    assert "task research · 4.2s · 3 turns" in plain
+    assert "tool: read" in plain
+    assert "README.md" in plain
+
+
+def test_agent_receipts_show_success_and_canceled_status() -> None:
+    call = ToolCall(
+        "agent-receipt",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    success = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done",
+            structured_content={"turns_used": 2, "child_session_path": ""},
+        ),
+        data={"elapsed_seconds": 1.5},
+    )
+    canceled = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "tool execution canceled", is_error=True),
+        data={"elapsed_seconds": 0.4},
+    )
+
+    assert "2 turns · 1.5s · ok" in render_agent_receipt(success).plain
+    assert "0 turns · 0.4s · canceled" in render_agent_receipt(canceled).plain
+
+
+def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    for index in range(25):
+        child.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"child line {index}")])
+        )
+    call = ToolCall(
+        "agent-expand",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done",
+            structured_content={
+                "turns_used": 3,
+                "child_session_path": str(child.session_dir),
+            },
+        ),
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(call.id, call, render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    ))
+    transcript.finish_tool(call.id, render_event(event), event)
+
+    assert transcript.toggle_latest_agent()
+    rendered = Text.from_ansi(transcript.render(120)).plain
+    assert "child line 4" not in rendered
+    assert "child line 5" in rendered
+    assert "child line 24" in rendered
+    assert rendered.count("child line ") == 20
+
+
+def test_agent_cards_remain_in_sequential_order() -> None:
+    transcript = TranscriptWidget()
+    for index in range(2):
+        call = ToolCall(
+            f"agent-{index}",
+            "agent",
+            {"prompt": "inspect", "description": f"task {index}"},
+        )
+        event = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "done",
+                structured_content={"turns_used": index + 1, "child_session_path": ""},
+            ),
+        )
+        transcript.start_tool(call.id, call, render_event(
+            StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+        ))
+        transcript.finish_tool(call.id, render_event(event), event)
+
+    rendered = Text.from_ansi(transcript.render(120)).plain
+    assert rendered.index("task 0") < rendered.index("task 1")
+    assert len(transcript._agent_units) == 2
 
 
 def test_long_single_line_read_uses_a_cropped_card() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import warnings
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
@@ -323,10 +324,10 @@ class AgentLoop:
             async for event in child_loop.run_turn(prompt):
                 if event.type is StreamEventType.TURN_START:
                     turns_used = max(turns_used, int(event.data.get("turn", 0)))
-                    publish("thinking")
+                    publish(f"turn {turns_used}: thinking")
                 elif event.type is StreamEventType.TOOL_APPROVAL_START:
                     name = event.tool_call.name if event.tool_call is not None else "tool"
-                    publish(f"approval pending: {name}")
+                    publish(f"turn {turns_used}: approval pending: {name}")
                     if self.tool_registry._active_lifecycle_sink is not None:
                         self.tool_registry._active_lifecycle_sink(
                             "approval_start", event.tool_call
@@ -338,7 +339,13 @@ class AgentLoop:
                         )
                 elif event.type is StreamEventType.TOOL_EXECUTION_START:
                     name = event.tool_call.name if event.tool_call is not None else "tool"
-                    publish(f"tool: {name}")
+                    arguments = (
+                        event.tool_call.arguments
+                        if event.tool_call is not None
+                        else {}
+                    )
+                    summary = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
+                    publish(f"turn {turns_used}: tool: {name} {summary}")
                 elif event.type is StreamEventType.TURN_END:
                     if event.message is not None:
                         last_assistant_text = _assistant_text_snippet(event.message)

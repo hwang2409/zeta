@@ -491,6 +491,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
             on_paste=self._paste_from_keybinding,
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
+            on_toggle_agent=self._transcript.toggle_latest_agent,
         )
         return FullScreenPromptSession(
             message=[("class:prompt", " > ")],
@@ -812,6 +813,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
             except asyncio.TimeoutError:
                 if self._spinner_active:
                     self._spinner_frame += 1
+                    if self._presenter.has_active_agent: self._presenter.refresh_active_agents()
                     self._invalidate_prompt()
             else:
                 self._spinner_reset.clear()
