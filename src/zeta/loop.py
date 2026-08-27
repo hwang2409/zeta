@@ -25,6 +25,7 @@ from .types import (
     ErrorInfo,
     Message,
     MessageRole,
+    assistant_text,
     StreamEvent,
     StreamEventType,
     StructuredToolResult,
@@ -429,7 +430,7 @@ class AgentLoop:
                 return child_result(
                     "agent error: child ended without a final response", error=True
                 )
-            final_text = _assistant_text(final_message)
+            final_text = assistant_text(final_message)
             if not final_text.strip():
                 return child_result(
                     "agent error: child returned an empty final assistant message",
@@ -1057,12 +1058,6 @@ def _durable_message(message: Message) -> Message:
     )
 
 
-def _assistant_text(message: Message) -> str:
-    return "".join(
-        block.text for block in message.content if isinstance(block, TextContent)
-    )
-
-
 def _assistant_text_snippet(message: Message) -> str:
-    text = _assistant_text(message).replace("\r", " ").replace("\n", " ")
+    text = assistant_text(message).replace("\r", " ").replace("\n", " ")
     return text if len(text) <= 160 else f"{text[:157]}..."

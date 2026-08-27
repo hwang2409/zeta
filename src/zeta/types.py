@@ -762,6 +762,14 @@ class Message:
         )
 
 
+def assistant_text(message: Message) -> str:
+    """Return assistant text without changing block boundaries."""
+
+    return "".join(
+        block.text for block in message.content if isinstance(block, TextContent)
+    )
+
+
 class StreamEventType(StrEnum):
     AGENT_START = "agent_start"
     TURN_START = "turn_start"

@@ -142,6 +142,15 @@ class TranscriptWidget(UIControl):
         self._bump_revision()
         return unit
 
+    def remove(self, unit: _TranscriptUnit) -> None:
+        if unit not in self._units:
+            return
+        self._units.remove(unit)
+        if self._anchor is not None and self._anchor[0] is unit:
+            self._anchor = None
+        self._render_cache.pop(unit.key, None)
+        self._bump_revision()
+
     def append_blank(self) -> None:
         self._append_unit(None)
 
@@ -472,6 +481,8 @@ class TranscriptPresenter:
         self._thinking_unit: _TranscriptUnit | None = None
         self._assistant_live: Live | None = None
         self._assistant_unit: _TranscriptUnit | None = None
+        self._assistant_message_units: list[_TranscriptUnit] = []
+        self._assistant_message_region: list[_TranscriptUnit] = []
 
     @property
     def tool_region(self) -> Live | None:
@@ -520,7 +531,11 @@ class TranscriptPresenter:
 
         if self._full_screen_active():
             if self._assistant_unit is None:
+                unit_start = len(self.transcript._units)
                 self._assistant_unit = self.print_unit(rendered)
+                self._assistant_message_region.extend(self.transcript._units[unit_start:])
+                if self._assistant_unit is not None:
+                    self._assistant_message_units.append(self._assistant_unit)
             else:
                 self._assistant_unit = self.transcript.replace(
                     self._assistant_unit, rendered
@@ -554,13 +569,53 @@ class TranscriptPresenter:
             if self._assistant_live is not None:
                 self._assistant_live.stop()
                 self._assistant_live = None
-            self.print_unit(rendered)
+        self._assistant_unit = None
+        self._assistant_unit_open = False
+
+    def finish_assistant_message(self, rendered: RenderableType | None) -> None:
+        """Render the complete assistant message in one transcript unit."""
+
+        if self._full_screen_active():
+            if rendered is not None:
+                unit = next(
+                    (
+                        candidate
+                        for candidate in self._assistant_message_units
+                        if candidate in self.transcript._units
+                    ),
+                    None,
+                )
+                if unit is None:
+                    unit = self.print_unit(rendered)
+                else:
+                    unit = self.transcript.replace(unit, rendered)
+                for candidate in self._assistant_message_units:
+                    if candidate is not unit:
+                        self.transcript.remove(candidate)
+            else:
+                for candidate in self._assistant_message_region:
+                    self.transcript.remove(candidate)
+        else:
+            if self._assistant_live is not None:
+                self._assistant_live.stop()
+                self._assistant_live = None
+            if rendered is not None:
+                self.print_unit(rendered)
+        self._assistant_message_units.clear()
+        self._assistant_message_region.clear()
         self._assistant_unit = None
         self._assistant_unit_open = False
 
     def reset_assistant_unit(self) -> None:
         self._assistant_unit_open = False
         self._assistant_unit = None
+
+    def reset_assistant_message(self) -> None:
+        """Forget the units owned by an incomplete assistant message."""
+
+        self._assistant_message_units.clear()
+        self._assistant_message_region.clear()
+        self.reset_assistant_unit()
 
     def start_thinking(self, rendered: Text) -> None:
         self.reset_assistant_unit()
@@ -769,6 +824,8 @@ class TranscriptPresenter:
         self._assistant_live = None
         self._thinking_unit = None
         self._assistant_unit = None
+        self._assistant_message_units.clear()
+        self._assistant_message_region.clear()
         self._assistant_unit_open = False
         self._printed_units = False
         self.transcript.clear()
