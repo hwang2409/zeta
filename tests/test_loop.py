@@ -764,26 +764,18 @@ async def test_parallel_cancellation_keeps_call_order(
 
 
 @pytest.mark.asyncio
-async def test_parallel_duplicate_ids_use_indexed_results(tmp_path: Path) -> None:
+async def test_parallel_duplicate_ids_fail_before_dispatch(tmp_path: Path) -> None:
     calls = [
         ToolCall("same-id", "first", {}),
         ToolCall("same-id", "second", {}),
     ]
     backend = FakeBackend([ScriptedTurn([], calls)])
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
-    registry.register("first", lambda arguments: "one", parallel_safe=True)
-    registry.register("second", lambda arguments: "two", parallel_safe=True)
 
-    await collect(AgentLoop(backend, store, registry=registry).run_turn("start"))
+    with pytest.raises(ValueError, match="duplicate tool call id"):
+        await collect(AgentLoop(backend, store).run_turn("start"))
 
-    results = [
-        message.tool_result
-        for message in store.messages()
-        if message.tool_result is not None
-    ]
-    assert [result.tool_call_id for result in results] == ["same-id", "same-id"]
-    assert [result.content for result in results] == ["one", "two"]
+    assert not (store.session_dir / "agents").exists()
 
 
 @pytest.fixture(scope="module")

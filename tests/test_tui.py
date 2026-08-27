@@ -1639,6 +1639,30 @@ def test_running_agent_card_can_expand_and_read_live_tail(tmp_path: Path) -> Non
     assert "1 turns" in rendered
 
 
+def test_presenter_refreshes_live_agent_cards_in_full_screen() -> None:
+    call = ToolCall(
+        "agent-refresh",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    transcript = TranscriptWidget()
+    transcript.start_tool(
+        call.id,
+        call,
+        render_event(StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)),
+    )
+    presenter = TranscriptPresenter(
+        transcript,
+        _test_console(),
+        lambda: True,
+        lambda renderable: None,
+    )
+
+    presenter.refresh_active_agents()
+
+    assert transcript._tools[call.id].revision == 1
+
+
 def test_agent_card_toggle_is_symmetric_during_and_after_execution(
     tmp_path: Path,
 ) -> None:

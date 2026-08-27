@@ -143,6 +143,26 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
 
 
 @pytest.mark.asyncio
+async def test_duplicate_parallel_agent_ids_fail_before_child_dispatch(
+    tmp_path: Path,
+) -> None:
+    calls = [_agent_call("same-id"), _agent_call("same-id")]
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=calls),
+            ScriptedTurn([TextContent("child one")]),
+            ScriptedTurn([TextContent("child two")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    with pytest.raises(ValueError, match="duplicate tool call id"):
+        await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    assert not (store.session_dir / "agents").exists()
+
+
+@pytest.mark.asyncio
 async def test_parent_abort_cancels_all_parallel_children(tmp_path: Path) -> None:
     calls = _parallel_agent_calls()
     backend = ParallelChildrenBackend(calls)

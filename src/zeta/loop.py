@@ -18,7 +18,11 @@ from .mcp import MCPMount, mount_mcp_servers
 from .prompts import load_identity
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from .tools.agent import CHILD_TURN_CAP, ChildApprovalPolicy, agent_result
-from .tools.registry import ToolExecutionContext, validate_tool_result
+from .tools.registry import (
+    ToolExecutionContext,
+    _validate_unique_tool_call_ids,
+    validate_tool_result,
+)
 from .types import (
     CompletionBackend,
     ContentBlock,
@@ -724,6 +728,7 @@ class AgentLoop:
                 for block in assistant_message.content
                 if isinstance(block, ToolUseContent)
             ]
+            _validate_unique_tool_call_ids(calls)
             approval_requests: list[tuple[str, ToolCall]] = []
             for tool_call in calls:
                 request = self.tool_registry.prepare_approval(tool_call)
