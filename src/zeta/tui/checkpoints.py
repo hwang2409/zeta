@@ -115,6 +115,12 @@ class CheckpointTranscriptMixin:
                     f"{entry.data['from_seq']}"
                 )
                 continue
+            if entry.type == "compaction":
+                self._print_system(
+                    "[compaction marker: entries "
+                    f"{entry.data['source_seq_start']}–{entry.data['source_seq_end']}]"
+                )
+                continue
             if entry.type != "message":
                 continue
             message = Message.from_dict(entry.data["message"])

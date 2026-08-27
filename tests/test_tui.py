@@ -3245,6 +3245,179 @@ async def test_rebuild_transcript_matches_character_stream(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("full_screen", [False, True])
+async def test_run_replays_resumed_transcript_before_prompt(
+    tmp_path: Path, full_screen: bool
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("remembered user")]))
+    call = ToolCall("resume-read", "read", {"path": "README.md"})
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("remembered assistant"), ToolUseContent(call)],
+        )
+    )
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult(call.id, "remembered tool output"),
+        )
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=True, color_system="truecolor"),
+    )
+
+    with create_pipe_input() as pipe:
+        if full_screen:
+            session = FullScreenPromptSession(
+                input=pipe,
+                output=DummyOutput(),
+                key_bindings=build_key_bindings(
+                    on_interrupt=app.abort_active,
+                    on_exit=app.request_exit,
+                ),
+                multiline=True,
+            )
+        else:
+            session = app_session(app, pipe)
+        run_task = asyncio.create_task(app.run(session))
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x04")
+        await run_task
+
+    rendered = (
+        app._transcript.render(120)
+        if full_screen
+        else Text.from_ansi(output.getvalue()).plain
+    )
+    rendered = Text.from_ansi(rendered).plain
+    assert "▌ remembered user" in rendered
+    assert "remembered assistant" in rendered
+    assert "read" in rendered
+    assert "README.md" in rendered
+
+
+def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("old user")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("old reply")]))
+    store.append_compaction_marker("provider summary", 1, 2)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "[compaction marker: entries 1–2]" in rendered
+    assert "provider summary" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_screen", [False, True])
+async def test_run_keeps_empty_resumed_transcript_blank(
+    tmp_path: Path, full_screen: bool
+) -> None:
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=True, color_system="truecolor"),
+    )
+
+    with create_pipe_input() as pipe:
+        session = (
+            FullScreenPromptSession(
+                input=pipe,
+                output=DummyOutput(),
+                key_bindings=build_key_bindings(
+                    on_interrupt=app.abort_active,
+                    on_exit=app.request_exit,
+                ),
+                multiline=True,
+            )
+            if full_screen
+            else app_session(app, pipe)
+        )
+        run_task = asyncio.create_task(app.run(session))
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x04")
+        await run_task
+
+    assert app._transcript.units == ()
+    assert "[error]" not in output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_resume_rebuild_matches_the_shared_renderer(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("user")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("assistant")]))
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=True, color_system="truecolor"),
+    )
+
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        run_task = asyncio.create_task(app.run(session))
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x04")
+        await run_task
+
+    resumed = app._transcript.render(120)
+    app._active_session = session
+    app._rebuild_transcript()
+    assert app._transcript.render(120) == resumed
+
+
+@pytest.mark.asyncio
+async def test_resume_replays_only_the_forked_branch(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("kept")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("kept reply")]))
+    checkpoint = store.append_checkpoint("saved")
+    store.append_message(Message(MessageRole.USER, [TextContent("abandoned")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("abandoned reply")]))
+    store.append_fork(str(checkpoint.seq))
+    store.append_message(Message(MessageRole.USER, [TextContent("new branch")]))
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    app._rebuild_transcript()
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "kept" in rendered
+    assert "new branch" in rendered
+    assert "abandoned" not in rendered
+
+
+@pytest.mark.asyncio
 async def test_aborted_turn_does_not_reorder_the_next_reply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
