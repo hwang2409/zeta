@@ -15,8 +15,11 @@ reference. This includes `@./file`, `@../file`, and `@~/file`. Bare words such
 as `@user` and `@dataclass` stay as prompt text. Missing path-like files show
 a notice and block that message.
 
-Use `/paste` or Ctrl+V to queue a macOS clipboard image for the next message.
-Attachment paths follow the read-tool policy: there is no attachment-specific sandbox;
+Use `/paste` or Ctrl+V to insert an image token such as `[Image #1]` at the
+cursor. The token stays in the message text and resolves to the staged image
+when you send it. Delete the token to cancel that image. Numbering starts at
+`[Image #1]` for each message and does not renumber after edits. Attachment
+paths follow the read-tool policy: there is no attachment-specific sandbox;
 absolute paths, home paths, and symlink targets are allowed. Repeated
 references to one resolved path produce one attachment block.
 

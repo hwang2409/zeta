@@ -217,9 +217,181 @@ async def test_ctrl_v_queues_one_image_and_preserves_composer_text(
 
     submitted = await run_ctrl_v(app, "draft\x16more")
 
-    assert submitted == ["draftmore"]
+    assert submitted == ["draft[Image #1]more"]
     assert len(app._pending_attachments) == 1
-    assert notices[0].startswith("pending image:")
+    assert notices == []
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_ctrl_v_numbers_multiple_images_without_renumbering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    monkeypatch.setattr(composer.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(composer.shutil, "which", lambda _: "/usr/bin/pngpaste")
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        Path(command[1]).write_bytes(PNG)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(composer.subprocess, "run", fake_run)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+
+    submitted = await run_ctrl_v(app, "a\x16b\x16c")
+
+    assert submitted == ["a[Image #1]b[Image #2]c"]
+    assert len(app._pending_attachments) == 2
+    assert list(app._pending_attachment_tokens) == ["[Image #1]", "[Image #2]"]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_paste_inserts_the_same_token_without_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    monkeypatch.setattr(composer.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(composer.shutil, "which", lambda _: "/usr/bin/pngpaste")
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        Path(command[1]).write_bytes(PNG)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(composer.subprocess, "run", fake_run)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        run_task = asyncio.create_task(app.run(session))
+        await asyncio.sleep(0)
+        pipe.send_text("/paste\r")
+        for _ in range(100):
+            if session.app.current_buffer.text == "[Image #1]":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("/paste did not insert an image token")
+        pipe.send_text("\x04")
+        await run_task
+
+    assert app._pending_attachment_tokens == {"[Image #1]": app._pending_attachments[0]}
+    assert notices == []
+
+
+def test_image_tokens_resolve_in_text_order_and_deleted_tokens_cancel(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    first.write_bytes(PNG)
+    second.write_bytes(PNG)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._pending_attachments[:] = [first, second]
+    app._pending_attachment_tokens.update(
+        {"[Image #1]": first, "[Image #2]": second}
+    )
+    notices: list[str] = []
+    app._print_system = notices.append
+
+    message = app._prepare_user_message("look [Image #2], not [Image #1]")
+
+    assert message is not None
+    assert message.content[0] == TextContent("look [Image #2], not [Image #1]")
+    assert [
+        block.path for block in message.content[1:] if isinstance(block, ImageContent)
+    ] == [str(second.resolve()), str(first.resolve())]
+
+    message = app._prepare_user_message("look [Image #2]")
+
+    assert message is not None
+    assert [
+        block.path for block in message.content[1:] if isinstance(block, ImageContent)
+    ] == [str(second.resolve())]
+    assert app._pending_attachments == [second]
+    assert notices == []
+
+
+def test_unknown_image_token_is_plain_text(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+
+    message = app._prepare_user_message("look at [Image #7]")
+
+    assert message is not None
+    assert message.content == [TextContent("look at [Image #7]")]
+
+
+@pytest.mark.asyncio
+async def test_image_token_numbering_resets_after_send(tmp_path: Path) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(PNG)
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        provider="fake",
+        model="offline",
+    )
+    app._pending_attachments.append(image)
+    app._pending_attachment_tokens["[Image #1]"] = image
+
+    await app._handle_prompt_value("inspect [Image #1]")
+    assert app._active_task is not None
+    await app._active_task
+
+    assert app._next_image_token == 1
+    assert app._pending_attachment_tokens == {}
+    assert app._pending_attachments == []
+    assert store.messages()[0].content[0] == TextContent("inspect [Image #1]")
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_paste_has_no_notice_or_pending_footer(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    with create_pipe_input() as pipe:
+        session = PromptSession(input=pipe, output=DummyOutput(), multiline=True)
+        prompt_task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0)
+        app._active_session = session
+        app._pending_attachments.append(tmp_path / "image.png")
+
+        toolbar = app._status_toolbar()
+
+        assert "pending attachment" not in "".join(text for _, text in toolbar)
+        session.app.exit()
+        await prompt_task
+    app._active_session = None
     await app.loop.close()
 
 

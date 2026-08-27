@@ -224,24 +224,38 @@ class ComposerAttachmentMixin:
             return f"paste unavailable: {exc}"
         if not isinstance(attachment, ImageContent):
             return "paste unavailable: clipboard image could not be decoded"
+        token = f"[Image #{self._next_image_token}]"
+        self._next_image_token += 1
         self._pending_attachments.append(path)
-        return f"pending image: {path} · {attachment.size or 0} bytes"
+        self._pending_attachment_tokens[token] = path
+        return token
 
-    def _pending_attachment_fragments(self) -> FormattedText:
-        fragments: FormattedText = []
-        for path in self._pending_attachments:
-            try:
-                size = path.stat().st_size
-            except OSError:
-                size = 0
-            label = self._display_attachment_path(path)
-            fragments.append(
-                (
-                    "class:status-bar",
-                    f"\n[pending attachment: {label} · {size} bytes]",
-                )
-            )
-        return fragments
+    def _pending_paths_for(self, value: str) -> list[Path]:
+        mapped_paths = set(self._pending_attachment_tokens.values())
+        for token in tuple(self._pending_attachment_tokens):
+            if token not in value:
+                del self._pending_attachment_tokens[token]
+        remaining_mapped_paths = set(self._pending_attachment_tokens.values())
+        self._pending_attachments[:] = [
+            path
+            for path in self._pending_attachments
+            if path not in mapped_paths or path in remaining_mapped_paths
+        ]
+
+        token_paths = sorted(
+            (
+                (value.index(token), path)
+                for token, path in self._pending_attachment_tokens.items()
+            ),
+            key=lambda item: item[0],
+        )
+        selected_paths = [path for _, path in token_paths]
+        selected_paths.extend(
+            path
+            for path in self._pending_attachments
+            if path not in remaining_mapped_paths
+        )
+        return selected_paths
 
     def _prepare_user_message(self, value: str) -> Message | None:
         try:
@@ -251,7 +265,7 @@ class ComposerAttachmentMixin:
             return None
 
         valid_pending: list[Path] = []
-        for path in self._pending_attachments:
+        for path in self._pending_paths_for(value):
             try:
                 build_user_message(value, self.loop.store.cwd, (path,))
             except AttachmentError as exc:
@@ -262,6 +276,11 @@ class ComposerAttachmentMixin:
         if not valid_pending:
             return message
         return build_user_message(value, self.loop.store.cwd, tuple(valid_pending))
+
+    def _clear_pending_attachments(self) -> None:
+        self._pending_attachments.clear()
+        self._pending_attachment_tokens.clear()
+        self._next_image_token = 1
 
     def _print_user(self, user: str | Message) -> None:
         self._presenter.reset_assistant_unit()
@@ -282,12 +301,6 @@ class ComposerAttachmentMixin:
                 label = self._display_attachment_path(Path(block.path))
                 rendered.append(
                     f"\n  file · {label} · {block.size or 0} bytes",
-                    style="dim",
-                )
-            elif isinstance(block, ImageContent):
-                label = self._display_attachment_path(Path(block.path)) if block.path else "clipboard"
-                rendered.append(
-                    f"\n  image · {label} · {block.size or 0} bytes",
                     style="dim",
                 )
         self._print_unit(rendered)
@@ -395,7 +408,7 @@ def build_key_bindings(
     on_interrupt: Callable[[], None],
     on_exit: Callable[[], None],
     on_submit: Callable[[str], None] | None = None,
-    on_paste: Callable[[], None] | None = None,
+    on_paste: Callable[[KeyPressEvent], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
 ) -> KeyBindings:
@@ -450,8 +463,7 @@ def build_key_bindings(
 
         @bindings.add("c-v")
         def paste(event: KeyPressEvent) -> None:
-            del event
-            on_paste()
+            on_paste(event)
 
     @bindings.add("escape", "enter", filter=~full_screen_mode)
     def alt_enter(event: KeyPressEvent) -> None:
