@@ -1656,34 +1656,30 @@ def test_agent_rendering_dispatch_stays_in_agent_card_seam() -> None:
     allowed_path = Path("tui") / "agent_card.py"
     violations: list[str] = []
 
-    def contains_agent_identifier(node: ast.AST) -> bool:
-        return any(
-            isinstance(item, ast.Constant) and item.value == "agent"
-            for item in ast.walk(node)
-        )
+    def docstring_constants(tree: ast.Module) -> set[ast.Constant]:
+        return {
+            node.body[0].value
+            for node in ast.walk(tree)
+            if isinstance(
+                node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+            )
+            and node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        }
 
     for path in root.rglob("*.py"):
         if path.relative_to(root.parent) == allowed_path:
             continue
         tree = ast.parse(path.read_text(), filename=str(path))
+        ignored = docstring_constants(tree)
         for node in ast.walk(tree):
-            condition: ast.AST | None = None
-            if isinstance(node, ast.Compare):
-                condition = node
-            elif isinstance(node, (ast.If, ast.IfExp, ast.While)):
-                condition = node.test
-            elif isinstance(node, ast.Match):
-                if any(
-                    contains_agent_identifier(case.pattern)
-                    or (
-                        case.guard is not None
-                        and contains_agent_identifier(case.guard)
-                    )
-                    for case in node.cases
-                ):
-                    violations.append(f"{path}:{node.lineno}")
-                continue
-            if condition is not None and contains_agent_identifier(condition):
+            if (
+                isinstance(node, ast.Constant)
+                and node.value == "agent"
+                and node not in ignored
+            ):
                 violations.append(f"{path}:{node.lineno}")
 
     assert violations == []
