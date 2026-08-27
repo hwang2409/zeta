@@ -722,11 +722,8 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
     def _finish_message(self, event: StreamEvent) -> None:
         if self._assistant_message_finished:
             return
-        value = self._assistant_text or "".join(
-            block.text
-            for block in (event.message.content if event.message is not None else ())
-            if isinstance(block, TextContent)
-        )
+        content = event.message.content if event.message is not None else (TextContent(self._assistant_text),)
+        value = "".join(block.text for block in content if isinstance(block, TextContent))
         if value and self._stream_kind in {"assistant", None}:
             self._presenter.finish_assistant(render_markdown(value))
             self._turn_had_visible_output |= bool(value.strip())

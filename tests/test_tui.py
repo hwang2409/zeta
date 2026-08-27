@@ -271,7 +271,16 @@ class QueueOrderBackend(CompletionBackend):
             await self.release.wait()
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
-            message=Message(MessageRole.ASSISTANT, [TextContent(f"reply {index}")]),
+            message=Message(
+                MessageRole.ASSISTANT,
+                [
+                    TextContent(
+                        "| name | value |\n| --- | --- |"
+                        if index == 0
+                        else f"reply {index}"
+                    )
+                ],
+            ),
         )
 
 
@@ -2902,6 +2911,85 @@ def test_markdown_stream_preserves_model_line_structure(tmp_path: Path) -> None:
         "4. play a game — choose one.",
         "5. call a friend — catch up.",
     ]
+
+
+@pytest.mark.asyncio
+async def test_completed_markdown_spans_ignore_stream_chunk_boundaries(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "1. **Round 2 (parallel):** use **four** workers, then "
+        "**single `fallback`**."
+    )
+    code_start = source.index("`fallback`")
+    code_end = code_start + len("`fallback`")
+    segmentations = [
+        [source],
+        [source[: source.index("**single") + 2], source[source.index("**single") + 2 :]],
+        [source[: code_start + 1], source[code_start + 1 :]],
+        [source[: code_end - 1], source[code_end - 1 :]],
+        [source[index : index + 3] for index in range(0, len(source), 3)],
+        list(source),
+    ]
+
+    rendered_outputs: list[str] = []
+    for chunks in segmentations:
+        app = TUIApp(
+            AgentLoop(
+                FakeBackend(
+                    [ScriptedTurn(content=[TextContent(chunk) for chunk in chunks])]
+                ),
+                ConversationStore(tmp_path / str(len(rendered_outputs))),
+            ),
+            provider="fake",
+            model="offline",
+        )
+        app._active_session = app._make_session()
+
+        await app._consume_turn("prompt")
+
+        rendered = app._transcript.render(120)
+        rendered_outputs.append(rendered)
+        plain = Text.from_ansi(rendered).plain
+        assert "**" not in plain
+        assert plain == (
+            "1. Round 2 (parallel): use four workers, then single fallback."
+        )
+
+    assert rendered_outputs == [rendered_outputs[0]] * len(segmentations)
+
+
+def test_completed_message_renders_final_message_text(tmp_path: Path) -> None:
+    source = (
+        "1. **Round 2 (parallel):** use **four** workers, then "
+        "**single `fallback`**."
+    )
+    partial = source[: source.index("`fallback`") + 1]
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    app._consume_text(
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent(partial),
+        )
+    )
+    app._finish_message(
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent(source)]),
+        )
+    )
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert rendered == (
+        "1. Round 2 (parallel): use four workers, then single fallback."
+    )
+    assert "**" not in rendered
 
 
 def test_markdown_stream_keeps_model_blank_lines_without_inserting_more(
