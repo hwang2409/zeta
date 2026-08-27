@@ -18,7 +18,11 @@ from .mcp import MCPMount, mount_mcp_servers
 from .prompts import load_identity
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from .tools.agent import CHILD_TURN_CAP, ChildApprovalPolicy, agent_result
-from .tools.registry import validate_tool_result
+from .tools.registry import (
+    ToolExecutionContext,
+    _validate_unique_tool_call_ids,
+    validate_tool_result,
+)
 from .types import (
     CompletionBackend,
     ContentBlock,
@@ -301,6 +305,7 @@ class AgentLoop:
         arguments: dict[str, Any],
         abort_signal: ToolAbortSignal,
         publisher: ToolStreamPublisher | None,
+        execution_context: ToolExecutionContext | None = None,
     ) -> dict[str, object]:
         prompt = arguments.get("prompt")
         description = arguments.get("description")
@@ -359,6 +364,12 @@ class AgentLoop:
             system_prompt=self.context_assembler.system_prompt,
         )
 
+        lifecycle_sink = (
+            execution_context.lifecycle_sink
+            if execution_context is not None
+            else None
+        )
+
         def publish(status: str) -> None:
             if publisher is not None:
                 publisher.publish(f"{description}: {status}\n", "stdout")
@@ -385,15 +396,11 @@ class AgentLoop:
                 elif event.type is StreamEventType.TOOL_APPROVAL_START:
                     name = event.tool_call.name if event.tool_call is not None else "tool"
                     publish(f"turn {child_turns() + 1}: approval pending: {name}")
-                    if self.tool_registry._active_lifecycle_sink is not None:
-                        self.tool_registry._active_lifecycle_sink(
-                            "approval_start", event.tool_call
-                        )
+                    if lifecycle_sink is not None:
+                        lifecycle_sink("approval_start", event.tool_call)
                 elif event.type is StreamEventType.TOOL_APPROVAL_END:
-                    if self.tool_registry._active_lifecycle_sink is not None:
-                        self.tool_registry._active_lifecycle_sink(
-                            "approval_end", event.tool_call
-                        )
+                    if lifecycle_sink is not None:
+                        lifecycle_sink("approval_end", event.tool_call)
                 elif event.type is StreamEventType.TOOL_EXECUTION_START:
                     name = event.tool_call.name if event.tool_call is not None else "tool"
                     arguments = (
@@ -721,6 +728,7 @@ class AgentLoop:
                 for block in assistant_message.content
                 if isinstance(block, ToolUseContent)
             ]
+            _validate_unique_tool_call_ids(calls)
             approval_requests: list[tuple[str, ToolCall]] = []
             for tool_call in calls:
                 request = self.tool_registry.prepare_approval(tool_call)

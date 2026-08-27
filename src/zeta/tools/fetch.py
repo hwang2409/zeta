@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import socket
 import zlib
@@ -459,17 +460,21 @@ def _readable_content(url: str, content_type: str, body: str) -> str:
 async def _fetch(
     registry: ToolRegistry,
     arguments: dict[str, Any],
-    _abort_signal: AbortSignal,
+    abort_signal: AbortSignal,
 ) -> StructuredToolResult:
     url = _normalize_url(arguments["url"])
     max_bytes = arguments.get("max_bytes", MAX_RESPONSE_BYTES)
     offset = arguments.get("offset", 0)
+    if abort_signal.is_set():
+        raise asyncio.CancelledError()
     try:
         response = await get_response(
             url,
             user_agent="zeta/fetch (web tool)",
             max_bytes=max_bytes,
         )
+        if abort_signal.is_set():
+            raise asyncio.CancelledError()
     except _DecompressedResponseTooLarge as exc:
         return _truncated_error_result(str(exc), full_size=exc.max_bytes + 1)
     except _CompressedResponseTruncated as exc:
@@ -508,6 +513,7 @@ def register(registry: ToolRegistry) -> None:
             "the cloud metadata address 169.254.169.254 is refused. If truncated, "
             "call again with offset=next_offset to continue."
         ),
+        parallel_safe=True,
         parameters={
             "type": "object",
             "properties": {

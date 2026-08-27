@@ -1359,6 +1359,30 @@ async def test_parallel_safe_calls_overlap_and_keep_call_order(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_execute_many_rejects_duplicate_ids_before_dispatch(tmp_path: Path) -> None:
+    called = False
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+
+    async def handler(arguments: dict[str, object]) -> str:
+        nonlocal called
+        del arguments
+        called = True
+        return "ran"
+
+    registry.register("work", handler, parallel_safe=True)
+
+    with pytest.raises(ValueError, match="duplicate tool call id"):
+        await registry.execute_many(
+            [
+                ToolCall("same-id", "work", {}),
+                ToolCall("same-id", "work", {}),
+            ]
+        )
+
+    assert not called
+
+
+@pytest.mark.asyncio
 async def test_execute_many_abort_cancels_every_parallel_handler(
     tmp_path: Path,
 ) -> None:

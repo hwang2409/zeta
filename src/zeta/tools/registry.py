@@ -107,6 +107,15 @@ ToolStreamSink = Callable[[StreamEvent], None]
 ToolLifecycleSink = Callable[..., None]
 
 
+@dataclass(frozen=True, slots=True)
+class ToolExecutionContext:
+    """Per-call state passed to handlers that need execution ownership."""
+
+    tool_call: ToolCall
+    agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None
+    lifecycle_sink: ToolLifecycleSink | None
+
+
 @dataclass(slots=True)
 class _ToolCallStreamPublisher:
     """Adapt handler chunks into non-blocking events for the agent loop."""
@@ -137,6 +146,12 @@ class _ToolCallStreamPublisher:
 
 class _ToolCanceled(Exception):
     pass
+
+
+def _validate_unique_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
+    call_ids = [tool_call.id for tool_call in tool_calls]
+    if len(call_ids) != len(set(call_ids)):
+        raise ValueError("duplicate tool call id in one execution batch")
 
 
 async def _yield_for_abort(
@@ -368,8 +383,6 @@ class ToolRegistry:
         self.max_output_chars = max_output_chars
         self._session_store = session_store
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
-        self._active_tool_call: ToolCall | None = None
-        self._active_lifecycle_sink: ToolLifecycleSink | None = None
         self.background_tasks = BackgroundTaskRegistry(
             session_dir=session_store.session_dir if session_store is not None else None,
         )
@@ -451,10 +464,6 @@ class ToolRegistry:
         self._tools.pop(name, None)
 
     @property
-    def active_tool_call(self) -> ToolCall | None:
-        return self._active_tool_call
-
-    @property
     def agent_runner(self) -> Callable[..., Awaitable[ToolHandlerResult]] | None:
         return self._agent_runner
 
@@ -489,8 +498,6 @@ class ToolRegistry:
             clone.pre_execute_hook,
         )
         clone._agent_runner = None
-        clone._active_tool_call = None
-        clone._active_lifecycle_sink = None
         return clone
     def abort(self) -> None:
         self.abort_signal.abort()
@@ -623,34 +630,15 @@ class ToolRegistry:
             if _stream_sink is not None
             else None
         )
-        self._active_tool_call = tool_call
-        previous_lifecycle_sink = self._active_lifecycle_sink
-        self._active_lifecycle_sink = _lifecycle_sink
-        try:
-            if stream_publisher is None:
-                try:
-                    result = await _invoke_handler(
-                        definition.handler,
-                        arguments,
-                        execution_signal,
-                    )
-                except _ToolCanceled:
-                    result = _legacy_result(_canceled_result(tool_call.id))
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
-                    result = _error_result(str(exc))
-            else:
-                result = await self._invoke_streaming_handler(
-                    definition.handler,
-                    arguments,
-                    execution_signal,
-                    stream_publisher,
-                    tool_call.id,
-                )
-        finally:
-            self._active_tool_call = None
-            self._active_lifecycle_sink = previous_lifecycle_sink
+        execution_context = ToolExecutionContext(tool_call, self._agent_runner, _lifecycle_sink)
+        handler = _bind_execution_context(definition.handler, execution_context)
+        result = await self._invoke_handler_with_abort(
+            handler,
+            arguments,
+            execution_signal,
+            stream_publisher,
+            tool_call.id,
+        )
         if isinstance(result, ToolResult):
             if result.tool_call_id != tool_call.id:
                 normalized_result = _error_result(
@@ -674,12 +662,12 @@ class ToolRegistry:
             )
         return _normalize_result(normalized_result, self.max_output_chars)
 
-    async def _invoke_streaming_handler(
+    async def _invoke_handler_with_abort(
         self,
         handler: ToolHandler,
         arguments: dict[str, Any],
         execution_signal: ToolAbortSignal,
-        stream_publisher: ToolStreamPublisher,
+        stream_publisher: ToolStreamPublisher | None,
         tool_call_id: str,
     ) -> ToolHandlerResult:
         current = asyncio.current_task()
@@ -693,22 +681,24 @@ class ToolRegistry:
 
         abort_wait = asyncio.create_task(cancel_on_abort())
         try:
-            return await _invoke_handler(
-                handler,
-                arguments,
-                execution_signal,
-                stream_publisher,
-            )
-        except _ToolCanceled:
-            return _legacy_result(_canceled_result(tool_call_id))
-        except asyncio.CancelledError:
-            if execution_signal.is_set():
+            try:
+                return await _invoke_handler(
+                    handler,
+                    arguments,
+                    execution_signal,
+                    stream_publisher,
+                )
+            except _ToolCanceled:
                 return _legacy_result(_canceled_result(tool_call_id))
-            raise
-        except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
-            return _error_result(str(exc))
+            except asyncio.CancelledError:
+                if execution_signal.is_set():
+                    return _legacy_result(_canceled_result(tool_call_id))
+                raise
+            except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
+                return _error_result(str(exc))
         finally:
-            stream_publisher.close()
+            if stream_publisher is not None:
+                stream_publisher.close()
             if not abort_wait.done():
                 abort_wait.cancel()
                 await asyncio.gather(abort_wait, return_exceptions=True)
@@ -756,6 +746,7 @@ class ToolRegistry:
     ) -> list[StructuredToolResult]:
         """Execute calls with safe contiguous groups in parallel, preserving order."""
 
+        _validate_unique_tool_call_ids(tool_calls)
         parent_signal = abort_signal or self.abort_signal
         boundary_signal = parent_signal if _signal_is_set(parent_signal) else None
         scope_signal = parent_signal
@@ -844,15 +835,9 @@ async def _invoke_handler(
                     )
                 except TypeError:
                     try:
-                        signature.bind(
-                            arguments,
-                            abort_signal,
-                            stream_publisher=stream_publisher,
-                        )
+                        signature.bind(arguments, abort_signal, stream_publisher=stream_publisher)
                     except TypeError:
-                        result = _invoke_handler_without_stream(
-                            handler, signature, arguments, abort_signal
-                        )
+                        result = _invoke_handler_without_stream(handler, signature, arguments, abort_signal)
                     else:
                         result = handler(
                             arguments,
@@ -868,9 +853,7 @@ async def _invoke_handler(
             else:
                 result = handler(arguments, abort_signal, stream_publisher)
         else:
-            result = _invoke_handler_without_stream(
-                handler, signature, arguments, abort_signal
-            )
+            result = _invoke_handler_without_stream(handler, signature, arguments, abort_signal)
     if inspect.isawaitable(result):
         result = await result
     return result
@@ -892,6 +875,17 @@ def _invoke_handler_without_stream(
             return handler(arguments)
         return handler(arguments, abort_signal=abort_signal)
     return handler(arguments, abort_signal)
+
+
+def _bind_execution_context(
+    handler: ToolHandler,
+    context: ToolExecutionContext,
+) -> ToolHandler:
+    try:
+        inspect.signature(handler).parameters["execution_context"]
+    except (KeyError, TypeError, ValueError):
+        return handler
+    return partial(handler, execution_context=context)
 
 
 def validate_tool_result(result: object) -> StructuredToolResult:

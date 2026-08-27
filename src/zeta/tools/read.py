@@ -174,6 +174,7 @@ def register(registry: ToolRegistry) -> None:
         "read",
         _read,
         description="Read a UTF-8 file. Relative paths use the session cwd.",
+        parallel_safe=True,
         parameters={
             "type": "object",
             "properties": {

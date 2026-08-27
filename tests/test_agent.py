@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,17 @@ from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy
-from zeta.types import MessageRole, StreamEventType, TextContent, ToolCall, ToolUseContent
+from zeta.types import (
+    CompletionBackend,
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolSchema,
+    ToolUseContent,
+)
 
 
 async def _collect(events):
@@ -23,6 +34,185 @@ def _agent_call(call_id: str = "agent-1") -> ToolCall:
         "agent",
         {"prompt": "inspect the task", "description": "task research"},
     )
+
+
+class ParallelChildrenBackend(CompletionBackend):
+    def __init__(self, calls: Sequence[ToolCall]) -> None:
+        self.parent_calls = list(calls)
+        self.call_count = 0
+        self.child_count = 0
+        self.children_started = asyncio.Event()
+        self.release_children = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        self.call_count += 1
+        if self.call_count == 1:
+            blocks = [ToolUseContent(call) for call in self.parent_calls]
+        else:
+            self.child_count += 1
+            child_index = self.child_count
+            if self.child_count == len(self.parent_calls):
+                self.children_started.set()
+            await self.release_children.wait()
+            blocks = [TextContent(f"child-{child_index}")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+class ParallelApprovalBackend(CompletionBackend):
+    def __init__(self, calls: Sequence[ToolCall]) -> None:
+        self.parent_calls = list(calls)
+        self.call_count = 0
+        self.child_count = 0
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        self.call_count += 1
+        if self.call_count == 1:
+            blocks = [ToolUseContent(call) for call in self.parent_calls]
+        elif self.call_count <= 3:
+            self.child_count += 1
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        f"child-bash-{self.child_count}",
+                        "bash",
+                        {"cmd": f"echo child-{self.child_count}"},
+                    )
+                )
+            ]
+        else:
+            blocks = [TextContent(f"child-final-{self.call_count}")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+def _parallel_agent_calls() -> list[ToolCall]:
+    return [
+        ToolCall(
+            f"agent-{index}",
+            "agent",
+            {"prompt": f"inspect {index}", "description": f"task {index}"},
+        )
+        for index in (1, 2)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_agent_calls_overlap_and_keep_child_results(
+    tmp_path: Path,
+) -> None:
+    calls = _parallel_agent_calls()
+    backend = ParallelChildrenBackend(calls)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    await asyncio.wait_for(backend.children_started.wait(), timeout=1)
+    backend.release_children.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    results = [message.tool_result for message in store.messages() if message.tool_result]
+    assert [result.content for result in results if result is not None] == [
+        "child-1",
+        "child-2",
+    ]
+    assert sorted(path.name for path in (store.session_dir / "agents").iterdir()) == [
+        "1",
+        "2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_parallel_agent_ids_fail_before_child_dispatch(
+    tmp_path: Path,
+) -> None:
+    calls = [_agent_call("same-id"), _agent_call("same-id")]
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=calls),
+            ScriptedTurn([TextContent("child one")]),
+            ScriptedTurn([TextContent("child two")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    with pytest.raises(ValueError, match="duplicate tool call id"):
+        await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    assert not (store.session_dir / "agents").exists()
+
+
+@pytest.mark.asyncio
+async def test_parent_abort_cancels_all_parallel_children(tmp_path: Path) -> None:
+    calls = _parallel_agent_calls()
+    backend = ParallelChildrenBackend(calls)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    await asyncio.wait_for(backend.children_started.wait(), timeout=1)
+    loop.abort()
+    await asyncio.wait_for(task, timeout=1)
+
+    results = [message.tool_result for message in store.messages() if message.tool_result]
+    assert len(results) == 2
+    assert all(result is not None and result.content == "tool execution canceled" for result in results)
+    for index, call in enumerate(calls, start=1):
+        child_store = ConversationStore(
+            store.session_dir / "agents", session_id=str(index)
+        )
+        assert child_store.agent_canceled() == {
+            "tool_call_id": call.id,
+            "content": "tool execution canceled",
+        }
+
+
+@pytest.mark.asyncio
+async def test_parallel_delegated_approvals_resolve_by_child_instance(
+    tmp_path: Path,
+) -> None:
+    calls = _parallel_agent_calls()
+    backend = ParallelApprovalBackend(calls)
+    store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(store=store)
+    loop = AgentLoop(backend, store, approval_policy=policy, max_turns=1)
+
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    for _ in range(100):
+        if len(policy.pending_requests()) == 2:
+            break
+        await asyncio.sleep(0.01)
+    pending = policy.pending_requests()
+    assert len(pending) == 2
+    assert {request.child_instance_id for request in pending} == {
+        f"{store.session_id}:1",
+        f"{store.session_id}:2",
+    }
+    allow, deny = pending
+    assert policy.approve(allow.key)
+    assert policy.deny(deny.key)
+    await asyncio.wait_for(task, timeout=1)
+    assert policy.pending_requests() == []
 
 
 @pytest.mark.asyncio

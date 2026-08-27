@@ -8,7 +8,13 @@ from typing import Any
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..types import Message, MessageRole, ToolCall, ToolUseContent
-from .registry import AbortSignal, ToolRegistry, ToolStreamPublisher, text_block
+from .registry import (
+    AbortSignal,
+    ToolExecutionContext,
+    ToolRegistry,
+    ToolStreamPublisher,
+    text_block,
+)
 
 
 CHILD_TURN_CAP = 25
@@ -148,9 +154,11 @@ async def _agent(
     arguments: dict[str, Any],
     abort_signal: AbortSignal,
     stream_publisher: ToolStreamPublisher | None = None,
+    execution_context: ToolExecutionContext | None = None,
 ) -> dict[str, object]:
-    runner = registry.agent_runner
-    call = registry.active_tool_call
+    del registry
+    runner = execution_context.agent_runner if execution_context is not None else None
+    call = execution_context.tool_call if execution_context is not None else None
     if runner is None or call is None:
         return agent_result(
             "agent error: agent tool is unavailable outside an agent loop",
@@ -158,7 +166,13 @@ async def _agent(
             turns_used=0,
             child_session_path="",
         )
-    return await runner(call, arguments, abort_signal, stream_publisher)
+    return await runner(
+        call,
+        arguments,
+        abort_signal,
+        stream_publisher,
+        execution_context,
+    )
 
 
 def register(registry: ToolRegistry) -> None:
@@ -180,4 +194,5 @@ def register(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         requires_approval=False,
+        parallel_safe=True,
     )
