@@ -59,11 +59,12 @@ ToolStream = Literal["stdout", "stderr"]
 
 def _discover_tool_modules() -> list[str]:
     package = importlib.import_module(__package__)
-    return sorted(
+    modules = (
         f"{package.__name__}.{module_info.name}"
         for module_info in pkgutil.iter_modules(package.__path__)
         if not module_info.name.startswith("_")
     )
+    return sorted(modules, key=lambda name: (name.endswith(".agent"), name))
 
 
 def _register_discovered_tools(registry: ToolRegistry) -> None:
@@ -103,7 +104,7 @@ class ToolStreamPublisher(Protocol):
 
 
 ToolStreamSink = Callable[[StreamEvent], None]
-ToolLifecycleSink = Callable[[str], None]
+ToolLifecycleSink = Callable[..., None]
 
 
 @dataclass(slots=True)
@@ -365,6 +366,9 @@ class ToolRegistry:
             self.approval_policy.bind_store(approval_store)
         self.max_output_chars = max_output_chars
         self._session_store = session_store
+        self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
+        self._active_tool_call: ToolCall | None = None
+        self._active_lifecycle_sink: ToolLifecycleSink | None = None
         self.background_tasks = BackgroundTaskRegistry(
             session_dir=session_store.session_dir if session_store is not None else None,
         )
@@ -372,6 +376,7 @@ class ToolRegistry:
             session_store.bash_cwd if session_store is not None else str(self.cwd)
         )
         self._tools: dict[str, ToolDefinition] = {}
+        self._register_builtin = register_builtin
         if register_builtin:
             _register_discovered_tools(self)
 
@@ -439,6 +444,46 @@ class ToolRegistry:
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
 
+    @property
+    def active_tool_call(self) -> ToolCall | None:
+        return self._active_tool_call
+    @property
+    def agent_runner(self) -> Callable[..., Awaitable[ToolHandlerResult]] | None:
+        return self._agent_runner
+    def set_agent_runner(
+        self,
+        runner: Callable[..., Awaitable[ToolHandlerResult]] | None,
+    ) -> None:
+        self._agent_runner = runner
+    def clone_for_session(
+        self,
+        store: ConversationStore,
+        *,
+        exclude_names: set[str] | frozenset[str] = frozenset(),
+    ) -> ToolRegistry:
+        clone = ToolRegistry(
+            store.cwd,
+            session_store=store,
+            max_output_chars=self.max_output_chars,
+            register_builtin=self._register_builtin,
+        )
+        names = set(self._tools) - exclude_names
+        for name in list(clone._tools):
+            if name not in names:
+                clone.unregister(name)
+        for definition in self.definitions:
+            if definition.name in exclude_names or definition.name in clone._tools:
+                continue
+            clone.register(
+                definition.name,
+                definition.handler,
+                description=definition.description,
+                parameters=definition.parameters,
+                parallel_safe=definition.parallel_safe,
+                validate_arguments=definition.validate_arguments,
+                requires_approval=definition.requires_approval,
+            )
+        return clone
     def abort(self) -> None:
         self.abort_signal.abort()
 
@@ -570,27 +615,34 @@ class ToolRegistry:
             if _stream_sink is not None
             else None
         )
-        if stream_publisher is None:
-            try:
-                result = await _invoke_handler(
+        self._active_tool_call = tool_call
+        previous_lifecycle_sink = self._active_lifecycle_sink
+        self._active_lifecycle_sink = _lifecycle_sink
+        try:
+            if stream_publisher is None:
+                try:
+                    result = await _invoke_handler(
+                        definition.handler,
+                        arguments,
+                        execution_signal,
+                    )
+                except _ToolCanceled:
+                    result = _legacy_result(_canceled_result(tool_call.id))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
+                    result = _error_result(str(exc))
+            else:
+                result = await self._invoke_streaming_handler(
                     definition.handler,
                     arguments,
                     execution_signal,
+                    stream_publisher,
+                    tool_call.id,
                 )
-            except _ToolCanceled:
-                result = _legacy_result(_canceled_result(tool_call.id))
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
-                result = _error_result(str(exc))
-        else:
-            result = await self._invoke_streaming_handler(
-                definition.handler,
-                arguments,
-                execution_signal,
-                stream_publisher,
-                tool_call.id,
-            )
+        finally:
+            self._active_tool_call = None
+            self._active_lifecycle_sink = previous_lifecycle_sink
         if isinstance(result, ToolResult):
             if result.tool_call_id != tool_call.id:
                 normalized_result = _error_result(

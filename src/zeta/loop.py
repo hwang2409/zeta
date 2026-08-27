@@ -5,14 +5,18 @@ from __future__ import annotations
 import asyncio
 import warnings
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from pathlib import Path
+from typing import Any
 
+from .core.abort import AbortSignal as ToolAbortSignal
 from .core.approval import ApprovalPolicy
 from .core.context import ContextAssembler
 from .core.hooks import HookManager
 from .core.store import ConversationStore
 from .mcp import MCPMount, mount_mcp_servers
 from .prompts import load_identity
-from .tools import ToolHandler, ToolRegistry
+from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
+from .tools.agent import CHILD_TURN_CAP, ChildApprovalPolicy, agent_result
 from .tools.registry import validate_tool_result
 from .types import (
     CompletionBackend,
@@ -106,6 +110,8 @@ class AgentLoop:
     ) -> None:
         self.backend = backend
         self.store = store
+        self._agent_child_stores: dict[str, ConversationStore] = {}
+        self._recover_agent_children()
         if registry is not None and tools is not None:
             raise ValueError("pass only one tool registry")
         if registry is not None:
@@ -177,6 +183,8 @@ class AgentLoop:
             self.hooks.bind_session(store.session_id)
             if self.tool_registry.pre_execute_hook is None:
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
+        if "agent" in self.tool_registry.definitions_by_name:
+            self.tool_registry.set_agent_runner(self._run_agent_tool)
 
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
@@ -192,6 +200,182 @@ class AgentLoop:
         """Signal the active tool batch before the caller cancels the turn."""
 
         self.tool_registry.abort()
+
+    def _recover_agent_children(self) -> None:
+        """Resolve child markers left by a process exit before resuming."""
+
+        for tool_call_id, marker in self.store.agent_children().items():
+            tool_call = ToolCall.from_dict(marker["tool_call"])
+            if self._existing_tool_result(tool_call_id) is None:
+                self.store.append_message(
+                    Message(
+                        MessageRole.TOOL_RESULT,
+                        [TextContent("tool execution canceled")],
+                        tool_result=ToolResult(
+                            tool_call_id,
+                            "tool execution canceled",
+                            is_error=True,
+                        ),
+                    )
+                )
+            child_path = Path(marker["child_session_path"])
+            agents_root = self.store.session_dir / "agents"
+            if child_path.parent == agents_root and child_path.name.isdigit():
+                child_store = ConversationStore(
+                    agents_root,
+                    session_id=child_path.name,
+                    cwd=self.store.cwd,
+                )
+                child_store.finish_agent_parent()
+            self.store.finish_agent_child(tool_call.id)
+
+    async def _run_agent_tool(
+        self,
+        tool_call: ToolCall,
+        arguments: dict[str, Any],
+        abort_signal: ToolAbortSignal,
+        publisher: ToolStreamPublisher | None,
+    ) -> dict[str, object]:
+        prompt = arguments.get("prompt")
+        description = arguments.get("description")
+        if type(prompt) is not str or not prompt.strip():
+            return agent_result(
+                "agent error: prompt must be a nonempty string",
+                error=True,
+                turns_used=0,
+                child_session_path="",
+            )
+        if type(description) is not str or not description.strip():
+            return agent_result(
+                "agent error: description must be a nonempty string",
+                error=True,
+                turns_used=0,
+                child_session_path="",
+            )
+        child_number = self.store.allocate_agent_index()
+        agents_root = self.store.session_dir / "agents"
+        child_store = ConversationStore(
+            agents_root,
+            session_id=str(child_number),
+            cwd=self.store.cwd,
+        )
+        child_store.mark_agent_parent(tool_call.id)
+        child_path = str(child_store.session_dir)
+        self._agent_child_stores[tool_call.id] = child_store
+        self.store.register_agent_child(
+            tool_call,
+            child_session_path=child_path,
+            description=description,
+        )
+        child_registry = self.tool_registry.clone_for_session(
+            child_store,
+            exclude_names={"agent"},
+        )
+        child_loop = AgentLoop(
+            self.backend,
+            child_store,
+            registry=child_registry,
+            max_turns=CHILD_TURN_CAP,
+            token_budget=self.context_assembler.token_budget,
+            retained_tail=self.context_assembler.retained_tail,
+            system_prompt=self.context_assembler.system_prompt,
+        )
+        parent_policy = self.tool_registry.approval_policy
+        if parent_policy is not None:
+            child_registry.set_approval_policy(
+                ChildApprovalPolicy(parent_policy, child_store)  # type: ignore[arg-type]
+            )
+
+        def publish(status: str) -> None:
+            if publisher is not None:
+                publisher.publish(f"{description}: {status}\n", "stdout")
+
+        async def consume() -> dict[str, object]:
+            turns_used = 0
+            final_message: Message | None = None
+            cap_hit = False
+            error_message: str | None = None
+            async for event in child_loop.run_turn(prompt):
+                if event.type is StreamEventType.TURN_START:
+                    turns_used = max(turns_used, int(event.data.get("turn", 0)))
+                    publish("thinking")
+                elif event.type is StreamEventType.TOOL_APPROVAL_START:
+                    name = event.tool_call.name if event.tool_call is not None else "tool"
+                    publish(f"approval pending: {name}")
+                    if self.tool_registry._active_lifecycle_sink is not None:
+                        self.tool_registry._active_lifecycle_sink(
+                            "approval_start", event.tool_call
+                        )
+                elif event.type is StreamEventType.TOOL_APPROVAL_END:
+                    if self.tool_registry._active_lifecycle_sink is not None:
+                        self.tool_registry._active_lifecycle_sink(
+                            "approval_end", event.tool_call
+                        )
+                elif event.type is StreamEventType.TOOL_EXECUTION_START:
+                    name = event.tool_call.name if event.tool_call is not None else "tool"
+                    publish(f"tool: {name}")
+                elif event.type is StreamEventType.TURN_END:
+                    if event.data.get("tool_calls") == 0 and event.message is not None:
+                        final_message = event.message
+                elif event.type is StreamEventType.ERROR and event.error is not None:
+                    if event.error.code == "max_turns":
+                        cap_hit = True
+                    else:
+                        error_message = event.error.message
+            if cap_hit:
+                return agent_result(
+                    f"agent error: child reached the {CHILD_TURN_CAP}-turn cap; "
+                    f"partial state is saved at {child_path}",
+                    error=True,
+                    turns_used=turns_used,
+                    child_session_path=child_path,
+                )
+            if error_message is not None:
+                return agent_result(
+                    f"agent error: {error_message}",
+                    error=True,
+                    turns_used=turns_used,
+                    child_session_path=child_path,
+                )
+            if final_message is None:
+                return agent_result(
+                    "agent error: child ended without a final response",
+                    error=True,
+                    turns_used=turns_used,
+                    child_session_path=child_path,
+                )
+            return agent_result(
+                "".join(
+                    block.text
+                    for block in final_message.content
+                    if isinstance(block, TextContent)
+                ),
+                error=False,
+                turns_used=turns_used,
+                child_session_path=child_path,
+            )
+
+        child_task = asyncio.create_task(consume())
+        abort_task = asyncio.create_task(abort_signal.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (child_task, abort_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if abort_task in done:
+                child_loop.abort()
+                child_task.cancel()
+                await asyncio.gather(child_task, return_exceptions=True)
+                raise asyncio.CancelledError()
+            result = child_task.result()
+            child_store.finish_agent_parent()
+            self.store.finish_agent_child(tool_call.id)
+            return result
+        finally:
+            if not abort_task.done():
+                abort_task.cancel()
+            await asyncio.gather(abort_task, return_exceptions=True)
+            await child_loop.close()
 
     def prepare_resume_pending_tool(self, request_id: str) -> bool:
         """Reserve the abort generation before resuming an approved tool."""
@@ -679,6 +863,11 @@ class AgentLoop:
             )
             if self.hooks is not None:
                 self.hooks.post_tool(call.name, result.content)
+            if call.name == "agent":
+                child_store = self._agent_child_stores.pop(call.id, None)
+                if child_store is not None:
+                    child_store.finish_agent_parent()
+                self.store.finish_agent_child(call.id)
         return results
 
     def _persist_partial(

@@ -58,6 +58,9 @@ class ConversationStore(CheckpointForkMixin):
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
         self._todo_items: list[TodoItem] = []
+        self._agent_counter = 0
+        self._agent_children: dict[str, dict[str, Any]] = {}
+        self._agent_parent: dict[str, Any] | None = None
         with self._append_lock():
             self._load()
             self._load_session_state()
@@ -189,6 +192,75 @@ class ConversationStore(CheckpointForkMixin):
             self._write_session_state(self.bash_cwd, normalized)
             self._todo_items = [dict(item) for item in normalized]
 
+    def allocate_agent_index(self) -> int:
+        """Allocate the next durable child-agent directory number."""
+
+        with self._append_lock():
+            self._load()
+            self._load_session_state()
+            self._agent_counter += 1
+            self._write_session_state(self.bash_cwd, self._todo_items)
+            return self._agent_counter
+
+    def register_agent_child(
+        self,
+        tool_call: ToolCall,
+        *,
+        child_session_path: str,
+        description: str,
+    ) -> None:
+        """Persist a running child marker before the child starts."""
+
+        if not child_session_path or not description:
+            raise ValueError("child marker fields must be nonempty")
+        with self._append_lock():
+            self._load()
+            self._load_session_state()
+            self._agent_children[tool_call.id] = {
+                "tool_call": tool_call.to_dict(),
+                "child_session_path": child_session_path,
+                "description": description,
+            }
+            self._write_session_state(self.bash_cwd, self._todo_items)
+
+    def agent_children(self) -> dict[str, dict[str, Any]]:
+        """Return durable markers for children that did not finish."""
+
+        return copy.deepcopy(self._agent_children)
+
+    def finish_agent_child(self, tool_call_id: str) -> None:
+        """Remove a child marker after its parent tool result is durable."""
+
+        with self._append_lock():
+            self._load()
+            self._load_session_state()
+            if tool_call_id not in self._agent_children:
+                return
+            self._agent_children.pop(tool_call_id)
+            self._write_session_state(self.bash_cwd, self._todo_items)
+
+    def mark_agent_parent(self, parent_tool_call_id: str) -> None:
+        """Persist the parent call id in a child session before execution."""
+
+        if not parent_tool_call_id:
+            raise ValueError("parent tool call id must be nonempty")
+        with self._append_lock():
+            self._load()
+            self._load_session_state()
+            self._agent_parent = {"tool_call_id": parent_tool_call_id}
+            self._write_session_state(self.bash_cwd, self._todo_items)
+
+    def finish_agent_parent(self) -> None:
+        """Remove the child marker after child execution finishes."""
+
+        with self._append_lock():
+            self._load()
+            self._load_session_state()
+            if self._agent_parent is None:
+                return
+            self._agent_parent = None
+            self._write_session_state(self.bash_cwd, self._todo_items)
+
     def _load_session_state(self) -> None:
         if not self.state_path.exists():
             self._write_session_state(self.cwd, ())
@@ -210,8 +282,50 @@ class ConversationStore(CheckpointForkMixin):
             raise ConversationIntegrityError(
                 f"session state todo list is invalid: {self.state_path}"
             ) from exc
+        agent_counter = value.get("agent_counter", 0)
+        if type(agent_counter) is not int or agent_counter < 0:
+            raise ConversationIntegrityError(
+                f"session state agent counter is invalid: {self.state_path}"
+            )
+        agent_children = value.get("agent_children", {})
+        if type(agent_children) is not dict:
+            raise ConversationIntegrityError(
+                f"session state child markers are invalid: {self.state_path}"
+            )
+        for call_id, marker in agent_children.items():
+            if (
+                type(call_id) is not str
+                or not call_id
+                or type(marker) is not dict
+                or type(marker.get("tool_call")) is not dict
+                or type(marker.get("child_session_path")) is not str
+                or not marker["child_session_path"]
+                or type(marker.get("description")) is not str
+                or not marker["description"]
+            ):
+                raise ConversationIntegrityError(
+                    f"session state child marker is invalid: {self.state_path}"
+                )
+            try:
+                ToolCall.from_dict(marker["tool_call"])
+            except ValueError as exc:
+                raise ConversationIntegrityError(
+                    f"session state child tool call is invalid: {self.state_path}"
+                ) from exc
+        agent_parent = value.get("agent_parent")
+        if agent_parent is not None and (
+            type(agent_parent) is not dict
+            or type(agent_parent.get("tool_call_id")) is not str
+            or not agent_parent["tool_call_id"]
+        ):
+            raise ConversationIntegrityError(
+                f"session state parent marker is invalid: {self.state_path}"
+            )
         self.bash_cwd = bash_cwd
         self._todo_items = todo_items
+        self._agent_counter = agent_counter
+        self._agent_children = copy.deepcopy(agent_children)
+        self._agent_parent = copy.deepcopy(agent_parent)
 
     def _write_session_state(
         self, bash_cwd: str, todo_items: Iterable[TodoItem]
@@ -220,6 +334,12 @@ class ConversationStore(CheckpointForkMixin):
         normalized_items = [dict(item) for item in todo_items]
         if normalized_items:
             state["todo_items"] = normalized_items
+        if self._agent_counter:
+            state["agent_counter"] = self._agent_counter
+        if self._agent_children:
+            state["agent_children"] = copy.deepcopy(self._agent_children)
+        if self._agent_parent is not None:
+            state["agent_parent"] = copy.deepcopy(self._agent_parent)
         temporary = tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
