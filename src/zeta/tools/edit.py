@@ -104,9 +104,9 @@ async def _edit(
 
 
 def register(registry: ToolRegistry) -> None:
-    registry.register(
+    registry.register_session_tool(
         "edit",
-        lambda arguments, abort_signal: _edit(registry, arguments, abort_signal),
+        _edit,
         description=(
             "Replace one unique UTF-8 string in a file. "
             "Relative paths use the session cwd."

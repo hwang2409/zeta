@@ -146,9 +146,9 @@ async def _websearch(
 
 
 def register(registry: ToolRegistry) -> None:
-    registry.register(
+    registry.register_session_tool(
         "websearch",
-        lambda arguments, abort_signal: _websearch(registry, arguments, abort_signal),
+        _websearch,
         description=(
             "Search the web with DuckDuckGo. Network access requires approval. "
             "The keyless HTML backend may change without notice."

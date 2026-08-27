@@ -15,7 +15,8 @@ import pytest
 from rich.cells import cell_len
 from rich.console import Console
 
-from zeta.core.approval import ApprovalPolicy
+from zeta.core.abort import AbortGenerationRegistry
+from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
@@ -24,6 +25,7 @@ from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.tui.app import TUIApp, create_app
+from zeta.tools.agent import ChildApprovalPolicy
 from zeta.cli import build_parser, main
 from zeta.tui.layout import CONTENT_MARGIN, content_width
 from zeta.types import (
@@ -1027,6 +1029,47 @@ async def test_resumed_pending_approval_is_presented_and_resolvable(
     assert call.id in app.console.file.getvalue()
     assert await app._handle_approval_input(f"approve {call.id}")
     assert app.loop.store.pending_approvals() == []
+
+
+@pytest.mark.asyncio
+async def test_tui_resolves_colliding_child_approvals_by_unique_key(
+    tmp_path: Path,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "sessions", session_id="parent")
+    policy = ApprovalPolicy(store=parent_store)
+    loop = AgentLoop(FakeBackend([]), parent_store, approval_policy=policy)
+    app = TUIApp(
+        loop,
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+    )
+    app.console = Console(file=StringIO(), force_terminal=False)
+    child_a = ConversationStore(tmp_path / "children", session_id="a")
+    child_b = ConversationStore(tmp_path / "children", session_id="b")
+    policy_a = ChildApprovalPolicy(policy, child_a, "child a", "child-a")
+    policy_b = ChildApprovalPolicy(policy, child_b, "child b", "child-b")
+    call_a = ToolCall("same-request", "bash", {"cmd": "a"})
+    call_b = ToolCall("same-request", "bash", {"cmd": "b"})
+    signal_a = AbortGenerationRegistry().new_generation()
+    signal_b = AbortGenerationRegistry().new_generation()
+    task_a = asyncio.create_task(policy_a.authorize(call_a, signal_a))
+    task_b = asyncio.create_task(policy_b.authorize(call_b, signal_b))
+
+    await wait_until(lambda: len(app.pending_approvals) == 2)
+    app._present_pending_approvals()
+    rendered = app.console.file.getvalue()
+    assert "child a: bash [('child-a', 'same-request')]" in rendered
+    assert "child b: bash [('child-b', 'same-request')]" in rendered
+
+    assert await app._handle_approval_input(
+        "approve ('child-a', 'same-request')"
+    )
+    assert await app._handle_approval_input("deny ('child-b', 'same-request')")
+    assert await task_a == ApprovalDecision.ALLOW
+    assert await task_b == ApprovalDecision.DENY
+    signal_a.abort()
+    signal_b.abort()
 
 
 @pytest.mark.asyncio

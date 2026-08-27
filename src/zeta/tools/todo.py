@@ -57,9 +57,9 @@ async def _todo(
 
 
 def register(registry: ToolRegistry) -> None:
-    registry.register(
+    registry.register_session_tool(
         "todo",
-        lambda arguments: _todo(registry, arguments),
+        _todo,
         description=(
             "Use for multi-step tasks: mark one item in_progress before starting "
             "it and completed immediately after finishing it."

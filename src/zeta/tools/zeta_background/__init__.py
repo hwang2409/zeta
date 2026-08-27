@@ -93,9 +93,9 @@ async def _task_kill(
 
 
 def register(registry: ToolRegistry) -> None:
-    registry.register(
+    registry.register_session_tool(
         "run_background",
-        lambda arguments, abort_signal: _run_background(registry, arguments),
+        _run_background,
         description=(
             "Start a shell command as a session-scoped background task. "
             "Use task_output to monitor it."
@@ -110,9 +110,9 @@ def register(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
     )
-    registry.register(
+    registry.register_session_tool(
         "task_output",
-        lambda arguments, abort_signal: _task_output(registry, arguments),
+        _task_output,
         description="Read incremental output and status from a background task.",
         parameters={
             "type": "object",
@@ -125,9 +125,9 @@ def register(registry: ToolRegistry) -> None:
         },
         requires_approval=False,
     )
-    registry.register(
+    registry.register_session_tool(
         "task_kill",
-        lambda arguments, abort_signal: _task_kill(registry, arguments),
+        _task_kill,
         description="Terminate a background task process group.",
         parameters={
             "type": "object",

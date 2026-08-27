@@ -260,7 +260,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
 
     def slash_status(self) -> SlashStatus:
         pending = tuple(
-            f"{request.request_id} ({request.tool_call.name})"
+            f"{request.key} ({request.label or request.tool_call.name})"
             for request in self.pending_approvals
         )
         items = self.loop.store.todo_items()
@@ -373,11 +373,12 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
     def _present_pending_approvals(self) -> None:
         for request in self.pending_approvals:
             arguments = json.dumps(request.tool_call.arguments, sort_keys=True)
+            key = str(request.key)
             self._print(
                 Text(
-                    f"[approval pending] {request.request_id}: "
-                    f"{request.tool_call.name} {arguments}; "
-                    f"type approve {request.request_id} or deny {request.request_id}",
+                    f"[approval pending] {request.label or request.tool_call.name} "
+                    f"[{key}]: "
+                    f"{arguments}; type approve {key} or deny {key}",
                     style="yellow",
                 )
             )
@@ -391,19 +392,27 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
             self._print(Text("[approval] no pending requests", style="dim"))
             return True
         if len(parts) != 2:
-            self._print(Text(f"[approval] use {parts[0]} <request-id>", style="yellow"))
+            self._print(Text(f"[approval] use {parts[0]} <approval-key>", style="yellow"))
             return True
-        request_id = parts[1].strip()
-        if request_id not in {request.request_id for request in pending}:
-            self._print(Text(f"[approval] unknown request: {request_id}", style="yellow"))
+        requested_key = parts[1].strip()
+        request = next(
+            (request for request in pending if str(request.key) == requested_key),
+            None,
+        )
+        if request is None:
+            self._print(
+                Text(f"[approval] unknown request: {requested_key}", style="yellow")
+            )
             return True
+        key = request.key
+        request_id = request.request_id
         resolved = (
-            self._approval_policy.approve(request_id)
+            self._approval_policy.approve(key)
             if parts[0] == "approve"
-            else self._approval_policy.deny(request_id)
+            else self._approval_policy.deny(key)
         )
         if resolved:
-            self._print(Text(f"[approval] {parts[0]}d {request_id}", style="green"))
+            self._print(Text(f"[approval] {parts[0]}d {key}", style="green"))
             # If a turn is already parked in the approval poll, it will pick up
             # the resolution and execute the tool itself. Running the tool here
             # would race that path and persist a duplicate tool_result — which
@@ -435,7 +444,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
                     and asyncio.current_task().cancelling() > 0
                 )
                 self.loop.abort()
-                self._abort_approval(request_id)
+                self._abort_approval(key)
                 self.loop.finalize_canceled(request_id)
                 if resume_task is not None:
                     resume_task.cancel()
@@ -521,7 +530,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
             tool_running = self._loop_state == "tool-running"
             self.loop.abort()
             for request in self.pending_approvals:
-                self._abort_approval(request.request_id)
+                self._abort_approval(request.key)
                 self.loop.finalize_canceled(request.request_id)
             self._loop_state = "interrupted"
             self._invalidate_prompt()
@@ -530,7 +539,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
             else:
                 self._active_task.cancel()
 
-    def _abort_approval(self, request_id: str) -> None:
+    def _abort_approval(self, request_id: str | tuple[str, str]) -> None:
         if self._approval_policy is not None:
             self._approval_policy.abort(request_id)
 

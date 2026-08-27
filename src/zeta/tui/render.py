@@ -51,7 +51,7 @@ MAX_RESULT = 180
 MAX_TOOL_LINES = 15
 SPINNER_FRAMES = ("·", "•", "●", "•")
 RECEIPT_TOOLS = frozenset(
-    {"read", "glob", "grep", "search", "find", "list", "websearch"}
+    {"agent", "read", "glob", "grep", "search", "find", "list", "websearch"}
 )
 SUMMARY_TOOLS = frozenset({"glob", "grep", "search", "find", "websearch"})
 OSC_RE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b]*(?:\x07|\x1b\\)")
@@ -354,9 +354,13 @@ def _tool_panel(
     )
 
 
-def render_tool_progress(call: ToolCall, content: str) -> Panel:
-    """Render streamed tool output inside the same card surface."""
+def render_tool_progress(call: ToolCall, content: str) -> RenderableType:
+    """Render streamed tool output for the transcript."""
 
+    if call.name.lower() == "agent":
+        lines = content.splitlines()
+        status = lines[-1] if lines else "running"
+        return _safe_text(status, style=RECEIPT)
     body = Text("running…", style=DIM) if not content else _render_tool_output(content)
     return _tool_panel(call, body)
 

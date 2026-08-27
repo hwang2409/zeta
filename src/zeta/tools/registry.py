@@ -17,7 +17,8 @@ import os
 import pkgutil
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -47,23 +48,22 @@ from ._process import BackgroundTaskRegistry
 
 AbortSignal = ToolAbortSignal
 MAX_STRUCTURED_CONTENT_DEPTH = 32
-ToolHook = Callable[
-    [str, dict[str, Any]], bool | str | Awaitable[bool | str] | None
-]
+ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerResult = str | StructuredToolResult | ToolResult
-ToolHandler = Callable[
-    ..., ToolHandlerResult | Awaitable[ToolHandlerResult]
-]
+ToolHandler = Callable[..., ToolHandlerResult | Awaitable[ToolHandlerResult]]
+ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
 ToolStream = Literal["stdout", "stderr"]
 
-
+def _bind_handler(handler: ToolHandler, registry: ToolRegistry) -> ToolHandler:
+    return partial(handler, registry)
 def _discover_tool_modules() -> list[str]:
     package = importlib.import_module(__package__)
-    return sorted(
+    modules = (
         f"{package.__name__}.{module_info.name}"
         for module_info in pkgutil.iter_modules(package.__path__)
         if not module_info.name.startswith("_")
     )
+    return sorted(modules, key=lambda name: (name.endswith(".agent"), name))
 
 
 def _register_discovered_tools(registry: ToolRegistry) -> None:
@@ -103,7 +103,7 @@ class ToolStreamPublisher(Protocol):
 
 
 ToolStreamSink = Callable[[StreamEvent], None]
-ToolLifecycleSink = Callable[[str], None]
+ToolLifecycleSink = Callable[..., None]
 
 
 @dataclass(slots=True)
@@ -291,6 +291,7 @@ class ToolDefinition:
     description: str
     parameters: dict[str, Any]
     handler: ToolHandler
+    handler_factory: ToolHandlerFactory | None = None
     parallel_safe: bool = False
     validate_arguments: bool = True
     requires_approval: bool = True
@@ -303,16 +304,13 @@ class ToolDefinition:
         }
 
 
-def _copy_definition(definition: ToolDefinition) -> ToolDefinition:
-    return ToolDefinition(
-        name=definition.name,
-        description=definition.description,
-        parameters=copy.deepcopy(definition.parameters),
-        handler=definition.handler,
-        parallel_safe=definition.parallel_safe,
-        validate_arguments=definition.validate_arguments,
-        requires_approval=definition.requires_approval,
+def _copy_definition(definition: ToolDefinition, registry: ToolRegistry | None = None) -> ToolDefinition:
+    handler = (
+        definition.handler_factory(registry)
+        if registry is not None and definition.handler_factory is not None
+        else definition.handler
     )
+    return replace(definition, parameters=copy.deepcopy(definition.parameters), handler=handler)
 
 
 class ToolRegistry:
@@ -365,6 +363,9 @@ class ToolRegistry:
             self.approval_policy.bind_store(approval_store)
         self.max_output_chars = max_output_chars
         self._session_store = session_store
+        self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
+        self._active_tool_call: ToolCall | None = None
+        self._active_lifecycle_sink: ToolLifecycleSink | None = None
         self.background_tasks = BackgroundTaskRegistry(
             session_dir=session_store.session_dir if session_store is not None else None,
         )
@@ -372,6 +373,7 @@ class ToolRegistry:
             session_store.bash_cwd if session_store is not None else str(self.cwd)
         )
         self._tools: dict[str, ToolDefinition] = {}
+        self._register_builtin = register_builtin
         if register_builtin:
             _register_discovered_tools(self)
 
@@ -406,6 +408,7 @@ class ToolRegistry:
         parallel_safe: bool = False,
         validate_arguments: bool = True,
         requires_approval: bool = True,
+        handler_factory: ToolHandlerFactory | None = None,
     ) -> ToolDefinition:
         if type(name) is not str or not name:
             raise ValueError("tool name must be a nonempty string")
@@ -427,6 +430,7 @@ class ToolRegistry:
             description=description,
             parameters=normalized,
             handler=handler,
+            handler_factory=handler_factory,
             parallel_safe=parallel_safe,
             validate_arguments=validate_arguments,
             requires_approval=requires_approval,
@@ -436,9 +440,54 @@ class ToolRegistry:
 
     register_tool = register
 
+    def register_session_tool(self, name: str, handler: ToolHandler, **kwargs: Any) -> ToolDefinition:
+        return self.register(name, _bind_handler(handler, self), handler_factory=partial(_bind_handler, handler), **kwargs)
+
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
 
+    @property
+    def active_tool_call(self) -> ToolCall | None:
+        return self._active_tool_call
+
+    @property
+    def agent_runner(self) -> Callable[..., Awaitable[ToolHandlerResult]] | None:
+        return self._agent_runner
+
+    def set_agent_runner(
+        self,
+        runner: Callable[..., Awaitable[ToolHandlerResult]] | None,
+    ) -> None:
+        self._agent_runner = runner
+
+    def clone_for_session(
+        self,
+        store: ConversationStore,
+        *,
+        exclude_names: set[str] | frozenset[str] = frozenset(),
+    ) -> ToolRegistry:
+        clone = copy.copy(self)
+        clone._cwd_fd = os.dup(self._cwd_fd)
+        clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
+        clone._tools = {
+            name: _copy_definition(definition, clone)
+            for name, definition in self._tools.items()
+            if name not in exclude_names
+        }
+        clone._session_store = store
+        clone.background_tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+        )
+        clone.bash_cwd = store.bash_cwd
+        clone.abort_signal = clone._abort_registry.new_generation()
+        clone._approval_gate = ApprovalGate(
+            clone.approval_policy,
+            clone.pre_execute_hook,
+        )
+        clone._agent_runner = None
+        clone._active_tool_call = None
+        clone._active_lifecycle_sink = None
+        return clone
     def abort(self) -> None:
         self.abort_signal.abort()
 
@@ -570,27 +619,34 @@ class ToolRegistry:
             if _stream_sink is not None
             else None
         )
-        if stream_publisher is None:
-            try:
-                result = await _invoke_handler(
+        self._active_tool_call = tool_call
+        previous_lifecycle_sink = self._active_lifecycle_sink
+        self._active_lifecycle_sink = _lifecycle_sink
+        try:
+            if stream_publisher is None:
+                try:
+                    result = await _invoke_handler(
+                        definition.handler,
+                        arguments,
+                        execution_signal,
+                    )
+                except _ToolCanceled:
+                    result = _legacy_result(_canceled_result(tool_call.id))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
+                    result = _error_result(str(exc))
+            else:
+                result = await self._invoke_streaming_handler(
                     definition.handler,
                     arguments,
                     execution_signal,
+                    stream_publisher,
+                    tool_call.id,
                 )
-            except _ToolCanceled:
-                result = _legacy_result(_canceled_result(tool_call.id))
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - tool handlers must fail closed
-                result = _error_result(str(exc))
-        else:
-            result = await self._invoke_streaming_handler(
-                definition.handler,
-                arguments,
-                execution_signal,
-                stream_publisher,
-                tool_call.id,
-            )
+        finally:
+            self._active_tool_call = None
+            self._active_lifecycle_sink = previous_lifecycle_sink
         if isinstance(result, ToolResult):
             if result.tool_call_id != tool_call.id:
                 normalized_result = _error_result(
