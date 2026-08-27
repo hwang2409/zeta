@@ -874,7 +874,13 @@ def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
     payload = build_messages_payload(
         [
             Message(MessageRole.SYSTEM, [TextContent("stable")]),
-            Message(MessageRole.ASSISTANT, [TextContent("previous answer")]),
+            Message(
+                MessageRole.ASSISTANT,
+                [
+                    TextContent("previous answer"),
+                    ThinkingContent("private plan", "signature"),
+                ],
+            ),
             Message(MessageRole.USER, [TextContent("run")]),
         ],
         [{"name": "read", "description": "read a file", "parameters": {"type": "object"}}],
@@ -892,10 +898,11 @@ def test_payload_caches_stable_prefix_and_maps_tool_results() -> None:
     assert payload["messages"][-2]["content"][0]["cache_control"] == {
         "type": "ephemeral"
     }
+    assert "cache_control" not in payload["messages"][-2]["content"][1]
 
 
 @pytest.mark.asyncio
-async def test_compaction_keeps_system_cache_prefix_bytes(tmp_path: Path) -> None:
+async def test_compaction_keeps_stable_cache_prefix_bytes(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(Message(MessageRole.USER, [TextContent("old")]))
     store.append_message(Message(MessageRole.USER, [TextContent("tail")]))
@@ -912,7 +919,7 @@ async def test_compaction_keeps_system_cache_prefix_bytes(tmp_path: Path) -> Non
     before = await assembler.assemble()
     before_payload = build_messages_payload(
         before,
-        [],
+        [{"name": "read", "parameters": {"type": "object"}}],
         model="claude-test",
         max_tokens=4096,
         thinking_budget=2048,
@@ -920,7 +927,7 @@ async def test_compaction_keeps_system_cache_prefix_bytes(tmp_path: Path) -> Non
     after = await assembler.assemble(force=True)
     after_payload = build_messages_payload(
         after,
-        [],
+        [{"name": "read", "parameters": {"type": "object"}}],
         model="claude-test",
         max_tokens=4096,
         thinking_budget=2048,
@@ -929,7 +936,16 @@ async def test_compaction_keeps_system_cache_prefix_bytes(tmp_path: Path) -> Non
     encode = lambda value: json.dumps(
         value, ensure_ascii=False, separators=(",", ":")
     ).encode()
-    assert encode(before_payload["system"]) == encode(after_payload["system"])
+    assert encode(
+        {"system": before_payload["system"], "tools": before_payload["tools"]}
+    ) == encode(
+        {"system": after_payload["system"], "tools": after_payload["tools"]}
+    )
+    assert not any(
+        "cache_control" in block
+        for message in after_payload["messages"]
+        for block in message["content"]
+    )
 
 
 def test_anthropic_flattens_non_text_tool_blocks_at_provider_boundary() -> None:

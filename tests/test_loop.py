@@ -51,30 +51,9 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
 async def test_fake_usage_reports_cache_reads_on_consecutive_turns(tmp_path: Path) -> None:
     backend = FakeBackend(
         [
-            ScriptedTurn(
-                [TextContent("first")],
-                usage={
-                    "input_tokens": 100,
-                    "cache_creation_input_tokens": 80,
-                    "output_tokens": 5,
-                },
-            ),
-            ScriptedTurn(
-                [TextContent("second")],
-                usage={
-                    "input_tokens": 20,
-                    "cache_read_input_tokens": 80,
-                    "output_tokens": 5,
-                },
-            ),
-            ScriptedTurn(
-                [TextContent("third")],
-                usage={
-                    "input_tokens": 20,
-                    "cache_read_input_tokens": 100,
-                    "output_tokens": 5,
-                },
-            ),
+            ScriptedTurn([TextContent("first")], usage={"output_tokens": 5}),
+            ScriptedTurn([TextContent("second")], usage={"output_tokens": 5}),
+            ScriptedTurn([TextContent("third")], usage={"output_tokens": 5}),
         ]
     )
     loop = AgentLoop(backend, ConversationStore(tmp_path), tool_schemas=[])
@@ -82,11 +61,25 @@ async def test_fake_usage_reports_cache_reads_on_consecutive_turns(tmp_path: Pat
     await collect(loop.run_turn("first prompt"))
     assert loop.context_assembler.cache_read_input_tokens_this_session == 0
     await collect(loop.run_turn("second prompt"))
-    assert loop.context_assembler.cache_read_input_tokens_this_session == 80
+    second_read = loop.context_assembler.cache_read_input_tokens_this_session
+    assert second_read > 0
     await collect(loop.run_turn("third prompt"))
 
-    assert loop.context_assembler.cache_read_input_tokens_this_session == 180
-    assert loop.context_assembler.cache_creation_input_tokens_this_session == 80
+    assert loop.context_assembler.cache_read_input_tokens_this_session > second_read
+    assert loop.context_assembler.cache_creation_input_tokens_this_session > 0
+
+    churn_backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first")], usage={"output_tokens": 1}),
+            ScriptedTurn([TextContent("changed")], usage={"output_tokens": 1}),
+        ]
+    )
+    first_request = [Message(MessageRole.USER, [TextContent("first")])]
+    changed_request = [Message(MessageRole.USER, [TextContent("changed")])]
+    await collect(churn_backend.complete(first_request, []))
+    changed_events = await collect(churn_backend.complete(changed_request, []))
+
+    assert changed_events[-1].data["usage"]["cache_read_input_tokens"] == 0
 
 
 @pytest.mark.asyncio

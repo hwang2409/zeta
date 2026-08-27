@@ -27,6 +27,7 @@ from ..types import (
 
 ANTHROPIC_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 ANTHROPIC_MAX_IMAGE_DIMENSION = 8000
+_CACHEABLE_BLOCK_TYPES = {"text", "tool_use", "tool_result", "image"}
 
 
 def _image_block_from_content(content: ImageContent) -> ToolImageBlock:
@@ -170,6 +171,7 @@ def build_messages_payload(
     system: list[dict[str, Any]] = []
     wire_messages: list[dict[str, Any]] = []
     latest_user_wire_index: int | None = None
+    has_compaction = False
     for message in messages:
         if message.role is MessageRole.SYSTEM:
             content = _wire_content(message.content)
@@ -192,6 +194,8 @@ def build_messages_payload(
             ]
             wire_messages.append({"role": "user", "content": content})
             continue
+        if message.role is MessageRole.COMPACTION:
+            has_compaction = True
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
         content = _wire_content(message.content)
         if content or role != "assistant":
@@ -217,11 +221,18 @@ def build_messages_payload(
         payload["tools"] = tools
     # The active user turn can grow during tool calls, so cache only completed
     # conversation history before that turn.
-    if latest_user_wire_index is not None and latest_user_wire_index > 0:
+    if (
+        not has_compaction
+        and latest_user_wire_index is not None
+        and latest_user_wire_index > 0
+    ):
         prefix_message = wire_messages[latest_user_wire_index - 1]
         content = prefix_message["content"]
         if isinstance(content, list) and content:
-            content[-1]["cache_control"] = {"type": "ephemeral"}
+            for block in reversed(content):
+                if block.get("type") in _CACHEABLE_BLOCK_TYPES:
+                    block["cache_control"] = {"type": "ephemeral"}
+                    break
     return payload
 
 
