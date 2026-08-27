@@ -44,6 +44,7 @@ from ..types import (
     StreamEventType,
     TextContent,
     ThinkingContent,
+    assistant_text,
 )
 from .background import background_notice
 from .checkpoints import CheckpointTranscriptMixin
@@ -194,7 +195,6 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
         self._assistant_text = ""
-        self._assistant_message_finished = False
         self._thinking_text = ""
         self._thinking_duration: float | None = None
         self._thinking_started_at: float | None = None
@@ -709,32 +709,32 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         if self._stream_kind in {"thinking", "redacted-thinking"} and self._thinking_text:
             self._print_committed([self._thinking_text], thinking=True)
         elif self._stream_kind == "assistant" and self._assistant_text:
-            self._presenter.finish_assistant(render_markdown(self._assistant_text))
-            self._assistant_message_finished = True
-            self._assistant_text = ""
+            self._presenter.finish_assistant(Text(self._assistant_text, style=BODY))
         self._stream_kind = self._stream_identity = None
         self._partial = self._thinking_text = ""
         self._thinking_duration = self._thinking_started_at = None
 
     def _flush_markdown(self) -> None:
-        if self._assistant_text: self._presenter.finish_assistant(render_markdown(self._assistant_text)); self._assistant_text = ""
+        if self._assistant_text:
+            self._presenter.finish_assistant(render_markdown(self._assistant_text))
 
     def _finish_message(self, event: StreamEvent) -> None:
-        if self._assistant_message_finished:
-            return
-        content = event.message.content if event.message is not None else (TextContent(self._assistant_text),)
-        value = "".join(block.text for block in content if isinstance(block, TextContent))
-        if value and self._stream_kind in {"assistant", None}:
-            self._presenter.finish_assistant(render_markdown(value))
-            self._turn_had_visible_output |= bool(value.strip())
-            self._assistant_message_finished = True
-        elif self._stream_kind in {"thinking", "redacted-thinking"}:
+        if self._stream_kind in {"thinking", "redacted-thinking"}:
             self._flush_stream_kind()
+        value = (
+            assistant_text(event.message)
+            if event.message is not None
+            else self._assistant_text
+        )
+        if value:
+            self._presenter.finish_assistant_message(render_markdown(value))
+            self._turn_had_visible_output |= bool(value.strip())
         self._stream_kind = self._stream_identity = None
         self._reset_stream_buffers()
 
     def _flush_pending_stream(self) -> None:
-        self._flush_stream_kind(); self._flush_markdown(); self._presenter.reset_assistant_unit()
+        self._flush_stream_kind()
+        self._presenter.reset_assistant_unit()
 
     def _consume_text(self, event: StreamEvent) -> None:
         incoming_kind, incoming_identity = stream_key(event)
@@ -774,7 +774,10 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         self._turn_had_visible_output |= bool(value.strip())
 
     def _reset_stream_state(self) -> None:
-        self._reset_stream_buffers(); self._partial = ""; self._streaming = False
+        self._stream_kind = self._stream_identity = None
+        self._partial = self._thinking_text = ""
+        self._thinking_duration = self._thinking_started_at = None
+        self._streaming = False
 
     def _reset_stream_buffers(self) -> None:
         self._assistant_text = self._thinking_text = ""
@@ -789,7 +792,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
     def _prepare_stream_event(self, event: StreamEvent) -> None:
         if event.type is StreamEventType.MESSAGE_START:
             self._flush_pending_stream()
-            self._assistant_message_finished = False
+            self._assistant_text = ""
             return
         if event.type is StreamEventType.MESSAGE_END:
             return

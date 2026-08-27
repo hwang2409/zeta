@@ -9,9 +9,9 @@ from ..types import (
     MessageRole,
     StreamEvent,
     StreamEventType,
-    TextContent,
     ToolCall,
     ToolUseContent,
+    assistant_text,
 )
 from .render import render_event, render_markdown
 
@@ -100,11 +100,7 @@ class CheckpointTranscriptMixin:
 
     @staticmethod
     def _message_text(message: Message) -> str:
-        return "\n".join(
-            block.text
-            for block in message.content
-            if isinstance(block, TextContent) and block.text
-        )
+        return assistant_text(message)
 
     def _rebuild_transcript(self) -> None:
         """Re-render the visible transcript from the active durable branch."""

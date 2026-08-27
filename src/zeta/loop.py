@@ -25,6 +25,7 @@ from .types import (
     ErrorInfo,
     Message,
     MessageRole,
+    assistant_text,
     StreamEvent,
     StreamEventType,
     StructuredToolResult,
@@ -1058,9 +1059,7 @@ def _durable_message(message: Message) -> Message:
 
 
 def _assistant_text(message: Message) -> str:
-    return "".join(
-        block.text for block in message.content if isinstance(block, TextContent)
-    )
+    return assistant_text(message)
 
 
 def _assistant_text_snippet(message: Message) -> str:

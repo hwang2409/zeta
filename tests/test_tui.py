@@ -2992,6 +2992,133 @@ def test_completed_message_renders_final_message_text(tmp_path: Path) -> None:
     assert "**" not in rendered
 
 
+def test_completed_message_rerenders_text_split_by_thinking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    events = [
+        StreamEvent(StreamEventType.MESSAGE_START),
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("before **"),
+        ),
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=ThinkingContent("plan"),
+        ),
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("bold** after"),
+        ),
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(
+                MessageRole.ASSISTANT,
+                [
+                    TextContent("before **"),
+                    ThinkingContent("plan"),
+                    TextContent("bold** after"),
+                ],
+            ),
+        ),
+    ]
+    for event in events:
+        app._prepare_stream_event(event)
+        if event.type is StreamEventType.MESSAGE_UPDATE:
+            app._consume_text(event)
+        elif event.type is StreamEventType.MESSAGE_END:
+            app._finish_message(event)
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "**" not in rendered
+    assert "before bold after" in rendered
+
+
+def test_completed_message_rerenders_text_split_by_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    call = ToolCall("split-1", "read", {"path": "README.md"})
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    events = [
+        StreamEvent(StreamEventType.MESSAGE_START),
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("before **"),
+        ),
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=ToolUseContent(call),
+        ),
+        StreamEvent(
+            StreamEventType.MESSAGE_UPDATE,
+            content=TextContent("bold** after"),
+        ),
+        StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(
+                MessageRole.ASSISTANT,
+                [
+                    TextContent("before **"),
+                    ToolUseContent(call),
+                    TextContent("bold** after"),
+                ],
+            ),
+        ),
+    ]
+    for event in events:
+        app._prepare_stream_event(event)
+        if event.type is StreamEventType.MESSAGE_UPDATE:
+            app._consume_text(event)
+        elif event.type is StreamEventType.MESSAGE_END:
+            app._finish_message(event)
+
+    rendered = Text.from_ansi(app._transcript.render(120)).plain
+    assert "**" not in rendered
+    assert "before bold after" in rendered
+
+
+@pytest.mark.asyncio
+async def test_rebuild_transcript_matches_character_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    source = "before **bold** after"
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend(
+                [ScriptedTurn(content=[TextContent(character) for character in source])]
+            ),
+            ConversationStore(tmp_path / "sessions"),
+        ),
+        provider="fake",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+    app._print_user("prompt")
+
+    await app._consume_turn("prompt")
+
+    live = app._transcript.render(120)
+    app._rebuild_transcript()
+    replayed = app._transcript.render(120)
+    assert replayed == live
+
+
 def test_markdown_stream_keeps_model_blank_lines_without_inserting_more(
     tmp_path: Path,
 ) -> None:
