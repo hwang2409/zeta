@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Sequence
+from typing import AsyncIterator, Callable, Sequence
 
 from ..types import (
     CompletionBackend,
@@ -33,11 +34,17 @@ class FakeBackend(CompletionBackend):
         turns: Sequence[ScriptedTurn],
         *,
         close_error: Exception | None = None,
+        request_serializer: Callable[
+            [Sequence[Message], Sequence[ToolSchema]], bytes
+        ] | None = None,
     ) -> None:
         self.turns = list(turns)
         self.calls: list[tuple[list[Message], list[ToolSchema]]] = []
         self.completion_close_count = 0
         self.close_error = close_error
+        self.request_serializer = request_serializer
+        self.request_bytes: list[bytes] = []
+        self._previous_request: bytes | None = None
 
     async def complete(
         self,
@@ -47,6 +54,25 @@ class FakeBackend(CompletionBackend):
         index = len(self.calls)
         self.calls.append((list(messages), list(tool_schemas)))
         turn = self.turns[index]
+        if self.request_serializer is None:
+            request = json.dumps(
+                [
+                    *(message.to_dict() for message in messages),
+                    {"tools": list(tool_schemas)},
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        else:
+            request = self.request_serializer(messages, tool_schemas)
+        self.request_bytes.append(request)
+        usage = dict(turn.usage)
+        cache_read = _common_prefix_length(self._previous_request, request)
+        self._previous_request = request
+        if usage:
+            usage["cache_read_input_tokens"] = cache_read
+            usage["cache_creation_input_tokens"] = len(request) - cache_read
         blocks = [*turn.content, *(ToolUseContent(call) for call in turn.tool_calls)]
         try:
             yield StreamEvent(StreamEventType.MESSAGE_START)
@@ -59,9 +85,21 @@ class FakeBackend(CompletionBackend):
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
                 message=Message(role=MessageRole.ASSISTANT, content=blocks),
-                data={"usage": dict(turn.usage)} if turn.usage else {},
+                data={"usage": usage} if usage else {},
             )
         finally:
             self.completion_close_count += 1
             if self.close_error is not None:
                 raise self.close_error
+
+
+def _common_prefix_length(
+    previous: bytes | None, current: bytes
+) -> int:
+    if previous is None:
+        return 0
+    length = min(len(previous), len(current))
+    for index in range(length):
+        if previous[index] != current[index]:
+            return index
+    return length

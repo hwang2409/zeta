@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
+import zeta.providers.anthropic as anthropic_module
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
@@ -29,6 +30,19 @@ from zeta.types import (
 )
 
 
+def anthropic_request_bytes(
+    messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
+) -> bytes:
+    payload = anthropic_module.build_request_payload(
+        messages,
+        tool_schemas,
+        model="claude-test",
+        max_tokens=4096,
+        thinking_budget=2048,
+    )
+    return anthropic_module.serialize_request_payload(payload)
+
+
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
     return [event async for event in events]
 
@@ -45,6 +59,75 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
         MessageRole.USER,
         MessageRole.ASSISTANT,
     ]
+
+
+@pytest.mark.asyncio
+async def test_fake_usage_reports_cache_reads_on_consecutive_turns(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first")], usage={"output_tokens": 5}),
+            ScriptedTurn([TextContent("second")], usage={"output_tokens": 5}),
+            ScriptedTurn([TextContent("third")], usage={"output_tokens": 5}),
+        ],
+        request_serializer=anthropic_request_bytes,
+    )
+    loop = AgentLoop(backend, ConversationStore(tmp_path), tool_schemas=[])
+
+    await collect(loop.run_turn("first prompt"))
+    assert loop.context_assembler.cache_read_input_tokens_this_session == 0
+    await collect(loop.run_turn("second prompt"))
+    second_read = loop.context_assembler.cache_read_input_tokens_this_session
+    assert second_read > 0
+    await collect(loop.run_turn("third prompt"))
+
+    assert loop.context_assembler.cache_read_input_tokens_this_session > second_read
+    assert loop.context_assembler.cache_creation_input_tokens_this_session > 0
+    first_payload = json.loads(backend.request_bytes[0])
+    assert first_payload["system"][0]["text"] == (
+        "You are Claude Code, Anthropic's official CLI for Claude."
+    )
+
+    baseline_backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("same")], usage={"output_tokens": 1}),
+            ScriptedTurn([TextContent("same")], usage={"output_tokens": 1}),
+        ],
+        request_serializer=anthropic_request_bytes,
+    )
+    same_request = [Message(MessageRole.USER, [TextContent("same")])]
+    await collect(baseline_backend.complete(same_request, []))
+    baseline_events = await collect(baseline_backend.complete(same_request, []))
+    baseline_read = baseline_events[-1].data["usage"]["cache_read_input_tokens"]
+
+    mutated_backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("same")], usage={"output_tokens": 1}),
+            ScriptedTurn([TextContent("same")], usage={"output_tokens": 1}),
+        ],
+    )
+
+    def mutate_first_request(
+        messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
+    ) -> bytes:
+        payload = anthropic_module.build_request_payload(
+            messages,
+            tool_schemas,
+            model="claude-test",
+            max_tokens=4096,
+            thinking_budget=2048,
+        )
+        if not mutated_backend.request_bytes:
+            payload["system"][0]["text"] += "x"
+        return anthropic_module.serialize_request_payload(payload)
+
+    mutated_backend.request_serializer = mutate_first_request
+    await collect(mutated_backend.complete(same_request, []))
+    changed_events = await collect(mutated_backend.complete(same_request, []))
+
+    assert (
+        changed_events[-1].data["usage"]["cache_read_input_tokens"]
+        < baseline_read
+    )
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,7 @@ from ..types import (
 
 ANTHROPIC_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 ANTHROPIC_MAX_IMAGE_DIMENSION = 8000
+_CACHEABLE_BLOCK_TYPES = {"text", "tool_use", "tool_result", "image"}
 
 
 def _image_block_from_content(content: ImageContent) -> ToolImageBlock:
@@ -169,6 +170,7 @@ def build_messages_payload(
     _validate_thinking_parameters(max_tokens, thinking_budget)
     system: list[dict[str, Any]] = []
     wire_messages: list[dict[str, Any]] = []
+    latest_user_wire_index: int | None = None
     for message in messages:
         if message.role is MessageRole.SYSTEM:
             content = _wire_content(message.content)
@@ -194,6 +196,8 @@ def build_messages_payload(
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
         content = _wire_content(message.content)
         if content or role != "assistant":
+            if message.role is MessageRole.USER:
+                latest_user_wire_index = len(wire_messages)
             wire_messages.append({"role": role, "content": content})
 
     if system:
@@ -212,16 +216,25 @@ def build_messages_payload(
         payload["system"] = system
     if tools:
         payload["tools"] = tools
-    for message in reversed(wire_messages):
-        if message["role"] != "user":
-            continue
-        content = message["content"]
-        if isinstance(content, list) and content:
-            last_block = content[-1]
-            if last_block.get("type") in {"text", "tool_result"}:
-                last_block["cache_control"] = {"type": "ephemeral"}
-        break
+    # The active user turn can grow during tool calls, so cache only completed
+    # conversation history before that turn.
+    if latest_user_wire_index is not None:
+        for message in reversed(wire_messages[:latest_user_wire_index]):
+            content = message["content"]
+            if not isinstance(content, list):
+                continue
+            for block in reversed(content):
+                if _is_cacheable_block(block):
+                    block["cache_control"] = {"type": "ephemeral"}
+                    return payload
     return payload
+
+
+def _is_cacheable_block(block: Mapping[str, Any]) -> bool:
+    block_type = block.get("type")
+    if block_type not in _CACHEABLE_BLOCK_TYPES:
+        return False
+    return block_type != "text" or bool(block.get("text", "").strip())
 
 
 def _validate_thinking_parameters(max_tokens: int, thinking_budget: int) -> None:
