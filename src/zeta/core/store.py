@@ -221,6 +221,7 @@ class ConversationStore(CheckpointForkMixin):
                 "tool_call": tool_call.to_dict(),
                 "child_session_path": child_session_path,
                 "description": description,
+                "turns_used": 0,
             }
             self._write_session_state(self.bash_cwd, self._todo_items)
 
@@ -228,6 +229,20 @@ class ConversationStore(CheckpointForkMixin):
         """Return durable markers for children that did not finish."""
 
         return copy.deepcopy(self._agent_children)
+
+    def update_agent_child_turns(self, tool_call_id: str, turns_used: int) -> None:
+        """Persist the number of completed turns for a running child."""
+
+        if type(turns_used) is not int or turns_used < 0:
+            raise ValueError("child turns must be a nonnegative integer")
+        with self._append_lock():
+            self._load()
+            self._load_session_state()
+            marker = self._agent_children.get(tool_call_id)
+            if marker is None:
+                return
+            marker["turns_used"] = turns_used
+            self._write_session_state(self.bash_cwd, self._todo_items)
 
     def finish_agent_child(self, tool_call_id: str) -> None:
         """Remove a child marker after its parent tool result is durable."""
@@ -323,6 +338,13 @@ class ConversationStore(CheckpointForkMixin):
                 or not marker["child_session_path"]
                 or type(marker.get("description")) is not str
                 or not marker["description"]
+                or (
+                    "turns_used" in marker
+                    and (
+                        type(marker["turns_used"]) is not int
+                        or marker["turns_used"] < 0
+                    )
+                )
             ):
                 raise ConversationIntegrityError(
                     f"session state child marker is invalid: {self.state_path}"

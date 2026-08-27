@@ -323,7 +323,7 @@ class AgentCard:
         self._expanded = not self._expanded
         if self._expanded:
             return self._expanded_render()
-        return self._receipt
+        return self._receipt if self._finished else self._progress()
 
 
 def render_agent_progress(
