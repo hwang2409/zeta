@@ -588,19 +588,19 @@ async def _decode_response(
 
     def process_provider_error(
         record: tuple[str, dict[str, Any]],
-    ) -> tuple[StreamEvent | None, bool]:
+    ) -> tuple[StreamEvent | None, AnthropicStreamError | None]:
         event, payload = record
         event_type = payload.get("type", event)
         if event_type != "error":
-            return process_record(record), False
+            return process_record(record), None
         try:
-            return process_record(record), False
-        except AnthropicStreamError:
+            return process_record(record), None
+        except AnthropicStreamError as exc:
             if message_state == "not-started":
                 raise
             if message_state == "stopped":
-                return None, False
-            return salvage(AnthropicStreamError), True
+                return None, None
+            return salvage(type(exc)), exc
 
     try:
         async for line in response.aiter_lines():
@@ -610,7 +610,7 @@ async def _decode_response(
                 continue
             sse_events_received += 1
             last_event_at = time.monotonic()
-            translated, salvaged = process_provider_error(record)
+            translated, provider_error = process_provider_error(record)
             if translated is None:
                 continue
             if translated.type is StreamEventType.MESSAGE_END:
@@ -625,8 +625,8 @@ async def _decode_response(
                 )
                 finished = True
             yield translated
-            if salvaged:
-                return
+            if provider_error is not None:
+                raise provider_error
     except httpx.HTTPError as exc:
         if finished or message_state == "not-started":
             raise
@@ -639,7 +639,7 @@ async def _decode_response(
     if record is not None:
         sse_events_received += 1
         last_event_at = time.monotonic()
-        translated, salvaged = process_provider_error(record)
+        translated, provider_error = process_provider_error(record)
         if translated is not None:
             if translated.type is StreamEventType.MESSAGE_END:
                 translated = StreamEvent(
@@ -652,17 +652,17 @@ async def _decode_response(
                     },
                 )
                 yield translated
+                if provider_error is not None:
+                    raise provider_error
                 return
             yield translated
-            if salvaged:
-                return
+            if provider_error is not None:
+                raise provider_error
     if not finished:
         if message_state == "not-started":
             raise AnthropicStreamError("Anthropic stream ended before message_start")
         salvage("clean-eof")
-        raise AnthropicStreamError(
-            "Anthropic stream ended before message completion"
-        )
+        raise AnthropicStreamError("Anthropic stream ended before message completion")
 
 
 def _translate_event(
@@ -684,8 +684,10 @@ def _translate_event(
         if type(message) is not str:
             raise AnthropicStreamError("Anthropic stream error message is invalid")
         reason = detail.get("type")
+        reason_text = error_body_excerpt(message.encode()) or "Anthropic stream error"
+        detail = f"{reason}: {reason_text}" if type(reason) is str else reason_text
         raise AnthropicStreamError(
-            error_body_excerpt(message.encode()) or "Anthropic stream error",
+            detail,
             retryable=reason in {"overloaded_error", "rate_limit_error"},
             retry_reason=reason if reason in {"overloaded_error", "rate_limit_error"} else None,
         )

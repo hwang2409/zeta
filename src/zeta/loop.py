@@ -708,22 +708,24 @@ class AgentLoop:
             completion: AsyncIterator[StreamEvent] | None = None
             completion_succeeded = False
             provider_error: ErrorInfo | None = None
-            if self.context_assembler.needs_compaction():
-                yield StreamEvent(
-                    StreamEventType.COMPACTION_START,
-                    data={"turn": turn_number},
-                )
-            context_messages = await self.context_assembler.assemble(backend=self.backend)
-            context = self.context_assembler.last_context
-            if context is not None and context.compacted:
-                yield StreamEvent(
-                    StreamEventType.COMPACTION_END,
-                    data={
-                        "turn": turn_number,
-                        "token_count": context.token_count,
-                    },
-                )
             try:
+                if self.context_assembler.needs_compaction():
+                    yield StreamEvent(
+                        StreamEventType.COMPACTION_START,
+                        data={"turn": turn_number},
+                    )
+                context_messages = await self.context_assembler.assemble(
+                    backend=self.backend
+                )
+                context = self.context_assembler.last_context
+                if context is not None and context.compacted:
+                    yield StreamEvent(
+                        StreamEventType.COMPACTION_END,
+                        data={
+                            "turn": turn_number,
+                            "token_count": context.token_count,
+                        },
+                    )
                 completion = self.backend.complete(
                     context_messages, self.tool_schemas
                 )
@@ -752,12 +754,7 @@ class AgentLoop:
                     if event.message is not None and event.type is StreamEventType.MESSAGE_END:
                         assistant_message = event.message
                     if event.type is StreamEventType.MESSAGE_END:
-                        if event.data.get("truncated"):
-                            provider_error = ErrorInfo(
-                                "stream_error",
-                                "provider stream ended before completion",
-                            )
-                        else:
+                        if not event.data.get("truncated"):
                             completion_succeeded = True
                     yield event
                     if provider_error is not None:

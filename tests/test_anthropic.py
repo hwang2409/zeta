@@ -1442,14 +1442,14 @@ async def test_post_start_provider_error_salvages_once(tmp_path: Path) -> None:
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
-    events = [
-        event
+    events: list[StreamEvent] = []
+    with pytest.raises(AnthropicStreamError, match="overloaded_error: busy"):
         async for event in AnthropicBackend(
             client=client,
             token_store=store,
             diagnostics_path=diagnostics_path,
-        ).complete([], [])
-    ]
+        ).complete([], []):
+            events.append(event)
 
     assert len(requests) == 1
     assert not any(event.type is StreamEventType.RETRY for event in events)

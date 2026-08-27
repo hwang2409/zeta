@@ -194,6 +194,8 @@ class CompactionPolicy:
                 if event.type is StreamEventType.MESSAGE_END and event.message is not None:
                     completed = event.message
         except Exception as exc:
+            if type(getattr(exc, "code", None)) is str:
+                raise
             raise SummaryCompletionError("summary completion failed") from exc
 
         if on_usage is not None and summary_usage:

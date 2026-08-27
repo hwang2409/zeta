@@ -37,6 +37,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from zeta.core.approval import ApprovalPolicy
+from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
@@ -1596,6 +1597,62 @@ async def test_retry_failure_renders_a_fresh_error_card(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_compaction_failure_renders_reason_and_retry_succeeds(
+    tmp_path: Path,
+) -> None:
+    class CompactionBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("compaction provider disconnected")
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+            )
+
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
+    backend = CompactionBackend()
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        system_prompt="",
+        token_counter=lambda message: 60 if message.role is MessageRole.USER else 1,
+        backend=backend,
+    )
+    app = TUIApp(
+        AgentLoop(backend, store, context_assembler=assembler),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    await app._consume_turn("new")
+
+    rendered = Text.from_ansi(app.console.file.getvalue()).plain
+    assert app.retry_available()
+    assert "provider failure · backend_error" in rendered
+    assert "summary completion failed" in rendered
+    assert store.turn_in_flight() is False
+
+    app.retry_failed_turn()
+    assert app._active_task is not None
+    await app._active_task
+
+    assert backend.calls == 3
+    assert store.messages()[-1].content[0].text == "done"
+
+
+@pytest.mark.asyncio
 async def test_resumed_failed_turn_renders_and_retries_without_duplication(
     tmp_path: Path,
 ) -> None:
@@ -1638,6 +1695,63 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
         for message in backend.request_messages[0]
         if message.role is not MessageRole.SYSTEM
     ] == [MessageRole.USER]
+
+
+def test_resumed_failure_followed_by_success_is_not_retryable(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("prompt")]))
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("partial")],
+            metadata={
+                "turn_failed": True,
+                "turn_error": {"code": "backend_error", "message": "boom"},
+            },
+        )
+    )
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("recovered")])
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._rebuild_transcript()
+
+    assert not app.retry_available()
+
+
+def test_resumed_failure_followed_by_new_user_is_not_retryable(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("first")]))
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            metadata={
+                "turn_failed": True,
+                "turn_error": {"code": "backend_error", "message": "boom"},
+            },
+        )
+    )
+    store.append_message(Message(MessageRole.USER, [TextContent("second")]))
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._rebuild_transcript()
+
+    assert not app.retry_available()
 
 
 @pytest.mark.asyncio

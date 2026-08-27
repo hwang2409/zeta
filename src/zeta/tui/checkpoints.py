@@ -130,13 +130,16 @@ class CheckpointTranscriptMixin:
                 continue
             message = Message.from_dict(entry.data["message"])
             if message.role is MessageRole.USER:
+                self._failed_turn = None
                 last_user = message
                 self._print_user(message)
             elif message.role is MessageRole.ASSISTANT:
                 text = assistant_text(message)
                 if text:
                     self._print_unit(render_markdown(text))
-                if message.metadata.get(FAILED_TURN_MARKER):
+                if not message.metadata.get(FAILED_TURN_MARKER):
+                    self._failed_turn = None
+                else:
                     error_value = message.metadata.get(FAILED_TURN_ERROR)
                     error = (
                         ErrorInfo.from_dict(error_value)
@@ -145,6 +148,8 @@ class CheckpointTranscriptMixin:
                     )
                     if is_retryable_error(error) and last_user is not None:
                         self._failed_turn = (assistant_text(last_user), last_user)
+                    else:
+                        self._failed_turn = None
                     self._print_unit(
                         render_event(StreamEvent(StreamEventType.ERROR, error=error))
                     )
