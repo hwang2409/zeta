@@ -230,12 +230,24 @@ class ComposerAttachmentMixin:
         self._pending_attachment_tokens[token] = path
         return token
 
+    def _delete_staged_attachment(self, path: Path) -> None:
+        if (
+            path.parent == self.loop.store.session_dir
+            and path.name.startswith("clipboard-")
+            and path.suffix == ".png"
+        ):
+            path.unlink(missing_ok=True)
+
     def _pending_paths_for(self, value: str) -> list[Path]:
         mapped_paths = set(self._pending_attachment_tokens.values())
-        for token in tuple(self._pending_attachment_tokens):
+        cancelled_paths: set[Path] = set()
+        for token, path in tuple(self._pending_attachment_tokens.items()):
             if token not in value:
                 del self._pending_attachment_tokens[token]
+                cancelled_paths.add(path)
         remaining_mapped_paths = set(self._pending_attachment_tokens.values())
+        for path in cancelled_paths - remaining_mapped_paths:
+            self._delete_staged_attachment(path)
         self._pending_attachments[:] = [
             path
             for path in self._pending_attachments
@@ -278,6 +290,10 @@ class ComposerAttachmentMixin:
         return build_user_message(value, self.loop.store.cwd, tuple(valid_pending))
 
     def _clear_pending_attachments(self) -> None:
+        mapped_paths = set(self._pending_attachment_tokens.values())
+        for path in self._pending_attachments:
+            if path not in mapped_paths:
+                self._delete_staged_attachment(path)
         self._pending_attachments.clear()
         self._pending_attachment_tokens.clear()
         self._next_image_token = 1

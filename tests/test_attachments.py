@@ -373,6 +373,83 @@ async def test_image_token_numbering_resets_after_send(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_image_token_removes_staged_file_on_send(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        provider="fake",
+        model="offline",
+    )
+    staged = store.session_dir / "clipboard-cancelled.png"
+    staged.write_bytes(PNG)
+    app._pending_attachments.append(staged)
+    app._pending_attachment_tokens["[Image #1]"] = staged
+
+    await app._handle_prompt_value("send")
+    assert app._active_task is not None
+    await app._active_task
+
+    assert not staged.exists()
+    assert store.messages()[0].content == [TextContent("send")]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_image_token_keeps_delivered_staged_file(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        provider="fake",
+        model="offline",
+    )
+    cancelled = store.session_dir / "clipboard-cancelled.png"
+    delivered = store.session_dir / "clipboard-delivered.png"
+    cancelled.write_bytes(PNG)
+    delivered.write_bytes(PNG)
+    app._pending_attachments[:] = [cancelled, delivered]
+    app._pending_attachment_tokens.update(
+        {"[Image #1]": cancelled, "[Image #2]": delivered}
+    )
+
+    await app._handle_prompt_value("send [Image #2]")
+    assert app._active_task is not None
+    await app._active_task
+
+    assert not cancelled.exists()
+    assert delivered.exists()
+    assert store.messages()[0].content[0] == TextContent("send [Image #2]")
+    assert store.messages()[0].content[1].path == str(delivered)
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_image_token_cancellation_removes_staged_file(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        provider="fake",
+        model="offline",
+    )
+    staged = store.session_dir / "clipboard-partial.png"
+    staged.write_bytes(PNG)
+    app._pending_attachments.append(staged)
+    app._pending_attachment_tokens["[Image #1]"] = staged
+
+    await app._handle_prompt_value("send [Image #1")
+    assert app._active_task is not None
+    await app._active_task
+
+    assert not staged.exists()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
 async def test_paste_has_no_notice_or_pending_footer(tmp_path: Path) -> None:
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
