@@ -1,5 +1,7 @@
 import asyncio
+import json
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -9,8 +11,13 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
+from zeta.mcp import MCPMount
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy
+from zeta.tools.agent_presets import (
+    AGENT_PRESETS,
+    GENERAL_PRESET,
+)
 from zeta.types import (
     CompletionBackend,
     Message,
@@ -28,11 +35,16 @@ async def _collect(events):
     return [event async for event in events]
 
 
-def _agent_call(call_id: str = "agent-1") -> ToolCall:
+def _agent_call(
+    call_id: str = "agent-1", agent_type: str | None = None
+) -> ToolCall:
+    arguments = {"prompt": "inspect the task", "description": "task research"}
+    if agent_type is not None:
+        arguments["agent_type"] = agent_type
     return ToolCall(
         call_id,
         "agent",
-        {"prompt": "inspect the task", "description": "task research"},
+        arguments,
     )
 
 
@@ -234,6 +246,261 @@ async def test_agent_returns_child_text_and_persists_child_session(tmp_path: Pat
     assert "agent" not in {
         schema["name"] for schema in backend.calls[1][1]
     }
+    assert {
+        schema["name"] for schema in backend.calls[1][1]
+    } == {
+        schema["name"] for schema in backend.calls[0][1]
+    } - {"agent"}
+
+
+def test_agent_schema_uses_preset_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    custom = replace(
+        AGENT_PRESETS["explore"],
+        name="custom",  # type: ignore[arg-type]
+    )
+    monkeypatch.setitem(AGENT_PRESETS, "explore", custom)
+    registry = ToolRegistry(tmp_path)
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    AgentLoop(FakeBackend([]), store, registry=registry)
+
+    agent_schema = next(schema for schema in registry.schemas if schema["name"] == "agent")
+    agent_type_schema = agent_schema["parameters"]["properties"]["agent_type"]
+    assert agent_type_schema["enum"] == [
+        preset.name for preset in AGENT_PRESETS.values()
+    ]
+    expected_description = "Choose one of: " + "; ".join(
+        f"{preset.name}: {preset.selection_guidance}"
+        for preset in AGENT_PRESETS.values()
+    ) + "."
+    assert agent_type_schema["description"] == expected_description
+
+
+@pytest.mark.asyncio
+async def test_general_agent_markers_keep_legacy_state_bytes(tmp_path: Path) -> None:
+    omitted = ConversationStore(tmp_path / "omitted", cwd=tmp_path)
+    explicit = ConversationStore(tmp_path / "explicit", cwd=tmp_path)
+    omitted_backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call(call_id="omitted")]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    explicit_backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    _agent_call(call_id="explicit", agent_type=GENERAL_PRESET.name)
+                ]
+            ),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+
+    await _collect(AgentLoop(omitted_backend, omitted, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(explicit_backend, explicit, max_turns=1).run_turn("start"))
+
+    omitted_child_state = omitted.session_dir / "agents" / "1" / "session_state.json"
+    explicit_child_state = explicit.session_dir / "agents" / "1" / "session_state.json"
+    assert omitted_child_state.read_bytes() == explicit_child_state.read_bytes()
+    assert json.loads(omitted_child_state.read_text()) == {"bash_cwd": str(tmp_path)}
+    assert omitted.state_path.read_bytes() == explicit.state_path.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_explore_child_has_read_only_tools_and_rejects_exec(
+    tmp_path: Path,
+) -> None:
+    child_exec = ToolCall("child-exec", "exec", {"command": "echo no"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call(agent_type="explore")]),
+            ScriptedTurn(tool_calls=[child_exec]),
+            ScriptedTurn([TextContent("explore complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    child_schemas = {schema["name"] for schema in backend.calls[1][1]}
+    assert child_schemas == {"fetch", "read", "skill", "websearch"}
+    child_messages = ConversationStore(
+        store.session_dir / "agents", session_id="1"
+    ).messages()
+    child_result = next(
+        message.tool_result for message in child_messages if message.tool_result
+    )
+    assert child_result.is_error
+    assert child_result.content == "unknown tool: exec"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "agent_type",
+    ["explore", "plan"],
+)
+async def test_restricted_child_cannot_use_mounted_mcp_write_tool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    agent_type: str,
+) -> None:
+    mount_calls = 0
+
+    async def mount_write_tool(registry: ToolRegistry) -> MCPMount:
+        nonlocal mount_calls
+        mount_calls += 1
+
+        async def remote_write(
+            arguments: dict[str, object], abort_signal
+        ) -> dict[str, object]:
+            del arguments, abort_signal
+            return {
+                "content": [{"type": "text", "text": "write executed"}],
+                "isError": False,
+                "structuredContent": None,
+            }
+
+        registry.register(
+            "remote:write",
+            remote_write,
+            parameters={"type": "object"},
+            requires_approval=False,
+        )
+        return MCPMount(())
+
+    monkeypatch.setattr("zeta.loop.mount_mcp_servers", mount_write_tool)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call(agent_type=agent_type)]),
+            ScriptedTurn(
+                tool_calls=[ToolCall("remote-write", "remote:write", {})]
+            ),
+            ScriptedTurn([TextContent("restricted complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    assert mount_calls == 1
+    child_result = next(
+        message.tool_result
+        for message in ConversationStore(
+            store.session_dir / "agents", session_id="1"
+        ).messages()
+        if message.tool_result
+    )
+    assert child_result.is_error
+    assert child_result.content == "unknown tool: remote:write"
+
+
+@pytest.mark.asyncio
+async def test_plan_child_includes_todo_and_only_read_only_tools(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call(agent_type="plan")]),
+            ScriptedTurn([TextContent("plan complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    assert {schema["name"] for schema in backend.calls[1][1]} == {
+        "fetch",
+        "read",
+        "skill",
+        "todo",
+        "websearch",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_type", "turn_cap"),
+    [("explore", 15), ("plan", 20)],
+)
+async def test_typed_child_turn_cap_is_enforced(
+    tmp_path: Path, agent_type: str, turn_cap: int
+) -> None:
+    child_call = ToolCall("child-read", "read", {"path": "missing"})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[_agent_call(agent_type=agent_type)])]
+        + [
+            ScriptedTurn(
+                [TextContent(f"step-{turn}")],
+                tool_calls=[child_call],
+            )
+            for turn in range(1, turn_cap + 1)
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.is_error
+    assert f"{turn_cap}-turn cap" in result.content
+    assert result.structured_content == {
+        "turns_used": turn_cap,
+        "child_session_path": str(store.session_dir / "agents" / "1"),
+        "agent_type": agent_type,
+    }
+
+
+@pytest.mark.asyncio
+async def test_unknown_agent_type_returns_loud_error(tmp_path: Path) -> None:
+    call = _agent_call()
+    call = ToolCall(
+        call.id,
+        call.name,
+        {**call.arguments, "agent_type": "unknown"},
+    )
+    backend = FakeBackend([])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    result = await loop._run_agent_tool(
+        call,
+        call.arguments,
+        AbortGenerationRegistry().new_generation(),
+        None,
+    )
+
+    assert result["isError"] is True
+    assert "unknown agent_type" in result["content"][0]["text"]
+    assert not (store.session_dir / "agents").exists()
+
+
+@pytest.mark.asyncio
+async def test_typed_preamble_composes_with_child_system_prompt(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call(agent_type="explore")]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(
+        AgentLoop(
+            backend,
+            store,
+            max_turns=1,
+            system_prompt="existing child instructions",
+        ).run_turn("start")
+    )
+
+    child_system = backend.calls[1][0][0]
+    system_text = " ".join(
+        block.text for block in child_system.content if isinstance(block, TextContent)
+    )
+    assert "You are an explore sub-agent." in system_text
+    assert "existing child instructions" in system_text
 
 
 @pytest.mark.asyncio
@@ -520,6 +787,30 @@ async def test_agent_normal_completion_reports_all_child_turns(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_typed_child_type_survives_completion_and_reopen(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call(agent_type="explore")]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    assert child.agent_type() == "explore"
+    assert json.loads(child.state_path.read_text())["agent_parent"] == {
+        "tool_call_id": "agent-1",
+        "agent_type": "explore",
+        "status": "finished",
+    }
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result.structured_content is not None
+    assert result.structured_content["agent_type"] == "explore"
+
+
+@pytest.mark.asyncio
 async def test_empty_child_final_message_returns_error(tmp_path: Path) -> None:
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[_agent_call()]), ScriptedTurn()]
@@ -595,6 +886,29 @@ async def test_parent_abort_after_child_turn_reports_completed_turns(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_typed_child_type_survives_cancellation_and_reopen(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call(agent_type="explore")]),
+            ScriptedTurn([TextContent("slow")], delay=5),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    await asyncio.sleep(0.05)
+    loop.abort()
+
+    await task
+
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result.structured_content is not None
+    assert result.structured_content["agent_type"] == "explore"
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    assert child.agent_type() == "explore"
+
+
+@pytest.mark.asyncio
 async def test_parent_result_append_precedes_marker_cleanup(tmp_path: Path, monkeypatch) -> None:
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[_agent_call()]), ScriptedTurn([TextContent("done")])]
@@ -642,3 +956,28 @@ def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
     }
     assert not store.agent_children()
     assert '"agent_parent"' not in (child.state_path).read_text()
+
+
+def test_resume_preserves_typed_child_receipt(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="parent")
+    call = _agent_call(agent_type="explore")
+    child = ConversationStore(
+        store.session_dir / "agents", session_id="1", cwd=store.cwd
+    )
+    child.mark_agent_parent(call.id, agent_type="explore")
+    store.allocate_agent_index()
+    store.register_agent_child(
+        call,
+        child_session_path=str(child.session_dir),
+        description="task research",
+        agent_type="explore",
+    )
+    store.update_agent_child_turns(call.id, 2)
+
+    AgentLoop(FakeBackend([]), store, max_turns=1)
+
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result.structured_content is not None
+    assert result.structured_content["agent_type"] == "explore"
+    reopened_child = ConversationStore(store.session_dir / "agents", session_id="1")
+    assert reopened_child.agent_type() == "explore"

@@ -19,7 +19,13 @@ from .core.store import ConversationStore
 from .mcp import MCPMount, mount_mcp_servers
 from .prompts import load_identity
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
-from .tools.agent import CHILD_TURN_CAP, ChildApprovalPolicy, agent_result
+from .tools.agent import ChildApprovalPolicy, agent_result
+from .tools.agent_presets import (
+    GENERAL_PRESET,
+    agent_type_names,
+    compose_system_prompt,
+    get_agent_preset,
+)
 from .tools.registry import (
     ToolExecutionContext,
     _validate_unique_tool_call_ids,
@@ -151,12 +157,14 @@ class AgentLoop:
         retained_tail: int = 8,
         on_completion_success: Callable[[], None] | None = None,
         hooks: HookManager | None = None,
+        skip_mcp_mount: bool = False,
     ) -> None:
         self.backend = backend
         self.store = store
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
         self._agent_child_turns: dict[str, int] = {}
+        self._agent_child_types: dict[str, str] = {}
         self._recover_agent_children()
         if registry is not None and tools is not None:
             raise ValueError("pass only one tool registry")
@@ -195,7 +203,7 @@ class AgentLoop:
         else:
             raise TypeError("tools must be a mapping or ToolRegistry")
         self._mcp_mount: MCPMount | None = None
-        self._mcp_mount_attempted = False
+        self._mcp_mount_attempted = skip_mcp_mount
         self._provided_tool_schemas = tool_schemas is not None
         self.tool_registry.bind_session_store(store)
         if (
@@ -264,6 +272,7 @@ class AgentLoop:
         error: bool,
         child_session_path: str | None = None,
         turns_used: int | None = None,
+        agent_type: str | None = None,
     ) -> dict[str, object]:
         child_store = self._agent_child_stores.get(tool_call_id)
         path = (
@@ -281,6 +290,11 @@ class AgentLoop:
             error=error,
             turns_used=turns,
             child_session_path=path,
+            agent_type=(
+                preset.name
+                if (preset := get_agent_preset(agent_type)) is not None
+                else None
+            ),
         )
 
     def _canceled_agent_result(
@@ -289,6 +303,7 @@ class AgentLoop:
         *,
         child_session_path: str | None = None,
         turns_used: int | None = None,
+        agent_type: str | None = None,
     ) -> ToolResult:
         return _validated_tool_result(
             self._child_result_payload(
@@ -297,6 +312,7 @@ class AgentLoop:
                 error=True,
                 child_session_path=child_session_path,
                 turns_used=turns_used,
+                agent_type=agent_type,
             ),
             tool_call_id,
         )
@@ -316,6 +332,7 @@ class AgentLoop:
                             tool_call_id,
                             child_session_path=marker["child_session_path"],
                             turns_used=marker.get("turns_used", 0),
+                            agent_type=marker.get("agent_type"),
                         ),
                     )
                 )
@@ -343,6 +360,7 @@ class AgentLoop:
     ) -> dict[str, object]:
         prompt = arguments.get("prompt")
         description = arguments.get("description")
+        agent_type = arguments.get("agent_type", GENERAL_PRESET.name)
         if type(prompt) is not str or not prompt.strip():
             return self._child_result_payload(
                 tool_call.id,
@@ -355,6 +373,18 @@ class AgentLoop:
                 "agent error: description must be a nonempty string",
                 error=True,
             )
+        preset = get_agent_preset(agent_type)
+        if preset is None:
+            return self._child_result_payload(
+                tool_call.id,
+                "agent error: unknown agent_type "
+                f"{agent_type!r}; expected one of: {', '.join(agent_type_names())}",
+                error=True,
+            )
+        await self._ensure_mcp_servers()
+        stored_agent_type = (
+            None if preset.name == GENERAL_PRESET.name else preset.name
+        )
         child_number = self.store.allocate_agent_index()
         agents_root = self.store.session_dir / "agents"
         child_store = ConversationStore(
@@ -362,21 +392,28 @@ class AgentLoop:
             session_id=str(child_number),
             cwd=self.store.cwd,
         )
-        child_store.mark_agent_parent(tool_call.id)
+        child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
         child_path = str(child_store.session_dir)
         child_instance_id = f"{self.store.session_id}:{child_number}"
         self._agent_child_stores[tool_call.id] = child_store
         self._agent_child_turns[tool_call.id] = 0
+        self._agent_child_types[tool_call.id] = preset.name
         if publisher is not None:
             publisher.set_metadata({"child_session_path": child_path})
         self.store.register_agent_child(
             tool_call,
             child_session_path=child_path,
             description=description,
+            agent_type=stored_agent_type,
         )
+        excluded_names = {"agent"}
+        if preset.tool_names is not None:
+            excluded_names.update(
+                set(self.tool_registry.definitions_by_name) - preset.tool_names
+            )
         child_registry = self.tool_registry.clone_for_session(
             child_store,
-            exclude_names={"agent"},
+            exclude_names=excluded_names,
         )
         parent_policy = self.tool_registry.approval_policy
         child_policy: ChildApprovalPolicy | None = None
@@ -392,10 +429,14 @@ class AgentLoop:
             self.backend,
             child_store,
             registry=child_registry,
-            max_turns=CHILD_TURN_CAP,
+            max_turns=preset.turn_cap,
             token_budget=self.context_assembler.token_budget,
             retained_tail=self.context_assembler.retained_tail,
-            system_prompt=self.context_assembler.system_prompt,
+            system_prompt=compose_system_prompt(
+                self.context_assembler.system_prompt,
+                preset.preamble,
+            ),
+            skip_mcp_mount=True,
         )
 
         lifecycle_sink = (
@@ -417,6 +458,7 @@ class AgentLoop:
                 text,
                 error=error,
                 child_session_path=child_path,
+                agent_type=preset.name,
             )
 
         async def consume() -> dict[str, object]:
@@ -464,7 +506,7 @@ class AgentLoop:
                 error_message = _error_info(exc).message
             if cap_hit:
                 return child_result(
-                    f"agent error: child reached the {CHILD_TURN_CAP}-turn cap; "
+                    f"agent error: child reached the {preset.turn_cap}-turn cap; "
                     f"partial state is saved at {child_path}; "
                     f"last assistant text: {last_assistant_text or '[none]'}; "
                     f"turns used: {child_turns()}",
@@ -1075,6 +1117,7 @@ class AgentLoop:
                 result = self._canceled_agent_result(
                     call.id,
                     child_session_path=str(child_store.session_dir),
+                    agent_type=self._agent_child_types.get(call.id),
                 )
             if result is None:
                 result = slot
@@ -1105,6 +1148,7 @@ class AgentLoop:
                     child_store.finish_agent_parent()
                 self.store.finish_agent_child(call.id)
                 self._agent_child_turns.pop(call.id, None)
+                self._agent_child_types.pop(call.id, None)
         return results
 
     def _persist_partial(

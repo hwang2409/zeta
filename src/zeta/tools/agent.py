@@ -8,6 +8,12 @@ from typing import Any
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..types import Message, MessageRole, ToolCall, ToolUseContent
+from .agent_presets import (
+    AgentType,
+    GENERAL_PRESET,
+    agent_type_description,
+    agent_type_names,
+)
 from .registry import (
     AbortSignal,
     ToolExecutionContext,
@@ -15,10 +21,6 @@ from .registry import (
     ToolStreamPublisher,
     text_block,
 )
-
-
-CHILD_TURN_CAP = 25
-
 
 class ChildApprovalPolicy:
     """Keep child approval state in both the child and parent stores."""
@@ -138,14 +140,18 @@ def agent_result(
     error: bool,
     turns_used: int,
     child_session_path: str,
+    agent_type: AgentType | None = None,
 ) -> dict[str, object]:
+    structured_content: dict[str, object] = {
+        "turns_used": turns_used,
+        "child_session_path": child_session_path,
+    }
+    if agent_type is not None and agent_type != GENERAL_PRESET.name:
+        structured_content["agent_type"] = agent_type
     return {
         "content": [text_block(text)],
         "isError": error,
-        "structuredContent": {
-            "turns_used": turns_used,
-            "child_session_path": child_session_path,
-        },
+        "structuredContent": structured_content,
     }
 
 
@@ -182,13 +188,19 @@ def register(registry: ToolRegistry) -> None:
         description=(
             "Delegate multi-step exploration or research that would pollute the "
             "main context. The child has its own bounded context and cannot "
-            "spawn further agents."
+            "spawn further agents. Built-in types: "
+            f"{agent_type_description()}"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "prompt": {"type": "string"},
                 "description": {"type": "string"},
+                "agent_type": {
+                    "type": "string",
+                    "enum": agent_type_names(),
+                    "description": agent_type_description(),
+                },
             },
             "required": ["prompt", "description"],
             "additionalProperties": False,
