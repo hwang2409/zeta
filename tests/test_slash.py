@@ -183,7 +183,16 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
         (snapshot.turn, snapshot.input_tokens, snapshot.output_tokens)
         for snapshot in app.slash_status().usage_history
     ] == [(1, 10, 2), (2, 20, 5)]
-    assert "estimated_cost_usd: $0.039249" in output
+    pricing = MODEL_PRICES["claude"]["claude-sonnet-4-6"]
+    assert pricing is not None
+    expected_cost = sum(
+        snapshot.input_tokens * pricing.input
+        + snapshot.cache_read_input_tokens * pricing.cache_read
+        + snapshot.cache_creation_input_tokens * (pricing.cache_write or 0)
+        + snapshot.output_tokens * pricing.output
+        for snapshot in app.slash_status().usage_cost_by_model
+    ) / 1_000_000
+    assert f"estimated_cost_usd: ${expected_cost:.6f}" in output
 
 
 @pytest.mark.asyncio
