@@ -16,7 +16,6 @@ from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
-from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -55,6 +54,7 @@ from .composer import (
     ComposerAttachmentMixin,
     DraftPersistence,
     TurnConsumerMixin,
+    UndoCandidate,
     VimCursorShapeConfig,
     build_key_bindings,
     history_for,
@@ -186,7 +186,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         self.verbose = verbose
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
-        self._queued: deque[Message] = deque()
+        self._queued: deque[tuple[Message, UndoCandidate]] = deque()
         self._pending_attachments: list[Path] = []
         self._pending_attachment_tokens: dict[str, Path] = {}
         self._next_image_token = 1
@@ -217,7 +217,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             draft_path or self.loop.store.session_dir / "draft"
         )
         self._draft_session: PromptSession[str] | None = None
-        self._undo_candidate: str | None = None
+        self._undo_candidate: UndoCandidate | str | None = None
         self._approval_policy = approval_policy
         self._context_files = tuple(context_files)
         self._on_model_change = on_model_change
@@ -254,7 +254,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
     def queued_messages(self) -> tuple[str, ...]:
         return tuple(
             block.text
-            for message in self._queued
+            for message, _candidate in self._queued
             for block in message.content[:1]
             if isinstance(block, TextContent)
         )
@@ -552,29 +552,8 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         if self._history is None:
             self._history = history_for(self._history_path)
         self._history.append_string(value)
-        self._draft.clear()
-    def _restore_composer(self, value: str) -> None:
-        session = self._active_session or self._session
-        if session is None:
-            return
-        buffer = session.app.current_buffer
-        buffer.set_document(Document(value, len(value)))
-    def undo_sent_turn(self) -> None:
-        """Abort the current turn and restore its submitted text once."""
-
-        candidate = self._undo_candidate
-        if (
-            candidate is None
-            or not self.active
-            or self._loop_state not in {"streaming", "compacting", "tool-running", "approval"}
-        ):
-            self._print_unit(Text("undo unavailable: turn already completed", style=DIM))
-            return
-        self._undo_candidate = None
-        self.abort_active()
-        self._restore_composer(candidate)
-        self._draft.schedule(candidate)
-
+        if not self._draft.clear_submitted():
+            self._draft.clear()
     def request_exit(self) -> None:
         self._exit_requested = True
         self.abort_active()
@@ -732,6 +711,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         self._invalidate_prompt()
 
     def _submit_input(self, value: str) -> None:
+        self._draft.mark_submitted()
         self._input_queue.put_nowait(value)
 
     async def _handle_prompt_value(self, value: str) -> None:
@@ -760,12 +740,14 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         if self.pending_approvals:
             self._present_pending_approvals()
         elif self.active:
+            candidate = self._undo_candidate_for_message(model_input, user_message)
             self._clear_pending_attachments()
-            self._queued.append(user_message)
+            self._queued.append((user_message, candidate))
         else:
+            candidate = self._undo_candidate_for_message(model_input, user_message)
             self._clear_pending_attachments()
             self._print_user(user_message)
-            self._undo_candidate = model_input
+            self._undo_candidate = candidate
             self._start_turn(model_input, user_message=user_message)
 
     def _discard_tool_region(self) -> None:

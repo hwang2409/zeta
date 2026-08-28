@@ -2,10 +2,33 @@ from __future__ import annotations
 
 import os
 from collections.abc import Generator
+from pathlib import Path
 
 import httpx
 import pytest
 from rich.console import Console
+
+
+LIVE_ZETA_HOME = Path.home() / ".zeta"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolate_zeta_home(tmp_path_factory: pytest.TempPathFactory) -> Generator[None, None, None]:
+    """Keep every test away from the developer's real zeta home."""
+
+    isolated_home = tmp_path_factory.mktemp("zeta-home")
+    fake_home = isolated_home.parent / "home"
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("ZETA_HOME", str(isolated_home))
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+        yield
+        assert Path(os.environ["ZETA_HOME"]) != LIVE_ZETA_HOME
+        assert Path.home() == fake_home
+
+
+def test_test_home_is_isolated() -> None:
+    assert Path(os.environ["ZETA_HOME"]) != LIVE_ZETA_HOME
 
 
 @pytest.fixture(autouse=True)

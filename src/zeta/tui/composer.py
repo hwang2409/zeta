@@ -11,7 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -265,6 +265,10 @@ class DraftPersistence:
         self.path = Path(path)
         self.delay = delay
         self._pending_text: str | None = None
+        self._pending_revision: int | None = None
+        self._revision = 0
+        self._persisted_revision: int | None = None
+        self._submitted_revision: int | None = None
         self._scheduled: asyncio.TimerHandle | None = None
 
     def load(self) -> str:
@@ -276,7 +280,9 @@ class DraftPersistence:
             return ""
 
     def schedule(self, text: str) -> None:
+        self._revision += 1
         self._pending_text = text
+        self._pending_revision = self._revision
         if self._scheduled is not None:
             self._scheduled.cancel()
         try:
@@ -291,11 +297,14 @@ class DraftPersistence:
             self._scheduled.cancel()
             self._scheduled = None
         text = self._pending_text
+        revision = self._pending_revision
         self._pending_text = None
+        self._pending_revision = None
         if text is None:
             return
         if not text:
             self.path.unlink(missing_ok=True)
+            self._persisted_revision = revision
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: str | None = None
@@ -313,19 +322,54 @@ class DraftPersistence:
                 os.fsync(handle.fileno())
             os.replace(temporary_path, self.path)
             temporary_path = None
+            self._persisted_revision = revision
         finally:
             if temporary_path is not None:
                 Path(temporary_path).unlink(missing_ok=True)
 
     def clear(self) -> None:
         self._pending_text = None
+        self._pending_revision = None
+        self._submitted_revision = None
         if self._scheduled is not None:
             self._scheduled.cancel()
             self._scheduled = None
         self.path.unlink(missing_ok=True)
+        self._persisted_revision = None
+
+    def mark_submitted(self) -> None:
+        """Remember the draft revision submitted by the prompt callback."""
+
+        self._submitted_revision = self._revision
+
+    def clear_submitted(self) -> bool:
+        """Clear only the revision captured by the most recent submission."""
+
+        submitted_revision = self._submitted_revision
+        self._submitted_revision = None
+        if submitted_revision is None:
+            return False
+        if (
+            self._pending_revision is not None
+            and self._pending_revision <= submitted_revision
+        ):
+            self._pending_text = None
+            self._pending_revision = None
+            if self._scheduled is not None:
+                self._scheduled.cancel()
+                self._scheduled = None
+        if (
+            self._persisted_revision is not None
+            and self._persisted_revision <= submitted_revision
+        ):
+            self.path.unlink(missing_ok=True)
+            self._persisted_revision = None
+        return True
 
     def attach(self, buffer: Buffer) -> None:
         draft = self.load()
+        if draft:
+            self._persisted_revision = self._revision
         if draft and not buffer.text:
             buffer.set_document(Document(draft, len(draft)))
 
@@ -333,6 +377,38 @@ class DraftPersistence:
             self.schedule(buffer.text)
 
         buffer.on_text_changed += changed
+
+
+@dataclass(frozen=True, slots=True)
+class UndoCandidate:
+    """Keep submitted text and attachment references available for undo."""
+
+    text: str
+    attachment_paths: tuple[Path, ...] = ()
+    attachment_tokens: tuple[tuple[str, Path], ...] = ()
+
+    @classmethod
+    def from_message(
+        cls,
+        text: str,
+        message: Message,
+        attachment_tokens: Mapping[str, Path],
+    ) -> UndoCandidate:
+        paths = tuple(
+            dict.fromkeys(
+                Path(block.path).resolve()
+                for block in message.content
+                if isinstance(block, (TextContent, ImageContent))
+                and block.path is not None
+            )
+        )
+        path_set = set(paths)
+        tokens = tuple(
+            (token, path.resolve())
+            for token, path in attachment_tokens.items()
+            if path.resolve() in path_set
+        )
+        return cls(text, paths, tokens)
 
 
 @dataclass(frozen=True, slots=True)
@@ -582,6 +658,50 @@ class ComposerAttachmentMixin:
         self._pending_attachment_tokens.clear()
         self._next_image_token = 1
 
+    def _undo_candidate_for_message(
+        self, text: str, message: Message
+    ) -> UndoCandidate:
+        return UndoCandidate.from_message(
+            text, message, self._pending_attachment_tokens
+        )
+
+    def _restore_composer(self, value: str) -> None:
+        session = self._active_session or self._session
+        if session is None:
+            return
+        session.app.current_buffer.set_document(Document(value, len(value)))
+
+    def undo_sent_turn(self) -> None:
+        """Abort the current turn and restore its submitted text once."""
+
+        candidate = self._undo_candidate
+        if (
+            candidate is None
+            or not self.active
+            or self._loop_state
+            not in {"streaming", "compacting", "tool-running", "approval"}
+        ):
+            self._print_unit(Text("undo unavailable: turn already completed", style=DIM))
+            return
+        self._undo_candidate = None
+        self.abort_active()
+        if isinstance(candidate, str):
+            candidate = UndoCandidate(candidate)
+        session = self._active_session or self._session
+        buffer = session.app.current_buffer if session is not None else None
+        if buffer is not None and buffer.text:
+            self._print_system(
+                f"undo kept the current draft; sent text: {candidate.text}"
+            )
+            self._draft.schedule(buffer.text)
+            return
+        self._restore_composer(candidate.text)
+        self._pending_attachments[:] = list(candidate.attachment_paths)
+        self._pending_attachment_tokens.clear()
+        self._pending_attachment_tokens.update(candidate.attachment_tokens)
+        self._next_image_token = len(self._pending_attachment_tokens) + 1
+        self._draft.schedule(candidate.text)
+
     def _print_user(self, user: str | Message) -> None:
         self._presenter.reset_assistant_unit()
         if isinstance(user, str):
@@ -608,7 +728,7 @@ class ComposerAttachmentMixin:
     def _start_queued_turn(self) -> None:
         if not self._queued:
             return
-        user_message = self._queued.popleft()
+        user_message, candidate = self._queued.popleft()
         user_text = next(
             block.text
             for block in user_message.content
@@ -616,7 +736,7 @@ class ComposerAttachmentMixin:
         )
         self._print_user(user_message)
         self._print(Text("[queued]", style="dim"))
-        self._undo_candidate = user_text
+        self._undo_candidate = candidate
         self._start_turn(user_text, user_message=user_message)
 
     def _start_turn(
@@ -864,6 +984,7 @@ def build_key_bindings(
         suppress_history_detach = True
         try:
             buffer.history_forward()
+            buffer.cursor_position = len(buffer.text)
         finally:
             suppress_history_detach = False
         history_navigation_active = buffer.text != ""
