@@ -204,3 +204,26 @@ def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:
     rendered = Text.from_ansi(app._transcript.render(120)).plain
     assert "read" in rendered
     assert "README.md" in rendered
+
+
+def test_fork_rejects_running_background_agents_then_allows_completion(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(message(MessageRole.USER, "start"))
+    store.append_message(message(MessageRole.ASSISTANT, "reply"))
+    store.append_checkpoint("saved")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
+    )
+    app.loop._background_child_cancellers["agent-1"] = lambda: None
+
+    assert app.slash_fork("saved") == (
+        "fork unavailable while background agents are running"
+    )
+
+    app.loop._background_child_cancellers.clear()
+    assert app.slash_fork("saved") == "forked to checkpoint 'saved' at seq 3"

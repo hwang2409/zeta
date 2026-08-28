@@ -287,6 +287,9 @@ class AgentCard:
     def current(self) -> RenderableType | None:
         return self._progress() if self.active else None
 
+    def set_child_session_path(self, path: str) -> None:
+        self._child_session_path = path
+
     def update(self, rendered: RenderableType, event: StreamEvent | None = None) -> RenderableType | None:
         if not self._supported:
             return None

@@ -242,6 +242,59 @@ async def test_background_completion_notification_waits_for_next_turn_boundary(
 
 
 @pytest.mark.asyncio
+async def test_background_completion_during_setup_is_drained_at_turn_start(
+    tmp_path: Path,
+) -> None:
+    backend = BackgroundBackend([_background_agent_call()])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skip_mcp_mount=True)
+
+    await _collect(loop.run_turn("start"))
+    setup_started = asyncio.Event()
+
+    async def delayed_setup() -> None:
+        setup_started.set()
+        backend.release_child.set()
+        while not store.agent_notifications():
+            await asyncio.sleep(0)
+
+    loop._ensure_mcp_servers = delayed_setup
+    events = await _collect(loop.run_turn("follow up"))
+
+    assert setup_started.is_set()
+    assert events[0].type is StreamEventType.AGENT_NOTIFICATION
+    assert events[0].data["status"] == "completed"
+    assert events[1].type is StreamEventType.AGENT_START
+    assert store.agent_notifications() == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_background_completion_leaves_no_pending_abort_waiter(
+    tmp_path: Path,
+) -> None:
+    baseline = set(asyncio.all_tasks())
+    backend = BackgroundBackend([_background_agent_call()])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+    for _ in range(100):
+        if not loop._tracked_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert not [
+        task
+        for task in asyncio.all_tasks()
+        if task not in baseline and not task.done()
+    ]
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
     call = _background_agent_call()
     backend = BackgroundBackend([call])

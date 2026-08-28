@@ -82,6 +82,8 @@ class CheckpointTranscriptMixin:
     def slash_fork(self, args: str) -> str:
         if self.active or self.loop.store.turn_in_flight():
             return "fork unavailable while a turn is running"
+        if self.loop.background_children_running:
+            return "fork unavailable while background agents are running"
         selector = args.strip()
         if not selector:
             checkpoints = self.loop.store.list_checkpoints()

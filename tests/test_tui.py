@@ -2289,6 +2289,53 @@ def test_running_agent_card_can_expand_and_read_live_tail(tmp_path: Path) -> Non
     assert "1 turns" in rendered
 
 
+def test_background_agent_card_stores_path_at_start_and_expands(
+    tmp_path: Path,
+) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("live tail")]))
+    call = ToolCall(
+        "agent-background-expand",
+        "agent",
+        {
+            "prompt": "inspect",
+            "description": "background research",
+            "background": True,
+        },
+    )
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        _test_console(),
+        lambda: True,
+        lambda renderable: None,
+    )
+
+    presenter.handle_tool_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call),
+        aborted=False,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "background agent started",
+                structured_content={
+                    "status": "running",
+                    "child_session_path": str(child.session_dir),
+                },
+            ),
+        ),
+        aborted=False,
+    )
+
+    assert transcript.toggle_latest_agent()
+    rendered = Text.from_ansi(transcript.render(120)).plain
+    assert "live tail" in rendered
+
+
 def test_presenter_refreshes_live_agent_cards_in_full_screen() -> None:
     call = ToolCall(
         "agent-refresh",

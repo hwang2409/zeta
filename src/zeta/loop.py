@@ -553,7 +553,6 @@ class AgentLoop:
             return child_result(final_text, error=False)
 
         child_task = self._create_task(consume())
-        abort_task = self._create_task(abort_signal.wait())
         child_canceled = False
 
         async def cancel_child() -> None:
@@ -611,6 +610,7 @@ class AgentLoop:
                 status="running",
             )
 
+        abort_task = self._create_task(abort_signal.wait())
         try:
             done, _ = await asyncio.wait(
                 (child_task, abort_task),
@@ -791,12 +791,6 @@ class AgentLoop:
         user_message: Message | None = None,
         persist_user_message: bool = True,
     ) -> AsyncIterator[StreamEvent]:
-        for notification in self.store.agent_notifications():
-            yield StreamEvent(
-                StreamEventType.AGENT_NOTIFICATION,
-                data={"notification_id": notification.id, **notification.data},
-            )
-            self.store.acknowledge_agent_notification(notification.id)
         if self.hooks is not None:
             self.hooks.user_prompt_submit(user_text)
         if user_message is None:
@@ -807,15 +801,25 @@ class AgentLoop:
             self.store.append_message(user_message)
         elif user_message not in self.store.messages():
             raise ValueError("cannot reuse a user message that is not persisted")
+        setup_error: ErrorInfo | None = None
         try:
             await self._ensure_mcp_servers()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            error = _error_info(exc)
-            self._persist_partial_with_cancelled_tools([], None, failure=error)
+            setup_error = _error_info(exc)
+
+        for notification in self.store.agent_notifications():
+            yield StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={"notification_id": notification.id, **notification.data},
+            )
+            self.store.acknowledge_agent_notification(notification.id)
+
+        if setup_error is not None:
+            self._persist_partial_with_cancelled_tools([], None, failure=setup_error)
             yield StreamEvent(StreamEventType.AGENT_START)
-            yield StreamEvent(StreamEventType.ERROR, error=error)
+            yield StreamEvent(StreamEventType.ERROR, error=setup_error)
             yield StreamEvent(StreamEventType.AGENT_END)
             return
         yield StreamEvent(StreamEventType.AGENT_START)

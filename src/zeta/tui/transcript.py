@@ -209,6 +209,11 @@ class TranscriptWidget(UIControl):
         if call_id in self._tools:
             self._background_tools.add(call_id)
 
+    def set_tool_child_session_path(self, call_id: str, path: str) -> None:
+        unit = self._tools.get(call_id)
+        if unit is not None:
+            unit.card.set_child_session_path(path)
+
     def discard_tools(self) -> None:
         if not self._tools:
             return
@@ -771,6 +776,16 @@ class TranscriptPresenter:
                 self._background_tool_ids.add(event.tool_call.id)
                 if self._full_screen_active():
                     self.transcript.mark_tool_background(event.tool_call.id)
+                path = structured.get("child_session_path") if structured else None
+                if isinstance(path, str) and path:
+                    if self._full_screen_active():
+                        self.transcript.set_tool_child_session_path(
+                            event.tool_call.id, path
+                        )
+                    else:
+                        unit = self._tool_region_units.get(event.tool_call.id)
+                        if unit is not None:
+                            unit.card.set_child_session_path(path)
                 return ToolEventPresentation(visible_output=True)
         rendered = render_event(event)
         if not self._full_screen_active() and event.tool_call is not None:
