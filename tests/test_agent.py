@@ -169,6 +169,36 @@ class BackgroundBackend(CompletionBackend):
         )
 
 
+class NestedBlockingBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.grandchild_started = asyncio.Event()
+        self.release_grandchild = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        self.call_count += 1
+        if self.call_count == 1:
+            blocks = [ToolUseContent(_agent_call("child"))]
+        elif self.call_count == 2:
+            blocks = [ToolUseContent(_agent_call("grandchild"))]
+        else:
+            self.grandchild_started.set()
+            await self.release_grandchild.wait()
+            blocks = [TextContent("grandchild complete")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 def _background_agent_call(call_id: str = "background-1") -> ToolCall:
     return ToolCall(
         call_id,
@@ -543,14 +573,14 @@ async def test_agent_returns_child_text_and_persists_child_session(tmp_path: Pat
     assert [message.role for message in ConversationStore(
         store.session_dir / "agents", session_id="1"
     ).messages()] == [MessageRole.USER, MessageRole.ASSISTANT]
-    assert "agent" not in {
+    assert "agent" in {
         schema["name"] for schema in backend.calls[1][1]
     }
     assert {
         schema["name"] for schema in backend.calls[1][1]
     } == {
         schema["name"] for schema in backend.calls[0][1]
-    } - {"agent"}
+    }
 
 
 def test_agent_schema_uses_preset_registry(
@@ -625,7 +655,7 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
     await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
     child_schemas = {schema["name"] for schema in backend.calls[1][1]}
-    assert child_schemas == {"fetch", "read", "skill", "websearch"}
+    assert child_schemas == {"agent", "fetch", "read", "skill", "websearch"}
     child_messages = ConversationStore(
         store.session_dir / "agents", session_id="1"
     ).messages()
@@ -709,6 +739,7 @@ async def test_plan_child_includes_todo_and_only_read_only_tools(tmp_path: Path)
     await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
     assert {schema["name"] for schema in backend.calls[1][1]} == {
+        "agent",
         "fetch",
         "read",
         "skill",
@@ -972,13 +1003,14 @@ async def test_agent_turn_cap_returns_loud_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_child_agent_call_is_rejected(tmp_path: Path) -> None:
+async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
     nested = _agent_call("nested")
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call()]),
             ScriptedTurn(tool_calls=[nested]),
-            ScriptedTurn([TextContent("nested rejected")]),
+            ScriptedTurn([TextContent("grandchild complete")]),
+            ScriptedTurn([TextContent("child complete")]),
         ]
     )
     store = ConversationStore(tmp_path)
@@ -986,7 +1018,7 @@ async def test_child_agent_call_is_rejected(tmp_path: Path) -> None:
     await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.content == "nested rejected"
+    assert result.content == "child complete"
     child_result = next(
         message.tool_result
         for message in ConversationStore(
@@ -994,8 +1026,194 @@ async def test_child_agent_call_is_rejected(tmp_path: Path) -> None:
         ).messages()
         if message.tool_result
     )
+    assert child_result.content == "grandchild complete"
+    grandchild_schemas = {
+        schema["name"] for schema in backend.calls[2][1]
+    }
+    assert "agent" not in grandchild_schemas
+
+
+@pytest.mark.asyncio
+async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
+    nested = _agent_call("grandchild")
+    child = _agent_call("child", "explore")
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[child]),
+            ScriptedTurn(tool_calls=[nested]),
+            ScriptedTurn([TextContent("grandchild complete")]),
+            ScriptedTurn([TextContent("child complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    child_tools = {schema["name"] for schema in backend.calls[1][1]}
+    grandchild_tools = {schema["name"] for schema in backend.calls[2][1]}
+    assert child_tools == {"agent", "fetch", "read", "skill", "websearch"}
+    assert grandchild_tools == {"fetch", "read", "skill", "websearch"}
+
+
+@pytest.mark.asyncio
+async def test_shared_turn_budget_covers_generations(tmp_path: Path) -> None:
+    nested = _agent_call("grandchild")
+    child = _agent_call("child")
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[child]),
+            ScriptedTurn(tool_calls=[nested]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(
+        AgentLoop(
+            backend,
+            store,
+            max_turns=1,
+            agent_turn_budget=1,
+        ).run_turn("start")
+    )
+
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result.is_error
+    assert "shared agent turn budget exhausted" in result.content
+    assert result.structured_content is not None
+    assert result.structured_content["error_code"] == "agent_turn_budget"
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    child_result = next(
+        message.tool_result
+        for message in child_store.messages()
+        if message.tool_result
+    )
     assert child_result.is_error
-    assert "unknown tool: agent" in child_result.content
+    assert "shared agent turn budget exhausted" in child_result.content
+
+
+@pytest.mark.asyncio
+async def test_shared_turn_budget_covers_parallel_siblings(tmp_path: Path) -> None:
+    calls = [_agent_call("child-1"), _agent_call("child-2")]
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=calls),
+            ScriptedTurn([TextContent("one")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(
+        AgentLoop(
+            backend,
+            store,
+            max_turns=1,
+            agent_turn_budget=1,
+        ).run_turn("start")
+    )
+
+    results = [message.tool_result for message in store.messages() if message.tool_result]
+    assert sorted(result.is_error for result in results if result is not None) == [
+        False,
+        True,
+    ]
+    assert any(
+        result is not None
+        and result.structured_content is not None
+        and result.structured_content.get("error_code") == "agent_turn_budget"
+        for result in results
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_grandchild_is_rejected_loudly(tmp_path: Path) -> None:
+    nested = _agent_call("grandchild")
+    nested.arguments["background"] = True
+    child = _background_agent_call("child")
+    child.arguments["prompt"] = "inspect the task"
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[child]),
+            ScriptedTurn(tool_calls=[nested]),
+            ScriptedTurn([TextContent("child complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _wait_for_notification(store, "completed")
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    nested_result = next(
+        message.tool_result
+        for message in child_store.messages()
+        if message.tool_result
+    )
+    assert nested_result.is_error
+    assert "background grandchildren are not supported" in nested_result.content
+
+
+@pytest.mark.asyncio
+async def test_abort_propagates_through_two_nested_levels(tmp_path: Path) -> None:
+    backend = NestedBlockingBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
+    loop.abort()
+    await asyncio.wait_for(task, timeout=1)
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    grandchild_store = ConversationStore(
+        child_store.session_dir / "agents", session_id="1"
+    )
+    assert child_store.agent_canceled() == {
+        "tool_call_id": "child",
+        "content": "tool execution canceled",
+    }
+    assert grandchild_store.agent_canceled() == {
+        "tool_call_id": "grandchild",
+        "content": "tool execution canceled",
+    }
+    await loop.close()
+
+
+def test_resume_cancels_nested_tree_markers(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    child_call = _agent_call("child")
+    grandchild_call = _agent_call("grandchild")
+    child.mark_agent_parent(child_call.id)
+    grandchild.mark_agent_parent(grandchild_call.id)
+    child.register_agent_child(
+        grandchild_call,
+        child_session_path=str(grandchild.session_dir),
+        description="grandchild",
+        child_instance_id="root:1:1",
+    )
+    root.register_agent_child(
+        child_call,
+        child_session_path=str(child.session_dir),
+        description="child",
+    )
+
+    resumed = ConversationStore(tmp_path, session_id="root")
+    AgentLoop(FakeBackend([]), resumed)
+
+    assert not resumed.agent_children()
+    assert ConversationStore(
+        root.session_dir / "agents", session_id="1"
+    ).agent_canceled() == {
+        "tool_call_id": "child",
+        "content": "tool execution canceled",
+    }
+    assert ConversationStore(
+        child.session_dir / "agents", session_id="1"
+    ).agent_canceled() == {
+        "tool_call_id": "grandchild",
+        "content": "tool execution canceled",
+    }
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,86 @@ class _AgentLoopForRecovery(Protocol):
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None: ...
 
 
+def _open_child_store(store: ConversationStore, path: Path) -> ConversationStore | None:
+    agents_root = store.session_dir / "agents"
+    if path.parent != agents_root or not path.name.isdigit():
+        return None
+    return ConversationStore(agents_root, session_id=path.name, cwd=store.cwd)
+
+
+def _nested_canceled_result(marker: dict[str, object]) -> ToolResult:
+    structured_content: dict[str, object] = {
+        "turns_used": marker.get("turns_used", 0),
+        "child_session_path": marker["child_session_path"],
+    }
+    if type(marker.get("agent_type")) is str:
+        structured_content["agent_type"] = marker["agent_type"]
+    return ToolResult(
+        ToolCall.from_dict(marker["tool_call"]).id,
+        "tool execution canceled",
+        is_error=True,
+        structured_content=structured_content,
+    )
+
+
+def _existing_tool_result(store: ConversationStore, tool_call_id: str) -> bool:
+    return any(
+        message.tool_result is not None
+        and message.tool_result.tool_call_id == tool_call_id
+        for message in store.messages()
+    )
+
+
+def _recover_nested_children(store: ConversationStore) -> None:
+    """Cancel descendants left behind when an ancestor session exits."""
+
+    for tool_call_id, marker in store.agent_children().items():
+        tool_call = ToolCall.from_dict(marker["tool_call"])
+        child_path = Path(marker["child_session_path"])
+        child_store = _open_child_store(store, child_path)
+        if child_store is not None:
+            _recover_nested_children(child_store)
+        existing_result = _existing_tool_result(store, tool_call_id)
+        completed_background = False
+        if marker.get("background"):
+            child_instance_id = marker.get(
+                "child_instance_id", f"{store.session_id}:{child_path.name}"
+            )
+            existing = next(
+                (
+                    entry
+                    for entry in store.agent_notifications(pending_only=False)
+                    if entry.data["child_instance_id"] == child_instance_id
+                ),
+                None,
+            )
+            if existing is None:
+                store.append_agent_notification(
+                    child_instance_id,
+                    child_session_path=str(child_path),
+                    description=marker["description"],
+                    status="canceled",
+                    text="background child canceled when the parent session exited",
+                )
+            elif child_store is not None:
+                completed_background = True
+                child_store.finish_agent_parent()
+        elif not existing_result:
+            store.append_message(
+                Message(
+                    MessageRole.TOOL_RESULT,
+                    [TextContent("tool execution canceled")],
+                    tool_result=_nested_canceled_result(marker),
+                )
+            )
+        if child_store is not None:
+            if existing_result or completed_background:
+                child_store.finish_agent_parent()
+            else:
+                child_store.mark_agent_canceled(tool_call.id)
+        store.finish_agent_child(tool_call_id)
+
+
 def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
     """Resolve child markers left by a process exit before resuming."""
 
@@ -41,8 +121,13 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
         agents_root = loop.store.session_dir / "agents"
+        child_store = _open_child_store(loop.store, child_path)
+        if child_store is not None:
+            _recover_nested_children(child_store)
         if marker.get("background"):
-            child_instance_id = f"{loop.store.session_id}:{child_path.name}"
+            child_instance_id = marker.get(
+                "child_instance_id", f"{loop.store.session_id}:{child_path.name}"
+            )
             notification = next(
                 (
                     entry
@@ -51,13 +136,6 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                 ),
                 None,
             )
-            child_store = None
-            if child_path.parent == agents_root and child_path.name.isdigit():
-                child_store = ConversationStore(
-                    agents_root,
-                    session_id=child_path.name,
-                    cwd=loop.store.cwd,
-                )
             if notification is None:
                 loop.store.append_agent_notification(
                     child_instance_id,
@@ -87,11 +165,6 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                 )
             )
         if child_path.parent == agents_root and child_path.name.isdigit():
-            child_store = ConversationStore(
-                agents_root,
-                session_id=child_path.name,
-                cwd=loop.store.cwd,
-            )
             if existing_result is None:
                 child_store.mark_agent_canceled(tool_call.id)
             else:

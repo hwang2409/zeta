@@ -144,6 +144,8 @@ def agent_result(
     status: str | None = None,
     child_instance_id: str | None = None,
     description: str | None = None,
+    depth: int | None = None,
+    budget_exhausted: bool = False,
 ) -> dict[str, object]:
     structured_content: dict[str, object] = {
         "turns_used": turns_used,
@@ -157,6 +159,11 @@ def agent_result(
         structured_content["child_instance_id"] = child_instance_id
     if description is not None:
         structured_content["description"] = description
+    # Keep depth-one result payloads byte-compatible with the pre-nesting shape.
+    if depth is not None and depth != 1:
+        structured_content["depth"] = depth
+    if budget_exhausted:
+        structured_content["error_code"] = "agent_turn_budget"
     return {
         "content": [text_block(text)],
         "isError": error,

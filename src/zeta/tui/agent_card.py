@@ -62,6 +62,7 @@ class AgentCard:
         self._child_session_path = ""
         self._expanded = False
         self._receipt: RenderableType | None = None
+        self._depth = 1
 
     @property
     def supported(self) -> bool:
@@ -109,6 +110,7 @@ class AgentCard:
         *,
         elapsed_seconds: float,
         turns_used: int,
+        depth: int = 1,
         expanded: bool = False,
     ) -> Text:
         affordance = "collapse: ctrl+x ctrl+o" if expanded else "expand: ctrl+x ctrl+o"
@@ -116,7 +118,7 @@ class AgentCard:
         prefix = f"{agent_type} · " if agent_type else ""
         return Text(
             f"{prefix}{cls._description(call)} · {elapsed_seconds:.1f}s · "
-            f"{turns_used} turns · {affordance}",
+            f"{turns_used} turns · depth {depth} · {affordance}",
             style=COMMAND,
             no_wrap=True,
             overflow="ellipsis",
@@ -130,13 +132,22 @@ class AgentCard:
         *,
         elapsed_seconds: float = 0.0,
         turns_used: int | None = None,
+        depth: int = 1,
     ) -> Panel | None:
         if call.name.casefold() != "agent":
             return None
         turns = cls._turns_from_content(content) if turns_used is None else turns_used
         body = Text(cls._step(content), style=BODY, no_wrap=True, overflow="ellipsis")
         return Panel(
-            Group(cls._header(call, elapsed_seconds=elapsed_seconds, turns_used=turns), body),
+            Group(
+                cls._header(
+                    call,
+                    elapsed_seconds=elapsed_seconds,
+                    turns_used=turns,
+                    depth=depth,
+                ),
+                body,
+            ),
             border_style=CARD_BORDER,
             style=CARD_BG,
             padding=(0, 1),
@@ -144,7 +155,16 @@ class AgentCard:
         )
 
     @classmethod
-    def _tail_lines(cls, child_session_path: str, limit: int) -> list[str]:
+    def _tail_lines(
+        cls,
+        child_session_path: str,
+        limit: int,
+        seen: set[str] | None = None,
+    ) -> list[str]:
+        seen = set() if seen is None else seen
+        if child_session_path in seen or limit < 1:
+            return []
+        seen.add(child_session_path)
         path = Path(child_session_path) / "conversation.jsonl"
         lines: deque[str] = deque(maxlen=limit)
         try:
@@ -177,6 +197,24 @@ class AgentCard:
                             arguments = tool_call.get("arguments", {})
                             if isinstance(name, str) and isinstance(arguments, dict):
                                 lines.append(f"tool: {name} {_arguments(arguments)}")
+                    tool_result = message.get("tool_result")
+                    structured = (
+                        tool_result.get("structured_content")
+                        if isinstance(tool_result, dict)
+                        else None
+                    )
+                    nested_path = (
+                        structured.get("child_session_path")
+                        if isinstance(structured, dict)
+                        else None
+                    )
+                    if isinstance(nested_path, str) and nested_path:
+                        nested_tail = cls._tail_lines(
+                            nested_path,
+                            max(1, limit - len(lines)),
+                            seen,
+                        )
+                        lines.extend(f"  {line}" for line in nested_tail)
         except OSError:
             return []
         return list(lines)
@@ -190,6 +228,7 @@ class AgentCard:
         turns_used: int,
         child_session_path: str,
         limit: int = MAX_TAIL_LINES,
+        depth: int = 1,
     ) -> Panel | None:
         if call.name.casefold() != "agent":
             return None
@@ -206,6 +245,7 @@ class AgentCard:
                     call,
                     elapsed_seconds=elapsed_seconds,
                     turns_used=turns_used,
+                    depth=depth,
                     expanded=True,
                 ),
                 body,
@@ -223,6 +263,7 @@ class AgentCard:
         *,
         elapsed_seconds: float | None = None,
         turns_used: int | None = None,
+        depth: int | None = None,
     ) -> Text | None:
         call = event.tool_call
         result = event.tool_result
@@ -237,9 +278,14 @@ class AgentCard:
                 value = event.data.get("elapsed_ms")
                 elapsed = max(0.0, float(value) / 1000) if isinstance(value, (int, float)) else 0.0
         turns = turns_used
+        display_depth = 1 if depth is None else depth
         if turns is None and result.structured_content is not None:
             value = result.structured_content.get("turns_used")
             turns = value if type(value) is int and value >= 0 else 0
+        if result.structured_content is not None:
+            value = result.structured_content.get("depth")
+            if depth is None and type(value) is int and value >= 1:
+                display_depth = value
         turns = turns or 0
         structured = result.structured_content or {}
         structured_status = structured.get("status")
@@ -253,8 +299,8 @@ class AgentCard:
         prefix = f"{agent_type} · " if agent_type else ""
         return Text(
             f"{prefix}{cls._description(call)} · {turns} turns · "
-            f"{max(0.0, elapsed or 0.0):.1f}s · "
-            f"{status} · expand: ctrl+x ctrl+o",
+            f"{max(0.0, elapsed or 0.0):.1f}s · {status} · "
+            f"depth {display_depth} · expand: ctrl+x ctrl+o",
             style=ERROR if status in {"fail", "error", "canceled"} else RECEIPT,
             no_wrap=True,
             overflow="ellipsis",
@@ -282,6 +328,7 @@ class AgentCard:
             "\n".join(self._output),
             elapsed_seconds=self._elapsed(),
             turns_used=self._turns,
+            depth=self._depth,
         )
 
     def current(self) -> RenderableType | None:
@@ -301,6 +348,9 @@ class AgentCard:
             path = event.data.get("child_session_path")
             if isinstance(path, str) and path:
                 self._child_session_path = path
+            depth = event.data.get("depth")
+            if type(depth) is int and depth >= 1:
+                self._depth = depth
         if self._expanded:
             return self._expanded_render()
         return self._progress()
@@ -320,6 +370,9 @@ class AgentCard:
         turns = structured.get("turns_used") if structured else None
         if type(turns) is int and turns >= 0:
             self._turns = turns
+        depth = structured.get("depth") if structured else None
+        if type(depth) is int and depth >= 1:
+            self._depth = depth
         path = structured.get("child_session_path") if structured else None
         if isinstance(path, str):
             self._child_session_path = path
@@ -327,6 +380,7 @@ class AgentCard:
             event,
             elapsed_seconds=self._elapsed_seconds,
             turns_used=self._turns,
+            depth=self._depth,
         )
         return self._expanded_render() if self._expanded else self._receipt
 
@@ -336,6 +390,7 @@ class AgentCard:
             elapsed_seconds=self._elapsed_seconds if self._finished else self._elapsed(),
             turns_used=self._turns,
             child_session_path=self._child_session_path,
+            depth=self._depth,
         )
 
     def toggle(self) -> RenderableType | None:
@@ -353,12 +408,14 @@ def render_agent_progress(
     *,
     elapsed_seconds: float = 0.0,
     turns_used: int | None = None,
+    depth: int = 1,
 ) -> Panel | None:
     return AgentCard.render_progress(
         call,
         content,
         elapsed_seconds=elapsed_seconds,
         turns_used=turns_used,
+        depth=depth,
     )
 
 
@@ -369,6 +426,7 @@ def render_agent_expanded(
     turns_used: int,
     child_session_path: str,
     limit: int = MAX_TAIL_LINES,
+    depth: int = 1,
 ) -> Panel | None:
     return AgentCard.render_expanded(
         call,
@@ -376,6 +434,7 @@ def render_agent_expanded(
         turns_used=turns_used,
         child_session_path=child_session_path,
         limit=limit,
+        depth=depth,
     )
 
 
@@ -384,9 +443,11 @@ def render_agent_receipt(
     *,
     elapsed_seconds: float | None = None,
     turns_used: int | None = None,
+    depth: int | None = None,
 ) -> Text | None:
     return AgentCard.render_receipt(
         event,
         elapsed_seconds=elapsed_seconds,
         turns_used=turns_used,
+        depth=depth,
     )

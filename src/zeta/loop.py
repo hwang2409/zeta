@@ -11,6 +11,13 @@ from typing import Any, TypeVar
 import httpx
 
 from .core.abort import AbortSignal as ToolAbortSignal
+from .agent_budget import (
+    MAX_AGENT_DEPTH,
+    SharedTurnBudget,
+    child_depth as next_agent_depth,
+    consume_turn,
+    configure_budget,
+)
 from .agent_background import finish_background_child, recover_agent_children
 from .core.approval import ApprovalPolicy
 from .core.context import ContextAssembler
@@ -157,9 +164,20 @@ class AgentLoop:
         on_completion_success: Callable[[], None] | None = None,
         hooks: HookManager | None = None,
         skip_mcp_mount: bool = False,
+        agent_depth: int = 0,
+        agent_instance_id: str | None = None,
+        agent_turn_budget: int | None = None,
+        shared_agent_budget: SharedTurnBudget | None = None,
     ) -> None:
+        if type(agent_depth) is not int or not 0 <= agent_depth <= MAX_AGENT_DEPTH:
+            raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
         self.backend = backend
         self.store = store
+        self.agent_depth = agent_depth
+        self.agent_instance_id = agent_instance_id
+        self._shared_agent_budget = configure_budget(
+            agent_turn_budget, shared_agent_budget
+        )
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
         self._agent_child_turns: dict[str, int] = {}
@@ -241,7 +259,6 @@ class AgentLoop:
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
-
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
 
@@ -251,29 +268,24 @@ class AgentLoop:
             self.backend.model = model
         else:
             self._model = model
-
     def abort(self) -> None:
         """Signal the active tool batch before the caller cancels the turn."""
 
         self.tool_registry.abort()
         for cancel in tuple(self._background_child_cancellers.values()):
             cancel()
-
     def set_background_event_sink(
         self, sink: Callable[[StreamEvent], None] | None
     ) -> None:
         """Set the sink for progress from children that outlive their turn."""
 
         self._background_event_sink = sink
-
     @property
     def background_children_running(self) -> bool:
         return bool(self._background_child_cancellers)
-
     def _publish_background_event(self, event: StreamEvent) -> None:
         if self._background_event_sink is not None:
             self._background_event_sink(event)
-
     def _create_task(
         self,
         coroutine: Coroutine[Any, Any, TaskResult],
@@ -295,6 +307,8 @@ class AgentLoop:
         status: str | None = None,
         child_instance_id: str | None = None,
         description: str | None = None,
+        depth: int | None = None,
+        budget_exhausted: bool = False,
     ) -> dict[str, object]:
         child_store = self._agent_child_stores.get(tool_call_id)
         path = (
@@ -320,6 +334,8 @@ class AgentLoop:
             status=status,
             child_instance_id=child_instance_id,
             description=description,
+            depth=depth,
+            budget_exhausted=budget_exhausted,
         )
 
     def _canceled_agent_result(
@@ -341,7 +357,6 @@ class AgentLoop:
             ),
             tool_call_id,
         )
-
     async def _run_agent_tool(
         self,
         tool_call: ToolCall,
@@ -372,6 +387,13 @@ class AgentLoop:
                 "agent error: background must be a boolean",
                 error=True,
             )
+        child_depth, nesting_error = next_agent_depth(self.agent_depth, background)
+        if nesting_error is not None:
+            return self._child_result_payload(
+                tool_call.id,
+                nesting_error,
+                error=True,
+            )
         preset = get_agent_preset(agent_type)
         if preset is None:
             return self._child_result_payload(
@@ -380,6 +402,9 @@ class AgentLoop:
                 f"{agent_type!r}; expected one of: {', '.join(agent_type_names())}",
                 error=True,
             )
+        if self._shared_agent_budget is None:
+            self._shared_agent_budget = SharedTurnBudget(preset.turn_cap)
+        shared_agent_budget = self._shared_agent_budget
         await self._ensure_mcp_servers()
         stored_agent_type = (
             None if preset.name == GENERAL_PRESET.name else preset.name
@@ -393,23 +418,33 @@ class AgentLoop:
         )
         child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
         child_path = str(child_store.session_dir)
-        child_instance_id = f"{self.store.session_id}:{child_number}"
+        child_instance_id = (
+            f"{self.agent_instance_id}:{child_number}"
+            if self.agent_instance_id is not None
+            else f"{self.store.session_id}:{child_number}"
+        )
         self._agent_child_stores[tool_call.id] = child_store
         self._agent_child_turns[tool_call.id] = 0
         self._agent_child_types[tool_call.id] = preset.name
         if publisher is not None:
-            publisher.set_metadata({"child_session_path": child_path})
+            publisher.set_metadata(
+                {"child_session_path": child_path, "depth": child_depth}
+            )
         self.store.register_agent_child(
             tool_call,
             child_session_path=child_path,
             description=description,
             agent_type=stored_agent_type,
             background=background,
+            child_instance_id=(child_instance_id if child_depth > 1 else None),
         )
-        excluded_names = {"agent"}
+        excluded_names = {"agent"} if child_depth == MAX_AGENT_DEPTH else set()
         if preset.tool_names is not None:
+            allowed_names = set(preset.tool_names)
+            if child_depth < MAX_AGENT_DEPTH:
+                allowed_names.add("agent")
             excluded_names.update(
-                set(self.tool_registry.definitions_by_name) - preset.tool_names
+                set(self.tool_registry.definitions_by_name) - allowed_names
             )
         child_registry = self.tool_registry.clone_for_session(
             child_store,
@@ -437,14 +472,15 @@ class AgentLoop:
                 preset.preamble,
             ),
             skip_mcp_mount=True,
+            agent_depth=child_depth,
+            agent_instance_id=child_instance_id,
+            shared_agent_budget=shared_agent_budget,
         )
-
         lifecycle_sink = (
             execution_context.lifecycle_sink
             if execution_context is not None
             else None
         )
-
         def publish(status: str) -> None:
             if background:
                 self._publish_background_event(
@@ -457,13 +493,9 @@ class AgentLoop:
                 )
             elif publisher is not None:
                 publisher.publish(f"{description}: {status}\n", "stdout")
-
         def child_turns() -> int:
             return self._agent_child_turns.get(tool_call.id, 0)
-
-        def child_result(
-            text: str, *, error: bool, status: str | None = None
-        ) -> dict[str, object]:
+        def child_result(text: str, *, error: bool, status: str | None = None, budget_exhausted: bool = False) -> dict[str, object]:
             return self._child_result_payload(
                 tool_call.id,
                 text,
@@ -473,8 +505,9 @@ class AgentLoop:
                 status=status,
                 child_instance_id=child_instance_id if background else None,
                 description=description if background else None,
+                depth=child_depth,
+                budget_exhausted=budget_exhausted,
             )
-
         def publish_lifecycle(kind: str, call: ToolCall | None) -> None:
             if call is None:
                 return
@@ -487,12 +520,12 @@ class AgentLoop:
                 return
             if not background and lifecycle_sink is not None:
                 lifecycle_sink(kind, call)
-
         async def consume() -> dict[str, object]:
             final_message: Message | None = None
             last_assistant_text = ""
             cap_hit = False
             error_message: str | None = None
+            budget_exhausted = False
             try:
                 async for event in child_loop.run_turn(prompt):
                     if event.type is StreamEventType.TURN_START:
@@ -521,8 +554,20 @@ class AgentLoop:
                             last_assistant_text = _assistant_text_snippet(event.message)
                         if event.data.get("tool_calls") == 0 and event.message is not None:
                             final_message = event.message
+                    elif (
+                        event.type is StreamEventType.TOOL_EXECUTION_END
+                        and event.tool_result is not None
+                        and event.tool_result.structured_content is not None
+                        and event.tool_result.structured_content.get("error_code")
+                        == "agent_turn_budget"
+                    ):
+                        budget_exhausted = True
+                        error_message = event.tool_result.content
                     elif event.type is StreamEventType.ERROR and event.error is not None:
-                        if event.error.code == "max_turns":
+                        if event.error.code == "agent_turn_budget":
+                            budget_exhausted = True
+                            error_message = event.error.message
+                        elif event.error.code == "max_turns":
                             cap_hit = True
                         else:
                             error_message = event.error.message
@@ -530,6 +575,12 @@ class AgentLoop:
                 raise
             except Exception as exc:
                 error_message = _error_info(exc).message
+            if budget_exhausted:
+                return child_result(
+                    f"agent error: {error_message or 'shared agent turn budget exhausted'}",
+                    error=True,
+                    budget_exhausted=True,
+                )
             if cap_hit:
                 return child_result(
                     f"agent error: child reached the {preset.turn_cap}-turn cap; "
@@ -551,7 +602,6 @@ class AgentLoop:
                     error=True,
                 )
             return child_result(final_text, error=False)
-
         child_task = self._create_task(consume())
         child_canceled = False
 
@@ -565,7 +615,6 @@ class AgentLoop:
                 child_task.cancel()
             await asyncio.gather(child_task, return_exceptions=True)
             child_store.mark_agent_canceled(tool_call.id)
-
         if background:
             def request_background_cancel() -> None:
                 child_loop.abort()
@@ -825,6 +874,12 @@ class AgentLoop:
         yield StreamEvent(StreamEventType.AGENT_START)
 
         for turn_number in range(1, self.max_turns + 1):
+            if self.agent_depth and (
+                error := consume_turn(self._shared_agent_budget)
+            ) is not None:
+                yield StreamEvent(StreamEventType.ERROR, error=error)
+                yield StreamEvent(StreamEventType.AGENT_END)
+                return
             self.tool_registry.start_batch()
             yield StreamEvent(
                 StreamEventType.TURN_START,
@@ -1046,7 +1101,10 @@ class AgentLoop:
                     continue
                 child_store = self._agent_child_stores.pop(call.id, None)
                 if child_store is not None:
-                    child_store.finish_agent_parent()
+                    if result.content == "tool execution canceled":
+                        child_store.mark_agent_canceled(call.id)
+                    else:
+                        child_store.finish_agent_parent()
                 self.store.finish_agent_child(call.id)
                 self._agent_child_turns.pop(call.id, None)
                 self._agent_child_types.pop(call.id, None)

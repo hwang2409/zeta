@@ -2103,6 +2103,53 @@ def test_typed_agent_cards_and_receipts_show_type() -> None:
     assert "explore · task research" in receipt.plain
 
 
+def test_nested_agent_card_shows_depth_and_reaches_grandchild_tail(
+    tmp_path: Path,
+) -> None:
+    grandchild = ConversationStore(tmp_path / "agents", session_id="1")
+    grandchild.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("grandchild receipt")])
+    )
+    child = ConversationStore(tmp_path / "agents", session_id="child")
+    nested = ToolCall(
+        "grandchild-call",
+        "agent",
+        {"prompt": "inspect", "description": "grandchild"},
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(nested)]))
+    child.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent("grandchild complete")],
+            tool_result=ToolResult(
+                nested.id,
+                "grandchild complete",
+                structured_content={
+                    "turns_used": 1,
+                    "child_session_path": str(grandchild.session_dir),
+                    "depth": 2,
+                },
+            ),
+        )
+    )
+    call = ToolCall(
+        "child-call",
+        "agent",
+        {"prompt": "inspect", "description": "child"},
+    )
+    rendered = AgentCard.render_expanded(
+        call,
+        elapsed_seconds=1.0,
+        turns_used=1,
+        child_session_path=str(child.session_dir),
+    )
+
+    assert rendered is not None
+    plain = Text.from_ansi(renderable_plain(rendered)).plain
+    assert "depth 1" in plain
+    assert "grandchild receipt" in plain
+
+
 def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     call = ToolCall(
