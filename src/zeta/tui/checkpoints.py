@@ -63,6 +63,8 @@ class CheckpointTranscriptMixin:
             )
         except Exception as exc:
             return f"compact failed: {exc}"
+        finally:
+            self._usage_tracker.record_compaction(self.model)
         after = self.loop.store.compaction_marker_count()
         if after == before:
             return "compact: nothing to compact"

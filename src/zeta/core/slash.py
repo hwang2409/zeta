@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from ..types import Message, MessageRole, StreamEventType, TextContent
@@ -30,6 +30,7 @@ class UsageSnapshot:
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     model: str | None = None
+    estimated_cost_usd: float | None = None
 
     @property
     def cache_total(self) -> int:
@@ -49,9 +50,11 @@ class UsageSnapshot:
 class UsageTracker:
     """Keep bounded usage deltas at real turn boundaries."""
 
-    def __init__(self, source: UsageCounterSource) -> None:
+    def __init__(self, source: UsageCounterSource, provider: str | None = None) -> None:
         self.source = source
+        self.provider = provider
         self._baseline = self._counters()
+        self._cost_baseline = self._baseline
         self._history: deque[UsageSnapshot] = deque(maxlen=8)
         self._cost_by_model: dict[str, UsageSnapshot] = {}
         self._completed_turns = 0
@@ -65,19 +68,33 @@ class UsageTracker:
         return tuple(self._cost_by_model.values())
 
     def record(self, event_type: StreamEventType, model: str) -> None:
+        current = self._counters()
+        self._record_cost_delta(current, model)
         if event_type is StreamEventType.COMPACTION_END:
-            current = self._counters()
-            self._accumulate_cost(
-                usage_delta(current, self._baseline, 0, model)
-            )
             self._baseline = current
         elif event_type is StreamEventType.TURN_END:
-            current = self._counters()
             self._completed_turns += 1
             snapshot = usage_delta(current, self._baseline, self._completed_turns, model)
             self._history.append(snapshot)
-            self._accumulate_cost(snapshot)
             self._baseline = current
+
+    def record_compaction(self, model: str) -> None:
+        """Record direct compaction usage without adding a trend snapshot."""
+
+        current = self._counters()
+        self._record_cost_delta(current, model)
+        self._baseline = current
+
+    def _record_cost_delta(self, current: Mapping[str, int], model: str) -> None:
+        snapshot = usage_delta(current, self._cost_baseline, 0, model)
+        self._cost_baseline = dict(current)
+        if snapshot.cache_total or snapshot.output_tokens:
+            if self.provider is not None:
+                snapshot = replace(
+                    snapshot,
+                    estimated_cost_usd=_snapshot_cost(self.provider, snapshot),
+                )
+            self._accumulate_cost(snapshot)
 
     def _accumulate_cost(self, snapshot: UsageSnapshot) -> None:
         if snapshot.model is None:
@@ -98,6 +115,12 @@ class UsageTracker:
                 + snapshot.cache_creation_input_tokens
             ),
             model=snapshot.model,
+            estimated_cost_usd=(
+                previous.estimated_cost_usd + snapshot.estimated_cost_usd
+                if previous.estimated_cost_usd is not None
+                and snapshot.estimated_cost_usd is not None
+                else None
+            ),
         )
 
     def _counters(self) -> dict[str, int]:
@@ -150,14 +173,14 @@ MODEL_PRICES: dict[str, dict[str, ModelPricing | None]] = {
         "claude-haiku-4-5": ModelPricing(1.0, 5.0, 0.1, 1.25),
     },
     "codex": {
-        "codex-auto-review": ModelPricing(2.5, 15.0, 0.25, None),
+        "codex-auto-review": ModelPricing(2.5, 15.0, 0.25, 0.0),
         "gpt-5.3-codex-spark": None,
-        "gpt-5.4-mini": ModelPricing(0.75, 4.5, 0.075, None),
-        "gpt-5.5": ModelPricing(5.0, 30.0, 0.5, None),
-        "gpt-5.6-sol": ModelPricing(4.0, 20.0, 0.4, 5.0),
-        "gpt-5.6-terra": ModelPricing(2.0, 12.0, 0.2, 2.5),
-        "gpt-5.6-luna": ModelPricing(0.2, 1.2, 0.02, 0.25),
-        "gpt-5.4": ModelPricing(2.5, 15.0, 0.25, None),
+        "gpt-5.4-mini": ModelPricing(0.75, 4.5, 0.075, 0.0),
+        "gpt-5.5": ModelPricing(5.0, 30.0, 0.5, 0.0),
+        "gpt-5.6-sol": ModelPricing(4.0, 20.0, 0.4, 0.0),
+        "gpt-5.6-terra": ModelPricing(2.0, 12.0, 0.2, 0.0),
+        "gpt-5.6-luna": ModelPricing(0.2, 1.2, 0.02, 0.0),
+        "gpt-5.4": ModelPricing(2.5, 15.0, 0.25, 0.0),
         "gpt-reserve": None,
     },
 }
@@ -180,7 +203,7 @@ MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int | None]] = {
         "codex-auto-review": 1_050_000,
         "gpt-5.3-codex-spark": None,
         "gpt-5.4-mini": 400_000,
-        "gpt-5.5": 1_000_000,
+        "gpt-5.5": 1_050_000,
         "gpt-5.6-sol": 1_050_000,
         "gpt-5.6-terra": 1_050_000,
         "gpt-5.6-luna": 1_050_000,
@@ -243,32 +266,39 @@ def _compaction_source(
     marker: ConversationEntry,
     entries: Sequence[ConversationEntry],
 ) -> tuple[list[Message], int]:
-    replaces = marker.data.get("replaces", [])
-    if replaces:
-        by_id = {entry.id: entry for entry in entries}
-        source_messages: list[Message] = []
-        entries_folded = 0
-        for entry_id in replaces:
-            entry = by_id.get(entry_id)
-            if entry is None:
-                continue
-            if entry.type == "message":
-                source_messages.append(Message.from_dict(entry.data["message"]))
-                entries_folded += 1
-            elif entry.type == "compaction":
-                source_messages.extend(_compaction_replacements(entry))
-        return source_messages, entries_folded
-
     start = marker.data["source_seq_start"]
     end = marker.data["source_seq_end"]
-    folded_messages = [
-        Message.from_dict(entry.data["message"])
-        for entry in entries
-        if entry.type == "message"
-        and start <= entry.seq <= end
-        and _is_folded_message(entry)
-    ]
-    return folded_messages, len(folded_messages)
+    replaces = marker.data.get("replaces", [])
+    by_id = {entry.id: entry for entry in entries}
+    source_messages: list[Message] = []
+    entries_folded = 0
+    consumed: set[str] = set()
+    replaced_ranges: list[tuple[int, int]] = []
+    for entry_id in replaces:
+        entry = by_id.get(entry_id)
+        if entry is None:
+            continue
+        consumed.add(entry.id)
+        if entry.type == "message":
+            source_messages.append(Message.from_dict(entry.data["message"]))
+            entries_folded += 1
+        elif entry.type == "compaction":
+            source_messages.extend(_compaction_replacements(entry))
+            replaced_ranges.append(
+                (entry.data["source_seq_start"], entry.data["source_seq_end"])
+            )
+    for entry in entries:
+        if entry.type != "message" or entry.id in consumed:
+            continue
+        if not (start <= entry.seq <= end):
+            continue
+        if any(lo <= entry.seq <= hi for lo, hi in replaced_ranges):
+            continue
+        if not _is_folded_message(entry):
+            continue
+        source_messages.append(Message.from_dict(entry.data["message"]))
+        entries_folded += 1
+    return source_messages, entries_folded
 
 
 def _compaction_replacements(
@@ -321,6 +351,33 @@ def usage_delta(
         cache_read_input_tokens=delta("cache_read_input_tokens"),
         cache_creation_input_tokens=delta("cache_creation_input_tokens"),
     )
+
+
+LONG_CONTEXT_INPUT_THRESHOLD = 272_000
+LONG_CONTEXT_MODELS = frozenset(
+    {"codex-auto-review", "gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"}
+)
+
+
+def _snapshot_cost(provider: str, snapshot: UsageSnapshot) -> float | None:
+    if snapshot.model is None:
+        return None
+    pricing = MODEL_PRICES.get(provider, {}).get(snapshot.model)
+    if pricing is None:
+        return None
+    multiplier = (
+        provider == "codex"
+        and snapshot.model in LONG_CONTEXT_MODELS
+        and snapshot.cache_total > LONG_CONTEXT_INPUT_THRESHOLD
+    )
+    input_multiplier = 2.0 if multiplier else 1.0
+    output_multiplier = 1.5 if multiplier else 1.0
+    return (
+        snapshot.input_tokens * pricing.input * input_multiplier
+        + snapshot.cache_read_input_tokens * pricing.cache_read * input_multiplier
+        + snapshot.cache_creation_input_tokens * (pricing.cache_write or 0)
+        + snapshot.output_tokens * pricing.output * output_multiplier
+    ) / 1_000_000
 
 
 def compaction_history(
@@ -550,6 +607,14 @@ def _format_estimated_cost(status: SlashStatus) -> str:
         if MODEL_PRICES.get(status.provider, {}).get(status.model) is None:
             return f"unavailable (unknown model: {status.model})"
         return "unavailable (model attribution unavailable)"
+    if status.usage_cost_by_model and all(
+        snapshot.estimated_cost_usd is not None for snapshot in status.usage_cost_by_model
+    ):
+        total = sum(
+            snapshot.estimated_cost_usd or 0.0
+            for snapshot in status.usage_cost_by_model
+        )
+        return f"${total:.6f}"
     total = 0.0
     for snapshot in usage:
         if snapshot.model is None:
@@ -559,12 +624,7 @@ def _format_estimated_cost(status: SlashStatus) -> str:
             return f"unavailable (unknown model: {snapshot.model})"
         if snapshot.cache_creation_input_tokens and pricing.cache_write is None:
             return f"unavailable (cache-write price unavailable for model: {snapshot.model})"
-        total += (
-            snapshot.input_tokens * pricing.input
-            + snapshot.output_tokens * pricing.output
-            + snapshot.cache_read_input_tokens * pricing.cache_read
-            + snapshot.cache_creation_input_tokens * (pricing.cache_write or 0)
-        ) / 1_000_000
+        total += _snapshot_cost(status.provider, snapshot) or 0.0
     return f"${total:.6f}"
 
 

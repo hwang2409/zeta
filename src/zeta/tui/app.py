@@ -191,7 +191,9 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         self._exit_requested = False
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
-        self._usage_tracker = UsageTracker(self.loop.context_assembler)
+        self._usage_tracker = UsageTracker(
+            self.loop.context_assembler, provider=provider
+        )
         self._assistant_text = ""
         self._thinking_text = ""
         self._thinking_duration: float | None = None

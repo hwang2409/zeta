@@ -34,6 +34,7 @@ from zeta.tui.composer import build_key_bindings
 from zeta.types import (
     Message,
     MessageRole,
+    StreamEvent,
     StreamEventType,
     TextContent,
     ToolCall,
@@ -182,7 +183,75 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
         (snapshot.turn, snapshot.input_tokens, snapshot.output_tokens)
         for snapshot in app.slash_status().usage_history
     ] == [(1, 10, 2), (2, 20, 5)]
-    assert "estimated_cost_usd: $0.035357" in output
+    assert "estimated_cost_usd: $0.039249" in output
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_captures_summarization_cost(tmp_path: Path) -> None:
+    def token_count(message: Message) -> int:
+        if message.role is MessageRole.COMPACTION or message.metadata.get(
+            "compaction_summary"
+        ):
+            return 1
+        return 40
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                [TextContent("first")],
+                usage={"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+            ),
+            ScriptedTurn(
+                [TextContent("summary")],
+                usage={"input_tokens": 40, "output_tokens": 2, "total_tokens": 42},
+            ),
+        ]
+    )
+    store = ConversationStore(tmp_path / "sessions")
+    assembler = ContextAssembler(
+        store,
+        backend=backend,
+        token_budget=1_000_000,
+        retained_tail=1,
+        token_counter=token_count,
+    )
+    loop = AgentLoop(backend, store, context_assembler=assembler)
+    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
+
+    await app._consume_turn("first")
+    baseline_tokens = assembler.uncached_input_tokens_this_session
+    assert await app.slash_compact() != "compact: nothing to compact"
+
+    per_model = {snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model}
+    snapshot = per_model["claude-sonnet-4-6"]
+    assert snapshot.input_tokens >= baseline_tokens + 40
+    assert snapshot.output_tokens >= 3
+
+
+@pytest.mark.asyncio
+async def test_errored_turn_usage_does_not_leak_to_next_model(tmp_path: Path) -> None:
+    class _ErrorBackend(FakeBackend):
+        async def complete(self, messages, tool_schemas):
+            self.calls.append((list(messages), list(tool_schemas)))
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(role=MessageRole.ASSISTANT, content=[TextContent("boom")]),
+                data={"usage": {"input_tokens": 100, "output_tokens": 5, "total_tokens": 105}},
+            )
+            raise RuntimeError("backend exploded after usage")
+
+    store = ConversationStore(tmp_path / "sessions")
+    error_backend = _ErrorBackend([])
+    loop = AgentLoop(error_backend, store)
+    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
+
+    await app._consume_turn("first")
+
+    app.model = "claude-opus-4-6"
+    per_model = {snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model}
+    assert "claude-sonnet-4-6" in per_model
+    assert "claude-opus-4-6" not in per_model
+    assert per_model["claude-sonnet-4-6"].input_tokens == 100
 
 
 def test_usage_cost_keeps_all_turns_outside_bounded_trend() -> None:
@@ -379,7 +448,7 @@ def test_cost_uses_the_model_for_each_turn() -> None:
     assert "estimated_cost_usd: $8.000000" in output
 
 
-def test_gpt_5_5_has_published_cost() -> None:
+def test_gpt_5_5_long_context_applies_published_multiplier() -> None:
     output = create_slash_registry().dispatch(
         FakeSlashSession(
             replace(
@@ -400,7 +469,59 @@ def test_gpt_5_5_has_published_cost() -> None:
     )
 
     assert output is not None
-    assert "estimated_cost_usd: $35.000000" in output
+    assert "estimated_cost_usd: $55.000000" in output
+
+
+def test_gpt_5_5_below_long_context_threshold_uses_base_rates() -> None:
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(
+            replace(
+                session().status,
+                provider="codex",
+                model="gpt-5.5",
+                usage_history=(
+                    UsageSnapshot(
+                        1,
+                        input_tokens=100_000,
+                        output_tokens=100_000,
+                        model="gpt-5.5",
+                    ),
+                ),
+            )
+        ),
+        "/status",
+    )
+
+    assert output is not None
+    assert "estimated_cost_usd: $3.500000" in output
+
+
+def test_gpt_5_5_window_matches_published_value() -> None:
+    assert MODEL_CONTEXT_WINDOWS["codex"]["gpt-5.5"] == 1_050_000
+
+
+def test_codex_cache_write_is_free() -> None:
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(
+            replace(
+                session().status,
+                provider="codex",
+                model="gpt-5.6-sol",
+                usage_history=(
+                    UsageSnapshot(
+                        1,
+                        input_tokens=100,
+                        cache_creation_input_tokens=1_000_000,
+                        model="gpt-5.6-sol",
+                    ),
+                ),
+            )
+        ),
+        "/status",
+    )
+
+    assert output is not None
+    assert "estimated_cost_usd: $0.000800" in output
 
 
 def test_compaction_history_counts_folded_messages_only(tmp_path: Path) -> None:
@@ -446,7 +567,6 @@ def test_compaction_history_subtracts_both_replacements(tmp_path: Path) -> None:
         "summary",
         source[0].seq,
         source[-1].seq,
-        replaces=[entry.id for entry in source],
     )
 
     history = compaction_history(store.replay(), token_count)
@@ -471,7 +591,6 @@ def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> N
         "first summary",
         first_source[0].seq,
         first_source[-1].seq,
-        replaces=[entry.id for entry in first_source],
     )
     second_source = [
         store.append_message(Message(MessageRole.USER, [TextContent("new source")])),
@@ -483,7 +602,7 @@ def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> N
         "second summary",
         first_source[0].seq,
         second_source[-1].seq,
-        replaces=[first_marker.id, *(entry.id for entry in second_source)],
+        replaces=[first_marker.id],
     )
 
     history = compaction_history(store.replay(), token_count)
