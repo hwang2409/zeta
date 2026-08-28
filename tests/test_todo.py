@@ -10,6 +10,7 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
 from zeta.core.fake import FakeBackend
+from zeta.core.todo import TODO_STATUSES
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
@@ -34,9 +35,7 @@ async def test_todo_writes_and_reads_the_full_list(tmp_path: Path) -> None:
 
     written = await registry.execute(ToolCall("write", "todo", {"items": items}))
     read = await registry.execute(ToolCall("read", "todo", {}))
-    action_read = await registry.execute(
-        ToolCall("action-read", "todo", {"action": "read"})
-    )
+    action_read = await registry.execute(ToolCall("action-read", "todo", {}))
 
     expected = {
         "items": items,
@@ -47,6 +46,53 @@ async def test_todo_writes_and_reads_the_full_list(tmp_path: Path) -> None:
     assert read["structuredContent"] == expected
     assert action_read["structuredContent"] == expected
     assert store.todo_items() == items
+
+
+def test_todo_schema_matches_handler_contract(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+    schema = next(schema for schema in registry.schemas if schema["name"] == "todo")
+    parameters = schema["parameters"]
+    properties = parameters["properties"]
+    item_schema = properties["items"]["items"]
+
+    assert "Read the current todo list when items is omitted." in schema["description"]
+    assert "Write the full todo list by providing items." in schema["description"]
+    assert set(properties) == {"items"}
+    assert set(item_schema["properties"]) == {"content", "status"}
+    assert item_schema["required"] == ["content", "status"]
+    assert item_schema["additionalProperties"] is False
+    assert item_schema["properties"]["status"]["enum"] == list(TODO_STATUSES)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        *(
+            {"items": [{"content": status, "status": status}]}
+            for status in TODO_STATUSES
+        ),
+    ],
+)
+async def test_every_todo_handler_branch_is_schema_representable(
+    tmp_path: Path, arguments: dict[str, object]
+) -> None:
+    _, registry = _registry(tmp_path)
+
+    result = await registry.execute(ToolCall("branch", "todo", arguments))
+
+    assert result["isError"] is False
+
+
+@pytest.mark.asyncio
+async def test_todo_rejects_removed_action_argument(tmp_path: Path) -> None:
+    _, registry = _registry(tmp_path)
+
+    result = await registry.execute(ToolCall("action", "todo", {"action": "read"}))
+
+    assert result["isError"] is True
+    assert "unexpected properties: action" in result["structuredContent"]["error"]
 
 
 @pytest.mark.asyncio

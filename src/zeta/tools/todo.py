@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Literal, TypedDict
+from typing import TypedDict
 
-from ..core.todo import TodoItem, parse_todo_items, todo_counts
+from ..core.todo import TODO_STATUSES, TodoItem, parse_todo_items, todo_counts
 from ..types import StructuredContentValue, StructuredToolResult
 from .registry import ToolRegistry, _success_result, text_block
 
 
 class TodoArguments(TypedDict, total=False):
-    action: Literal["read"]
     items: list[TodoItem]
 
 
@@ -42,10 +41,12 @@ async def _todo(
     arguments: TodoArguments,
 ) -> StructuredToolResult:
     store = registry.session_store
-    if arguments.get("action") == "read":
-        if "items" in arguments:
-            return _todo_error("todo read action cannot include items")
-        return _todo_result(store.todo_items())
+    unexpected = sorted(set(arguments) - {"items"})
+    if unexpected:
+        return _todo_error(
+            "todo arguments contain only items; unexpected properties: "
+            + ", ".join(unexpected)
+        )
     if "items" not in arguments:
         return _todo_result(store.todo_items())
     try:
@@ -61,20 +62,24 @@ def register(registry: ToolRegistry) -> None:
         "todo",
         _todo,
         description=(
+            "Read the current todo list when items is omitted. "
+            "Write the full todo list by providing items. "
             "Use for multi-step tasks: mark one item in_progress before starting "
             "it and completed immediately after finishing it."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["read"]},
                 "items": {
                     "type": "array",
                     "items": {
                         "type": "object",
                         "properties": {
                             "content": {"type": "string"},
-                            "status": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": list(TODO_STATUSES),
+                            },
                         },
                         "required": ["content", "status"],
                         "additionalProperties": False,
@@ -83,5 +88,6 @@ def register(registry: ToolRegistry) -> None:
             },
             "additionalProperties": False,
         },
+        validate_arguments=False,
         requires_approval=False,
     )
