@@ -164,6 +164,9 @@ class AgentLoop:
         self._agent_child_stores: dict[str, ConversationStore] = {}
         self._agent_child_turns: dict[str, int] = {}
         self._agent_child_types: dict[str, str] = {}
+        self._background_child_cancellers: dict[str, Callable[[], None]] = {}
+        self._background_child_watchers: dict[str, asyncio.Task[Any]] = {}
+        self._background_event_sink: Callable[[StreamEvent], None] | None = None
         self._recover_agent_children()
         if registry is not None and tools is not None:
             raise ValueError("pass only one tool registry")
@@ -253,6 +256,23 @@ class AgentLoop:
         """Signal the active tool batch before the caller cancels the turn."""
 
         self.tool_registry.abort()
+        for cancel in tuple(self._background_child_cancellers.values()):
+            cancel()
+
+    def set_background_event_sink(
+        self, sink: Callable[[StreamEvent], None] | None
+    ) -> None:
+        """Set the sink for progress from children that outlive their turn."""
+
+        self._background_event_sink = sink
+
+    @property
+    def background_children_running(self) -> bool:
+        return bool(self._background_child_cancellers)
+
+    def _publish_background_event(self, event: StreamEvent) -> None:
+        if self._background_event_sink is not None:
+            self._background_event_sink(event)
 
     def _create_task(
         self,
@@ -272,6 +292,9 @@ class AgentLoop:
         child_session_path: str | None = None,
         turns_used: int | None = None,
         agent_type: str | None = None,
+        status: str | None = None,
+        child_instance_id: str | None = None,
+        description: str | None = None,
     ) -> dict[str, object]:
         child_store = self._agent_child_stores.get(tool_call_id)
         path = (
@@ -294,6 +317,9 @@ class AgentLoop:
                 if (preset := get_agent_preset(agent_type)) is not None
                 else None
             ),
+            status=status,
+            child_instance_id=child_instance_id,
+            description=description,
         )
 
     def _canceled_agent_result(
@@ -321,6 +347,39 @@ class AgentLoop:
 
         for tool_call_id, marker in self.store.agent_children().items():
             tool_call = ToolCall.from_dict(marker["tool_call"])
+            child_path = Path(marker["child_session_path"])
+            agents_root = self.store.session_dir / "agents"
+            if marker.get("background"):
+                child_instance_id = f"{self.store.session_id}:{child_path.name}"
+                notification = next(
+                    (
+                        entry
+                        for entry in self.store.agent_notifications(pending_only=False)
+                        if entry.data["child_instance_id"] == child_instance_id
+                    ),
+                    None,
+                )
+                child_store = None
+                if child_path.parent == agents_root and child_path.name.isdigit():
+                    child_store = ConversationStore(
+                        agents_root,
+                        session_id=child_path.name,
+                        cwd=self.store.cwd,
+                    )
+                if notification is None:
+                    self.store.append_agent_notification(
+                        child_instance_id,
+                        child_session_path=marker["child_session_path"],
+                        description=marker["description"],
+                        status="canceled",
+                        text="background child canceled when the parent session exited",
+                    )
+                    if child_store is not None:
+                        child_store.mark_agent_canceled(tool_call.id)
+                elif child_store is not None:
+                    child_store.finish_agent_parent()
+                self.store.finish_agent_child(tool_call_id)
+                continue
             existing_result = self._existing_tool_result(tool_call_id)
             if existing_result is None:
                 self.store.append_message(
@@ -335,8 +394,6 @@ class AgentLoop:
                         ),
                     )
                 )
-            child_path = Path(marker["child_session_path"])
-            agents_root = self.store.session_dir / "agents"
             if child_path.parent == agents_root and child_path.name.isdigit():
                 child_store = ConversationStore(
                     agents_root,
@@ -360,6 +417,7 @@ class AgentLoop:
         prompt = arguments.get("prompt")
         description = arguments.get("description")
         agent_type = arguments.get("agent_type", GENERAL_PRESET.name)
+        background = arguments.get("background", False)
         if type(prompt) is not str or not prompt.strip():
             return self._child_result_payload(
                 tool_call.id,
@@ -370,6 +428,12 @@ class AgentLoop:
             return self._child_result_payload(
                 tool_call.id,
                 "agent error: description must be a nonempty string",
+                error=True,
+            )
+        if type(background) is not bool:
+            return self._child_result_payload(
+                tool_call.id,
+                "agent error: background must be a boolean",
                 error=True,
             )
         preset = get_agent_preset(agent_type)
@@ -404,6 +468,7 @@ class AgentLoop:
             child_session_path=child_path,
             description=description,
             agent_type=stored_agent_type,
+            background=background,
         )
         excluded_names = {"agent"}
         if preset.tool_names is not None:
@@ -445,20 +510,47 @@ class AgentLoop:
         )
 
         def publish(status: str) -> None:
-            if publisher is not None:
+            if background:
+                self._publish_background_event(
+                    StreamEvent(
+                        StreamEventType.TOOL_EXECUTION_UPDATE,
+                        tool_call=tool_call,
+                        delta=f"{description}: {status}\n",
+                        data={"stream": "stdout"},
+                    )
+                )
+            elif publisher is not None:
                 publisher.publish(f"{description}: {status}\n", "stdout")
 
         def child_turns() -> int:
             return self._agent_child_turns.get(tool_call.id, 0)
 
-        def child_result(text: str, *, error: bool) -> dict[str, object]:
+        def child_result(
+            text: str, *, error: bool, status: str | None = None
+        ) -> dict[str, object]:
             return self._child_result_payload(
                 tool_call.id,
                 text,
                 error=error,
                 child_session_path=child_path,
                 agent_type=preset.name,
+                status=status,
+                child_instance_id=child_instance_id if background else None,
+                description=description if background else None,
             )
+
+        def publish_lifecycle(kind: str, call: ToolCall | None) -> None:
+            if call is None:
+                return
+            event_type = {
+                "approval_start": StreamEventType.TOOL_APPROVAL_START,
+                "approval_end": StreamEventType.TOOL_APPROVAL_END,
+                "execution_start": StreamEventType.TOOL_EXECUTION_START,
+            }.get(kind)
+            if event_type is None:
+                return
+            if not background and lifecycle_sink is not None:
+                lifecycle_sink(kind, call)
 
         async def consume() -> dict[str, object]:
             final_message: Message | None = None
@@ -472,11 +564,9 @@ class AgentLoop:
                     elif event.type is StreamEventType.TOOL_APPROVAL_START:
                         name = event.tool_call.name if event.tool_call is not None else "tool"
                         publish(f"turn {child_turns() + 1}: approval pending: {name}")
-                        if lifecycle_sink is not None:
-                            lifecycle_sink("approval_start", event.tool_call)
+                        publish_lifecycle("approval_start", event.tool_call)
                     elif event.type is StreamEventType.TOOL_APPROVAL_END:
-                        if lifecycle_sink is not None:
-                            lifecycle_sink("approval_end", event.tool_call)
+                        publish_lifecycle("approval_end", event.tool_call)
                     elif event.type is StreamEventType.TOOL_EXECUTION_START:
                         name = event.tool_call.name if event.tool_call is not None else "tool"
                         arguments = (
@@ -486,6 +576,7 @@ class AgentLoop:
                         )
                         summary = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
                         publish(f"turn {child_turns() + 1}: tool: {name} {summary}")
+                        publish_lifecycle("execution_start", event.tool_call)
                     elif event.type is StreamEventType.TURN_END:
                         turns = child_turns() + 1
                         self._agent_child_turns[tool_call.id] = turns
@@ -540,6 +631,86 @@ class AgentLoop:
             await asyncio.gather(child_task, return_exceptions=True)
             child_store.mark_agent_canceled(tool_call.id)
 
+        if background:
+            def request_background_cancel() -> None:
+                child_loop.abort()
+                if not child_task.done():
+                    child_task.cancel()
+
+            async def finish_background() -> None:
+                status = "completed"
+                notification_text = ""
+                try:
+                    result = await child_task
+                    content = result.get("content")
+                    if (
+                        isinstance(content, list)
+                        and content
+                        and isinstance(content[0], dict)
+                        and isinstance(content[0].get("text"), str)
+                    ):
+                        notification_text = content[0]["text"]
+                    else:
+                        notification_text = "background child returned no text"
+                    if result.get("isError") is True:
+                        status = "error"
+                except asyncio.CancelledError:
+                    status = "canceled"
+                    notification_text = "background child canceled"
+                except Exception as exc:
+                    status = "error"
+                    notification_text = f"agent error: {_error_info(exc).message}"
+                if status == "canceled":
+                    child_store.mark_agent_canceled(tool_call.id)
+                else:
+                    child_store.finish_agent_parent()
+                notification = self.store.append_agent_notification(
+                    child_instance_id,
+                    child_session_path=child_path,
+                    description=description,
+                    status=status,
+                    text=notification_text or "background child completed",
+                )
+                self.store.finish_agent_child(tool_call.id)
+                terminal_payload = self._child_result_payload(
+                    tool_call.id,
+                    notification_text or "background child completed",
+                    error=status != "completed",
+                    child_session_path=child_path,
+                    turns_used=child_turns(),
+                    agent_type=preset.name,
+                    status=status,
+                    child_instance_id=child_instance_id,
+                    description=description,
+                )
+                self._publish_background_event(
+                    StreamEvent(
+                        StreamEventType.TOOL_EXECUTION_END,
+                        tool_call=tool_call,
+                        tool_result=_validated_tool_result(
+                            terminal_payload, tool_call.id
+                        ),
+                        data={"notification_id": notification.id},
+                    )
+                )
+                self._agent_child_stores.pop(tool_call.id, None)
+                self._agent_child_turns.pop(tool_call.id, None)
+                self._agent_child_types.pop(tool_call.id, None)
+                self._background_child_cancellers.pop(tool_call.id, None)
+                self._background_child_watchers.pop(tool_call.id, None)
+                if child_policy is not None:
+                    child_policy.cleanup()
+                await child_loop.close()
+
+            watcher = self._create_task(finish_background())
+            self._background_child_watchers[tool_call.id] = watcher
+            self._background_child_cancellers[tool_call.id] = request_background_cancel
+            return child_result(
+                f"background agent started: {description}",
+                error=False,
+                status="running",
+            )
+
         try:
             done, _ = await asyncio.wait(
                 (child_task, abort_task),
@@ -588,6 +759,11 @@ class AgentLoop:
     async def close(self) -> None:
         """Close session-owned transports and background processes."""
 
+        for cancel in tuple(self._background_child_cancellers.values()):
+            cancel()
+        watchers = tuple(self._background_child_watchers.values())
+        if watchers:
+            await asyncio.gather(*watchers, return_exceptions=True)
         tracked_tasks = tuple(self._tracked_tasks)
         for task in tracked_tasks:
             task.cancel()
@@ -715,6 +891,12 @@ class AgentLoop:
         user_message: Message | None = None,
         persist_user_message: bool = True,
     ) -> AsyncIterator[StreamEvent]:
+        for notification in self.store.agent_notifications():
+            yield StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={"notification_id": notification.id, **notification.data},
+            )
+            self.store.acknowledge_agent_notification(notification.id)
         if self.hooks is not None:
             self.hooks.user_prompt_submit(user_text)
         if user_message is None:
@@ -952,6 +1134,12 @@ class AgentLoop:
             if self.hooks is not None:
                 self.hooks.post_tool(call.name, result.content)
             if call.name == "agent":
+                is_background = (
+                    result.structured_content is not None
+                    and result.structured_content.get("status") == "running"
+                )
+                if is_background:
+                    continue
                 child_store = self._agent_child_stores.pop(call.id, None)
                 if child_store is not None:
                     child_store.finish_agent_parent()

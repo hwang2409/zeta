@@ -51,6 +51,10 @@ def _parse_agent_state(value: dict[str, Any], state_path: Path) -> dict[str, Any
                     or marker["turns_used"] < 0
                 )
             )
+            or (
+                "background" in marker
+                and type(marker["background"]) is not bool
+            )
         ):
             raise ConversationIntegrityError(
                 f"session state child marker is invalid: {state_path}"
@@ -151,6 +155,7 @@ class AgentStateMixin:
         child_session_path: str,
         description: str,
         agent_type: str | None = None,
+        background: bool = False,
     ) -> None:
         """Persist a running child marker before the child starts."""
 
@@ -165,6 +170,8 @@ class AgentStateMixin:
                 "description": description,
                 "turns_used": 0,
             }
+            if background:
+                marker["background"] = True
             marker.update(_agent_type_metadata(agent_type))
             self._agent_children[tool_call.id] = marker
             self._write_session_state(self.bash_cwd, self._todo_items)

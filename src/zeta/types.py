@@ -788,6 +788,7 @@ class StreamEventType(StrEnum):
     TOOL_EXECUTION_START = "tool_execution_start"
     TOOL_EXECUTION_UPDATE = "tool_execution_update"
     TOOL_EXECUTION_END = "tool_execution_end"
+    AGENT_NOTIFICATION = "agent_notification"
     TURN_END = "turn_end"
     AGENT_END = "agent_end"
     ERROR = "error"

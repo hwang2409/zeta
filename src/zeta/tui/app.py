@@ -232,6 +232,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             self._full_screen_active,
             lambda renderable: self._print(renderable),
         )
+        self.loop.set_background_event_sink(self._handle_background_event)
         self._input_queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._fork_rebuilt = False
     @property
@@ -561,6 +562,9 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
                 self._abort_requested = True
             else:
                 self._active_task.cancel()
+        elif self.loop.background_children_running:
+            self.loop.abort()
+            self._invalidate_prompt()
 
     def _abort_approval(self, request_id: str | tuple[str, str]) -> None:
         if self._approval_policy is not None:
@@ -660,6 +664,16 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         )
         self._abort_requested = False
         return stop_after_tool
+
+    def _handle_background_event(self, event: StreamEvent) -> None:
+        """Render child progress while keeping completion notices at turn boundaries."""
+
+        if event.type in {
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            StreamEventType.TOOL_EXECUTION_END,
+        }:
+            self._presenter.handle_tool_event(event, aborted=False)
+            self._invalidate_prompt()
 
     def _handle_resumed_tool_event(self, event: StreamEvent) -> None:
         self._handle_tool_event(event)

@@ -110,6 +110,9 @@ class CheckpointTranscriptMixin:
         self._failed_turn = None
         tool_calls: dict[str, ToolCall] = {}
         last_user: Message | None = None
+        pending_notifications = {
+            entry.id for entry in self.loop.store.agent_notifications()
+        }
         for entry in self.loop.store.replay():
             if entry.type == "checkpoint":
                 self._print_system(
@@ -129,6 +132,16 @@ class CheckpointTranscriptMixin:
                 )
                 continue
             if entry.type != "message":
+                if entry.type == "notification" and entry.id in pending_notifications:
+                    self._print_unit(
+                        render_event(
+                            StreamEvent(
+                                StreamEventType.AGENT_NOTIFICATION,
+                                data={"notification_id": entry.id, **entry.data},
+                            )
+                        )
+                    )
+                    self.loop.store.acknowledge_agent_notification(entry.id)
                 continue
             message = Message.from_dict(entry.data["message"])
             if message.role is MessageRole.USER:

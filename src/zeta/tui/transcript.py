@@ -86,6 +86,7 @@ class TranscriptWidget(UIControl):
     def __init__(self) -> None:
         self._units: list[_TranscriptUnit | None] = []
         self._tools: dict[str, _ToolUnit] = {}
+        self._background_tools: set[str] = set()
         self._card_units: dict[str, _ToolUnit] = {}
         self._render_cache: dict[int, tuple[int, int, str]] = {}
         self._parsed_cache: OrderedDict[int, list[list[tuple[str, str]]]] = (
@@ -159,6 +160,7 @@ class TranscriptWidget(UIControl):
 
         self._units.clear()
         self._tools.clear()
+        self._background_tools.clear()
         self._card_units.clear()
         self._render_cache.clear()
         self._parsed_cache.clear()
@@ -199,11 +201,22 @@ class TranscriptWidget(UIControl):
             self._bump_revision()
         else:
             self.append(rendered)
+        self._background_tools.discard(call_id)
+
+    def mark_tool_background(self, call_id: str) -> None:
+        """Keep a running child card after its parent tool call returns."""
+
+        if call_id in self._tools:
+            self._background_tools.add(call_id)
 
     def discard_tools(self) -> None:
         if not self._tools:
             return
-        active = set(self._tools.values())
+        active = {
+            unit
+            for call_id, unit in self._tools.items()
+            if call_id not in self._background_tools
+        }
         removed_keys = {
             unit.key
             for unit in self._units
@@ -218,7 +231,11 @@ class TranscriptWidget(UIControl):
             self._anchor = None
         for key in removed_keys:
             self._render_cache.pop(key, None)
-        self._tools.clear()
+        self._tools = {
+            call_id: unit
+            for call_id, unit in self._tools.items()
+            if call_id in self._background_tools
+        }
         self._bump_revision()
 
     def toggle_latest_agent(self) -> bool:
@@ -472,6 +489,7 @@ class TranscriptPresenter:
         self._printed_units = False
         self._assistant_unit_open = False
         self._active_tool_calls: set[str] = set()
+        self._background_tool_ids: set[str] = set()
         self._pending_tool_renders: list[RenderableType] = []
         self._tool_region_units: dict[str, _ToolUnit] = {}
         self._tool_region: Live | None = None
@@ -739,8 +757,21 @@ class TranscriptPresenter:
         if event.type is not StreamEventType.TOOL_EXECUTION_END:
             return None
 
+        structured = (
+            event.tool_result.structured_content
+            if event.tool_result is not None
+            else None
+        )
+        is_background_start = (
+            structured is not None and structured.get("status") == "running"
+        )
         if event.tool_call is not None:
             self._active_tool_calls.discard(event.tool_call.id)
+            if is_background_start:
+                self._background_tool_ids.add(event.tool_call.id)
+                if self._full_screen_active():
+                    self.transcript.mark_tool_background(event.tool_call.id)
+                return ToolEventPresentation(visible_output=True)
         rendered = render_event(event)
         if not self._full_screen_active() and event.tool_call is not None:
             unit = self._tool_region_units.get(event.tool_call.id)
@@ -752,6 +783,8 @@ class TranscriptPresenter:
                 self.transcript.finish_tool(event.tool_call.id, rendered, event)
             else:
                 self._pending_tool_renders.append(rendered)
+        if event.tool_call is not None:
+            self._background_tool_ids.discard(event.tool_call.id)
         if not self._active_tool_calls:
             self.commit_tool_region()
         return ToolEventPresentation(
@@ -763,11 +796,24 @@ class TranscriptPresenter:
         final_renders = self._pending_tool_renders
         self._pending_tool_renders = []
         if self._tool_region is not None:
-            if final_renders:
-                self._tool_region.update(Group(*final_renders))
-            self._tool_region.stop()
-            self._tool_region = None
-        self._tool_region_units.clear()
+            self._tool_region_units = {
+                call_id: unit
+                for call_id, unit in self._tool_region_units.items()
+                if call_id in self._background_tool_ids
+            }
+            if self._background_tool_ids:
+                self._tool_region.update(self._tool_region_renderable())
+            else:
+                if final_renders:
+                    self._tool_region.update(Group(*final_renders))
+                self._tool_region.stop()
+                self._tool_region = None
+        else:
+            self._tool_region_units = {
+                call_id: unit
+                for call_id, unit in self._tool_region_units.items()
+                if call_id in self._background_tool_ids
+            }
         for rendered in final_renders:
             self.print(rendered)
         self.reset_assistant_unit()
@@ -777,9 +823,20 @@ class TranscriptPresenter:
         if self._full_screen_active():
             self.transcript.discard_tools()
         if self._tool_region is not None:
-            self._tool_region.stop()
-            self._tool_region = None
-        self._tool_region_units.clear()
+            self._tool_region_units = {
+                call_id: unit
+                for call_id, unit in self._tool_region_units.items()
+                if call_id in self._background_tool_ids
+            }
+            if not self._background_tool_ids:
+                self._tool_region.stop()
+                self._tool_region = None
+        else:
+            self._tool_region_units = {
+                call_id: unit
+                for call_id, unit in self._tool_region_units.items()
+                if call_id in self._background_tool_ids
+            }
 
     def clear_active_tool_calls(self) -> None:
         self._active_tool_calls.clear()

@@ -25,6 +25,7 @@ from .checkpoints import (
 )
 
 SCHEMA = "zeta.conversation.v1"
+MAX_AGENT_NOTIFICATION_TEXT = 4_000
 
 
 class ConversationStore(AgentStateMixin, CheckpointForkMixin):
@@ -260,6 +261,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         ids: set[str] = set()
         approval_requests: dict[str, ConversationEntry] = {}
         approval_resolutions: set[str] = set()
+        notifications: set[str] = set()
+        notification_acks: set[str] = set()
         by_id = {entry.id: entry for entry in self._entries}
         active_ids: set[str] = set()
         current = self._entries[-1] if self._entries else None
@@ -321,6 +324,19 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                         f"duplicate approval resolution: {request_id}"
                     )
                 approval_resolutions.add(request_id)
+            elif entry.type == "notification":
+                notifications.add(entry.id)
+            elif entry.type == "notification_ack":
+                notification_id = entry.data.get("notification_id")
+                if notification_id not in notifications:
+                    raise ConversationIntegrityError(
+                        f"notification acknowledgement is not linked: {notification_id}"
+                    )
+                if notification_id in notification_acks:
+                    raise ConversationIntegrityError(
+                        f"duplicate notification acknowledgement: {notification_id}"
+                    )
+                notification_acks.add(notification_id)
             ids.add(entry.id)
 
     @staticmethod
@@ -413,6 +429,24 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                     raise ValueError("approval resolution id must be a nonempty string")
                 if decision not in {"allow", "deny", "abort"}:
                     raise ValueError("invalid approval resolution")
+            elif entry.type == "notification":
+                if (
+                    type(entry.data.get("child_instance_id")) is not str
+                    or not entry.data["child_instance_id"]
+                    or type(entry.data.get("child_session_path")) is not str
+                    or not entry.data["child_session_path"]
+                    or type(entry.data.get("description")) is not str
+                    or not entry.data["description"]
+                    or entry.data.get("status") not in {"completed", "error", "canceled"}
+                    or type(entry.data.get("text")) is not str
+                    or not entry.data["text"]
+                    or len(entry.data["text"]) > MAX_AGENT_NOTIFICATION_TEXT
+                ):
+                    raise ValueError("invalid agent notification")
+            elif entry.type == "notification_ack":
+                notification_id = entry.data.get("notification_id")
+                if type(notification_id) is not str or not notification_id:
+                    raise ValueError("notification id must be a nonempty string")
             else:
                 raise ValueError(f"unsupported conversation entry type: {entry.type}")
         except (KeyError, TypeError, ValueError) as exc:
@@ -472,6 +506,68 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
 
     def append_message(self, message: Message, *, parent_id: str | None = None) -> ConversationEntry:
         return self._append_row("message", {"message": message.to_dict()}, parent_id)
+
+    def append_agent_notification(
+        self,
+        child_instance_id: str,
+        *,
+        child_session_path: str,
+        description: str,
+        status: str,
+        text: str,
+    ) -> ConversationEntry:
+        """Persist one bounded background-child completion notification."""
+
+        if (
+            not child_instance_id
+            or not child_session_path
+            or not description
+            or status not in {"completed", "error", "canceled"}
+            or not text
+        ):
+            raise ValueError("invalid agent notification")
+        return self._append_row(
+            "notification",
+            {
+                "child_instance_id": child_instance_id,
+                "child_session_path": child_session_path,
+                "description": description,
+                "status": status,
+                "text": text[:MAX_AGENT_NOTIFICATION_TEXT],
+            },
+        )
+
+    def agent_notifications(
+        self, *, pending_only: bool = True
+    ) -> list[ConversationEntry]:
+        """Return durable background-child notifications on the active branch."""
+
+        branch = self.replay()
+        acknowledged = {
+            entry.data["notification_id"]
+            for entry in branch
+            if entry.type == "notification_ack"
+        }
+        return [
+            entry
+            for entry in branch
+            if entry.type == "notification"
+            and (not pending_only or entry.id not in acknowledged)
+        ]
+
+    def acknowledge_agent_notification(self, notification_id: str) -> None:
+        """Durably mark one notification as rendered by the parent UI."""
+
+        notifications = self.agent_notifications(pending_only=False)
+        if not any(entry.id == notification_id for entry in notifications):
+            raise ValueError(f"unknown agent notification: {notification_id}")
+        if any(
+            entry.data["notification_id"] == notification_id
+            for entry in self.replay()
+            if entry.type == "notification_ack"
+        ):
+            return
+        self._append_row("notification_ack", {"notification_id": notification_id})
 
     def append_compaction_marker(
         self,

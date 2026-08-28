@@ -99,6 +99,67 @@ def _test_console(output: StringIO | None = None, *, width: int = 80) -> Console
     )
 
 
+def test_background_agent_card_survives_parent_tool_completion() -> None:
+    call = ToolCall(
+        "background-1",
+        "agent",
+        {
+            "prompt": "inspect",
+            "description": "background research",
+            "background": True,
+        },
+    )
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        _test_console(),
+        lambda: True,
+        lambda renderable: transcript.append(renderable) if renderable else None,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call),
+        aborted=False,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "background agent started",
+                structured_content={"status": "running"},
+            ),
+        ),
+        aborted=False,
+    )
+    assert presenter.has_active_agent
+
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            tool_call=call,
+            delta="turn 1: thinking",
+        ),
+        aborted=False,
+    )
+    assert "thinking" in Text.from_ansi(transcript.render(120)).plain
+
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "child complete",
+                structured_content={"status": "completed", "turns_used": 1},
+            ),
+        ),
+        aborted=False,
+    )
+    assert not presenter.has_active_agent
+    assert "completed" in Text.from_ansi(transcript.render(120)).plain
+
+
 def _contains_background_sgr(value: str) -> bool:
     return any(
         parameter == "48"

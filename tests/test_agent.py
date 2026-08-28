@@ -26,6 +26,7 @@ from zeta.types import (
     StreamEventType,
     TextContent,
     ToolCall,
+    ToolResult,
     ToolSchema,
     ToolUseContent,
 )
@@ -127,6 +128,252 @@ def _parallel_agent_calls() -> list[ToolCall]:
         )
         for index in (1, 2)
     ]
+
+
+class BackgroundBackend(CompletionBackend):
+    def __init__(self, calls: Sequence[ToolCall]) -> None:
+        self.calls = list(calls)
+        self.child_started = asyncio.Event()
+        self.release_child = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        if last_user == "start":
+            blocks = [ToolUseContent(call) for call in self.calls]
+        elif last_user == "inspect the task":
+            self.child_started.set()
+            await self.release_child.wait()
+            blocks = [TextContent("child complete")]
+        else:
+            blocks = [TextContent("parent continued")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+def _background_agent_call(call_id: str = "background-1") -> ToolCall:
+    return ToolCall(
+        call_id,
+        "agent",
+        {
+            "prompt": "inspect the task",
+            "description": "background research",
+            "background": True,
+        },
+    )
+
+
+async def _wait_for_notification(
+    store: ConversationStore, status: str
+) -> object:
+    for _ in range(100):
+        notifications = store.agent_notifications()
+        if notifications and notifications[-1].data["status"] == status:
+            return notifications[-1]
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"missing {status} background notification")
+
+
+@pytest.mark.asyncio
+async def test_background_agent_returns_handle_and_parent_continues(
+    tmp_path: Path,
+) -> None:
+    backend = BackgroundBackend([_background_agent_call()])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.structured_content is not None
+    assert result.structured_content["status"] == "running"
+    assert result.structured_content["description"] == "background research"
+    assert backend.child_started.is_set()
+
+    parent_events = await _collect(loop.run_turn("follow up"))
+    assert any(
+        event.type is StreamEventType.TURN_END for event in parent_events
+    )
+    assert store.agent_notifications() == []
+
+    backend.release_child.set()
+    notification = await _wait_for_notification(store, "completed")
+    assert notification.data["text"] == "child complete"
+    assert not store.agent_children()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_background_completion_notification_waits_for_next_turn_boundary(
+    tmp_path: Path,
+) -> None:
+    backend = BackgroundBackend([_background_agent_call()])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+
+    events = await _collect(loop.run_turn("follow up"))
+    assert events[0].type is StreamEventType.AGENT_NOTIFICATION
+    assert events[0].data["text"] == "child complete"
+    assert loop.store.agent_notifications() == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
+    call = _background_agent_call()
+    backend = BackgroundBackend([call])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    loop.abort()
+    notification = await _wait_for_notification(store, "canceled")
+    assert "parent session exited" not in notification.data["text"]
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    assert child_store.agent_canceled() == {
+        "tool_call_id": call.id,
+        "content": "tool execution canceled",
+    }
+    assert not store.agent_children()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_background_and_foreground_tools_mix_in_one_turn(
+    tmp_path: Path,
+) -> None:
+    background = _background_agent_call()
+    foreground = ToolCall("read-1", "read", {"path": "missing"})
+    backend = BackgroundBackend([background, foreground])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    results = [message.tool_result for message in store.messages() if message.tool_result]
+    assert len(results) == 2
+    assert any(
+        result is not None
+        and result.structured_content is not None
+        and result.structured_content.get("status") == "running"
+        for result in results
+    )
+    assert any(result is not None and result.is_error for result in results)
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+    await loop.close()
+
+
+def _persist_background_receipt(
+    store: ConversationStore, call: ToolCall, child: ConversationStore
+) -> None:
+    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
+    )
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent("background agent started")],
+            tool_result=ToolResult(
+                call.id,
+                "background agent started",
+                structured_content={
+                    "turns_used": 0,
+                    "child_session_path": str(child.session_dir),
+                    "status": "running",
+                    "child_instance_id": f"{store.session_id}:1",
+                    "description": "background research",
+                },
+            ),
+        )
+    )
+
+
+def test_resume_cancels_live_background_child(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="parent")
+    call = _background_agent_call()
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.mark_agent_parent(call.id)
+    _persist_background_receipt(store, call, child)
+    store.allocate_agent_index()
+    store.register_agent_child(
+        call,
+        child_session_path=str(child.session_dir),
+        description="background research",
+        background=True,
+    )
+
+    resumed = ConversationStore(tmp_path, session_id="parent")
+    AgentLoop(BackgroundBackend([]), resumed)
+
+    notification = resumed.agent_notifications()[0]
+    assert notification.data["status"] == "canceled"
+    assert "session exited" in notification.data["text"]
+    assert not resumed.agent_children()
+    assert ConversationStore(
+        store.session_dir / "agents", session_id="1"
+    ).agent_canceled() == {
+        "tool_call_id": call.id,
+        "content": "tool execution canceled",
+    }
+
+
+def test_resume_keeps_completed_unnotified_background_notification(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="parent")
+    call = _background_agent_call()
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.mark_agent_parent(call.id)
+    _persist_background_receipt(store, call, child)
+    store.allocate_agent_index()
+    store.register_agent_child(
+        call,
+        child_session_path=str(child.session_dir),
+        description="background research",
+        background=True,
+    )
+    store.append_agent_notification(
+        "parent:1",
+        child_session_path=str(child.session_dir),
+        description="background research",
+        status="completed",
+        text="child complete",
+    )
+
+    resumed = ConversationStore(tmp_path, session_id="parent")
+    AgentLoop(BackgroundBackend([]), resumed)
+
+    notification = resumed.agent_notifications()[0]
+    assert notification.data["status"] == "completed"
+    assert notification.data["text"] == "child complete"
+    assert not resumed.agent_children()
+    assert ConversationStore(
+        store.session_dir / "agents", session_id="1"
+    ).agent_canceled() is None
 
 
 @pytest.mark.asyncio

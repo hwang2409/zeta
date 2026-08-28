@@ -883,6 +883,19 @@ def render_event(event: StreamEvent) -> RenderableType | None:
     if event.type is StreamEventType.RETRY:
         text = event.data.get("text")
         return Text(text if type(text) is str else "retrying", style=DIM)
+    if event.type is StreamEventType.AGENT_NOTIFICATION:
+        description = event.data.get("description")
+        status = event.data.get("status")
+        text = event.data.get("text")
+        path = event.data.get("child_session_path")
+        if not all(type(value) is str for value in (description, status, text, path)):
+            return Text("background agent notification unavailable", style=ERROR)
+        style = ERROR if status in {"error", "canceled"} else RECEIPT
+        return Text(
+            f"background · {description} · {status} · {text} · {path}",
+            style=style,
+            overflow="ellipsis",
+        )
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
         agent_render = AgentCard.render_progress(event.tool_call, "")
         if agent_render is not None:
