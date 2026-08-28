@@ -16,6 +16,7 @@ from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
+from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -52,6 +53,7 @@ from .background import background_notice
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
+    DraftPersistence,
     TurnConsumerMixin,
     VimCursorShapeConfig,
     build_key_bindings,
@@ -164,6 +166,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         console: Console | None = None,
         session: PromptSession[str] | None = None,
         history_path: str | Path | None = None,
+        draft_path: str | Path | None = None,
         approval_policy: ApprovalPolicy | None = None,
         context_files: Sequence[str] = (),
         on_model_change: Callable[[str], None] | None = None,
@@ -209,6 +212,12 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         self._resuming_tool = False
         self._session = session
         self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
+        self._history = None
+        self._draft = DraftPersistence(
+            draft_path or self.loop.store.session_dir / "draft"
+        )
+        self._draft_session: PromptSession[str] | None = None
+        self._undo_candidate: str | None = None
         self._approval_policy = approval_policy
         self._context_files = tuple(context_files)
         self._on_model_change = on_model_change
@@ -505,6 +514,8 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         return style
 
     def _make_session(self) -> PromptSession[str]:
+        if self._history is None:
+            self._history = history_for(self._history_path)
         bindings = build_key_bindings(
             on_interrupt=self.abort_active,
             on_exit=self.request_exit,
@@ -515,11 +526,13 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             on_toggle_agent=self._transcript.toggle_latest_agent,
             on_retry=self.retry_failed_turn,
             retry_available=self.retry_available,
+            on_undo=self.undo_sent_turn,
+            append_history=False,
         )
-        return FullScreenPromptSession(
+        session = FullScreenPromptSession(
             message=[("class:prompt", " > ")],
             placeholder=[("class:placeholder", "type a message...")],
-            history=history_for(self._history_path),
+            history=self._history,
             key_bindings=bindings,
             multiline=True,
             editing_mode=EditingMode.VI if self.vim_mode else EditingMode.EMACS,
@@ -528,6 +541,39 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             show_frame=True,
             style=DynamicStyle(self._prompt_style),
         )
+        self._attach_draft(session)
+        return session
+    def _attach_draft(self, session: PromptSession[str]) -> None:
+        if self._draft_session is session:
+            return
+        self._draft.attach(session.default_buffer)
+        self._draft_session = session
+    def _record_prompt(self, value: str) -> None:
+        if self._history is None:
+            self._history = history_for(self._history_path)
+        self._history.append_string(value)
+        self._draft.clear()
+    def _restore_composer(self, value: str) -> None:
+        session = self._active_session or self._session
+        if session is None:
+            return
+        buffer = session.app.current_buffer
+        buffer.set_document(Document(value, len(value)))
+    def undo_sent_turn(self) -> None:
+        """Abort the current turn and restore its submitted text once."""
+
+        candidate = self._undo_candidate
+        if (
+            candidate is None
+            or not self.active
+            or self._loop_state not in {"streaming", "compacting", "tool-running", "approval"}
+        ):
+            self._print_unit(Text("undo unavailable: turn already completed", style=DIM))
+            return
+        self._undo_candidate = None
+        self.abort_active()
+        self._restore_composer(candidate)
+        self._draft.schedule(candidate)
 
     def request_exit(self) -> None:
         self._exit_requested = True
@@ -598,6 +644,12 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             model_window=self.loop.context_assembler.token_budget,
             vim_state=vim_state_label(self.vim_mode),
             background_count=self.loop.tool_registry.background_tasks.running_count,
+            undo_available=(
+                self._undo_candidate is not None
+                and self.active
+                and self._loop_state
+                in {"streaming", "compacting", "tool-running", "approval"}
+            ),
         )
         fragments = status_formatted_text(status)
         return fragments
@@ -687,9 +739,11 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         if parsed is None or self._exit_requested:
             return
         if await self._handle_approval_input(parsed):
+            self._record_prompt(parsed)
             return
         slash_output = await self._slash_commands.dispatch_async(self, parsed)
         if slash_output is not None:
+            self._record_prompt(parsed)
             if self._fork_rebuilt:
                 self._fork_rebuilt = False
             elif slash_output.startswith("[Image #"):
@@ -701,6 +755,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         user_message = self._prepare_user_message(model_input)
         if user_message is None:
             return
+        self._record_prompt(parsed)
         self._failed_turn = None
         if self.pending_approvals:
             self._present_pending_approvals()
@@ -710,6 +765,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         else:
             self._clear_pending_attachments()
             self._print_user(user_message)
+            self._undo_candidate = model_input
             self._start_turn(model_input, user_message=user_message)
 
     def _discard_tool_region(self) -> None:
@@ -925,6 +981,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
 
         session = session or self._session or self._make_session()
         self._active_session = session
+        self._attach_draft(session)
         if isinstance(session, FullScreenPromptSession):
             self._install_full_screen_layout(session)
         self.loop.session_start()
@@ -960,6 +1017,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
                         break
                     prompt_task = asyncio.create_task(self._read_prompt(session))
         finally:
+            self._draft.flush()
             if prompt_task is not None and not prompt_task.done():
                 prompt_task.cancel()
                 await asyncio.gather(prompt_task, return_exceptions=True)

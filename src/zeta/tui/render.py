@@ -957,6 +957,7 @@ def format_status(
     model_window: int | None = None,
     vim_state: str | None = None,
     background_count: int = 0,
+    undo_available: bool = False,
 ) -> Text:
     """Format the compact status bar shown below the composer."""
 
@@ -995,6 +996,8 @@ def format_status(
         left_segments.append(f"bg {background_count}")
     left = "  ".join(left_segments)
     right_segments = ["/status", "ctrl+c interrupt", "ctrl+d quit"]
+    if undo_available:
+        right_segments.append("ctrl+u undo")
     if session_id:
         right_segments.append(session_id[:8])
     if width is None:

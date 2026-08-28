@@ -47,6 +47,7 @@ from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.agent_card import AgentCard
 from zeta.tui.composer import (
+    DraftPersistence,
     build_key_bindings,
     history_for,
     parse_input,
@@ -5962,3 +5963,126 @@ async def test_vi_composer_history_up_works_from_insert_mode_on_empty_buffer(
 @pytest.mark.parametrize("value", ["", "  \n  "])
 def test_parse_input_rejects_blank_turns(value: str) -> None:
     assert parse_input(value) is None
+
+
+@pytest.mark.asyncio
+async def test_composer_history_is_bounded_and_keeps_multiline_entries(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "history"
+    history = history_for(path)
+    for index in range(1001):
+        history.append_string(f"prompt {index}\nline two")
+
+    assert len(history.get_strings()) == 1000
+    assert history.get_strings()[0] == "prompt 1\nline two"
+    assert history.get_strings()[-1] == "prompt 1000\nline two"
+    reopened = history_for(path)
+    loaded: list[str] = []
+    async for entry in reopened.load():
+        loaded.append(entry)
+    assert loaded[:2] == ["prompt 1000\nline two", "prompt 999\nline two"]
+
+
+@pytest.mark.asyncio
+async def test_draft_persistence_round_trip_and_clear(tmp_path: Path) -> None:
+    persistence = DraftPersistence(tmp_path / "draft", delay=0.01)
+    persistence.schedule("line one\nline two")
+    await asyncio.sleep(0.02)
+    assert persistence.load() == "line one\nline two"
+
+    persistence.clear()
+    assert not (tmp_path / "draft").exists()
+
+
+def test_history_stores_attachment_tokens_without_payloads(tmp_path: Path) -> None:
+    history = history_for(tmp_path / "history")
+    history.append_string("inspect [Image #1]")
+
+    assert history.get_strings() == ["inspect [Image #1]"]
+    assert b"iVBOR" not in (tmp_path / "history").read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_ctrl_r_search_uses_cross_session_history(tmp_path: Path) -> None:
+    history = history_for(tmp_path / "history")
+    history.append_string("older session prompt")
+    history.append_string("newer session prompt")
+
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x12older")
+        await wait_until(lambda: session.search_buffer.text == "older")
+        pipe.send_text("\r")
+        await wait_until(
+            lambda: session.default_buffer.text == "older session prompt"
+        )
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_app_draft_round_trip_and_send_clear(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    first = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+        history_path=tmp_path / "history",
+    )
+    first_session = first._make_session()
+    first_session.default_buffer.insert_text("unsent draft")
+    await asyncio.sleep(0.25)
+
+    reopened_store = ConversationStore(
+        store.root_dir, session_id=store.session_id, cwd=store.cwd
+    )
+    second = TUIApp(
+        AgentLoop(FakeBackend([]), reopened_store),
+        provider="fake",
+        model="offline",
+        history_path=tmp_path / "history",
+    )
+    second_session = second._make_session()
+    assert second_session.default_buffer.text == "unsent draft"
+
+    second._record_prompt("sent prompt")
+    assert not (store.session_dir / "draft").exists()
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_text_and_aborts_streaming_turn(tmp_path: Path) -> None:
+    backend = AbortThenSuccessBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    session = app._make_session()
+    app._active_session = session
+    task = asyncio.create_task(app._consume_turn("sent message"))
+    app._active_task = task
+    await backend.started.wait()
+
+    app._undo_candidate = "sent message"
+    app.undo_sent_turn()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert session.app.current_buffer.text == "sent message"
+    assert app._loop_state == "interrupted"
+    app.undo_sent_turn()
+    assert session.app.current_buffer.text == "sent message"
+    assert "undo unavailable" in "\n".join(app._transcript.lines(120))

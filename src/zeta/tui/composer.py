@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import platform
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,9 +18,11 @@ from typing import Any
 from uuid import uuid4
 
 from prompt_toolkit.application import Application, get_app
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
+from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.filters import Condition, vi_insert_mode
+from prompt_toolkit.filters import Condition, is_searching, vi_insert_mode
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -51,6 +55,8 @@ SHIFT_ENTER_SEQUENCES = frozenset(
 ATTACHMENT_MAX_TEXT_BYTES = 200 * 1024
 ATTACHMENT_TOKEN_RE = re.compile(r'(?<!\S)@(?:"([^"\n]+)"|([^\s]+))')
 SPINNER_INTERVAL = 0.2
+HISTORY_LIMIT = 1000
+DRAFT_WRITE_DELAY = 0.2
 
 
 class TurnConsumerMixin:
@@ -194,6 +200,139 @@ class TurnConsumerMixin:
 
 class AttachmentError(ValueError):
     """Raised when a composer attachment cannot be read or decoded."""
+
+
+class BoundedFileHistory(FileHistory):
+    """Store recent composer entries without retaining attachment payloads."""
+
+    def __init__(self, filename: str | Path, *, limit: int = HISTORY_LIMIT) -> None:
+        if limit < 1:
+            raise ValueError("history limit must be positive")
+        self.limit = limit
+        super().__init__(str(filename))
+
+    def load_history_strings(self) -> list[str]:
+        return list(super().load_history_strings())[: self.limit]
+
+    def append_string(self, string: str) -> None:
+        if not self._loaded:
+            self._loaded_strings = list(self.load_history_strings())
+            self._loaded = True
+        if self._loaded_strings and self._loaded_strings[0] == string:
+            return
+        self._loaded_strings.insert(0, string)
+        del self._loaded_strings[self.limit :]
+        self._write_entries(self._loaded_strings[::-1])
+
+    def store_string(self, string: str) -> None:
+        """Keep direct history writes bounded as well."""
+
+        if self._loaded:
+            entries = [string, *self._loaded_strings]
+        else:
+            entries = [string, *self.load_history_strings()]
+        self._write_entries(entries[: self.limit][::-1])
+
+    def _write_entries(self, entries: list[str]) -> None:
+        history_path = Path(self.filename)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=history_path.parent,
+                prefix=f".{history_path.name}.",
+                delete=False,
+            ) as handle:
+                temporary_path = handle.name
+                for entry in entries:
+                    handle.write(b"\n# zeta composer history\n")
+                    for line in entry.split("\n"):
+                        handle.write(f"+{line}\n".encode("utf-8", errors="replace"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, history_path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                Path(temporary_path).unlink(missing_ok=True)
+
+
+class DraftPersistence:
+    """Persist the current composer text after a short idle delay."""
+
+    def __init__(self, path: str | Path, *, delay: float = DRAFT_WRITE_DELAY) -> None:
+        self.path = Path(path)
+        self.delay = delay
+        self._pending_text: str | None = None
+        self._scheduled: asyncio.TimerHandle | None = None
+
+    def load(self) -> str:
+        try:
+            return self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+        except OSError:
+            return ""
+
+    def schedule(self, text: str) -> None:
+        self._pending_text = text
+        if self._scheduled is not None:
+            self._scheduled.cancel()
+        try:
+            event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.flush()
+            return
+        self._scheduled = event_loop.call_later(self.delay, self.flush)
+
+    def flush(self) -> None:
+        if self._scheduled is not None:
+            self._scheduled.cancel()
+            self._scheduled = None
+        text = self._pending_text
+        self._pending_text = None
+        if text is None:
+            return
+        if not text:
+            self.path.unlink(missing_ok=True)
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                delete=False,
+            ) as handle:
+                temporary_path = handle.name
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, self.path)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                Path(temporary_path).unlink(missing_ok=True)
+
+    def clear(self) -> None:
+        self._pending_text = None
+        if self._scheduled is not None:
+            self._scheduled.cancel()
+            self._scheduled = None
+        self.path.unlink(missing_ok=True)
+
+    def attach(self, buffer: Buffer) -> None:
+        draft = self.load()
+        if draft and not buffer.text:
+            buffer.set_document(Document(draft, len(draft)))
+
+        def changed(_buffer: Buffer) -> None:
+            self.schedule(buffer.text)
+
+        buffer.on_text_changed += changed
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,6 +616,7 @@ class ComposerAttachmentMixin:
         )
         self._print_user(user_message)
         self._print(Text("[queued]", style="dim"))
+        self._undo_candidate = user_text
         self._start_turn(user_text, user_message=user_message)
 
     def _start_turn(
@@ -486,6 +626,7 @@ class ComposerAttachmentMixin:
         user_message: Message | None = None,
         persist_user_message: bool = True,
     ) -> None:
+        self._loop_state = "streaming"
         self._active_task = asyncio.create_task(
             self._consume_turn(
                 user_text,
@@ -566,21 +707,43 @@ def build_key_bindings(
     on_toggle_agent: Callable[[], None] | None = None,
     on_retry: Callable[[], None] | None = None,
     retry_available: Callable[[], bool] | None = None,
+    on_undo: Callable[[], None] | None = None,
+    append_history: bool = True,
 ) -> KeyBindings:
     """Build the small key map used by the full-screen composer."""
 
     bindings = KeyBindings()
     escape_chord_pending = False
     escape_chord_cursor_position: int | None = None
+    history_navigation_active = False
+    history_navigation_buffer: Buffer | None = None
+    suppress_history_detach = False
+
+    def track_history_buffer(buffer: Buffer) -> None:
+        nonlocal history_navigation_active, history_navigation_buffer
+        if history_navigation_buffer is buffer:
+            return
+        history_navigation_buffer = buffer
+
+        def detach_history_navigation(_buffer: Buffer) -> None:
+            nonlocal history_navigation_active
+            if not suppress_history_detach:
+                history_navigation_active = False
+
+        buffer.on_text_changed += detach_history_navigation
 
     @Condition
     def vi_insert_history_navigation() -> bool:
         app = get_app()
         buffer = app.current_buffer
-        return vi_insert_mode() and (
-            not buffer.text
-            or buffer.working_index < len(buffer._working_lines) - 1
-        )
+        track_history_buffer(buffer)
+        return vi_insert_mode()
+
+    @Condition
+    def emacs_history_navigation() -> bool:
+        app = get_app()
+        track_history_buffer(app.current_buffer)
+        return app.editing_mode is EditingMode.EMACS
 
     @Condition
     def full_screen_mode() -> bool:
@@ -611,7 +774,8 @@ def build_key_bindings(
             insert_newline(event)
             return
         if on_submit is not None:
-            event.current_buffer.append_to_history()
+            if append_history:
+                event.current_buffer.append_to_history()
             on_submit(event.current_buffer.text)
             event.current_buffer.reset()
         else:
@@ -621,12 +785,26 @@ def build_key_bindings(
     def newline(event: KeyPressEvent) -> None:
         insert_newline(event)
 
+    @bindings.add("enter", filter=is_searching, eager=True)
+    def accept_history_search(event: KeyPressEvent) -> None:
+        del event
+        from prompt_toolkit.search import accept_search
+
+        accept_search()
+
     if on_retry is not None:
 
         @bindings.add("c-r", filter=retry_ready, eager=True)
         def retry(event: KeyPressEvent) -> None:
             del event
             on_retry()
+
+    if on_undo is not None:
+
+        @bindings.add("c-u", eager=True)
+        def undo(event: KeyPressEvent) -> None:
+            del event
+            on_undo()
 
     if on_paste is not None:
 
@@ -656,13 +834,39 @@ def build_key_bindings(
         if not escape_chord_pending:
             escape_chord_cursor_position = None
 
-    @bindings.add("up", filter=vi_insert_history_navigation)
+    @bindings.add(
+        "up", filter=vi_insert_history_navigation | emacs_history_navigation
+    )
     def history_up(event: KeyPressEvent) -> None:
-        event.current_buffer.auto_up()
+        nonlocal history_navigation_active, suppress_history_detach
+        buffer = event.current_buffer
+        if not history_navigation_active and buffer.text:
+            if buffer.document.cursor_position_row > 0:
+                buffer.auto_up()
+            return
+        suppress_history_detach = True
+        try:
+            buffer.history_backward()
+        finally:
+            suppress_history_detach = False
+        history_navigation_active = buffer.text != ""
 
-    @bindings.add("down", filter=vi_insert_history_navigation)
+    @bindings.add(
+        "down", filter=vi_insert_history_navigation | emacs_history_navigation
+    )
     def history_down(event: KeyPressEvent) -> None:
-        event.current_buffer.auto_down()
+        nonlocal history_navigation_active, suppress_history_detach
+        buffer = event.current_buffer
+        if not history_navigation_active:
+            if buffer.document.cursor_position_row < buffer.document.line_count - 1:
+                buffer.auto_down()
+            return
+        suppress_history_detach = True
+        try:
+            buffer.history_forward()
+        finally:
+            suppress_history_detach = False
+        history_navigation_active = buffer.text != ""
 
     @bindings.add("c-c")
     def interrupt(event: KeyPressEvent) -> None:
@@ -698,9 +902,9 @@ def build_key_bindings(
     return bindings
 
 
-def history_for(path: str | Path) -> FileHistory:
+def history_for(path: str | Path) -> BoundedFileHistory:
     """Create a persistent history object and its parent directory."""
 
     history_path = Path(path)
     history_path.parent.mkdir(parents=True, exist_ok=True)
-    return FileHistory(str(history_path))
+    return BoundedFileHistory(history_path)
