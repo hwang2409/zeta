@@ -12,12 +12,34 @@ from rich.console import Console
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
-from zeta.core.slash import SlashStatus, create_slash_registry
+from zeta.core.slash import (
+    MODEL_CONTEXT_WINDOWS,
+    MODEL_PRICES,
+    CompactionSummary,
+    SlashStatus,
+    UNPRICED_MODEL_IDS,
+    UsageTracker,
+    UsageSnapshot,
+    compaction_history,
+    context_fill_percent,
+    create_slash_registry,
+    render_context_gauge,
+)
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
+from zeta.providers import PROVIDER_MODELS
+from zeta.providers.usage import normalize_usage
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings
-from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
+from zeta.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolUseContent,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,9 +147,18 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
 
     backend = FakeBackend(
         [
-            ScriptedTurn([TextContent("first")], usage={"total_tokens": 20}),
-            ScriptedTurn([TextContent("summary")], usage={"total_tokens": 10}),
-            ScriptedTurn([TextContent("second")], usage={"total_tokens": 5}),
+            ScriptedTurn(
+                [TextContent("first")],
+                usage={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+            ),
+            ScriptedTurn(
+                [TextContent("summary")],
+                usage={"input_tokens": 30, "output_tokens": 3, "total_tokens": 33},
+            ),
+            ScriptedTurn(
+                [TextContent("second")],
+                usage={"input_tokens": 20, "output_tokens": 5, "total_tokens": 25},
+            ),
         ]
     )
     store = ConversationStore(tmp_path / "sessions")
@@ -139,17 +170,115 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
         token_counter=token_count,
     )
     loop = AgentLoop(backend, store, context_assembler=assembler)
+    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
 
-    async for _ in loop.run_turn("first"):
-        pass
-    async for _ in loop.run_turn("second"):
-        pass
+    await app._consume_turn("first")
+    await app._consume_turn("second")
 
-    app = TUIApp(loop, provider="fake", model="offline")
     output = create_slash_registry().dispatch(app, "/status")
 
     assert output is not None
-    assert "tokens_used_this_session: 35" in output
+    assert "tokens_used_this_session: 70" in output
+    assert [
+        (snapshot.turn, snapshot.input_tokens, snapshot.output_tokens)
+        for snapshot in app.slash_status().usage_history
+    ] == [(1, 10, 2), (2, 20, 5)]
+    assert "estimated_cost_usd: $0.039249" in output
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_captures_summarization_cost(tmp_path: Path) -> None:
+    def token_count(message: Message) -> int:
+        if message.role is MessageRole.COMPACTION or message.metadata.get(
+            "compaction_summary"
+        ):
+            return 1
+        return 40
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                [TextContent("first")],
+                usage={"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+            ),
+            ScriptedTurn(
+                [TextContent("summary")],
+                usage={"input_tokens": 40, "output_tokens": 2, "total_tokens": 42},
+            ),
+        ]
+    )
+    store = ConversationStore(tmp_path / "sessions")
+    assembler = ContextAssembler(
+        store,
+        backend=backend,
+        token_budget=1_000_000,
+        retained_tail=1,
+        token_counter=token_count,
+    )
+    loop = AgentLoop(backend, store, context_assembler=assembler)
+    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
+
+    await app._consume_turn("first")
+    baseline_tokens = assembler.uncached_input_tokens_this_session
+    assert await app.slash_compact() != "compact: nothing to compact"
+
+    per_model = {snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model}
+    snapshot = per_model["claude-sonnet-4-6"]
+    assert snapshot.input_tokens >= baseline_tokens + 40
+    assert snapshot.output_tokens >= 3
+
+
+@pytest.mark.asyncio
+async def test_errored_turn_usage_does_not_leak_to_next_model(tmp_path: Path) -> None:
+    class _ErrorBackend(FakeBackend):
+        async def complete(self, messages, tool_schemas):
+            self.calls.append((list(messages), list(tool_schemas)))
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(role=MessageRole.ASSISTANT, content=[TextContent("boom")]),
+                data={"usage": {"input_tokens": 100, "output_tokens": 5, "total_tokens": 105}},
+            )
+            raise RuntimeError("backend exploded after usage")
+
+    store = ConversationStore(tmp_path / "sessions")
+    error_backend = _ErrorBackend([])
+    loop = AgentLoop(error_backend, store)
+    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
+
+    await app._consume_turn("first")
+
+    app.model = "claude-opus-4-6"
+    per_model = {snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model}
+    assert "claude-sonnet-4-6" in per_model
+    assert "claude-opus-4-6" not in per_model
+    assert per_model["claude-sonnet-4-6"].input_tokens == 100
+
+
+def test_usage_cost_keeps_all_turns_outside_bounded_trend() -> None:
+    class Counters:
+        uncached_input_tokens_this_session = 0
+        output_tokens_this_session = 0
+        cache_read_input_tokens_this_session = 0
+        cache_creation_input_tokens_this_session = 0
+
+    counters = Counters()
+    tracker = UsageTracker(counters)
+    for _ in range(9):
+        counters.uncached_input_tokens_this_session += 1_000_000
+        tracker.record(StreamEventType.TURN_END, "claude-sonnet-4-6")
+
+    status = replace(
+        session().status,
+        provider="claude",
+        model="claude-sonnet-4-6",
+        usage_history=tracker.history,
+        usage_cost_by_model=tracker.cost_by_model,
+    )
+    output = create_slash_registry().dispatch(FakeSlashSession(status), "/status")
+
+    assert output is not None
+    assert len(tracker.history) == 8
+    assert "estimated_cost_usd: $27.000000" in output
 
 
 def test_status_renders_cache_hit_rate_as_na_without_usage() -> None:
@@ -165,6 +294,339 @@ def test_status_renders_cache_hit_rate_as_na_without_usage() -> None:
 
     assert output is not None
     assert "prompt_cache_hit_rate: n/a" in output
+
+
+def test_status_renders_usage_trend_cost_and_context_gauge() -> None:
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(
+            replace(
+                session().status,
+                provider="claude",
+                model="claude-sonnet-4-6",
+                uncached_input_tokens=100,
+                output_tokens_this_session=50,
+                cache_read_input_tokens=50,
+                cache_creation_input_tokens=25,
+                tokens_in_current_context=50,
+                model_window=100,
+                usage_history=(
+                    UsageSnapshot(
+                        1,
+                        input_tokens=100,
+                        cache_creation_input_tokens=25,
+                        model="claude-sonnet-4-6",
+                    ),
+                    UsageSnapshot(
+                        2,
+                        input_tokens=100,
+                        cache_read_input_tokens=50,
+                        model="claude-sonnet-4-6",
+                    ),
+                ),
+            )
+        ),
+        "/status",
+    )
+
+    assert output is not None
+    assert "cache_hit_trend: 1:0% 2:33%" in output
+    assert "estimated_cost_usd: $0.000709" in output
+    assert "window: 50 / 100" in output
+    assert "fill: [##########----------] 50%" in output
+
+
+def test_status_marks_unknown_model_cost_and_window() -> None:
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(
+            replace(
+                session().status,
+                provider="claude",
+                model="claude-future",
+                tokens_in_current_context=50,
+            )
+        ),
+        "/status",
+    )
+
+    assert output is not None
+    assert "estimated_cost_usd: unavailable (unknown model: claude-future)" in output
+    assert "fill: [????????????????????] unknown" in output
+
+
+@pytest.mark.parametrize(
+    ("tokens", "window", "expected"),
+    [(0, 100, 0), (100, 100, 100), (200, 100, 100), (-1, 100, 0), (50, 0, None)],
+)
+def test_context_fill_percent_boundaries(
+    tokens: int, window: int, expected: int | None
+) -> None:
+    assert context_fill_percent(tokens, window) == expected
+
+
+def test_context_gauge_unknown_window_is_bounded() -> None:
+    assert render_context_gauge(10, None, width=8) == "[????????] unknown"
+
+
+def test_status_renders_compaction_history_and_empty_state() -> None:
+    empty = create_slash_registry().dispatch(session(), "/status")
+    assert empty is not None
+    assert "compaction_history:\n  none" in empty
+
+    status = replace(
+        session().status,
+        compaction_history=(CompactionSummary(3, 4, 120),),
+    )
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(status), "/status"
+    )
+    assert output is not None
+    assert "compaction_history:\n  turn 3: 4 entries, 120 tokens saved" in output
+
+
+def test_price_table_covers_current_provider_models() -> None:
+    for provider, models in PROVIDER_MODELS.items():
+        assert models == MODEL_PRICES[provider].keys()
+        assert models == MODEL_CONTEXT_WINDOWS[provider].keys()
+        for model in models:
+            pricing = MODEL_PRICES[provider][model]
+            window = MODEL_CONTEXT_WINDOWS[provider][model]
+            if model in UNPRICED_MODEL_IDS[provider]:
+                assert pricing is None
+                assert window is None
+            else:
+                assert pricing is not None
+                assert window is not None
+
+
+def test_codex_cache_writes_use_existing_usage_categories() -> None:
+    assert normalize_usage(
+        {
+            "input_tokens": 100,
+            "output_tokens": 4,
+            "input_tokens_details": {
+                "cached_tokens": 20,
+                "cache_write_tokens": 70,
+            },
+        }
+    ) == {
+        "input_tokens": 10,
+        "output_tokens": 4,
+        "input_tokens_details": {
+            "cached_tokens": 20,
+            "cache_write_tokens": 70,
+        },
+        "cache_read_input_tokens": 20,
+        "cache_creation_input_tokens": 70,
+    }
+
+
+def test_cost_uses_the_model_for_each_turn() -> None:
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(
+            replace(
+                session().status,
+                provider="claude",
+                model="claude-opus-4-6",
+                usage_history=(
+                    UsageSnapshot(
+                        1,
+                        input_tokens=1_000_000,
+                        model="claude-sonnet-4-6",
+                    ),
+                    UsageSnapshot(
+                        2,
+                        input_tokens=1_000_000,
+                        model="claude-opus-4-6",
+                    ),
+                ),
+            )
+        ),
+        "/status",
+    )
+
+    assert output is not None
+    assert "estimated_cost_usd: $8.000000" in output
+
+
+def test_gpt_5_5_long_context_applies_published_multiplier() -> None:
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(
+            replace(
+                session().status,
+                provider="codex",
+                model="gpt-5.5",
+                usage_history=(
+                    UsageSnapshot(
+                        1,
+                        input_tokens=1_000_000,
+                        output_tokens=1_000_000,
+                        model="gpt-5.5",
+                    ),
+                ),
+            )
+        ),
+        "/status",
+    )
+
+    assert output is not None
+    assert "estimated_cost_usd: $55.000000" in output
+
+
+def test_gpt_5_5_below_long_context_threshold_uses_base_rates() -> None:
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(
+            replace(
+                session().status,
+                provider="codex",
+                model="gpt-5.5",
+                usage_history=(
+                    UsageSnapshot(
+                        1,
+                        input_tokens=100_000,
+                        output_tokens=100_000,
+                        model="gpt-5.5",
+                    ),
+                ),
+            )
+        ),
+        "/status",
+    )
+
+    assert output is not None
+    assert "estimated_cost_usd: $3.500000" in output
+
+
+def test_gpt_5_5_window_matches_published_value() -> None:
+    assert MODEL_CONTEXT_WINDOWS["codex"]["gpt-5.5"] == 1_050_000
+
+
+def test_codex_cache_write_is_free() -> None:
+    output = create_slash_registry().dispatch(
+        FakeSlashSession(
+            replace(
+                session().status,
+                provider="codex",
+                model="gpt-5.6-sol",
+                usage_history=(
+                    UsageSnapshot(
+                        1,
+                        input_tokens=100,
+                        cache_creation_input_tokens=1_000_000,
+                        model="gpt-5.6-sol",
+                    ),
+                ),
+            )
+        ),
+        "/status",
+    )
+
+    assert output is not None
+    assert "estimated_cost_usd: $0.000800" in output
+
+
+def test_compaction_history_counts_folded_messages_only(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    for index in range(2):
+        store.append_message(
+            Message(MessageRole.USER, [TextContent(f"message {index}")])
+        )
+        store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent(f"reply {index}")])
+        )
+    store.append_checkpoint("before warning")
+    store._append_row("warning", {"message": "ignored"})
+    store.append_compaction_marker("summary", 1, 6)
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+    )
+
+    history = app.slash_status().compaction_history
+    assert len(history) == 1
+    assert history[0].entries_folded == 4
+
+
+def test_compaction_history_subtracts_both_replacements(tmp_path: Path) -> None:
+    def token_count(message: Message) -> int:
+        if message.role is MessageRole.COMPACTION:
+            return 3
+        if message.metadata.get("compaction_summary"):
+            return 1
+        return 9
+
+    store = ConversationStore(tmp_path / "sessions")
+    source = [
+        store.append_message(Message(MessageRole.USER, [TextContent("source")])),
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")])),
+        store.append_message(Message(MessageRole.USER, [TextContent("source 2")])),
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply 2")])),
+    ]
+    store.append_compaction_marker(
+        "summary",
+        source[0].seq,
+        source[-1].seq,
+    )
+
+    history = compaction_history(store.replay(), token_count)
+
+    assert history == (CompactionSummary(2, 4, 32),)
+
+
+def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> None:
+    def token_count(message: Message) -> int:
+        if message.role is MessageRole.COMPACTION:
+            return 3
+        if message.metadata.get("compaction_summary"):
+            return 1
+        return 9
+
+    store = ConversationStore(tmp_path / "sessions")
+    first_source = [
+        store.append_message(Message(MessageRole.USER, [TextContent("source")])),
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")])),
+    ]
+    first_marker = store.append_compaction_marker(
+        "first summary",
+        first_source[0].seq,
+        first_source[-1].seq,
+    )
+    second_source = [
+        store.append_message(Message(MessageRole.USER, [TextContent("new source")])),
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply")])),
+        store.append_message(Message(MessageRole.USER, [TextContent("new source 2")])),
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply 2")])),
+    ]
+    store.append_compaction_marker(
+        "second summary",
+        first_source[0].seq,
+        second_source[-1].seq,
+        replaces=[first_marker.id],
+    )
+
+    history = compaction_history(store.replay(), token_count)
+
+    assert history[0] == CompactionSummary(1, 2, 14)
+    assert history[1] == CompactionSummary(3, 4, 36)
+
+
+def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("original")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")]))
+    checkpoint = store.append_checkpoint("saved")
+    store.append_message(Message(MessageRole.USER, [TextContent("abandoned")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("later")]))
+    store.append_compaction_marker("abandoned summary", 1, 5)
+    store.append_fork(str(checkpoint.seq))
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+    )
+
+    assert app.slash_status().compaction_history == ()
 
 
 def test_unknown_command_passes_through_unchanged() -> None:

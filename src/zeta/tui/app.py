@@ -32,7 +32,9 @@ from ..core.project_context import (
     load_project_context,
 )
 from ..core.session import SessionError, SessionManager, env_home
-from ..core.slash import SlashStatus, create_slash_registry
+from ..core.slash import (
+    MODEL_CONTEXT_WINDOWS, SlashStatus, UsageTracker, compaction_history, create_slash_registry
+)
 from ..core.todo import todo_count_tuple
 from ..loop import AgentLoop
 from ..providers.anthropic import AnthropicBackend, AnthropicCredentialStore
@@ -189,6 +191,9 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         self._exit_requested = False
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
+        self._usage_tracker = UsageTracker(
+            self.loop.context_assembler, provider=provider
+        )
         self._assistant_text = ""
         self._thinking_text = ""
         self._thinking_duration: float | None = None
@@ -276,39 +281,37 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         return tuple(self._approval_policy.pending_requests())
 
     def slash_status(self) -> SlashStatus:
+        context_assembler = self.loop.context_assembler
         pending = tuple(
             f"{request.key} ({request.label or request.tool_call.name})"
             for request in self.pending_approvals
         )
         items = self.loop.store.todo_items()
+        compaction_history_data = compaction_history(
+            self.loop.store.replay(), context_assembler.token_counter
+        )
         return SlashStatus(
             session_id=self.loop.store.session_id,
             provider=self.provider,
             model=self.model,
-            retained_tail=self.loop.context_assembler.retained_tail,
-            tokens_used_this_session=(
-                self.loop.context_assembler.tokens_used_this_session
-            ),
-            tokens_in_current_context=self.loop.context_assembler.token_count,
+            retained_tail=context_assembler.retained_tail,
+            tokens_used_this_session=context_assembler.tokens_used_this_session,
+            tokens_in_current_context=context_assembler.token_count,
             compaction_marker_count=self.loop.store.compaction_marker_count(),
             pending_approvals=pending,
             checkpoint_count=self.loop.store.checkpoint_count(),
-            cache_read_input_tokens=(
-                self.loop.context_assembler.cache_read_input_tokens_this_session
-            ),
-            cache_creation_input_tokens=(
-                self.loop.context_assembler.cache_creation_input_tokens_this_session
-            ),
-            uncached_input_tokens=(
-                self.loop.context_assembler.uncached_input_tokens_this_session
-            ),
-            output_tokens_this_session=(
-                self.loop.context_assembler.output_tokens_this_session
-            ),
+            cache_read_input_tokens=context_assembler.cache_read_input_tokens_this_session,
+            cache_creation_input_tokens=context_assembler.cache_creation_input_tokens_this_session,
+            uncached_input_tokens=context_assembler.uncached_input_tokens_this_session,
+            output_tokens_this_session=context_assembler.output_tokens_this_session,
             context_files=self._context_files,
             vim_mode=self.vim_mode,
             hooks=(() if self._hooks is None else self._hooks.status_entries),
             todo_counts=todo_count_tuple(items) if items else None,
+            usage_history=self._usage_tracker.history,
+            usage_cost_by_model=self._usage_tracker.cost_by_model,
+            compaction_history=compaction_history_data,
+            model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
         )
 
     def slash_model(self, args: str) -> str:
