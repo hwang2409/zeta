@@ -1098,6 +1098,37 @@ async def test_aclose_after_message_end_persists_complete_state(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_aclose_during_active_tool_persists_canceled_result(tmp_path: Path) -> None:
+    call = ToolCall("active-close", "blocked", {})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    store = ConversationStore(tmp_path)
+    started = asyncio.Event()
+
+    async def blocked(arguments: dict[str, object]) -> str:
+        del arguments
+        started.set()
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    stream = AgentLoop(
+        backend,
+        store,
+        tools={"blocked": blocked},
+        max_turns=1,
+    ).run_turn("start")
+    async for event in stream:
+        if event.type is StreamEventType.TOOL_EXECUTION_START:
+            await started.wait()
+            await stream.aclose()
+            break
+
+    result = store.messages()[-1].tool_result
+    assert result is not None
+    assert result.content == "tool execution canceled"
+    assert result.is_error is True
+
+
+@pytest.mark.asyncio
 async def test_plain_async_iterator_completes_without_aclose(tmp_path: Path) -> None:
     class PlainCompletion:
         def __init__(self) -> None:

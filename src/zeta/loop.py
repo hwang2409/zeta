@@ -889,8 +889,12 @@ class AgentLoop:
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
 
-            async for event in dispatch_tool_calls(self, calls, _validated_tool_result):
-                yield event
+            dispatch = dispatch_tool_calls(self, calls, _validated_tool_result)
+            try:
+                async for event in dispatch:
+                    yield event
+            finally:
+                await dispatch.aclose()
             yield StreamEvent(
                 StreamEventType.TURN_END,
                 message=assistant_message,
