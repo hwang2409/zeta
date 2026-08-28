@@ -14,6 +14,7 @@ from .store import ConversationEntry, ConversationStore
 from ..types import (
     CompletionBackend,
     ContentBlock,
+    ErrorInfo,
     FAILED_TURN_MARKER,
     flatten_tool_content,
     ImageContent,
@@ -186,6 +187,18 @@ class CompactionPolicy:
                 usage = event.data.get("usage")
                 if isinstance(usage, Mapping):
                     summary_usage.update(usage)
+                if event.type is StreamEventType.ERROR:
+                    info = (
+                        event.error
+                        if isinstance(event.error, ErrorInfo)
+                        else ErrorInfo(
+                            "backend_error",
+                            "provider emitted an invalid error event",
+                        )
+                    )
+                    failure = SummaryCompletionError(info.message)
+                    failure.code = info.code
+                    raise failure
                 if event.type is StreamEventType.MESSAGE_UPDATE:
                     if event.content is not None:
                         partial.append(event.content)

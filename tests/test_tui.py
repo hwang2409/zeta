@@ -1653,6 +1653,136 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
 
 
 @pytest.mark.asyncio
+async def test_compaction_error_event_aborts_and_preserves_source(
+    tmp_path: Path,
+) -> None:
+    class PartialThenErrorBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            self.calls += 1
+            if self.calls == 1:
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    content=TextContent("half a summary"),
+                )
+                yield StreamEvent(
+                    StreamEventType.ERROR,
+                    error=ErrorInfo("stream_error", "compaction stream aborted"),
+                )
+                return
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+            )
+
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
+    baseline = [entry.id for entry in store.replay()]
+    backend = PartialThenErrorBackend()
+    assembler = ContextAssembler(
+        store,
+        token_budget=100,
+        retained_tail=1,
+        system_prompt="",
+        token_counter=lambda message: 60 if message.role is MessageRole.USER else 1,
+        backend=backend,
+    )
+    app = TUIApp(
+        AgentLoop(backend, store, context_assembler=assembler),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    await app._consume_turn("new")
+
+    rendered = Text.from_ansi(app.console.file.getvalue()).plain
+    assert app.retry_available()
+    assert "provider failure · stream_error" in rendered
+    assert "compaction stream aborted" in rendered
+    assert store.compaction_marker_count() == 0
+    assert [entry.id for entry in store.replay()][: len(baseline)] == baseline
+    assert store.turn_in_flight() is False
+
+    app.retry_failed_turn()
+    assert app._active_task is not None
+    await app._active_task
+
+    assert backend.calls == 3
+    assert store.messages()[-1].content[0].text == "done"
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_error_event_aborts_and_preserves_source(
+    tmp_path: Path,
+) -> None:
+    class PartialThenErrorBackend(CompletionBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tool_schemas
+            self.calls += 1
+            if self.calls == 1:
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    content=TextContent("half a summary"),
+                )
+                yield StreamEvent(
+                    StreamEventType.ERROR,
+                    error=ErrorInfo("stream_error", "compaction stream aborted"),
+                )
+                return
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent("summary text")]),
+            )
+
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(Message(MessageRole.USER, [TextContent("old")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("tail")]))
+    baseline = [entry.id for entry in store.replay()]
+    backend = PartialThenErrorBackend()
+    assembler = ContextAssembler(
+        store,
+        token_budget=10_000,
+        retained_tail=1,
+        system_prompt="",
+        backend=backend,
+    )
+    app = TUIApp(
+        AgentLoop(backend, store, context_assembler=assembler),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    reply = await app.slash_compact()
+
+    assert reply.startswith("compact failed:")
+    assert "compaction stream aborted" in reply
+    assert store.compaction_marker_count() == 0
+    assert [entry.id for entry in store.replay()] == baseline
+
+    retry = await app.slash_compact()
+
+    assert backend.calls == 2
+    assert store.compaction_marker_count() == 1
+    assert retry.startswith("compacted entries")
+
+
+@pytest.mark.asyncio
 async def test_resumed_failed_turn_renders_and_retries_without_duplication(
     tmp_path: Path,
 ) -> None:
