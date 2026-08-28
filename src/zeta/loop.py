@@ -6,12 +6,12 @@ import asyncio
 import json
 import warnings
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
-from pathlib import Path
 from typing import Any, TypeVar
 
 import httpx
 
 from .core.abort import AbortSignal as ToolAbortSignal
+from .agent_background import finish_background_child, recover_agent_children
 from .core.approval import ApprovalPolicy
 from .core.context import ContextAssembler
 from .core.hooks import HookManager
@@ -167,7 +167,7 @@ class AgentLoop:
         self._background_child_cancellers: dict[str, Callable[[], None]] = {}
         self._background_child_watchers: dict[str, asyncio.Task[Any]] = {}
         self._background_event_sink: Callable[[StreamEvent], None] | None = None
-        self._recover_agent_children()
+        recover_agent_children(self)
         if registry is not None and tools is not None:
             raise ValueError("pass only one tool registry")
         if registry is not None:
@@ -341,70 +341,6 @@ class AgentLoop:
             ),
             tool_call_id,
         )
-
-    def _recover_agent_children(self) -> None:
-        """Resolve child markers left by a process exit before resuming."""
-
-        for tool_call_id, marker in self.store.agent_children().items():
-            tool_call = ToolCall.from_dict(marker["tool_call"])
-            child_path = Path(marker["child_session_path"])
-            agents_root = self.store.session_dir / "agents"
-            if marker.get("background"):
-                child_instance_id = f"{self.store.session_id}:{child_path.name}"
-                notification = next(
-                    (
-                        entry
-                        for entry in self.store.agent_notifications(pending_only=False)
-                        if entry.data["child_instance_id"] == child_instance_id
-                    ),
-                    None,
-                )
-                child_store = None
-                if child_path.parent == agents_root and child_path.name.isdigit():
-                    child_store = ConversationStore(
-                        agents_root,
-                        session_id=child_path.name,
-                        cwd=self.store.cwd,
-                    )
-                if notification is None:
-                    self.store.append_agent_notification(
-                        child_instance_id,
-                        child_session_path=marker["child_session_path"],
-                        description=marker["description"],
-                        status="canceled",
-                        text="background child canceled when the parent session exited",
-                    )
-                    if child_store is not None:
-                        child_store.mark_agent_canceled(tool_call.id)
-                elif child_store is not None:
-                    child_store.finish_agent_parent()
-                self.store.finish_agent_child(tool_call_id)
-                continue
-            existing_result = self._existing_tool_result(tool_call_id)
-            if existing_result is None:
-                self.store.append_message(
-                    Message(
-                        MessageRole.TOOL_RESULT,
-                        [TextContent("tool execution canceled")],
-                        tool_result=self._canceled_agent_result(
-                            tool_call_id,
-                            child_session_path=marker["child_session_path"],
-                            turns_used=marker.get("turns_used", 0),
-                            agent_type=marker.get("agent_type"),
-                        ),
-                    )
-                )
-            if child_path.parent == agents_root and child_path.name.isdigit():
-                child_store = ConversationStore(
-                    agents_root,
-                    session_id=child_path.name,
-                    cwd=self.store.cwd,
-                )
-                if existing_result is None:
-                    child_store.mark_agent_canceled(tool_call.id)
-                else:
-                    child_store.finish_agent_parent()
-            self.store.finish_agent_child(tool_call.id)
 
     async def _run_agent_tool(
         self,
@@ -637,62 +573,7 @@ class AgentLoop:
                 if not child_task.done():
                     child_task.cancel()
 
-            async def finish_background() -> None:
-                status = "completed"
-                notification_text = ""
-                try:
-                    result = await child_task
-                    content = result.get("content")
-                    if (
-                        isinstance(content, list)
-                        and content
-                        and isinstance(content[0], dict)
-                        and isinstance(content[0].get("text"), str)
-                    ):
-                        notification_text = content[0]["text"]
-                    else:
-                        notification_text = "background child returned no text"
-                    if result.get("isError") is True:
-                        status = "error"
-                except asyncio.CancelledError:
-                    status = "canceled"
-                    notification_text = "background child canceled"
-                except Exception as exc:
-                    status = "error"
-                    notification_text = f"agent error: {_error_info(exc).message}"
-                if status == "canceled":
-                    child_store.mark_agent_canceled(tool_call.id)
-                else:
-                    child_store.finish_agent_parent()
-                notification = self.store.append_agent_notification(
-                    child_instance_id,
-                    child_session_path=child_path,
-                    description=description,
-                    status=status,
-                    text=notification_text or "background child completed",
-                )
-                self.store.finish_agent_child(tool_call.id)
-                terminal_payload = self._child_result_payload(
-                    tool_call.id,
-                    notification_text or "background child completed",
-                    error=status != "completed",
-                    child_session_path=child_path,
-                    turns_used=child_turns(),
-                    agent_type=preset.name,
-                    status=status,
-                    child_instance_id=child_instance_id,
-                    description=description,
-                )
-                self._publish_background_event(
-                    StreamEvent(
-                        StreamEventType.TOOL_EXECUTION_END,
-                        tool_call=tool_call,
-                        tool_result=_validated_tool_result(
-                            terminal_payload, tool_call.id
-                        ),
-                        data={"notification_id": notification.id},
-                    )
-                )
+            def cleanup_background_child() -> None:
                 self._agent_child_stores.pop(tool_call.id, None)
                 self._agent_child_turns.pop(tool_call.id, None)
                 self._agent_child_types.pop(tool_call.id, None)
@@ -700,7 +581,26 @@ class AgentLoop:
                 self._background_child_watchers.pop(tool_call.id, None)
                 if child_policy is not None:
                     child_policy.cleanup()
-                await child_loop.close()
+
+            async def finish_background() -> None:
+                await finish_background_child(
+                    child_task=child_task,
+                    child_store=child_store,
+                    parent_store=self.store,
+                    tool_call=tool_call,
+                    child_instance_id=child_instance_id,
+                    child_path=child_path,
+                    description=description,
+                    child_turns=child_turns,
+                    build_result=lambda text, error, status: child_result(
+                        text, error=error, status=status
+                    ),
+                    validate_result=_validated_tool_result,
+                    publish_event=self._publish_background_event,
+                    cleanup=cleanup_background_child,
+                    close_child=child_loop.close,
+                    error_message=lambda exc: _error_info(exc).message,
+                )
 
             watcher = self._create_task(finish_background())
             self._background_child_watchers[tool_call.id] = watcher
