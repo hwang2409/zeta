@@ -241,16 +241,21 @@ class AgentCard:
             value = result.structured_content.get("turns_used")
             turns = value if type(value) is int and value >= 0 else 0
         turns = turns or 0
-        status = "canceled" if result.content == "tool execution canceled" else (
-            "fail" if result.is_error else "ok"
-        )
+        structured = result.structured_content or {}
+        structured_status = structured.get("status")
+        if structured_status in {"running", "completed", "error", "canceled"}:
+            status = structured_status
+        else:
+            status = "canceled" if result.content == "tool execution canceled" else (
+                "fail" if result.is_error else "ok"
+            )
         agent_type = cls._agent_type(call)
         prefix = f"{agent_type} · " if agent_type else ""
         return Text(
             f"{prefix}{cls._description(call)} · {turns} turns · "
             f"{max(0.0, elapsed or 0.0):.1f}s · "
             f"{status} · expand: ctrl+x ctrl+o",
-            style=ERROR if status == "fail" else RECEIPT,
+            style=ERROR if status in {"fail", "error", "canceled"} else RECEIPT,
             no_wrap=True,
             overflow="ellipsis",
         )
@@ -281,6 +286,9 @@ class AgentCard:
 
     def current(self) -> RenderableType | None:
         return self._progress() if self.active else None
+
+    def set_child_session_path(self, path: str) -> None:
+        self._child_session_path = path
 
     def update(self, rendered: RenderableType, event: StreamEvent | None = None) -> RenderableType | None:
         if not self._supported:

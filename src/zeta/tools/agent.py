@@ -141,6 +141,9 @@ def agent_result(
     turns_used: int,
     child_session_path: str,
     agent_type: AgentType | None = None,
+    status: str | None = None,
+    child_instance_id: str | None = None,
+    description: str | None = None,
 ) -> dict[str, object]:
     structured_content: dict[str, object] = {
         "turns_used": turns_used,
@@ -148,6 +151,12 @@ def agent_result(
     }
     if agent_type is not None and agent_type != GENERAL_PRESET.name:
         structured_content["agent_type"] = agent_type
+    if status is not None:
+        structured_content["status"] = status
+    if child_instance_id is not None:
+        structured_content["child_instance_id"] = child_instance_id
+    if description is not None:
+        structured_content["description"] = description
     return {
         "content": [text_block(text)],
         "isError": error,
@@ -200,6 +209,10 @@ def register(registry: ToolRegistry) -> None:
                     "type": "string",
                     "enum": agent_type_names(),
                     "description": agent_type_description(),
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Keep the child running across parent turns and return a handle.",
                 },
             },
             "required": ["prompt", "description"],
