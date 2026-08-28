@@ -553,7 +553,12 @@ class TranscriptPresenter:
                 )
         self._assistant_unit_open = True
 
-    def finish_assistant(self, rendered: RenderableType) -> None:
+    def finish_assistant(
+        self,
+        rendered: RenderableType,
+        *,
+        preserve_inline: bool = False,
+    ) -> None:
         """Commit the completed assistant message into its existing unit."""
 
         if self._full_screen_active():
@@ -567,6 +572,8 @@ class TranscriptPresenter:
             if self._assistant_live is not None:
                 self._assistant_live.stop()
                 self._assistant_live = None
+            if preserve_inline:
+                self.print_unit(rendered)
         self._assistant_unit = None
         self._assistant_unit_open = False
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from rich import box
 from mdit_py_plugins.tasklists import tasklists_plugin
 
 from ..types import (
+    ErrorInfo,
     flatten_tool_content,
     RedactedThinkingContent,
     StreamEvent,
@@ -50,6 +52,7 @@ from .agent_card import AgentCard
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
 MAX_TOOL_LINES = 15
+MAX_ERROR_REASON = 400
 SPINNER_FRAMES = ("·", "•", "●", "•")
 RECEIPT_TOOLS = frozenset(
     {"read", "glob", "grep", "search", "find", "list", "websearch"}
@@ -202,6 +205,61 @@ def _safe_text(value: str, *, style: str) -> Text:
         overflow="ellipsis",
         no_wrap=True,
     )
+
+
+def render_error_card(event: StreamEvent) -> Panel:
+    """Render a bounded error with a retry affordance when supported."""
+
+    error = event.error
+    code = error.code if error is not None and error.code else "backend_error"
+    raw_reason = error.message if error is not None else "unknown error"
+    reason = _strip_terminal_controls(raw_reason).strip()
+    reason = reason or "unknown error"
+    try:
+        is_json_payload = json.loads(reason) is not None
+    except (json.JSONDecodeError, TypeError):
+        is_json_payload = False
+    reason = _truncate(reason, MAX_ERROR_REASON)
+    retryable = is_retryable_error(error)
+    title = "provider failure" if retryable else "error"
+    content: list[RenderableType] = [Text(f"{title} · {code}", style=ERROR)]
+    if not is_json_payload:
+        content.append(_safe_text(f"reason: {reason}", style=BODY))
+    else:
+        content.extend(
+            (
+                Text("payload · json", style=DIM),
+                Syntax(
+                    reason,
+                    "json",
+                    theme=CODE_THEME,
+                    word_wrap=True,
+                    background_color="default",
+                ),
+            )
+        )
+    if retryable:
+        content.append(Text("retry: ctrl+r", style=AFFORDANCE))
+    return Panel(
+        Group(*content),
+        border_style=ERROR,
+        style=CARD_BG,
+        padding=(0, 1),
+        expand=True,
+    )
+
+
+def is_retryable_error(error: ErrorInfo | None) -> bool:
+    """Return whether an error can succeed when the provider is retried."""
+
+    return error is not None and error.code in {
+        "auth_error",
+        "backend_error",
+        "http_error",
+        "stream_error",
+        "timeout",
+        "transport_error",
+    }
 
 
 def _tool_receipt(event: StreamEvent) -> Text:
@@ -848,8 +906,7 @@ def render_event(event: StreamEvent) -> RenderableType | None:
             return _tool_receipt(event)
         return _tool_card(event)
     if event.type is StreamEventType.ERROR:
-        message = event.error.message if event.error else "unknown error"
-        return Text(f"[error] {message}", style=ERROR)
+        return render_error_card(event)
     if event.type in {
         StreamEventType.AGENT_END,
         StreamEventType.COMPACTION_START,

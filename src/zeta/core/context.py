@@ -14,6 +14,8 @@ from .store import ConversationEntry, ConversationStore
 from ..types import (
     CompletionBackend,
     ContentBlock,
+    ErrorInfo,
+    FAILED_TURN_MARKER,
     flatten_tool_content,
     ImageContent,
     Message,
@@ -185,6 +187,18 @@ class CompactionPolicy:
                 usage = event.data.get("usage")
                 if isinstance(usage, Mapping):
                     summary_usage.update(usage)
+                if event.type is StreamEventType.ERROR:
+                    info = (
+                        event.error
+                        if isinstance(event.error, ErrorInfo)
+                        else ErrorInfo(
+                            "backend_error",
+                            "provider emitted an invalid error event",
+                        )
+                    )
+                    failure = SummaryCompletionError(info.message)
+                    failure.code = info.code
+                    raise failure
                 if event.type is StreamEventType.MESSAGE_UPDATE:
                     if event.content is not None:
                         partial.append(event.content)
@@ -193,6 +207,8 @@ class CompactionPolicy:
                 if event.type is StreamEventType.MESSAGE_END and event.message is not None:
                     completed = event.message
         except Exception as exc:
+            if type(getattr(exc, "code", None)) is str:
+                raise
             raise SummaryCompletionError("summary completion failed") from exc
 
         if on_usage is not None and summary_usage:
@@ -485,6 +501,7 @@ class ContextAssembler:
         }
         items: list[_ContextItem] = []
         emitted_marker_ids: set[str] = set()
+        failed_tool_call_ids: set[str] = set()
         for entry in entries:
             marker = markers_by_start.get(entry.seq)
             if marker is not None:
@@ -496,9 +513,23 @@ class ContextAssembler:
                 continue
             if entry.type != "message":
                 continue
+            message = Message.from_dict(entry.data["message"])
+            if message.metadata.get(FAILED_TURN_MARKER):
+                failed_tool_call_ids.update(
+                    block.tool_call.id
+                    for block in message.content
+                    if isinstance(block, ToolUseContent)
+                )
+                continue
             if any(start <= entry.seq <= end for start, end in compacted_ranges):
                 continue
-            items.append(_ContextItem(entry, Message.from_dict(entry.data["message"])))
+            if (
+                message.role is MessageRole.TOOL_RESULT
+                and message.tool_result is not None
+                and message.tool_result.tool_call_id in failed_tool_call_ids
+            ):
+                continue
+            items.append(_ContextItem(entry, message))
         for marker in markers:
             if marker.id not in emitted_marker_ids:
                 items.extend(self._marker_items(marker))

@@ -1442,14 +1442,14 @@ async def test_post_start_provider_error_salvages_once(tmp_path: Path) -> None:
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     client = client_for(handler)
-    events = [
-        event
+    events: list[StreamEvent] = []
+    with pytest.raises(AnthropicStreamError, match="overloaded_error: busy"):
         async for event in AnthropicBackend(
             client=client,
             token_store=store,
             diagnostics_path=diagnostics_path,
-        ).complete([], [])
-    ]
+        ).complete([], []):
+            events.append(event)
 
     assert len(requests) == 1
     assert not any(event.type is StreamEventType.RETRY for event in events)
@@ -1716,15 +1716,12 @@ async def test_request_entry_transport_failure_is_typed(
 
 
 @pytest.mark.asyncio
-async def test_early_stream_end_is_salvaged(tmp_path: Path) -> None:
-    events = await _collect_anthropic_events(
-        tmp_path,
-        'data: {"type":"message_start","message":{}}\n',
-    )
-
-    assert events[-1].type is StreamEventType.MESSAGE_END
-    assert events[-1].data["truncated"] is True
-    assert events[-1].message == Message(MessageRole.ASSISTANT)
+async def test_early_stream_end_is_typed(tmp_path: Path) -> None:
+    with pytest.raises(AnthropicStreamError, match="before message completion"):
+        await _collect_anthropic_events(
+            tmp_path,
+            'data: {"type":"message_start","message":{}}\n',
+        )
     record = json.loads(
         (tmp_path / "logs" / "stream-diagnostics.jsonl").read_text().strip()
     )
@@ -1805,17 +1802,14 @@ async def test_network_eof_salvage_records_exception_and_headers(tmp_path: Path)
 
     store = AnthropicCredentialStore(tmp_path / "zeta.json")
     store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
-    events = [
-        event
-        async for event in AnthropicBackend(client=Client(), token_store=store).complete(
-            [], []
-        )
-    ]
-
-    assert events[-1].message == Message(
-        MessageRole.ASSISTANT, [TextContent("partial")]
-    )
-    assert events[-1].data["truncated"] is True
+    with pytest.raises(AnthropicStreamError) as raised:
+        [
+            event
+            async for event in AnthropicBackend(client=Client(), token_store=store).complete(
+                [], []
+            )
+        ]
+    assert "peer closed" not in str(raised.value)
     record = json.loads(
         (tmp_path / "logs" / "stream-diagnostics.jsonl").read_text().strip()
     )
@@ -1997,40 +1991,33 @@ async def test_message_stop_salvages_mixed_open_blocks(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_eof_after_empty_text_start_omits_text_block(tmp_path: Path) -> None:
-    events = await _collect_anthropic_events(
-        tmp_path,
-        'data: {"type":"message_start","message":{}}\n\n'
-        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n',
-    )
-
-    assert events[-1].message == Message(MessageRole.ASSISTANT)
-    assert events[-1].data["truncated"] is True
+async def test_eof_after_empty_text_start_is_typed(tmp_path: Path) -> None:
+    with pytest.raises(AnthropicStreamError, match="before message completion"):
+        await _collect_anthropic_events(
+            tmp_path,
+            'data: {"type":"message_start","message":{}}\n\n'
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n',
+        )
 
 
 @pytest.mark.asyncio
-async def test_eof_after_tool_start_drops_tool_call(tmp_path: Path) -> None:
-    events = await _collect_anthropic_events(
-        tmp_path,
-        'data: {"type":"message_start","message":{}}\n\n'
-        'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"read"}}\n',
-    )
-
-    assert events[-1].message == Message(MessageRole.ASSISTANT)
-    assert events[-1].data["dropped_tool_calls"] == 1
+async def test_eof_after_tool_start_is_typed(tmp_path: Path) -> None:
+    with pytest.raises(AnthropicStreamError, match="before message completion"):
+        await _collect_anthropic_events(
+            tmp_path,
+            'data: {"type":"message_start","message":{}}\n\n'
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"read"}}\n',
+        )
 
 
 @pytest.mark.asyncio
-async def test_eof_keeps_open_redacted_thinking(tmp_path: Path) -> None:
-    events = await _collect_anthropic_events(
-        tmp_path,
-        'data: {"type":"message_start","message":{}}\n\n'
-        'data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque"}}\n',
-    )
-
-    assert events[-1].message == Message(
-        MessageRole.ASSISTANT, [RedactedThinkingContent("opaque")]
-    )
+async def test_eof_with_open_redacted_thinking_is_typed(tmp_path: Path) -> None:
+    with pytest.raises(AnthropicStreamError, match="before message completion"):
+        await _collect_anthropic_events(
+            tmp_path,
+            'data: {"type":"message_start","message":{}}\n\n'
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque"}}\n',
+        )
 
 
 @pytest.mark.asyncio
@@ -2060,24 +2047,20 @@ async def test_message_stop_keeps_unsigned_thinking_for_display(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_early_stream_end_salvages_block_without_message_stop(tmp_path: Path) -> None:
-    events = await _collect_anthropic_events(
-        tmp_path,
-        "\n".join(
-            [
-                'data: {"type":"message_start","message":{}}',
-                "",
-                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
-                "",
-                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cut off"}}',
-            ]
-        ),
-    )
-
-    assert events[-1].message == Message(
-        MessageRole.ASSISTANT, [TextContent("cut off")]
-    )
-    assert events[-1].data["truncated"] is True
+async def test_early_stream_end_with_partial_text_is_typed(tmp_path: Path) -> None:
+    with pytest.raises(AnthropicStreamError, match="before message completion"):
+        await _collect_anthropic_events(
+            tmp_path,
+            "\n".join(
+                [
+                    'data: {"type":"message_start","message":{}}',
+                    "",
+                    'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                    "",
+                    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cut off"}}',
+                ]
+            ),
+        )
 
 
 def test_salvaged_context_omits_unsigned_thinking_on_replay() -> None:
@@ -2169,15 +2152,13 @@ async def test_closed_malformed_tool_with_open_sibling_remains_strict(
 
 
 @pytest.mark.asyncio
-async def test_eof_message_delta_preserves_stop_reason_and_usage(tmp_path: Path) -> None:
-    events = await _collect_anthropic_events(
-        tmp_path,
-        'data: {"type":"message_start","message":{}}\n\n'
-        'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":7}}',
-    )
-
-    assert events[-1].data["stop_reason"] == "max_tokens"
-    assert events[-1].data["usage"] == {"output_tokens": 7}
+async def test_eof_message_delta_is_typed(tmp_path: Path) -> None:
+    with pytest.raises(AnthropicStreamError, match="before message completion"):
+        await _collect_anthropic_events(
+            tmp_path,
+            'data: {"type":"message_start","message":{}}\n\n'
+            'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":7}}',
+        )
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,10 @@ class MessageRole(StrEnum):
     COMPACTION = "compaction"
 
 
+FAILED_TURN_MARKER = "turn_failed"
+FAILED_TURN_ERROR = "turn_error"
+
+
 class ContentType(StrEnum):
     TEXT = "text"
     IMAGE = "image"

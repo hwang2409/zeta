@@ -50,6 +50,7 @@ from .background import background_notice
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
+    TurnConsumerMixin,
     VimCursorShapeConfig,
     build_key_bindings,
     history_for,
@@ -68,7 +69,6 @@ from .models import MODEL_CATALOGS, validate_model_name
 from .models import load_model_catalog as _load_model_catalog
 from .render import (
     format_status,
-    render_event,
     render_markdown,
     render_thought,
     render_thought_live,
@@ -81,7 +81,6 @@ from .theme import (
     COMPOSER_BORDER,
     COMPOSER_FOCUS,
     DIM,
-    ERROR,
     RICH_THEME,
 )
 from .todo import TodoWidget
@@ -90,9 +89,6 @@ from .transcript import TranscriptPresenter, TranscriptWidget
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 RECENT_SESSION_LIMIT = 20
-SPINNER_INTERVAL = 0.2
-
-
 def _validate_model_name(provider: str, model: str) -> None:
     validate_model_name(provider, model)
 
@@ -153,7 +149,7 @@ def build_backend(
     raise ValueError(f"unsupported provider: {provider}")
 
 
-class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
+class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMixin):
     """Full-screen transcript, persistent composer, and follow-up queue."""
 
     def __init__(
@@ -220,6 +216,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         self._slash_commands = create_slash_registry()
         self._compaction_shown = False
         self._turn_had_visible_output = False
+        self._failed_turn: tuple[str, Message] | None = None
         self._active_session: PromptSession[str] | None = None
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
@@ -250,6 +247,27 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
     @property
     def active(self) -> bool:
         return self._active_task is not None and not self._active_task.done()
+
+    def retry_available(self) -> bool:
+        """Return whether the last failed turn can be retried."""
+
+        return self._failed_turn is not None and not self.active
+
+    def retry_failed_turn(self) -> None:
+        """Retry the last failed user message without appending it again."""
+
+        if not self.retry_available():
+            return
+        failed_turn = self._failed_turn
+        self._failed_turn = None
+        if failed_turn is None:
+            return
+        user_text, user_message = failed_turn
+        self._start_turn(
+            user_text,
+            user_message=user_message,
+            persist_user_message=False,
+        )
 
     @property
     def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
@@ -491,6 +509,8 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_toggle_agent=self._transcript.toggle_latest_agent,
+            on_retry=self.retry_failed_turn,
+            retry_available=self.retry_available,
         )
         return FullScreenPromptSession(
             message=[("class:prompt", " > ")],
@@ -664,6 +684,7 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         user_message = self._prepare_user_message(model_input)
         if user_message is None:
             return
+        self._failed_turn = None
         if self.pending_approvals:
             self._present_pending_approvals()
         elif self.active:
@@ -704,11 +725,14 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
     def _invalidate_prompt() -> None:
         get_app().invalidate()
 
-    def _flush_stream_kind(self) -> None:
+    def _flush_stream_kind(self, *, preserve_inline: bool = False) -> None:
         if self._stream_kind in {"thinking", "redacted-thinking"} and self._thinking_text:
             self._print_committed([self._thinking_text], thinking=True)
         elif self._stream_kind == "assistant" and self._assistant_text:
-            self._presenter.finish_assistant(Text(self._assistant_text, style=BODY))
+            self._presenter.finish_assistant(
+                Text(self._assistant_text, style=BODY),
+                preserve_inline=preserve_inline,
+            )
         self._stream_kind = self._stream_identity = None
         self._partial = self._thinking_text = ""
         self._thinking_duration = self._thinking_started_at = None
@@ -793,6 +817,10 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
             return
         if event.type is StreamEventType.MESSAGE_END:
             return
+        if event.type is StreamEventType.ERROR:
+            self._flush_stream_kind(preserve_inline=True)
+            self._presenter.reset_assistant_unit()
+            return
         if event.type is not StreamEventType.MESSAGE_UPDATE:
             self._flush_pending_stream()
             return
@@ -800,107 +828,6 @@ class TUIApp(CheckpointTranscriptMixin, ComposerAttachmentMixin):
         current = self._stream_kind, self._stream_identity
         if (incoming_kind, incoming_identity) != current:
             self._flush_pending_stream()
-
-    async def _pulse_spinner(self) -> None:
-        while True:
-            try:
-                await asyncio.wait_for(
-                    self._spinner_reset.wait(), timeout=SPINNER_INTERVAL
-                )
-            except asyncio.TimeoutError:
-                if self._spinner_active:
-                    self._spinner_frame += 1
-                    if self._presenter.has_active_agent: self._presenter.refresh_active_agents()
-                    self._invalidate_prompt()
-            else:
-                self._spinner_reset.clear()
-
-    async def _consume_turn(
-        self,
-        user_text: str,
-        *,
-        user_message: Message | None = None,
-    ) -> None:
-        self._abort_requested = False
-        self._turn_had_visible_output = False
-        self._loop_state = "streaming"
-        self._streaming = True
-        self._spinner_active = True
-        spinner_task = asyncio.create_task(self._pulse_spinner())
-        try:
-            async for event in self.loop.run_turn(
-                user_text,
-                user_message=user_message,
-            ):
-                self._update_usage(event)
-                self._prepare_stream_event(event)
-                stop_after_tool = self._handle_tool_event(event)
-                if self.verbose:
-                    self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style=DIM))
-                if event.type is StreamEventType.MESSAGE_UPDATE:
-                    self._consume_text(event)
-                    self._invalidate_prompt()
-                    continue
-                if event.type is StreamEventType.TURN_START:
-                    self._spinner_frame = 0
-                    self._spinner_reset.set()
-                    self._streaming = True
-                    self._compaction_shown = False
-                elif event.type is StreamEventType.COMPACTION_START:
-                    self._compaction_shown = True
-                    self._loop_state = "compacting"
-                elif event.type is StreamEventType.COMPACTION_END:
-                    self._loop_state = "streaming"
-                elif event.type is StreamEventType.MESSAGE_END:
-                    self._finish_message(event)
-                    self._streaming = False
-                elif event.type is StreamEventType.AGENT_END:
-                    self._reset_stream_state()
-                    self._loop_state = "idle"
-                    if not self._turn_had_visible_output:
-                        self._print_unit(Text("no response", style=CHROME))
-                        self._turn_had_visible_output = True
-                if event.type not in {
-                    StreamEventType.TOOL_APPROVAL_START,
-                    StreamEventType.TOOL_APPROVAL_END,
-                    StreamEventType.TOOL_EXECUTION_UPDATE,
-                    StreamEventType.TOOL_EXECUTION_END,
-                    StreamEventType.TOOL_EXECUTION_START,
-                }:
-                    rendered = render_event(event)
-                    if rendered is not None:
-                        self._turn_had_visible_output |= event.type is StreamEventType.MESSAGE_END and bool(event.data.get("truncated"))
-                        if event.type in {
-                            StreamEventType.AGENT_END,
-                            StreamEventType.ERROR,
-                        }:
-                            self._print_unit(rendered)
-                            if event.type is StreamEventType.ERROR:
-                                self._turn_had_visible_output = True
-                        else:
-                            self._print(rendered)
-                self._invalidate_prompt()
-                if event.type is StreamEventType.TOOL_EXECUTION_END and stop_after_tool:
-                    break
-        except asyncio.CancelledError:
-            self._flush_pending_stream(); self._reset_stream_state()
-            self._loop_state = "interrupted"
-            self._print_unit(Text("[aborted]", style=ERROR))
-            raise
-        except Exception as exc:
-            self._flush_pending_stream(); self._reset_stream_state()
-            self._loop_state = "idle"
-            self._print_unit(Text(f"[error] {exc}", style=ERROR))
-        finally:
-            self._presenter.clear_active_tool_calls()
-            self._discard_tool_region()
-            self._presenter.reset_assistant_message()
-            self._abort_requested = False
-            self._streaming = False
-            self._spinner_active = False
-            spinner_task.cancel()
-            await asyncio.gather(spinner_task, return_exceptions=True)
-            self._invalidate_prompt()
 
     async def _read_prompt(self, session: PromptSession[str]) -> str | None:
         def insert_pending_tokens() -> None:
