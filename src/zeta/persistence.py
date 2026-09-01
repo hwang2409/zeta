@@ -103,7 +103,6 @@ class DraftPersistence:
         self._pending_revision: int | None = None
         self._revision = 0
         self._persisted_revision: int | None = None
-        self._submitted_revision: int | None = None
         self._scheduled: asyncio.TimerHandle | None = None
         self._state_provider: Callable[[], tuple[Mapping[str, Path], int]] | None = None
         self._pending_attachment_tokens: tuple[tuple[str, str], ...] = ()
@@ -219,25 +218,20 @@ class DraftPersistence:
         self._pending_revision = None
         self._pending_attachment_tokens = ()
         self._pending_next_image_token = 1
-        self._submitted_revision = None
         if self._scheduled is not None:
             self._scheduled.cancel()
             self._scheduled = None
         self.path.unlink(missing_ok=True)
         self._persisted_revision = None
 
-    def mark_submitted(self) -> None:
-        """Remember the draft revision submitted by the prompt callback."""
+    def mark_submitted(self) -> int:
+        """Return the draft revision captured by the prompt callback."""
 
-        self._submitted_revision = self._revision
+        return self._revision
 
-    def clear_submitted(self) -> bool:
-        """Clear only the revision captured by the most recent submission."""
+    def clear_submitted(self, submitted_revision: int) -> bool:
+        """Clear only the draft revision captured by one submission."""
 
-        submitted_revision = self._submitted_revision
-        self._submitted_revision = None
-        if submitted_revision is None:
-            return False
         if (
             self._pending_revision is not None
             and self._pending_revision <= submitted_revision

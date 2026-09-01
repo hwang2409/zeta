@@ -575,12 +575,14 @@ class TUIApp(
         self._attach_draft_state(session.default_buffer, self._draft.load_state())
         self._draft_session = session
 
-    def _record_prompt(self, value: str) -> None:
+    def _record_prompt(self, value: str, draft_revision: int | None = None) -> None:
         if self._history is None:
             self._history = history_for(self._history_path)
         self._history.append_string(value)
-        if not self._draft.clear_submitted():
+        if draft_revision is None:
             self._draft.clear()
+        else:
+            self._draft.clear_submitted(draft_revision)
 
     def request_exit(self) -> None:
         self._exit_requested = True

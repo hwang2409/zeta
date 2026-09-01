@@ -2003,6 +2003,96 @@ async def test_submitted_revision_does_not_clear_a_rapid_new_draft(
     await app.loop.close()
 
 
+@pytest.mark.asyncio
+async def test_rapid_buffer_sends_keep_the_newest_persisted_draft(
+    tmp_path: Path,
+) -> None:
+    backend = GateBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        draft_path=tmp_path / "draft",
+    )
+    session = app._make_session()
+    app._active_session = session
+    session.default_buffer.insert_text("first")
+    app._submit_input(session.default_buffer.text)
+    session.default_buffer.reset()
+    session.default_buffer.insert_text("second")
+    app._submit_input(session.default_buffer.text)
+    session.default_buffer.reset()
+    session.default_buffer.insert_text("third draft")
+    await asyncio.sleep(0.25)
+
+    first = await app._submissions.get()
+    first_task = asyncio.create_task(app._handle_prompt_value(first))
+    await backend.started.wait()
+    second = await app._submissions.get()
+    await app._handle_prompt_value(second)
+    backend.release.set()
+    await first_task
+    await app._active_task
+    app._start_queued_turn()
+    await app._active_task
+
+    assert session.default_buffer.text == "third draft"
+    assert app._draft.load() == "third draft"
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_rapid_buffer_sends_keep_each_staged_image_owned(
+    tmp_path: Path,
+) -> None:
+    backend = GateBackend()
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    first_image = store.session_dir / "clipboard-first.png"
+    second_image = store.session_dir / "clipboard-second.png"
+    first_image.write_bytes(PNG)
+    second_image.write_bytes(PNG)
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._pending_attachments.append(first_image)
+    app._pending_attachment_tokens["[Image #1]"] = first_image
+    session.default_buffer.insert_text("first [Image #1]")
+    app._submit_input(session.default_buffer.text)
+    session.default_buffer.reset()
+    app._pending_attachments.append(second_image)
+    app._pending_attachment_tokens["[Image #1]"] = second_image
+    session.default_buffer.insert_text("second [Image #1]")
+    app._submit_input(session.default_buffer.text)
+    session.default_buffer.reset()
+
+    first = await app._submissions.get()
+    first_task = asyncio.create_task(app._handle_prompt_value(first))
+    await backend.started.wait()
+    second = await app._submissions.get()
+    await app._handle_prompt_value(second)
+    backend.release.set()
+    await first_task
+    await app._active_task
+    app._start_queued_turn()
+    await app._active_task
+
+    assert first_image.exists()
+    assert second_image.exists()
+    user_messages = [
+        message
+        for message in store.messages()
+        if message.role is MessageRole.USER
+    ]
+    assert user_messages[0].content[1].path == str(first_image)
+    assert user_messages[1].content[1].path == str(second_image)
+    await app.loop.close()
+
+
 def test_tool_render_mode_keeps_receipt_rule_in_one_place() -> None:
     read = ToolCall("read-1", "read", {"path": "README.md"})
     short = StreamEvent(
@@ -5487,13 +5577,14 @@ async def test_undo_restores_double_slash_source_text(tmp_path: Path) -> None:
     session = app._make_session()
     app._active_session = session
 
-    await app._handle_prompt_value("//status")
+    raw = "  //status  \n"
+    await app._handle_prompt_value(raw)
     await backend.started.wait()
     app.undo_sent_turn()
     await asyncio.gather(app._active_task, return_exceptions=True)
 
-    assert session.app.current_buffer.text == "//status"
-    await app._handle_prompt_value("//status")
+    assert session.app.current_buffer.text == raw
+    await app._handle_prompt_value(raw)
     await app._active_task
 
     assert len(backend.calls) == 2
@@ -6307,6 +6398,28 @@ async def test_undo_restores_submission_before_turn_creation(tmp_path: Path) -> 
 
     assert session.default_buffer.text == "sent too early"
     assert app._active_task is None
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_undo_keeps_a_new_buffer_draft(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    session.default_buffer.insert_text("sent")
+    app._submit_input(session.default_buffer.text)
+    session.default_buffer.reset()
+    session.default_buffer.insert_text("new draft")
+
+    app.undo_sent_turn()
+    submission = await app._submissions.get()
+    await app._handle_prompt_value(submission)
+
+    assert session.default_buffer.text == "new draft"
     await app.loop.close()
 
 

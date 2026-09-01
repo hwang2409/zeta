@@ -392,6 +392,33 @@ class ComposerAttachmentMixin:
         )
         self._next_image_token = draft.next_image_token
 
+    def _capture_pending_attachment_state(
+        self,
+    ) -> tuple[tuple[Path, ...], tuple[tuple[str, Path], ...], int]:
+        state = (
+            tuple(self._pending_attachments),
+            tuple(self._pending_attachment_tokens.items()),
+            self._next_image_token,
+        )
+        self._pending_attachments.clear()
+        self._pending_attachment_tokens.clear()
+        self._next_image_token = 1
+        return state
+
+    def _restore_pending_attachment_state(
+        self,
+        paths: tuple[Path, ...],
+        tokens: tuple[tuple[str, Path], ...],
+        next_image_token: int,
+    ) -> None:
+        self._pending_attachments[:] = paths
+        self._pending_attachment_tokens = dict(tokens)
+        self._next_image_token = next_image_token
+
+    def _release_attachment_paths(self, paths: tuple[Path, ...]) -> None:
+        for path in paths:
+            self._delete_staged_attachment(path)
+
     def _attach_draft_state(self, buffer: Buffer, draft: Any) -> None:
         self._restore_draft_state(draft)
         self._draft.attach(
@@ -435,38 +462,60 @@ class ComposerAttachmentMixin:
         ):
             path.unlink(missing_ok=True)
 
-    def _pending_paths_for(self, value: str) -> list[Path]:
-        mapped_paths = set(self._pending_attachment_tokens.values())
+    def _pending_paths_for(
+        self,
+        value: str,
+        *,
+        pending_attachments: list[Path] | None = None,
+        pending_attachment_tokens: dict[str, Path] | None = None,
+    ) -> list[Path]:
+        attachments = (
+            self._pending_attachments
+            if pending_attachments is None
+            else pending_attachments
+        )
+        tokens = (
+            self._pending_attachment_tokens
+            if pending_attachment_tokens is None
+            else pending_attachment_tokens
+        )
+        mapped_paths = set(tokens.values())
         cancelled_paths: set[Path] = set()
-        for token, path in tuple(self._pending_attachment_tokens.items()):
+        for token, path in tuple(tokens.items()):
             if token not in value:
-                del self._pending_attachment_tokens[token]
+                del tokens[token]
                 cancelled_paths.add(path)
-        remaining_mapped_paths = set(self._pending_attachment_tokens.values())
+        remaining_mapped_paths = set(tokens.values())
         for path in cancelled_paths - remaining_mapped_paths:
             self._delete_staged_attachment(path)
-        self._pending_attachments[:] = [
+        attachments[:] = [
             path
-            for path in self._pending_attachments
+            for path in attachments
             if path not in mapped_paths or path in remaining_mapped_paths
         ]
 
         token_paths = sorted(
             (
                 (value.index(token), path)
-                for token, path in self._pending_attachment_tokens.items()
+                for token, path in tokens.items()
             ),
             key=lambda item: item[0],
         )
         selected_paths = [path for _, path in token_paths]
         selected_paths.extend(
             path
-            for path in self._pending_attachments
+            for path in attachments
             if path not in remaining_mapped_paths
         )
         return selected_paths
 
-    def _prepare_user_message(self, value: str) -> Message | None:
+    def _prepare_user_message(
+        self,
+        value: str,
+        *,
+        pending_attachments: list[Path] | None = None,
+        pending_attachment_tokens: dict[str, Path] | None = None,
+    ) -> Message | None:
         try:
             message = build_user_message(value, self.loop.store.cwd)
         except AttachmentError as exc:
@@ -474,14 +523,23 @@ class ComposerAttachmentMixin:
             return None
 
         valid_pending: list[Path] = []
-        for path in self._pending_paths_for(value):
+        for path in self._pending_paths_for(
+            value,
+            pending_attachments=pending_attachments,
+            pending_attachment_tokens=pending_attachment_tokens,
+        ):
             try:
                 build_user_message(value, self.loop.store.cwd, (path,))
             except AttachmentError as exc:
                 self._print_system(f"pending attachment dropped: {exc}")
             else:
                 valid_pending.append(path)
-        self._pending_attachments[:] = valid_pending
+        attachments = (
+            self._pending_attachments
+            if pending_attachments is None
+            else pending_attachments
+        )
+        attachments[:] = valid_pending
         if not valid_pending:
             return message
         return build_user_message(value, self.loop.store.cwd, tuple(valid_pending))
@@ -516,9 +574,27 @@ class ComposerAttachmentMixin:
 
         pending_submission = self._submissions.cancel_current()
         if pending_submission is not None:
-            self._draft.clear_submitted()
+            session = self._active_session or self._session
+            buffer = session.app.current_buffer if session is not None else None
+            self._draft.clear_submitted(pending_submission.draft_revision)
+            if buffer is not None and buffer.text:
+                self._release_attachment_paths(pending_submission.attachment_paths)
+                self._print_system(
+                    f"undo kept the current draft; sent text: {pending_submission.text}"
+                )
+                self._draft.schedule(buffer.text)
+                return
             self._restore_composer(pending_submission.text)
-            self._draft.schedule(pending_submission.text)
+            self._restore_pending_attachment_state(
+                pending_submission.attachment_paths,
+                pending_submission.attachment_tokens,
+                pending_submission.next_image_token,
+            )
+            self._draft.schedule(
+                pending_submission.text,
+                attachment_tokens=dict(pending_submission.attachment_tokens),
+                next_image_token=pending_submission.next_image_token,
+            )
             return
 
         candidate = self._undo_candidate
