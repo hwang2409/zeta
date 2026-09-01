@@ -217,6 +217,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         )
         self._draft_session: PromptSession[str] | None = None
         self._undo_candidate: UndoCandidate | None = None
+        self._pending_submission = self._cancelled_submission = None
         self._approval_policy = approval_policy
         self._context_files = tuple(context_files)
         self._on_model_change = on_model_change
@@ -545,7 +546,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
     def _attach_draft(self, session: PromptSession[str]) -> None:
         if self._draft_session is session:
             return
-        self._draft.attach(session.default_buffer)
+        self._attach_draft_state(session.default_buffer, self._draft.load_state())
         self._draft_session = session
     def _record_prompt(self, value: str) -> None:
         if self._history is None:
@@ -710,18 +711,30 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         self._invalidate_prompt()
 
     def _submit_input(self, value: str) -> None:
+        self._cancelled_submission = None; self._pending_submission = value
         self._draft.mark_submitted()
         self._input_queue.put_nowait(value)
 
     async def _handle_prompt_value(self, value: str) -> None:
+        pending_submission, skip_submission = self._pending_submission_for(value)
+        if skip_submission:
+            return
+        queued_submission = pending_submission is not None
         parsed = parse_input(value)
         if parsed is None or self._exit_requested:
-            return
+            self._complete_pending_submission(queued_submission); return
         if await self._handle_approval_input(parsed):
-            self._record_prompt(parsed)
+            if self._pending_submission_changed(value, queued_submission):
+                return
+            self._complete_pending_submission(queued_submission); self._record_prompt(parsed)
+            return
+        if self._pending_submission_changed(value, queued_submission):
             return
         slash_output = await self._slash_commands.dispatch_async(self, parsed)
+        if self._pending_submission_changed(value, queued_submission):
+            return
         if slash_output is not None:
+            self._complete_pending_submission(queued_submission)
             self._record_prompt(parsed)
             if self._fork_rebuilt:
                 self._fork_rebuilt = False
@@ -733,20 +746,26 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         model_input = self._slash_commands.input_for_model(parsed)
         user_message = self._prepare_user_message(model_input)
         if user_message is None:
+            self._complete_pending_submission(queued_submission)
+            return
+        if self._pending_submission_changed(value, queued_submission):
             return
         self._record_prompt(parsed)
         self._failed_turn = None
         if self.pending_approvals:
             self._present_pending_approvals()
+            self._complete_pending_submission(queued_submission)
         elif self.active:
             candidate = self._undo_candidate_for_message(model_input, user_message)
             self._clear_pending_attachments()
             self._queued.append((user_message, candidate))
+            self._complete_pending_submission(queued_submission)
         else:
             candidate = self._undo_candidate_for_message(model_input, user_message)
             self._clear_pending_attachments()
             self._print_user(user_message)
             self._undo_candidate = candidate
+            self._complete_pending_submission(queued_submission)
             self._start_turn(model_input, user_message=user_message)
 
     def _discard_tool_region(self) -> None:

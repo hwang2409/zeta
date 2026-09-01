@@ -383,6 +383,43 @@ end run
 class ComposerAttachmentMixin:
     """Attachment behavior shared by the TUI composition root."""
 
+    def _restore_draft_state(self, draft: Any) -> None:
+        self._pending_attachment_tokens = {
+            token: path.resolve() for token, path in draft.attachment_tokens
+        }
+        self._pending_attachments[:] = list(
+            dict.fromkeys(self._pending_attachment_tokens.values())
+        )
+        self._next_image_token = draft.next_image_token
+
+    def _complete_pending_submission(self, queued: bool) -> None:
+        if queued:
+            self._pending_submission = None
+
+    def _pending_submission_for(self, value: str) -> tuple[str | None, bool]:
+        if self._cancelled_submission == value:
+            self._cancelled_submission = None
+            return None, True
+        pending = self._pending_submission
+        return (
+            (None, True)
+            if pending is not None and pending != value
+            else (pending, False)
+        )
+
+    def _pending_submission_changed(self, value: str, queued: bool) -> bool:
+        return queued and self._pending_submission != value
+
+    def _attach_draft_state(self, buffer: Buffer, draft: Any) -> None:
+        self._restore_draft_state(draft)
+        self._draft.attach(
+            buffer,
+            state_provider=lambda: (
+                self._pending_attachment_tokens,
+                self._next_image_token,
+            ),
+        )
+
     @staticmethod
     def _display_attachment_path(path: Path) -> str:
         value = str(path)
@@ -494,6 +531,15 @@ class ComposerAttachmentMixin:
 
     def undo_sent_turn(self) -> None:
         """Abort the current turn and restore its submitted text once."""
+
+        pending_submission = getattr(self, "_pending_submission", None)
+        if pending_submission is not None:
+            self._pending_submission = None
+            self._cancelled_submission = pending_submission
+            self._draft.clear_submitted()
+            self._restore_composer(pending_submission)
+            self._draft.schedule(pending_submission)
+            return
 
         candidate = self._undo_candidate
         if (
@@ -733,7 +779,7 @@ def build_key_bindings(
 
     if on_retry is not None:
 
-        @bindings.add("c-r", filter=retry_ready, eager=True)
+        @bindings.add("c-y", filter=retry_ready, eager=True)
         def retry(event: KeyPressEvent) -> None:
             del event
             on_retry()

@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+import fcntl
+import json
 import os
 import tempfile
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from prompt_toolkit.buffer import Buffer
@@ -28,23 +33,40 @@ class BoundedFileHistory(FileHistory):
         return list(super().load_history_strings())[: self.limit]
 
     def append_string(self, string: str) -> None:
-        if not self._loaded:
-            self._loaded_strings = list(self.load_history_strings())
-            self._loaded = True
-        if self._loaded_strings and self._loaded_strings[0] == string:
-            return
-        self._loaded_strings.insert(0, string)
-        del self._loaded_strings[self.limit :]
-        self._write_entries(self._loaded_strings[::-1])
+        with self._locked():
+            entries = list(self.load_history_strings())
+            if entries and entries[0] == string:
+                self._loaded_strings = entries
+                self._loaded = True
+                return
+            entries.insert(0, string)
+            del entries[self.limit :]
+            self._write_entries(entries[::-1])
+        self._loaded_strings = entries
+        self._loaded = True
 
     def store_string(self, string: str) -> None:
         """Keep direct history writes bounded as well."""
 
-        if self._loaded:
-            entries = [string, *self._loaded_strings]
-        else:
+        with self._locked():
             entries = [string, *self.load_history_strings()]
-        self._write_entries(entries[: self.limit][::-1])
+            entries = entries[: self.limit]
+            self._write_entries(entries[::-1])
+        self._loaded_strings = entries
+        self._loaded = True
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        history_path = Path(self.filename)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = history_path.with_name(f".{history_path.name}.lock")
+        lock = lock_path.open("a+")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
 
     def _write_entries(self, entries: list[str]) -> None:
         history_path = Path(self.filename)
@@ -83,19 +105,60 @@ class DraftPersistence:
         self._persisted_revision: int | None = None
         self._submitted_revision: int | None = None
         self._scheduled: asyncio.TimerHandle | None = None
+        self._state_provider: Callable[[], tuple[Mapping[str, Path], int]] | None = None
+        self._pending_attachment_tokens: tuple[tuple[str, str], ...] = ()
+        self._pending_next_image_token = 1
 
     def load(self) -> str:
-        try:
-            return self.path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return ""
-        except OSError:
-            return ""
+        return self.load_state().text
 
-    def schedule(self, text: str) -> None:
+    def load_state(self) -> DraftState:
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return DraftState("")
+        except OSError:
+            return DraftState("")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return DraftState(raw)
+        if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
+            return DraftState("")
+        raw_tokens = payload.get("attachment_tokens", {})
+        tokens = (
+            tuple(
+                (token, Path(path))
+                for token, path in raw_tokens.items()
+                if isinstance(token, str) and isinstance(path, str)
+            )
+            if isinstance(raw_tokens, dict)
+            else ()
+        )
+        next_image_token = payload.get("next_image_token", 1)
+        if type(next_image_token) is not int or next_image_token < 1:
+            next_image_token = 1
+        return DraftState(payload["text"], tokens, next_image_token)
+
+    def schedule(
+        self,
+        text: str,
+        *,
+        attachment_tokens: Mapping[str, Path] | None = None,
+        next_image_token: int | None = None,
+    ) -> None:
+        if attachment_tokens is None and self._state_provider is not None:
+            attachment_tokens, next_image_token = self._state_provider()
+        attachment_tokens = attachment_tokens or {}
+        if next_image_token is None:
+            next_image_token = 1
         self._revision += 1
         self._pending_text = text
         self._pending_revision = self._revision
+        self._pending_attachment_tokens = tuple(
+            (token, str(Path(path))) for token, path in attachment_tokens.items()
+        )
+        self._pending_next_image_token = next_image_token
         if self._scheduled is not None:
             self._scheduled.cancel()
         try:
@@ -111,8 +174,12 @@ class DraftPersistence:
             self._scheduled = None
         text = self._pending_text
         revision = self._pending_revision
+        attachment_tokens = self._pending_attachment_tokens
+        next_image_token = self._pending_next_image_token
         self._pending_text = None
         self._pending_revision = None
+        self._pending_attachment_tokens = ()
+        self._pending_next_image_token = 1
         if text is None:
             return
         if not text:
@@ -130,7 +197,14 @@ class DraftPersistence:
                 delete=False,
             ) as handle:
                 temporary_path = handle.name
-                handle.write(text)
+                json.dump(
+                    {
+                        "text": text,
+                        "attachment_tokens": dict(attachment_tokens),
+                        "next_image_token": next_image_token,
+                    },
+                    handle,
+                )
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_path, self.path)
@@ -143,6 +217,8 @@ class DraftPersistence:
     def clear(self) -> None:
         self._pending_text = None
         self._pending_revision = None
+        self._pending_attachment_tokens = ()
+        self._pending_next_image_token = 1
         self._submitted_revision = None
         if self._scheduled is not None:
             self._scheduled.cancel()
@@ -179,17 +255,30 @@ class DraftPersistence:
             self._persisted_revision = None
         return True
 
-    def attach(self, buffer: Buffer) -> None:
-        draft = self.load()
-        if draft:
+    def attach(
+        self,
+        buffer: Buffer,
+        *,
+        state_provider: Callable[[], tuple[Mapping[str, Path], int]] | None = None,
+    ) -> None:
+        self._state_provider = state_provider
+        draft = self.load_state()
+        if draft.text:
             self._persisted_revision = self._revision
-        if draft and not buffer.text:
-            buffer.set_document(Document(draft, len(draft)))
+        if draft.text and not buffer.text:
+            buffer.set_document(Document(draft.text, len(draft.text)))
 
         def changed(_buffer: Buffer) -> None:
             self.schedule(buffer.text)
 
         buffer.on_text_changed += changed
+
+
+@dataclass(frozen=True, slots=True)
+class DraftState:
+    text: str
+    attachment_tokens: tuple[tuple[str, Path], ...] = ()
+    next_image_token: int = 1
 
 
 def history_for(path: str | Path) -> BoundedFileHistory:

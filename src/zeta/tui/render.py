@@ -239,7 +239,7 @@ def render_error_card(event: StreamEvent) -> Panel:
             )
         )
     if retryable:
-        content.append(Text("retry: ctrl+r", style=AFFORDANCE))
+        content.append(Text("retry: ctrl+y", style=AFFORDANCE))
     return Panel(
         Group(*content),
         border_style=ERROR,

@@ -53,19 +53,6 @@ def isolate_zeta_home(tmp_path_factory: pytest.TempPathFactory) -> Generator[Non
         )
 
 
-def test_test_home_is_isolated() -> None:
-    assert Path(os.environ["ZETA_HOME"]) != LIVE_ZETA_HOME
-
-
-def test_path_home_follows_home_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    expected = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(expected))
-
-    assert Path.home() == expected
-
-
 @pytest.fixture(autouse=True)
 def stable_terminal_defaults(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch

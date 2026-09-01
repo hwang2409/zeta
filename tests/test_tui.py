@@ -1524,7 +1524,7 @@ def test_render_error_card_bounds_and_labels_json_payload() -> None:
     assert "provider failure · stream_error" in plain
     assert "payload · json" in plain
     assert len(plain) < 600
-    assert "retry: ctrl+r" in plain
+    assert "retry: ctrl+y" in plain
 
 
 @pytest.mark.parametrize("code", ["max_turns", "ui_error"])
@@ -1540,7 +1540,7 @@ def test_non_provider_errors_are_not_retryable(code: str) -> None:
     plain = renderable_plain(rendered)
     assert f"error · {code}" in plain
     assert "provider failure" not in plain
-    assert "retry: ctrl+r" not in plain
+    assert "retry: ctrl+y" not in plain
     assert is_retryable_error(event.error) is False
 
 
@@ -1565,7 +1565,7 @@ async def test_provider_failure_card_is_visible_in_both_modes(
     assert "| name | value |" in plain
     assert "provider failure · backend_error" in plain
     assert "reason: boom" in plain
-    assert "retry: ctrl+r" in plain
+    assert "retry: ctrl+y" in plain
 
 
 @pytest.mark.asyncio
@@ -1881,7 +1881,7 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
     rendered = Text.from_ansi(output.getvalue()).plain
     assert "partial response" in rendered
     assert "provider failure · backend_error" in rendered
-    assert "retry: ctrl+r" in rendered
+    assert "retry: ctrl+y" in rendered
 
     app.retry_failed_turn()
     assert app._active_task is not None
@@ -1997,7 +1997,7 @@ async def test_submitted_revision_does_not_clear_a_rapid_new_draft(
     await app._handle_prompt_value("sent prompt")
     await asyncio.sleep(0.25)
 
-    assert draft_path.read_text(encoding="utf-8") == "new rapid draft"
+    assert app._draft.load() == "new rapid draft"
     if app._active_task is not None:
         await app._active_task
     await app.loop.close()
@@ -4546,20 +4546,16 @@ def test_footer_builder_formats_context_usage_and_hints() -> None:
     )
     assert "ctrl+u undo" not in footer.plain
 
-    try:
-        undo_footer = format_status(
-            "openai",
-            "gpt-5.4",
-            "streaming",
-            token_count=18_600,
-            model_window=200_000,
-            session_id="abcdef12",
-            undo_available=True,
-        )
-    except TypeError:
-        undo_footer = None
-    if undo_footer is not None:
-        assert "ctrl+u undo" in undo_footer.plain
+    undo_footer = format_status(
+        "openai",
+        "gpt-5.4",
+        "streaming",
+        token_count=18_600,
+        model_window=200_000,
+        session_id="abcdef12",
+        undo_available=True,
+    )
+    assert "ctrl+u undo" in undo_footer.plain
 
 
 def test_footer_shows_vim_state_and_degrades_as_a_whole_segment() -> None:
@@ -6045,6 +6041,31 @@ async def test_composer_history_is_bounded_and_keeps_multiline_entries(
 
 
 @pytest.mark.asyncio
+async def test_composer_history_merges_updates_from_active_instances(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "history"
+    first = history_for(path)
+    second = history_for(path)
+    async for _entry in first.load():
+        pass
+    async for _entry in second.load():
+        pass
+
+    first.append_string("first session prompt")
+    second.append_string("second session prompt")
+
+    reopened = history_for(path)
+    async for _entry in reopened.load():
+        pass
+
+    assert reopened.get_strings() == [
+        "first session prompt",
+        "second session prompt",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_draft_persistence_round_trip_and_clear(tmp_path: Path) -> None:
     persistence = DraftPersistence(tmp_path / "draft", delay=0.01)
     persistence.schedule("line one\nline two")
@@ -6053,6 +6074,23 @@ async def test_draft_persistence_round_trip_and_clear(tmp_path: Path) -> None:
 
     persistence.clear()
     assert not (tmp_path / "draft").exists()
+
+
+def test_draft_persistence_restores_attachment_metadata(tmp_path: Path) -> None:
+    staged = tmp_path / "clipboard-image.png"
+    persistence = DraftPersistence(tmp_path / "draft")
+    persistence.schedule(
+        "inspect [Image #1]",
+        attachment_tokens={"[Image #1]": staged},
+        next_image_token=2,
+    )
+    persistence.flush()
+
+    state = DraftPersistence(tmp_path / "draft").load_state()
+
+    assert state.text == "inspect [Image #1]"
+    assert state.attachment_tokens == (("[Image #1]", staged),)
+    assert state.next_image_token == 2
 
 
 @pytest.mark.asyncio
@@ -6104,6 +6142,8 @@ async def test_ctrl_r_search_uses_cross_session_history(tmp_path: Path) -> None:
             key_bindings=build_key_bindings(
                 on_interrupt=lambda: None,
                 on_exit=lambda: None,
+                on_retry=lambda: None,
+                retry_available=lambda: True,
             ),
             multiline=True,
         )
@@ -6146,6 +6186,28 @@ async def test_app_draft_round_trip_and_send_clear(tmp_path: Path) -> None:
 
     second._record_prompt("sent prompt")
     assert not (store.session_dir / "draft").exists()
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_submission_before_turn_creation(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    session = app._make_session()
+    app._active_session = session
+    session.default_buffer.insert_text("sent too early")
+    app._submit_input(session.default_buffer.text)
+    session.default_buffer.reset()
+
+    app.undo_sent_turn()
+    await app._handle_prompt_value("sent too early")
+
+    assert session.default_buffer.text == "sent too early"
+    assert app._active_task is None
+    await app.loop.close()
 
 
 @pytest.mark.asyncio
