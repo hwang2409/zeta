@@ -545,6 +545,7 @@ class TUIApp(
             history=self._history,
             key_bindings=bindings,
             multiline=True,
+            mouse_support=True,
             editing_mode=EditingMode.VI if self.vim_mode else EditingMode.EMACS,
             bottom_toolbar=self._status_toolbar,
             erase_when_done=True,
@@ -954,6 +955,8 @@ class TUIApp(
                 footer,
                 self._todo_widget,
                 self.loop.store,
+                on_scroll_up=self._transcript.scroll_up,
+                on_scroll_down=self._transcript.scroll_down,
             )
         ]
 

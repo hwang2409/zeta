@@ -30,7 +30,10 @@ from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
-from prompt_toolkit.data_structures import Size
+from prompt_toolkit.data_structures import Point, Size
+from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+from prompt_toolkit.layout.screen import Screen, WritePosition
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from rich.cells import cell_len
 from rich.console import Console
 from rich.panel import Panel
@@ -1077,6 +1080,90 @@ def test_transcript_completion_swap_preserves_scrolled_anchor() -> None:
     assert "token-065" in " ".join(Text.from_ansi(line).plain for line in visible)
     assert transcript._line_locations[transcript.scroll_offset][0] is unit
 
+
+
+def _render_layout(
+    session: FullScreenPromptSession, mouse_handlers: MouseHandlers
+) -> None:
+    """Lay the full-screen tree out over an 80x24 terminal."""
+
+    session.layout.update_parents_relations()
+    session.layout.container.write_to_screen(
+        Screen(),
+        mouse_handlers,
+        WritePosition(xpos=0, ypos=0, width=80, height=24),
+        "",
+        False,
+        None,
+    )
+
+
+def _wheel(event_type: MouseEventType, *, x: int, y: int) -> MouseEvent:
+    return MouseEvent(
+        position=Point(x=x, y=y),
+        event_type=event_type,
+        button=MouseButton.NONE,
+        modifiers=frozenset(),
+    )
+
+
+def test_full_screen_session_enables_mouse_reporting(tmp_path: Path) -> None:
+    app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
+
+    session = app._make_session()
+
+    assert isinstance(session, FullScreenPromptSession)
+    assert session.app.mouse_support()
+
+
+def test_mouse_reporting_leaves_out_pointer_motion(tmp_path: Path) -> None:
+    app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
+    session = app._make_session()
+    written: list[str] = []
+    session.app.output.write_raw = written.append
+
+    session.app.output.enable_mouse_support()
+
+    assert "\x1b[?1000h" in written  # clicks and the wheel
+    assert "\x1b[?1006h" in written  # SGR coordinates
+    assert "\x1b[?1003h" not in written  # every pointer move
+
+
+async def test_wheel_scrolls_transcript_from_transcript_and_composer(tmp_path: Path) -> None:
+    app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
+    session = app._make_session()
+    app._install_full_screen_layout(session)
+    for index in range(120):
+        app._transcript.append(Text(f"line {index}"))
+    mouse_handlers = MouseHandlers()
+    with set_app(session.app):
+        _render_layout(session, mouse_handlers)
+        over_transcript = mouse_handlers.mouse_handlers[5][10]
+        over_composer = mouse_handlers.mouse_handlers[23][10]
+        tail_offset = app._transcript.scroll_offset
+
+        over_transcript(_wheel(MouseEventType.SCROLL_UP, x=10, y=5))
+        assert app._transcript.scroll_offset == tail_offset - 3
+
+        over_composer(_wheel(MouseEventType.SCROLL_UP, x=10, y=23))
+        assert app._transcript.scroll_offset == tail_offset - 6
+
+        over_composer(_wheel(MouseEventType.SCROLL_DOWN, x=10, y=23))
+        assert app._transcript.scroll_offset == tail_offset - 3
+
+
+async def test_composer_still_receives_non_wheel_mouse_events(tmp_path: Path) -> None:
+    app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
+    session = app._make_session()
+    app._install_full_screen_layout(session)
+    mouse_handlers = MouseHandlers()
+    with set_app(session.app):
+        _render_layout(session, mouse_handlers)
+        over_composer = mouse_handlers.mouse_handlers[23][10]
+
+        result = over_composer(_wheel(MouseEventType.MOUSE_MOVE, x=10, y=23))
+
+    assert result is NotImplemented
 
 def test_transcript_parsed_cache_is_bounded_and_revision_scoped() -> None:
     transcript = TranscriptWidget()
@@ -5376,7 +5463,9 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
     content = padded.children[1]
     assert content.__class__.__name__ == "HSplit"
     assert content.children[0].__class__.__name__ == "Window"
-    bottom = content.children[1]
+    wheel_router = content.children[1]
+    assert wheel_router.__class__.__name__ == "WheelRouter"
+    bottom = wheel_router.content
     assert bottom.__class__.__name__ == "HSplit"
     assert bottom.children[-1].__class__.__name__ == "ConditionalContainer"
 

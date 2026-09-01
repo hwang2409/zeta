@@ -367,7 +367,7 @@ def test_full_screen_layout_places_todo_between_transcript_and_composer(
     app._install_full_screen_layout(session)
 
     content = session.layout.container.children[0].children[1]
-    bottom = content.children[1]
+    bottom = content.children[1].content
     todo_panel = bottom.children[0]
 
     assert todo_panel.__class__.__name__ == "ConditionalContainer"
