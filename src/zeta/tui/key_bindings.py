@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 from prompt_toolkit import PromptSession
@@ -16,6 +17,7 @@ from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.output import Output
 
 SHIFT_ENTER_SEQUENCES = frozenset(
     {
@@ -29,6 +31,19 @@ SHIFT_ENTER_SEQUENCES = frozenset(
 # Mouse reporting modes prompt-toolkit turns on, cleared again by hand so a
 # hard exit cannot leave the shell swallowing clicks and selections.
 MOUSE_OFF = b"\x1b[?1000l\x1b[?1003l\x1b[?1015l\x1b[?1006l"
+
+
+def _enable_wheel_reporting(output: Output) -> None:
+    """Report clicks and wheel ticks, but not every pointer move.
+
+    prompt-toolkit's own `enable_mouse_support` also turns on ?1003h, which
+    streams an event for every step of pointer motion across the terminal.
+    The transcript only needs the wheel, so that traffic is pure overhead.
+    """
+
+    output.write_raw("\x1b[?1000h")  # click and wheel reporting
+    output.write_raw("\x1b[?1015h")  # urxvt extended coordinates
+    output.write_raw("\x1b[?1006h")  # SGR extended coordinates
 
 
 class FullScreenPromptSession(PromptSession[str]):
@@ -48,6 +63,9 @@ class FullScreenPromptSession(PromptSession[str]):
             application.renderer.full_screen,
             application.erase_when_done,
         ) = True, True, False
+        application.output.enable_mouse_support = partial(
+            _enable_wheel_reporting, application.output
+        )
         return application
 
     def restore_terminal(self) -> None:
@@ -434,6 +452,11 @@ def build_key_bindings(
             del event
             on_deny()
 
+    # Terminals report the wheel as mouse events, which the transcript window
+    # handles itself; these keys only exist for the few that send \x1b[62~ and
+    # \x1b[63~ instead. They still earn their place: prompt-toolkit's own
+    # binding for them feeds `up`/`down` back in, which the composer would
+    # take as history navigation.
     if on_scroll_up is not None:
 
         @bindings.add(Keys.ScrollUp)

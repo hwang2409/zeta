@@ -1116,6 +1116,19 @@ def test_full_screen_session_enables_mouse_reporting(tmp_path: Path) -> None:
     assert session.app.mouse_support()
 
 
+def test_mouse_reporting_leaves_out_pointer_motion(tmp_path: Path) -> None:
+    app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
+    session = app._make_session()
+    written: list[str] = []
+    session.app.output.write_raw = written.append
+
+    session.app.output.enable_mouse_support()
+
+    assert "\x1b[?1000h" in written  # clicks and the wheel
+    assert "\x1b[?1006h" in written  # SGR coordinates
+    assert "\x1b[?1003h" not in written  # every pointer move
+
+
 async def test_wheel_scrolls_transcript_from_transcript_and_composer(tmp_path: Path) -> None:
     app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
     session = app._make_session()

@@ -85,6 +85,9 @@ class WheelRouter(Container):
     ) -> None:
         """Wrap the handlers the child just registered over its own region."""
 
+        # One wrapper per distinct child handler rather than one per cell. The
+        # cache holds each wrapper, which closes over its handler, so the ids
+        # it is keyed by cannot be reused underneath it.
         wrapped: dict[int, MouseHandler] = {}
         rows = mouse_handlers.mouse_handlers
         y_range = range(write_position.ypos, write_position.ypos + write_position.height)
