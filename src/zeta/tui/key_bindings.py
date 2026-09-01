@@ -26,6 +26,11 @@ SHIFT_ENTER_SEQUENCES = frozenset(
 )
 
 
+# Mouse reporting modes prompt-toolkit turns on, cleared again by hand so a
+# hard exit cannot leave the shell swallowing clicks and selections.
+MOUSE_OFF = b"\x1b[?1000l\x1b[?1003l\x1b[?1015l\x1b[?1006l"
+
+
 class FullScreenPromptSession(PromptSession[str]):
     """Prompt session that owns the alternate screen for the whole app."""
 
@@ -51,13 +56,14 @@ class FullScreenPromptSession(PromptSession[str]):
         import os
         import sys
 
+        self.app.output.disable_mouse_support()
         self.app.output.quit_alternate_screen()
         self.app.output.show_cursor()
         self.app.output.flush()
         stdout = sys.__stdout__
         if stdout.isatty():
             try:
-                os.write(stdout.fileno(), b"\x1b[?1049l\x1b[?25h")
+                os.write(stdout.fileno(), MOUSE_OFF + b"\x1b[?1049l\x1b[?25h")
             except OSError:
                 pass
 
