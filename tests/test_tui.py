@@ -752,12 +752,36 @@ def test_transcript_search_highlights_matches_and_wraps() -> None:
     assert "\x1b[" not in transcript.render(80)
 
 
+def test_transcript_search_stays_anchored_at_the_tail_until_closed() -> None:
+    transcript = TranscriptWidget()
+    for index in range(20):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(80, 3)
+
+    transcript.begin_search()
+    transcript.update_search("line 19")
+    transcript.create_content(80, 3)
+
+    assert not transcript.follow_tail
+    assert transcript.position_indicator() == "line 18/20"
+
+    transcript.append(Text("new tail"))
+    transcript.create_content(80, 3)
+    assert not transcript.follow_tail
+    assert transcript.scroll_offset == 17
+
+    transcript.end_search()
+    assert not transcript.follow_tail
+
+
 def test_transcript_user_jumps_skip_non_user_units() -> None:
     transcript = TranscriptWidget()
-    transcript.append_user(Text("first user"))
+    first_user = transcript.append(Text("first user"))
+    transcript.mark_user(first_user)
     transcript.append(Text("tool receipt"))
     transcript.append(Text("assistant thought"))
-    transcript.append_user(Text("second user"))
+    second_user = transcript.append(Text("second user"))
+    transcript.mark_user(second_user)
     transcript.append(Text("assistant answer"))
     transcript.create_content(80, 2)
     transcript._set_scroll_offset(0)
@@ -767,6 +791,22 @@ def test_transcript_user_jumps_skip_non_user_units() -> None:
     assert transcript.previous_user_message()
     assert transcript.scroll_offset == 0
     assert not transcript.previous_user_message()
+
+
+def test_transcript_user_jump_targets_only_the_start_of_each_message() -> None:
+    transcript = TranscriptWidget()
+    first = transcript.append(Text("first\ncontinuation\nlast"))
+    transcript.mark_user(first)
+    transcript.append(Text("assistant"))
+    second = transcript.append(Text("second"))
+    transcript.mark_user(second)
+    transcript.create_content(80, 1)
+    transcript._set_scroll_offset(0)
+
+    assert transcript.next_user_message()
+    assert transcript.scroll_offset == 4
+    assert transcript.previous_user_message()
+    assert transcript.scroll_offset == 0
 
 
 def test_transcript_position_indicator_hides_at_pinned_tail() -> None:
@@ -805,6 +845,35 @@ def test_transcript_paging_reuses_rendered_content_for_large_sessions(
         transcript.page_up()
         transcript.create_content(80, 20)
     assert calls == 0
+
+
+def test_transcript_paging_reuses_locations_by_width_and_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = TranscriptWidget()
+    for index in range(2_000):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(80, 20)
+
+    calls = 0
+    original_compute = transcript._compute_locations
+
+    def counted_compute(width: int) -> list[tuple[object, int]]:
+        nonlocal calls
+        calls += 1
+        return original_compute(width)  # type: ignore[return-value]
+
+    monkeypatch.setattr(transcript, "_compute_locations", counted_compute)
+    for _ in range(100):
+        transcript.page_up()
+        transcript.create_content(80, 20)
+    assert calls == 0
+
+    transcript.create_content(40, 20)
+    assert calls == 1
+    transcript.append(Text("new line"))
+    transcript.create_content(40, 20)
+    assert calls == 2
 
 
 def test_transcript_resize_preserves_anchor_and_tail_reentry() -> None:
@@ -2997,6 +3066,46 @@ def test_transcript_navigation_bindings_are_full_screen_only() -> None:
         assert not bindings.get_bindings_for_keys((Keys.ControlF,))[-1].filter()
 
 
+@pytest.mark.asyncio
+async def test_transcript_search_query_accepts_navigation_key_text() -> None:
+    active = False
+    values: list[str] = []
+    actions: list[str] = []
+
+    def start_search() -> None:
+        nonlocal active
+        active = True
+
+    def end_search() -> None:
+        nonlocal active
+        active = False
+
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_search_start=start_search,
+                search_active=lambda: active,
+                on_search_input=values.append,
+                on_search_next=lambda: actions.append("next"),
+                on_search_previous=lambda: actions.append("previous"),
+                on_search_end=end_search,
+            ),
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        session.app.full_screen = True
+        pipe.send_text("\x06nN\x12")
+        await wait_until(lambda: values == ["n", "nN", "nN\x12"])
+        pipe.send_text("\rN\x1b")
+        await wait_until(lambda: actions == ["next", "previous"])
+        session.app.exit()
+        await task
+
+
 def test_long_single_line_read_uses_a_cropped_card() -> None:
     call = ToolCall("read-long", "read", {"path": "README.md"})
     event = StreamEvent(
@@ -4975,6 +5084,20 @@ def test_footer_shows_transcript_navigation_and_search_state() -> None:
     assert "enter/n next" in footer.plain
     assert "N prev" in footer.plain
     assert "esc close" in footer.plain
+
+    narrow = format_status(
+        "fake",
+        "offline",
+        "idle",
+        token_count=18,
+        width=50,
+        transcript_navigation=True,
+        transcript_search="target",
+        transcript_match=(2, 5),
+        transcript_position="line 14/80",
+    )
+    assert 'find "target" 2/5' in narrow.plain
+    assert "line 14/80" in narrow.plain
 
 
 def test_footer_shows_vim_state_and_degrades_as_a_whole_segment() -> None:

@@ -89,7 +89,8 @@ from .theme import (
     RICH_THEME,
 )
 from .todo import TodoWidget
-from .transcript import TranscriptPresenter, TranscriptWidget
+from .transcript import TranscriptWidget
+from .transcript_presenter import TranscriptPresenter
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
@@ -515,9 +516,7 @@ class TUIApp(
             on_page_down=self._transcript.page_down,
             on_search_start=self._transcript.begin_search,
             search_active=lambda: self._transcript.search_active,
-            on_search_input=lambda value: self._transcript.update_search(
-                self._transcript.search_query + value
-            ),
+            on_search_input=self._transcript.update_search,
             on_search_backspace=self._transcript.search_backspace,
             on_search_next=self._transcript.next_search_match,
             on_search_previous=self._transcript.previous_search_match,

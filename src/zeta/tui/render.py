@@ -1020,9 +1020,57 @@ def format_status(
         value = f"{left}  {' · '.join(right_segments)}"
     else:
         value = left
-        candidates = (left, state_segment)
-        if vim_state and background_count > 0:
-            candidates = (left, f"{vim_state}  {state_segment}", state_segment)
+        if transcript_search is not None:
+            search_current, search_total = transcript_match or (0, 0)
+            search_prefix = 'find "'
+            search_suffix = f'" {search_current}/{search_total}'
+            minimum_search_width = cell_len(f'{search_prefix}…{search_suffix}')
+
+            def search_segment(max_width: int) -> str:
+                if max_width < minimum_search_width:
+                    return ""
+                full = f'{search_prefix}{transcript_search}{search_suffix}'
+                if cell_len(full) <= max_width:
+                    return full
+                if max_width >= minimum_search_width:
+                    available = max_width - cell_len(search_prefix) - cell_len(search_suffix)
+                    query = Text(
+                        transcript_search,
+                        no_wrap=True,
+                        overflow="ellipsis",
+                    )
+                    query.truncate(max(1, available), overflow="ellipsis")
+                    return f"{search_prefix}{query.plain}{search_suffix}"
+                fitted = Text(full, no_wrap=True, overflow="ellipsis")
+                fitted.truncate(max_width, overflow="ellipsis")
+                return fitted.plain
+
+            navigation_candidates = (
+                (state_segment, transcript_position),
+                (state_text, transcript_position),
+                ("", transcript_position),
+                (state_segment, ""),
+                (state_text, ""),
+                ("", ""),
+            )
+            for state, position in navigation_candidates:
+                fixed = cell_len(state) + cell_len(position)
+                gaps = 2 * (bool(state) + bool(position))
+                if fixed + gaps >= width:
+                    continue
+                search = search_segment(width - fixed - gaps)
+                if not search:
+                    continue
+                parts = [search, state, position]
+                candidate = "  ".join(part for part in parts if part)
+                if cell_len(candidate) <= width:
+                    value = candidate
+                    break
+        candidates = (value,)
+        if transcript_search is None:
+            candidates = (left, state_segment)
+            if vim_state and background_count > 0:
+                candidates = (left, f"{vim_state}  {state_segment}", state_segment)
         for candidate_left in candidates:
             value = candidate_left
             for start in range(len(right_segments)):
