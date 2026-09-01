@@ -392,24 +392,6 @@ class ComposerAttachmentMixin:
         )
         self._next_image_token = draft.next_image_token
 
-    def _complete_pending_submission(self, queued: bool) -> None:
-        if queued:
-            self._pending_submission = None
-
-    def _pending_submission_for(self, value: str) -> tuple[str | None, bool]:
-        if self._cancelled_submission == value:
-            self._cancelled_submission = None
-            return None, True
-        pending = self._pending_submission
-        return (
-            (None, True)
-            if pending is not None and pending != value
-            else (pending, False)
-        )
-
-    def _pending_submission_changed(self, value: str, queued: bool) -> bool:
-        return queued and self._pending_submission != value
-
     def _attach_draft_state(self, buffer: Buffer, draft: Any) -> None:
         self._restore_draft_state(draft)
         self._draft.attach(
@@ -532,13 +514,11 @@ class ComposerAttachmentMixin:
     def undo_sent_turn(self) -> None:
         """Abort the current turn and restore its submitted text once."""
 
-        pending_submission = getattr(self, "_pending_submission", None)
+        pending_submission = self._submissions.cancel_current()
         if pending_submission is not None:
-            self._pending_submission = None
-            self._cancelled_submission = pending_submission
             self._draft.clear_submitted()
-            self._restore_composer(pending_submission)
-            self._draft.schedule(pending_submission)
+            self._restore_composer(pending_submission.text)
+            self._draft.schedule(pending_submission.text)
             return
 
         candidate = self._undo_candidate

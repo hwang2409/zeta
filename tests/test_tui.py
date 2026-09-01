@@ -5409,6 +5409,106 @@ async def test_run_delivers_queued_follow_up_after_current_turn(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> None:
+    backend = GateBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._submit_input("first")
+    app._submit_input("second")
+    first = await app._submissions.get()
+    first_task = asyncio.create_task(app._handle_prompt_value(first))
+    await backend.started.wait()
+    second = await app._submissions.get()
+    await app._handle_prompt_value(second)
+
+    backend.release.set()
+    await first_task
+    await app._active_task
+    app._start_queued_turn()
+    await app._active_task
+
+    user_texts = [
+        block.text
+        for message in store.messages()
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ]
+    assert user_texts == ["first", "second"]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_submission_undo_cancels_only_the_exact_rapid_enter(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._submit_input("same")
+    app.undo_sent_turn()
+    app._submit_input("same")
+    first = await app._submissions.get()
+    second = await app._submissions.get()
+    await app._handle_prompt_value(first)
+    await app._handle_prompt_value(second)
+    await app._active_task
+
+    user_texts = [
+        block.text
+        for message in store.messages()
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ]
+    assert user_texts == ["same"]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_double_slash_source_text(tmp_path: Path) -> None:
+    backend = GateBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    session = app._make_session()
+    app._active_session = session
+
+    await app._handle_prompt_value("//status")
+    await backend.started.wait()
+    app.undo_sent_turn()
+    await asyncio.gather(app._active_task, return_exceptions=True)
+
+    assert session.app.current_buffer.text == "//status"
+    await app._handle_prompt_value("//status")
+    await app._active_task
+
+    assert len(backend.calls) == 2
+    resent = [
+        block.text
+        for message in backend.calls[-1]
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ]
+    assert resent[-1] == "/status"
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
 async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
     tool_started = asyncio.Event()
     call = ToolCall("call-1", "block", {})
