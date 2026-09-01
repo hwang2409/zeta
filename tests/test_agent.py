@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta.agent_background import BackgroundAgentOwner, finish_background_child
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -34,6 +35,83 @@ from zeta.types import (
 
 async def _collect(events):
     return [event async for event in events]
+
+
+@pytest.mark.asyncio
+async def test_background_owner_waits_for_child_close_before_unregister(
+    tmp_path: Path,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(tmp_path / "child")
+    call = _agent_call()
+    parent_store.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="task research",
+    )
+    child_store.mark_agent_parent(call.id)
+    owner = BackgroundAgentOwner(parent_store)
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    cleanup_called = asyncio.Event()
+
+    async def close_child() -> None:
+        close_started.set()
+        await release_close.wait()
+
+    def cleanup() -> None:
+        cleanup_called.set()
+        owner.unregister("child-1")
+
+    watcher = asyncio.create_task(
+        finish_background_child(
+            child_task=asyncio.create_task(
+                asyncio.sleep(
+                    0,
+                    result={
+                        "content": [{"text": "done"}],
+                        "isError": False,
+                    },
+                )
+            ),
+            child_store=child_store,
+            parent_store=parent_store,
+            notification_store=parent_store,
+            tool_call=call,
+            child_instance_id="child-1",
+            child_path=str(child_store.session_dir),
+            description="task research",
+            child_turns=lambda: 0,
+            build_result=lambda text, error, status: {
+                "content": [{"text": text}],
+                "isError": error,
+                "structuredContent": {"status": status},
+            },
+            validate_result=lambda result, tool_call_id: ToolResult(
+                tool_call_id,
+                result["content"][0]["text"],
+                is_error=result["isError"],
+                structured_content=result["structuredContent"],
+            ),
+            publish_event=lambda event: None,
+            cleanup=cleanup,
+            close_child=close_child,
+            error_message=lambda exc: str(exc),
+            background_owner=owner,
+        )
+    )
+    owner.register("child-1", lambda: None, watcher, parent_store)
+
+    await close_started.wait()
+    waiting = asyncio.create_task(owner.wait())
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    assert not cleanup_called.is_set()
+
+    release_close.set()
+    await watcher
+    await waiting
+    assert cleanup_called.is_set()
 
 
 def _agent_call(

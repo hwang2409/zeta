@@ -669,6 +669,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         """Render child progress while keeping completion notices at turn boundaries."""
 
         if event.type in {
+            StreamEventType.TOOL_EXECUTION_START,
             StreamEventType.TOOL_EXECUTION_UPDATE,
             StreamEventType.TOOL_EXECUTION_END,
         }:

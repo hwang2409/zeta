@@ -410,6 +410,6 @@ async def finish_background_child(
         )
     finally:
         try:
-            cleanup()
-        finally:
             await close_child()
+        finally:
+            cleanup()

@@ -278,13 +278,23 @@ class AgentCard:
                 value = event.data.get("elapsed_ms")
                 elapsed = max(0.0, float(value) / 1000) if isinstance(value, (int, float)) else 0.0
         turns = turns_used
-        display_depth = 1 if depth is None else depth
+        event_depth = event.data.get("depth")
+        display_depth = 1
+        if depth is not None:
+            display_depth = depth
+        elif type(event_depth) is int and event_depth >= 1:
+            display_depth = event_depth
         if turns is None and result.structured_content is not None:
             value = result.structured_content.get("turns_used")
             turns = value if type(value) is int and value >= 0 else 0
         if result.structured_content is not None:
             value = result.structured_content.get("depth")
-            if depth is None and type(value) is int and value >= 1:
+            if (
+                depth is None
+                and not (type(event_depth) is int and event_depth >= 1)
+                and type(value) is int
+                and value >= 1
+            ):
                 display_depth = value
         turns = turns or 0
         structured = result.structured_content or {}
@@ -317,6 +327,13 @@ class AgentCard:
             "",
             depth=depth if type(depth) is int and depth >= 1 else 1,
         )
+
+    def start(self, event: StreamEvent) -> None:
+        if event.type is not StreamEventType.TOOL_EXECUTION_START:
+            return
+        depth = event.data.get("depth")
+        if type(depth) is int and depth >= 1:
+            self._depth = depth
 
     @classmethod
     def render_end(cls, event: StreamEvent) -> RenderableType | None:

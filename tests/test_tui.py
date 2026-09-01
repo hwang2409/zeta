@@ -2063,11 +2063,33 @@ def test_agent_receipts_show_success_and_canceled_status() -> None:
         StreamEventType.TOOL_EXECUTION_END,
         tool_call=call,
         tool_result=ToolResult(call.id, "tool execution canceled", is_error=True),
-        data={"elapsed_seconds": 0.4},
+        data={"elapsed_seconds": 0.4, "depth": 2},
     )
 
     assert "2 turns · 1.5s · ok" in render_agent_receipt(success).plain
-    assert "0 turns · 0.4s · canceled" in render_agent_receipt(canceled).plain
+    canceled_plain = render_agent_receipt(canceled).plain
+    assert "0 turns · 0.4s · canceled" in canceled_plain
+    assert "depth 2" in canceled_plain
+
+
+def test_background_start_event_reaches_presenter_with_depth(tmp_path: Path) -> None:
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path), output)
+    call = ToolCall(
+        "background-nested",
+        "agent",
+        {"prompt": "inspect", "description": "nested research"},
+    )
+
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=call,
+            data={"depth": 2},
+        )
+    )
+
+    assert "depth 2" in output.getvalue()
 
 
 def test_typed_agent_cards_and_receipts_show_type() -> None:

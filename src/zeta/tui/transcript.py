@@ -28,13 +28,20 @@ from .theme import RICH_THEME
 
 
 class _ToolUnit:
-    def __init__(self, call: ToolCall, initial: RenderableType) -> None:
+    def __init__(
+        self,
+        call: ToolCall,
+        initial: RenderableType,
+        start_event: StreamEvent | None = None,
+    ) -> None:
         self.call = call
-        self.renderable = initial
         self.output: list[str] = []
         self.finished = False
         self.revision = 0
         self.card = AgentCard(call)
+        if start_event is not None:
+            self.card.start(start_event)
+        self.renderable = initial
 
     @property
     def active_card(self) -> bool:
@@ -171,9 +178,13 @@ class TranscriptWidget(UIControl):
         self._bump_revision()
 
     def start_tool(
-        self, call_id: str, call: ToolCall, renderable: RenderableType
+        self,
+        call_id: str,
+        call: ToolCall,
+        renderable: RenderableType,
+        start_event: StreamEvent | None = None,
     ) -> None:
-        unit = _ToolUnit(call, renderable)
+        unit = _ToolUnit(call, renderable, start_event)
         self._append_unit(unit)
         self._tools[call_id] = unit
         self._card_units[call_id] = unit
@@ -696,7 +707,7 @@ class TranscriptPresenter:
             return bool(event.delta and event.delta.strip())
         call = event.tool_call
         if call is not None and call.id not in self._tool_region_units:
-            self._tool_region_units[call.id] = _ToolUnit(call, rendered)
+            self._tool_region_units[call.id] = _ToolUnit(call, rendered, event)
         unit = self._tool_region_units.get(call.id) if call is not None else None
         if unit is None:
             return False
@@ -746,13 +757,14 @@ class TranscriptPresenter:
                     event.tool_call.id,
                     event.tool_call,
                     rendered,
+                    event,
                 )
                 self._printed_units = True
             else:
                 self.print_unit(rendered)
             if not self._full_screen_active() and event.tool_call is not None:
                 self._tool_region_units[event.tool_call.id] = _ToolUnit(
-                    event.tool_call, rendered
+                    event.tool_call, rendered, event
                 )
             return ToolEventPresentation(visible_output=True)
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
