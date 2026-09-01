@@ -897,7 +897,7 @@ def render_event(event: StreamEvent) -> RenderableType | None:
             overflow="ellipsis",
         )
     if event.type is StreamEventType.TOOL_EXECUTION_START and event.tool_call:
-        agent_render = AgentCard.render_progress(event.tool_call, "")
+        agent_render = AgentCard.render_start(event)
         if agent_render is not None:
             return agent_render
         if event.tool_call.name.lower() in RECEIPT_TOOLS:

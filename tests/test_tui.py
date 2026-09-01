@@ -2187,11 +2187,33 @@ def test_agent_receipts_show_success_and_canceled_status() -> None:
         StreamEventType.TOOL_EXECUTION_END,
         tool_call=call,
         tool_result=ToolResult(call.id, "tool execution canceled", is_error=True),
-        data={"elapsed_seconds": 0.4},
+        data={"elapsed_seconds": 0.4, "depth": 2},
     )
 
     assert "2 turns · 1.5s · ok" in render_agent_receipt(success).plain
-    assert "0 turns · 0.4s · canceled" in render_agent_receipt(canceled).plain
+    canceled_plain = render_agent_receipt(canceled).plain
+    assert "0 turns · 0.4s · canceled" in canceled_plain
+    assert "depth 2" in canceled_plain
+
+
+def test_background_start_event_reaches_presenter_with_depth(tmp_path: Path) -> None:
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path), output)
+    call = ToolCall(
+        "background-nested",
+        "agent",
+        {"prompt": "inspect", "description": "nested research"},
+    )
+
+    app._handle_background_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=call,
+            data={"depth": 2},
+        )
+    )
+
+    assert "depth 2" in output.getvalue()
 
 
 def test_typed_agent_cards_and_receipts_show_type() -> None:
@@ -2225,6 +2247,191 @@ def test_typed_agent_cards_and_receipts_show_type() -> None:
     )
     assert receipt is not None
     assert "explore · task research" in receipt.plain
+
+
+def test_nested_agent_card_shows_depth_and_reaches_grandchild_tail(
+    tmp_path: Path,
+) -> None:
+    grandchild = ConversationStore(tmp_path / "agents", session_id="1")
+    grandchild.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("grandchild receipt")])
+    )
+    child = ConversationStore(tmp_path / "agents", session_id="child")
+    nested = ToolCall(
+        "grandchild-call",
+        "agent",
+        {"prompt": "inspect", "description": "grandchild"},
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(nested)]))
+    child.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent("grandchild complete")],
+            tool_result=ToolResult(
+                nested.id,
+                "grandchild complete",
+                structured_content={
+                    "turns_used": 1,
+                    "child_session_path": str(grandchild.session_dir),
+                    "depth": 2,
+                },
+            ),
+        )
+    )
+    call = ToolCall(
+        "child-call",
+        "agent",
+        {"prompt": "inspect", "description": "child"},
+    )
+    rendered = AgentCard.render_expanded(
+        call,
+        elapsed_seconds=1.0,
+        turns_used=1,
+        child_session_path=str(child.session_dir),
+    )
+
+    assert rendered is not None
+    plain = Text.from_ansi(renderable_plain(rendered)).plain
+    assert "depth 1" in plain
+    assert "grandchild receipt" in plain
+
+
+@pytest.mark.asyncio
+async def test_nested_agent_lifecycle_reaches_tui_with_depth(
+    tmp_path: Path,
+) -> None:
+    nested = ToolCall(
+        "grandchild-call",
+        "agent",
+        {"prompt": "inspect", "description": "grandchild"},
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        "child-call",
+                        "agent",
+                        {"prompt": "inspect", "description": "child"},
+                    )
+                ]
+            ),
+            ScriptedTurn(tool_calls=[nested]),
+            ScriptedTurn([TextContent("grandchild complete")]),
+            ScriptedTurn([TextContent("child complete")]),
+        ]
+    )
+    events = [
+        event
+        async for event in AgentLoop(
+            backend, ConversationStore(tmp_path), max_turns=1
+        ).run_turn("start")
+    ]
+
+    starts = [
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_START
+        and event.tool_call is not None
+        and event.tool_call.id == nested.id
+    ]
+    ends = [
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+        and event.tool_call is not None
+        and event.tool_call.id == nested.id
+    ]
+    assert len(starts) == 1
+    assert len(ends) == 1
+    assert starts[0].data["depth"] == 2
+    assert ends[0].tool_result is not None
+    assert ends[0].tool_result.structured_content is not None
+    assert ends[0].tool_result.structured_content["depth"] == 2
+    rendered = AgentCard.render_start(starts[0])
+    assert rendered is not None
+    assert "depth 2" in renderable_plain(rendered)
+
+
+def test_nested_lifecycle_keys_keep_identical_foreground_and_background_ids() -> None:
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        _test_console(),
+        lambda: True,
+        lambda renderable: None,
+    )
+    foreground = ToolCall(
+        "same-id",
+        "agent",
+        {"prompt": "inspect", "description": "foreground"},
+    )
+    background = ToolCall(
+        "same-id",
+        "agent",
+        {"prompt": "inspect", "description": "background"},
+    )
+    foreground_scope = "root:foreground"
+    background_scope = "root:background"
+
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=foreground,
+            data={"agent_instance_id": foreground_scope},
+        ),
+        aborted=False,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=background,
+            data={"agent_instance_id": background_scope},
+        ),
+        aborted=False,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=background,
+            tool_result=ToolResult(
+                background.id,
+                "background agent started",
+                structured_content={
+                    "status": "running",
+                    "child_session_path": "/tmp/background",
+                },
+            ),
+            data={"agent_instance_id": background_scope},
+        ),
+        aborted=False,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=foreground,
+            tool_result=ToolResult(foreground.id, "foreground complete"),
+            data={"agent_instance_id": foreground_scope},
+        ),
+        aborted=False,
+    )
+
+    assert (background_scope, background.id) in transcript._tools
+    assert (foreground_scope, foreground.id) not in transcript._tools
+    assert presenter.has_active_agent
+
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=background,
+            tool_result=ToolResult(background.id, "background complete"),
+            data={"agent_instance_id": background_scope},
+        ),
+        aborted=False,
+    )
+
+    assert not transcript._tools
+    assert not presenter.has_active_agent
 
 
 def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> None:
@@ -2362,10 +2569,10 @@ def test_non_full_screen_agent_cards_keep_interleaved_child_streams() -> None:
         )
 
     units = presenter._tool_region_units
-    assert units["agent-1"].card._child_session_path == "/tmp/child-1"
-    assert units["agent-2"].card._child_session_path == "/tmp/child-2"
-    assert "step-1" in "\n".join(units["agent-1"].output)
-    assert "step-2" in "\n".join(units["agent-2"].output)
+    assert units[(None, "agent-1")].card._child_session_path == "/tmp/child-1"
+    assert units[(None, "agent-2")].card._child_session_path == "/tmp/child-2"
+    assert "step-1" in "\n".join(units[(None, "agent-1")].output)
+    assert "step-2" in "\n".join(units[(None, "agent-2")].output)
 
     for index, call in enumerate(calls, start=1):
         presenter.handle_tool_event(
@@ -2481,7 +2688,7 @@ def test_presenter_refreshes_live_agent_cards_in_full_screen() -> None:
 
     presenter.refresh_active_agents()
 
-    assert transcript._tools[call.id].revision == 1
+    assert transcript._tools[(None, call.id)].revision == 1
 
 
 def test_agent_card_toggle_is_symmetric_during_and_after_execution(
@@ -4902,9 +5109,14 @@ def test_full_screen_pty_keeps_padded_margins_clean(
             str(columns),
             "-y",
             str(rows),
+            "sh",
+            "-c",
+            'exec env ZETA_HOME="$1" TERM="$2" COLORTERM="$3" "$4" --provider fake',
+            "zeta-pane",
+            str(tmp_path / "zeta-home"),
+            "xterm-256color",
+            "truecolor",
             str(zeta),
-            "--provider",
-            "fake",
         ],
         cwd=Path(__file__).parents[1],
         env=env,
@@ -4958,6 +5170,7 @@ def test_full_screen_pty_keeps_padded_margins_clean(
         assert any(line.startswith("  ▌ hello") for line in plain)
         assert all(not line[:2].strip() for line in plain)
         assert not _contains_background_sgr(escaped)
+        assert list((tmp_path / "zeta-home" / "sessions").iterdir())
     finally:
         subprocess.run(["tmux", "kill-session", "-t", session], check=False)
 

@@ -55,6 +55,13 @@ def _parse_agent_state(value: dict[str, Any], state_path: Path) -> dict[str, Any
                 "background" in marker
                 and type(marker["background"]) is not bool
             )
+            or (
+                "child_instance_id" in marker
+                and (
+                    type(marker["child_instance_id"]) is not str
+                    or not marker["child_instance_id"]
+                )
+            )
         ):
             raise ConversationIntegrityError(
                 f"session state child marker is invalid: {state_path}"
@@ -156,6 +163,7 @@ class AgentStateMixin:
         description: str,
         agent_type: str | None = None,
         background: bool = False,
+        child_instance_id: str | None = None,
     ) -> None:
         """Persist a running child marker before the child starts."""
 
@@ -172,8 +180,11 @@ class AgentStateMixin:
             }
             if background:
                 marker["background"] = True
+            if child_instance_id is not None:
+                marker["child_instance_id"] = child_instance_id
             marker.update(_agent_type_metadata(agent_type))
-            self._agent_children[tool_call.id] = marker
+            marker_key = child_instance_id or tool_call.id
+            self._agent_children[marker_key] = marker
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     def agent_children(self) -> dict[str, dict[str, Any]]:
@@ -181,29 +192,29 @@ class AgentStateMixin:
 
         return copy.deepcopy(self._agent_children)
 
-    def update_agent_child_turns(self, tool_call_id: str, turns_used: int) -> None:
-        """Persist the number of completed turns for a running child."""
+    def update_agent_child_turns(self, marker_key: str, turns_used: int) -> None:
+        """Persist completed turns for a child marker."""
 
         if type(turns_used) is not int or turns_used < 0:
             raise ValueError("child turns must be a nonnegative integer")
         with self._append_lock():
             self._load()
             self._load_session_state()
-            marker = self._agent_children.get(tool_call_id)
+            marker = self._agent_children.get(marker_key)
             if marker is None:
                 return
             marker["turns_used"] = turns_used
             self._write_session_state(self.bash_cwd, self._todo_items)
 
-    def finish_agent_child(self, tool_call_id: str) -> None:
-        """Remove a child marker after its parent tool result is durable."""
+    def finish_agent_child(self, marker_key: str) -> None:
+        """Remove a child marker after its parent result is durable."""
 
         with self._append_lock():
             self._load()
             self._load_session_state()
-            if tool_call_id not in self._agent_children:
+            if marker_key not in self._agent_children:
                 return
-            self._agent_children.pop(tool_call_id)
+            self._agent_children.pop(marker_key)
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     def mark_agent_parent(

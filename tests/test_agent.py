@@ -6,6 +6,11 @@ from pathlib import Path
 
 import pytest
 
+from zeta.agent_background import (
+    BackgroundAgentOwner,
+    adopt_agent_children,
+    finish_background_child,
+)
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -34,6 +39,83 @@ from zeta.types import (
 
 async def _collect(events):
     return [event async for event in events]
+
+
+@pytest.mark.asyncio
+async def test_background_owner_waits_for_child_close_before_unregister(
+    tmp_path: Path,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(tmp_path / "child")
+    call = _agent_call()
+    parent_store.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="task research",
+    )
+    child_store.mark_agent_parent(call.id)
+    owner = BackgroundAgentOwner(parent_store)
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    cleanup_called = asyncio.Event()
+
+    async def close_child() -> None:
+        close_started.set()
+        await release_close.wait()
+
+    def cleanup() -> None:
+        cleanup_called.set()
+        owner.unregister("child-1")
+
+    watcher = asyncio.create_task(
+        finish_background_child(
+            child_task=asyncio.create_task(
+                asyncio.sleep(
+                    0,
+                    result={
+                        "content": [{"text": "done"}],
+                        "isError": False,
+                    },
+                )
+            ),
+            child_store=child_store,
+            parent_store=parent_store,
+            notification_store=parent_store,
+            tool_call=call,
+            child_instance_id="child-1",
+            child_path=str(child_store.session_dir),
+            description="task research",
+            child_turns=lambda: 0,
+            build_result=lambda text, error, status: {
+                "content": [{"text": text}],
+                "isError": error,
+                "structuredContent": {"status": status},
+            },
+            validate_result=lambda result, tool_call_id: ToolResult(
+                tool_call_id,
+                result["content"][0]["text"],
+                is_error=result["isError"],
+                structured_content=result["structuredContent"],
+            ),
+            publish_event=lambda event: None,
+            cleanup=cleanup,
+            close_child=close_child,
+            error_message=lambda exc: str(exc),
+            background_owner=owner,
+        )
+    )
+    owner.register("child-1", lambda: None, watcher, parent_store)
+
+    await close_started.wait()
+    waiting = asyncio.create_task(owner.wait())
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    assert not cleanup_called.is_set()
+
+    release_close.set()
+    await watcher
+    await waiting
+    assert cleanup_called.is_set()
 
 
 def _agent_call(
@@ -160,6 +242,162 @@ class BackgroundBackend(CompletionBackend):
             blocks = [TextContent("child complete")]
         else:
             blocks = [TextContent("parent continued")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+class NestedBlockingBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.grandchild_started = asyncio.Event()
+        self.release_grandchild = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        self.call_count += 1
+        if self.call_count == 1:
+            blocks = [ToolUseContent(_agent_call("child"))]
+        elif self.call_count == 2:
+            blocks = [ToolUseContent(_agent_call("grandchild"))]
+        else:
+            self.grandchild_started.set()
+            await self.release_grandchild.wait()
+            blocks = [TextContent("grandchild complete")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+class NestedBackgroundBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.grandchild_started = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        self.call_count += 1
+        if self.call_count == 1:
+            blocks = [ToolUseContent(_background_agent_call("child"))]
+        elif self.call_count == 2:
+            nested = _background_agent_call("grandchild")
+            nested.arguments["description"] = "grandchild"
+            blocks = [ToolUseContent(nested)]
+        else:
+            self.grandchild_started.set()
+            await asyncio.Event().wait()
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+class ForegroundNestedBackgroundBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.child_nested = False
+        self.grandchild_started = asyncio.Event()
+        self.release_grandchild = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        if last_user == "start":
+            child = _agent_call("child")
+            child.arguments["prompt"] = "child prompt"
+            blocks = [ToolUseContent(child)]
+        elif last_user == "child prompt" and not self.child_nested:
+            self.child_nested = True
+            grandchild = _background_agent_call("grandchild")
+            grandchild.arguments["prompt"] = "grandchild prompt"
+            grandchild.arguments["description"] = "grandchild"
+            blocks = [ToolUseContent(grandchild)]
+        elif last_user == "grandchild prompt":
+            self.grandchild_started.set()
+            await self.release_grandchild.wait()
+            blocks = [TextContent("grandchild complete")]
+        else:
+            blocks = [TextContent("child complete")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+class ParallelNestedReadBackend(CompletionBackend):
+    def __init__(self, count: int) -> None:
+        self.calls = []
+        for index in range(count):
+            call = _agent_call(f"agent-{index}")
+            call.arguments["prompt"] = f"inspect {index}"
+            self.calls.append(call)
+        self.seen_prompts: set[str] = set()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        if last_user == "start":
+            blocks = [ToolUseContent(call) for call in self.calls]
+        elif last_user not in self.seen_prompts:
+            self.seen_prompts.add(last_user)
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        f"{last_user}-read",
+                        "read",
+                        {"path": "missing"},
+                    )
+                )
+            ]
+        else:
+            blocks = [TextContent("child complete")]
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
@@ -315,6 +553,60 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_parent_abort_cancels_background_grandchild(
+    tmp_path: Path,
+) -> None:
+    backend = NestedBackgroundBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
+    loop.abort()
+    await _wait_for_notification(store, "canceled")
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    grandchild_store = ConversationStore(
+        child_store.session_dir / "agents", session_id="1"
+    )
+    assert child_store.agent_notifications(pending_only=False)[0].data["status"] == (
+        "canceled"
+    )
+    assert grandchild_store.agent_canceled() == {
+        "tool_call_id": "grandchild",
+        "content": "tool execution canceled",
+    }
+    assert not store.agent_children()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_foreground_child_does_not_wait_for_background_grandchild(
+    tmp_path: Path,
+) -> None:
+    backend = ForegroundNestedBackgroundBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
+    events = await asyncio.wait_for(task, timeout=1)
+
+    assert any(event.type is StreamEventType.TURN_END for event in events)
+    assert store.agent_notifications() == []
+    marker = next(iter(store.agent_children().values()))
+    assert marker["child_session_path"] == str(
+        store.session_dir / "agents" / "1" / "agents" / "1"
+    )
+
+    backend.release_grandchild.set()
+    notification = await _wait_for_notification(store, "completed")
+    assert notification.data["text"] == "grandchild complete"
+    await loop.close()
+    assert not store.agent_children()
+
+
+@pytest.mark.asyncio
 async def test_background_and_foreground_tools_mix_in_one_turn(
     tmp_path: Path,
 ) -> None:
@@ -429,6 +721,104 @@ def test_resume_keeps_completed_unnotified_background_notification(
     ).agent_canceled() is None
 
 
+def test_resume_cancels_adopted_background_grandchild(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(
+        child.session_dir / "agents", session_id="1"
+    )
+    child_call = _background_agent_call("child")
+    child.mark_agent_parent(child_call.id)
+    child.finish_agent_parent()
+    grandchild_call = _background_agent_call("grandchild")
+    grandchild.mark_agent_parent(grandchild_call.id)
+    root.register_agent_child(
+        grandchild_call,
+        child_session_path=str(grandchild.session_dir),
+        description="grandchild",
+        background=True,
+        child_instance_id="root:1:1",
+    )
+
+    resumed = ConversationStore(tmp_path, session_id="root")
+    AgentLoop(FakeBackend([]), resumed)
+
+    notification = resumed.agent_notifications()[0]
+    assert notification.data["status"] == "canceled"
+    assert "session exited" in notification.data["text"]
+    assert not resumed.agent_children()
+    assert ConversationStore(
+        child.session_dir / "agents", session_id="1"
+    ).agent_canceled() == {
+        "tool_call_id": grandchild_call.id,
+        "content": "tool execution canceled",
+    }
+
+
+def test_resume_keeps_same_id_adopted_background_grandchildren_separate(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    children = [
+        ConversationStore(root.session_dir / "agents", session_id=str(index))
+        for index in (1, 2)
+    ]
+    grandchild_call = _background_agent_call("same-grandchild")
+
+    for index, child in enumerate(children, start=1):
+        grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+        grandchild.mark_agent_parent(grandchild_call.id)
+        child.register_agent_child(
+            grandchild_call,
+            child_session_path=str(grandchild.session_dir),
+            description=f"grandchild {index}",
+            background=True,
+            child_instance_id=f"root:{index}:1",
+        )
+        adopt_agent_children(child, root)
+
+    assert set(root.agent_children()) == {"root:1:1", "root:2:1"}
+    root.finish_agent_child("root:1:1")
+    assert set(root.agent_children()) == {"root:2:1"}
+
+    resumed = ConversationStore(tmp_path, session_id="root")
+    AgentLoop(FakeBackend([]), resumed)
+
+    notifications = resumed.agent_notifications(pending_only=False)
+    assert [entry.data["child_instance_id"] for entry in notifications] == [
+        "root:2:1"
+    ]
+    recovered = ConversationStore(
+        children[1].session_dir / "agents", session_id="1"
+    )
+    assert recovered.agent_canceled() == {
+        "tool_call_id": "same-grandchild",
+        "content": "tool execution canceled",
+    }
+
+
+@pytest.mark.asyncio
+async def test_background_persistence_failure_does_not_block_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call = _background_agent_call()
+    backend = BackgroundBackend([call])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+
+    def fail_notification(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("persistence failed")
+
+    monkeypatch.setattr(store, "append_agent_notification", fail_notification)
+    backend.release_child.set()
+    await asyncio.wait_for(loop.close(), timeout=1)
+
+    assert not loop.background_children_running
+
+
 @pytest.mark.asyncio
 async def test_parallel_agent_calls_overlap_and_keep_child_results(
     tmp_path: Path,
@@ -452,6 +842,42 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
         "1",
         "2",
     ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_nested_lifecycle_events_survive_large_batch(
+    tmp_path: Path,
+) -> None:
+    backend = ParallelNestedReadBackend(44)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_turn_budget=100,
+    )
+
+    events = await asyncio.wait_for(_collect(loop.run_turn("start")), timeout=2)
+
+    read_lifecycle = [
+        event
+        for event in events
+        if event.tool_call is not None
+        and event.tool_call.name == "read"
+        and event.type
+        in {
+            StreamEventType.TOOL_EXECUTION_START,
+            StreamEventType.TOOL_EXECUTION_END,
+        }
+    ]
+    assert len(read_lifecycle) == 88
+    errors = [
+        event.error
+        for event in events
+        if event.type is StreamEventType.ERROR and event.error is not None
+    ]
+    assert [error.code for error in errors] == ["max_turns"]
+    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -543,14 +969,14 @@ async def test_agent_returns_child_text_and_persists_child_session(tmp_path: Pat
     assert [message.role for message in ConversationStore(
         store.session_dir / "agents", session_id="1"
     ).messages()] == [MessageRole.USER, MessageRole.ASSISTANT]
-    assert "agent" not in {
+    assert "agent" in {
         schema["name"] for schema in backend.calls[1][1]
     }
     assert {
         schema["name"] for schema in backend.calls[1][1]
     } == {
         schema["name"] for schema in backend.calls[0][1]
-    } - {"agent"}
+    }
 
 
 def test_agent_schema_uses_preset_registry(
@@ -625,7 +1051,7 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
     await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
     child_schemas = {schema["name"] for schema in backend.calls[1][1]}
-    assert child_schemas == {"fetch", "read", "skill", "websearch"}
+    assert child_schemas == {"agent", "fetch", "read", "skill", "websearch"}
     child_messages = ConversationStore(
         store.session_dir / "agents", session_id="1"
     ).messages()
@@ -709,6 +1135,7 @@ async def test_plan_child_includes_todo_and_only_read_only_tools(tmp_path: Path)
     await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
     assert {schema["name"] for schema in backend.calls[1][1]} == {
+        "agent",
         "fetch",
         "read",
         "skill",
@@ -972,13 +1399,14 @@ async def test_agent_turn_cap_returns_loud_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_child_agent_call_is_rejected(tmp_path: Path) -> None:
+async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
     nested = _agent_call("nested")
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call()]),
             ScriptedTurn(tool_calls=[nested]),
-            ScriptedTurn([TextContent("nested rejected")]),
+            ScriptedTurn([TextContent("grandchild complete")]),
+            ScriptedTurn([TextContent("child complete")]),
         ]
     )
     store = ConversationStore(tmp_path)
@@ -986,7 +1414,7 @@ async def test_child_agent_call_is_rejected(tmp_path: Path) -> None:
     await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.content == "nested rejected"
+    assert result.content == "child complete"
     child_result = next(
         message.tool_result
         for message in ConversationStore(
@@ -994,8 +1422,248 @@ async def test_child_agent_call_is_rejected(tmp_path: Path) -> None:
         ).messages()
         if message.tool_result
     )
+    assert child_result.content == "grandchild complete"
+    grandchild_schemas = {
+        schema["name"] for schema in backend.calls[2][1]
+    }
+    assert "agent" not in grandchild_schemas
+
+
+@pytest.mark.asyncio
+async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
+    nested = _agent_call("grandchild")
+    child = _agent_call("child", "explore")
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[child]),
+            ScriptedTurn(tool_calls=[nested]),
+            ScriptedTurn([TextContent("grandchild complete")]),
+            ScriptedTurn([TextContent("child complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    child_tools = {schema["name"] for schema in backend.calls[1][1]}
+    grandchild_tools = {schema["name"] for schema in backend.calls[2][1]}
+    assert child_tools == {"agent", "fetch", "read", "skill", "websearch"}
+    assert grandchild_tools == {"fetch", "read", "skill", "websearch"}
+
+
+@pytest.mark.asyncio
+async def test_shared_turn_budget_covers_generations(tmp_path: Path) -> None:
+    nested = _agent_call("grandchild")
+    child = _agent_call("child")
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[child]),
+            ScriptedTurn(tool_calls=[nested]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(
+        AgentLoop(
+            backend,
+            store,
+            max_turns=1,
+            agent_turn_budget=1,
+        ).run_turn("start")
+    )
+
+    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    assert result.is_error
+    assert "shared agent turn budget exhausted" in result.content
+    assert result.structured_content is not None
+    assert result.structured_content["error_code"] == "agent_turn_budget"
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    child_result = next(
+        message.tool_result
+        for message in child_store.messages()
+        if message.tool_result
+    )
     assert child_result.is_error
-    assert "unknown tool: agent" in child_result.content
+    assert "shared agent turn budget exhausted" in child_result.content
+
+
+@pytest.mark.asyncio
+async def test_shared_turn_budget_covers_parallel_siblings(tmp_path: Path) -> None:
+    calls = [_agent_call("child-1"), _agent_call("child-2")]
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=calls),
+            ScriptedTurn([TextContent("one")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(
+        AgentLoop(
+            backend,
+            store,
+            max_turns=1,
+            agent_turn_budget=1,
+        ).run_turn("start")
+    )
+
+    results = [message.tool_result for message in store.messages() if message.tool_result]
+    assert sorted(result.is_error for result in results if result is not None) == [
+        False,
+        True,
+    ]
+    assert any(
+        result is not None
+        and result.structured_content is not None
+        and result.structured_content.get("error_code") == "agent_turn_budget"
+        for result in results
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) -> None:
+    nested = _agent_call("grandchild")
+    nested.arguments["background"] = True
+    child = _background_agent_call("child")
+    child.arguments["prompt"] = "inspect the task"
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[child]),
+            ScriptedTurn(tool_calls=[nested]),
+            ScriptedTurn([TextContent("child complete")]),
+            ScriptedTurn([TextContent("child finished")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _wait_for_notification(store, "completed")
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    nested_result = next(
+        message.tool_result
+        for message in child_store.messages()
+        if message.tool_result
+    )
+    assert nested_result.structured_content is not None
+    assert nested_result.structured_content["status"] == "running"
+    assert [entry.data["status"] for entry in child_store.agent_notifications()] == [
+        "completed"
+    ]
+    grandchild_store = ConversationStore(
+        child_store.session_dir / "agents", session_id="1"
+    )
+    assert grandchild_store.agent_canceled() is None
+
+
+@pytest.mark.asyncio
+async def test_abort_propagates_through_two_nested_levels(tmp_path: Path) -> None:
+    backend = NestedBlockingBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
+    loop.abort()
+    await asyncio.wait_for(task, timeout=1)
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    grandchild_store = ConversationStore(
+        child_store.session_dir / "agents", session_id="1"
+    )
+    assert child_store.agent_canceled() == {
+        "tool_call_id": "child",
+        "content": "tool execution canceled",
+    }
+    assert grandchild_store.agent_canceled() == {
+        "tool_call_id": "grandchild",
+        "content": "tool execution canceled",
+    }
+    await loop.close()
+
+
+def test_resume_cancels_nested_tree_markers(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    child_call = _agent_call("child")
+    grandchild_call = _agent_call("grandchild")
+    child.mark_agent_parent(child_call.id)
+    grandchild.mark_agent_parent(grandchild_call.id)
+    child.register_agent_child(
+        grandchild_call,
+        child_session_path=str(grandchild.session_dir),
+        description="grandchild",
+        child_instance_id="root:1:1",
+    )
+    root.register_agent_child(
+        child_call,
+        child_session_path=str(child.session_dir),
+        description="child",
+    )
+
+    resumed = ConversationStore(tmp_path, session_id="root")
+    AgentLoop(FakeBackend([]), resumed)
+
+    assert not resumed.agent_children()
+    assert ConversationStore(
+        root.session_dir / "agents", session_id="1"
+    ).agent_canceled() == {
+        "tool_call_id": "child",
+        "content": "tool execution canceled",
+    }
+    assert ConversationStore(
+        child.session_dir / "agents", session_id="1"
+    ).agent_canceled() == {
+        "tool_call_id": "grandchild",
+        "content": "tool execution canceled",
+    }
+
+
+def test_resume_cancels_nested_background_tree_markers(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    child_call = _background_agent_call("child")
+    grandchild_call = _background_agent_call("grandchild")
+    child_call.arguments["description"] = "child"
+    grandchild_call.arguments["description"] = "grandchild"
+    child.mark_agent_parent(child_call.id)
+    grandchild.mark_agent_parent(grandchild_call.id)
+    _persist_background_receipt(child, grandchild_call, grandchild)
+    child.register_agent_child(
+        grandchild_call,
+        child_session_path=str(grandchild.session_dir),
+        description="grandchild",
+        background=True,
+        child_instance_id="root:1:1",
+    )
+    _persist_background_receipt(root, child_call, child)
+    root.register_agent_child(
+        child_call,
+        child_session_path=str(child.session_dir),
+        description="child",
+        background=True,
+        child_instance_id="root:1",
+    )
+
+    resumed = ConversationStore(tmp_path, session_id="root")
+    AgentLoop(FakeBackend([]), resumed)
+
+    assert resumed.agent_notifications()[0].data["status"] == "canceled"
+    resumed_child = ConversationStore(
+        resumed.session_dir / "agents", session_id="1"
+    )
+    resumed_grandchild = ConversationStore(
+        resumed_child.session_dir / "agents", session_id="1"
+    )
+    assert resumed_child.agent_notifications()[0].data["status"] == "canceled"
+    assert not resumed.agent_children()
+    assert not resumed_child.agent_children()
+    assert resumed_grandchild.agent_canceled() == {
+        "tool_call_id": "grandchild",
+        "content": "tool execution canceled",
+    }
 
 
 @pytest.mark.asyncio
@@ -1045,6 +1713,56 @@ async def test_child_approval_uses_parent_policy(tmp_path: Path) -> None:
     denied = next(message.tool_result for message in child_messages if message.tool_result)
     assert denied.is_error
     assert denied.content == "tool execution denied"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        ("approve", "nested"),
+        ("deny", "tool execution denied"),
+        ("abort", "tool execution canceled"),
+    ],
+)
+async def test_grandchild_approval_composes_with_parent_policy(
+    tmp_path: Path, action: str, expected: str
+) -> None:
+    grandchild_bash = ToolCall("grandchild-bash", "bash", {"cmd": "echo nested"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("child")]),
+            ScriptedTurn(tool_calls=[_agent_call("grandchild")]),
+            ScriptedTurn(tool_calls=[grandchild_bash]),
+            ScriptedTurn([TextContent("grandchild finished")]),
+            ScriptedTurn([TextContent("child finished")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(store=store)
+    loop = AgentLoop(backend, store, approval_policy=policy, max_turns=1)
+
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    for _ in range(100):
+        pending = policy.pending_requests()
+        if pending:
+            break
+        await asyncio.sleep(0.01)
+    assert len(pending) == 1
+    request = pending[0]
+    assert request.child_instance_id == f"{store.session_id}:1:1"
+    assert getattr(policy, action)(request.key)
+    await asyncio.wait_for(task, timeout=1)
+
+    grandchild_store = ConversationStore(
+        store.session_dir / "agents" / "1" / "agents", session_id="1"
+    )
+    bash_result = next(
+        message.tool_result
+        for message in grandchild_store.messages()
+        if message.tool_result is not None
+    )
+    assert expected in bash_result.content
+    await loop.close()
 
 
 @pytest.mark.asyncio
