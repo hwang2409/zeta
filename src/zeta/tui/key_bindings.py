@@ -153,6 +153,7 @@ def build_key_bindings(
             full_screen_mode()
             and search_active is not None
             and search_active()
+            and not is_searching()
         )
 
     @Condition

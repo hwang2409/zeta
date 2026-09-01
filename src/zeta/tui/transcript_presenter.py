@@ -288,8 +288,7 @@ class TranscriptPresenter:
     def refresh_active_agents(self) -> None:
         """Refresh elapsed time without adding child events to the parent store."""
 
-        for unit in self.transcript._tools.values():
-            unit.refresh()
+        self.transcript.refresh_active_agents()
         if self._tool_region is not None:
             for unit in self._tool_region_units.values():
                 unit.refresh()

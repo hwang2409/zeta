@@ -26,7 +26,7 @@ from ..types import (
 from .agent_card import AgentCard
 from .render import render_tool_progress
 from .theme import RICH_THEME
-from .transcript_search import SearchMatch, find_matches, highlight
+from .transcript_search import HighlightCache, SearchMatch, find_matches
 
 
 def stream_key(
@@ -151,16 +151,18 @@ class TranscriptWidget(UIControl):
         self._content_width = 80
         self._line_locations: list[tuple[_TranscriptUnit | None, int]] = []
         self._locations_revision = -1
-        self._locations_cache: dict[
+        self._locations_cache: OrderedDict[
             int, tuple[int, list[tuple[_TranscriptUnit | None, int]]]
-        ] = {}
+        ] = OrderedDict()
         self._anchor: tuple[_TranscriptUnit | None, int] | None = None
         self._user_units: list[_TranscriptUnit] = []
         self._search_active = False
         self._search_query = ""
         self._search_index = 0
-        self._search_cache: dict[tuple[int, int, str], list[SearchMatch]] = {}
-        self._highlight_cache: tuple[tuple[int, int, str, int], str] | None = None
+        self._search_cache: OrderedDict[
+            tuple[int, int, str], list[SearchMatch]
+        ] = OrderedDict()
+        self._highlight_cache: tuple[tuple[int, int, str], HighlightCache] | None = None
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -268,6 +270,17 @@ class TranscriptWidget(UIControl):
         unit = self._tools.get(_tool_lifecycle_key(call_id, event))
         if unit is not None:
             unit.update(rendered, event)
+            self._bump_revision()
+
+    def refresh_active_agents(self) -> None:
+        """Refresh active cards and invalidate derived transcript caches once."""
+
+        refreshed = False
+        for unit in self._tools.values():
+            revision = unit.revision
+            unit.refresh()
+            refreshed = refreshed or unit.revision != revision
+        if refreshed:
             self._bump_revision()
 
     def finish_tool(
@@ -425,6 +438,11 @@ class TranscriptWidget(UIControl):
             plain_lines = Text.from_ansi(self._base_render(actual_width)).plain.splitlines()
             matches = find_matches(plain_lines, self._search_query)
             self._search_cache[cache_key] = matches
+            self._search_cache.move_to_end(cache_key)
+            while len(self._search_cache) > 3:
+                self._search_cache.popitem(last=False)
+        else:
+            self._search_cache.move_to_end(cache_key)
         self._search_index = self._search_index % len(matches) if matches else 0
         return matches
 
@@ -436,13 +454,29 @@ class TranscriptWidget(UIControl):
                 allow_follow_tail=False,
             )
 
+    def _refresh_search_render_cache(self) -> None:
+        cache = self._highlight_cache
+        if cache is None or cache[0][0] != self._content_width:
+            self._parsed_cache.clear()
+            return
+        cache[1].render(self._search_index)
+        parsed = self._parsed_cache.get(self._content_width)
+        if parsed is None:
+            return
+        for line in cache[1].changed_lines:
+            fragments = to_formatted_text(ANSI(cache[1].fragments[line]))
+            updated = list(split_lines(fragments)) or [[]]
+            if len(updated) != 1:
+                self._parsed_cache.clear()
+                return
+            parsed[line] = updated[0]
+
     def next_search_match(self) -> bool:
         matches = self._search_matches()
         if not matches:
             return False
         self._search_index = (self._search_index + 1) % len(matches)
-        self._parsed_cache.clear()
-        self._highlight_cache = None
+        self._refresh_search_render_cache()
         self._focus_search_match()
         return True
 
@@ -451,8 +485,7 @@ class TranscriptWidget(UIControl):
         if not matches:
             return False
         self._search_index = (self._search_index - 1) % len(matches)
-        self._parsed_cache.clear()
-        self._highlight_cache = None
+        self._refresh_search_render_cache()
         self._focus_search_match()
         return True
 
@@ -506,12 +539,13 @@ class TranscriptWidget(UIControl):
         matches = self._search_matches(width)
         if not matches:
             return base
-        cache_key = (width, self._revision, self._search_query, self._search_index)
-        if self._highlight_cache is not None and self._highlight_cache[0] == cache_key:
-            return self._highlight_cache[1]
-        rendered = highlight(base, width, matches, self._search_index)
-        self._highlight_cache = (cache_key, rendered)
-        return rendered
+        cache_key = (width, self._revision, self._search_query)
+        if self._highlight_cache is None or self._highlight_cache[0] != cache_key:
+            self._highlight_cache = (
+                cache_key,
+                HighlightCache(base, width, matches),
+            )
+        return self._highlight_cache[1].render(self._search_index)
 
     def _render_unit(self, unit: _TranscriptUnit, width: int) -> str:
         value = unit.value
@@ -561,9 +595,13 @@ class TranscriptWidget(UIControl):
     def _locations(self, width: int) -> list[tuple[_TranscriptUnit | None, int]]:
         cached = self._locations_cache.get(width)
         if cached is not None and cached[0] == self._revision:
+            self._locations_cache.move_to_end(width)
             return cached[1]
         locations = self._compute_locations(width)
         self._locations_cache[width] = (self._revision, locations)
+        self._locations_cache.move_to_end(width)
+        while len(self._locations_cache) > 3:
+            self._locations_cache.popitem(last=False)
         return locations
 
     def _compute_locations(self, width: int) -> list[tuple[_TranscriptUnit | None, int]]:

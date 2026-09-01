@@ -876,6 +876,16 @@ def test_transcript_paging_reuses_locations_by_width_and_revision(
     assert calls == 2
 
 
+def test_transcript_locations_cache_is_bounded_by_width() -> None:
+    transcript = TranscriptWidget()
+    transcript.append(Text("line"))
+
+    for width in range(40, 141):
+        transcript._locations(width)
+
+    assert len(transcript._locations_cache) == 3
+
+
 def test_transcript_resize_preserves_anchor_and_tail_reentry() -> None:
     transcript = TranscriptWidget()
     for index in range(8):
@@ -1046,6 +1056,18 @@ def test_transcript_parsed_cache_is_bounded_and_revision_scoped() -> None:
 
     transcript.append(Text("new line"))
     assert not transcript._parsed_cache
+
+
+def test_transcript_search_cache_is_bounded_by_width() -> None:
+    transcript = TranscriptWidget()
+    transcript.append(Text("target"))
+    transcript.begin_search()
+    transcript.update_search("target")
+
+    for width in range(40, 141):
+        transcript._search_matches(width)
+
+    assert len(transcript._search_cache) == 3
 
 
 def test_transcript_cache_uses_stable_keys_after_tool_discard() -> None:
@@ -2842,6 +2864,48 @@ def test_presenter_refreshes_live_agent_cards_in_full_screen() -> None:
     assert transcript._tools[(None, call.id)].revision == 1
 
 
+def test_background_agent_refresh_invalidates_transcript_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = ToolCall(
+        "agent-background-refresh",
+        "agent",
+        {"prompt": "inspect", "description": "background research"},
+    )
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        _test_console(),
+        lambda: True,
+        lambda renderable: None,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call),
+        aborted=False,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "background agent started",
+                structured_content={"status": "running"},
+            ),
+        ),
+        aborted=False,
+    )
+    transcript.begin_search()
+    transcript.update_search("fresh target")
+    assert transcript.search_status() == (0, 0)
+
+    unit = transcript._tools[(None, call.id)]
+    monkeypatch.setattr(unit.card, "refresh", lambda: Text("fresh target"))
+    presenter.refresh_active_agents()
+
+    assert transcript.search_status() == (1, 1)
+
+
 def test_agent_card_toggle_is_symmetric_during_and_after_execution(
     tmp_path: Path,
 ) -> None:
@@ -3102,6 +3166,58 @@ async def test_transcript_search_query_accepts_navigation_key_text() -> None:
         await wait_until(lambda: values == ["n", "nN", "nN\x12"])
         pipe.send_text("\rN\x1b")
         await wait_until(lambda: actions == ["next", "previous"])
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("editing_mode", [EditingMode.EMACS, EditingMode.VI])
+async def test_history_search_acceptance_survives_transcript_search(
+    editing_mode: EditingMode,
+    tmp_path: Path,
+) -> None:
+    history = history_for(tmp_path / "history")
+    history.append_string("history target")
+    transcript_search_active = False
+    actions: list[str] = []
+
+    def start_search() -> None:
+        nonlocal transcript_search_active
+        transcript_search_active = True
+
+    def end_search() -> None:
+        nonlocal transcript_search_active
+        transcript_search_active = False
+
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=editing_mode,
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_search_start=start_search,
+                search_active=lambda: transcript_search_active,
+                on_search_input=lambda _value: None,
+                on_search_next=lambda: actions.append("next"),
+                on_search_end=end_search,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        session.app.full_screen = True
+        pipe.send_text("\x06query\r")
+        await wait_until(lambda: actions == ["next"])
+        pipe.send_text("\x12history")
+        await wait_until(lambda: session.search_buffer.text == "history")
+        pipe.send_text("\r")
+        await wait_until(
+            lambda: session.default_buffer.text == "history target"
+        )
+        assert actions == ["next"]
         session.app.exit()
         await task
 
