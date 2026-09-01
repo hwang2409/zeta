@@ -463,6 +463,9 @@ class TranscriptWidget(UIControl):
         parsed = self._parsed_cache.get(self._content_width)
         if parsed is None:
             return
+        for width in tuple(self._parsed_cache):
+            if width != self._content_width:
+                del self._parsed_cache[width]
         for line in cache[1].changed_lines:
             fragments = to_formatted_text(ANSI(cache[1].fragments[line]))
             updated = list(split_lines(fragments)) or [[]]

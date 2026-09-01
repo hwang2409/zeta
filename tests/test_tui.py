@@ -26,6 +26,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
+from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
@@ -750,6 +751,37 @@ def test_transcript_search_highlights_matches_and_wraps() -> None:
     transcript.end_search()
     assert transcript.search_status() is None
     assert "\x1b[" not in transcript.render(80)
+
+
+def test_transcript_search_resize_back_refreshes_current_match_style() -> None:
+    def match_styles(content: UIContent) -> tuple[str, str]:
+        first, second = (
+            next(
+                style
+                for style, text in content.get_line(line)
+                if text == "t" and style
+            )
+            for line in (1, 2)
+        )
+        return first, second
+
+    transcript = TranscriptWidget()
+    transcript.append(Text("first target"))
+    transcript.append(Text("second target"))
+    transcript.begin_search()
+    transcript.update_search("target")
+
+    initial = transcript.create_content(60, 3)
+    initial_styles = match_styles(initial)
+
+    transcript.create_content(30, 3)
+    assert transcript.next_search_match()
+    assert transcript.search_status() == (2, 2)
+
+    resized = transcript.create_content(60, 3)
+    resized_styles = match_styles(resized)
+
+    assert resized_styles == initial_styles[::-1]
 
 
 def test_transcript_search_stays_anchored_at_the_tail_until_closed() -> None:
