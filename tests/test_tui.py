@@ -6813,6 +6813,44 @@ async def test_vi_composer_history_up_works_from_insert_mode_on_empty_buffer(
     assert submitted == ["remember me", "remember me"]
 
 
+@pytest.mark.asyncio
+async def test_approval_shortcuts_only_fire_on_an_empty_composer() -> None:
+    answered: list[str] = []
+
+    def bindings() -> object:
+        return build_key_bindings(
+            on_interrupt=lambda: None,
+            on_exit=lambda: None,
+            on_approve=lambda: answered.append("approve"),
+            on_deny=lambda: answered.append("deny"),
+            approval_active=lambda: True,
+        )
+
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=bindings(),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0)
+        pipe.send_text("deny 3")
+        await asyncio.sleep(0.05)
+
+        assert session.default_buffer.text == "deny 3"
+        assert answered == []
+
+        session.default_buffer.reset()
+        pipe.send_text("y")
+        await asyncio.sleep(0.05)
+
+        assert answered == ["approve"]
+        assert session.default_buffer.text == ""
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.parametrize("value", ["", "  \n  "])
 def test_parse_input_rejects_blank_turns(value: str) -> None:
     assert parse_input(value) is None

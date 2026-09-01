@@ -405,14 +405,25 @@ def build_key_bindings(
 
         @Condition
         def approval_pending() -> bool:
-            return approval_active is not None and approval_active()
+            # Only while the composer is empty: otherwise the "n" and "y" in a
+            # typed "deny 3" would resolve requests instead of reaching the
+            # buffer, and the second keystroke would answer the next request.
+            return (
+                approval_active is not None
+                and approval_active()
+                and not get_app().current_buffer.text
+            )
 
-        @bindings.add("y", filter=approval_pending, eager=True)
+        # Transcript search owns n and N while it is open, and history search
+        # takes the keyboard whole, so the shortcut stands down for both.
+        answering = approval_pending & ~transcript_search_mode & ~is_searching
+
+        @bindings.add("y", filter=answering, eager=True)
         def approve(event: KeyPressEvent) -> None:
             del event
             on_approve()
 
-        @bindings.add("n", filter=approval_pending, eager=True)
+        @bindings.add("n", filter=answering, eager=True)
         def deny(event: KeyPressEvent) -> None:
             del event
             on_deny()

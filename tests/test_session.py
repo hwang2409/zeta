@@ -1061,6 +1061,9 @@ async def test_tui_resolves_colliding_child_approvals_by_unique_key(
     rendered = app.console.file.getvalue()
     assert "child a: bash" in rendered
     assert "child b: bash" in rendered
+    # y/n only answer the first card, so the second one names its own key.
+    assert "y approve · n deny" in rendered
+    assert "approve ('child-b', 'same-request')" in rendered
 
     assert await app._handle_approval_input(
         "approve ('child-a', 'same-request')"
