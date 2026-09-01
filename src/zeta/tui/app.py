@@ -5,8 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
-import sys
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -15,7 +13,7 @@ from shutil import get_terminal_size
 from typing import Any
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.application import Application, get_app
+from prompt_toolkit.application import get_app
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -41,8 +39,10 @@ from ..core.slash import (
 )
 from ..core.todo import todo_count_tuple
 from ..loop import AgentLoop
+from ..persistence import DraftPersistence, history_for
 from ..providers.anthropic import AnthropicBackend, AnthropicCredentialStore
 from ..providers.codex import CodexBackend, CodexCredentialStore
+from ..submission import Submission, SubmissionMixin, SubmissionQueue
 from ..types import (
     CompletionBackend,
     Message,
@@ -52,13 +52,12 @@ from ..types import (
     ThinkingContent,
     assistant_text,
 )
-from .background import background_notice
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
+    FullScreenPromptSession,
     TurnConsumerMixin,
     UndoCandidate,
-    VimCursorShapeConfig,
     build_key_bindings,
     status_formatted_text,
     vim_state_label,
@@ -72,15 +71,12 @@ from .layout import (
 )
 from .models import MODEL_CATALOGS, validate_model_name
 from .models import load_model_catalog as _load_model_catalog
-from ..persistence import DraftPersistence, history_for
 from .render import (
     format_status,
     render_markdown,
     render_thought,
     render_thought_live,
 )
-from .stream import stream_key
-from ..submission import Submission, SubmissionMixin, SubmissionQueue
 from .theme import (
     ACCENT,
     BODY,
@@ -91,48 +87,23 @@ from .theme import (
     RICH_THEME,
 )
 from .todo import TodoWidget
-from .transcript import TranscriptPresenter, TranscriptWidget
+from .transcript import TranscriptWidget, stream_key
+from .transcript_presenter import TranscriptPresenter
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 RECENT_SESSION_LIMIT = 20
 
 
+def background_notice(app: Any, message: str) -> None:
+    """Print one dim background task notice and refresh the prompt."""
+
+    app._print(Text(message, style=DIM))
+    app._invalidate_prompt()
+
+
 def _validate_model_name(provider: str, model: str) -> None:
     validate_model_name(provider, model)
-
-
-class FullScreenPromptSession(PromptSession[str]):
-    """Prompt session that owns the alternate screen for the whole app."""
-
-    def _create_application(
-        self, editing_mode: EditingMode, erase_when_done: bool
-    ) -> Application[str]:
-        application = super()._create_application(editing_mode, erase_when_done)
-        application.ttimeoutlen, application.timeoutlen, application.cursor = (
-            0.02,
-            0.5,
-            VimCursorShapeConfig(),
-        )
-        (
-            application.full_screen,
-            application.renderer.full_screen,
-            application.erase_when_done,
-        ) = True, True, False
-        return application
-
-    def restore_terminal(self) -> None:
-        """Restore the shell viewport after prompt-toolkit exits."""
-
-        self.app.output.quit_alternate_screen()
-        self.app.output.show_cursor()
-        self.app.output.flush()
-        stdout = sys.__stdout__
-        if stdout.isatty():
-            try:
-                os.write(stdout.fileno(), b"\x1b[?1049l\x1b[?25h")
-            except OSError:
-                pass
 
 
 def _zeta_home() -> Path:
@@ -548,6 +519,15 @@ class TUIApp(
             on_paste=self._paste_from_keybinding,
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
+            on_search_start=self._transcript.begin_search,
+            search_active=lambda: self._transcript.search_active,
+            on_search_input=self._transcript.update_search,
+            on_search_backspace=self._transcript.search_backspace,
+            on_search_next=self._transcript.next_search_match,
+            on_search_previous=self._transcript.previous_search_match,
+            on_search_end=self._transcript.end_search,
+            on_previous_user=self._transcript.previous_user_message,
+            on_next_user=self._transcript.next_user_message,
             on_toggle_agent=self._transcript.toggle_latest_agent,
             on_retry=self.retry_failed_turn,
             retry_available=self.retry_available,
@@ -659,6 +639,14 @@ class TUIApp(
                 and self._loop_state
                 in {"streaming", "compacting", "tool-running", "approval"}
             ),
+            transcript_navigation=self._full_screen_active(),
+            transcript_search=(
+                self._transcript.search_query
+                if self._transcript.search_active
+                else None
+            ),
+            transcript_match=self._transcript.search_status(),
+            transcript_position=self._transcript.position_indicator(),
         )
         fragments = status_formatted_text(status)
         return fragments

@@ -958,6 +958,10 @@ def format_status(
     vim_state: str | None = None,
     background_count: int = 0,
     undo_available: bool = False,
+    transcript_navigation: bool = False,
+    transcript_search: str | None = None,
+    transcript_match: tuple[int, int] | None = None,
+    transcript_position: str | None = None,
 ) -> Text:
     """Format the compact status bar shown below the composer."""
 
@@ -994,8 +998,20 @@ def format_status(
         left_segments.insert(0, vim_state)
     if background_count > 0:
         left_segments.append(f"bg {background_count}")
+    if transcript_position:
+        left_segments.append(transcript_position)
+    if transcript_search is not None:
+        current, total = transcript_match or (0, 0)
+        left_segments.insert(
+            0,
+            f'find "{transcript_search}" {current}/{total}',
+        )
     left = "  ".join(left_segments)
     right_segments = ["/status", "ctrl+c interrupt", "ctrl+d quit"]
+    if transcript_navigation:
+        right_segments.extend(("ctrl+f find", "ctrl+up/down users"))
+    if transcript_search is not None:
+        right_segments.extend(("enter/n next", "N prev", "esc close"))
     if undo_available:
         right_segments.append("ctrl+u undo")
     if session_id:
@@ -1004,9 +1020,53 @@ def format_status(
         value = f"{left}  {' · '.join(right_segments)}"
     else:
         value = left
-        candidates = (left, state_segment)
-        if vim_state and background_count > 0:
-            candidates = (left, f"{vim_state}  {state_segment}", state_segment)
+        if transcript_search is not None:
+            search_current, search_total = transcript_match or (0, 0)
+            search_prefix = 'find "'
+            search_suffix = f'" {search_current}/{search_total}'
+            minimum_search_width = cell_len(f'{search_prefix}…{search_suffix}')
+
+            def search_segment(max_width: int) -> str:
+                if max_width < minimum_search_width:
+                    return ""
+                full = f'{search_prefix}{transcript_search}{search_suffix}'
+                if cell_len(full) <= max_width:
+                    return full
+                available = max_width - cell_len(search_prefix) - cell_len(search_suffix)
+                query = Text(
+                    transcript_search,
+                    no_wrap=True,
+                    overflow="ellipsis",
+                )
+                query.truncate(max(1, available), overflow="ellipsis")
+                return f"{search_prefix}{query.plain}{search_suffix}"
+
+            navigation_candidates = (
+                (state_segment, transcript_position),
+                (state_text, transcript_position),
+                ("", transcript_position),
+                (state_segment, ""),
+                (state_text, ""),
+                ("", ""),
+            )
+            for state, position in navigation_candidates:
+                fixed = cell_len(state) + cell_len(position)
+                gaps = 2 * (bool(state) + bool(position))
+                if fixed + gaps >= width:
+                    continue
+                search = search_segment(width - fixed - gaps)
+                if not search:
+                    continue
+                parts = [search, state, position]
+                candidate = "  ".join(part for part in parts if part)
+                if cell_len(candidate) <= width:
+                    value = candidate
+                    break
+        candidates = (value,)
+        if transcript_search is None:
+            candidates = (left, state_segment)
+            if vim_state and background_count > 0:
+                candidates = (left, f"{vim_state}  {state_segment}", state_segment)
         for candidate_left in candidates:
             value = candidate_left
             for start in range(len(right_segments)):

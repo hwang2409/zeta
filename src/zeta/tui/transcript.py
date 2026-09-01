@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import re
 from collections import OrderedDict
-from collections.abc import Callable
-from dataclasses import dataclass
 from io import StringIO
 
 from prompt_toolkit.data_structures import Point
@@ -15,16 +13,43 @@ from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.layout.dimension import AnyDimension, Dimension
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
-from rich.console import Console, Group, RenderableType
-from rich.live import Live
-from rich.padding import Padding
+from rich.console import Console, RenderableType
 from rich.text import Text
 
-from ..types import StreamEvent, StreamEventType, ToolCall
-from .layout import CONTENT_MARGIN
+from ..types import (
+    RedactedThinkingContent,
+    StreamEvent,
+    TextContent,
+    ThinkingContent,
+    ToolCall,
+)
 from .agent_card import AgentCard
-from .render import render_event, render_tool_progress
+from .render import render_tool_progress
 from .theme import RICH_THEME
+from .transcript_search import HighlightCache, SearchMatch, find_matches
+
+
+def stream_key(
+    event: StreamEvent,
+) -> tuple[str | None, tuple[str, object] | None]:
+    content = event.content
+    index = event.data.get("index")
+    identity = (
+        ("index", index)
+        if isinstance(index, (int, str, tuple))
+        else None
+    )
+    if isinstance(content, ThinkingContent):
+        return "thinking", identity or (
+            ("signature", content.signature)
+            if content.signature is not None
+            else ("kind", "thinking")
+        )
+    if isinstance(content, RedactedThinkingContent):
+        return "redacted-thinking", identity or ("data", content.data)
+    if isinstance(content, TextContent) or event.delta is not None:
+        return "assistant", ("kind", "assistant")
+    return None, None
 
 
 ToolLifecycleKey = tuple[str | None, str]
@@ -125,7 +150,19 @@ class TranscriptWidget(UIControl):
         self._viewport_height = 1
         self._content_width = 80
         self._line_locations: list[tuple[_TranscriptUnit | None, int]] = []
+        self._locations_revision = -1
+        self._locations_cache: OrderedDict[
+            int, tuple[int, list[tuple[_TranscriptUnit | None, int]]]
+        ] = OrderedDict()
         self._anchor: tuple[_TranscriptUnit | None, int] | None = None
+        self._user_units: list[_TranscriptUnit] = []
+        self._search_active = False
+        self._search_query = ""
+        self._search_index = 0
+        self._search_cache: OrderedDict[
+            tuple[int, int, str], list[SearchMatch]
+        ] = OrderedDict()
+        self._highlight_cache: tuple[tuple[int, int, str], HighlightCache] | None = None
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -148,6 +185,9 @@ class TranscriptWidget(UIControl):
     def _bump_revision(self) -> None:
         self._revision += 1
         self._parsed_cache.clear()
+        self._locations_cache.clear()
+        self._search_cache.clear()
+        self._highlight_cache = None
 
     def _append_unit(self, value: RenderableType | _ToolUnit | None) -> _TranscriptUnit:
         unit = _TranscriptUnit(self._next_key, value)
@@ -155,6 +195,12 @@ class TranscriptWidget(UIControl):
         self._next_key += 1
         self._bump_revision()
         return unit
+
+    def mark_user(self, unit: _TranscriptUnit | None) -> None:
+        """Mark an existing full-screen unit as a user message."""
+
+        if unit is not None and unit in self._units and unit not in self._user_units:
+            self._user_units.append(unit)
 
     def append(self, renderable: RenderableType) -> _TranscriptUnit:
         return self._append_unit(renderable)
@@ -175,6 +221,8 @@ class TranscriptWidget(UIControl):
         self._units.remove(unit)
         if self._anchor is not None and self._anchor[0] is unit:
             self._anchor = None
+        if unit in self._user_units:
+            self._user_units.remove(unit)
         self._render_cache.pop(unit.key, None)
         self._bump_revision()
 
@@ -191,7 +239,11 @@ class TranscriptWidget(UIControl):
         self._render_cache.clear()
         self._parsed_cache.clear()
         self._line_locations.clear()
+        self._locations_cache.clear()
         self._anchor = None
+        self._user_units.clear()
+        self._search_cache.clear()
+        self._highlight_cache = None
         self._scroll_offset = 0
         self._follow_tail = True
         self._bump_revision()
@@ -218,6 +270,17 @@ class TranscriptWidget(UIControl):
         unit = self._tools.get(_tool_lifecycle_key(call_id, event))
         if unit is not None:
             unit.update(rendered, event)
+            self._bump_revision()
+
+    def refresh_active_agents(self) -> None:
+        """Refresh active cards and invalidate derived transcript caches once."""
+
+        refreshed = False
+        for unit in self._tools.values():
+            revision = unit.revision
+            unit.refresh()
+            refreshed = refreshed or unit.revision != revision
+        if refreshed:
             self._bump_revision()
 
     def finish_tool(
@@ -267,6 +330,7 @@ class TranscriptWidget(UIControl):
             for unit in self._units
             if unit is None or unit.value not in active
         ]
+        self._user_units[:] = [unit for unit in self._user_units if unit in self._units]
         if self._anchor is not None and self._anchor[0] not in self._units:
             self._anchor = None
         for key in removed_keys:
@@ -295,28 +359,196 @@ class TranscriptWidget(UIControl):
     def scroll_offset(self) -> int:
         return self._scroll_offset
 
-    def _set_scroll_offset(self, value: int) -> None:
+    def _set_scroll_offset(self, value: int, *, allow_follow_tail: bool = True) -> None:
         line_count = len(self._parsed_lines(self._content_width))
         tail = max(0, line_count - self._viewport_height)
         self._scroll_offset = min(max(0, value), tail)
-        self._follow_tail = self._scroll_offset >= tail
+        self._follow_tail = allow_follow_tail and self._scroll_offset >= tail
         locations = self._locations(self._content_width)
         if locations:
             self._anchor = locations[min(self._scroll_offset, len(locations) - 1)]
 
     def page_up(self) -> None:
         self._set_scroll_offset(self._scroll_offset - self._viewport_height)
-        self._follow_tail = False
 
     def page_down(self) -> None:
         self._set_scroll_offset(self._scroll_offset + self._viewport_height)
 
     def scroll_up(self) -> None:
         self._set_scroll_offset(self._scroll_offset - 3)
-        self._follow_tail = False
 
     def scroll_down(self) -> None:
         self._set_scroll_offset(self._scroll_offset + 3)
+
+    @property
+    def search_active(self) -> bool:
+        return self._search_active
+
+    @property
+    def search_query(self) -> str:
+        return self._search_query
+
+    def begin_search(self) -> None:
+        self._search_active = True
+        self._search_query = ""
+        self._search_index = 0
+        self._highlight_cache = None
+
+    def update_search(self, query: str) -> None:
+        self._search_active = True
+        self._search_query = query
+        self._search_index = 0
+        self._parsed_cache.clear()
+        self._search_cache.clear()
+        self._highlight_cache = None
+        self._focus_search_match()
+
+    def search_backspace(self) -> None:
+        if self._search_query:
+            self.update_search(self._search_query[:-1])
+
+    def end_search(self) -> None:
+        self._search_active = False
+        self._search_query = ""
+        self._search_index = 0
+        self._parsed_cache.clear()
+        self._highlight_cache = None
+        line_count = len(self._parsed_lines(self._content_width))
+        tail = max(0, line_count - self._viewport_height)
+        self._follow_tail = self._scroll_offset >= tail
+
+    def _base_render(self, width: int) -> str:
+        rendered_units: list[str] = []
+        for unit in self._units:
+            if unit is None:
+                rendered_units.append("")
+                continue
+            rendered_units.append(self._render_unit(unit, width))
+        value = "\n".join(rendered_units).rstrip("\n")
+        lines = value.splitlines()
+        while lines and not Text.from_ansi(lines[0]).plain.strip():
+            lines.pop(0)
+        return "\n".join(lines)
+
+    def _search_matches(self, width: int | None = None) -> list[SearchMatch]:
+        actual_width = width or self._content_width
+        cache_key = (actual_width, self._revision, self._search_query)
+        matches = self._search_cache.get(cache_key)
+        if matches is None:
+            plain_lines = Text.from_ansi(self._base_render(actual_width)).plain.splitlines()
+            matches = find_matches(plain_lines, self._search_query)
+            self._search_cache[cache_key] = matches
+            self._search_cache.move_to_end(cache_key)
+            while len(self._search_cache) > 3:
+                self._search_cache.popitem(last=False)
+        else:
+            self._search_cache.move_to_end(cache_key)
+        self._search_index = self._search_index % len(matches) if matches else 0
+        return matches
+
+    def _focus_search_match(self) -> None:
+        matches = self._search_matches()
+        if matches:
+            self._set_scroll_offset(
+                matches[self._search_index].first_line,
+                allow_follow_tail=False,
+            )
+
+    def _refresh_search_render_cache(self) -> None:
+        cache = self._highlight_cache
+        if cache is None or cache[0][0] != self._content_width:
+            self._parsed_cache.clear()
+            return
+        cache[1].render(self._search_index)
+        parsed = self._parsed_cache.get(self._content_width)
+        if parsed is None:
+            return
+        for width in tuple(self._parsed_cache):
+            if width != self._content_width:
+                del self._parsed_cache[width]
+        for line in cache[1].changed_lines:
+            fragments = to_formatted_text(ANSI(cache[1].fragments[line]))
+            updated = list(split_lines(fragments)) or [[]]
+            if len(updated) != 1:
+                self._parsed_cache.clear()
+                return
+            parsed[line] = updated[0]
+
+    def next_search_match(self) -> bool:
+        matches = self._search_matches()
+        if not matches:
+            return False
+        self._search_index = (self._search_index + 1) % len(matches)
+        self._refresh_search_render_cache()
+        self._focus_search_match()
+        return True
+
+    def previous_search_match(self) -> bool:
+        matches = self._search_matches()
+        if not matches:
+            return False
+        self._search_index = (self._search_index - 1) % len(matches)
+        self._refresh_search_render_cache()
+        self._focus_search_match()
+        return True
+
+    def _jump_to_user(self, *, next_message: bool) -> bool:
+        if self._locations_revision != self._revision:
+            self.create_content(self._content_width, self._viewport_height)
+        user_units = set(self._user_units)
+        seen: set[_TranscriptUnit] = set()
+        targets: list[int] = []
+        for index, (unit, _offset) in enumerate(self._line_locations):
+            if unit in user_units and unit not in seen:
+                seen.add(unit)
+                targets.append(index)
+        if next_message:
+            target = next((index for index in targets if index > self._scroll_offset), None)
+        else:
+            target = next(
+                (index for index in reversed(targets) if index < self._scroll_offset),
+                None,
+            )
+        if target is None:
+            return False
+        self._set_scroll_offset(target)
+        return True
+
+    def next_user_message(self) -> bool:
+        return self._jump_to_user(next_message=True)
+
+    def previous_user_message(self) -> bool:
+        return self._jump_to_user(next_message=False)
+
+    def search_status(self) -> tuple[int, int] | None:
+        if not self._search_active:
+            return None
+        matches = self._search_matches()
+        if not matches:
+            return (0, 0)
+        return (self._search_index + 1, len(matches))
+
+    def position_indicator(self) -> str | None:
+        """Return the top visible line unless the viewport follows the tail."""
+
+        if self._follow_tail:
+            return None
+        total = len(self._parsed_lines(self._content_width))
+        if not total:
+            return None
+        return f"line {min(self._scroll_offset + 1, total)}/{total}"
+
+    def _highlighted_render(self, width: int, base: str) -> str:
+        matches = self._search_matches(width)
+        if not matches:
+            return base
+        cache_key = (width, self._revision, self._search_query)
+        if self._highlight_cache is None or self._highlight_cache[0] != cache_key:
+            self._highlight_cache = (
+                cache_key,
+                HighlightCache(base, width, matches),
+            )
+        return self._highlight_cache[1].render(self._search_index)
 
     def _render_unit(self, unit: _TranscriptUnit, width: int) -> str:
         value = unit.value
@@ -345,17 +577,7 @@ class TranscriptWidget(UIControl):
         return rendered
 
     def render(self, width: int) -> str:
-        rendered_units: list[str] = []
-        for unit in self._units:
-            if unit is None:
-                rendered_units.append("")
-                continue
-            rendered_units.append(self._render_unit(unit, width))
-        value = "\n".join(rendered_units).rstrip("\n")
-        lines = value.splitlines()
-        while lines and not Text.from_ansi(lines[0]).plain.strip():
-            lines.pop(0)
-        return "\n".join(lines)
+        return self._highlighted_render(width, self._base_render(width))
 
     def lines(self, width: int) -> list[str]:
         return self.render(width).splitlines()
@@ -374,6 +596,18 @@ class TranscriptWidget(UIControl):
         return lines
 
     def _locations(self, width: int) -> list[tuple[_TranscriptUnit | None, int]]:
+        cached = self._locations_cache.get(width)
+        if cached is not None and cached[0] == self._revision:
+            self._locations_cache.move_to_end(width)
+            return cached[1]
+        locations = self._compute_locations(width)
+        self._locations_cache[width] = (self._revision, locations)
+        self._locations_cache.move_to_end(width)
+        while len(self._locations_cache) > 3:
+            self._locations_cache.popitem(last=False)
+        return locations
+
+    def _compute_locations(self, width: int) -> list[tuple[_TranscriptUnit | None, int]]:
         raw_lines: list[tuple[str, _TranscriptUnit | None, int]] = []
         for unit in self._units:
             if unit is None:
@@ -469,11 +703,12 @@ class TranscriptWidget(UIControl):
                 max(0, len(lines) - self._viewport_height),
             )
         tail = max(0, len(lines) - self._viewport_height)
-        if not self._follow_tail and self._scroll_offset >= tail:
+        if not self._search_active and not self._follow_tail and self._scroll_offset >= tail:
             self._follow_tail = True
         if self._follow_tail:
             self._scroll_offset = tail
         self._line_locations = locations
+        self._locations_revision = self._revision
         prefix_lines = max(0, self._viewport_height - len(lines))
         visible_lines = ([[] for _ in range(prefix_lines)] + lines)
         cursor_y = min(prefix_lines + self._scroll_offset, len(visible_lines) - 1)
@@ -506,428 +741,9 @@ class TranscriptWidget(UIControl):
         )
 
 
-@dataclass(frozen=True)
-class ToolEventPresentation:
-    visible_output: bool = False
-    stop_after_tool: bool = False
+def __getattr__(name: str):
+    if name == "TranscriptPresenter":
+        from .transcript_presenter import TranscriptPresenter
 
-
-class TranscriptPresenter:
-    """Own transcript output and tool-card presentation for the TUI."""
-
-    def __init__(
-        self,
-        transcript: TranscriptWidget,
-        console: Console,
-        full_screen_active: Callable[[], bool],
-        print_callback: Callable[[RenderableType | None], None],
-    ) -> None:
-        self.transcript = transcript
-        self.console = console
-        self._full_screen_active = full_screen_active
-        self._print_callback = print_callback
-        self._printed_units = False
-        self._assistant_unit_open = False
-        self._active_tool_calls: set[ToolLifecycleKey] = set()
-        self._background_tool_ids: set[ToolLifecycleKey] = set()
-        self._pending_tool_renders: list[RenderableType] = []
-        self._tool_region_units: dict[ToolLifecycleKey, _ToolUnit] = {}
-        self._tool_region: Live | None = None
-        self._thinking_live: Live | None = None
-        self._thinking_unit: _TranscriptUnit | None = None
-        self._assistant_live: Live | None = None
-        self._assistant_unit: _TranscriptUnit | None = None
-        self._assistant_message_units: list[_TranscriptUnit] = []
-        self._assistant_message_region: list[_TranscriptUnit] = []
-
-    @property
-    def tool_region(self) -> Live | None:
-        return self._tool_region
-
-    @property
-    def has_active_agent(self) -> bool:
-        return self.transcript.has_active_agent or any(
-            unit.active_card for unit in self._tool_region_units.values()
-        )
-
-    def _append(self, renderable: RenderableType) -> None:
-        self.transcript.append(renderable)
-
-    def append_blank(self) -> None:
-        self.transcript.append_blank()
-
-    def print(self, renderable: RenderableType | None) -> None:
-        if renderable is None:
-            return
-        self._print_callback(renderable)
-
-    def print_unit(self, renderable: RenderableType | None) -> _TranscriptUnit | None:
-        if renderable is None:
-            return None
-        if self._printed_units:
-            if self._full_screen_active():
-                self.append_blank()
-            else:
-                self.console.print()
-        self.print(renderable)
-        self._printed_units = True
-        if self._full_screen_active() and self.transcript._units:
-            return self.transcript._units[-1]
-        return None
-
-    def print_assistant(self, renderable: RenderableType | None) -> bool:
-        if renderable is None:
-            return False
-        self.update_assistant(renderable)
-        plain = getattr(renderable, "plain", None)
-        return plain is None or bool(plain.strip())
-
-    def update_assistant(self, rendered: RenderableType) -> None:
-        """Replace the one mutable unit used by an in-flight assistant message."""
-
-        if self._full_screen_active():
-            if self._assistant_unit is None:
-                unit_start = len(self.transcript._units)
-                self._assistant_unit = self.print_unit(rendered)
-                self._assistant_message_region.extend(self.transcript._units[unit_start:])
-                if self._assistant_unit is not None:
-                    self._assistant_message_units.append(self._assistant_unit)
-            else:
-                self._assistant_unit = self.transcript.replace(
-                    self._assistant_unit, rendered
-                )
-        else:
-            if self._assistant_live is None:
-                self._assistant_live = Live(
-                    Padding(rendered, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN)),
-                    console=self.console,
-                    transient=True,
-                    refresh_per_second=20,
-                )
-                self._assistant_live.start()
-            else:
-                self._assistant_live.update(
-                    Padding(rendered, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN))
-                )
-        self._assistant_unit_open = True
-
-    def finish_assistant(
-        self,
-        rendered: RenderableType,
-        *,
-        preserve_inline: bool = False,
-    ) -> None:
-        """Commit the completed assistant message into its existing unit."""
-
-        if self._full_screen_active():
-            if self._assistant_unit is None:
-                self._assistant_unit = self.print_unit(rendered)
-            else:
-                self._assistant_unit = self.transcript.replace(
-                    self._assistant_unit, rendered
-                )
-        else:
-            if self._assistant_live is not None:
-                self._assistant_live.stop()
-                self._assistant_live = None
-            if preserve_inline:
-                self.print_unit(rendered)
-        self._assistant_unit = None
-        self._assistant_unit_open = False
-
-    def finish_assistant_message(self, rendered: RenderableType | None) -> None:
-        """Render the complete assistant message in one transcript unit."""
-
-        if self._full_screen_active():
-            if rendered is not None:
-                unit = next(
-                    (
-                        candidate
-                        for candidate in self._assistant_message_units
-                        if candidate in self.transcript._units
-                    ),
-                    None,
-                )
-                if unit is None:
-                    unit = self.print_unit(rendered)
-                else:
-                    unit = self.transcript.replace(unit, rendered)
-                for candidate in self._assistant_message_units:
-                    if candidate is not unit:
-                        self.transcript.remove(candidate)
-            else:
-                for candidate in self._assistant_message_region:
-                    self.transcript.remove(candidate)
-        else:
-            if self._assistant_live is not None:
-                self._assistant_live.stop()
-                self._assistant_live = None
-            if rendered is not None:
-                self.print_unit(rendered)
-        self._assistant_message_units.clear()
-        self._assistant_message_region.clear()
-        self._assistant_unit = None
-        self._assistant_unit_open = False
-
-    def reset_assistant_unit(self) -> None:
-        self._assistant_unit_open = False
-        self._assistant_unit = None
-
-    def reset_assistant_message(self) -> None:
-        """Forget the units owned by an incomplete assistant message."""
-
-        self._assistant_message_units.clear()
-        self._assistant_message_region.clear()
-        self.reset_assistant_unit()
-
-    def start_thinking(self, rendered: Text) -> None:
-        self.reset_assistant_unit()
-        if self._full_screen_active():
-            self._thinking_unit = self.print_unit(rendered)
-        else:
-            self._thinking_live = Live(
-                Padding(rendered, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN)),
-                console=self.console,
-                transient=True,
-                refresh_per_second=20,
-            )
-            self._thinking_live.start()
-
-    def update_thinking(self, rendered: Text) -> None:
-        if self._full_screen_active():
-            if self._thinking_unit is None:
-                self._thinking_unit = self.print_unit(rendered)
-            else:
-                self._thinking_unit = self.transcript.replace(
-                    self._thinking_unit, rendered
-                )
-        elif self._thinking_live is not None:
-            self._thinking_live.update(
-                Padding(rendered, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN))
-            )
-
-    def finish_thinking(self, rendered: Text) -> None:
-        if self._full_screen_active():
-            if self._thinking_unit is None:
-                self._thinking_unit = self.print_unit(rendered)
-            else:
-                self._thinking_unit = self.transcript.replace(
-                    self._thinking_unit, rendered
-                )
-            self._thinking_unit = None
-        elif self._thinking_live is not None:
-            self._thinking_live.stop()
-            self._thinking_live = None
-            self.print_unit(rendered)
-        self.reset_assistant_unit()
-
-    def update_tool_region(self, event: StreamEvent) -> bool:
-        rendered = render_event(event)
-        if not isinstance(rendered, Text):
-            return False
-        if self._full_screen_active():
-            lifecycle_key = _event_tool_lifecycle_key(event)
-            if event.tool_call is not None:
-                if lifecycle_key is not None:
-                    self.transcript.update_tool(lifecycle_key, rendered, event)
-            return bool(event.delta and event.delta.strip())
-        call = event.tool_call
-        lifecycle_key = _event_tool_lifecycle_key(event)
-        if (
-            call is not None
-            and lifecycle_key is not None
-            and lifecycle_key not in self._tool_region_units
-        ):
-            self._tool_region_units[lifecycle_key] = _ToolUnit(call, rendered, event)
-        unit = (
-            self._tool_region_units.get(lifecycle_key)
-            if lifecycle_key is not None
-            else None
-        )
-        if unit is None:
-            return False
-        if self._tool_region is None:
-            self._tool_region = Live(
-                self._tool_region_renderable(),
-                console=self.console,
-                transient=True,
-                refresh_per_second=20,
-            )
-        unit.update(rendered, event)
-        self._tool_region.update(self._tool_region_renderable())
-        return bool(event.delta and event.delta.strip())
-
-    def _tool_region_renderable(self) -> Padding | Group:
-        renderables = [unit.renderable for unit in self._tool_region_units.values()]
-        content: RenderableType = Group(*renderables) if len(renderables) > 1 else renderables[0]
-        return Padding(content, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN))
-
-    def refresh_active_agents(self) -> None:
-        """Refresh elapsed time without adding child events to the parent store."""
-
-        for unit in self.transcript._tools.values():
-            unit.refresh()
-        if self._tool_region is not None:
-            for unit in self._tool_region_units.values():
-                unit.refresh()
-            self._tool_region.update(self._tool_region_renderable())
-
-    def handle_tool_event(
-        self,
-        event: StreamEvent,
-        *,
-        aborted: bool,
-    ) -> ToolEventPresentation | None:
-        if event.type is StreamEventType.TOOL_EXECUTION_START:
-            self.reset_assistant_unit()
-            lifecycle_key = _event_tool_lifecycle_key(event)
-            if lifecycle_key is not None:
-                self._active_tool_calls.add(lifecycle_key)
-            rendered = render_event(event)
-            if rendered is None:
-                return ToolEventPresentation()
-            if self._full_screen_active() and event.tool_call is not None:
-                if self._printed_units:
-                    self.append_blank()
-                self.transcript.start_tool(
-                    event.tool_call.id,
-                    event.tool_call,
-                    rendered,
-                    event,
-                )
-                self._printed_units = True
-            else:
-                self.print_unit(rendered)
-            if not self._full_screen_active() and event.tool_call is not None:
-                if lifecycle_key is not None:
-                    self._tool_region_units[lifecycle_key] = _ToolUnit(
-                        event.tool_call, rendered, event
-                    )
-            return ToolEventPresentation(visible_output=True)
-        if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
-            return ToolEventPresentation(
-                visible_output=self.update_tool_region(event)
-            )
-        if event.type is not StreamEventType.TOOL_EXECUTION_END:
-            return None
-
-        structured = (
-            event.tool_result.structured_content
-            if event.tool_result is not None
-            else None
-        )
-        is_background_start = (
-            structured is not None and structured.get("status") == "running"
-        )
-        if event.tool_call is not None:
-            lifecycle_key = _event_tool_lifecycle_key(event)
-            if lifecycle_key is not None:
-                self._active_tool_calls.discard(lifecycle_key)
-            if is_background_start:
-                if lifecycle_key is not None:
-                    self._background_tool_ids.add(lifecycle_key)
-                if self._full_screen_active():
-                    if lifecycle_key is not None:
-                        self.transcript.mark_tool_background(lifecycle_key)
-                path = structured.get("child_session_path") if structured else None
-                if isinstance(path, str) and path:
-                    if self._full_screen_active():
-                        if lifecycle_key is not None:
-                            self.transcript.set_tool_child_session_path(
-                                lifecycle_key, path
-                            )
-                    else:
-                        unit = self._tool_region_units.get(lifecycle_key)
-                        if unit is not None:
-                            unit.card.set_child_session_path(path)
-                return ToolEventPresentation(visible_output=True)
-        rendered = render_event(event)
-        if not self._full_screen_active() and event.tool_call is not None:
-            lifecycle_key = _event_tool_lifecycle_key(event)
-            unit = self._tool_region_units.get(lifecycle_key)
-            if unit is not None and rendered is not None:
-                unit.finish(rendered, event)
-                rendered = unit.renderable
-        if rendered is not None:
-            if self._full_screen_active() and event.tool_call is not None:
-                lifecycle_key = _event_tool_lifecycle_key(event)
-                if lifecycle_key is not None:
-                    self.transcript.finish_tool(lifecycle_key, rendered, event)
-            else:
-                self._pending_tool_renders.append(rendered)
-        if event.tool_call is not None:
-            lifecycle_key = _event_tool_lifecycle_key(event)
-            if lifecycle_key is not None:
-                self._background_tool_ids.discard(lifecycle_key)
-        if not self._active_tool_calls:
-            self.commit_tool_region()
-        return ToolEventPresentation(
-            visible_output=rendered is not None,
-            stop_after_tool=aborted,
-        )
-
-    def commit_tool_region(self) -> None:
-        final_renders = self._pending_tool_renders
-        self._pending_tool_renders = []
-        if self._tool_region is not None:
-            self._tool_region_units = {
-                call_id: unit
-                for call_id, unit in self._tool_region_units.items()
-                if call_id in self._background_tool_ids
-            }
-            if self._background_tool_ids:
-                self._tool_region.update(self._tool_region_renderable())
-            else:
-                if final_renders:
-                    self._tool_region.update(Group(*final_renders))
-                self._tool_region.stop()
-                self._tool_region = None
-        else:
-            self._tool_region_units = {
-                call_id: unit
-                for call_id, unit in self._tool_region_units.items()
-                if call_id in self._background_tool_ids
-            }
-        for rendered in final_renders:
-            self.print(rendered)
-        self.reset_assistant_unit()
-
-    def discard_tool_region(self) -> None:
-        self._pending_tool_renders.clear()
-        if self._full_screen_active():
-            self.transcript.discard_tools()
-        if self._tool_region is not None:
-            self._tool_region_units = {
-                call_id: unit
-                for call_id, unit in self._tool_region_units.items()
-                if call_id in self._background_tool_ids
-            }
-            if not self._background_tool_ids:
-                self._tool_region.stop()
-                self._tool_region = None
-        else:
-            self._tool_region_units = {
-                call_id: unit
-                for call_id, unit in self._tool_region_units.items()
-                if call_id in self._background_tool_ids
-            }
-
-    def clear_active_tool_calls(self) -> None:
-        self._active_tool_calls.clear()
-
-    def clear(self) -> None:
-        """Reset presentation state before rebuilding the transcript."""
-
-        self._tool_region = None
-        self._tool_region_units.clear()
-        self._pending_tool_renders.clear()
-        self._active_tool_calls.clear()
-        self._thinking_live = None
-        self._assistant_live = None
-        self._thinking_unit = None
-        self._assistant_unit = None
-        self._assistant_message_units.clear()
-        self._assistant_message_region.clear()
-        self._assistant_unit_open = False
-        self._printed_units = False
-        self.transcript.clear()
+        return TranscriptPresenter
+    raise AttributeError(name)

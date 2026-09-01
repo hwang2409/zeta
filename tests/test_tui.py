@@ -26,6 +26,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import set_app
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
+from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
@@ -725,6 +726,198 @@ def test_transcript_follows_tail_until_scrolled_up() -> None:
     assert transcript.scroll_offset == len(transcript.lines(80)) - 3
 
 
+def test_transcript_search_highlights_matches_and_wraps() -> None:
+    transcript = TranscriptWidget()
+    transcript.append(Text("alpha target"))
+    transcript.append(Text("target between"))
+    transcript.append(Text("omega target"))
+    transcript.create_content(80, 2)
+
+    transcript.begin_search()
+    transcript.update_search("target")
+    assert transcript.search_status() == (1, 3)
+    assert "target" in Text.from_ansi(transcript.render(80)).plain
+    assert "\x1b[" in transcript.render(80)
+
+    assert transcript.next_search_match()
+    assert transcript.search_status() == (2, 3)
+    assert transcript.next_search_match()
+    assert transcript.search_status() == (3, 3)
+    assert transcript.next_search_match()
+    assert transcript.search_status() == (1, 3)
+    assert transcript.previous_search_match()
+    assert transcript.search_status() == (3, 3)
+
+    transcript.end_search()
+    assert transcript.search_status() is None
+    assert "\x1b[" not in transcript.render(80)
+
+
+def test_transcript_search_resize_back_refreshes_current_match_style() -> None:
+    def match_styles(content: UIContent) -> tuple[str, str]:
+        first, second = (
+            next(
+                style
+                for style, text in content.get_line(line)
+                if text == "t" and style
+            )
+            for line in (1, 2)
+        )
+        return first, second
+
+    transcript = TranscriptWidget()
+    transcript.append(Text("first target"))
+    transcript.append(Text("second target"))
+    transcript.begin_search()
+    transcript.update_search("target")
+
+    initial = transcript.create_content(60, 3)
+    initial_styles = match_styles(initial)
+
+    transcript.create_content(30, 3)
+    assert transcript.next_search_match()
+    assert transcript.search_status() == (2, 2)
+
+    resized = transcript.create_content(60, 3)
+    resized_styles = match_styles(resized)
+
+    assert resized_styles == initial_styles[::-1]
+
+
+def test_transcript_search_stays_anchored_at_the_tail_until_closed() -> None:
+    transcript = TranscriptWidget()
+    for index in range(20):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(80, 3)
+
+    transcript.begin_search()
+    transcript.update_search("line 19")
+    transcript.create_content(80, 3)
+
+    assert not transcript.follow_tail
+    assert transcript.position_indicator() == "line 18/20"
+
+    transcript.append(Text("new tail"))
+    transcript.create_content(80, 3)
+    assert not transcript.follow_tail
+    assert transcript.scroll_offset == 17
+
+    transcript.end_search()
+    assert not transcript.follow_tail
+
+
+def test_transcript_user_jumps_skip_non_user_units() -> None:
+    transcript = TranscriptWidget()
+    first_user = transcript.append(Text("first user"))
+    transcript.mark_user(first_user)
+    transcript.append(Text("tool receipt"))
+    transcript.append(Text("assistant thought"))
+    second_user = transcript.append(Text("second user"))
+    transcript.mark_user(second_user)
+    transcript.append(Text("assistant answer"))
+    transcript.create_content(80, 2)
+    transcript._set_scroll_offset(0)
+
+    assert transcript.next_user_message()
+    assert transcript.scroll_offset == 3
+    assert transcript.previous_user_message()
+    assert transcript.scroll_offset == 0
+    assert not transcript.previous_user_message()
+
+
+def test_transcript_user_jump_targets_only_the_start_of_each_message() -> None:
+    transcript = TranscriptWidget()
+    first = transcript.append(Text("first\ncontinuation\nlast"))
+    transcript.mark_user(first)
+    transcript.append(Text("assistant"))
+    second = transcript.append(Text("second"))
+    transcript.mark_user(second)
+    transcript.create_content(80, 1)
+    transcript._set_scroll_offset(0)
+
+    assert transcript.next_user_message()
+    assert transcript.scroll_offset == 4
+    assert transcript.previous_user_message()
+    assert transcript.scroll_offset == 0
+
+
+def test_transcript_position_indicator_hides_at_pinned_tail() -> None:
+    transcript = TranscriptWidget()
+    for index in range(8):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(80, 3)
+
+    assert transcript.position_indicator() is None
+    transcript._set_scroll_offset(0)
+    assert transcript.position_indicator() == "line 1/8"
+    transcript._set_scroll_offset(4)
+    assert transcript.position_indicator() == "line 5/8"
+    transcript._set_scroll_offset(5)
+    assert transcript.position_indicator() is None
+
+
+def test_transcript_paging_reuses_rendered_content_for_large_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = TranscriptWidget()
+    for index in range(2_000):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(80, 20)
+
+    calls = 0
+    original_render = transcript.render
+
+    def counted_render(width: int) -> str:
+        nonlocal calls
+        calls += 1
+        return original_render(width)
+
+    monkeypatch.setattr(transcript, "render", counted_render)
+    for _ in range(100):
+        transcript.page_up()
+        transcript.create_content(80, 20)
+    assert calls == 0
+
+
+def test_transcript_paging_reuses_locations_by_width_and_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = TranscriptWidget()
+    for index in range(2_000):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(80, 20)
+
+    calls = 0
+    original_compute = transcript._compute_locations
+
+    def counted_compute(width: int) -> list[tuple[object, int]]:
+        nonlocal calls
+        calls += 1
+        return original_compute(width)  # type: ignore[return-value]
+
+    monkeypatch.setattr(transcript, "_compute_locations", counted_compute)
+    for _ in range(100):
+        transcript.page_up()
+        transcript.create_content(80, 20)
+    assert calls == 0
+
+    transcript.create_content(40, 20)
+    assert calls == 1
+    transcript.append(Text("new line"))
+    transcript.create_content(40, 20)
+    assert calls == 2
+
+
+def test_transcript_locations_cache_is_bounded_by_width() -> None:
+    transcript = TranscriptWidget()
+    transcript.append(Text("line"))
+
+    for width in range(40, 141):
+        transcript._locations(width)
+
+    assert len(transcript._locations_cache) == 3
+
+
 def test_transcript_resize_preserves_anchor_and_tail_reentry() -> None:
     transcript = TranscriptWidget()
     for index in range(8):
@@ -895,6 +1088,18 @@ def test_transcript_parsed_cache_is_bounded_and_revision_scoped() -> None:
 
     transcript.append(Text("new line"))
     assert not transcript._parsed_cache
+
+
+def test_transcript_search_cache_is_bounded_by_width() -> None:
+    transcript = TranscriptWidget()
+    transcript.append(Text("target"))
+    transcript.begin_search()
+    transcript.update_search("target")
+
+    for width in range(40, 141):
+        transcript._search_matches(width)
+
+    assert len(transcript._search_cache) == 3
 
 
 def test_transcript_cache_uses_stable_keys_after_tool_discard() -> None:
@@ -2691,6 +2896,48 @@ def test_presenter_refreshes_live_agent_cards_in_full_screen() -> None:
     assert transcript._tools[(None, call.id)].revision == 1
 
 
+def test_background_agent_refresh_invalidates_transcript_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = ToolCall(
+        "agent-background-refresh",
+        "agent",
+        {"prompt": "inspect", "description": "background research"},
+    )
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        _test_console(),
+        lambda: True,
+        lambda renderable: None,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call),
+        aborted=False,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "background agent started",
+                structured_content={"status": "running"},
+            ),
+        ),
+        aborted=False,
+    )
+    transcript.begin_search()
+    transcript.update_search("fresh target")
+    assert transcript.search_status() == (0, 0)
+
+    unit = transcript._tools[(None, call.id)]
+    monkeypatch.setattr(unit.card, "refresh", lambda: Text("fresh target"))
+    presenter.refresh_active_agents()
+
+    assert transcript.search_status() == (1, 1)
+
+
 def test_agent_card_toggle_is_symmetric_during_and_after_execution(
     tmp_path: Path,
 ) -> None:
@@ -2893,6 +3140,118 @@ def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None
     for mode in (EditingMode.EMACS, EditingMode.VI):
         session = PromptSession(key_bindings=bindings, editing_mode=mode)
         assert not session.app.key_bindings.get_bindings_for_keys((Keys.ControlO,))
+
+
+def test_transcript_navigation_bindings_are_full_screen_only() -> None:
+    bindings = build_key_bindings(
+        on_interrupt=lambda: None,
+        on_exit=lambda: None,
+        on_search_start=lambda: None,
+        search_active=lambda: False,
+        on_search_input=lambda _value: None,
+        on_search_end=lambda: None,
+        on_previous_user=lambda: None,
+        on_next_user=lambda: None,
+    )
+
+    assert bindings.get_bindings_for_keys((Keys.ControlF,))
+    assert bindings.get_bindings_for_keys((Keys.ControlUp,))
+    assert bindings.get_bindings_for_keys((Keys.ControlDown,))
+    inline = PromptSession(key_bindings=bindings)
+    with set_app(inline.app):
+        assert not bindings.get_bindings_for_keys((Keys.ControlF,))[-1].filter()
+
+
+@pytest.mark.asyncio
+async def test_transcript_search_query_accepts_navigation_key_text() -> None:
+    active = False
+    values: list[str] = []
+    actions: list[str] = []
+
+    def start_search() -> None:
+        nonlocal active
+        active = True
+
+    def end_search() -> None:
+        nonlocal active
+        active = False
+
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_search_start=start_search,
+                search_active=lambda: active,
+                on_search_input=values.append,
+                on_search_next=lambda: actions.append("next"),
+                on_search_previous=lambda: actions.append("previous"),
+                on_search_end=end_search,
+            ),
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        session.app.full_screen = True
+        pipe.send_text("\x06nN\x12")
+        await wait_until(lambda: values == ["n", "nN", "nN\x12"])
+        pipe.send_text("\rN\x1b")
+        await wait_until(lambda: actions == ["next", "previous"])
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("editing_mode", [EditingMode.EMACS, EditingMode.VI])
+async def test_history_search_acceptance_survives_transcript_search(
+    editing_mode: EditingMode,
+    tmp_path: Path,
+) -> None:
+    history = history_for(tmp_path / "history")
+    history.append_string("history target")
+    transcript_search_active = False
+    actions: list[str] = []
+
+    def start_search() -> None:
+        nonlocal transcript_search_active
+        transcript_search_active = True
+
+    def end_search() -> None:
+        nonlocal transcript_search_active
+        transcript_search_active = False
+
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=editing_mode,
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_search_start=start_search,
+                search_active=lambda: transcript_search_active,
+                on_search_input=lambda _value: None,
+                on_search_next=lambda: actions.append("next"),
+                on_search_end=end_search,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        session.app.full_screen = True
+        pipe.send_text("\x06query\r")
+        await wait_until(lambda: actions == ["next"])
+        pipe.send_text("\x12history")
+        await wait_until(lambda: session.search_buffer.text == "history")
+        pipe.send_text("\r")
+        await wait_until(
+            lambda: session.default_buffer.text == "history target"
+        )
+        assert actions == ["next"]
+        session.app.exit()
+        await task
 
 
 def test_long_single_line_read_uses_a_cropped_card() -> None:
@@ -4853,6 +5212,40 @@ def test_footer_builder_formats_context_usage_and_hints() -> None:
         undo_available=True,
     )
     assert "ctrl+u undo" in undo_footer.plain
+
+
+def test_footer_shows_transcript_navigation_and_search_state() -> None:
+    footer = format_status(
+        "fake",
+        "offline",
+        "idle",
+        token_count=18,
+        transcript_navigation=True,
+        transcript_search="target",
+        transcript_match=(2, 5),
+        transcript_position="line 14/80",
+    )
+
+    assert 'find "target" 2/5' in footer.plain
+    assert "line 14/80" in footer.plain
+    assert "ctrl+f find" in footer.plain
+    assert "enter/n next" in footer.plain
+    assert "N prev" in footer.plain
+    assert "esc close" in footer.plain
+
+    narrow = format_status(
+        "fake",
+        "offline",
+        "idle",
+        token_count=18,
+        width=50,
+        transcript_navigation=True,
+        transcript_search="target",
+        transcript_match=(2, 5),
+        transcript_position="line 14/80",
+    )
+    assert 'find "target" 2/5' in narrow.plain
+    assert "line 14/80" in narrow.plain
 
 
 def test_footer_shows_vim_state_and_degrades_as_a_whole_segment() -> None:

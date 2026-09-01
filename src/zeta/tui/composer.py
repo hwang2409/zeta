@@ -9,24 +9,18 @@ import platform
 import re
 import shutil
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from prompt_toolkit.application import Application, get_app
+from prompt_toolkit.application import get_app
 from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.filters import Condition, is_searching, vi_insert_mode
 from prompt_toolkit.formatted_text import FormattedText
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
-from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.key_binding.vi_state import InputMode
-from prompt_toolkit.keys import Keys
 from rich.text import Text
 
 from ..types import (
@@ -39,19 +33,25 @@ from ..types import (
     TextContent,
     image_signature_matches,
 )
+from .key_bindings import (
+    FullScreenPromptSession,
+    VimCursorShapeConfig,
+    build_key_bindings,
+)
 from .render import is_retryable_error, render_event
 from .theme import BODY, CHROME, DIM, ERROR, USER_ROLE
 
-SHIFT_ENTER_SEQUENCES = frozenset(
-    {
-        "\x1b[27;2;13~",
-        "\x1b[27;5;13~",
-        "\x1b[27;6;13~",
-    }
-)
 ATTACHMENT_MAX_TEXT_BYTES = 200 * 1024
 ATTACHMENT_TOKEN_RE = re.compile(r'(?<!\S)@(?:"([^"\n]+)"|([^\s]+))')
 SPINNER_INTERVAL = 0.2
+
+__all__ = [
+    "FullScreenPromptSession",
+    "VimCursorShapeConfig",
+    "build_key_bindings",
+]
+
+
 class TurnConsumerMixin:
     """Consume loop events and preserve failed-turn recovery state."""
 
@@ -626,7 +626,7 @@ class ComposerAttachmentMixin:
     def _print_user(self, user: str | Message) -> None:
         self._presenter.reset_assistant_unit()
         if isinstance(user, str):
-            self._print_unit(Text.assemble(("▌ ", USER_ROLE), (user, BODY)))
+            self._presenter.print_user(Text.assemble(("▌ ", USER_ROLE), (user, BODY)))
             return
         prompt = next(
             (
@@ -644,7 +644,7 @@ class ComposerAttachmentMixin:
                     f"\n  file · {label} · {block.size or 0} bytes",
                     style="dim",
                 )
-        self._print_unit(rendered)
+        self._presenter.print_user(rendered)
 
     def _start_queued_turn(self) -> None:
         if not self._queued:
@@ -675,20 +675,6 @@ class ComposerAttachmentMixin:
                 persist_user_message=persist_user_message,
             )
         )
-
-
-class VimCursorShapeConfig(CursorShapeConfig):
-    """Use a beam in insert mode and a block in every other vi mode."""
-
-    def get_cursor_shape(self, application: Application[Any]) -> CursorShape:
-        if getattr(application, "editing_mode", None) is not EditingMode.VI:
-            return CursorShape._NEVER_CHANGE
-        if getattr(application.vi_state, "input_mode", None) in {
-            InputMode.INSERT,
-            InputMode.INSERT_MULTIPLE,
-        }:
-            return CursorShape.BEAM
-        return CursorShape.BLOCK
 
 
 def vim_state_label(vim_mode: bool) -> str | None:
@@ -735,210 +721,3 @@ def parse_input(value: str) -> str | None:
 
     stripped = value.strip()
     return stripped or None
-
-
-def build_key_bindings(
-    *,
-    on_interrupt: Callable[[], None],
-    on_exit: Callable[[], None],
-    on_submit: Callable[[str], None] | None = None,
-    on_paste: Callable[[KeyPressEvent], None] | None = None,
-    on_page_up: Callable[[], None] | None = None,
-    on_page_down: Callable[[], None] | None = None,
-    on_toggle_agent: Callable[[], None] | None = None,
-    on_retry: Callable[[], None] | None = None,
-    retry_available: Callable[[], bool] | None = None,
-    on_undo: Callable[[], None] | None = None,
-    append_history: bool = True,
-) -> KeyBindings:
-    """Build the small key map used by the full-screen composer."""
-
-    bindings = KeyBindings()
-    escape_chord_pending = False
-    escape_chord_cursor_position: int | None = None
-    history_navigation_active = False
-    history_navigation_buffer: Buffer | None = None
-    suppress_history_detach = False
-
-    def track_history_buffer(buffer: Buffer) -> None:
-        nonlocal history_navigation_active, history_navigation_buffer
-        if history_navigation_buffer is buffer:
-            return
-        history_navigation_buffer = buffer
-
-        def detach_history_navigation(_buffer: Buffer) -> None:
-            nonlocal history_navigation_active
-            if not suppress_history_detach:
-                history_navigation_active = False
-
-        buffer.on_text_changed += detach_history_navigation
-
-    @Condition
-    def vi_insert_history_navigation() -> bool:
-        app = get_app()
-        buffer = app.current_buffer
-        track_history_buffer(buffer)
-        return vi_insert_mode()
-
-    @Condition
-    def emacs_history_navigation() -> bool:
-        app = get_app()
-        track_history_buffer(app.current_buffer)
-        return app.editing_mode is EditingMode.EMACS
-
-    @Condition
-    def full_screen_mode() -> bool:
-        return get_app().full_screen
-
-    @Condition
-    def retry_ready() -> bool:
-        return (
-            on_retry is not None
-            and (retry_available is None or retry_available())
-        )
-
-    def insert_newline(event: KeyPressEvent) -> None:
-        event.current_buffer.insert_text("\n")
-
-    @bindings.add("enter")
-    def submit(event: KeyPressEvent) -> None:
-        nonlocal escape_chord_cursor_position, escape_chord_pending
-        if escape_chord_pending:
-            escape_chord_pending = False
-            if escape_chord_cursor_position is not None:
-                event.current_buffer.cursor_position = escape_chord_cursor_position
-            escape_chord_cursor_position = None
-            event.app.vi_state.input_mode = InputMode.INSERT
-            insert_newline(event)
-            return
-        if event.data in SHIFT_ENTER_SEQUENCES:
-            insert_newline(event)
-            return
-        if on_submit is not None:
-            if append_history:
-                event.current_buffer.append_to_history()
-            on_submit(event.current_buffer.text)
-            event.current_buffer.reset()
-        else:
-            event.current_buffer.validate_and_handle()
-
-    @bindings.add("c-j")
-    def newline(event: KeyPressEvent) -> None:
-        insert_newline(event)
-
-    @bindings.add("enter", filter=is_searching, eager=True)
-    def accept_history_search(event: KeyPressEvent) -> None:
-        del event
-        from prompt_toolkit.search import accept_search
-
-        accept_search()
-
-    if on_retry is not None:
-
-        @bindings.add("c-y", filter=retry_ready, eager=True)
-        def retry(event: KeyPressEvent) -> None:
-            del event
-            on_retry()
-
-    if on_undo is not None:
-
-        @bindings.add("c-u", eager=True)
-        def undo(event: KeyPressEvent) -> None:
-            del event
-            on_undo()
-
-    if on_paste is not None:
-
-        @bindings.add("c-v")
-        def paste(event: KeyPressEvent) -> None:
-            on_paste(event)
-
-    @bindings.add("escape", "enter", filter=~full_screen_mode)
-    def alt_enter(event: KeyPressEvent) -> None:
-        insert_newline(event)
-
-    native_escape = next(
-        binding
-        for binding in load_vi_bindings().bindings
-        if binding.keys == (Keys.Escape,)
-    )
-
-    bindings.add(Keys.Escape, filter=native_escape.filter & ~full_screen_mode)(native_escape)
-
-    @bindings.add(Keys.Escape, filter=native_escape.filter & full_screen_mode, eager=True)
-    def escape(event: KeyPressEvent) -> None:
-        nonlocal escape_chord_cursor_position, escape_chord_pending
-        escape_chord_cursor_position = event.current_buffer.cursor_position
-        native_escape.call(event)
-        next_key = next(iter(event.key_processor.input_queue), None)
-        escape_chord_pending = next_key is not None and next_key.key == Keys.Enter
-        if not escape_chord_pending:
-            escape_chord_cursor_position = None
-
-    @bindings.add(
-        "up", filter=vi_insert_history_navigation | emacs_history_navigation
-    )
-    def history_up(event: KeyPressEvent) -> None:
-        nonlocal history_navigation_active, suppress_history_detach
-        buffer = event.current_buffer
-        if not history_navigation_active and buffer.text:
-            if buffer.document.cursor_position_row > 0:
-                buffer.auto_up()
-            return
-        suppress_history_detach = True
-        try:
-            buffer.history_backward()
-        finally:
-            suppress_history_detach = False
-        history_navigation_active = buffer.text != ""
-
-    @bindings.add(
-        "down", filter=vi_insert_history_navigation | emacs_history_navigation
-    )
-    def history_down(event: KeyPressEvent) -> None:
-        nonlocal history_navigation_active, suppress_history_detach
-        buffer = event.current_buffer
-        if not history_navigation_active:
-            if buffer.document.cursor_position_row < buffer.document.line_count - 1:
-                buffer.auto_down()
-            return
-        suppress_history_detach = True
-        try:
-            buffer.history_forward()
-            buffer.cursor_position = len(buffer.text)
-        finally:
-            suppress_history_detach = False
-        history_navigation_active = buffer.text != ""
-
-    @bindings.add("c-c")
-    def interrupt(event: KeyPressEvent) -> None:
-        on_interrupt()
-        event.current_buffer.reset()
-
-    @bindings.add("c-d")
-    def exit_prompt(event: KeyPressEvent) -> None:
-        on_exit()
-        event.app.exit(exception=EOFError())
-
-    if on_page_up is not None:
-
-        @bindings.add("pageup")
-        def page_up(event: KeyPressEvent) -> None:
-            del event
-            on_page_up()
-
-    if on_page_down is not None:
-
-        @bindings.add("pagedown")
-        def page_down(event: KeyPressEvent) -> None:
-            del event
-            on_page_down()
-
-    if on_toggle_agent is not None:
-
-        @bindings.add("c-x", "c-o")
-        def toggle_agent(event: KeyPressEvent) -> None:
-            del event
-            on_toggle_agent()
-
-    return bindings
