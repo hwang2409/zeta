@@ -431,6 +431,7 @@ class AgentLoop:
         self._agent_child_stores[tool_call.id] = child_store
         self._agent_child_turns[tool_call.id] = 0
         self._agent_child_types[tool_call.id] = preset.name
+        child_marker_key = child_instance_id if child_depth > 1 else tool_call.id
         if publisher is not None:
             publisher.set_metadata(
                 {"child_session_path": child_path, "depth": child_depth}
@@ -490,12 +491,15 @@ class AgentLoop:
         )
         def publish(status: str) -> None:
             if background:
+                event_data: dict[str, object] = {"stream": "stdout"}
+                if self.agent_instance_id is not None:
+                    event_data["agent_instance_id"] = self.agent_instance_id
                 self._publish_background_event(
                     StreamEvent(
                         StreamEventType.TOOL_EXECUTION_UPDATE,
                         tool_call=tool_call,
                         delta=f"{description}: {status}\n",
-                        data={"stream": "stdout"},
+                        data=event_data,
                     )
                 )
             elif publisher is not None:
@@ -533,6 +537,7 @@ class AgentLoop:
             if event_type is None:
                 return
             data = {"depth": child_depth if depth is None else depth}
+            data["agent_instance_id"] = child_instance_id
             if background:
                 self._publish_background_event(
                     StreamEvent(
@@ -546,7 +551,7 @@ class AgentLoop:
                 lifecycle_sink(kind, call, data, tool_result)
         def update_turns(turns: int) -> None:
             self._agent_child_turns[tool_call.id] = turns
-            self.store.update_agent_child_turns(tool_call.id, turns)
+            self.store.update_agent_child_turns(child_marker_key, turns)
 
         child_task = self._create_task(
             consume_child(
@@ -609,6 +614,8 @@ class AgentLoop:
                     cleanup=cleanup_background_child,
                     close_child=lambda: child_loop.close(cancel_background=False),
                     error_message=lambda exc: _error_info(exc).message,
+                    marker_key=child_marker_key,
+                    agent_instance_id=self.agent_instance_id,
                     background_owner=self._background_owner,
                 )
 
@@ -1101,11 +1108,14 @@ class AgentLoop:
                             background_owner=self._background_owner,
                         )
                         child_store.finish_agent_parent()
-                self.store.finish_agent_child(call.id)
+                self.store.finish_agent_child(
+                    f"{self.agent_instance_id}:{child_store.session_id}"
+                    if child_store is not None and self.agent_instance_id is not None
+                    else call.id
+                )
                 self._agent_child_turns.pop(call.id, None)
                 self._agent_child_types.pop(call.id, None)
         return results
-
     def _persist_partial(
         self,
         partial_blocks: list[ContentBlock],

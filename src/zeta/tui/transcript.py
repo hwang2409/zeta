@@ -27,6 +27,25 @@ from .render import render_event, render_tool_progress
 from .theme import RICH_THEME
 
 
+ToolLifecycleKey = tuple[str | None, str]
+
+
+def _tool_lifecycle_key(
+    call_id: str | ToolLifecycleKey,
+    event: StreamEvent | None = None,
+) -> ToolLifecycleKey:
+    if isinstance(call_id, tuple):
+        return call_id
+    session_id = event.data.get("agent_instance_id") if event is not None else None
+    return (session_id if type(session_id) is str else None, call_id)
+
+
+def _event_tool_lifecycle_key(event: StreamEvent) -> ToolLifecycleKey | None:
+    if event.tool_call is None:
+        return None
+    return _tool_lifecycle_key(event.tool_call.id, event)
+
+
 class _ToolUnit:
     def __init__(
         self,
@@ -92,9 +111,9 @@ class TranscriptWidget(UIControl):
 
     def __init__(self) -> None:
         self._units: list[_TranscriptUnit | None] = []
-        self._tools: dict[str, _ToolUnit] = {}
-        self._background_tools: set[str] = set()
-        self._card_units: dict[str, _ToolUnit] = {}
+        self._tools: dict[ToolLifecycleKey, _ToolUnit] = {}
+        self._background_tools: set[ToolLifecycleKey] = set()
+        self._card_units: dict[ToolLifecycleKey, _ToolUnit] = {}
         self._render_cache: dict[int, tuple[int, int, str]] = {}
         self._parsed_cache: OrderedDict[int, list[list[tuple[str, str]]]] = (
             OrderedDict()
@@ -117,7 +136,7 @@ class TranscriptWidget(UIControl):
         return any(unit.active_card for unit in self._tools.values())
 
     @property
-    def _agent_units(self) -> dict[str, _ToolUnit]:
+    def _agent_units(self) -> dict[ToolLifecycleKey, _ToolUnit]:
         """Keep the old diagnostic view while card selection stays generic."""
 
         return {
@@ -179,49 +198,54 @@ class TranscriptWidget(UIControl):
 
     def start_tool(
         self,
-        call_id: str,
+        call_id: str | ToolLifecycleKey,
         call: ToolCall,
         renderable: RenderableType,
         start_event: StreamEvent | None = None,
     ) -> None:
         unit = _ToolUnit(call, renderable, start_event)
+        lifecycle_key = _tool_lifecycle_key(call_id, start_event)
         self._append_unit(unit)
-        self._tools[call_id] = unit
-        self._card_units[call_id] = unit
+        self._tools[lifecycle_key] = unit
+        self._card_units[lifecycle_key] = unit
 
     def update_tool(
         self,
-        call_id: str,
+        call_id: str | ToolLifecycleKey,
         rendered: RenderableType,
         event: StreamEvent | None = None,
     ) -> None:
-        unit = self._tools.get(call_id)
+        unit = self._tools.get(_tool_lifecycle_key(call_id, event))
         if unit is not None:
             unit.update(rendered, event)
             self._bump_revision()
 
     def finish_tool(
         self,
-        call_id: str,
+        call_id: str | ToolLifecycleKey,
         rendered: RenderableType,
         event: StreamEvent | None = None,
     ) -> None:
-        unit = self._tools.pop(call_id, None)
+        lifecycle_key = _tool_lifecycle_key(call_id, event)
+        unit = self._tools.pop(lifecycle_key, None)
         if unit is not None:
             unit.finish(rendered, event)
             self._bump_revision()
         else:
             self.append(rendered)
-        self._background_tools.discard(call_id)
+        self._background_tools.discard(lifecycle_key)
 
-    def mark_tool_background(self, call_id: str) -> None:
+    def mark_tool_background(self, call_id: str | ToolLifecycleKey) -> None:
         """Keep a running child card after its parent tool call returns."""
 
-        if call_id in self._tools:
-            self._background_tools.add(call_id)
+        lifecycle_key = _tool_lifecycle_key(call_id)
+        if lifecycle_key in self._tools:
+            self._background_tools.add(lifecycle_key)
 
-    def set_tool_child_session_path(self, call_id: str, path: str) -> None:
-        unit = self._tools.get(call_id)
+    def set_tool_child_session_path(
+        self, call_id: str | ToolLifecycleKey, path: str
+    ) -> None:
+        unit = self._tools.get(_tool_lifecycle_key(call_id))
         if unit is not None:
             unit.card.set_child_session_path(path)
 
@@ -248,9 +272,9 @@ class TranscriptWidget(UIControl):
         for key in removed_keys:
             self._render_cache.pop(key, None)
         self._tools = {
-            call_id: unit
-            for call_id, unit in self._tools.items()
-            if call_id in self._background_tools
+            lifecycle_key: unit
+            for lifecycle_key, unit in self._tools.items()
+            if lifecycle_key in self._background_tools
         }
         self._bump_revision()
 
@@ -504,10 +528,10 @@ class TranscriptPresenter:
         self._print_callback = print_callback
         self._printed_units = False
         self._assistant_unit_open = False
-        self._active_tool_calls: set[str] = set()
-        self._background_tool_ids: set[str] = set()
+        self._active_tool_calls: set[ToolLifecycleKey] = set()
+        self._background_tool_ids: set[ToolLifecycleKey] = set()
         self._pending_tool_renders: list[RenderableType] = []
-        self._tool_region_units: dict[str, _ToolUnit] = {}
+        self._tool_region_units: dict[ToolLifecycleKey, _ToolUnit] = {}
         self._tool_region: Live | None = None
         self._thinking_live: Live | None = None
         self._thinking_unit: _TranscriptUnit | None = None
@@ -702,13 +726,24 @@ class TranscriptPresenter:
         if not isinstance(rendered, Text):
             return False
         if self._full_screen_active():
+            lifecycle_key = _event_tool_lifecycle_key(event)
             if event.tool_call is not None:
-                self.transcript.update_tool(event.tool_call.id, rendered, event)
+                if lifecycle_key is not None:
+                    self.transcript.update_tool(lifecycle_key, rendered, event)
             return bool(event.delta and event.delta.strip())
         call = event.tool_call
-        if call is not None and call.id not in self._tool_region_units:
-            self._tool_region_units[call.id] = _ToolUnit(call, rendered, event)
-        unit = self._tool_region_units.get(call.id) if call is not None else None
+        lifecycle_key = _event_tool_lifecycle_key(event)
+        if (
+            call is not None
+            and lifecycle_key is not None
+            and lifecycle_key not in self._tool_region_units
+        ):
+            self._tool_region_units[lifecycle_key] = _ToolUnit(call, rendered, event)
+        unit = (
+            self._tool_region_units.get(lifecycle_key)
+            if lifecycle_key is not None
+            else None
+        )
         if unit is None:
             return False
         if self._tool_region is None:
@@ -745,8 +780,9 @@ class TranscriptPresenter:
     ) -> ToolEventPresentation | None:
         if event.type is StreamEventType.TOOL_EXECUTION_START:
             self.reset_assistant_unit()
-            if event.tool_call is not None:
-                self._active_tool_calls.add(event.tool_call.id)
+            lifecycle_key = _event_tool_lifecycle_key(event)
+            if lifecycle_key is not None:
+                self._active_tool_calls.add(lifecycle_key)
             rendered = render_event(event)
             if rendered is None:
                 return ToolEventPresentation()
@@ -763,9 +799,10 @@ class TranscriptPresenter:
             else:
                 self.print_unit(rendered)
             if not self._full_screen_active() and event.tool_call is not None:
-                self._tool_region_units[event.tool_call.id] = _ToolUnit(
-                    event.tool_call, rendered, event
-                )
+                if lifecycle_key is not None:
+                    self._tool_region_units[lifecycle_key] = _ToolUnit(
+                        event.tool_call, rendered, event
+                    )
             return ToolEventPresentation(visible_output=True)
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
             return ToolEventPresentation(
@@ -783,35 +820,45 @@ class TranscriptPresenter:
             structured is not None and structured.get("status") == "running"
         )
         if event.tool_call is not None:
-            self._active_tool_calls.discard(event.tool_call.id)
+            lifecycle_key = _event_tool_lifecycle_key(event)
+            if lifecycle_key is not None:
+                self._active_tool_calls.discard(lifecycle_key)
             if is_background_start:
-                self._background_tool_ids.add(event.tool_call.id)
+                if lifecycle_key is not None:
+                    self._background_tool_ids.add(lifecycle_key)
                 if self._full_screen_active():
-                    self.transcript.mark_tool_background(event.tool_call.id)
+                    if lifecycle_key is not None:
+                        self.transcript.mark_tool_background(lifecycle_key)
                 path = structured.get("child_session_path") if structured else None
                 if isinstance(path, str) and path:
                     if self._full_screen_active():
-                        self.transcript.set_tool_child_session_path(
-                            event.tool_call.id, path
-                        )
+                        if lifecycle_key is not None:
+                            self.transcript.set_tool_child_session_path(
+                                lifecycle_key, path
+                            )
                     else:
-                        unit = self._tool_region_units.get(event.tool_call.id)
+                        unit = self._tool_region_units.get(lifecycle_key)
                         if unit is not None:
                             unit.card.set_child_session_path(path)
                 return ToolEventPresentation(visible_output=True)
         rendered = render_event(event)
         if not self._full_screen_active() and event.tool_call is not None:
-            unit = self._tool_region_units.get(event.tool_call.id)
+            lifecycle_key = _event_tool_lifecycle_key(event)
+            unit = self._tool_region_units.get(lifecycle_key)
             if unit is not None and rendered is not None:
                 unit.finish(rendered, event)
                 rendered = unit.renderable
         if rendered is not None:
             if self._full_screen_active() and event.tool_call is not None:
-                self.transcript.finish_tool(event.tool_call.id, rendered, event)
+                lifecycle_key = _event_tool_lifecycle_key(event)
+                if lifecycle_key is not None:
+                    self.transcript.finish_tool(lifecycle_key, rendered, event)
             else:
                 self._pending_tool_renders.append(rendered)
         if event.tool_call is not None:
-            self._background_tool_ids.discard(event.tool_call.id)
+            lifecycle_key = _event_tool_lifecycle_key(event)
+            if lifecycle_key is not None:
+                self._background_tool_ids.discard(lifecycle_key)
         if not self._active_tool_calls:
             self.commit_tool_region()
         return ToolEventPresentation(

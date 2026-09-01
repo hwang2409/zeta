@@ -2229,6 +2229,87 @@ async def test_nested_agent_lifecycle_reaches_tui_with_depth(
     assert "depth 2" in renderable_plain(rendered)
 
 
+def test_nested_lifecycle_keys_keep_identical_foreground_and_background_ids() -> None:
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        _test_console(),
+        lambda: True,
+        lambda renderable: None,
+    )
+    foreground = ToolCall(
+        "same-id",
+        "agent",
+        {"prompt": "inspect", "description": "foreground"},
+    )
+    background = ToolCall(
+        "same-id",
+        "agent",
+        {"prompt": "inspect", "description": "background"},
+    )
+    foreground_scope = "root:foreground"
+    background_scope = "root:background"
+
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=foreground,
+            data={"agent_instance_id": foreground_scope},
+        ),
+        aborted=False,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=background,
+            data={"agent_instance_id": background_scope},
+        ),
+        aborted=False,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=background,
+            tool_result=ToolResult(
+                background.id,
+                "background agent started",
+                structured_content={
+                    "status": "running",
+                    "child_session_path": "/tmp/background",
+                },
+            ),
+            data={"agent_instance_id": background_scope},
+        ),
+        aborted=False,
+    )
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=foreground,
+            tool_result=ToolResult(foreground.id, "foreground complete"),
+            data={"agent_instance_id": foreground_scope},
+        ),
+        aborted=False,
+    )
+
+    assert (background_scope, background.id) in transcript._tools
+    assert (foreground_scope, foreground.id) not in transcript._tools
+    assert presenter.has_active_agent
+
+    presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=background,
+            tool_result=ToolResult(background.id, "background complete"),
+            data={"agent_instance_id": background_scope},
+        ),
+        aborted=False,
+    )
+
+    assert not transcript._tools
+    assert not presenter.has_active_agent
+
+
 def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     call = ToolCall(
@@ -2364,10 +2445,10 @@ def test_non_full_screen_agent_cards_keep_interleaved_child_streams() -> None:
         )
 
     units = presenter._tool_region_units
-    assert units["agent-1"].card._child_session_path == "/tmp/child-1"
-    assert units["agent-2"].card._child_session_path == "/tmp/child-2"
-    assert "step-1" in "\n".join(units["agent-1"].output)
-    assert "step-2" in "\n".join(units["agent-2"].output)
+    assert units[(None, "agent-1")].card._child_session_path == "/tmp/child-1"
+    assert units[(None, "agent-2")].card._child_session_path == "/tmp/child-2"
+    assert "step-1" in "\n".join(units[(None, "agent-1")].output)
+    assert "step-2" in "\n".join(units[(None, "agent-2")].output)
 
     for index, call in enumerate(calls, start=1):
         presenter.handle_tool_event(
@@ -2483,7 +2564,7 @@ def test_presenter_refreshes_live_agent_cards_in_full_screen() -> None:
 
     presenter.refresh_active_agents()
 
-    assert transcript._tools[call.id].revision == 1
+    assert transcript._tools[(None, call.id)].revision == 1
 
 
 def test_agent_card_toggle_is_symmetric_during_and_after_execution(

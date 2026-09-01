@@ -124,8 +124,11 @@ def adopt_agent_children(
 ) -> None:
     """Move unfinished descendants into the surviving parent session."""
 
-    for tool_call_id, marker in child_store.agent_children().items():
+    for marker_key, marker in child_store.agent_children().items():
         tool_call = ToolCall.from_dict(marker["tool_call"])
+        adopted_key = marker.get("child_instance_id", marker_key)
+        if type(adopted_key) is not str:
+            adopted_key = marker_key
         parent_store.register_agent_child(
             tool_call,
             child_session_path=marker["child_session_path"],
@@ -136,11 +139,11 @@ def adopt_agent_children(
         )
         turns_used = marker.get("turns_used", 0)
         if turns_used:
-            parent_store.update_agent_child_turns(tool_call_id, turns_used)
+            parent_store.update_agent_child_turns(adopted_key, turns_used)
         child_instance_id = marker.get("child_instance_id")
         if background_owner is not None and type(child_instance_id) is str:
             background_owner.adopt(child_instance_id, parent_store)
-        child_store.finish_agent_child(tool_call_id)
+        child_store.finish_agent_child(marker_key)
 
 
 def _nested_canceled_result(marker: dict[str, object]) -> ToolResult:
@@ -186,13 +189,13 @@ def _recover_nested_children(
 ) -> None:
     """Cancel descendants left behind when an ancestor session exits."""
 
-    for tool_call_id, marker in store.agent_children().items():
+    for marker_key, marker in store.agent_children().items():
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
         child_store = _open_child_store(store, child_path)
         if child_store is not None:
             _recover_nested_children(child_store, notification_store)
-        existing_result = _existing_tool_result(store, tool_call_id)
+        existing_result = _existing_tool_result(store, tool_call.id)
         notification_status: str | None = None
         if marker.get("background"):
             child_instance_id = marker.get(
@@ -242,13 +245,13 @@ def _recover_nested_children(
                 child_store.finish_agent_parent()
             else:
                 child_store.mark_agent_canceled(tool_call.id)
-        store.finish_agent_child(tool_call_id)
+        store.finish_agent_child(marker_key)
 
 
 def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
     """Resolve child markers left by a process exit before resuming."""
 
-    for tool_call_id, marker in loop.store.agent_children().items():
+    for marker_key, marker in loop.store.agent_children().items():
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
         agents_root = loop.store.session_dir / "agents"
@@ -294,16 +297,16 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                     child_store.mark_agent_canceled(tool_call.id)
                 else:
                     child_store.finish_agent_parent()
-            loop.store.finish_agent_child(tool_call_id)
+            loop.store.finish_agent_child(marker_key)
             continue
-        existing_result = loop._existing_tool_result(tool_call_id)
+        existing_result = loop._existing_tool_result(tool_call.id)
         if existing_result is None:
             loop.store.append_message(
                 Message(
                     MessageRole.TOOL_RESULT,
                     [TextContent("tool execution canceled")],
                     tool_result=loop._canceled_agent_result(
-                        tool_call_id,
+                        tool_call.id,
                         child_session_path=marker["child_session_path"],
                         turns_used=marker.get("turns_used", 0),
                         agent_type=marker.get("agent_type"),
@@ -315,7 +318,7 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                 child_store.mark_agent_canceled(tool_call.id)
             else:
                 child_store.finish_agent_parent()
-        loop.store.finish_agent_child(tool_call.id)
+        loop.store.finish_agent_child(marker_key)
 
 
 BuildResult = Callable[[str, bool, str], dict[str, object]]
@@ -338,6 +341,8 @@ async def finish_background_child(
     cleanup: Callable[[], None],
     close_child: Callable[[], Awaitable[None]],
     error_message: Callable[[BaseException], str],
+    marker_key: str | None = None,
+    agent_instance_id: str | None = None,
     background_owner: BackgroundAgentOwner | None = None,
 ) -> None:
     """Persist a background child result and publish its terminal card event."""
@@ -394,18 +399,21 @@ async def finish_background_child(
                 status=status,
                 text=notification_text or "background child completed",
             )
-        effective_parent_store.finish_agent_child(tool_call.id)
+        effective_parent_store.finish_agent_child(marker_key or tool_call.id)
         terminal_payload = build_result(
             notification_text or "background child completed",
             status != "completed",
             status,
         )
+        event_data: dict[str, object] = {"notification_id": notification.id}
+        if agent_instance_id is not None:
+            event_data["agent_instance_id"] = agent_instance_id
         publish_event(
             StreamEvent(
                 StreamEventType.TOOL_EXECUTION_END,
                 tool_call=tool_call,
                 tool_result=validate_result(terminal_payload, tool_call.id),
-                data={"notification_id": notification.id},
+                data=event_data,
             )
         )
     finally:

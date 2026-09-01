@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from zeta.agent_background import BackgroundAgentOwner, finish_background_child
+from zeta.agent_background import (
+    BackgroundAgentOwner,
+    adopt_agent_children,
+    finish_background_child,
+)
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -590,7 +594,8 @@ async def test_foreground_child_does_not_wait_for_background_grandchild(
 
     assert any(event.type is StreamEventType.TURN_END for event in events)
     assert store.agent_notifications() == []
-    assert store.agent_children()["grandchild"]["child_session_path"] == str(
+    marker = next(iter(store.agent_children().values()))
+    assert marker["child_session_path"] == str(
         store.session_dir / "agents" / "1" / "agents" / "1"
     )
 
@@ -746,6 +751,48 @@ def test_resume_cancels_adopted_background_grandchild(tmp_path: Path) -> None:
         child.session_dir / "agents", session_id="1"
     ).agent_canceled() == {
         "tool_call_id": grandchild_call.id,
+        "content": "tool execution canceled",
+    }
+
+
+def test_resume_keeps_same_id_adopted_background_grandchildren_separate(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    children = [
+        ConversationStore(root.session_dir / "agents", session_id=str(index))
+        for index in (1, 2)
+    ]
+    grandchild_call = _background_agent_call("same-grandchild")
+
+    for index, child in enumerate(children, start=1):
+        grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+        grandchild.mark_agent_parent(grandchild_call.id)
+        child.register_agent_child(
+            grandchild_call,
+            child_session_path=str(grandchild.session_dir),
+            description=f"grandchild {index}",
+            background=True,
+            child_instance_id=f"root:{index}:1",
+        )
+        adopt_agent_children(child, root)
+
+    assert set(root.agent_children()) == {"root:1:1", "root:2:1"}
+    root.finish_agent_child("root:1:1")
+    assert set(root.agent_children()) == {"root:2:1"}
+
+    resumed = ConversationStore(tmp_path, session_id="root")
+    AgentLoop(FakeBackend([]), resumed)
+
+    notifications = resumed.agent_notifications(pending_only=False)
+    assert [entry.data["child_instance_id"] for entry in notifications] == [
+        "root:2:1"
+    ]
+    recovered = ConversationStore(
+        children[1].session_dir / "agents", session_id="1"
+    )
+    assert recovered.agent_canceled() == {
+        "tool_call_id": "same-grandchild",
         "content": "tool execution canceled",
     }
 
