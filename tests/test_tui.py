@@ -47,9 +47,15 @@ from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.agent_card import AgentCard
 from zeta.tui.composer import (
+    UndoCandidate,
     build_key_bindings,
-    history_for,
     parse_input,
+)
+from zeta.persistence import DraftPersistence, history_for
+
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
 )
 from zeta.tui.layout import content_width
 from zeta.tui.render import (
@@ -1518,7 +1524,7 @@ def test_render_error_card_bounds_and_labels_json_payload() -> None:
     assert "provider failure · stream_error" in plain
     assert "payload · json" in plain
     assert len(plain) < 600
-    assert "retry: ctrl+r" in plain
+    assert "retry: ctrl+y" in plain
 
 
 @pytest.mark.parametrize("code", ["max_turns", "ui_error"])
@@ -1534,7 +1540,7 @@ def test_non_provider_errors_are_not_retryable(code: str) -> None:
     plain = renderable_plain(rendered)
     assert f"error · {code}" in plain
     assert "provider failure" not in plain
-    assert "retry: ctrl+r" not in plain
+    assert "retry: ctrl+y" not in plain
     assert is_retryable_error(event.error) is False
 
 
@@ -1559,7 +1565,7 @@ async def test_provider_failure_card_is_visible_in_both_modes(
     assert "| name | value |" in plain
     assert "provider failure · backend_error" in plain
     assert "reason: boom" in plain
-    assert "retry: ctrl+r" in plain
+    assert "retry: ctrl+y" in plain
 
 
 @pytest.mark.asyncio
@@ -1875,7 +1881,7 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
     rendered = Text.from_ansi(output.getvalue()).plain
     assert "partial response" in rendered
     assert "provider failure · backend_error" in rendered
-    assert "retry: ctrl+r" in rendered
+    assert "retry: ctrl+y" in rendered
 
     app.retry_failed_turn()
     assert app._active_task is not None
@@ -1967,6 +1973,124 @@ async def test_draft_survives_provider_failure(tmp_path: Path) -> None:
     assert session.app.current_buffer.text == "draft while streaming"
     failed_message = app.loop.store.messages()[-1]
     assert failed_message.metadata["turn_failed"] is True
+
+
+@pytest.mark.asyncio
+async def test_submitted_revision_does_not_clear_a_rapid_new_draft(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    draft_path = tmp_path / "draft"
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+        draft_path=draft_path,
+    )
+    session = app._make_session()
+    app._active_session = session
+    session.default_buffer.insert_text("sent prompt")
+    app._submit_input("sent prompt")
+    session.default_buffer.reset()
+    session.default_buffer.insert_text("new rapid draft")
+
+    await app._handle_prompt_value("sent prompt")
+    await asyncio.sleep(0.25)
+
+    assert app._draft.load() == "new rapid draft"
+    if app._active_task is not None:
+        await app._active_task
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_rapid_buffer_sends_keep_the_newest_persisted_draft(
+    tmp_path: Path,
+) -> None:
+    backend = GateBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        draft_path=tmp_path / "draft",
+    )
+    session = app._make_session()
+    app._active_session = session
+    session.default_buffer.insert_text("first")
+    app._submit_input(session.default_buffer.text)
+    session.default_buffer.reset()
+    session.default_buffer.insert_text("second")
+    app._submit_input(session.default_buffer.text)
+    session.default_buffer.reset()
+    session.default_buffer.insert_text("third draft")
+    await asyncio.sleep(0.25)
+
+    first = await app._submissions.get()
+    first_task = asyncio.create_task(app._handle_prompt_value(first))
+    await backend.started.wait()
+    second = await app._submissions.get()
+    await app._handle_prompt_value(second)
+    backend.release.set()
+    await first_task
+    await app._active_task
+    app._start_queued_turn()
+    await app._active_task
+
+    assert session.default_buffer.text == "third draft"
+    assert app._draft.load() == "third draft"
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_rapid_buffer_sends_keep_each_staged_image_owned(
+    tmp_path: Path,
+) -> None:
+    backend = GateBackend()
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    first_image = store.session_dir / "clipboard-first.png"
+    second_image = store.session_dir / "clipboard-second.png"
+    first_image.write_bytes(PNG)
+    second_image.write_bytes(PNG)
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._pending_attachments.append(first_image)
+    app._pending_attachment_tokens["[Image #1]"] = first_image
+    session.default_buffer.insert_text("first [Image #1]")
+    app._submit_input(session.default_buffer.text)
+    session.default_buffer.reset()
+    app._pending_attachments.append(second_image)
+    app._pending_attachment_tokens["[Image #1]"] = second_image
+    session.default_buffer.insert_text("second [Image #1]")
+    app._submit_input(session.default_buffer.text)
+    session.default_buffer.reset()
+
+    first = await app._submissions.get()
+    first_task = asyncio.create_task(app._handle_prompt_value(first))
+    await backend.started.wait()
+    second = await app._submissions.get()
+    await app._handle_prompt_value(second)
+    backend.release.set()
+    await first_task
+    await app._active_task
+    app._start_queued_turn()
+    await app._active_task
+
+    assert first_image.exists()
+    assert second_image.exists()
+    user_messages = [
+        message
+        for message in store.messages()
+        if message.role is MessageRole.USER
+    ]
+    assert user_messages[0].content[1].path == str(first_image)
+    assert user_messages[1].content[1].path == str(second_image)
+    await app.loop.close()
 
 
 def test_tool_render_mode_keeps_receipt_rule_in_one_place() -> None:
@@ -4510,6 +4634,18 @@ def test_footer_builder_formats_context_usage_and_hints() -> None:
     assert footer.plain == (
         "idle  18.6K (9%)  /status · ctrl+c interrupt · ctrl+d quit · abcdef12"
     )
+    assert "ctrl+u undo" not in footer.plain
+
+    undo_footer = format_status(
+        "openai",
+        "gpt-5.4",
+        "streaming",
+        token_count=18_600,
+        model_window=200_000,
+        session_id="abcdef12",
+        undo_available=True,
+    )
+    assert "ctrl+u undo" in undo_footer.plain
 
 
 def test_footer_shows_vim_state_and_degrades_as_a_whole_segment() -> None:
@@ -5363,6 +5499,107 @@ async def test_run_delivers_queued_follow_up_after_current_turn(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> None:
+    backend = GateBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._submit_input("first")
+    app._submit_input("second")
+    first = await app._submissions.get()
+    first_task = asyncio.create_task(app._handle_prompt_value(first))
+    await backend.started.wait()
+    second = await app._submissions.get()
+    await app._handle_prompt_value(second)
+
+    backend.release.set()
+    await first_task
+    await app._active_task
+    app._start_queued_turn()
+    await app._active_task
+
+    user_texts = [
+        block.text
+        for message in store.messages()
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ]
+    assert user_texts == ["first", "second"]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_submission_undo_cancels_only_the_exact_rapid_enter(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    app._submit_input("same")
+    app.undo_sent_turn()
+    app._submit_input("same")
+    first = await app._submissions.get()
+    second = await app._submissions.get()
+    await app._handle_prompt_value(first)
+    await app._handle_prompt_value(second)
+    await app._active_task
+
+    user_texts = [
+        block.text
+        for message in store.messages()
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ]
+    assert user_texts == ["same"]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_double_slash_source_text(tmp_path: Path) -> None:
+    backend = GateBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    session = app._make_session()
+    app._active_session = session
+
+    raw = "  //status  \n"
+    await app._handle_prompt_value(raw)
+    await backend.started.wait()
+    app.undo_sent_turn()
+    await asyncio.gather(app._active_task, return_exceptions=True)
+
+    assert session.app.current_buffer.text == raw
+    await app._handle_prompt_value(raw)
+    await app._active_task
+
+    assert len(backend.calls) == 2
+    resent = [
+        block.text
+        for message in backend.calls[-1]
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextContent)
+    ]
+    assert resent[-1] == "/status"
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
 async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
     tool_started = asyncio.Event()
     call = ToolCall("call-1", "block", {})
@@ -5690,7 +5927,9 @@ async def test_vi_composer_paste_in_insert_mode_and_wrapped_multiline_submission
 
 
 @pytest.mark.asyncio
-async def test_vi_composer_history_down_returns_to_empty_buffer(tmp_path: Path) -> None:
+async def test_vi_composer_history_down_restores_multiline_entry_cursor(
+    tmp_path: Path,
+) -> None:
     history = history_for(tmp_path / "history")
     submitted: list[str] = []
 
@@ -5717,22 +5956,31 @@ async def test_vi_composer_history_down_returns_to_empty_buffer(tmp_path: Path) 
         fast_vi_timeouts(session)
         first = asyncio.create_task(session.prompt_async(" ❯ "))
         await asyncio.sleep(0)
-        pipe.send_text("first\r")
+        pipe.send_text("first line\nsecond line\r")
         await first
         second = asyncio.create_task(session.prompt_async(" ❯ "))
         await asyncio.sleep(0)
-        pipe.send_text("second\r")
+        pipe.send_text("other first\nother second\r")
         await second
         third = asyncio.create_task(session.prompt_async(" ❯ "))
         await asyncio.sleep(0)
         pipe.send_text("\x1b[A")
-        await wait_until(lambda: session.app.current_buffer.text == "second")
+        await wait_until(
+            lambda: session.app.current_buffer.text == "other first\nother second"
+        )
+        pipe.send_text("\x1b[A")
+        await wait_until(
+            lambda: session.app.current_buffer.text == "first line\nsecond line"
+        )
         pipe.send_text("\x1b[B")
-        await wait_until(lambda: session.app.current_buffer.text == "")
+        await wait_until(
+            lambda: session.app.current_buffer.text == "other first\nother second"
+            and session.app.current_buffer.cursor_position == len("other first\nother second")
+        )
         session.app.exit()
         await third
 
-    assert submitted == ["first", "second"]
+    assert submitted == ["first line\nsecond line", "other first\nother second"]
 
 
 def test_vim_slash_command_toggles_both_directions(tmp_path: Path) -> None:
@@ -5962,3 +6210,344 @@ async def test_vi_composer_history_up_works_from_insert_mode_on_empty_buffer(
 @pytest.mark.parametrize("value", ["", "  \n  "])
 def test_parse_input_rejects_blank_turns(value: str) -> None:
     assert parse_input(value) is None
+
+
+@pytest.mark.asyncio
+async def test_composer_history_is_bounded_and_keeps_multiline_entries(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "history"
+    history = history_for(path)
+    for index in range(1001):
+        history.append_string(f"prompt {index}\nline two")
+
+    assert len(history.get_strings()) == 1000
+    assert history.get_strings()[0] == "prompt 1\nline two"
+    assert history.get_strings()[-1] == "prompt 1000\nline two"
+    reopened = history_for(path)
+    loaded: list[str] = []
+    async for entry in reopened.load():
+        loaded.append(entry)
+    assert loaded[:2] == ["prompt 1000\nline two", "prompt 999\nline two"]
+
+
+@pytest.mark.asyncio
+async def test_composer_history_merges_updates_from_active_instances(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "history"
+    first = history_for(path)
+    second = history_for(path)
+    async for _entry in first.load():
+        pass
+    async for _entry in second.load():
+        pass
+
+    first.append_string("first session prompt")
+    second.append_string("second session prompt")
+
+    reopened = history_for(path)
+    async for _entry in reopened.load():
+        pass
+
+    assert reopened.get_strings() == [
+        "first session prompt",
+        "second session prompt",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_draft_persistence_round_trip_and_clear(tmp_path: Path) -> None:
+    persistence = DraftPersistence(tmp_path / "draft", delay=0.01)
+    persistence.schedule("line one\nline two")
+    await asyncio.sleep(0.02)
+    assert persistence.load() == "line one\nline two"
+
+    persistence.clear()
+    assert not (tmp_path / "draft").exists()
+
+
+def test_draft_persistence_restores_attachment_metadata(tmp_path: Path) -> None:
+    staged = tmp_path / "clipboard-image.png"
+    persistence = DraftPersistence(tmp_path / "draft")
+    persistence.schedule(
+        "inspect [Image #1]",
+        attachment_tokens={"[Image #1]": staged},
+        next_image_token=2,
+    )
+    persistence.flush()
+
+    state = DraftPersistence(tmp_path / "draft").load_state()
+
+    assert state.text == "inspect [Image #1]"
+    assert state.attachment_tokens == (("[Image #1]", staged),)
+    assert state.next_image_token == 2
+
+
+@pytest.mark.asyncio
+async def test_history_and_draft_store_attachment_refs_without_payloads(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "image.png"
+    text_file = tmp_path / "notes.txt"
+    image.write_bytes(PNG)
+    text_file.write_text("private attachment text", encoding="utf-8")
+    history_path = tmp_path / "history"
+    draft_path = tmp_path / "draft"
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        provider="fake",
+        model="offline",
+        history_path=history_path,
+        draft_path=draft_path,
+    )
+    app._draft.schedule("inspect @./image.png @./notes.txt")
+    app._draft.flush()
+
+    await app._handle_prompt_value("inspect @./image.png @./notes.txt")
+    assert app._active_task is not None
+    await app._active_task
+
+    payload = base64.b64encode(PNG)
+    for path in (history_path, draft_path):
+        contents = path.read_bytes() if path.exists() else b""
+        assert payload not in contents
+        assert b"private attachment text" not in contents
+    assert isinstance(store.messages()[0].content[1], ImageContent)
+    assert isinstance(store.messages()[0].content[2], TextContent)
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_ctrl_r_search_uses_cross_session_history(tmp_path: Path) -> None:
+    history = history_for(tmp_path / "history")
+    history.append_string("older session prompt")
+    history.append_string("newer session prompt")
+
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            history=history_for(tmp_path / "history"),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_retry=lambda: None,
+                retry_available=lambda: True,
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x12older")
+        await wait_until(lambda: session.search_buffer.text == "older")
+        pipe.send_text("\r")
+        await wait_until(
+            lambda: session.default_buffer.text == "older session prompt"
+        )
+        session.app.exit()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_app_draft_round_trip_and_send_clear(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    first = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+        history_path=tmp_path / "history",
+    )
+    first_session = first._make_session()
+    first_session.default_buffer.insert_text("unsent draft")
+    await asyncio.sleep(0.25)
+
+    reopened_store = ConversationStore(
+        store.root_dir, session_id=store.session_id, cwd=store.cwd
+    )
+    second = TUIApp(
+        AgentLoop(FakeBackend([]), reopened_store),
+        provider="fake",
+        model="offline",
+        history_path=tmp_path / "history",
+    )
+    second_session = second._make_session()
+    assert second_session.default_buffer.text == "unsent draft"
+
+    second._record_prompt("sent prompt")
+    assert not (store.session_dir / "draft").exists()
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_submission_before_turn_creation(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    session = app._make_session()
+    app._active_session = session
+    session.default_buffer.insert_text("sent too early")
+    app._submit_input(session.default_buffer.text)
+    session.default_buffer.reset()
+
+    app.undo_sent_turn()
+    await app._handle_prompt_value("sent too early")
+
+    assert session.default_buffer.text == "sent too early"
+    assert app._active_task is None
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_undo_keeps_a_new_buffer_draft(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    session.default_buffer.insert_text("sent")
+    app._submit_input(session.default_buffer.text)
+    session.default_buffer.reset()
+    session.default_buffer.insert_text("new draft")
+
+    app.undo_sent_turn()
+    submission = await app._submissions.get()
+    await app._handle_prompt_value(submission)
+
+    assert session.default_buffer.text == "new draft"
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_text_and_aborts_streaming_turn(tmp_path: Path) -> None:
+    backend = AbortThenSuccessBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    session = app._make_session()
+    app._active_session = session
+    task = asyncio.create_task(app._consume_turn("sent message"))
+    app._active_task = task
+    await backend.started.wait()
+
+    app._undo_candidate = UndoCandidate("sent message")
+    app.undo_sent_turn()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert session.app.current_buffer.text == "sent message"
+    assert app._loop_state == "interrupted"
+    app.undo_sent_turn()
+    assert session.app.current_buffer.text == "sent message"
+    assert "undo unavailable" in "\n".join(app._transcript.lines(120))
+
+
+@pytest.mark.asyncio
+async def test_undo_keeps_a_draft_typed_during_streaming(tmp_path: Path) -> None:
+    backend = AbortThenSuccessBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    session = app._make_session()
+    app._active_session = session
+    task = asyncio.create_task(app._consume_turn("sent message"))
+    app._active_task = task
+    await backend.started.wait()
+    session.default_buffer.insert_text("new draft")
+    app._undo_candidate = UndoCandidate("sent message")
+
+    app.undo_sent_turn()
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0.25)
+
+    assert session.app.current_buffer.text == "new draft"
+    assert app._draft.load() == "new draft"
+    assert "sent text: sent message" in "\n".join(app._transcript.lines(120))
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_staged_image_for_resubmission(tmp_path: Path) -> None:
+    backend = AbortThenSuccessBackend()
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    staged = store.session_dir / "clipboard-image.png"
+    staged.write_bytes(PNG)
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._pending_attachments.append(staged)
+    app._pending_attachment_tokens["[Image #1]"] = staged
+    await app._handle_prompt_value("inspect [Image #1]")
+    assert app._active_task is not None
+    await backend.started.wait()
+
+    app.undo_sent_turn()
+    await asyncio.gather(app._active_task, return_exceptions=True)
+
+    assert app._pending_attachment_tokens == {"[Image #1]": staged}
+    assert app._pending_attachments == [staged]
+    await app._handle_prompt_value("inspect [Image #1]")
+    assert app._active_task is not None
+    await app._active_task
+
+    user_messages = [
+        message
+        for message in store.messages()
+        if message.role is MessageRole.USER
+    ]
+    assert isinstance(user_messages[-1].content[1], ImageContent)
+    assert user_messages[-1].content[1].data == base64.b64encode(PNG).decode()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_next_image_token_after_deleted_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    pasted = tmp_path / "pasted.png"
+    first.write_bytes(PNG)
+    second.write_bytes(PNG)
+    pasted.write_bytes(PNG)
+    backend = AbortThenSuccessBackend()
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._pending_attachments[:] = [first, second]
+    app._pending_attachment_tokens.update(
+        {"[Image #1]": first, "[Image #2]": second}
+    )
+    app._next_image_token = 3
+
+    await app._handle_prompt_value("inspect [Image #2]")
+    await backend.started.wait()
+    app.undo_sent_turn()
+    await asyncio.gather(app._active_task, return_exceptions=True)
+
+    monkeypatch.setattr("zeta.tui.composer.paste_image", lambda _: pasted)
+    assert app.slash_paste("") == "[Image #3]"
+    assert app._pending_attachment_tokens == {
+        "[Image #2]": second,
+        "[Image #3]": pasted,
+    }
+    await app.loop.close()

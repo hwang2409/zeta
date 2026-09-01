@@ -9,18 +9,19 @@ import platform
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from prompt_toolkit.application import Application, get_app
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
+from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.filters import Condition, vi_insert_mode
+from prompt_toolkit.filters import Condition, is_searching, vi_insert_mode
 from prompt_toolkit.formatted_text import FormattedText
-from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -51,8 +52,6 @@ SHIFT_ENTER_SEQUENCES = frozenset(
 ATTACHMENT_MAX_TEXT_BYTES = 200 * 1024
 ATTACHMENT_TOKEN_RE = re.compile(r'(?<!\S)@(?:"([^"\n]+)"|([^\s]+))')
 SPINNER_INTERVAL = 0.2
-
-
 class TurnConsumerMixin:
     """Consume loop events and preserve failed-turn recovery state."""
 
@@ -194,6 +193,40 @@ class TurnConsumerMixin:
 
 class AttachmentError(ValueError):
     """Raised when a composer attachment cannot be read or decoded."""
+
+
+@dataclass(frozen=True, slots=True)
+class UndoCandidate:
+    """Keep submitted text and attachment references available for undo."""
+
+    text: str
+    attachment_paths: tuple[Path, ...] = ()
+    attachment_tokens: tuple[tuple[str, Path], ...] = ()
+    next_image_token: int = 1
+
+    @classmethod
+    def from_message(
+        cls,
+        text: str,
+        message: Message,
+        attachment_tokens: Mapping[str, Path],
+        next_image_token: int,
+    ) -> UndoCandidate:
+        paths = tuple(
+            dict.fromkeys(
+                Path(block.path).resolve()
+                for block in message.content
+                if isinstance(block, (TextContent, ImageContent))
+                and block.path is not None
+            )
+        )
+        path_set = set(paths)
+        tokens = tuple(
+            (token, path.resolve())
+            for token, path in attachment_tokens.items()
+            if path.resolve() in path_set
+        )
+        return cls(text, paths, tokens, next_image_token)
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +383,52 @@ end run
 class ComposerAttachmentMixin:
     """Attachment behavior shared by the TUI composition root."""
 
+    def _restore_draft_state(self, draft: Any) -> None:
+        self._pending_attachment_tokens = {
+            token: path.resolve() for token, path in draft.attachment_tokens
+        }
+        self._pending_attachments[:] = list(
+            dict.fromkeys(self._pending_attachment_tokens.values())
+        )
+        self._next_image_token = draft.next_image_token
+
+    def _capture_pending_attachment_state(
+        self,
+    ) -> tuple[tuple[Path, ...], tuple[tuple[str, Path], ...], int]:
+        state = (
+            tuple(self._pending_attachments),
+            tuple(self._pending_attachment_tokens.items()),
+            self._next_image_token,
+        )
+        self._pending_attachments.clear()
+        self._pending_attachment_tokens.clear()
+        self._next_image_token = 1
+        return state
+
+    def _restore_pending_attachment_state(
+        self,
+        paths: tuple[Path, ...],
+        tokens: tuple[tuple[str, Path], ...],
+        next_image_token: int,
+    ) -> None:
+        self._pending_attachments[:] = paths
+        self._pending_attachment_tokens = dict(tokens)
+        self._next_image_token = next_image_token
+
+    def _release_attachment_paths(self, paths: tuple[Path, ...]) -> None:
+        for path in paths:
+            self._delete_staged_attachment(path)
+
+    def _attach_draft_state(self, buffer: Buffer, draft: Any) -> None:
+        self._restore_draft_state(draft)
+        self._draft.attach(
+            buffer,
+            state_provider=lambda: (
+                self._pending_attachment_tokens,
+                self._next_image_token,
+            ),
+        )
+
     @staticmethod
     def _display_attachment_path(path: Path) -> str:
         value = str(path)
@@ -383,38 +462,60 @@ class ComposerAttachmentMixin:
         ):
             path.unlink(missing_ok=True)
 
-    def _pending_paths_for(self, value: str) -> list[Path]:
-        mapped_paths = set(self._pending_attachment_tokens.values())
+    def _pending_paths_for(
+        self,
+        value: str,
+        *,
+        pending_attachments: list[Path] | None = None,
+        pending_attachment_tokens: dict[str, Path] | None = None,
+    ) -> list[Path]:
+        attachments = (
+            self._pending_attachments
+            if pending_attachments is None
+            else pending_attachments
+        )
+        tokens = (
+            self._pending_attachment_tokens
+            if pending_attachment_tokens is None
+            else pending_attachment_tokens
+        )
+        mapped_paths = set(tokens.values())
         cancelled_paths: set[Path] = set()
-        for token, path in tuple(self._pending_attachment_tokens.items()):
+        for token, path in tuple(tokens.items()):
             if token not in value:
-                del self._pending_attachment_tokens[token]
+                del tokens[token]
                 cancelled_paths.add(path)
-        remaining_mapped_paths = set(self._pending_attachment_tokens.values())
+        remaining_mapped_paths = set(tokens.values())
         for path in cancelled_paths - remaining_mapped_paths:
             self._delete_staged_attachment(path)
-        self._pending_attachments[:] = [
+        attachments[:] = [
             path
-            for path in self._pending_attachments
+            for path in attachments
             if path not in mapped_paths or path in remaining_mapped_paths
         ]
 
         token_paths = sorted(
             (
                 (value.index(token), path)
-                for token, path in self._pending_attachment_tokens.items()
+                for token, path in tokens.items()
             ),
             key=lambda item: item[0],
         )
         selected_paths = [path for _, path in token_paths]
         selected_paths.extend(
             path
-            for path in self._pending_attachments
+            for path in attachments
             if path not in remaining_mapped_paths
         )
         return selected_paths
 
-    def _prepare_user_message(self, value: str) -> Message | None:
+    def _prepare_user_message(
+        self,
+        value: str,
+        *,
+        pending_attachments: list[Path] | None = None,
+        pending_attachment_tokens: dict[str, Path] | None = None,
+    ) -> Message | None:
         try:
             message = build_user_message(value, self.loop.store.cwd)
         except AttachmentError as exc:
@@ -422,14 +523,23 @@ class ComposerAttachmentMixin:
             return None
 
         valid_pending: list[Path] = []
-        for path in self._pending_paths_for(value):
+        for path in self._pending_paths_for(
+            value,
+            pending_attachments=pending_attachments,
+            pending_attachment_tokens=pending_attachment_tokens,
+        ):
             try:
                 build_user_message(value, self.loop.store.cwd, (path,))
             except AttachmentError as exc:
                 self._print_system(f"pending attachment dropped: {exc}")
             else:
                 valid_pending.append(path)
-        self._pending_attachments[:] = valid_pending
+        attachments = (
+            self._pending_attachments
+            if pending_attachments is None
+            else pending_attachments
+        )
+        attachments[:] = valid_pending
         if not valid_pending:
             return message
         return build_user_message(value, self.loop.store.cwd, tuple(valid_pending))
@@ -442,6 +552,76 @@ class ComposerAttachmentMixin:
         self._pending_attachments.clear()
         self._pending_attachment_tokens.clear()
         self._next_image_token = 1
+
+    def _undo_candidate_for_message(
+        self, text: str, message: Message
+    ) -> UndoCandidate:
+        return UndoCandidate.from_message(
+            text,
+            message,
+            self._pending_attachment_tokens,
+            self._next_image_token,
+        )
+
+    def _restore_composer(self, value: str) -> None:
+        session = self._active_session or self._session
+        if session is None:
+            return
+        session.app.current_buffer.set_document(Document(value, len(value)))
+
+    def undo_sent_turn(self) -> None:
+        """Abort the current turn and restore its submitted text once."""
+
+        pending_submission = self._submissions.cancel_current()
+        if pending_submission is not None:
+            session = self._active_session or self._session
+            buffer = session.app.current_buffer if session is not None else None
+            self._draft.clear_submitted(pending_submission.draft_revision)
+            if buffer is not None and buffer.text:
+                self._release_attachment_paths(pending_submission.attachment_paths)
+                self._print_system(
+                    f"undo kept the current draft; sent text: {pending_submission.text}"
+                )
+                self._draft.schedule(buffer.text)
+                return
+            self._restore_composer(pending_submission.text)
+            self._restore_pending_attachment_state(
+                pending_submission.attachment_paths,
+                pending_submission.attachment_tokens,
+                pending_submission.next_image_token,
+            )
+            self._draft.schedule(
+                pending_submission.text,
+                attachment_tokens=dict(pending_submission.attachment_tokens),
+                next_image_token=pending_submission.next_image_token,
+            )
+            return
+
+        candidate = self._undo_candidate
+        if (
+            candidate is None
+            or not self.active
+            or self._loop_state
+            not in {"streaming", "compacting", "tool-running", "approval"}
+        ):
+            self._print_unit(Text("undo unavailable: turn already completed", style=DIM))
+            return
+        self._undo_candidate = None
+        self.abort_active()
+        session = self._active_session or self._session
+        buffer = session.app.current_buffer if session is not None else None
+        if buffer is not None and buffer.text:
+            self._print_system(
+                f"undo kept the current draft; sent text: {candidate.text}"
+            )
+            self._draft.schedule(buffer.text)
+            return
+        self._restore_composer(candidate.text)
+        self._pending_attachments[:] = list(candidate.attachment_paths)
+        self._pending_attachment_tokens.clear()
+        self._pending_attachment_tokens.update(candidate.attachment_tokens)
+        self._next_image_token = candidate.next_image_token
+        self._draft.schedule(candidate.text)
 
     def _print_user(self, user: str | Message) -> None:
         self._presenter.reset_assistant_unit()
@@ -469,7 +649,7 @@ class ComposerAttachmentMixin:
     def _start_queued_turn(self) -> None:
         if not self._queued:
             return
-        user_message = self._queued.popleft()
+        user_message, candidate = self._queued.popleft()
         user_text = next(
             block.text
             for block in user_message.content
@@ -477,6 +657,7 @@ class ComposerAttachmentMixin:
         )
         self._print_user(user_message)
         self._print(Text("[queued]", style="dim"))
+        self._undo_candidate = candidate
         self._start_turn(user_text, user_message=user_message)
 
     def _start_turn(
@@ -486,6 +667,7 @@ class ComposerAttachmentMixin:
         user_message: Message | None = None,
         persist_user_message: bool = True,
     ) -> None:
+        self._loop_state = "streaming"
         self._active_task = asyncio.create_task(
             self._consume_turn(
                 user_text,
@@ -566,21 +748,43 @@ def build_key_bindings(
     on_toggle_agent: Callable[[], None] | None = None,
     on_retry: Callable[[], None] | None = None,
     retry_available: Callable[[], bool] | None = None,
+    on_undo: Callable[[], None] | None = None,
+    append_history: bool = True,
 ) -> KeyBindings:
     """Build the small key map used by the full-screen composer."""
 
     bindings = KeyBindings()
     escape_chord_pending = False
     escape_chord_cursor_position: int | None = None
+    history_navigation_active = False
+    history_navigation_buffer: Buffer | None = None
+    suppress_history_detach = False
+
+    def track_history_buffer(buffer: Buffer) -> None:
+        nonlocal history_navigation_active, history_navigation_buffer
+        if history_navigation_buffer is buffer:
+            return
+        history_navigation_buffer = buffer
+
+        def detach_history_navigation(_buffer: Buffer) -> None:
+            nonlocal history_navigation_active
+            if not suppress_history_detach:
+                history_navigation_active = False
+
+        buffer.on_text_changed += detach_history_navigation
 
     @Condition
     def vi_insert_history_navigation() -> bool:
         app = get_app()
         buffer = app.current_buffer
-        return vi_insert_mode() and (
-            not buffer.text
-            or buffer.working_index < len(buffer._working_lines) - 1
-        )
+        track_history_buffer(buffer)
+        return vi_insert_mode()
+
+    @Condition
+    def emacs_history_navigation() -> bool:
+        app = get_app()
+        track_history_buffer(app.current_buffer)
+        return app.editing_mode is EditingMode.EMACS
 
     @Condition
     def full_screen_mode() -> bool:
@@ -611,7 +815,8 @@ def build_key_bindings(
             insert_newline(event)
             return
         if on_submit is not None:
-            event.current_buffer.append_to_history()
+            if append_history:
+                event.current_buffer.append_to_history()
             on_submit(event.current_buffer.text)
             event.current_buffer.reset()
         else:
@@ -621,12 +826,26 @@ def build_key_bindings(
     def newline(event: KeyPressEvent) -> None:
         insert_newline(event)
 
+    @bindings.add("enter", filter=is_searching, eager=True)
+    def accept_history_search(event: KeyPressEvent) -> None:
+        del event
+        from prompt_toolkit.search import accept_search
+
+        accept_search()
+
     if on_retry is not None:
 
-        @bindings.add("c-r", filter=retry_ready, eager=True)
+        @bindings.add("c-y", filter=retry_ready, eager=True)
         def retry(event: KeyPressEvent) -> None:
             del event
             on_retry()
+
+    if on_undo is not None:
+
+        @bindings.add("c-u", eager=True)
+        def undo(event: KeyPressEvent) -> None:
+            del event
+            on_undo()
 
     if on_paste is not None:
 
@@ -656,13 +875,40 @@ def build_key_bindings(
         if not escape_chord_pending:
             escape_chord_cursor_position = None
 
-    @bindings.add("up", filter=vi_insert_history_navigation)
+    @bindings.add(
+        "up", filter=vi_insert_history_navigation | emacs_history_navigation
+    )
     def history_up(event: KeyPressEvent) -> None:
-        event.current_buffer.auto_up()
+        nonlocal history_navigation_active, suppress_history_detach
+        buffer = event.current_buffer
+        if not history_navigation_active and buffer.text:
+            if buffer.document.cursor_position_row > 0:
+                buffer.auto_up()
+            return
+        suppress_history_detach = True
+        try:
+            buffer.history_backward()
+        finally:
+            suppress_history_detach = False
+        history_navigation_active = buffer.text != ""
 
-    @bindings.add("down", filter=vi_insert_history_navigation)
+    @bindings.add(
+        "down", filter=vi_insert_history_navigation | emacs_history_navigation
+    )
     def history_down(event: KeyPressEvent) -> None:
-        event.current_buffer.auto_down()
+        nonlocal history_navigation_active, suppress_history_detach
+        buffer = event.current_buffer
+        if not history_navigation_active:
+            if buffer.document.cursor_position_row < buffer.document.line_count - 1:
+                buffer.auto_down()
+            return
+        suppress_history_detach = True
+        try:
+            buffer.history_forward()
+            buffer.cursor_position = len(buffer.text)
+        finally:
+            suppress_history_detach = False
+        history_navigation_active = buffer.text != ""
 
     @bindings.add("c-c")
     def interrupt(event: KeyPressEvent) -> None:
@@ -696,11 +942,3 @@ def build_key_bindings(
             on_toggle_agent()
 
     return bindings
-
-
-def history_for(path: str | Path) -> FileHistory:
-    """Create a persistent history object and its parent directory."""
-
-    history_path = Path(path)
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-    return FileHistory(str(history_path))

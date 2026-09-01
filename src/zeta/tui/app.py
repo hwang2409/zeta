@@ -33,7 +33,11 @@ from ..core.project_context import (
 )
 from ..core.session import SessionError, SessionManager, env_home
 from ..core.slash import (
-    MODEL_CONTEXT_WINDOWS, SlashStatus, UsageTracker, compaction_history, create_slash_registry
+    MODEL_CONTEXT_WINDOWS,
+    SlashStatus,
+    UsageTracker,
+    compaction_history,
+    create_slash_registry,
 )
 from ..core.todo import todo_count_tuple
 from ..loop import AgentLoop
@@ -53,10 +57,9 @@ from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
     TurnConsumerMixin,
+    UndoCandidate,
     VimCursorShapeConfig,
     build_key_bindings,
-    history_for,
-    parse_input,
     status_formatted_text,
     vim_state_label,
 )
@@ -69,6 +72,7 @@ from .layout import (
 )
 from .models import MODEL_CATALOGS, validate_model_name
 from .models import load_model_catalog as _load_model_catalog
+from ..persistence import DraftPersistence, history_for
 from .render import (
     format_status,
     render_markdown,
@@ -76,6 +80,7 @@ from .render import (
     render_thought_live,
 )
 from .stream import stream_key
+from ..submission import Submission, SubmissionMixin, SubmissionQueue
 from .theme import (
     ACCENT,
     BODY,
@@ -91,6 +96,8 @@ from .transcript import TranscriptPresenter, TranscriptWidget
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 RECENT_SESSION_LIMIT = 20
+
+
 def _validate_model_name(provider: str, model: str) -> None:
     validate_model_name(provider, model)
 
@@ -102,8 +109,16 @@ class FullScreenPromptSession(PromptSession[str]):
         self, editing_mode: EditingMode, erase_when_done: bool
     ) -> Application[str]:
         application = super()._create_application(editing_mode, erase_when_done)
-        application.ttimeoutlen, application.timeoutlen, application.cursor = 0.02, 0.5, VimCursorShapeConfig()
-        application.full_screen, application.renderer.full_screen, application.erase_when_done = True, True, False
+        application.ttimeoutlen, application.timeoutlen, application.cursor = (
+            0.02,
+            0.5,
+            VimCursorShapeConfig(),
+        )
+        (
+            application.full_screen,
+            application.renderer.full_screen,
+            application.erase_when_done,
+        ) = True, True, False
         return application
 
     def restore_terminal(self) -> None:
@@ -151,7 +166,12 @@ def build_backend(
     raise ValueError(f"unsupported provider: {provider}")
 
 
-class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMixin):
+class TUIApp(
+    SubmissionMixin,
+    TurnConsumerMixin,
+    CheckpointTranscriptMixin,
+    ComposerAttachmentMixin,
+):
     """Full-screen transcript, persistent composer, and follow-up queue."""
 
     def __init__(
@@ -164,6 +184,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         console: Console | None = None,
         session: PromptSession[str] | None = None,
         history_path: str | Path | None = None,
+        draft_path: str | Path | None = None,
         approval_policy: ApprovalPolicy | None = None,
         context_files: Sequence[str] = (),
         on_model_change: Callable[[str], None] | None = None,
@@ -183,7 +204,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         self.verbose = verbose
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
-        self._queued: deque[Message] = deque()
+        self._queued: deque[tuple[Message, UndoCandidate]] = deque()
         self._pending_attachments: list[Path] = []
         self._pending_attachment_tokens: dict[str, Path] = {}
         self._next_image_token = 1
@@ -208,7 +229,16 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         self._abort_requested = False
         self._resuming_tool = False
         self._session = session
-        self._history_path = Path(history_path) if history_path else _zeta_home() / "history"
+        self._history_path = (
+            Path(history_path) if history_path else _zeta_home() / "history"
+        )
+        self._history = None
+        self._draft = DraftPersistence(
+            draft_path or self.loop.store.session_dir / "draft"
+        )
+        self._draft_session: PromptSession[str] | None = None
+        self._undo_candidate: UndoCandidate | None = None
+        self._submissions = SubmissionQueue()
         self._approval_policy = approval_policy
         self._context_files = tuple(context_files)
         self._on_model_change = on_model_change
@@ -233,8 +263,8 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             lambda renderable: self._print(renderable),
         )
         self.loop.set_background_event_sink(self._handle_background_event)
-        self._input_queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._fork_rebuilt = False
+
     @property
     def _transcript_lines(self) -> list[str]:
         """Expose rendered lines for diagnostics while keeping logical units in the widget."""
@@ -245,7 +275,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
     def queued_messages(self) -> tuple[str, ...]:
         return tuple(
             block.text
-            for message in self._queued
+            for message, _candidate in self._queued
             for block in message.content[:1]
             if isinstance(block, TextContent)
         )
@@ -330,7 +360,9 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         if not self._model_catalog_loaded:
             self._start_model_catalog_load()
         if self._model_catalog is None:
-            catalog_warning = f"model catalog unavailable for {self.provider} — using anyway"
+            catalog_warning = (
+                f"model catalog unavailable for {self.provider} — using anyway"
+            )
         elif model not in self._model_catalog:
             catalog_warning = (
                 f"model not found in {self.provider} catalog — using anyway"
@@ -349,6 +381,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         if catalog_warning is not None:
             return f"model: {model} ({catalog_warning})"
         return f"model: {model}"
+
     def slash_vim(self, args: str) -> str:
         requested = args.strip().lower()
         if not args:
@@ -413,7 +446,9 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             self._print(Text("[approval] no pending requests", style="dim"))
             return True
         if len(parts) != 2:
-            self._print(Text(f"[approval] use {parts[0]} <approval-key>", style="yellow"))
+            self._print(
+                Text(f"[approval] use {parts[0]} <approval-key>", style="yellow")
+            )
             return True
         requested_key = parts[1].strip()
         request = next(
@@ -481,6 +516,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
                     self._active_task = None
         self._present_pending_approvals()
         return True
+
     def _prompt_style(self) -> Style:
         focused = get_app().current_buffer.name == "DEFAULT_BUFFER"
         style = self._prompt_styles.get(focused)
@@ -493,9 +529,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
                     "status-bar": f"noreverse fg:{CHROME}",
                     "frame": "",
                     "frame.border": (
-                        f"fg:{COMPOSER_FOCUS}"
-                        if focused
-                        else f"fg:{COMPOSER_BORDER}"
+                        f"fg:{COMPOSER_FOCUS}" if focused else f"fg:{COMPOSER_BORDER}"
                     ),
                     "text-area": f"fg:{BODY}",
                     "text-area.prompt": f"fg:{ACCENT} bold",
@@ -505,6 +539,8 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         return style
 
     def _make_session(self) -> PromptSession[str]:
+        if self._history is None:
+            self._history = history_for(self._history_path)
         bindings = build_key_bindings(
             on_interrupt=self.abort_active,
             on_exit=self.request_exit,
@@ -515,11 +551,13 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             on_toggle_agent=self._transcript.toggle_latest_agent,
             on_retry=self.retry_failed_turn,
             retry_available=self.retry_available,
+            on_undo=self.undo_sent_turn,
+            append_history=False,
         )
-        return FullScreenPromptSession(
+        session = FullScreenPromptSession(
             message=[("class:prompt", " > ")],
             placeholder=[("class:placeholder", "type a message...")],
-            history=history_for(self._history_path),
+            history=self._history,
             key_bindings=bindings,
             multiline=True,
             editing_mode=EditingMode.VI if self.vim_mode else EditingMode.EMACS,
@@ -528,6 +566,23 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             show_frame=True,
             style=DynamicStyle(self._prompt_style),
         )
+        self._attach_draft(session)
+        return session
+
+    def _attach_draft(self, session: PromptSession[str]) -> None:
+        if self._draft_session is session:
+            return
+        self._attach_draft_state(session.default_buffer, self._draft.load_state())
+        self._draft_session = session
+
+    def _record_prompt(self, value: str, draft_revision: int | None = None) -> None:
+        if self._history is None:
+            self._history = history_for(self._history_path)
+        self._history.append_string(value)
+        if draft_revision is None:
+            self._draft.clear()
+        else:
+            self._draft.clear_submitted(draft_revision)
 
     def request_exit(self) -> None:
         self._exit_requested = True
@@ -598,6 +653,12 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             model_window=self.loop.context_assembler.token_budget,
             vim_state=vim_state_label(self.vim_mode),
             background_count=self.loop.tool_registry.background_tasks.running_count,
+            undo_available=(
+                self._undo_candidate is not None
+                and self.active
+                and self._loop_state
+                in {"streaming", "compacting", "tool-running", "approval"}
+            ),
         )
         fragments = status_formatted_text(status)
         return fragments
@@ -614,7 +675,9 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             if self._full_screen_active():
                 self._append_transcript(renderable)
             else:
-                self.console.print(Padding(renderable, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN)))
+                self.console.print(
+                    Padding(renderable, (0, CONTENT_MARGIN, 0, CONTENT_MARGIN))
+                )
 
     def _print_unit(self, renderable: RenderableType | None) -> None:
         self._presenter.print_unit(renderable)
@@ -650,8 +713,10 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             return False
 
         aborted = self._abort_requested or self._loop_state == "interrupted"
-        self._loop_state = "interrupted" if aborted else (
-            "idle" if self._resuming_tool else "streaming"
+        self._loop_state = (
+            "interrupted"
+            if aborted
+            else ("idle" if self._resuming_tool else "streaming")
         )
         presentation = self._presenter.handle_tool_event(
             event,
@@ -659,9 +724,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         )
         if presentation is not None and presentation.visible_output:
             self._turn_had_visible_output = True
-        stop_after_tool = (
-            presentation is not None and presentation.stop_after_tool
-        )
+        stop_after_tool = presentation is not None and presentation.stop_after_tool
         self._abort_requested = False
         return stop_after_tool
 
@@ -678,39 +741,6 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
     def _handle_resumed_tool_event(self, event: StreamEvent) -> None:
         self._handle_tool_event(event)
         self._invalidate_prompt()
-
-    def _submit_input(self, value: str) -> None:
-        self._input_queue.put_nowait(value)
-
-    async def _handle_prompt_value(self, value: str) -> None:
-        parsed = parse_input(value)
-        if parsed is None or self._exit_requested:
-            return
-        if await self._handle_approval_input(parsed):
-            return
-        slash_output = await self._slash_commands.dispatch_async(self, parsed)
-        if slash_output is not None:
-            if self._fork_rebuilt:
-                self._fork_rebuilt = False
-            elif slash_output.startswith("[Image #"):
-                self._insert_paste_token(slash_output)
-            else:
-                self._print_system(slash_output)
-            return
-        model_input = self._slash_commands.input_for_model(parsed)
-        user_message = self._prepare_user_message(model_input)
-        if user_message is None:
-            return
-        self._failed_turn = None
-        if self.pending_approvals:
-            self._present_pending_approvals()
-        elif self.active:
-            self._clear_pending_attachments()
-            self._queued.append(user_message)
-        else:
-            self._clear_pending_attachments()
-            self._print_user(user_message)
-            self._start_turn(model_input, user_message=user_message)
 
     def _discard_tool_region(self) -> None:
         self._presenter.discard_tool_region()
@@ -743,7 +773,10 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
         get_app().invalidate()
 
     def _flush_stream_kind(self, *, preserve_inline: bool = False) -> None:
-        if self._stream_kind in {"thinking", "redacted-thinking"} and self._thinking_text:
+        if (
+            self._stream_kind in {"thinking", "redacted-thinking"}
+            and self._thinking_text
+        ):
             self._print_committed([self._thinking_text], thinking=True)
         elif self._stream_kind == "assistant" and self._assistant_text:
             self._presenter.finish_assistant(
@@ -766,19 +799,24 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             if event.message is not None
             else self._assistant_text
         )
-        self._presenter.finish_assistant_message(render_markdown(value) if value else None)
-        if value: self._turn_had_visible_output |= bool(value.strip())
+        self._presenter.finish_assistant_message(
+            render_markdown(value) if value else None
+        )
+        if value:
+            self._turn_had_visible_output |= bool(value.strip())
         self._stream_kind = self._stream_identity = None
         self._reset_stream_buffers()
 
     def _flush_pending_stream(self) -> None:
-        self._flush_stream_kind(); self._presenter.reset_assistant_unit()
+        self._flush_stream_kind()
+        self._presenter.reset_assistant_unit()
 
     def _consume_text(self, event: StreamEvent) -> None:
         incoming_kind, incoming_identity = stream_key(event)
-        if self._stream_kind is not None and (
-            incoming_kind, incoming_identity
-        ) != (self._stream_kind, self._stream_identity):
+        if self._stream_kind is not None and (incoming_kind, incoming_identity) != (
+            self._stream_kind,
+            self._stream_identity,
+        ):
             self._flush_pending_stream()
         redacted = incoming_kind == "redacted-thinking"
         thinking = redacted
@@ -867,8 +905,8 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
 
     async def _run_full_screen(self, session: FullScreenPromptSession) -> None:
         prompt_task = asyncio.create_task(session.app.run_async())
-        input_task: asyncio.Task[str | None] = asyncio.create_task(
-            self._input_queue.get()
+        input_task: asyncio.Task[Submission] = asyncio.create_task(
+            self._submissions.get()
         )
         try:
             while not self._exit_requested:
@@ -894,10 +932,8 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
                     break
                 if input_task in done:
                     value = await input_task
-                    if value is None:
-                        break
                     await self._handle_prompt_value(value)
-                    input_task = asyncio.create_task(self._input_queue.get())
+                    input_task = asyncio.create_task(self._submissions.get())
         finally:
             if not prompt_task.done():
                 prompt_task.cancel()
@@ -925,6 +961,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
 
         session = session or self._session or self._make_session()
         self._active_session = session
+        self._attach_draft(session)
         if isinstance(session, FullScreenPromptSession):
             self._install_full_screen_layout(session)
         self.loop.session_start()
@@ -940,7 +977,9 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
                 wait_for: set[asyncio.Task[Any]] = {prompt_task}
                 if self._active_task is not None:
                     wait_for.add(self._active_task)
-                done, _ = await asyncio.wait(wait_for, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    wait_for, return_when=asyncio.FIRST_COMPLETED
+                )
 
                 if self._active_task is not None and self._active_task in done:
                     try:
@@ -960,6 +999,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
                         break
                     prompt_task = asyncio.create_task(self._read_prompt(session))
         finally:
+            self._draft.flush()
             if prompt_task is not None and not prompt_task.done():
                 prompt_task.cancel()
                 await asyncio.gather(prompt_task, return_exceptions=True)
@@ -970,6 +1010,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
                 session.restore_terminal()
             await self.loop.close()
             self._active_session = None
+
 
 def create_app(args: argparse.Namespace) -> TUIApp:
     home = _zeta_home()
@@ -991,9 +1032,16 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             width = content_width(get_terminal_size(fallback=(80, 24)).columns)
             print(resume_picker_line("recent zeta sessions:", width))
             for index, preview in enumerate(previews, start=1):
-                print(resume_picker_line(f"{index}. {preview.updated_at} {preview.session_id[:8]} {preview.preview}", width))
+                print(
+                    resume_picker_line(
+                        f"{index}. {preview.updated_at} {preview.session_id[:8]} {preview.preview}",
+                        width,
+                    )
+                )
             try:
-                choice = input(resume_picker_line("select a session:", width - 1) + " ").strip()
+                choice = input(
+                    resume_picker_line("select a session:", width - 1) + " "
+                ).strip()
                 selected = int(choice)
                 if not 1 <= selected <= len(previews):
                     raise ValueError("selection out of range")
@@ -1121,7 +1169,9 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         context_files=[str(path) for path in project_context.files],
         on_model_change=model_changed,
         vim_mode=metadata.vim_mode,
-        on_vim_mode_change=lambda enabled: manager.record_vim_mode(metadata, enabled=enabled),
+        on_vim_mode_change=lambda enabled: manager.record_vim_mode(
+            metadata, enabled=enabled
+        ),
     )
 
 
