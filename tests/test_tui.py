@@ -2150,6 +2150,63 @@ def test_nested_agent_card_shows_depth_and_reaches_grandchild_tail(
     assert "grandchild receipt" in plain
 
 
+@pytest.mark.asyncio
+async def test_nested_agent_lifecycle_reaches_tui_with_depth(
+    tmp_path: Path,
+) -> None:
+    nested = ToolCall(
+        "grandchild-call",
+        "agent",
+        {"prompt": "inspect", "description": "grandchild"},
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[
+                    ToolCall(
+                        "child-call",
+                        "agent",
+                        {"prompt": "inspect", "description": "child"},
+                    )
+                ]
+            ),
+            ScriptedTurn(tool_calls=[nested]),
+            ScriptedTurn([TextContent("grandchild complete")]),
+            ScriptedTurn([TextContent("child complete")]),
+        ]
+    )
+    events = [
+        event
+        async for event in AgentLoop(
+            backend, ConversationStore(tmp_path), max_turns=1
+        ).run_turn("start")
+    ]
+
+    starts = [
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_START
+        and event.tool_call is not None
+        and event.tool_call.id == nested.id
+    ]
+    ends = [
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+        and event.tool_call is not None
+        and event.tool_call.id == nested.id
+    ]
+    assert len(starts) == 1
+    assert len(ends) == 1
+    assert starts[0].data["depth"] == 2
+    assert ends[0].tool_result is not None
+    assert ends[0].tool_result.structured_content is not None
+    assert ends[0].tool_result.structured_content["depth"] == 2
+    rendered = AgentCard.render_start(starts[0])
+    assert rendered is not None
+    assert "depth 2" in renderable_plain(rendered)
+
+
 def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     call = ToolCall(
@@ -4813,9 +4870,14 @@ def test_full_screen_pty_keeps_padded_margins_clean(
             str(columns),
             "-y",
             str(rows),
+            "sh",
+            "-c",
+            'exec env ZETA_HOME="$1" TERM="$2" COLORTERM="$3" "$4" --provider fake',
+            "zeta-pane",
+            str(tmp_path / "zeta-home"),
+            "xterm-256color",
+            "truecolor",
             str(zeta),
-            "--provider",
-            "fake",
         ],
         cwd=Path(__file__).parents[1],
         env=env,
@@ -4869,6 +4931,7 @@ def test_full_screen_pty_keeps_padded_margins_clean(
         assert any(line.startswith("  ▌ hello") for line in plain)
         assert all(not line[:2].strip() for line in plain)
         assert not _contains_background_sgr(escaped)
+        assert list((tmp_path / "zeta-home" / "sessions").iterdir())
     finally:
         subprocess.run(["tmux", "kill-session", "-t", session], check=False)
 

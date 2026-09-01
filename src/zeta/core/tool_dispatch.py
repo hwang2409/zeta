@@ -79,14 +79,27 @@ async def dispatch_tool_calls(
             stream_updates.put_nowait(queued)
         stream_updates.put_nowait(event)
 
-    def enqueue_tool_lifecycle(kind: str, tool_call: ToolCall) -> None:
+    def enqueue_tool_lifecycle(
+        kind: str,
+        tool_call: ToolCall,
+        data: Mapping[str, object] | None = None,
+        tool_result: ToolResult | None = None,
+    ) -> None:
         event_type = {
             "approval_start": StreamEventType.TOOL_APPROVAL_START,
             "approval_end": StreamEventType.TOOL_APPROVAL_END,
             "execution_start": StreamEventType.TOOL_EXECUTION_START,
+            "execution_end": StreamEventType.TOOL_EXECUTION_END,
         }.get(kind)
         if event_type is not None:
-            stream_updates.put_nowait(StreamEvent(event_type, tool_call=tool_call))
+            stream_updates.put_nowait(
+                StreamEvent(
+                    event_type,
+                    tool_call=tool_call,
+                    tool_result=tool_result,
+                    data={} if data is None else dict(data),
+                )
+            )
 
     active_task: asyncio.Task[StructuredToolResult] | None = None
     parallel_tasks: dict[asyncio.Task[StructuredToolResult], tuple[int, ToolCall]] = {}
@@ -116,8 +129,8 @@ async def dispatch_tool_calls(
                             tool_call,
                             _stream_sink=enqueue_tool_update,
                             _lifecycle_sink=(
-                                lambda kind, call=tool_call: enqueue_tool_lifecycle(
-                                    kind, call
+                                lambda kind, call=tool_call, data=None, tool_result=None: enqueue_tool_lifecycle(
+                                    kind, call, data, tool_result
                                 )
                             ),
                         )
@@ -180,7 +193,9 @@ async def dispatch_tool_calls(
                     tool_call,
                     _stream_sink=enqueue_tool_update,
                     _lifecycle_sink=(
-                        lambda kind, call=tool_call: enqueue_tool_lifecycle(kind, call)
+                        lambda kind, call=tool_call, data=None, tool_result=None: enqueue_tool_lifecycle(
+                            kind, call, data, tool_result
+                        )
                     ),
                 )
             )

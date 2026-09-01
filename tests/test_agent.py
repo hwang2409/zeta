@@ -199,6 +199,36 @@ class NestedBlockingBackend(CompletionBackend):
         )
 
 
+class NestedBackgroundBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.grandchild_started = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tool_schemas
+        self.call_count += 1
+        if self.call_count == 1:
+            blocks = [ToolUseContent(_background_agent_call("child"))]
+        elif self.call_count == 2:
+            nested = _background_agent_call("grandchild")
+            nested.arguments["description"] = "grandchild"
+            blocks = [ToolUseContent(nested)]
+        else:
+            self.grandchild_started.set()
+            await asyncio.Event().wait()
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 def _background_agent_call(call_id: str = "background-1") -> ToolCall:
     return ToolCall(
         call_id,
@@ -338,6 +368,34 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     assert child_store.agent_canceled() == {
         "tool_call_id": call.id,
+        "content": "tool execution canceled",
+    }
+    assert not store.agent_children()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_abort_cancels_background_grandchild(
+    tmp_path: Path,
+) -> None:
+    backend = NestedBackgroundBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
+    loop.abort()
+    await _wait_for_notification(store, "canceled")
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    grandchild_store = ConversationStore(
+        child_store.session_dir / "agents", session_id="1"
+    )
+    assert child_store.agent_notifications(pending_only=False)[0].data["status"] == (
+        "canceled"
+    )
+    assert grandchild_store.agent_canceled() == {
+        "tool_call_id": "grandchild",
         "content": "tool execution canceled",
     }
     assert not store.agent_children()
@@ -1125,7 +1183,7 @@ async def test_shared_turn_budget_covers_parallel_siblings(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_background_grandchild_is_rejected_loudly(tmp_path: Path) -> None:
+async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) -> None:
     nested = _agent_call("grandchild")
     nested.arguments["background"] = True
     child = _background_agent_call("child")
@@ -1135,6 +1193,7 @@ async def test_background_grandchild_is_rejected_loudly(tmp_path: Path) -> None:
             ScriptedTurn(tool_calls=[child]),
             ScriptedTurn(tool_calls=[nested]),
             ScriptedTurn([TextContent("child complete")]),
+            ScriptedTurn([TextContent("child finished")]),
         ]
     )
     store = ConversationStore(tmp_path)
@@ -1148,8 +1207,15 @@ async def test_background_grandchild_is_rejected_loudly(tmp_path: Path) -> None:
         for message in child_store.messages()
         if message.tool_result
     )
-    assert nested_result.is_error
-    assert "background grandchildren are not supported" in nested_result.content
+    assert nested_result.structured_content is not None
+    assert nested_result.structured_content["status"] == "running"
+    assert [entry.data["status"] for entry in child_store.agent_notifications()] == [
+        "completed"
+    ]
+    grandchild_store = ConversationStore(
+        child_store.session_dir / "agents", session_id="1"
+    )
+    assert grandchild_store.agent_canceled() is None
 
 
 @pytest.mark.asyncio
@@ -1216,6 +1282,52 @@ def test_resume_cancels_nested_tree_markers(tmp_path: Path) -> None:
     }
 
 
+def test_resume_cancels_nested_background_tree_markers(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    child_call = _background_agent_call("child")
+    grandchild_call = _background_agent_call("grandchild")
+    child_call.arguments["description"] = "child"
+    grandchild_call.arguments["description"] = "grandchild"
+    child.mark_agent_parent(child_call.id)
+    grandchild.mark_agent_parent(grandchild_call.id)
+    _persist_background_receipt(child, grandchild_call, grandchild)
+    child.register_agent_child(
+        grandchild_call,
+        child_session_path=str(grandchild.session_dir),
+        description="grandchild",
+        background=True,
+        child_instance_id="root:1:1",
+    )
+    _persist_background_receipt(root, child_call, child)
+    root.register_agent_child(
+        child_call,
+        child_session_path=str(child.session_dir),
+        description="child",
+        background=True,
+        child_instance_id="root:1",
+    )
+
+    resumed = ConversationStore(tmp_path, session_id="root")
+    AgentLoop(FakeBackend([]), resumed)
+
+    assert resumed.agent_notifications()[0].data["status"] == "canceled"
+    resumed_child = ConversationStore(
+        resumed.session_dir / "agents", session_id="1"
+    )
+    resumed_grandchild = ConversationStore(
+        resumed_child.session_dir / "agents", session_id="1"
+    )
+    assert resumed_child.agent_notifications()[0].data["status"] == "canceled"
+    assert not resumed.agent_children()
+    assert not resumed_child.agent_children()
+    assert resumed_grandchild.agent_canceled() == {
+        "tool_call_id": "grandchild",
+        "content": "tool execution canceled",
+    }
+
+
 @pytest.mark.asyncio
 async def test_child_approval_uses_parent_policy(tmp_path: Path) -> None:
     child_call = ToolCall("child-bash", "bash", {"cmd": "echo no"})
@@ -1263,6 +1375,56 @@ async def test_child_approval_uses_parent_policy(tmp_path: Path) -> None:
     denied = next(message.tool_result for message in child_messages if message.tool_result)
     assert denied.is_error
     assert denied.content == "tool execution denied"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        ("approve", "nested"),
+        ("deny", "tool execution denied"),
+        ("abort", "tool execution canceled"),
+    ],
+)
+async def test_grandchild_approval_composes_with_parent_policy(
+    tmp_path: Path, action: str, expected: str
+) -> None:
+    grandchild_bash = ToolCall("grandchild-bash", "bash", {"cmd": "echo nested"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("child")]),
+            ScriptedTurn(tool_calls=[_agent_call("grandchild")]),
+            ScriptedTurn(tool_calls=[grandchild_bash]),
+            ScriptedTurn([TextContent("grandchild finished")]),
+            ScriptedTurn([TextContent("child finished")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(store=store)
+    loop = AgentLoop(backend, store, approval_policy=policy, max_turns=1)
+
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    for _ in range(100):
+        pending = policy.pending_requests()
+        if pending:
+            break
+        await asyncio.sleep(0.01)
+    assert len(pending) == 1
+    request = pending[0]
+    assert request.child_instance_id == f"{store.session_id}:1:1"
+    assert getattr(policy, action)(request.key)
+    await asyncio.wait_for(task, timeout=1)
+
+    grandchild_store = ConversationStore(
+        store.session_dir / "agents" / "1" / "agents", session_id="1"
+    )
+    bash_result = next(
+        message.tool_result
+        for message in grandchild_store.messages()
+        if message.tool_result is not None
+    )
+    assert expected in bash_result.content
+    await loop.close()
 
 
 @pytest.mark.asyncio

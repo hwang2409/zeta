@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import warnings
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from typing import Any, TypeVar
@@ -18,7 +17,12 @@ from .agent_budget import (
     consume_turn,
     configure_budget,
 )
-from .agent_background import finish_background_child, recover_agent_children
+from .agent_background import (
+    BackgroundAgentOwner,
+    finish_background_child,
+    recover_agent_children,
+)
+from .agent_runner import consume_child
 from .core.approval import ApprovalPolicy
 from .core.context import ContextAssembler
 from .core.hooks import HookManager
@@ -55,7 +59,6 @@ from .types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
-    assistant_text,
     flatten_tool_content,
 )
 
@@ -168,6 +171,7 @@ class AgentLoop:
         agent_instance_id: str | None = None,
         agent_turn_budget: int | None = None,
         shared_agent_budget: SharedTurnBudget | None = None,
+        background_owner: BackgroundAgentOwner | None = None,
     ) -> None:
         if type(agent_depth) is not int or not 0 <= agent_depth <= MAX_AGENT_DEPTH:
             raise ValueError(f"agent depth must be between 0 and {MAX_AGENT_DEPTH}")
@@ -178,6 +182,7 @@ class AgentLoop:
         self._shared_agent_budget = configure_budget(
             agent_turn_budget, shared_agent_budget
         )
+        self._background_owner = background_owner or BackgroundAgentOwner()
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
         self._agent_child_turns: dict[str, int] = {}
@@ -272,8 +277,7 @@ class AgentLoop:
         """Signal the active tool batch before the caller cancels the turn."""
 
         self.tool_registry.abort()
-        for cancel in tuple(self._background_child_cancellers.values()):
-            cancel()
+        self._background_owner.cancel_all()
     def set_background_event_sink(
         self, sink: Callable[[StreamEvent], None] | None
     ) -> None:
@@ -282,7 +286,7 @@ class AgentLoop:
         self._background_event_sink = sink
     @property
     def background_children_running(self) -> bool:
-        return bool(self._background_child_cancellers)
+        return self._background_owner.running or bool(self._background_child_cancellers)
     def _publish_background_event(self, event: StreamEvent) -> None:
         if self._background_event_sink is not None:
             self._background_event_sink(event)
@@ -475,7 +479,9 @@ class AgentLoop:
             agent_depth=child_depth,
             agent_instance_id=child_instance_id,
             shared_agent_budget=shared_agent_budget,
+            background_owner=self._background_owner,
         )
+        child_loop.set_background_event_sink(self._publish_background_event)
         lifecycle_sink = (
             execution_context.lifecycle_sink
             if execution_context is not None
@@ -508,101 +514,53 @@ class AgentLoop:
                 depth=child_depth,
                 budget_exhausted=budget_exhausted,
             )
-        def publish_lifecycle(kind: str, call: ToolCall | None) -> None:
+        def publish_lifecycle(
+            kind: str,
+            call: ToolCall | None,
+            *,
+            tool_result: ToolResult | None = None,
+            depth: int | None = None,
+        ) -> None:
             if call is None:
                 return
             event_type = {
                 "approval_start": StreamEventType.TOOL_APPROVAL_START,
                 "approval_end": StreamEventType.TOOL_APPROVAL_END,
                 "execution_start": StreamEventType.TOOL_EXECUTION_START,
+                "execution_end": StreamEventType.TOOL_EXECUTION_END,
             }.get(kind)
             if event_type is None:
                 return
-            if not background and lifecycle_sink is not None:
-                lifecycle_sink(kind, call)
-        async def consume() -> dict[str, object]:
-            final_message: Message | None = None
-            last_assistant_text = ""
-            cap_hit = False
-            error_message: str | None = None
-            budget_exhausted = False
-            try:
-                async for event in child_loop.run_turn(prompt):
-                    if event.type is StreamEventType.TURN_START:
-                        publish(f"turn {child_turns() + 1}: thinking")
-                    elif event.type is StreamEventType.TOOL_APPROVAL_START:
-                        name = event.tool_call.name if event.tool_call is not None else "tool"
-                        publish(f"turn {child_turns() + 1}: approval pending: {name}")
-                        publish_lifecycle("approval_start", event.tool_call)
-                    elif event.type is StreamEventType.TOOL_APPROVAL_END:
-                        publish_lifecycle("approval_end", event.tool_call)
-                    elif event.type is StreamEventType.TOOL_EXECUTION_START:
-                        name = event.tool_call.name if event.tool_call is not None else "tool"
-                        arguments = (
-                            event.tool_call.arguments
-                            if event.tool_call is not None
-                            else {}
-                        )
-                        summary = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
-                        publish(f"turn {child_turns() + 1}: tool: {name} {summary}")
-                        publish_lifecycle("execution_start", event.tool_call)
-                    elif event.type is StreamEventType.TURN_END:
-                        turns = child_turns() + 1
-                        self._agent_child_turns[tool_call.id] = turns
-                        self.store.update_agent_child_turns(tool_call.id, turns)
-                        if event.message is not None:
-                            last_assistant_text = _assistant_text_snippet(event.message)
-                        if event.data.get("tool_calls") == 0 and event.message is not None:
-                            final_message = event.message
-                    elif (
-                        event.type is StreamEventType.TOOL_EXECUTION_END
-                        and event.tool_result is not None
-                        and event.tool_result.structured_content is not None
-                        and event.tool_result.structured_content.get("error_code")
-                        == "agent_turn_budget"
-                    ):
-                        budget_exhausted = True
-                        error_message = event.tool_result.content
-                    elif event.type is StreamEventType.ERROR and event.error is not None:
-                        if event.error.code == "agent_turn_budget":
-                            budget_exhausted = True
-                            error_message = event.error.message
-                        elif event.error.code == "max_turns":
-                            cap_hit = True
-                        else:
-                            error_message = event.error.message
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                error_message = _error_info(exc).message
-            if budget_exhausted:
-                return child_result(
-                    f"agent error: {error_message or 'shared agent turn budget exhausted'}",
-                    error=True,
-                    budget_exhausted=True,
+            data = {"depth": child_depth if depth is None else depth}
+            if background:
+                self._publish_background_event(
+                    StreamEvent(
+                        event_type,
+                        tool_call=call,
+                        tool_result=tool_result,
+                        data=data,
+                    )
                 )
-            if cap_hit:
-                return child_result(
-                    f"agent error: child reached the {preset.turn_cap}-turn cap; "
-                    f"partial state is saved at {child_path}; "
-                    f"last assistant text: {last_assistant_text or '[none]'}; "
-                    f"turns used: {child_turns()}",
-                    error=True,
-                )
-            if error_message is not None:
-                return child_result(f"agent error: {error_message}", error=True)
-            if final_message is None:
-                return child_result(
-                    "agent error: child ended without a final response", error=True
-                )
-            final_text = assistant_text(final_message)
-            if not final_text.strip():
-                return child_result(
-                    "agent error: child returned an empty final assistant message",
-                    error=True,
-                )
-            return child_result(final_text, error=False)
-        child_task = self._create_task(consume())
+            elif lifecycle_sink is not None:
+                lifecycle_sink(kind, call, data, tool_result)
+        def update_turns(turns: int) -> None:
+            self._agent_child_turns[tool_call.id] = turns
+            self.store.update_agent_child_turns(tool_call.id, turns)
+
+        child_task = self._create_task(
+            consume_child(
+                child_loop,
+                prompt,
+                turn_cap=preset.turn_cap,
+                child_path=child_path,
+                publish=publish,
+                child_turns=child_turns,
+                update_turns=update_turns,
+                publish_lifecycle=publish_lifecycle,
+                child_result=child_result,
+                error_message=lambda exc: _error_info(exc).message,
+            )
+        )
         child_canceled = False
 
         async def cancel_child() -> None:
@@ -627,6 +585,7 @@ class AgentLoop:
                 self._agent_child_types.pop(tool_call.id, None)
                 self._background_child_cancellers.pop(tool_call.id, None)
                 self._background_child_watchers.pop(tool_call.id, None)
+                self._background_owner.unregister(child_instance_id)
                 if child_policy is not None:
                     child_policy.cleanup()
 
@@ -646,13 +605,16 @@ class AgentLoop:
                     validate_result=_validated_tool_result,
                     publish_event=self._publish_background_event,
                     cleanup=cleanup_background_child,
-                    close_child=child_loop.close,
+                    close_child=lambda: child_loop.close(cancel_background=False),
                     error_message=lambda exc: _error_info(exc).message,
                 )
 
             watcher = self._create_task(finish_background())
             self._background_child_watchers[tool_call.id] = watcher
             self._background_child_cancellers[tool_call.id] = request_background_cancel
+            self._background_owner.register(
+                child_instance_id, request_background_cancel, watcher
+            )
             return child_result(
                 f"background agent started: {description}",
                 error=False,
@@ -679,7 +641,7 @@ class AgentLoop:
             if not abort_task.done():
                 abort_task.cancel()
             await asyncio.gather(abort_task, return_exceptions=True)
-            await child_loop.close()
+            await child_loop.close(cancel_background=False)
 
     def prepare_resume_pending_tool(self, request_id: str) -> bool:
         """Reserve the abort generation before resuming an approved tool."""
@@ -705,15 +667,24 @@ class AgentLoop:
             persist_user_message=persist_user_message,
         )
 
-    async def close(self) -> None:
+    async def close(self, *, cancel_background: bool = True) -> None:
         """Close session-owned transports and background processes."""
 
-        for cancel in tuple(self._background_child_cancellers.values()):
-            cancel()
+        if cancel_background and self.agent_depth == 0:
+            self._background_owner.cancel_all()
+        elif cancel_background:
+            for cancel in tuple(self._background_child_cancellers.values()):
+                cancel()
         watchers = tuple(self._background_child_watchers.values())
         if watchers:
             await asyncio.gather(*watchers, return_exceptions=True)
-        tracked_tasks = tuple(self._tracked_tasks)
+        if cancel_background and self.agent_depth == 0:
+            await self._background_owner.wait()
+        tracked_tasks = tuple(
+            task
+            for task in self._tracked_tasks
+            if cancel_background or task not in self._background_child_watchers.values()
+        )
         for task in tracked_tasks:
             task.cancel()
         await asyncio.gather(*tracked_tasks, return_exceptions=True)
@@ -1192,8 +1163,3 @@ def _durable_message(message: Message) -> Message:
         tool_result=message.tool_result,
         metadata=dict(message.metadata),
     )
-
-
-def _assistant_text_snippet(message: Message) -> str:
-    text = assistant_text(message).replace("\r", " ").replace("\n", " ")
-    return text if len(text) <= 160 else f"{text[:157]}..."

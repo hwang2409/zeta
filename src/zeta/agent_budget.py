@@ -38,12 +38,10 @@ def configure_budget(
     return inherited or (SharedTurnBudget(explicit) if explicit is not None else None)
 
 
-def child_depth(parent_depth: int, background: bool) -> tuple[int, str | None]:
+def child_depth(parent_depth: int, _background: bool) -> tuple[int, str | None]:
     depth = parent_depth + 1
     if depth > MAX_AGENT_DEPTH:
         return depth, f"agent error: maximum agent nesting depth is {MAX_AGENT_DEPTH}"
-    if depth == MAX_AGENT_DEPTH and background:
-        return depth, "agent error: background grandchildren are not supported"
     return depth, None
 
 

@@ -311,7 +311,12 @@ class AgentCard:
         call = event.tool_call
         if event.type is not StreamEventType.TOOL_EXECUTION_START or call is None:
             return None
-        return cls.render_progress(call, "")
+        depth = event.data.get("depth")
+        return cls.render_progress(
+            call,
+            "",
+            depth=depth if type(depth) is int and depth >= 1 else 1,
+        )
 
     @classmethod
     def render_end(cls, event: StreamEvent) -> RenderableType | None:

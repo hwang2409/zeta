@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from .core.store import ConversationStore
 from .types import (
@@ -32,6 +32,54 @@ class _AgentLoopForRecovery(Protocol):
     ) -> ToolResult: ...
 
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None: ...
+
+
+class BackgroundAgentOwner:
+    """Own cancellation and watcher state for one complete agent tree."""
+
+    def __init__(self) -> None:
+        self._cancellers: dict[str, Callable[[], None]] = {}
+        self._watchers: dict[str, asyncio.Task[Any]] = {}
+        self._canceling = False
+
+    def register(
+        self,
+        instance_id: str,
+        cancel: Callable[[], None],
+        watcher: asyncio.Task[Any],
+    ) -> None:
+        self._cancellers[instance_id] = cancel
+        self._watchers[instance_id] = watcher
+
+    def unregister(self, instance_id: str) -> None:
+        self._cancellers.pop(instance_id, None)
+        self._watchers.pop(instance_id, None)
+
+    def cancel_all(self) -> None:
+        if self._canceling:
+            return
+        self._canceling = True
+        try:
+            for cancel in tuple(self._cancellers.values()):
+                cancel()
+        finally:
+            self._canceling = False
+
+    @property
+    def running(self) -> bool:
+        return bool(self._cancellers)
+
+    async def wait(self) -> None:
+        current = asyncio.current_task()
+        while True:
+            watchers = tuple(
+                watcher
+                for watcher in self._watchers.values()
+                if watcher is not current
+            )
+            if not watchers:
+                return
+            await asyncio.gather(*watchers, return_exceptions=True)
 
 
 def _open_child_store(store: ConversationStore, path: Path) -> ConversationStore | None:
@@ -74,7 +122,7 @@ def _recover_nested_children(store: ConversationStore) -> None:
         if child_store is not None:
             _recover_nested_children(child_store)
         existing_result = _existing_tool_result(store, tool_call_id)
-        completed_background = False
+        notification_status: str | None = None
         if marker.get("background"):
             child_instance_id = marker.get(
                 "child_instance_id", f"{store.session_id}:{child_path.name}"
@@ -95,9 +143,9 @@ def _recover_nested_children(store: ConversationStore) -> None:
                     status="canceled",
                     text="background child canceled when the parent session exited",
                 )
-            elif child_store is not None:
-                completed_background = True
-                child_store.finish_agent_parent()
+                notification_status = "canceled"
+            else:
+                notification_status = existing.data["status"]
         elif not existing_result:
             store.append_message(
                 Message(
@@ -107,7 +155,9 @@ def _recover_nested_children(store: ConversationStore) -> None:
                 )
             )
         if child_store is not None:
-            if existing_result or completed_background:
+            if marker.get("background") and notification_status == "canceled":
+                child_store.mark_agent_canceled(tool_call.id)
+            elif existing_result or notification_status is not None:
                 child_store.finish_agent_parent()
             else:
                 child_store.mark_agent_canceled(tool_call.id)
@@ -147,7 +197,10 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                 if child_store is not None:
                     child_store.mark_agent_canceled(tool_call.id)
             elif child_store is not None:
-                child_store.finish_agent_parent()
+                if notification.data["status"] == "canceled":
+                    child_store.mark_agent_canceled(tool_call.id)
+                else:
+                    child_store.finish_agent_parent()
             loop.store.finish_agent_child(tool_call_id)
             continue
         existing_result = loop._existing_tool_result(tool_call_id)

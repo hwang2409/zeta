@@ -40,6 +40,22 @@ class ChildApprovalPolicy:
     def bind_store(self, store: ConversationStore) -> None:
         del store
 
+    def register_delegated(
+        self,
+        request: ApprovalRequest,
+        store: ConversationStore,
+        *,
+        child_instance_id: str | None = None,
+    ) -> None:
+        self.parent.register_delegated(
+            request,
+            store,
+            child_instance_id=child_instance_id,
+        )
+
+    def cleanup_delegated(self, child_instance_id: str) -> None:
+        self.parent.cleanup_delegated(child_instance_id)
+
     def decide(self, tool_name: str, arguments: dict[str, Any]) -> ApprovalDecision:
         return self.parent.decide(tool_name, arguments)
 
@@ -203,8 +219,9 @@ def register(registry: ToolRegistry) -> None:
         _agent,
         description=(
             "Delegate multi-step exploration or research that would pollute the "
-            "main context. The child has its own bounded context and cannot "
-            "spawn further agents. Built-in types: "
+            "main context. The child has its own bounded context and may spawn "
+            "one level of grandchildren, but grandchildren cannot spawn agents. "
+            "Built-in types: "
             f"{agent_type_description()}"
         ),
         parameters={
