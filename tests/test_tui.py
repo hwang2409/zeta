@@ -725,6 +725,88 @@ def test_transcript_follows_tail_until_scrolled_up() -> None:
     assert transcript.scroll_offset == len(transcript.lines(80)) - 3
 
 
+def test_transcript_search_highlights_matches_and_wraps() -> None:
+    transcript = TranscriptWidget()
+    transcript.append(Text("alpha target"))
+    transcript.append(Text("target between"))
+    transcript.append(Text("omega target"))
+    transcript.create_content(80, 2)
+
+    transcript.begin_search()
+    transcript.update_search("target")
+    assert transcript.search_status() == (1, 3)
+    assert "target" in Text.from_ansi(transcript.render(80)).plain
+    assert "\x1b[" in transcript.render(80)
+
+    assert transcript.next_search_match()
+    assert transcript.search_status() == (2, 3)
+    assert transcript.next_search_match()
+    assert transcript.search_status() == (3, 3)
+    assert transcript.next_search_match()
+    assert transcript.search_status() == (1, 3)
+    assert transcript.previous_search_match()
+    assert transcript.search_status() == (3, 3)
+
+    transcript.end_search()
+    assert transcript.search_status() is None
+    assert "\x1b[" not in transcript.render(80)
+
+
+def test_transcript_user_jumps_skip_non_user_units() -> None:
+    transcript = TranscriptWidget()
+    transcript.append_user(Text("first user"))
+    transcript.append(Text("tool receipt"))
+    transcript.append(Text("assistant thought"))
+    transcript.append_user(Text("second user"))
+    transcript.append(Text("assistant answer"))
+    transcript.create_content(80, 2)
+    transcript._set_scroll_offset(0)
+
+    assert transcript.next_user_message()
+    assert transcript.scroll_offset == 3
+    assert transcript.previous_user_message()
+    assert transcript.scroll_offset == 0
+    assert not transcript.previous_user_message()
+
+
+def test_transcript_position_indicator_hides_at_pinned_tail() -> None:
+    transcript = TranscriptWidget()
+    for index in range(8):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(80, 3)
+
+    assert transcript.position_indicator() is None
+    transcript._set_scroll_offset(0)
+    assert transcript.position_indicator() == "line 1/8"
+    transcript._set_scroll_offset(4)
+    assert transcript.position_indicator() == "line 5/8"
+    transcript._set_scroll_offset(5)
+    assert transcript.position_indicator() is None
+
+
+def test_transcript_paging_reuses_rendered_content_for_large_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = TranscriptWidget()
+    for index in range(2_000):
+        transcript.append(Text(f"line {index}"))
+    transcript.create_content(80, 20)
+
+    calls = 0
+    original_render = transcript.render
+
+    def counted_render(width: int) -> str:
+        nonlocal calls
+        calls += 1
+        return original_render(width)
+
+    monkeypatch.setattr(transcript, "render", counted_render)
+    for _ in range(100):
+        transcript.page_up()
+        transcript.create_content(80, 20)
+    assert calls == 0
+
+
 def test_transcript_resize_preserves_anchor_and_tail_reentry() -> None:
     transcript = TranscriptWidget()
     for index in range(8):
@@ -2895,6 +2977,26 @@ def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None
         assert not session.app.key_bindings.get_bindings_for_keys((Keys.ControlO,))
 
 
+def test_transcript_navigation_bindings_are_full_screen_only() -> None:
+    bindings = build_key_bindings(
+        on_interrupt=lambda: None,
+        on_exit=lambda: None,
+        on_search_start=lambda: None,
+        search_active=lambda: False,
+        on_search_input=lambda _value: None,
+        on_search_end=lambda: None,
+        on_previous_user=lambda: None,
+        on_next_user=lambda: None,
+    )
+
+    assert bindings.get_bindings_for_keys((Keys.ControlF,))
+    assert bindings.get_bindings_for_keys((Keys.ControlUp,))
+    assert bindings.get_bindings_for_keys((Keys.ControlDown,))
+    inline = PromptSession(key_bindings=bindings)
+    with set_app(inline.app):
+        assert not bindings.get_bindings_for_keys((Keys.ControlF,))[-1].filter()
+
+
 def test_long_single_line_read_uses_a_cropped_card() -> None:
     call = ToolCall("read-long", "read", {"path": "README.md"})
     event = StreamEvent(
@@ -4853,6 +4955,26 @@ def test_footer_builder_formats_context_usage_and_hints() -> None:
         undo_available=True,
     )
     assert "ctrl+u undo" in undo_footer.plain
+
+
+def test_footer_shows_transcript_navigation_and_search_state() -> None:
+    footer = format_status(
+        "fake",
+        "offline",
+        "idle",
+        token_count=18,
+        transcript_navigation=True,
+        transcript_search="target",
+        transcript_match=(2, 5),
+        transcript_position="line 14/80",
+    )
+
+    assert 'find "target" 2/5' in footer.plain
+    assert "line 14/80" in footer.plain
+    assert "ctrl+f find" in footer.plain
+    assert "enter/n next" in footer.plain
+    assert "N prev" in footer.plain
+    assert "esc close" in footer.plain
 
 
 def test_footer_shows_vim_state_and_degrades_as_a_whole_segment() -> None:

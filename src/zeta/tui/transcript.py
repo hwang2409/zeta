@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 import re
 from collections import OrderedDict
 from collections.abc import Callable
@@ -21,10 +22,10 @@ from rich.padding import Padding
 from rich.text import Text
 
 from ..types import StreamEvent, StreamEventType, ToolCall
-from .layout import CONTENT_MARGIN
 from .agent_card import AgentCard
+from .layout import CONTENT_MARGIN
 from .render import render_event, render_tool_progress
-from .theme import RICH_THEME
+from .theme import RICH_THEME, SEARCH_CURRENT, SEARCH_MATCH
 
 
 ToolLifecycleKey = tuple[str | None, str]
@@ -106,6 +107,17 @@ class _TranscriptUnit:
         self.value = value
 
 
+@dataclass(frozen=True)
+class _SearchMatch:
+    """One match and its line-local highlight ranges."""
+
+    ranges: tuple[tuple[int, int, int], ...]
+
+    @property
+    def first_line(self) -> int:
+        return self.ranges[0][0]
+
+
 class TranscriptWidget(UIControl):
     """Render logical transcript units at the current width and stay at the bottom."""
 
@@ -125,7 +137,12 @@ class TranscriptWidget(UIControl):
         self._viewport_height = 1
         self._content_width = 80
         self._line_locations: list[tuple[_TranscriptUnit | None, int]] = []
+        self._locations_revision = -1
         self._anchor: tuple[_TranscriptUnit | None, int] | None = None
+        self._user_units: list[_TranscriptUnit] = []
+        self._search_active = False
+        self._search_query = ""
+        self._search_index = 0
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
@@ -156,6 +173,19 @@ class TranscriptWidget(UIControl):
         self._bump_revision()
         return unit
 
+    def append_user(self, renderable: RenderableType) -> _TranscriptUnit:
+        """Append a user message and make it a jump target."""
+
+        unit = self._append_unit(renderable)
+        self._user_units.append(unit)
+        return unit
+
+    def mark_user(self, unit: _TranscriptUnit | None) -> None:
+        """Mark an existing full-screen unit as a user message."""
+
+        if unit is not None and unit in self._units and unit not in self._user_units:
+            self._user_units.append(unit)
+
     def append(self, renderable: RenderableType) -> _TranscriptUnit:
         return self._append_unit(renderable)
 
@@ -175,6 +205,8 @@ class TranscriptWidget(UIControl):
         self._units.remove(unit)
         if self._anchor is not None and self._anchor[0] is unit:
             self._anchor = None
+        if unit in self._user_units:
+            self._user_units.remove(unit)
         self._render_cache.pop(unit.key, None)
         self._bump_revision()
 
@@ -192,6 +224,7 @@ class TranscriptWidget(UIControl):
         self._parsed_cache.clear()
         self._line_locations.clear()
         self._anchor = None
+        self._user_units.clear()
         self._scroll_offset = 0
         self._follow_tail = True
         self._bump_revision()
@@ -267,6 +300,7 @@ class TranscriptWidget(UIControl):
             for unit in self._units
             if unit is None or unit.value not in active
         ]
+        self._user_units[:] = [unit for unit in self._user_units if unit in self._units]
         if self._anchor is not None and self._anchor[0] not in self._units:
             self._anchor = None
         for key in removed_keys:
@@ -306,17 +340,190 @@ class TranscriptWidget(UIControl):
 
     def page_up(self) -> None:
         self._set_scroll_offset(self._scroll_offset - self._viewport_height)
-        self._follow_tail = False
 
     def page_down(self) -> None:
         self._set_scroll_offset(self._scroll_offset + self._viewport_height)
 
     def scroll_up(self) -> None:
         self._set_scroll_offset(self._scroll_offset - 3)
-        self._follow_tail = False
 
     def scroll_down(self) -> None:
         self._set_scroll_offset(self._scroll_offset + 3)
+
+    @property
+    def search_active(self) -> bool:
+        return self._search_active
+
+    @property
+    def search_query(self) -> str:
+        return self._search_query
+
+    def begin_search(self) -> None:
+        self._search_active = True
+        self._search_query = ""
+        self._search_index = 0
+
+    def update_search(self, query: str) -> None:
+        self._search_active = True
+        self._search_query = query
+        self._search_index = 0
+        self._parsed_cache.clear()
+        self._focus_search_match()
+
+    def search_backspace(self) -> None:
+        if self._search_query:
+            self.update_search(self._search_query[:-1])
+
+    def end_search(self) -> None:
+        self._search_active = False
+        self._search_query = ""
+        self._search_index = 0
+        self._parsed_cache.clear()
+
+    def _base_render(self, width: int) -> str:
+        rendered_units: list[str] = []
+        for unit in self._units:
+            if unit is None:
+                rendered_units.append("")
+                continue
+            rendered_units.append(self._render_unit(unit, width))
+        value = "\n".join(rendered_units).rstrip("\n")
+        lines = value.splitlines()
+        while lines and not Text.from_ansi(lines[0]).plain.strip():
+            lines.pop(0)
+        return "\n".join(lines)
+
+    def _find_search_matches(self, width: int) -> list[_SearchMatch]:
+        if not self._search_query:
+            return []
+        plain_lines = Text.from_ansi(self._base_render(width)).plain.splitlines()
+        if not plain_lines:
+            return []
+        plain = "\n".join(plain_lines)
+        line_starts: list[int] = []
+        offset = 0
+        for line in plain_lines:
+            line_starts.append(offset)
+            offset += len(line) + 1
+        matches: list[_SearchMatch] = []
+        for found in re.finditer(re.escape(self._search_query), plain, re.IGNORECASE):
+            ranges: list[tuple[int, int, int]] = []
+            end = found.end()
+            line_index = bisect_right(line_starts, found.start()) - 1
+            while line_index < len(plain_lines):
+                line_start = line_starts[line_index]
+                line_end = line_start + len(plain_lines[line_index])
+                start = max(found.start(), line_start) - line_start
+                finish = min(end, line_end) - line_start
+                if finish > start:
+                    ranges.append((line_index, start, finish))
+                if end <= line_end:
+                    break
+                line_index += 1
+            if ranges:
+                matches.append(_SearchMatch(tuple(ranges)))
+        return matches
+
+    def _search_matches(self, width: int | None = None) -> list[_SearchMatch]:
+        matches = self._find_search_matches(width or self._content_width)
+        self._search_index = self._search_index % len(matches) if matches else 0
+        return matches
+
+    def _focus_search_match(self) -> None:
+        matches = self._search_matches()
+        if matches:
+            self._set_scroll_offset(matches[self._search_index].first_line)
+
+    def next_search_match(self) -> bool:
+        matches = self._search_matches()
+        if not matches:
+            return False
+        self._search_index = (self._search_index + 1) % len(matches)
+        self._parsed_cache.clear()
+        self._focus_search_match()
+        return True
+
+    def previous_search_match(self) -> bool:
+        matches = self._search_matches()
+        if not matches:
+            return False
+        self._search_index = (self._search_index - 1) % len(matches)
+        self._parsed_cache.clear()
+        self._focus_search_match()
+        return True
+
+    def _jump_to_user(self, *, next_message: bool) -> bool:
+        if self._locations_revision != self._revision:
+            self.create_content(self._content_width, self._viewport_height)
+        targets = sorted(
+            {
+                index
+                for index, (unit, _offset) in enumerate(self._line_locations)
+                if unit in self._user_units
+            }
+        )
+        if next_message:
+            target = next((index for index in targets if index > self._scroll_offset), None)
+        else:
+            target = next(
+                (index for index in reversed(targets) if index < self._scroll_offset),
+                None,
+            )
+        if target is None:
+            return False
+        self._set_scroll_offset(target)
+        return True
+
+    def next_user_message(self) -> bool:
+        return self._jump_to_user(next_message=True)
+
+    def previous_user_message(self) -> bool:
+        return self._jump_to_user(next_message=False)
+
+    def search_status(self) -> tuple[int, int] | None:
+        if not self._search_active:
+            return None
+        matches = self._search_matches()
+        if not matches:
+            return (0, 0)
+        return (self._search_index + 1, len(matches))
+
+    def position_indicator(self) -> str | None:
+        """Return the top visible line unless the viewport follows the tail."""
+
+        if self._follow_tail:
+            return None
+        total = len(self._parsed_lines(self._content_width))
+        if not total:
+            return None
+        return f"line {min(self._scroll_offset + 1, total)}/{total}"
+
+    def _highlighted_render(self, width: int, base: str) -> str:
+        matches = self._search_matches(width)
+        if not matches:
+            return base
+        ranges_by_line: dict[int, list[tuple[int, int, str]]] = {}
+        for match_index, match in enumerate(matches):
+            style = SEARCH_CURRENT if match_index == self._search_index else SEARCH_MATCH
+            for line, start, end in match.ranges:
+                ranges_by_line.setdefault(line, []).append((start, end, style))
+        lines = base.splitlines()
+        rendered_lines: list[str] = []
+        for line_index, line in enumerate(lines):
+            text = Text.from_ansi(line)
+            for start, end, style in ranges_by_line.get(line_index, []):
+                text.stylize(style, start, end)
+            output = StringIO()
+            Console(
+                file=output,
+                force_terminal=True,
+                color_system="truecolor",
+                no_color=False,
+                width=max(1, width),
+                theme=RICH_THEME,
+            ).print(text, end="")
+            rendered_lines.append(output.getvalue())
+        return "\n".join(rendered_lines)
 
     def _render_unit(self, unit: _TranscriptUnit, width: int) -> str:
         value = unit.value
@@ -345,17 +552,7 @@ class TranscriptWidget(UIControl):
         return rendered
 
     def render(self, width: int) -> str:
-        rendered_units: list[str] = []
-        for unit in self._units:
-            if unit is None:
-                rendered_units.append("")
-                continue
-            rendered_units.append(self._render_unit(unit, width))
-        value = "\n".join(rendered_units).rstrip("\n")
-        lines = value.splitlines()
-        while lines and not Text.from_ansi(lines[0]).plain.strip():
-            lines.pop(0)
-        return "\n".join(lines)
+        return self._highlighted_render(width, self._base_render(width))
 
     def lines(self, width: int) -> list[str]:
         return self.render(width).splitlines()
@@ -474,6 +671,7 @@ class TranscriptWidget(UIControl):
         if self._follow_tail:
             self._scroll_offset = tail
         self._line_locations = locations
+        self._locations_revision = self._revision
         prefix_lines = max(0, self._viewport_height - len(lines))
         visible_lines = ([[] for _ in range(prefix_lines)] + lines)
         cursor_y = min(prefix_lines + self._scroll_offset, len(visible_lines) - 1)
@@ -561,7 +759,9 @@ class TranscriptPresenter:
             return
         self._print_callback(renderable)
 
-    def print_unit(self, renderable: RenderableType | None) -> _TranscriptUnit | None:
+    def print_unit(
+        self, renderable: RenderableType | None, *, user: bool = False
+    ) -> _TranscriptUnit | None:
         if renderable is None:
             return None
         if self._printed_units:
@@ -572,8 +772,14 @@ class TranscriptPresenter:
         self.print(renderable)
         self._printed_units = True
         if self._full_screen_active() and self.transcript._units:
-            return self.transcript._units[-1]
+            unit = self.transcript._units[-1]
+            if user:
+                self.transcript.mark_user(unit)
+            return unit
         return None
+
+    def print_user(self, renderable: RenderableType | None) -> None:
+        self.print_unit(renderable, user=True)
 
     def print_assistant(self, renderable: RenderableType | None) -> bool:
         if renderable is None:

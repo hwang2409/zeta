@@ -5,16 +5,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import platform
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
@@ -52,6 +55,40 @@ SHIFT_ENTER_SEQUENCES = frozenset(
 ATTACHMENT_MAX_TEXT_BYTES = 200 * 1024
 ATTACHMENT_TOKEN_RE = re.compile(r'(?<!\S)@(?:"([^"\n]+)"|([^\s]+))')
 SPINNER_INTERVAL = 0.2
+
+
+class FullScreenPromptSession(PromptSession[str]):
+    """Prompt session that owns the alternate screen for the whole app."""
+
+    def _create_application(
+        self, editing_mode: EditingMode, erase_when_done: bool
+    ) -> Application[str]:
+        application = super()._create_application(editing_mode, erase_when_done)
+        application.ttimeoutlen, application.timeoutlen, application.cursor = (
+            0.02,
+            0.5,
+            VimCursorShapeConfig(),
+        )
+        (
+            application.full_screen,
+            application.renderer.full_screen,
+            application.erase_when_done,
+        ) = True, True, False
+        return application
+
+    def restore_terminal(self) -> None:
+        """Restore the shell viewport after prompt-toolkit exits."""
+
+        self.app.output.quit_alternate_screen()
+        self.app.output.show_cursor()
+        self.app.output.flush()
+        stdout = sys.__stdout__
+        if stdout.isatty():
+            try:
+                os.write(stdout.fileno(), b"\x1b[?1049l\x1b[?25h")
+            except OSError:
+                pass
+
 class TurnConsumerMixin:
     """Consume loop events and preserve failed-turn recovery state."""
 
@@ -626,7 +663,7 @@ class ComposerAttachmentMixin:
     def _print_user(self, user: str | Message) -> None:
         self._presenter.reset_assistant_unit()
         if isinstance(user, str):
-            self._print_unit(Text.assemble(("▌ ", USER_ROLE), (user, BODY)))
+            self._presenter.print_user(Text.assemble(("▌ ", USER_ROLE), (user, BODY)))
             return
         prompt = next(
             (
@@ -644,7 +681,7 @@ class ComposerAttachmentMixin:
                     f"\n  file · {label} · {block.size or 0} bytes",
                     style="dim",
                 )
-        self._print_unit(rendered)
+        self._presenter.print_user(rendered)
 
     def _start_queued_turn(self) -> None:
         if not self._queued:
@@ -745,6 +782,15 @@ def build_key_bindings(
     on_paste: Callable[[KeyPressEvent], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
+    on_search_start: Callable[[], None] | None = None,
+    search_active: Callable[[], bool] | None = None,
+    on_search_input: Callable[[str], None] | None = None,
+    on_search_backspace: Callable[[], None] | None = None,
+    on_search_next: Callable[[], None] | None = None,
+    on_search_previous: Callable[[], None] | None = None,
+    on_search_end: Callable[[], None] | None = None,
+    on_previous_user: Callable[[], None] | None = None,
+    on_next_user: Callable[[], None] | None = None,
     on_toggle_agent: Callable[[], None] | None = None,
     on_retry: Callable[[], None] | None = None,
     retry_available: Callable[[], bool] | None = None,
@@ -795,6 +841,14 @@ def build_key_bindings(
         return (
             on_retry is not None
             and (retry_available is None or retry_available())
+        )
+
+    @Condition
+    def transcript_search_mode() -> bool:
+        return (
+            full_screen_mode()
+            and search_active is not None
+            and search_active()
         )
 
     def insert_newline(event: KeyPressEvent) -> None:
@@ -933,6 +987,72 @@ def build_key_bindings(
         def page_down(event: KeyPressEvent) -> None:
             del event
             on_page_down()
+
+    if on_search_start is not None:
+
+        @bindings.add("c-f", filter=full_screen_mode, eager=True)
+        def start_transcript_search(event: KeyPressEvent) -> None:
+            del event
+            on_search_start()
+
+    if on_search_end is not None:
+
+        @bindings.add(Keys.Escape, filter=transcript_search_mode, eager=True)
+        def end_transcript_search(event: KeyPressEvent) -> None:
+            del event
+            on_search_end()
+
+    if on_search_input is not None:
+
+        @bindings.add(Keys.Any, filter=transcript_search_mode, eager=True)
+        def transcript_search_input(event: KeyPressEvent) -> None:
+            if event.data:
+                on_search_input(event.data)
+
+    if on_search_backspace is not None:
+
+        @bindings.add("backspace", filter=transcript_search_mode, eager=True)
+        def transcript_search_backspace(event: KeyPressEvent) -> None:
+            del event
+            on_search_backspace()
+
+        @bindings.add("c-h", filter=transcript_search_mode, eager=True)
+        def transcript_search_backspace_ctrl_h(event: KeyPressEvent) -> None:
+            del event
+            on_search_backspace()
+
+    if on_search_next is not None:
+
+        @bindings.add("n", filter=transcript_search_mode, eager=True)
+        def next_transcript_match(event: KeyPressEvent) -> None:
+            del event
+            on_search_next()
+
+        @bindings.add("enter", filter=transcript_search_mode, eager=True)
+        def next_transcript_match_enter(event: KeyPressEvent) -> None:
+            del event
+            on_search_next()
+
+    if on_search_previous is not None:
+
+        @bindings.add("N", filter=transcript_search_mode, eager=True)
+        def previous_transcript_match(event: KeyPressEvent) -> None:
+            del event
+            on_search_previous()
+
+    if on_previous_user is not None:
+
+        @bindings.add(Keys.ControlUp, filter=full_screen_mode, eager=True)
+        def previous_user(event: KeyPressEvent) -> None:
+            del event
+            on_previous_user()
+
+    if on_next_user is not None:
+
+        @bindings.add(Keys.ControlDown, filter=full_screen_mode, eager=True)
+        def next_user(event: KeyPressEvent) -> None:
+            del event
+            on_next_user()
 
     if on_toggle_agent is not None:
 

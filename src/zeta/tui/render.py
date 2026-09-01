@@ -958,6 +958,10 @@ def format_status(
     vim_state: str | None = None,
     background_count: int = 0,
     undo_available: bool = False,
+    transcript_navigation: bool = False,
+    transcript_search: str | None = None,
+    transcript_match: tuple[int, int] | None = None,
+    transcript_position: str | None = None,
 ) -> Text:
     """Format the compact status bar shown below the composer."""
 
@@ -994,8 +998,20 @@ def format_status(
         left_segments.insert(0, vim_state)
     if background_count > 0:
         left_segments.append(f"bg {background_count}")
+    if transcript_position:
+        left_segments.append(transcript_position)
+    if transcript_search is not None:
+        current, total = transcript_match or (0, 0)
+        left_segments.insert(
+            0,
+            f'find "{transcript_search}" {current}/{total}',
+        )
     left = "  ".join(left_segments)
     right_segments = ["/status", "ctrl+c interrupt", "ctrl+d quit"]
+    if transcript_navigation:
+        right_segments.extend(("ctrl+f find", "ctrl+up/down users"))
+    if transcript_search is not None:
+        right_segments.extend(("enter/n next", "N prev", "esc close"))
     if undo_available:
         right_segments.append("ctrl+u undo")
     if session_id:

@@ -25,6 +25,8 @@ RECEIPT = CHROME
 THOUGHT = f"italic {CHROME}"
 AFFORDANCE = f"dim {DIM}"
 USER_ROLE = ACCENT
+SEARCH_MATCH = f"{BODY} on #50544d"
+SEARCH_CURRENT = f"black on {ACCENT}"
 
 RICH_THEME = Theme(
     {
