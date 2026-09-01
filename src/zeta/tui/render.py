@@ -1032,18 +1032,14 @@ def format_status(
                 full = f'{search_prefix}{transcript_search}{search_suffix}'
                 if cell_len(full) <= max_width:
                     return full
-                if max_width >= minimum_search_width:
-                    available = max_width - cell_len(search_prefix) - cell_len(search_suffix)
-                    query = Text(
-                        transcript_search,
-                        no_wrap=True,
-                        overflow="ellipsis",
-                    )
-                    query.truncate(max(1, available), overflow="ellipsis")
-                    return f"{search_prefix}{query.plain}{search_suffix}"
-                fitted = Text(full, no_wrap=True, overflow="ellipsis")
-                fitted.truncate(max_width, overflow="ellipsis")
-                return fitted.plain
+                available = max_width - cell_len(search_prefix) - cell_len(search_suffix)
+                query = Text(
+                    transcript_search,
+                    no_wrap=True,
+                    overflow="ellipsis",
+                )
+                query.truncate(max(1, available), overflow="ellipsis")
+                return f"{search_prefix}{query.plain}{search_suffix}"
 
             navigation_candidates = (
                 (state_segment, transcript_position),

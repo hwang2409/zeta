@@ -16,9 +16,9 @@ from .render import render_event
 from .transcript import (
     ToolLifecycleKey,
     TranscriptWidget,
+    _event_tool_lifecycle_key,
     _ToolUnit,
     _TranscriptUnit,
-    _event_tool_lifecycle_key,
 )
 
 
@@ -251,9 +251,8 @@ class TranscriptPresenter:
             return False
         if self._full_screen_active():
             lifecycle_key = _event_tool_lifecycle_key(event)
-            if event.tool_call is not None:
-                if lifecycle_key is not None:
-                    self.transcript.update_tool(lifecycle_key, rendered, event)
+            if event.tool_call is not None and lifecycle_key is not None:
+                self.transcript.update_tool(lifecycle_key, rendered, event)
             return bool(event.delta and event.delta.strip())
         call = event.tool_call
         lifecycle_key = _event_tool_lifecycle_key(event)
@@ -322,11 +321,14 @@ class TranscriptPresenter:
                 self._printed_units = True
             else:
                 self.print_unit(rendered)
-            if not self._full_screen_active() and event.tool_call is not None:
-                if lifecycle_key is not None:
-                    self._tool_region_units[lifecycle_key] = _ToolUnit(
-                        event.tool_call, rendered, event
-                    )
+            if (
+                not self._full_screen_active()
+                and event.tool_call is not None
+                and lifecycle_key is not None
+            ):
+                self._tool_region_units[lifecycle_key] = _ToolUnit(
+                    event.tool_call, rendered, event
+                )
             return ToolEventPresentation(visible_output=True)
         if event.type is StreamEventType.TOOL_EXECUTION_UPDATE:
             return ToolEventPresentation(
@@ -350,9 +352,8 @@ class TranscriptPresenter:
             if is_background_start:
                 if lifecycle_key is not None:
                     self._background_tool_ids.add(lifecycle_key)
-                if self._full_screen_active():
-                    if lifecycle_key is not None:
-                        self.transcript.mark_tool_background(lifecycle_key)
+                if self._full_screen_active() and lifecycle_key is not None:
+                    self.transcript.mark_tool_background(lifecycle_key)
                 path = structured.get("child_session_path") if structured else None
                 if isinstance(path, str) and path:
                     if self._full_screen_active():

@@ -16,11 +16,40 @@ from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from rich.console import Console, RenderableType
 from rich.text import Text
 
-from ..types import StreamEvent, ToolCall
+from ..types import (
+    RedactedThinkingContent,
+    StreamEvent,
+    TextContent,
+    ThinkingContent,
+    ToolCall,
+)
 from .agent_card import AgentCard
 from .render import render_tool_progress
 from .theme import RICH_THEME
 from .transcript_search import SearchMatch, find_matches, highlight
+
+
+def stream_key(
+    event: StreamEvent,
+) -> tuple[str | None, tuple[str, object] | None]:
+    content = event.content
+    index = event.data.get("index")
+    identity = (
+        ("index", index)
+        if isinstance(index, (int, str, tuple))
+        else None
+    )
+    if isinstance(content, ThinkingContent):
+        return "thinking", identity or (
+            ("signature", content.signature)
+            if content.signature is not None
+            else ("kind", "thinking")
+        )
+    if isinstance(content, RedactedThinkingContent):
+        return "redacted-thinking", identity or ("data", content.data)
+    if isinstance(content, TextContent) or event.delta is not None:
+        return "assistant", ("kind", "assistant")
+    return None, None
 
 
 ToolLifecycleKey = tuple[str | None, str]

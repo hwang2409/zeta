@@ -39,8 +39,10 @@ from ..core.slash import (
 )
 from ..core.todo import todo_count_tuple
 from ..loop import AgentLoop
+from ..persistence import DraftPersistence, history_for
 from ..providers.anthropic import AnthropicBackend, AnthropicCredentialStore
 from ..providers.codex import CodexBackend, CodexCredentialStore
+from ..submission import Submission, SubmissionMixin, SubmissionQueue
 from ..types import (
     CompletionBackend,
     Message,
@@ -50,7 +52,6 @@ from ..types import (
     ThinkingContent,
     assistant_text,
 )
-from .background import background_notice
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
@@ -70,15 +71,12 @@ from .layout import (
 )
 from .models import MODEL_CATALOGS, validate_model_name
 from .models import load_model_catalog as _load_model_catalog
-from ..persistence import DraftPersistence, history_for
 from .render import (
     format_status,
     render_markdown,
     render_thought,
     render_thought_live,
 )
-from .stream import stream_key
-from ..submission import Submission, SubmissionMixin, SubmissionQueue
 from .theme import (
     ACCENT,
     BODY,
@@ -89,12 +87,19 @@ from .theme import (
     RICH_THEME,
 )
 from .todo import TodoWidget
-from .transcript import TranscriptWidget
+from .transcript import TranscriptWidget, stream_key
 from .transcript_presenter import TranscriptPresenter
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 RECENT_SESSION_LIMIT = 20
+
+
+def background_notice(app: Any, message: str) -> None:
+    """Print one dim background task notice and refresh the prompt."""
+
+    app._print(Text(message, style=DIM))
+    app._invalidate_prompt()
 
 
 def _validate_model_name(provider: str, model: str) -> None:
