@@ -262,6 +262,45 @@ def is_retryable_error(error: ErrorInfo | None) -> bool:
     }
 
 
+def render_approval_card(
+    tool_name: str,
+    arguments: dict[str, object],
+    *,
+    label: str | None = None,
+    key: str | None = None,
+    shortcut: bool = True,
+) -> Panel:
+    """Render an inline permission-request card styled like Claude/Codex.
+
+    `shortcut` marks the request the y/n keys answer: the rest have to be
+    named, so they show their key instead of an affordance they do not have.
+    """
+
+    header = Text.assemble(
+        ("allow ", DIM),
+        (label or tool_name, COMMAND),
+        ("?", DIM),
+    )
+    if key is not None:
+        header.append(f"  [{key}]", style=DIM)
+    arg_line = _arguments(arguments)
+    body_parts: list[RenderableType] = [header]
+    if arg_line:
+        body_parts.append(Text(arg_line, style=DIM, overflow="ellipsis", no_wrap=True))
+    if shortcut:
+        affordance = "y approve · n deny"
+    else:
+        affordance = f"approve {key} · deny {key}" if key is not None else "approve · deny"
+    body_parts.append(Text(affordance, style=AFFORDANCE))
+    return Panel(
+        Group(*body_parts),
+        border_style=ACCENT,
+        style=CARD_BG,
+        padding=(0, 1),
+        expand=True,
+    )
+
+
 def _tool_receipt(event: StreamEvent) -> Text:
     call = event.tool_call
     assert call is not None
