@@ -182,7 +182,7 @@ class AgentLoop:
         self._shared_agent_budget = configure_budget(
             agent_turn_budget, shared_agent_budget
         )
-        self._background_owner = background_owner or BackgroundAgentOwner()
+        self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
         self._agent_child_turns: dict[str, int] = {}
@@ -594,6 +594,7 @@ class AgentLoop:
                     child_task=child_task,
                     child_store=child_store,
                     parent_store=self.store,
+                    notification_store=self._background_owner.notification_store,
                     tool_call=tool_call,
                     child_instance_id=child_instance_id,
                     child_path=child_path,
@@ -615,11 +616,25 @@ class AgentLoop:
             self._background_owner.register(
                 child_instance_id, request_background_cancel, watcher
             )
-            return child_result(
+            # The tree owner now keeps this task pair alive after this loop closes.
+            self._tracked_tasks.discard(child_task)
+            self._tracked_tasks.discard(watcher)
+            running_result = child_result(
                 f"background agent started: {description}",
                 error=False,
                 status="running",
             )
+            running_tool_result = _validated_tool_result(
+                running_result, tool_call.id
+            )
+            self.store.append_message(
+                Message(
+                    MessageRole.TOOL_RESULT,
+                    [TextContent(running_tool_result.content)],
+                    tool_result=running_tool_result,
+                )
+            )
+            return running_result
 
         abort_task = self._create_task(abort_signal.wait())
         try:
@@ -676,7 +691,7 @@ class AgentLoop:
             for cancel in tuple(self._background_child_cancellers.values()):
                 cancel()
         watchers = tuple(self._background_child_watchers.values())
-        if watchers:
+        if cancel_background and watchers:
             await asyncio.gather(*watchers, return_exceptions=True)
         if cancel_background and self.agent_depth == 0:
             await self._background_owner.wait()

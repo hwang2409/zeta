@@ -56,10 +56,8 @@ async def dispatch_tool_calls(
     """Execute one tool batch and yield its lifecycle and result events."""
 
     completed_tool_indexes: set[int] = set()
-    # Cap advisory output at 128 events; final results stay complete.
-    stream_updates: asyncio.Queue[StreamEvent] = asyncio.Queue(
-        maxsize=128 + len(calls) * 3
-    )
+    # Advisory output is capped below; lifecycle events must never be dropped.
+    stream_updates: asyncio.Queue[StreamEvent] = asyncio.Queue()
 
     def enqueue_tool_update(event: StreamEvent) -> None:
         retained: list[StreamEvent] = []

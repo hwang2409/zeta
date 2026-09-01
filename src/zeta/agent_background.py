@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol
 
-from .core.store import ConversationStore
+from .core.store import ConversationEntry, ConversationStore
 from .types import (
     Message,
     MessageRole,
@@ -21,6 +21,7 @@ from .types import (
 
 class _AgentLoopForRecovery(Protocol):
     store: ConversationStore
+    _background_owner: BackgroundAgentOwner
 
     def _canceled_agent_result(
         self,
@@ -37,7 +38,8 @@ class _AgentLoopForRecovery(Protocol):
 class BackgroundAgentOwner:
     """Own cancellation and watcher state for one complete agent tree."""
 
-    def __init__(self) -> None:
+    def __init__(self, notification_store: ConversationStore) -> None:
+        self.notification_store = notification_store
         self._cancellers: dict[str, Callable[[], None]] = {}
         self._watchers: dict[str, asyncio.Task[Any]] = {}
         self._canceling = False
@@ -112,7 +114,24 @@ def _existing_tool_result(store: ConversationStore, tool_call_id: str) -> bool:
     )
 
 
-def _recover_nested_children(store: ConversationStore) -> None:
+def _agent_notification(
+    store: ConversationStore,
+    notification_id: str,
+) -> ConversationEntry | None:
+    return next(
+        (
+            entry
+            for entry in store.agent_notifications(pending_only=False)
+            if entry.data["child_instance_id"] == notification_id
+        ),
+        None,
+    )
+
+
+def _recover_nested_children(
+    store: ConversationStore,
+    notification_store: ConversationStore,
+) -> None:
     """Cancel descendants left behind when an ancestor session exits."""
 
     for tool_call_id, marker in store.agent_children().items():
@@ -120,23 +139,18 @@ def _recover_nested_children(store: ConversationStore) -> None:
         child_path = Path(marker["child_session_path"])
         child_store = _open_child_store(store, child_path)
         if child_store is not None:
-            _recover_nested_children(child_store)
+            _recover_nested_children(child_store, notification_store)
         existing_result = _existing_tool_result(store, tool_call_id)
         notification_status: str | None = None
         if marker.get("background"):
             child_instance_id = marker.get(
                 "child_instance_id", f"{store.session_id}:{child_path.name}"
             )
-            existing = next(
-                (
-                    entry
-                    for entry in store.agent_notifications(pending_only=False)
-                    if entry.data["child_instance_id"] == child_instance_id
-                ),
-                None,
-            )
+            existing = _agent_notification(notification_store, child_instance_id)
+            if existing is None and notification_store is not store:
+                existing = _agent_notification(store, child_instance_id)
             if existing is None:
-                store.append_agent_notification(
+                notification_store.append_agent_notification(
                     child_instance_id,
                     child_session_path=str(child_path),
                     description=marker["description"],
@@ -146,6 +160,21 @@ def _recover_nested_children(store: ConversationStore) -> None:
                 notification_status = "canceled"
             else:
                 notification_status = existing.data["status"]
+            if (
+                notification_store is not store
+                and _agent_notification(store, child_instance_id) is None
+            ):
+                store.append_agent_notification(
+                    child_instance_id,
+                    child_session_path=str(child_path),
+                    description=marker["description"],
+                    status=notification_status,
+                    text=(
+                        "background child canceled when the parent session exited"
+                        if notification_status == "canceled"
+                        else "background child completed"
+                    ),
+                )
         elif not existing_result:
             store.append_message(
                 Message(
@@ -173,27 +202,39 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
         agents_root = loop.store.session_dir / "agents"
         child_store = _open_child_store(loop.store, child_path)
         if child_store is not None:
-            _recover_nested_children(child_store)
+            _recover_nested_children(
+                child_store,
+                loop._background_owner.notification_store,
+            )
         if marker.get("background"):
             child_instance_id = marker.get(
                 "child_instance_id", f"{loop.store.session_id}:{child_path.name}"
             )
-            notification = next(
-                (
-                    entry
-                    for entry in loop.store.agent_notifications(pending_only=False)
-                    if entry.data["child_instance_id"] == child_instance_id
-                ),
-                None,
+            notification = _agent_notification(
+                loop._background_owner.notification_store,
+                child_instance_id,
             )
+            if (
+                notification is None
+                and loop._background_owner.notification_store is not loop.store
+            ):
+                notification = _agent_notification(loop.store, child_instance_id)
             if notification is None:
-                loop.store.append_agent_notification(
+                loop._background_owner.notification_store.append_agent_notification(
                     child_instance_id,
                     child_session_path=marker["child_session_path"],
                     description=marker["description"],
                     status="canceled",
                     text="background child canceled when the parent session exited",
                 )
+                if loop._background_owner.notification_store is not loop.store:
+                    loop.store.append_agent_notification(
+                        child_instance_id,
+                        child_session_path=marker["child_session_path"],
+                        description=marker["description"],
+                        status="canceled",
+                        text="background child canceled when the parent session exited",
+                    )
                 if child_store is not None:
                     child_store.mark_agent_canceled(tool_call.id)
             elif child_store is not None:
@@ -233,6 +274,7 @@ async def finish_background_child(
     child_task: asyncio.Task[dict[str, object]],
     child_store: ConversationStore,
     parent_store: ConversationStore,
+    notification_store: ConversationStore,
     tool_call: ToolCall,
     child_instance_id: str,
     child_path: str,
@@ -273,13 +315,21 @@ async def finish_background_child(
         child_store.mark_agent_canceled(tool_call.id)
     else:
         child_store.finish_agent_parent()
-    notification = parent_store.append_agent_notification(
+    notification = notification_store.append_agent_notification(
         child_instance_id,
         child_session_path=child_path,
         description=description,
         status=status,
         text=notification_text or "background child completed",
     )
+    if notification_store is not parent_store:
+        parent_store.append_agent_notification(
+            child_instance_id,
+            child_session_path=child_path,
+            description=description,
+            status=status,
+            text=notification_text or "background child completed",
+        )
     parent_store.finish_agent_child(tool_call.id)
     terminal_payload = build_result(
         notification_text or "background child completed",

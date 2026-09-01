@@ -229,6 +229,102 @@ class NestedBackgroundBackend(CompletionBackend):
         )
 
 
+class ForegroundNestedBackgroundBackend(CompletionBackend):
+    def __init__(self) -> None:
+        self.child_nested = False
+        self.grandchild_started = asyncio.Event()
+        self.release_grandchild = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        if last_user == "start":
+            child = _agent_call("child")
+            child.arguments["prompt"] = "child prompt"
+            blocks = [ToolUseContent(child)]
+        elif last_user == "child prompt" and not self.child_nested:
+            self.child_nested = True
+            grandchild = _background_agent_call("grandchild")
+            grandchild.arguments["prompt"] = "grandchild prompt"
+            grandchild.arguments["description"] = "grandchild"
+            blocks = [ToolUseContent(grandchild)]
+        elif last_user == "grandchild prompt":
+            self.grandchild_started.set()
+            await self.release_grandchild.wait()
+            blocks = [TextContent("grandchild complete")]
+        else:
+            blocks = [TextContent("child complete")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+class ParallelNestedReadBackend(CompletionBackend):
+    def __init__(self, count: int) -> None:
+        self.calls = []
+        for index in range(count):
+            call = _agent_call(f"agent-{index}")
+            call.arguments["prompt"] = f"inspect {index}"
+            self.calls.append(call)
+        self.seen_prompts: set[str] = set()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        if last_user == "start":
+            blocks = [ToolUseContent(call) for call in self.calls]
+        elif last_user not in self.seen_prompts:
+            self.seen_prompts.add(last_user)
+            blocks = [
+                ToolUseContent(
+                    ToolCall(
+                        f"{last_user}-read",
+                        "read",
+                        {"path": "missing"},
+                    )
+                )
+            ]
+        else:
+            blocks = [TextContent("child complete")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
 def _background_agent_call(call_id: str = "background-1") -> ToolCall:
     return ToolCall(
         call_id,
@@ -403,6 +499,27 @@ async def test_parent_abort_cancels_background_grandchild(
 
 
 @pytest.mark.asyncio
+async def test_foreground_child_does_not_wait_for_background_grandchild(
+    tmp_path: Path,
+) -> None:
+    backend = ForegroundNestedBackgroundBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    task = asyncio.create_task(_collect(loop.run_turn("start")))
+    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
+    events = await asyncio.wait_for(task, timeout=1)
+
+    assert any(event.type is StreamEventType.TURN_END for event in events)
+    assert store.agent_notifications() == []
+
+    backend.release_grandchild.set()
+    notification = await _wait_for_notification(store, "completed")
+    assert notification.data["text"] == "grandchild complete"
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_background_and_foreground_tools_mix_in_one_turn(
     tmp_path: Path,
 ) -> None:
@@ -540,6 +657,42 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
         "1",
         "2",
     ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_nested_lifecycle_events_survive_large_batch(
+    tmp_path: Path,
+) -> None:
+    backend = ParallelNestedReadBackend(44)
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        agent_turn_budget=100,
+    )
+
+    events = await asyncio.wait_for(_collect(loop.run_turn("start")), timeout=2)
+
+    read_lifecycle = [
+        event
+        for event in events
+        if event.tool_call is not None
+        and event.tool_call.name == "read"
+        and event.type
+        in {
+            StreamEventType.TOOL_EXECUTION_START,
+            StreamEventType.TOOL_EXECUTION_END,
+        }
+    ]
+    assert len(read_lifecycle) == 88
+    errors = [
+        event.error
+        for event in events
+        if event.type is StreamEventType.ERROR and event.error is not None
+    ]
+    assert [error.code for error in errors] == ["max_turns"]
+    await loop.close()
 
 
 @pytest.mark.asyncio
