@@ -1026,7 +1026,7 @@ async def test_resumed_pending_approval_is_presented_and_resolvable(
     app.console = Console(file=StringIO(), force_terminal=False)
     app._present_pending_approvals()
 
-    assert call.id in app.console.file.getvalue()
+    assert call.name in app.console.file.getvalue()  # card shows the tool name
     assert await app._handle_approval_input(f"approve {call.id}")
     assert app.loop.store.pending_approvals() == []
 
@@ -1059,8 +1059,8 @@ async def test_tui_resolves_colliding_child_approvals_by_unique_key(
     await wait_until(lambda: len(app.pending_approvals) == 2)
     app._present_pending_approvals()
     rendered = app.console.file.getvalue()
-    assert "child a: bash [('child-a', 'same-request')]" in rendered
-    assert "child b: bash [('child-b', 'same-request')]" in rendered
+    assert "child a: bash" in rendered
+    assert "child b: bash" in rendered
 
     assert await app._handle_approval_input(
         "approve ('child-a', 'same-request')"

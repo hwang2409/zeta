@@ -73,6 +73,7 @@ from .models import MODEL_CATALOGS, validate_model_name
 from .models import load_model_catalog as _load_model_catalog
 from .render import (
     format_status,
+    render_approval_card,
     render_markdown,
     render_thought,
     render_thought_live,
@@ -397,14 +398,11 @@ class TUIApp(
 
     def _present_pending_approvals(self) -> None:
         for request in self.pending_approvals:
-            arguments = json.dumps(request.tool_call.arguments, sort_keys=True)
-            key = str(request.key)
-            self._print(
-                Text(
-                    f"[approval pending] {request.label or request.tool_call.name} "
-                    f"[{key}]: "
-                    f"{arguments}; type approve {key} or deny {key}",
-                    style="yellow",
+            self._print_unit(
+                render_approval_card(
+                    request.tool_call.name,
+                    request.tool_call.arguments,
+                    label=request.label,
                 )
             )
 
@@ -533,6 +531,11 @@ class TUIApp(
             retry_available=self.retry_available,
             on_undo=self.undo_sent_turn,
             append_history=False,
+            on_approve=self._approve_first_pending,
+            on_deny=self._deny_first_pending,
+            approval_active=self._has_pending_approval,
+            on_scroll_up=self._transcript.scroll_up,
+            on_scroll_down=self._transcript.scroll_down,
         )
         session = FullScreenPromptSession(
             message=[("class:prompt", " > ")],
@@ -604,6 +607,21 @@ class TUIApp(
     def _abort_approval(self, request_id: str | tuple[str, str]) -> None:
         if self._approval_policy is not None:
             self._approval_policy.abort(request_id)
+
+    def _approve_first_pending(self) -> None:
+        """Approve the first pending tool call (keybinding shortcut)."""
+        pending = self.pending_approvals
+        if pending:
+            self._submit_input(f"approve {pending[0].key}")
+
+    def _deny_first_pending(self) -> None:
+        """Deny the first pending tool call (keybinding shortcut)."""
+        pending = self.pending_approvals
+        if pending:
+            self._submit_input(f"deny {pending[0].key}")
+
+    def _has_pending_approval(self) -> bool:
+        return bool(self.pending_approvals)
 
     def _status_toolbar(self) -> FormattedText:
         terminal_width = get_app().output.get_size().columns

@@ -98,6 +98,11 @@ def build_key_bindings(
     retry_available: Callable[[], bool] | None = None,
     on_undo: Callable[[], None] | None = None,
     append_history: bool = True,
+    on_approve: Callable[[], None] | None = None,
+    on_deny: Callable[[], None] | None = None,
+    approval_active: Callable[[], bool] | None = None,
+    on_scroll_up: Callable[[], None] | None = None,
+    on_scroll_down: Callable[[], None] | None = None,
 ) -> KeyBindings:
     """Build the small key map used by the full-screen composer."""
 
@@ -395,5 +400,35 @@ def build_key_bindings(
         def toggle_agent(event: KeyPressEvent) -> None:
             del event
             on_toggle_agent()
+
+    if on_approve is not None and on_deny is not None:
+
+        @Condition
+        def approval_pending() -> bool:
+            return approval_active is not None and approval_active()
+
+        @bindings.add("y", filter=approval_pending, eager=True)
+        def approve(event: KeyPressEvent) -> None:
+            del event
+            on_approve()
+
+        @bindings.add("n", filter=approval_pending, eager=True)
+        def deny(event: KeyPressEvent) -> None:
+            del event
+            on_deny()
+
+    if on_scroll_up is not None:
+
+        @bindings.add(Keys.ScrollUp)
+        def scroll_up(event: KeyPressEvent) -> None:
+            del event
+            on_scroll_up()
+
+    if on_scroll_down is not None:
+
+        @bindings.add(Keys.ScrollDown)
+        def scroll_down(event: KeyPressEvent) -> None:
+            del event
+            on_scroll_down()
 
     return bindings
