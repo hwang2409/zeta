@@ -42,6 +42,7 @@ class BackgroundAgentOwner:
         self.notification_store = notification_store
         self._cancellers: dict[str, Callable[[], None]] = {}
         self._watchers: dict[str, asyncio.Task[Any]] = {}
+        self._parent_stores: dict[str, ConversationStore] = {}
         self._canceling = False
 
     def register(
@@ -49,13 +50,26 @@ class BackgroundAgentOwner:
         instance_id: str,
         cancel: Callable[[], None],
         watcher: asyncio.Task[Any],
+        parent_store: ConversationStore | None = None,
     ) -> None:
         self._cancellers[instance_id] = cancel
         self._watchers[instance_id] = watcher
+        if parent_store is not None:
+            self._parent_stores[instance_id] = parent_store
 
     def unregister(self, instance_id: str) -> None:
         self._cancellers.pop(instance_id, None)
         self._watchers.pop(instance_id, None)
+        self._parent_stores.pop(instance_id, None)
+
+    def adopt(self, instance_id: str, parent_store: ConversationStore) -> None:
+        if instance_id in self._watchers:
+            self._parent_stores[instance_id] = parent_store
+
+    def parent_store(
+        self, instance_id: str, default: ConversationStore
+    ) -> ConversationStore:
+        return self._parent_stores.get(instance_id, default)
 
     def cancel_all(self) -> None:
         if self._canceling:
@@ -74,6 +88,9 @@ class BackgroundAgentOwner:
     async def wait(self) -> None:
         current = asyncio.current_task()
         while True:
+            for instance_id, watcher in tuple(self._watchers.items()):
+                if watcher.done():
+                    self.unregister(instance_id)
             watchers = tuple(
                 watcher
                 for watcher in self._watchers.values()
@@ -85,10 +102,45 @@ class BackgroundAgentOwner:
 
 
 def _open_child_store(store: ConversationStore, path: Path) -> ConversationStore | None:
-    agents_root = store.session_dir / "agents"
-    if path.parent != agents_root or not path.name.isdigit():
+    try:
+        parts = path.relative_to(store.session_dir).parts
+    except ValueError:
         return None
-    return ConversationStore(agents_root, session_id=path.name, cwd=store.cwd)
+    if (
+        len(parts) < 2
+        or len(parts) % 2
+        or any(parts[index] != "agents" for index in range(0, len(parts), 2))
+        or any(not parts[index].isdigit() for index in range(1, len(parts), 2))
+    ):
+        return None
+    return ConversationStore(path.parent, session_id=path.name, cwd=store.cwd)
+
+
+def adopt_agent_children(
+    child_store: ConversationStore,
+    parent_store: ConversationStore,
+    *,
+    background_owner: BackgroundAgentOwner | None = None,
+) -> None:
+    """Move unfinished descendants into the surviving parent session."""
+
+    for tool_call_id, marker in child_store.agent_children().items():
+        tool_call = ToolCall.from_dict(marker["tool_call"])
+        parent_store.register_agent_child(
+            tool_call,
+            child_session_path=marker["child_session_path"],
+            description=marker["description"],
+            agent_type=marker.get("agent_type"),
+            background=marker.get("background", False),
+            child_instance_id=marker.get("child_instance_id"),
+        )
+        turns_used = marker.get("turns_used", 0)
+        if turns_used:
+            parent_store.update_agent_child_turns(tool_call_id, turns_used)
+        child_instance_id = marker.get("child_instance_id")
+        if background_owner is not None and type(child_instance_id) is str:
+            background_owner.adopt(child_instance_id, parent_store)
+        child_store.finish_agent_child(tool_call_id)
 
 
 def _nested_canceled_result(marker: dict[str, object]) -> ToolResult:
@@ -286,63 +338,78 @@ async def finish_background_child(
     cleanup: Callable[[], None],
     close_child: Callable[[], Awaitable[None]],
     error_message: Callable[[BaseException], str],
+    background_owner: BackgroundAgentOwner | None = None,
 ) -> None:
     """Persist a background child result and publish its terminal card event."""
 
     status = "completed"
     notification_text = ""
     try:
-        result = await child_task
-        content = result.get("content")
-        if (
-            isinstance(content, list)
-            and content
-            and isinstance(content[0], dict)
-            and isinstance(content[0].get("text"), str)
-        ):
-            notification_text = content[0]["text"]
-        else:
-            notification_text = "background child returned no text"
-        if result.get("isError") is True:
+        try:
+            result = await child_task
+            content = result.get("content")
+            if (
+                isinstance(content, list)
+                and content
+                and isinstance(content[0], dict)
+                and isinstance(content[0].get("text"), str)
+            ):
+                notification_text = content[0]["text"]
+            else:
+                notification_text = "background child returned no text"
+            if result.get("isError") is True:
+                status = "error"
+        except asyncio.CancelledError:
+            status = "canceled"
+            notification_text = "background child canceled"
+        except Exception as exc:
             status = "error"
-    except asyncio.CancelledError:
-        status = "canceled"
-        notification_text = "background child canceled"
-    except Exception as exc:
-        status = "error"
-        notification_text = f"agent error: {error_message(exc)}"
-    if status == "canceled":
-        child_store.mark_agent_canceled(tool_call.id)
-    else:
-        child_store.finish_agent_parent()
-    notification = notification_store.append_agent_notification(
-        child_instance_id,
-        child_session_path=child_path,
-        description=description,
-        status=status,
-        text=notification_text or "background child completed",
-    )
-    if notification_store is not parent_store:
-        parent_store.append_agent_notification(
+            notification_text = f"agent error: {error_message(exc)}"
+        effective_parent_store = (
+            background_owner.parent_store(child_instance_id, parent_store)
+            if background_owner is not None
+            else parent_store
+        )
+        if status == "canceled":
+            child_store.mark_agent_canceled(tool_call.id)
+        else:
+            adopt_agent_children(
+                child_store,
+                effective_parent_store,
+                background_owner=background_owner,
+            )
+            child_store.finish_agent_parent()
+        notification = notification_store.append_agent_notification(
             child_instance_id,
             child_session_path=child_path,
             description=description,
             status=status,
             text=notification_text or "background child completed",
         )
-    parent_store.finish_agent_child(tool_call.id)
-    terminal_payload = build_result(
-        notification_text or "background child completed",
-        status != "completed",
-        status,
-    )
-    publish_event(
-        StreamEvent(
-            StreamEventType.TOOL_EXECUTION_END,
-            tool_call=tool_call,
-            tool_result=validate_result(terminal_payload, tool_call.id),
-            data={"notification_id": notification.id},
+        if notification_store is not effective_parent_store:
+            effective_parent_store.append_agent_notification(
+                child_instance_id,
+                child_session_path=child_path,
+                description=description,
+                status=status,
+                text=notification_text or "background child completed",
+            )
+        effective_parent_store.finish_agent_child(tool_call.id)
+        terminal_payload = build_result(
+            notification_text or "background child completed",
+            status != "completed",
+            status,
         )
-    )
-    cleanup()
-    await close_child()
+        publish_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=tool_call,
+                tool_result=validate_result(terminal_payload, tool_call.id),
+                data={"notification_id": notification.id},
+            )
+        )
+    finally:
+        try:
+            cleanup()
+        finally:
+            await close_child()

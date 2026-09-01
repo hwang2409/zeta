@@ -9,20 +9,21 @@ from typing import Any, TypeVar
 
 import httpx
 
-from .core.abort import AbortSignal as ToolAbortSignal
-from .agent_budget import (
-    MAX_AGENT_DEPTH,
-    SharedTurnBudget,
-    child_depth as next_agent_depth,
-    consume_turn,
-    configure_budget,
-)
 from .agent_background import (
     BackgroundAgentOwner,
+    adopt_agent_children,
     finish_background_child,
     recover_agent_children,
 )
+from .agent_budget import (
+    MAX_AGENT_DEPTH,
+    SharedTurnBudget,
+    configure_budget,
+    consume_turn,
+)
+from .agent_budget import child_depth as next_agent_depth
 from .agent_runner import consume_child
+from .core.abort import AbortSignal as ToolAbortSignal
 from .core.approval import ApprovalPolicy
 from .core.context import ContextAssembler
 from .core.hooks import HookManager
@@ -608,13 +609,17 @@ class AgentLoop:
                     cleanup=cleanup_background_child,
                     close_child=lambda: child_loop.close(cancel_background=False),
                     error_message=lambda exc: _error_info(exc).message,
+                    background_owner=self._background_owner,
                 )
 
             watcher = self._create_task(finish_background())
             self._background_child_watchers[tool_call.id] = watcher
             self._background_child_cancellers[tool_call.id] = request_background_cancel
             self._background_owner.register(
-                child_instance_id, request_background_cancel, watcher
+                child_instance_id,
+                request_background_cancel,
+                watcher,
+                parent_store=self.store,
             )
             # The tree owner now keeps this task pair alive after this loop closes.
             self._tracked_tasks.discard(child_task)
@@ -1090,6 +1095,11 @@ class AgentLoop:
                     if result.content == "tool execution canceled":
                         child_store.mark_agent_canceled(call.id)
                     else:
+                        adopt_agent_children(
+                            child_store,
+                            self.store,
+                            background_owner=self._background_owner,
+                        )
                         child_store.finish_agent_parent()
                 self.store.finish_agent_child(call.id)
                 self._agent_child_turns.pop(call.id, None)

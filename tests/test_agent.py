@@ -512,11 +512,15 @@ async def test_foreground_child_does_not_wait_for_background_grandchild(
 
     assert any(event.type is StreamEventType.TURN_END for event in events)
     assert store.agent_notifications() == []
+    assert store.agent_children()["grandchild"]["child_session_path"] == str(
+        store.session_dir / "agents" / "1" / "agents" / "1"
+    )
 
     backend.release_grandchild.set()
     notification = await _wait_for_notification(store, "completed")
     assert notification.data["text"] == "grandchild complete"
     await loop.close()
+    assert not store.agent_children()
 
 
 @pytest.mark.asyncio
@@ -632,6 +636,62 @@ def test_resume_keeps_completed_unnotified_background_notification(
     assert ConversationStore(
         store.session_dir / "agents", session_id="1"
     ).agent_canceled() is None
+
+
+def test_resume_cancels_adopted_background_grandchild(tmp_path: Path) -> None:
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(
+        child.session_dir / "agents", session_id="1"
+    )
+    child_call = _background_agent_call("child")
+    child.mark_agent_parent(child_call.id)
+    child.finish_agent_parent()
+    grandchild_call = _background_agent_call("grandchild")
+    grandchild.mark_agent_parent(grandchild_call.id)
+    root.register_agent_child(
+        grandchild_call,
+        child_session_path=str(grandchild.session_dir),
+        description="grandchild",
+        background=True,
+        child_instance_id="root:1:1",
+    )
+
+    resumed = ConversationStore(tmp_path, session_id="root")
+    AgentLoop(FakeBackend([]), resumed)
+
+    notification = resumed.agent_notifications()[0]
+    assert notification.data["status"] == "canceled"
+    assert "session exited" in notification.data["text"]
+    assert not resumed.agent_children()
+    assert ConversationStore(
+        child.session_dir / "agents", session_id="1"
+    ).agent_canceled() == {
+        "tool_call_id": grandchild_call.id,
+        "content": "tool execution canceled",
+    }
+
+
+@pytest.mark.asyncio
+async def test_background_persistence_failure_does_not_block_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call = _background_agent_call()
+    backend = BackgroundBackend([call])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+
+    def fail_notification(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("persistence failed")
+
+    monkeypatch.setattr(store, "append_agent_notification", fail_notification)
+    backend.release_child.set()
+    await asyncio.wait_for(loop.close(), timeout=1)
+
+    assert not loop.background_children_running
 
 
 @pytest.mark.asyncio
