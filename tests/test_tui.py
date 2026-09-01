@@ -47,11 +47,11 @@ from zeta.tools import ToolStreamPublisher
 from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.agent_card import AgentCard
 from zeta.tui.composer import (
-    DraftPersistence,
+    UndoCandidate,
     build_key_bindings,
-    history_for,
     parse_input,
 )
+from zeta.persistence import DraftPersistence, history_for
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
@@ -6164,7 +6164,7 @@ async def test_undo_restores_text_and_aborts_streaming_turn(tmp_path: Path) -> N
     app._active_task = task
     await backend.started.wait()
 
-    app._undo_candidate = "sent message"
+    app._undo_candidate = UndoCandidate("sent message")
     app.undo_sent_turn()
     await asyncio.gather(task, return_exceptions=True)
 
@@ -6191,7 +6191,7 @@ async def test_undo_keeps_a_draft_typed_during_streaming(tmp_path: Path) -> None
     app._active_task = task
     await backend.started.wait()
     session.default_buffer.insert_text("new draft")
-    app._undo_candidate = "sent message"
+    app._undo_candidate = UndoCandidate("sent message")
 
     app.undo_sent_turn()
     await asyncio.gather(task, return_exceptions=True)
@@ -6237,4 +6237,42 @@ async def test_undo_restores_staged_image_for_resubmission(tmp_path: Path) -> No
     ]
     assert isinstance(user_messages[-1].content[1], ImageContent)
     assert user_messages[-1].content[1].data == base64.b64encode(PNG).decode()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_next_image_token_after_deleted_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    pasted = tmp_path / "pasted.png"
+    first.write_bytes(PNG)
+    second.write_bytes(PNG)
+    pasted.write_bytes(PNG)
+    backend = AbortThenSuccessBackend()
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._pending_attachments[:] = [first, second]
+    app._pending_attachment_tokens.update(
+        {"[Image #1]": first, "[Image #2]": second}
+    )
+    app._next_image_token = 3
+
+    await app._handle_prompt_value("inspect [Image #2]")
+    await backend.started.wait()
+    app.undo_sent_turn()
+    await asyncio.gather(app._active_task, return_exceptions=True)
+
+    monkeypatch.setattr("zeta.tui.composer.paste_image", lambda _: pasted)
+    assert app.slash_paste("") == "[Image #3]"
+    assert app._pending_attachment_tokens == {
+        "[Image #2]": second,
+        "[Image #3]": pasted,
+    }
     await app.loop.close()

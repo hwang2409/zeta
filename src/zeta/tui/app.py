@@ -52,12 +52,10 @@ from .background import background_notice
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
-    DraftPersistence,
     TurnConsumerMixin,
     UndoCandidate,
     VimCursorShapeConfig,
     build_key_bindings,
-    history_for,
     parse_input,
     status_formatted_text,
     vim_state_label,
@@ -71,6 +69,7 @@ from .layout import (
 )
 from .models import MODEL_CATALOGS, validate_model_name
 from .models import load_model_catalog as _load_model_catalog
+from ..persistence import DraftPersistence, history_for
 from .render import (
     format_status,
     render_markdown,
@@ -217,7 +216,7 @@ class TUIApp(TurnConsumerMixin, CheckpointTranscriptMixin, ComposerAttachmentMix
             draft_path or self.loop.store.session_dir / "draft"
         )
         self._draft_session: PromptSession[str] | None = None
-        self._undo_candidate: UndoCandidate | str | None = None
+        self._undo_candidate: UndoCandidate | None = None
         self._approval_policy = approval_policy
         self._context_files = tuple(context_files)
         self._on_model_change = on_model_change
