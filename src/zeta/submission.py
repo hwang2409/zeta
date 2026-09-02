@@ -180,10 +180,14 @@ class SubmissionMixin:
                 self._fork_rebuilt = False
             elif slash_output.startswith("[Image #"):
                 self._insert_paste_token(slash_output)
-            else:
+            elif slash_output:
                 self._print_system(slash_output)
             return
         model_input = self._slash_commands.input_for_model(parsed)
+        macro_receipt = getattr(self, "_macro_receipt", None)
+        if macro_receipt is not None:
+            self._macro_receipt = None
+            model_input = f"{macro_receipt}\n\n{model_input}"
         pending_attachments = list(submission.attachment_paths)
         pending_attachment_tokens = dict(submission.attachment_tokens)
         user_message = self._prepare_user_message(

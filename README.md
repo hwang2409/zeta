@@ -35,6 +35,20 @@ references to one resolved path produce one attachment block.
 - `ctrl+x ctrl+o` expands or collapses the newest child card.
 - `ctrl+o` keeps its native prompt-toolkit behavior in the composer.
 
+## exec macro example
+
+Create `~/.zeta/commands/rebuild.md` for a local `/rebuild` macro:
+
+```markdown
+---
+kind: exec
+description: rebuild and relaunch the project
+---
+git pull --ff-only && make build && ./scripts/relaunch.sh
+```
+
+This is an example only. zeta does not install a default macro.
+
 ## Prior art
 
 - [pi](https://github.com/earendil-works/pi) (MIT) — reference for the

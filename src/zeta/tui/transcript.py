@@ -29,6 +29,9 @@ from .theme import RICH_THEME
 from .transcript_search import HighlightCache, SearchMatch, find_matches
 
 
+MAX_TOOL_TAIL_CHARS = 4_096
+
+
 def stream_key(
     event: StreamEvent,
 ) -> tuple[str | None, tuple[str, object] | None]:
@@ -97,6 +100,9 @@ class _ToolUnit:
         text = getattr(rendered, "plain", None)
         if isinstance(text, str):
             self.output.append(text)
+            output = "".join(self.output)
+            if len(output) > MAX_TOOL_TAIL_CHARS:
+                self.output = [output[-MAX_TOOL_TAIL_CHARS:]]
         if not self.finished:
             self.renderable = self.card.update(rendered, event) or render_tool_progress(
                 self.call, "\n".join(self.output)

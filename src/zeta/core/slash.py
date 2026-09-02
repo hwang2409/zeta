@@ -19,13 +19,14 @@ COMMAND_FILE_SIZE_LIMIT = 64 * 1024
 
 @dataclass(frozen=True, slots=True)
 class CustomCommand:
-    """One prompt-template command loaded from a markdown file."""
+    """One prompt or exec command loaded from a markdown file."""
 
     name: str
     description: str
     body: str
     path: Path
     source: str
+    kind: str = "prompt"
 
     def render(self, arguments: str) -> str:
         """Substitute the raw argument tail and positional arguments."""
@@ -95,6 +96,9 @@ def _read_command(path: Path, source: str) -> tuple[CustomCommand | None, str | 
         description = metadata.get("description", "")
         if type(description) is not str:
             raise ValueError("description must be a string")
+        kind = metadata.get("kind", "prompt")
+        if type(kind) is not str or kind not in {"prompt", "exec"}:
+            raise ValueError(f"unknown command kind: {kind!r}")
         if not body:
             raise ValueError("prompt body is empty")
     except (
@@ -105,7 +109,14 @@ def _read_command(path: Path, source: str) -> tuple[CustomCommand | None, str | 
         yaml.YAMLError,
     ) as exc:
         return None, f"ignored custom command {path}: {exc}"
-    return CustomCommand(name, description.strip(), body, path.resolve(), source), None
+    return CustomCommand(
+        name,
+        description.strip(),
+        body,
+        path.resolve(),
+        source,
+        kind,
+    ), None
 
 
 def _split_document(text: str, path: Path) -> tuple[dict[str, object], str]:
@@ -606,6 +617,8 @@ class SlashSession(Protocol):
 
     def slash_fork(self, args: str) -> str: ...
 
+    async def slash_exec_macro(self, command: CustomCommand, args: str) -> str: ...
+
 
 SlashResult = str | Awaitable[str]
 SlashHandler = Callable[[SlashSession, str], SlashResult]
@@ -696,9 +709,12 @@ class SlashCommandRegistry:
         if not parts:
             return None
         command = self._commands.get(parts[0])
-        if command is None:
+        if command is not None:
+            return command.run(session, parts[1] if len(parts) == 2 else "")
+        custom = self._custom_commands.get(parts[0])
+        if custom is None or custom.kind != "exec":
             return None
-        return command.run(session, parts[1] if len(parts) == 2 else "")
+        return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
 
     def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command, returning an awaitable for async commands."""
@@ -744,8 +760,9 @@ class SlashCommandRegistry:
             lines.append("  none")
         for command in self.custom_commands:
             description = f" — {command.description}" if command.description else ""
+            kind = " [exec]" if command.kind == "exec" else ""
             lines.append(
-                f"  /{command.name}{description} (source: {command.path})"
+                f"  /{command.name}{kind}{description} (source: {command.path})"
             )
         return "\n".join(lines)
 

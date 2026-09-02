@@ -12,6 +12,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
+from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.slash import (
     COMMAND_FILE_SIZE_LIMIT,
@@ -387,3 +388,116 @@ async def test_custom_command_becomes_the_model_user_message(
         if message.role.value == "user"
     )
     assert user_message.content[0].text == "Review changes"
+
+
+def test_exec_kind_loads_and_unknown_kind_fails_open(tmp_path: Path) -> None:
+    _write_command(
+        tmp_path / "commands",
+        "rebuild",
+        "---\nkind: exec\n---\nprintf rebuild\n",
+    )
+    _write_command(
+        tmp_path / "commands",
+        "unknown",
+        "---\nkind: mystery\n---\nprintf unknown\n",
+    )
+
+    result = load_custom_commands(home=tmp_path, project_dir=tmp_path / "project")
+
+    assert [command.kind for command in result.commands] == ["exec"]
+    assert any("unknown command kind" in notice for notice in result.notices)
+
+
+async def test_exec_macro_streams_receipt_writes_log_and_skips_provider(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(
+        home / "commands",
+        "rebuild",
+        "---\nkind: exec\n---\nprintf 'arg=%s all=%s\\n' $1 \"$ARGUMENTS\"\nprintf failure >&2\nexit 3\n",
+    )
+    backend = FakeBackend([])
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._handle_prompt_value("/rebuild first second")
+
+    log = next(store.session_dir.glob("macro-*.log"))
+    assert log.read_text(encoding="utf-8") == "arg=first all=first second\nfailure"
+    assert backend.calls == []
+    assert "/rebuild · exit 3" in output.getvalue()
+    assert "failure" not in output.getvalue()
+
+
+async def test_exec_macro_approval_is_ephemeral_and_uses_substituted_script(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(
+        home / "commands",
+        "deploy",
+        "---\nkind: exec\n---\nprintf approved-$1\n",
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        approval_policy=policy,
+        console=Console(file=output, force_terminal=False),
+    )
+
+    task = asyncio.create_task(app._handle_prompt_value("/deploy now"))
+    for _ in range(100):
+        if app.pending_approvals:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("macro approval did not appear")
+    assert "command=printf approved-now" in output.getvalue()
+    assert store.messages() == []
+
+    assert policy.approve(app.pending_approvals[0].key)
+    await task
+    assert store.messages() == []
+
+
+async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "wait", "---\nkind: exec\n---\nsleep 30\n")
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]), ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+        ),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=output, force_terminal=False),
+    )
+
+    task = asyncio.create_task(app._handle_prompt_value("/wait"))
+    for _ in range(100):
+        if app.active:
+            break
+        await asyncio.sleep(0.01)
+    app.abort_active()
+    await asyncio.wait_for(task, timeout=3)
+
+    assert "/wait · canceled" in output.getvalue()
+    log = next(app.loop.store.session_dir.glob("macro-*.log"))
+    assert log.exists()
+    assert "canceled · log " in output.getvalue()

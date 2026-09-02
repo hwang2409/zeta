@@ -24,6 +24,8 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding.vi_state import InputMode
 from rich.text import Text
 
+from ..core.slash import CustomCommand, SlashCommandRegistry
+from ..tools.exec import run_exec_macro
 from ..types import (
     ErrorInfo,
     ImageContent,
@@ -32,9 +34,10 @@ from ..types import (
     StreamEvent,
     StreamEventType,
     TextContent,
+    ToolCall,
+    ToolResult,
     image_signature_matches,
 )
-from ..core.slash import SlashCommandRegistry
 from .key_bindings import (
     FullScreenPromptSession,
     VimCursorShapeConfig,
@@ -708,6 +711,91 @@ class ComposerAttachmentMixin:
                 persist_user_message=persist_user_message,
             )
         )
+
+    async def slash_exec_macro(self, command: CustomCommand, args: str) -> str:
+        """Run one custom shell macro through the normal exec safety path."""
+
+        if self.active:
+            return "macro unavailable while a turn is running"
+        call = ToolCall(
+            f"macro-{uuid4().hex}",
+            "exec",
+            {"command": command.render(args)},
+        )
+        task = asyncio.create_task(self._run_exec_macro(command, call))
+        self._active_task = task
+        self._loop_state = "tool-running"
+        try:
+            await asyncio.shield(task)
+        finally:
+            if self._active_task is task:
+                self._active_task = None
+        return ""
+
+    async def _run_exec_macro(self, command: CustomCommand, call: ToolCall) -> None:
+        log_path = self.loop.store.session_dir / f"macro-{call.id[6:]}.log"
+
+        def lifecycle_sink(kind: str) -> None:
+            event_type = {
+                "approval_start": StreamEventType.TOOL_APPROVAL_START,
+                "approval_end": StreamEventType.TOOL_APPROVAL_END,
+                "execution_start": StreamEventType.TOOL_EXECUTION_START,
+            }.get(kind)
+            if event_type is None:
+                return
+            self._handle_tool_event(
+                StreamEvent(
+                    event_type,
+                    tool_call=call,
+                    data={"macro": command.name},
+                )
+            )
+            if kind == "approval_start":
+                asyncio.get_running_loop().call_soon(self._present_pending_approvals)
+            self._invalidate_prompt()
+
+        def stream_sink(event: StreamEvent) -> None:
+            event.data["macro"] = command.name
+            self._handle_tool_event(event)
+            self._invalidate_prompt()
+
+        canceled = False
+        try:
+            result = await run_exec_macro(
+                self.loop.tool_registry,
+                call,
+                log_path,
+                stream_sink=stream_sink,
+                lifecycle_sink=lifecycle_sink,
+            )
+        except asyncio.CancelledError:
+            result = ToolResult(call.id, "tool execution canceled", True)
+            canceled = True
+        finally:
+            if self._approval_policy is not None:
+                self._approval_policy.forget_ephemeral(call.id)
+        self._handle_tool_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=result,
+                data={"macro": command.name},
+            )
+        )
+        if result.content == "tool execution canceled":
+            status = "canceled"
+        else:
+            exit_code = (
+                result.structured_content.get("exit_code")
+                if result.structured_content is not None
+                else None
+            )
+            status = f"exit {exit_code}" if exit_code is not None else "failed"
+        self._macro_receipt = f"ran /{command.name}, {status}"
+        self._loop_state = "idle"
+        self._streaming = False
+        if canceled:
+            raise asyncio.CancelledError
 
 
 def vim_state_label(vim_mode: bool) -> str | None:

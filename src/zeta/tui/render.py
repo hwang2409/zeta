@@ -111,6 +111,8 @@ def _tool_content(event: StreamEvent) -> str:
 def tool_render_mode(event: StreamEvent) -> ToolRenderMode:
     """Choose the one display mode for completed tool results."""
 
+    if event.data.get("macro"):
+        return "receipt"
     call = event.tool_call
     result = event.tool_result
     if call is None or result is None or call.name.lower() not in RECEIPT_TOOLS:
@@ -307,6 +309,24 @@ def _tool_receipt(event: StreamEvent) -> Text:
     assert call is not None
     result = event.tool_result
     assert result is not None
+    macro = event.data.get("macro")
+    if isinstance(macro, str) and macro:
+        structured = result.structured_content or {}
+        if result.content == "tool execution canceled":
+            status = "canceled"
+        else:
+            exit_code = structured.get("exit_code")
+            status = f"exit {exit_code}" if exit_code is not None else "failed"
+        log_path = structured.get("log_path")
+        suffix = f"/{macro} · {status}"
+        if isinstance(log_path, str) and log_path:
+            suffix += f" · log {log_path}"
+        return Text(
+            f"⏺ {suffix}",
+            style=ERROR if result.is_error else RECEIPT,
+            overflow="ellipsis",
+            no_wrap=True,
+        )
     prefix = "⏺ "
     if result.is_error:
         prefix += "failed · "
@@ -940,6 +960,12 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         agent_render = AgentCard.render_start(event)
         if agent_render is not None:
             return agent_render
+        macro = event.data.get("macro")
+        if isinstance(macro, str) and macro:
+            return Text(
+                f"⏺ /{macro} · running",
+                style=RECEIPT,
+            )
         if event.tool_call.name.lower() in RECEIPT_TOOLS:
             suffix = _receipt_arguments(event.tool_call, "")
             return Text(
