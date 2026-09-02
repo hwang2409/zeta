@@ -6,12 +6,13 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
 logger = logging.getLogger(__name__)
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 class MCPConfigError(ValueError):
@@ -28,18 +29,36 @@ class MCPServerConfig:
     url: str | None = None
     auth_type: Literal["none", "bearer"] = "none"
     auth_token: str | None = None
+    missing_env: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class MCPConfig:
     path: Path
     servers: dict[str, MCPServerConfig] = field(default_factory=dict)
+    skipped_servers: dict[str, MCPServerConfig] = field(default_factory=dict)
+
+    @property
+    def configured_servers(self) -> dict[str, MCPServerConfig]:
+        """Return every valid server declaration, including skipped servers."""
+
+        return {**self.servers, **self.skipped_servers}
 
 
 def default_config_path() -> Path:
     configured_home = os.environ.get("ZETA_HOME")
     home = Path(configured_home).expanduser() if configured_home else Path.home() / ".zeta"
     return home / "mcp.json"
+
+
+def mcp_log_path(name: str) -> Path:
+    """Return the stderr log path used by MCP transports."""
+
+    runtime_root = Path(
+        os.environ.get("WIKI_AGENT_RUNTIME_DIR", Path.home() / ".zeta")
+    ).expanduser()
+    safe_name = _SAFE_NAME.sub("_", name) or "server"
+    return runtime_root / "mcp-logs" / f"{safe_name}.log"
 
 
 def load_mcp_config(path: str | Path | None = None) -> MCPConfig:
@@ -69,6 +88,7 @@ def load_mcp_config(path: str | Path | None = None) -> MCPConfig:
         raise MCPConfigError(f"MCP config servers must be an object: {selected_path}")
 
     servers: dict[str, MCPServerConfig] = {}
+    skipped: dict[str, MCPServerConfig] = {}
     for name, raw_server in raw_servers.items():
         if type(name) is not str or not name:
             raise MCPConfigError(f"MCP server names must be nonempty strings: {selected_path}")
@@ -76,15 +96,21 @@ def load_mcp_config(path: str | Path | None = None) -> MCPConfig:
             resolved, missing = _interpolate(raw_server, set())
         except ValueError as exc:
             raise MCPConfigError(f"invalid MCP server {name!r}: {exc}") from exc
-        if missing:
-            names = ", ".join(sorted(missing))
-            logger.warning("skipping MCP server %s; missing environment variables: %s", name, names)
-            continue
         try:
-            servers[name] = _parse_server(name, resolved)
+            server = _parse_server(name, resolved)
         except ValueError as exc:
             raise MCPConfigError(f"invalid MCP server {name!r} in {selected_path}: {exc}") from exc
-    return MCPConfig(selected_path, servers)
+        if missing:
+            names = tuple(sorted(missing))
+            logger.warning(
+                "skipping MCP server %s; missing environment variables: %s",
+                name,
+                ", ".join(names),
+            )
+            skipped[name] = replace(server, missing_env=names)
+        else:
+            servers[name] = server
+    return MCPConfig(selected_path, servers, skipped)
 
 
 def _interpolate(value: object, missing: set[str]) -> tuple[object, set[str]]:
@@ -164,4 +190,11 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
     )
 
 
-__all__ = ["MCPConfig", "MCPConfigError", "MCPServerConfig", "default_config_path", "load_mcp_config"]
+__all__ = [
+    "MCPConfig",
+    "MCPConfigError",
+    "MCPServerConfig",
+    "default_config_path",
+    "load_mcp_config",
+    "mcp_log_path",
+]

@@ -120,6 +120,9 @@ class SubmissionQueue:
 class SubmissionMixin:
     """Handle composer submissions without sharing mutable text state."""
 
+    async def slash_mcp(self, args: str) -> str:
+        return await self.loop.slash_mcp(args)
+
     def _submit_input(self, value: str) -> None:
         draft_revision = self._draft.mark_submitted()
         paths, tokens, next_image_token = self._capture_pending_attachment_state()

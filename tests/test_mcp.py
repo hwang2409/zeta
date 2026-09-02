@@ -144,6 +144,8 @@ def test_config_interpolates_and_skips_missing(tmp_path: Path, monkeypatch: pyte
     assert config.servers["present"].command == "server"
     assert config.servers["present"].env == {"TOKEN": "secret"}
     assert "missing" not in config.servers
+    assert config.skipped_servers["missing"].missing_env == ("MCP_MISSING",)
+    assert set(config.configured_servers) == {"present", "missing"}
 
 
 def test_config_override_and_malformed_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -354,6 +356,76 @@ async def test_mount_registers_prefixed_tool(tmp_path: Path, monkeypatch: pytest
     result = await registry.execute(ToolCall("call", "fake:echo", {"value": "mounted"}))
     assert result["content"][0]["text"] == "mounted"
     assert registry.schemas[0]["parameters"]["$defs"] == {"value": {"type": "string"}}
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mount_reports_states_and_notices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("MCP_PRESENT", "yes")
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(json.dumps({"servers": {
+        "mounted": {"transport": "stdio", "command": sys.executable, "args": ["-u", "-c", _stdio_source()]},
+        "failed": {"transport": "stdio", "command": "failed"},
+        "missing": {"transport": "stdio", "command": "${MCP_MISSING}"},
+        "timed": {"transport": "stdio", "command": "timed"},
+    }}))
+    monkeypatch.setattr(mount_module, "SERVER_SETUP_TIMEOUT_SECONDS", 0.01)
+    notices: list[str] = []
+
+    def build_client(server_config: MCPServerConfig):
+        return _FakeClient(server_config, fail_connect=server_config.name == "failed")
+
+    original_connect_and_list = mount_module._connect_and_list
+
+    async def connect_and_list(client):
+        if client.config.name == "timed":
+            await asyncio.sleep(1)
+        return await original_connect_and_list(client)
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    config = load_mcp_config(config_path)
+    mount = await mount_mcp_servers(registry, config, notice_sink=notices.append)
+
+    assert mount.statuses["mounted"].state == "mounted"
+    assert mount.statuses["failed"].state == "failed"
+    assert mount.statuses["missing"].state == "skipped-missing-env"
+    assert mount.statuses["timed"].state == "timed-out"
+    assert "missing environment variable(s): MCP_MISSING" in mount.render()
+    assert "stderr:" in mount.render()
+    assert len(notices) == 8
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mount_reconnects_one_server_and_rejects_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts = 0
+
+    def build_client(config: MCPServerConfig):
+        nonlocal attempts
+        attempts += 1
+        return _FakeClient(config, fail_connect=attempts == 1)
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    configs = {
+        "recover": MCPServerConfig("recover", "stdio", sys.executable),
+        "healthy": MCPServerConfig("healthy", "stdio", sys.executable),
+    }
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(registry, MCPConfig(tmp_path / "mcp.json", configs))
+
+    assert mount.statuses["recover"].state == "failed"
+    await mount.reconnect("recover")
+    assert mount.statuses["recover"].state == "mounted"
+    assert "recover:echo" in {schema["name"] for schema in registry.schemas}
+    with pytest.raises(ValueError, match="unknown MCP server: absent"):
+        await mount.reconnect("absent")
     await mount.close()
 
 

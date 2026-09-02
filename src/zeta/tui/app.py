@@ -219,6 +219,7 @@ class TUIApp(
             lambda renderable: self._print(renderable),
         )
         self.loop.set_background_event_sink(self._handle_background_event)
+        self.loop.set_mcp_notice_sink(lambda message: background_notice(self, message))
         self._fork_rebuilt = False
 
     @property

@@ -6,9 +6,7 @@ import asyncio
 import json
 import logging
 import os
-import re
 from collections.abc import Mapping
-from pathlib import Path
 from typing import BinaryIO
 
 from ..core.abort import AbortSignal
@@ -26,10 +24,9 @@ from .client import (
     tools_from_result,
     translate_call_result,
 )
-from .config import MCPServerConfig
+from .config import MCPServerConfig, mcp_log_path
 
 logger = logging.getLogger(__name__)
-_SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 class StdioMCPClient(MCPClient):
@@ -47,10 +44,10 @@ class StdioMCPClient(MCPClient):
     async def connect(self) -> None:
         if self._process is not None:
             return
-        log_root = Path(os.environ.get("WIKI_AGENT_RUNTIME_DIR", Path.home() / ".zeta")).expanduser() / "mcp-logs"
+        log_path = mcp_log_path(self.config.name)
+        log_root = log_path.parent
         log_root.mkdir(parents=True, exist_ok=True)
-        log_name = _SAFE_NAME.sub("_", self.config.name) or "server"
-        log_handle = (log_root / f"{log_name}.log").open("ab")
+        log_handle = log_path.open("ab")
         try:
             child_env = os.environ.copy()
             child_env.update(self.config.env)

@@ -587,10 +587,13 @@ class SlashStatus:
     usage_cost_by_model: tuple[UsageSnapshot, ...] = ()
     compaction_history: tuple[CompactionSummary, ...] = ()
     model_window: int | None = None
+    mcp_summary: str = "mcp: 0 mounted, 0 failed"
 
 
 class SlashSession(Protocol):
     def slash_status(self) -> SlashStatus: ...
+
+    async def slash_mcp(self, args: str) -> str: ...
 
     def slash_model(self, args: str) -> str: ...
 
@@ -796,6 +799,7 @@ def _format_status(status: SlashStatus) -> str:
         f"compaction_marker_count: {status.compaction_marker_count}",
         f"checkpoint_count: {status.checkpoint_count}",
         f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",
+        status.mcp_summary,
         "usage:",
         f"  input_tokens: {status.uncached_input_tokens}",
         f"  output_tokens: {status.output_tokens_this_session}",
@@ -871,6 +875,10 @@ def _run_status(session: SlashSession, args: str) -> str:
     return _format_status(session.slash_status())
 
 
+async def _run_mcp(session: SlashSession, args: str) -> str:
+    return await session.slash_mcp(args.strip())
+
+
 def _run_model(session: SlashSession, args: str) -> str:
     return session.slash_model(args.strip())
 
@@ -909,6 +917,7 @@ def create_slash_registry(
 
     registry = SlashCommandRegistry()
     registry.register(SlashCommand("status", _run_status, "show session status"))
+    registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
     registry.register(SlashCommand("model", _run_model, "show or change the model"))
     registry.register(SlashCommand("vim", _run_vim, "show or change vim mode"))
     registry.register(
