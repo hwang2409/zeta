@@ -5912,7 +5912,7 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
     async def observe_tool_spinner() -> tuple[int, int, str]:
         await tool_started.wait()
         frame_before = app._spinner_frame
-        await asyncio.sleep(0.75)
+        await wait_until(lambda: app._spinner_frame > frame_before)
         frame_after = app._spinner_frame
         toolbar = "".join(value for _, value in app._status_toolbar())
         return frame_before, frame_after, toolbar
@@ -5922,9 +5922,8 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
     )
     await backend.second_started.wait()
     starting_frame = app._spinner_frame
-    await asyncio.sleep(0.06)
     first_provider_frame = app._spinner_frame
-    await asyncio.sleep(0.39)
+    await wait_until(lambda: app._spinner_frame - starting_frame >= 2)
     ending_frame = app._spinner_frame
     backend.release_second.set()
     await turn

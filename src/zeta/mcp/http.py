@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import httpx
 
@@ -13,6 +13,7 @@ from ..core.abort import AbortSignal
 from .client import (
     MCPCanceled,
     MCPClient,
+    MCPError,
     MCPHTTPError,
     MCPProtocolError,
     MCPTool,
@@ -38,6 +39,10 @@ class StreamableHTTPMCPClient(MCPClient):
         self.protocol_version: str | None = None
         self._next_id = 0
         self._closed = False
+        self._failure_sink: Callable[[str], None] | None = None
+
+    def set_failure_sink(self, sink: Callable[[str], None] | None) -> None:
+        self._failure_sink = sink
 
     async def connect(self) -> None:
         if self._closed:
@@ -70,6 +75,10 @@ class StreamableHTTPMCPClient(MCPClient):
             result = await self._request("tools/call", {"name": name, "arguments": dict(arguments)}, abort_signal)
         except MCPCanceled:
             return canceled_result()
+        except MCPError as exc:
+            if self._failure_sink is not None:
+                self._failure_sink(str(exc))
+            return make_error_result(str(exc))
         except Exception as exc:  # noqa: BLE001 - remote failures become tool results
             return make_error_result(str(exc))
         return translate_call_result(result)

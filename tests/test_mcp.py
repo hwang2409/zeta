@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -129,6 +130,35 @@ class _FakeClient:
     async def close(self) -> None:
         if self.fail_close:
             raise RuntimeError("close failed")
+
+
+class _LifecycleClient(_FakeClient):
+    def __init__(self, config: MCPServerConfig) -> None:
+        super().__init__(config)
+        self._failure_sink: Callable[[str], None] | None = None
+        self.closed = False
+
+    def set_failure_sink(self, sink: Callable[[str], None] | None) -> None:
+        self._failure_sink = sink
+
+    def fail_transport(self, reason: str) -> None:
+        assert self._failure_sink is not None
+        self._failure_sink(reason)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _ApplicationErrorClient(_LifecycleClient):
+    async def call_tool(
+        self, name: str, arguments: dict[str, object], abort_signal: AbortSignal
+    ):
+        del name, arguments, abort_signal
+        return {
+            "content": [{"type": "text", "text": "application error"}],
+            "isError": True,
+            "structuredContent": None,
+        }
 
 
 def test_config_interpolates_and_skips_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -468,6 +498,126 @@ async def test_stdio_exit_updates_mount_status(
     assert mount.statuses["dead"].state == "failed"
     assert "dead:echo" not in {schema["name"] for schema in registry.schemas}
     await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mount_arms_failure_handler_during_sibling_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sibling_started = asyncio.Event()
+    release_sibling = asyncio.Event()
+    clients: dict[str, _LifecycleClient] = {}
+
+    def build_client(config: MCPServerConfig) -> _LifecycleClient:
+        client = _LifecycleClient(config)
+        clients[config.name] = client
+        return client
+
+    async def connect_and_list(client: _LifecycleClient) -> list[MCPTool]:
+        if client.config.name == "sibling":
+            sibling_started.set()
+            await release_sibling.wait()
+        else:
+            await sibling_started.wait()
+            client.fail_transport("early exit")
+        return [MCPTool("echo", "", {"type": "object"})]
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
+    configs = {
+        "early": MCPServerConfig("early", "stdio", "unused"),
+        "sibling": MCPServerConfig("sibling", "stdio", "unused"),
+    }
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    task = asyncio.create_task(
+        mount_mcp_servers(registry, MCPConfig(tmp_path / "mcp.json", configs))
+    )
+    await sibling_started.wait()
+    release_sibling.set()
+    mount = await task
+
+    assert mount.statuses["early"].state == "failed"
+    assert "early:echo" not in {schema["name"] for schema in registry.schemas}
+    assert "sibling:echo" in {schema["name"] for schema in registry.schemas}
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mount_cancellation_closes_clients_created_during_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = asyncio.Event()
+    never = asyncio.Event()
+    clients: list[_LifecycleClient] = []
+
+    def build_client(config: MCPServerConfig) -> _LifecycleClient:
+        client = _LifecycleClient(config)
+        clients.append(client)
+        return client
+
+    async def connect_and_list(client: _LifecycleClient) -> list[MCPTool]:
+        started.set()
+        await never.wait()
+        return [MCPTool("echo", "", {"type": "object"})]
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
+    config = MCPConfig(
+        tmp_path / "mcp.json",
+        {"blocked": MCPServerConfig("blocked", "stdio", "unused")},
+    )
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    task = asyncio.create_task(mount_mcp_servers(registry, config))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert clients and all(client.closed for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_mcp_application_error_keeps_server_mounted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    client = _ApplicationErrorClient(
+        MCPServerConfig("app", "stdio", "unused")
+    )
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"app": client.config}),
+    )
+    result = await registry.execute(ToolCall("call", "app:echo", {}))
+
+    assert result["isError"] is True
+    assert mount.statuses["app"].state == "mounted"
+    assert "app:echo" in {schema["name"] for schema in registry.schemas}
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_failure_refreshes_agent_loop_tool_schemas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _LifecycleClient(MCPServerConfig("dead", "stdio", "unused"))
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(json.dumps({"servers": {"dead": {"transport": "stdio", "command": "unused"}}}))
+    monkeypatch.setenv("ZETA_MCP_CONFIG", str(config_path))
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path),
+        tool_schemas=[{"name": "dead:echo", "description": "", "parameters": {}}],
+    )
+
+    await loop.ensure_mcp_servers()
+    assert "dead:echo" in {schema["name"] for schema in loop.tool_schemas}
+    client.fail_transport("transport dropped")
+
+    assert "dead:echo" not in {schema["name"] for schema in loop.tool_schemas}
+    await loop.close()
 
 
 @pytest.mark.asyncio

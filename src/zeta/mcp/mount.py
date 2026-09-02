@@ -11,7 +11,7 @@ from typing import Literal
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..types import StructuredToolResult
-from .client import MCPClient, MCPTool
+from .client import MCPClient, MCPError, MCPTool
 from .config import (
     MCPConfig,
     MCPConfigError,
@@ -59,6 +59,7 @@ class MCPMount:
     statuses: dict[str, MCPServerStatus]
     _clients: dict[str, MCPClient] = field(default_factory=dict)
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    _schema_refresh: Callable[[MCPMount], None] | None = None
     _closed: bool = False
 
     def __init__(
@@ -68,6 +69,7 @@ class MCPMount:
         statuses: dict[str, MCPServerStatus] | None = None,
         _clients: dict[str, MCPClient] | None = None,
         _locks: dict[str, asyncio.Lock] | None = None,
+        _schema_refresh: Callable[[MCPMount], None] | None = None,
         _closed: bool = False,
     ) -> None:
         if isinstance(registry, ToolRegistry):
@@ -86,6 +88,7 @@ class MCPMount:
         self._locks = _locks or {
             name: asyncio.Lock() for name in server_configs
         }
+        self._schema_refresh = _schema_refresh
         self._closed = _closed
 
     @property
@@ -129,22 +132,18 @@ class MCPMount:
         async with lock:
             if self._closed:
                 raise ValueError("MCP mount is closed")
-            self._unregister_tools(name)
-            client = self._clients.pop(name, None)
+            client = self._clients.get(name)
+            self._transition(name, client=client)
             if client is not None:
                 await _close_failed_client(client)
-            setup = await _setup_server(self.configs[name], notice_sink=notice_sink)
-            self.statuses[name] = setup.public
-            if setup.client is not None:
-                self._clients[name] = setup.client
-                self._attach_failure_handler(name, setup.client)
-                for tool in setup.tools:
-                    _register_tool(
-                        self.registry,
-                        setup.client,
-                        tool,
-                        mount=self,
-                    )
+            setup = await _setup_server(
+                self.configs[name],
+                notice_sink=notice_sink,
+                client_ready=lambda replacement: self._arm_client(
+                    name, replacement
+                ),
+            )
+            self._finish_setup(setup)
             return setup.public
 
     async def close(self) -> None:
@@ -154,10 +153,85 @@ class MCPMount:
         for name in tuple(set(self.configs) | set(self._clients)):
             lock = self._locks.setdefault(name, asyncio.Lock())
             async with lock:
-                self._unregister_tools(name)
-                client = self._clients.pop(name, None)
+                client = self._clients.get(name)
+                self._transition(name, client=client, allow_closed=True)
                 if client is not None:
                     await _close_failed_client(client)
+
+    def set_schema_refresh(self, callback: Callable[[MCPMount], None]) -> None:
+        """Bind the owner of provider tool schemas after initial setup."""
+
+        self._schema_refresh = callback
+        callback(self)
+
+    def _arm_client(self, name: str, client: MCPClient) -> None:
+        self._clients[name] = client
+        self._attach_failure_handler(name, client)
+
+    def _finish_setup(self, setup: _SetupResult) -> None:
+        client = setup.client
+        accepted = self._transition(
+            setup.public.name,
+            client=client,
+            state=setup.public.state,
+            reason=setup.public.reason,
+            tools=setup.tools,
+        )
+        if not accepted and client is not None:
+            asyncio.create_task(_close_failed_client(client))
+
+    def _transition(
+        self,
+        name: str,
+        *,
+        client: MCPClient | None,
+        state: MCPServerState | None = None,
+        reason: str | None = None,
+        tools: tuple[MCPTool, ...] = (),
+        allow_closed: bool = False,
+    ) -> bool:
+        """Apply one server state and keep registry and schemas in sync."""
+
+        if self._closed and not allow_closed:
+            return False
+        current = self._clients.get(name)
+        if client is not None and current is not None and current is not client:
+            return False
+        if state == "mounted":
+            if client is None or current is not client:
+                return False
+            self.statuses[name] = replace(
+                self.statuses.get(name)
+                or MCPServerStatus(
+                    name,
+                    self.configs[name].transport,
+                    "mounted",
+                ),
+                state="mounted",
+                tool_count=len(tools),
+                reason=None,
+            )
+            for tool in tools:
+                _register_tool(self.registry, client, tool, mount=self)
+        else:
+            self._unregister_tools(name)
+            if current is client:
+                self._clients.pop(name, None)
+            if state is not None:
+                previous = self.statuses.get(name) or MCPServerStatus(
+                    name,
+                    self.configs[name].transport,
+                    state,
+                )
+                self.statuses[name] = replace(
+                    previous,
+                    state=state,
+                    tool_count=0,
+                    reason=reason,
+                )
+        if self._schema_refresh is not None:
+            self._schema_refresh(self)
+        return True
 
     def _unregister_tools(self, server_name: str) -> None:
         prefix = f"{server_name}:"
@@ -173,17 +247,8 @@ class MCPMount:
             set_failure_sink(lambda reason: self._mark_failed(name, client, reason))
 
     def _mark_failed(self, name: str, client: MCPClient, reason: str) -> None:
-        if self._closed or self._clients.get(name) is not client:
-            return
-        self._unregister_tools(name)
-        status = self.statuses.get(name)
-        if status is not None:
-            self.statuses[name] = replace(
-                status,
-                state="failed",
-                tool_count=0,
-                reason=reason,
-            )
+        if self._transition(name, client=client, state="failed", reason=reason):
+            asyncio.create_task(_close_failed_client(client))
 
 
 async def mount_mcp_servers(
@@ -202,30 +267,30 @@ async def mount_mcp_servers(
             return MCPMount(registry, {}, {})
 
     configs = config.configured_servers
-    results = await asyncio.gather(
-        *(
-            _setup_server(server_config, notice_sink=notice_sink)
-            for server_config in configs.values()
-        )
-    )
     mount = MCPMount(
         registry,
         configs,
         {},
         _locks={name: asyncio.Lock() for name in configs},
     )
-    for setup in results:
-        mount.statuses[setup.public.name] = setup.public
-        if setup.client is not None:
-            mount._clients[setup.public.name] = setup.client
-            mount._attach_failure_handler(setup.public.name, setup.client)
-            for tool in setup.tools:
-                _register_tool(
-                    registry,
-                    setup.client,
-                    tool,
-                    mount=mount,
+    try:
+        results = await asyncio.gather(
+            *(
+                _setup_server(
+                    server_config,
+                    notice_sink=notice_sink,
+                    client_ready=lambda client, name=server_config.name: mount._arm_client(
+                        name, client
+                    ),
                 )
+                for server_config in configs.values()
+            )
+        )
+    except BaseException:
+        await mount.close()
+        raise
+    for setup in results:
+        mount._finish_setup(setup)
     return mount
 
 
@@ -233,6 +298,7 @@ async def _setup_server(
     server_config: MCPServerConfig,
     *,
     notice_sink: NoticeSink | None = None,
+    client_ready: Callable[[MCPClient], None] | None = None,
 ) -> _SetupResult:
     if server_config.missing_env:
         variables = ", ".join(server_config.missing_env)
@@ -253,6 +319,8 @@ async def _setup_server(
     client: MCPClient | None = None
     try:
         client = _build_client(server_config)
+        if client_ready is not None:
+            client_ready(client)
         tools = await asyncio.wait_for(
             _connect_and_list(client), timeout=SERVER_SETUP_TIMEOUT_SECONDS
         )
@@ -271,7 +339,7 @@ async def _setup_server(
             stderr_log_path=str(mcp_log_path(server_config.name)),
         )
         _notice(notice_sink, f"mcp · {server_config.name} timed-out ({reason})")
-        return _SetupResult(public)
+        return _SetupResult(public, client)
     except Exception as exc:  # noqa: BLE001 - isolate one bad server
         reason = _error_text(exc)
         logger.warning("failed to mount MCP server %s: %s", server_config.name, reason)
@@ -285,7 +353,11 @@ async def _setup_server(
             stderr_log_path=str(mcp_log_path(server_config.name)),
         )
         _notice(notice_sink, f"mcp · {server_config.name} failed: {reason}")
-        return _SetupResult(public)
+        return _SetupResult(public, client)
+    except BaseException:
+        if client is not None:
+            await _close_failed_client(client)
+        raise
     public = MCPServerStatus(
         server_config.name,
         server_config.transport,
@@ -320,19 +392,6 @@ async def _connect_and_list(client: MCPClient) -> list[MCPTool]:
     return await client.list_tools()
 
 
-def _call_error_text(result: StructuredToolResult) -> str:
-    content = result.get("content")
-    if type(content) is list:
-        text = " ".join(
-            block["text"]
-            for block in content
-            if type(block) is dict and type(block.get("text")) is str
-        ).strip()
-        if text:
-            return text
-    return "MCP tool call failed"
-
-
 async def _close_failed_client(client: MCPClient) -> None:
     try:
         await client.close()
@@ -354,11 +413,9 @@ def _register_tool(
     ) -> StructuredToolResult:
         try:
             result = await client.call_tool(tool.name, arguments, abort_signal)
-        except Exception as exc:
+        except MCPError as exc:
             mount._mark_failed(client.config.name, client, _error_text(exc))
             raise
-        if result.get("isError") is True:
-            mount._mark_failed(client.config.name, client, _call_error_text(result))
         return result
 
     try:

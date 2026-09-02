@@ -48,6 +48,10 @@ class StdioMCPClient(MCPClient):
 
         self._failure_sink = sink
 
+    def _report_failure(self, error: BaseException) -> None:
+        if self._failure_sink is not None and not self._suppress_failure:
+            self._failure_sink(_error_text(error))
+
     async def connect(self) -> None:
         if self._process is not None:
             return
@@ -100,6 +104,9 @@ class StdioMCPClient(MCPClient):
             result = await self._request("tools/call", {"name": name, "arguments": dict(arguments)}, abort_signal)
         except MCPCanceled:
             return canceled_result()
+        except MCPError as exc:
+            self._report_failure(exc)
+            return make_error_result(str(exc))
         except Exception as exc:  # noqa: BLE001 - remote failures become tool results
             return make_error_result(str(exc))
         return translate_call_result(result)
@@ -255,3 +262,10 @@ class StdioMCPClient(MCPClient):
 
 
 __all__ = ["StdioMCPClient"]
+
+
+def _error_text(error: BaseException) -> str:
+    try:
+        return str(error).strip() or type(error).__name__
+    except Exception:
+        return type(error).__name__

@@ -576,13 +576,14 @@ class AgentLoop:
                 self.tool_registry,
                 notice_sink=self._mcp_notice_sink,
             )
-        self._refresh_mcp_tool_schemas()
+        self._mcp_mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
         self._mcp_mount_attempted = True
 
-    def _refresh_mcp_tool_schemas(self) -> None:
-        if self._mcp_mount is None:
+    def _refresh_mcp_tool_schemas(self, mount: MCPMount | None = None) -> None:
+        mount = mount or self._mcp_mount
+        if mount is None:
             return
-        mcp_prefixes = tuple(f"{name}:" for name in self._mcp_mount.configs)
+        mcp_prefixes = tuple(f"{name}:" for name in mount.configs)
         current_mcp = [
             schema
             for schema in self.tool_registry.schemas
