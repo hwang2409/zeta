@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import re
+import shlex
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -27,6 +29,7 @@ class CustomCommand:
     path: Path
     source: str
     kind: str = "prompt"
+    timeout: float = 300.0
 
     def render(self, arguments: str) -> str:
         """Substitute the raw argument tail and positional arguments."""
@@ -41,6 +44,20 @@ class CustomCommand:
             return values[index - 1] if index <= len(values) else ""
 
         return re.sub(r"\$(ARGUMENTS|[1-9])(?!\d)", replace, self.body)
+
+    def render_exec(self, arguments: str) -> str:
+        """Build a shell invocation with arguments kept outside the script."""
+
+        argv = arguments.split()
+        return " ".join(
+            (
+                f"ARGUMENTS={shlex.quote(arguments)}",
+                "sh -c",
+                shlex.quote(self.body),
+                "zeta-macro",
+                *(shlex.quote(value) for value in argv),
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +116,18 @@ def _read_command(path: Path, source: str) -> tuple[CustomCommand | None, str | 
         kind = metadata.get("kind", "prompt")
         if type(kind) is not str or kind not in {"prompt", "exec"}:
             raise ValueError(f"unknown command kind: {kind!r}")
+        timeout = metadata.get("timeout", 300.0)
+        try:
+            timeout_value = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            timeout_value = 0.0
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout_value)
+            or timeout_value <= 0
+        ):
+            raise ValueError("timeout must be a positive finite number")
         if not body:
             raise ValueError("prompt body is empty")
     except (
@@ -116,6 +145,7 @@ def _read_command(path: Path, source: str) -> tuple[CustomCommand | None, str | 
         path.resolve(),
         source,
         kind,
+        timeout_value,
     ), None
 
 

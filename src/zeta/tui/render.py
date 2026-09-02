@@ -286,10 +286,15 @@ def render_approval_card(
     )
     if key is not None:
         header.append(f"  [{key}]", style=DIM)
-    arg_line = _arguments(arguments)
     body_parts: list[RenderableType] = [header]
-    if arg_line:
-        body_parts.append(Text(arg_line, style=DIM, overflow="ellipsis", no_wrap=True))
+    command = arguments.get("display_command") or _command(arguments)
+    command = str(command) if command is not None else None
+    if command is not None:
+        body_parts.append(Text(f"command={command}", style=DIM, overflow="fold"))
+    else:
+        arg_line = _arguments(arguments)
+        if arg_line:
+            body_parts.append(Text(arg_line, style=DIM, overflow="ellipsis", no_wrap=True))
     if shortcut:
         affordance = "y approve · n deny"
     else:
@@ -314,6 +319,8 @@ def _tool_receipt(event: StreamEvent) -> Text:
         structured = result.structured_content or {}
         if result.content == "tool execution canceled":
             status = "canceled"
+        elif structured.get("timed_out") is True:
+            status = "timeout"
         else:
             exit_code = structured.get("exit_code")
             status = f"exit {exit_code}" if exit_code is not None else "failed"

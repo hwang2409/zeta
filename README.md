@@ -43,11 +43,19 @@ Create `~/.zeta/commands/rebuild.md` for a local `/rebuild` macro:
 ---
 kind: exec
 description: rebuild and relaunch the project
+timeout: 300
 ---
 git pull --ff-only && make build && ./scripts/relaunch.sh
 ```
 
 This is an example only. zeta does not install a default macro.
+
+Exec macro arguments use shell positional parameters. `$1` through `$9` and
+`"$@"` receive the whitespace-split arguments. `$ARGUMENTS` receives the raw
+argument tail. Arguments are passed as argv values, so quotes, shell
+metacharacters, dollar signs, and newlines are not evaluated as shell code.
+Use `${10}` for the tenth argument; `$10` means `$1` followed by `0` in POSIX
+shells. The timeout defaults to 300 seconds and can be set in frontmatter.
 
 ## Prior art
 

@@ -74,17 +74,21 @@ async def _drain_stream(
     if stream is None:
         return
     read = getattr(stream, "read")  # noqa: B009 - process pipe interface
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     while True:
         chunk = await read(65_536)
         if not chunk:
             capture.finish()
+            text = decoder.decode(b"", final=True)
+            if stream_publisher is not None and text:
+                stream_publisher.publish(text, stream_name)
             return
         capture.append(chunk)
         if log_handle is not None:
             log_handle.write(chunk)
             log_handle.flush()
         if stream_publisher is not None:
-            text = chunk.decode(errors="replace")
+            text = decoder.decode(chunk, final=False)
             if text:
                 stream_publisher.publish(text, stream_name)
 
@@ -227,6 +231,7 @@ async def _exec(
             ],
             "isError": True,
             "structuredContent": {
+                "timed_out": True,
                 "exit_code": process.returncode,
                 "cwd": str(registry.cwd),
                 **({"log_path": str(log_path)} if log_path is not None else {}),
@@ -254,14 +259,17 @@ async def run_exec_macro(
     *,
     stream_sink: Callable[[StreamEvent], None],
     lifecycle_sink: Callable[[str], None],
+    abort_signal: AbortSignal | None = None,
 ) -> ToolResult:
     """Run an approved macro without persisting tool conversation entries."""
 
     Path(log_path).touch()
-    registry.start_batch()
+    scope_signal = abort_signal or registry.abort_signal.registry.new_generation()
     try:
         raw_result = await registry.execute(
             call,
+            abort_signal=scope_signal,
+            _scope_signal=scope_signal,
             _stream_sink=stream_sink,
             _lifecycle_sink=lifecycle_sink,
             _persist_approval=False,
@@ -278,7 +286,7 @@ async def run_exec_macro(
             structured_content=structured,
         )
     except asyncio.CancelledError:
-        registry.abort()
+        scope_signal.abort()
         return ToolResult(
             call.id,
             "tool execution canceled",
@@ -299,6 +307,7 @@ def register(registry: ToolRegistry) -> None:
             "type": "object",
             "properties": {
                 "command": {"type": "string", "minLength": 1},
+                "display_command": {"type": "string", "minLength": 1},
                 "timeout": {"type": "number", "exclusiveMinimum": 0},
                 "max_output": {"type": "integer", "minimum": 1},
             },

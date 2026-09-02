@@ -16,18 +16,21 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.slash import (
     COMMAND_FILE_SIZE_LIMIT,
+    CustomCommand,
     create_slash_registry,
     load_custom_commands,
 )
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
+from zeta.tools import ToolRegistry
+from zeta.tools.exec import run_exec_macro
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import (
     FullScreenPromptSession,
     SlashCompleter,
     build_key_bindings,
 )
-from zeta.types import TextContent
+from zeta.types import TextContent, ToolCall
 
 
 def _write_command(directory: Path, name: str, content: str) -> None:
@@ -408,6 +411,22 @@ def test_exec_kind_loads_and_unknown_kind_fails_open(tmp_path: Path) -> None:
     assert any("unknown command kind" in notice for notice in result.notices)
 
 
+def test_exec_macro_timeout_defaults_and_reads_frontmatter(tmp_path: Path) -> None:
+    _write_command(tmp_path / "commands", "default", "---\nkind: exec\n---\necho default")
+    _write_command(
+        tmp_path / "commands",
+        "custom",
+        "---\nkind: exec\ntimeout: 12.5\n---\necho custom",
+    )
+
+    result = load_custom_commands(home=tmp_path, project_dir=tmp_path / "project")
+
+    assert [(command.name, command.timeout) for command in result.commands] == [
+        ("custom", 12.5),
+        ("default", 300.0),
+    ]
+
+
 async def test_exec_macro_streams_receipt_writes_log_and_skips_provider(
     tmp_path: Path,
 ) -> None:
@@ -501,3 +520,152 @@ async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
     log = next(app.loop.store.session_dir.glob("macro-*.log"))
     assert log.exists()
     assert "canceled · log " in output.getvalue()
+
+
+async def test_exec_macro_passes_special_arguments_as_shell_argv(tmp_path: Path) -> None:
+    command = CustomCommand(
+        "args",
+        "",
+        "printf 'one=<%s>\\n' \"$1\"; printf 'all=<%s>\\n' \"$@\"; "
+        "printf 'raw=<%s>\\n' \"$ARGUMENTS\"; "
+        "printf 'ten=<%s> ten0=<%s>\\n' \"${10}\" \"$10\"",
+        tmp_path / "args.md",
+        "home",
+        "exec",
+    )
+    registry = ToolRegistry(tmp_path)
+    call = ToolCall(
+        "macro-args",
+        "exec",
+        {
+            "command": command.render_exec("one; '$HOME'\nline two"),
+            "timeout": command.timeout,
+        },
+    )
+
+    result = await run_exec_macro(
+        registry,
+        call,
+        tmp_path / "args.log",
+        stream_sink=lambda _event: None,
+        lifecycle_sink=lambda _kind: None,
+    )
+
+    assert result.is_error is False
+    assert "one=<one;>" in result.content
+    assert "all=<'$HOME'>" in result.content
+    assert "raw=<one; '$HOME'\nline two>" in result.content
+    assert "ten=<> ten0=<one;0>" in result.content
+
+
+async def test_macro_input_loop_keeps_processing_approval_input(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "deploy", "---\nkind: exec\n---\nsleep 0.1")
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._input_loop_active = True
+
+    await app._handle_prompt_value("/deploy")
+
+    assert app.active
+    for _ in range(100):
+        if app.pending_approvals:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("macro approval did not appear")
+    key = app.pending_approvals[0].key
+    await app._handle_prompt_value(f"approve {key}")
+    await asyncio.wait_for(app._active_task, timeout=2)
+
+
+async def test_macro_receipts_queue_until_the_next_provider_turn(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "first", "---\nkind: exec\n---\nprintf first")
+    _write_command(home / "commands", "second", "---\nkind: exec\n---\nprintf second")
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    await app._handle_prompt_value("/first")
+    await app._handle_prompt_value("/second")
+    await app._handle_prompt_value("continue")
+    await asyncio.wait_for(app._active_task, timeout=2)
+
+    user_message = next(message for message in backend.calls[0][0] if message.role.value == "user")
+    assert user_message.content[0].text.startswith(
+        "ran /first, exit 0\nran /second, exit 0\n\ncontinue"
+    )
+
+
+async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "wait", "---\nkind: exec\n---\nsleep 30")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions", cwd=tmp_path)),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    canceled = asyncio.Event()
+
+    async def background() -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            canceled.set()
+            raise
+
+    watcher = asyncio.create_task(background())
+    app.loop._background_owner.register("background", watcher.cancel, watcher)
+    macro_task = asyncio.create_task(app._handle_prompt_value("/wait"))
+    for _ in range(100):
+        if app.active:
+            break
+        await asyncio.sleep(0.01)
+
+    app.abort_active()
+    await asyncio.wait_for(macro_task, timeout=3)
+    assert not canceled.is_set()
+    watcher.cancel()
+    await asyncio.gather(watcher, return_exceptions=True)
+    app.loop._background_owner.unregister("background")
+
+
+async def test_exec_macro_timeout_has_a_distinct_receipt_status(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_command(
+        home / "commands",
+        "short",
+        "---\nkind: exec\ntimeout: 0.02\n---\nsleep 1",
+    )
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]), ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+        ),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._handle_prompt_value("/short")
+
+    assert "/short · timeout" in output.getvalue()
+    assert "/short · exit" not in output.getvalue()

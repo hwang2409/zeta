@@ -419,6 +419,28 @@ end run
 class ComposerAttachmentMixin:
     """Attachment behavior shared by the TUI composition root."""
 
+    def abort_active(self) -> None:
+        if self._active_task is not None and not self._active_task.done():
+            macro_running = self._macro_abort_signal is not None
+            if macro_running:
+                self._abort_macro()
+            else:
+                self.loop.abort()
+                for request in self.pending_approvals:
+                    self._abort_approval(request.key)
+                    self.loop.finalize_canceled(request.request_id)
+            if macro_running or (
+                self._loop_state == "tool-running" and not self._resuming_tool
+            ):
+                self._abort_requested = True
+            else:
+                self._active_task.cancel()
+            self._loop_state = "interrupted"
+            self._invalidate_prompt()
+        elif self.loop.background_children_running:
+            self.loop.abort()
+            self._invalidate_prompt()
+
     def _restore_draft_state(self, draft: Any) -> None:
         self._pending_attachment_tokens = {
             token: path.resolve() for token, path in draft.attachment_tokens
@@ -720,17 +742,34 @@ class ComposerAttachmentMixin:
         call = ToolCall(
             f"macro-{uuid4().hex}",
             "exec",
-            {"command": command.render(args)},
+            {
+                "command": command.render_exec(args),
+                "display_command": command.render(args),
+                "timeout": command.timeout,
+            },
         )
+        abort_signal = self.loop.tool_registry.abort_signal.registry.new_generation()
+        self._macro_abort_signal = abort_signal
+        self._macro_call_id = call.id
         task = asyncio.create_task(self._run_exec_macro(command, call))
         self._active_task = task
         self._loop_state = "tool-running"
-        try:
-            await asyncio.shield(task)
-        finally:
-            if self._active_task is task:
-                self._active_task = None
+        if not self._input_loop_active:
+            try:
+                await asyncio.shield(task)
+            finally:
+                if self._active_task is task:
+                    self._active_task = None
         return ""
+
+    def _abort_macro(self) -> None:
+        signal = self._macro_abort_signal
+        if signal is None:
+            return
+        signal.abort()
+        for request in self.pending_approvals:
+            if request.tool_call.id == self._macro_call_id:
+                self._abort_approval(request.key)
 
     async def _run_exec_macro(self, command: CustomCommand, call: ToolCall) -> None:
         log_path = self.loop.store.session_dir / f"macro-{call.id[6:]}.log"
@@ -767,6 +806,7 @@ class ComposerAttachmentMixin:
                 log_path,
                 stream_sink=stream_sink,
                 lifecycle_sink=lifecycle_sink,
+                abort_signal=self._macro_abort_signal,
             )
         except asyncio.CancelledError:
             result = ToolResult(call.id, "tool execution canceled", True)
@@ -784,6 +824,8 @@ class ComposerAttachmentMixin:
         )
         if result.content == "tool execution canceled":
             status = "canceled"
+        elif (result.structured_content or {}).get("timed_out") is True:
+            status = "timeout"
         else:
             exit_code = (
                 result.structured_content.get("exit_code")
@@ -791,7 +833,10 @@ class ComposerAttachmentMixin:
                 else None
             )
             status = f"exit {exit_code}" if exit_code is not None else "failed"
-        self._macro_receipt = f"ran /{command.name}, {status}"
+        self._macro_receipts.append(f"ran /{command.name}, {status}")
+        if self._macro_call_id == call.id:
+            self._macro_abort_signal = None
+            self._macro_call_id = None
         self._loop_state = "idle"
         self._streaming = False
         if canceled:
