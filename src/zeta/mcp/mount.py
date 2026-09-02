@@ -136,13 +136,22 @@ class MCPMount:
             self._transition(name, client=client)
             if client is not None:
                 await _close_failed_client(client)
-            setup = await _setup_server(
-                self.configs[name],
-                notice_sink=notice_sink,
-                client_ready=lambda replacement: self._arm_client(
-                    name, replacement
-                ),
-            )
+            try:
+                setup = await _setup_server(
+                    self.configs[name],
+                    notice_sink=notice_sink,
+                    client_ready=lambda replacement: self._arm_client(
+                        name, replacement
+                    ),
+                )
+            except BaseException as exc:
+                self._transition(
+                    name,
+                    client=self._clients.get(name),
+                    state="failed",
+                    reason=_error_text(exc),
+                )
+                raise
             self._finish_setup(setup)
             return setup.public
 
@@ -165,8 +174,7 @@ class MCPMount:
         callback(self)
 
     def _arm_client(self, name: str, client: MCPClient) -> None:
-        self._clients[name] = client
-        self._attach_failure_handler(name, client)
+        self._transition(name, client=client)
 
     def _finish_setup(self, setup: _SetupResult) -> None:
         client = setup.client
@@ -213,6 +221,9 @@ class MCPMount:
             )
             for tool in tools:
                 _register_tool(self.registry, client, tool, mount=self)
+        elif state is None and client is not None and current is None:
+            self._clients[name] = client
+            self._attach_failure_handler(name, client)
         else:
             self._unregister_tools(name)
             if current is client:

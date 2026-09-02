@@ -23,7 +23,11 @@ from zeta.mcp import (
     load_mcp_config,
     mount_mcp_servers,
 )
-from zeta.mcp.client import translate_call_result
+from zeta.mcp.client import (
+    MCPProtocolError,
+    parse_rpc_response,
+    translate_call_result,
+)
 from zeta.tools import ToolRegistry
 from zeta.types import TextContent, ToolCall
 
@@ -65,6 +69,27 @@ def test_mcp_non_text_blocks_keep_the_standard_content_shape() -> None:
             },
         },
     ]
+
+
+def test_mcp_json_rpc_error_is_a_tool_error() -> None:
+    result = translate_call_result(
+        parse_rpc_response(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -1, "message": "tool failed"},
+            },
+            1,
+        )
+    )
+
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "tool failed"
+
+
+def test_mcp_malformed_tool_result_is_a_protocol_error() -> None:
+    with pytest.raises(MCPProtocolError, match="content must be an array"):
+        translate_call_result({"content": "invalid"})
 
 
 def _stdio_source() -> str:
@@ -267,6 +292,45 @@ async def test_stdio_abort_returns_canceled_result(tmp_path: Path, monkeypatch: 
     result = await task
     assert result["content"][0]["text"] == "tool execution canceled"
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_abort_marks_mount_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _stdio_source().replace(
+        'result = {"content": [{"type": "text", "text": request["params"]["arguments"]["value"]}], "isError": False, "structuredContent": {"ok": True, "latency": 1.5}}',
+        'import time; time.sleep(5); result = {"content": [], "isError": False}',
+    )
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    config = MCPServerConfig("abort", "stdio", sys.executable, ("-u", "-c", source))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"abort": config}),
+    )
+    signal = AbortSignal()
+    task = asyncio.create_task(
+        registry.execute(
+            ToolCall("call", "abort:echo", {"value": "wait"}),
+            abort_signal=signal,
+        )
+    )
+    await asyncio.sleep(0.05)
+    signal.abort()
+    result = await task
+
+    assert result["isError"] is True
+    for _ in range(100):
+        if mount.statuses["abort"].state == "failed":
+            break
+        await asyncio.sleep(0.01)
+    assert mount.statuses["abort"].state == "failed"
+    assert mount.statuses["abort"].tool_count == 0
+    assert mount.clients == ()
+    assert registry.schemas == []
+    assert "abort: failed" in mount.render()
+    await mount.close()
 
 
 @pytest.mark.asyncio
@@ -476,6 +540,49 @@ async def test_mount_reconnects_one_server_and_rejects_unknown(
 
 
 @pytest.mark.asyncio
+async def test_canceled_reconnect_keeps_mount_state_consistent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = asyncio.Event()
+    never = asyncio.Event()
+    initial = _LifecycleClient(MCPServerConfig("server", "stdio", "unused"))
+    replacement = _LifecycleClient(initial.config)
+    clients = iter((initial, replacement))
+
+    def build_client(config: MCPServerConfig) -> _LifecycleClient:
+        del config
+        return next(clients)
+
+    async def connect_and_list(client: _LifecycleClient) -> list[MCPTool]:
+        if client is replacement:
+            started.set()
+            await never.wait()
+        return await client.list_tools()
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"server": initial.config}),
+    )
+
+    reconnect = asyncio.create_task(mount.reconnect("server"))
+    await started.wait()
+    reconnect.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reconnect
+
+    status = mount.statuses["server"]
+    assert status.state == "failed"
+    assert status.tool_count == 0
+    assert mount.clients == ()
+    assert registry.schemas == []
+    assert replacement.closed
+    await mount.close()
+
+
+@pytest.mark.asyncio
 async def test_stdio_exit_updates_mount_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -654,7 +761,7 @@ async def test_mount_isolates_bad_server_from_good_server(
 
 
 @pytest.mark.asyncio
-async def test_call_failure_does_not_affect_other_server(
+async def test_mcp_application_error_does_not_affect_other_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
@@ -667,7 +774,8 @@ async def test_call_failure_does_not_affect_other_server(
     failed = await registry.execute(ToolCall("failed", "fail:echo", {"value": "x"}))
     healthy = await registry.execute(ToolCall("healthy", "good:echo", {"value": "ok"}))
     assert failed["isError"] is True
-    assert mount.statuses["fail"].state == "failed"
+    assert mount.statuses["fail"].state == "mounted"
+    assert "fail:echo" in {schema["name"] for schema in registry.schemas}
     assert healthy["isError"] is False
     assert healthy["content"][0]["text"] == "ok"
     await mount.close()

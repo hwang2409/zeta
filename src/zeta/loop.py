@@ -397,7 +397,6 @@ class AgentLoop:
             await mount.reconnect(parts[1], notice_sink=self._mcp_notice_sink)
         except ValueError as exc:
             return f"mcp error: {exc}"
-        self._refresh_mcp_tool_schemas()
         return mount.render()
 
     @property

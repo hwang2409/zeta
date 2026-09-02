@@ -165,7 +165,7 @@ class StdioMCPClient(MCPClient):
                             )
                         except Exception:  # noqa: BLE001 - cancellation must continue to cleanup
                             logger.debug("MCP %s did not accept cancellation", self.config.name)
-                        await self._terminate_process()
+                        await self._terminate_process(report_failure=True)
                         raise MCPCanceled()
                     raw_response = await response
                 finally:
@@ -179,7 +179,7 @@ class StdioMCPClient(MCPClient):
                 current = asyncio.current_task()
                 if current is not None:
                     current.uncancel()
-                await self._terminate_process()
+                await self._terminate_process(report_failure=True)
             raise
         finally:
             self._pending.pop(request_id, None)
@@ -193,7 +193,7 @@ class StdioMCPClient(MCPClient):
             process.stdin.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
             await process.stdin.drain()
 
-    async def _terminate_process(self) -> None:
+    async def _terminate_process(self, *, report_failure: bool = False) -> None:
         process = self._process
         reader_task = self._reader_task
         if process is None:
@@ -210,13 +210,17 @@ class StdioMCPClient(MCPClient):
         await process.wait()
         if reader_task is not None and not reader_task.done():
             await asyncio.gather(reader_task, return_exceptions=True)
-        self._fail_pending(MCPError("MCP stdio server terminated after cancellation"))
+        error = MCPError("MCP stdio server terminated after cancellation")
+        self._fail_pending(error)
         self._process = None
         self._reader_task = None
         stderr = self._stderr
         self._stderr = None
         if stderr is not None:
             stderr.close()
+        if report_failure:
+            self._suppress_failure = False
+            self._report_failure(error)
 
     async def _read_stdout(self) -> None:
         process = self._process
@@ -267,5 +271,5 @@ __all__ = ["StdioMCPClient"]
 def _error_text(error: BaseException) -> str:
     try:
         return str(error).strip() or type(error).__name__
-    except Exception:
+    except Exception:  # noqa: BLE001 - error reporting must not mask the failure
         return type(error).__name__
