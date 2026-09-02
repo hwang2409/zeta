@@ -56,6 +56,8 @@ ToolStream = Literal["stdout", "stderr"]
 
 def _bind_handler(handler: ToolHandler, registry: ToolRegistry) -> ToolHandler:
     return partial(handler, registry)
+
+
 def _discover_tool_modules() -> list[str]:
     package = importlib.import_module(__package__)
     modules = (
@@ -565,6 +567,8 @@ class ToolRegistry:
         _boundary_signal: ToolAbortSignal | None = None,
         _stream_sink: ToolStreamSink | None = None,
         _lifecycle_sink: ToolLifecycleSink | None = None,
+        _persist_approval: bool = True,
+        _log_path: str | Path | None = None,
     ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
         if _boundary_signal is not None and _signal_is_set(_boundary_signal):
@@ -611,6 +615,7 @@ class ToolRegistry:
             lambda current: self._next_abort_generation(current, _scope_signal),
             _lifecycle_sink,
             skip_approval=not definition.requires_approval,
+            persist_request=_persist_approval,
         )
         if gate_result is not None:
             return _normalize_result(
@@ -632,9 +637,12 @@ class ToolRegistry:
         )
         execution_context = ToolExecutionContext(tool_call, self._agent_runner, _lifecycle_sink)
         handler = _bind_execution_context(definition.handler, execution_context)
+        execution_arguments = dict(arguments)
+        if _log_path is not None:
+            execution_arguments["_log_path"] = str(_log_path)
         result = await self._invoke_handler_with_abort(
             handler,
-            arguments,
+            execution_arguments,
             execution_signal,
             stream_publisher,
             tool_call.id,
@@ -651,9 +659,7 @@ class ToolRegistry:
             try:
                 normalized_result = validate_tool_result(result)
             except ValueError as exc:
-                normalized_result = _error_result(
-                    f"invalid tool handler result: {exc}"
-                )
+                normalized_result = _error_result(f"invalid tool handler result: {exc}")
         elif isinstance(result, str):
             normalized_result = _success_result(text_block(result))
         else:

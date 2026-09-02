@@ -4,17 +4,59 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ..core.abort import AbortSignal
-from ..types import StructuredToolResult, ToolTextBlock
+from ..types import (
+    StreamEvent,
+    StructuredToolResult,
+    ToolCall,
+    ToolResult,
+    ToolTextBlock,
+    flatten_tool_content,
+)
+from ._process import _kill_and_reap
 from .registry import (
     ToolRegistry,
+    ToolStream,
+    ToolStreamPublisher,
     _BoundedText,
     _success_result,
     _ToolCanceled,
+    validate_tool_result,
 )
-from ._process import _kill_and_reap
+
+
+@dataclass(frozen=True, slots=True)
+class MacroDisplay:
+    """Trusted, harness-side display data for a macro's tool call."""
+
+    command: str
+    argv: tuple[str, ...] = ()
+
+
+_trusted_macro_display: dict[str, MacroDisplay] = {}
+
+
+def register_macro_display(call_id: str, *, command: str, argv: tuple[str, ...]) -> None:
+    """Bind trusted display strings to a macro tool call the harness created."""
+
+    _trusted_macro_display[call_id] = MacroDisplay(command, argv)
+
+
+def trusted_macro_display(call_id: str) -> MacroDisplay | None:
+    """Return the trusted display data for a call the macro runner registered."""
+
+    return _trusted_macro_display.get(call_id)
+
+
+def forget_macro_display(call_id: str) -> None:
+    """Drop the trusted display entry once its owning macro is done."""
+
+    _trusted_macro_display.pop(call_id, None)
 
 
 class _BoundedOutput:
@@ -51,16 +93,34 @@ class _BoundedOutput:
                 self._data.extend(encoded)
 
 
-async def _drain_stream(stream: object, capture: _BoundedOutput) -> None:
+async def _drain_stream(
+    stream: object,
+    capture: _BoundedOutput,
+    *,
+    stream_name: ToolStream,
+    stream_publisher: ToolStreamPublisher | None,
+    log_handle: Any | None,
+) -> None:
     if stream is None:
         return
     read = getattr(stream, "read")  # noqa: B009 - process pipe interface
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     while True:
         chunk = await read(65_536)
         if not chunk:
             capture.finish()
+            text = decoder.decode(b"", final=True)
+            if stream_publisher is not None and text:
+                stream_publisher.publish(text, stream_name)
             return
         capture.append(chunk)
+        if log_handle is not None:
+            log_handle.write(chunk)
+            log_handle.flush()
+        if stream_publisher is not None:
+            text = decoder.decode(chunk, final=False)
+            if text:
+                stream_publisher.publish(text, stream_name)
 
 
 def _format_exec_result(
@@ -94,9 +154,16 @@ async def _exec(
     registry: ToolRegistry,
     arguments: dict[str, Any],
     abort_signal: AbortSignal,
+    stream_publisher: ToolStreamPublisher | None = None,
 ) -> StructuredToolResult:
     timeout = arguments.get("timeout", 30.0)
     output_limit = arguments.get("max_output", registry.max_output_chars)
+    log_path = arguments.get("_log_path")
+    log_handle = (
+        await asyncio.to_thread(Path(log_path).open, "wb")
+        if log_path is not None
+        else None
+    )
     try:
         process = await asyncio.create_subprocess_shell(
             arguments["command"],
@@ -106,13 +173,31 @@ async def _exec(
             start_new_session=True,
         )
     except OSError as exc:
+        if log_handle is not None:
+            log_handle.close()
         raise ValueError(f"could not execute command: {exc}") from exc
 
     stdout_capture = _BoundedOutput(output_limit)
     stderr_capture = _BoundedOutput(output_limit)
     process_wait = asyncio.create_task(process.wait())
-    stdout_drain = asyncio.create_task(_drain_stream(process.stdout, stdout_capture))
-    stderr_drain = asyncio.create_task(_drain_stream(process.stderr, stderr_capture))
+    stdout_drain = asyncio.create_task(
+        _drain_stream(
+            process.stdout,
+            stdout_capture,
+            stream_name="stdout",
+            stream_publisher=stream_publisher,
+            log_handle=log_handle,
+        )
+    )
+    stderr_drain = asyncio.create_task(
+        _drain_stream(
+            process.stderr,
+            stderr_capture,
+            stream_name="stderr",
+            stream_publisher=stream_publisher,
+            log_handle=log_handle,
+        )
+    )
     process_tasks = (process_wait, stdout_drain, stderr_drain)
     abort_wait = asyncio.create_task(abort_signal.wait())
     timeout_wait = asyncio.create_task(asyncio.sleep(timeout))
@@ -143,6 +228,11 @@ async def _exec(
                         "structuredContent": {
                             "exit_code": process.returncode,
                             "cwd": str(registry.cwd),
+                            **(
+                                {"log_path": str(log_path)}
+                                if log_path is not None
+                                else {}
+                            ),
                         },
                     }
                 return _success_result(
@@ -150,6 +240,7 @@ async def _exec(
                     structured_content={
                         "exit_code": process.returncode,
                         "cwd": str(registry.cwd),
+                        **({"log_path": str(log_path)} if log_path is not None else {}),
                     },
                 )
             if timeout_wait in done:
@@ -170,8 +261,10 @@ async def _exec(
             ],
             "isError": True,
             "structuredContent": {
+                "timed_out": True,
                 "exit_code": process.returncode,
                 "cwd": str(registry.cwd),
+                **({"log_path": str(log_path)} if log_path is not None else {}),
             },
         }
     except asyncio.CancelledError:
@@ -185,6 +278,51 @@ async def _exec(
             if not waiter.done():
                 waiter.cancel()
         await asyncio.gather(abort_wait, timeout_wait, return_exceptions=True)
+        if log_handle is not None:
+            log_handle.close()
+
+
+async def run_exec_macro(
+    registry: ToolRegistry,
+    call: ToolCall,
+    log_path: str | Path,
+    *,
+    stream_sink: Callable[[StreamEvent], None],
+    lifecycle_sink: Callable[[str], None],
+    abort_signal: AbortSignal | None = None,
+) -> ToolResult:
+    """Run an approved macro without persisting tool conversation entries."""
+
+    Path(log_path).touch()
+    scope_signal = abort_signal or registry.abort_signal.registry.new_generation()
+    try:
+        raw_result = await registry.execute(
+            call,
+            abort_signal=scope_signal,
+            _scope_signal=scope_signal,
+            _stream_sink=stream_sink,
+            _lifecycle_sink=lifecycle_sink,
+            _persist_approval=False,
+            _log_path=log_path,
+        )
+        result = validate_tool_result(raw_result)
+        structured = dict(result["structuredContent"] or {})
+        structured["log_path"] = str(log_path)
+        return ToolResult(
+            call.id,
+            flatten_tool_content(result["content"]),
+            result["isError"],
+            content_blocks=result["content"],
+            structured_content=structured,
+        )
+    except asyncio.CancelledError:
+        scope_signal.abort()
+        return ToolResult(
+            call.id,
+            "tool execution canceled",
+            True,
+            structured_content={"log_path": str(log_path)},
+        )
 
 
 def register(registry: ToolRegistry) -> None:

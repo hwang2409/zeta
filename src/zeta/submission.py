@@ -180,7 +180,7 @@ class SubmissionMixin:
                 self._fork_rebuilt = False
             elif slash_output.startswith("[Image #"):
                 self._insert_paste_token(slash_output)
-            else:
+            elif slash_output:
                 self._print_system(slash_output)
             return
         model_input = self._slash_commands.input_for_model(parsed)

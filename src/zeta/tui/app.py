@@ -43,6 +43,7 @@ from ..providers.codex import CodexBackend, CodexCredentialStore
 from ..providers.factory import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL
 from ..providers.factory import build_backend as build_network_backend
 from ..submission import Submission, SubmissionMixin, SubmissionQueue
+from ..tools.exec import trusted_macro_display
 from ..types import (
     CompletionBackend,
     Message,
@@ -182,6 +183,9 @@ class TUIApp(
         self._spinner_frame = 0
         self._spinner_reset = asyncio.Event()
         self._abort_requested = False
+        self._macro_abort_signal = self._macro_call_id = None
+        self._macro_receipts = deque()
+        self._input_loop_active = False
         self._resuming_tool = False
         self._session = session
         self._history_path = (
@@ -298,6 +302,7 @@ class TUIApp(
                     label=request.label,
                     key=str(request.key),
                     shortcut=index == 0,
+                    trusted_display=trusted_macro_display(request.tool_call.id),
                 )
             )
 
@@ -485,23 +490,6 @@ class TUIApp(
                 event.current_buffer.insert_text(result)
         elif result != "paste unavailable: clipboard does not contain an image":
             self._print_system(result)
-
-    def abort_active(self) -> None:
-        if self._active_task is not None and not self._active_task.done():
-            tool_running = self._loop_state == "tool-running"
-            self.loop.abort()
-            for request in self.pending_approvals:
-                self._abort_approval(request.key)
-                self.loop.finalize_canceled(request.request_id)
-            self._loop_state = "interrupted"
-            self._invalidate_prompt()
-            if tool_running and not self._resuming_tool:
-                self._abort_requested = True
-            else:
-                self._active_task.cancel()
-        elif self.loop.background_children_running:
-            self.loop.abort()
-            self._invalidate_prompt()
 
     def _abort_approval(self, request_id: str | tuple[str, str]) -> None:
         if self._approval_policy is not None:
@@ -807,6 +795,7 @@ class TUIApp(
         input_task: asyncio.Task[Submission] = asyncio.create_task(
             self._submissions.get()
         )
+        self._input_loop_active = True
         try:
             while not self._exit_requested:
                 wait_for: set[asyncio.Task[Any]] = {prompt_task, input_task}
@@ -834,6 +823,7 @@ class TUIApp(
                     await self._handle_prompt_value(value)
                     input_task = asyncio.create_task(self._submissions.get())
         finally:
+            self._input_loop_active = False
             if not prompt_task.done():
                 prompt_task.cancel()
                 await asyncio.gather(prompt_task, return_exceptions=True)
@@ -877,6 +867,7 @@ class TUIApp(
                 await self._run_full_screen(session)
                 return
             prompt_task = asyncio.create_task(self._read_prompt(session))
+            self._input_loop_active = True
             while prompt_task is not None and not self._exit_requested:
                 wait_for: set[asyncio.Task[Any]] = {prompt_task}
                 if self._active_task is not None:
@@ -903,6 +894,7 @@ class TUIApp(
                         break
                     prompt_task = asyncio.create_task(self._read_prompt(session))
         finally:
+            self._input_loop_active = False
             self._draft.flush()
             if prompt_task is not None and not prompt_task.done():
                 prompt_task.cancel()

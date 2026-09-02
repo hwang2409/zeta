@@ -60,6 +60,7 @@ class ApprovalPolicy:
         self._delegated: dict[
             tuple[str, str], tuple[ApprovalRequest, ConversationStore]
         ] = {}
+        self._ephemeral: dict[str, tuple[ApprovalRequest, str | None]] = {}
 
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
@@ -92,6 +93,11 @@ class ApprovalPolicy:
                 self._delegated.pop((child_id, request_id), None)
             else:
                 requests.append(request)
+        requests.extend(
+            request
+            for request, decision in self._ephemeral.values()
+            if decision is None
+        )
         return requests
 
     def register_delegated(
@@ -167,6 +173,10 @@ class ApprovalPolicy:
             )
         if isinstance(request_id, tuple):
             return False
+        ephemeral = self._ephemeral.get(request_id)
+        if ephemeral is not None:
+            self._ephemeral[request_id] = (ephemeral[0], "abort")
+            return True
         store = self._require_store()
         return store.resolve_approval(request_id, "abort")
 
@@ -182,6 +192,10 @@ class ApprovalPolicy:
             state = delegated[1].approval_states().get(delegated[0].request_id)
             return _resolved_decision(state[1] if state is not None else None)
         if isinstance(request_id, tuple):
+            return None
+        ephemeral = self._ephemeral.get(request_id)
+        if ephemeral is not None:
+            self._ephemeral[request_id] = (ephemeral[0], "abort")
             return None
         store = self._require_store()
         store.resolve_approval(request_id, "abort")
@@ -220,6 +234,10 @@ class ApprovalPolicy:
             )
         if isinstance(request_id, tuple):
             return False
+        ephemeral = self._ephemeral.get(request_id)
+        if ephemeral is not None:
+            self._ephemeral[request_id] = (ephemeral[0], resolved.value)
+            return True
         store = self._require_store()
         return store.resolve_approval(request_id, resolved.value)
 
@@ -256,6 +274,8 @@ class ApprovalPolicy:
         self,
         tool_call: ToolCall,
         abort_signal: _AbortSignal,
+        *,
+        persist_request: bool = True,
     ) -> ApprovalDecision | None:
         store = self._require_store()
         state = store.approval_states().get(tool_call.id)
@@ -270,12 +290,25 @@ class ApprovalPolicy:
             decision = self.decide(tool_call.name, tool_call.arguments)
             if decision is not ApprovalDecision.ASK:
                 return decision
-            store.append_message_with_approval_requests(
-                Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
-                [(tool_call.id, tool_call)],
-            )
+            if persist_request:
+                store.append_message_with_approval_requests(
+                    Message(MessageRole.ASSISTANT, [ToolUseContent(tool_call)]),
+                    [(tool_call.id, tool_call)],
+                )
+            else:
+                self._ephemeral[tool_call.id] = (
+                    ApprovalRequest(tool_call.id, tool_call),
+                    None,
+                )
 
         while True:
+            ephemeral = self._ephemeral.get(tool_call.id)
+            if ephemeral is not None and ephemeral[1] is not None:
+                if ephemeral[1] == ApprovalDecision.ALLOW.value:
+                    return ApprovalDecision.ALLOW
+                if ephemeral[1] == ApprovalDecision.DENY.value:
+                    return ApprovalDecision.DENY
+                return None
             state = store.approval_states().get(tool_call.id)
             if state is not None and state[1] is not None:
                 if state[1] == ApprovalDecision.ALLOW.value:
@@ -302,6 +335,11 @@ class ApprovalPolicy:
             await asyncio.gather(*pending, return_exceptions=True)
             if abort_task in done:
                 return self._resolve_abort_or_winner(tool_call.id)
+
+    def forget_ephemeral(self, request_id: str) -> None:
+        """Remove one non-durable approval after its owner finishes."""
+
+        self._ephemeral.pop(request_id, None)
 
     def _resolve_abort_or_winner(
         self,
@@ -356,6 +394,7 @@ class ApprovalGate:
         lifecycle: Callable[[str], None] | None = None,
         *,
         skip_approval: bool = False,
+        persist_request: bool = True,
     ) -> tuple[ToolResult | None, AbortSignal]:
         execution_signal = signal
         if self.policy is not None and not skip_approval:
@@ -367,7 +406,12 @@ class ApprovalGate:
             if approval_started and lifecycle is not None:
                 lifecycle("approval_start")
             try:
-                decision = await self.policy.authorize(tool_call, signal)
+                if persist_request:
+                    decision = await self.policy.authorize(tool_call, signal)
+                else:
+                    decision = await self.policy.authorize(
+                        tool_call, signal, persist_request=False
+                    )
             except Exception as exc:
                 return ToolResult(tool_call.id, f"approval failed: {exc}", True), execution_signal
             finally:

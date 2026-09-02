@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import re
+import shlex
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -19,13 +21,15 @@ COMMAND_FILE_SIZE_LIMIT = 64 * 1024
 
 @dataclass(frozen=True, slots=True)
 class CustomCommand:
-    """One prompt-template command loaded from a markdown file."""
+    """One prompt or exec command loaded from a markdown file."""
 
     name: str
     description: str
     body: str
     path: Path
     source: str
+    kind: str = "prompt"
+    timeout: float = 300.0
 
     def render(self, arguments: str) -> str:
         """Substitute the raw argument tail and positional arguments."""
@@ -40,6 +44,20 @@ class CustomCommand:
             return values[index - 1] if index <= len(values) else ""
 
         return re.sub(r"\$(ARGUMENTS|[1-9])(?!\d)", replace, self.body)
+
+    def render_exec(self, arguments: str) -> str:
+        """Build a shell invocation with arguments kept outside the script."""
+
+        argv = arguments.split()
+        return " ".join(
+            (
+                f"ARGUMENTS={shlex.quote(arguments)}",
+                "sh -c",
+                shlex.quote(self.body),
+                "zeta-macro",
+                *(shlex.quote(value) for value in argv),
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +113,23 @@ def _read_command(path: Path, source: str) -> tuple[CustomCommand | None, str | 
         description = metadata.get("description", "")
         if type(description) is not str:
             raise ValueError("description must be a string")
+        kind = metadata.get("kind", "prompt")
+        if type(kind) is not str or kind not in {"prompt", "exec"}:
+            raise ValueError(f"unknown command kind: {kind!r}")
+        timeout_value = 300.0
+        if kind == "exec":
+            timeout = metadata.get("timeout", 300.0)
+            try:
+                timeout_value = float(timeout)
+            except (TypeError, ValueError, OverflowError):
+                timeout_value = 0.0
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout_value)
+                or timeout_value <= 0
+            ):
+                raise ValueError("timeout must be a positive finite number")
         if not body:
             raise ValueError("prompt body is empty")
     except (
@@ -105,7 +140,15 @@ def _read_command(path: Path, source: str) -> tuple[CustomCommand | None, str | 
         yaml.YAMLError,
     ) as exc:
         return None, f"ignored custom command {path}: {exc}"
-    return CustomCommand(name, description.strip(), body, path.resolve(), source), None
+    return CustomCommand(
+        name,
+        description.strip(),
+        body,
+        path.resolve(),
+        source,
+        kind,
+        timeout_value,
+    ), None
 
 
 def _split_document(text: str, path: Path) -> tuple[dict[str, object], str]:
@@ -606,6 +649,8 @@ class SlashSession(Protocol):
 
     def slash_fork(self, args: str) -> str: ...
 
+    async def slash_exec_macro(self, command: CustomCommand, args: str) -> str: ...
+
 
 SlashResult = str | Awaitable[str]
 SlashHandler = Callable[[SlashSession, str], SlashResult]
@@ -696,9 +741,12 @@ class SlashCommandRegistry:
         if not parts:
             return None
         command = self._commands.get(parts[0])
-        if command is None:
+        if command is not None:
+            return command.run(session, parts[1] if len(parts) == 2 else "")
+        custom = self._custom_commands.get(parts[0])
+        if custom is None or custom.kind != "exec":
             return None
-        return command.run(session, parts[1] if len(parts) == 2 else "")
+        return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
 
     def dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command, returning an awaitable for async commands."""
@@ -744,8 +792,9 @@ class SlashCommandRegistry:
             lines.append("  none")
         for command in self.custom_commands:
             description = f" — {command.description}" if command.description else ""
+            kind = " [exec]" if command.kind == "exec" else ""
             lines.append(
-                f"  /{command.name}{description} (source: {command.path})"
+                f"  /{command.name}{kind}{description} (source: {command.path})"
             )
         return "\n".join(lines)
 

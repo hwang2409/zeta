@@ -10,7 +10,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -24,6 +24,8 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding.vi_state import InputMode
 from rich.text import Text
 
+from ..core.slash import CustomCommand, SlashCommandRegistry
+from ..tools.exec import forget_macro_display, register_macro_display, run_exec_macro
 from ..types import (
     ErrorInfo,
     ImageContent,
@@ -32,9 +34,10 @@ from ..types import (
     StreamEvent,
     StreamEventType,
     TextContent,
+    ToolCall,
+    ToolResult,
     image_signature_matches,
 )
-from ..core.slash import SlashCommandRegistry
 from .key_bindings import (
     FullScreenPromptSession,
     VimCursorShapeConfig,
@@ -80,6 +83,9 @@ class TurnConsumerMixin:
         user_message: Message | None = None,
         persist_user_message: bool = True,
     ) -> None:
+        user_text, user_message = self._consume_macro_receipts(
+            user_text, user_message
+        )
         self._abort_requested = False
         self._turn_had_visible_output = False
         self._loop_state = "streaming"
@@ -416,6 +422,28 @@ end run
 class ComposerAttachmentMixin:
     """Attachment behavior shared by the TUI composition root."""
 
+    def abort_active(self) -> None:
+        if self._active_task is not None and not self._active_task.done():
+            macro_running = self._macro_abort_signal is not None
+            if macro_running:
+                self._abort_macro()
+            else:
+                self.loop.abort()
+                for request in self.pending_approvals:
+                    self._abort_approval(request.key)
+                    self.loop.finalize_canceled(request.request_id)
+            if macro_running or (
+                self._loop_state == "tool-running" and not self._resuming_tool
+            ):
+                self._abort_requested = True
+            else:
+                self._active_task.cancel()
+            self._loop_state = "interrupted"
+            self._invalidate_prompt()
+        elif self.loop.background_children_running:
+            self.loop.abort()
+            self._invalidate_prompt()
+
     def _restore_draft_state(self, draft: Any) -> None:
         self._pending_attachment_tokens = {
             token: path.resolve() for token, path in draft.attachment_tokens
@@ -693,6 +721,24 @@ class ComposerAttachmentMixin:
         self._undo_candidate = candidate
         self._start_turn(user_text, user_message=user_message)
 
+    def _consume_macro_receipts(
+        self, user_text: str, user_message: Message | None
+    ) -> tuple[str, Message | None]:
+        if not self._macro_receipts:
+            return user_text, user_message
+        receipts = "\n".join(self._macro_receipts)
+        self._macro_receipts.clear()
+        user_text = f"{receipts}\n\n{user_text}"
+        if user_message is None:
+            return user_text, None
+        content = [
+            replace(block, text=user_text)
+            if isinstance(block, TextContent) and block.path is None
+            else block
+            for block in user_message.content
+        ]
+        return user_text, replace(user_message, content=content)
+
     def _start_turn(
         self,
         user_text: str,
@@ -708,6 +754,121 @@ class ComposerAttachmentMixin:
                 persist_user_message=persist_user_message,
             )
         )
+
+    async def slash_exec_macro(self, command: CustomCommand, args: str) -> str:
+        """Run one custom shell macro through the normal exec safety path."""
+
+        if self.active:
+            return "macro unavailable while a turn is running"
+        call = ToolCall(
+            f"macro-{uuid4().hex}",
+            "exec",
+            {
+                "command": command.render_exec(args),
+                "timeout": command.timeout,
+            },
+        )
+        register_macro_display(
+            call.id,
+            command=command.render(args),
+            argv=tuple(args.split()),
+        )
+        abort_signal = self.loop.tool_registry.abort_signal.registry.new_generation()
+        self._macro_abort_signal = abort_signal
+        self._macro_call_id = call.id
+        task = asyncio.create_task(self._run_exec_macro(command, call))
+        self._active_task = task
+        self._loop_state = "tool-running"
+        if not self._input_loop_active:
+            try:
+                await asyncio.shield(task)
+            finally:
+                if self._active_task is task:
+                    self._active_task = None
+        return ""
+
+    def _abort_macro(self) -> None:
+        signal = self._macro_abort_signal
+        if signal is None:
+            return
+        signal.abort()
+        for request in self.pending_approvals:
+            if request.tool_call.id == self._macro_call_id:
+                self._abort_approval(request.key)
+
+    async def _run_exec_macro(self, command: CustomCommand, call: ToolCall) -> None:
+        log_path = self.loop.store.session_dir / f"macro-{call.id[6:]}.log"
+
+        def lifecycle_sink(kind: str) -> None:
+            event_type = {
+                "approval_start": StreamEventType.TOOL_APPROVAL_START,
+                "approval_end": StreamEventType.TOOL_APPROVAL_END,
+                "execution_start": StreamEventType.TOOL_EXECUTION_START,
+            }.get(kind)
+            if event_type is None:
+                return
+            self._handle_tool_event(
+                StreamEvent(
+                    event_type,
+                    tool_call=call,
+                    data={"macro": command.name},
+                )
+            )
+            if kind == "approval_start":
+                asyncio.get_running_loop().call_soon(self._present_pending_approvals)
+            self._invalidate_prompt()
+
+        def stream_sink(event: StreamEvent) -> None:
+            event.data["macro"] = command.name
+            self._handle_tool_event(event)
+            self._invalidate_prompt()
+
+        canceled = False
+        try:
+            result = await run_exec_macro(
+                self.loop.tool_registry,
+                call,
+                log_path,
+                stream_sink=stream_sink,
+                lifecycle_sink=lifecycle_sink,
+                abort_signal=self._macro_abort_signal,
+            )
+        except asyncio.CancelledError:
+            result = ToolResult(call.id, "tool execution canceled", True)
+            canceled = True
+        finally:
+            if self._approval_policy is not None:
+                self._approval_policy.forget_ephemeral(call.id)
+            forget_macro_display(call.id)
+        self._handle_tool_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=result,
+                data={"macro": command.name},
+            )
+        )
+        if result.content == "tool execution canceled":
+            status = "canceled"
+        elif result.content == "tool execution denied":
+            status = "denied"
+        elif (result.structured_content or {}).get("timed_out") is True:
+            status = "timeout"
+        else:
+            exit_code = (
+                result.structured_content.get("exit_code")
+                if result.structured_content is not None
+                else None
+            )
+            status = f"exit {exit_code}" if exit_code is not None else "failed"
+        self._macro_receipts.append(f"ran /{command.name}, {status}")
+        if self._macro_call_id == call.id:
+            self._macro_abort_signal = None
+            self._macro_call_id = None
+        self._loop_state = "idle"
+        self._streaming = False
+        if canceled:
+            raise asyncio.CancelledError
 
 
 def vim_state_label(vim_mode: bool) -> str | None:
