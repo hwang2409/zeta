@@ -123,6 +123,11 @@ class SlashHandlerMixin:
             return "plan mode: on (read-only tools until you approve a plan)"
         return "plan mode: off"
 
+    def toggle_plan_mode(self) -> None:
+        """Toggle plan mode from the keyboard, reporting the same notice."""
+
+        self._print_system(self.slash_plan("toggle"))
+
     def _retune_budget_for_model(self) -> str | None:
         """Track the new model's context window unless the budget is pinned."""
 

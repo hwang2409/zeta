@@ -429,6 +429,7 @@ class TUIApp(
             on_approve=lambda: self._answer_first_pending("approve"),
             on_deny=lambda: self._answer_first_pending("deny"),
             approval_active=lambda: bool(self.pending_approvals),
+            on_plan_toggle=self.toggle_plan_mode,
             on_scroll_up=self._transcript.scroll_up,
             on_scroll_down=self._transcript.scroll_down,
         )

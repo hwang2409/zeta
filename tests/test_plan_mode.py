@@ -308,3 +308,75 @@ def test_plan_mode_does_not_touch_session_metadata(
     session_id = app.loop.store.session_id
     metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
     assert "plan_mode" not in metadata
+
+
+# --- the shift+tab binding -------------------------------------------------
+
+
+async def test_shift_tab_toggles_plan_mode() -> None:
+    import asyncio
+
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from zeta.tui.key_bindings import build_key_bindings
+
+    toggles: list[str] = []
+    with create_pipe_input() as pipe:
+        session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_plan_toggle=lambda: toggles.append("toggle"),
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0)
+        pipe.send_text("\x1b[Z")  # shift+tab
+        await asyncio.sleep(0.05)
+        assert toggles == ["toggle"]
+
+        # It is not a printable key, so it works with text in the composer too.
+        pipe.send_text("hello\x1b[Z")
+        await asyncio.sleep(0.05)
+        assert toggles == ["toggle", "toggle"]
+        assert session.default_buffer.text == "hello"
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def test_shift_tab_is_inert_without_a_handler() -> None:
+    from zeta.tui.key_bindings import build_key_bindings
+
+    bindings = build_key_bindings(
+        on_interrupt=lambda: None,
+        on_exit=lambda: None,
+    )
+    assert not [
+        binding
+        for binding in bindings.bindings
+        if any(str(key).endswith("BackTab") for key in binding.keys)
+    ]
+
+
+def test_key_toggle_reports_through_the_same_path_as_the_command() -> None:
+    from zeta.tui.slash_handlers import SlashHandlerMixin
+
+    printed: list[str] = []
+
+    class Session(SlashHandlerMixin, PlanSession):
+        def _print_system(self, output: str) -> None:
+            printed.append(output)
+
+    session = Session()
+    session.toggle_plan_mode()
+    assert session.plan_mode is True
+    assert printed == ["plan mode: on (read-only tools until you approve a plan)"]
+    session.toggle_plan_mode()
+    assert session.plan_mode is False
+    assert printed[-1] == "plan mode: off"
