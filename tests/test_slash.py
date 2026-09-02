@@ -712,6 +712,22 @@ async def test_compact_command_uses_async_dispatch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mcp_command_dispatches_status_and_reconnect() -> None:
+    class MCPTestSession:
+        async def slash_mcp(self, args: str) -> str:
+            return f"mcp args: {args}"
+
+    registry = create_slash_registry()
+    session_value = MCPTestSession()
+
+    assert await registry.dispatch_async(session_value, "/mcp") == "mcp args: "
+    assert (
+        await registry.dispatch_async(session_value, "/mcp reconnect server")
+        == "mcp args: reconnect server"
+    )
+
+
+@pytest.mark.asyncio
 async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> None:
     backend = FakeBackend([])
     output = StringIO()

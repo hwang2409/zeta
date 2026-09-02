@@ -192,6 +192,7 @@ class AgentLoop:
         self._background_child_cancellers: dict[str, Callable[[], None]] = {}
         self._background_child_watchers: dict[str, asyncio.Task[Any]] = {}
         self._background_event_sink: Callable[[StreamEvent], None] | None = None
+        self._mcp_notice_sink: Callable[[str], None] | None = None
         recover_agent_children(self)
         if registry is not None and tools is not None:
             raise ValueError("pass only one tool registry")
@@ -231,6 +232,7 @@ class AgentLoop:
             raise TypeError("tools must be a mapping or ToolRegistry")
         self._mcp_mount: MCPMount | None = None
         self._mcp_mount_attempted = skip_mcp_mount
+        self._mcp_mount_task: asyncio.Task[None] | None = None
         self._provided_tool_schemas = tool_schemas is not None
         self.tool_registry.bind_session_store(store)
         if (
@@ -367,6 +369,35 @@ class AgentLoop:
         """Set the sink for progress from children that outlive their turn."""
 
         self._background_event_sink = sink
+
+    def set_mcp_notice_sink(self, sink: Callable[[str], None] | None) -> None:
+        """Set the sink for MCP mount notices."""
+
+        self._mcp_notice_sink = sink
+
+    @property
+    def mcp_summary(self) -> str:
+        if self._mcp_mount is None:
+            return "mcp: 0 mounted, 0 failed"
+        return self._mcp_mount.summary
+
+    async def slash_mcp(self, args: str) -> str:
+        """Show MCP state or reconnect one configured server."""
+
+        await self._ensure_mcp_servers()
+        mount = self._mcp_mount
+        if mount is None:
+            return "mcp: no configured servers"
+        parts = args.split()
+        if not parts:
+            return mount.render()
+        if parts[0] != "reconnect" or len(parts) != 2:
+            return "mcp usage: /mcp or /mcp reconnect <server>"
+        try:
+            await mount.reconnect(parts[1], notice_sink=self._mcp_notice_sink)
+        except ValueError as exc:
+            return f"mcp error: {exc}"
+        return mount.render()
 
     @property
     def background_children_running(self) -> bool:
@@ -520,6 +551,9 @@ class AgentLoop:
         if self._mcp_mount is not None:
             await self._mcp_mount.close()
             self._mcp_mount = None
+        if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
+            self._mcp_mount_task.cancel()
+            await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
         await self.tool_registry.background_tasks.close()
 
     def session_start(self) -> None:
@@ -529,17 +563,43 @@ class AgentLoop:
     async def _ensure_mcp_servers(self) -> None:
         if self._mcp_mount_attempted:
             return
-        self._mcp_mount_attempted = True
-        self._mcp_mount = await mount_mcp_servers(self.tool_registry)
-        if self._provided_tool_schemas:
-            existing = {schema.get("name") for schema in self.tool_schemas}
-            self.tool_schemas.extend(
-                schema
-                for schema in self.tool_registry.schemas
-                if schema.get("name") not in existing
-            )
+        if self._mcp_mount_task is None:
+            self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
+        await asyncio.shield(self._mcp_mount_task)
+
+    async def _mount_mcp_servers(self) -> None:
+        if self._mcp_notice_sink is None:
+            self._mcp_mount = await mount_mcp_servers(self.tool_registry)
         else:
+            self._mcp_mount = await mount_mcp_servers(
+                self.tool_registry,
+                notice_sink=self._mcp_notice_sink,
+            )
+        self._mcp_mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
+        self._mcp_mount_attempted = True
+
+    def _refresh_mcp_tool_schemas(self, mount: MCPMount | None = None) -> None:
+        mount = mount or self._mcp_mount
+        if mount is None:
+            return
+        mcp_prefixes = tuple(f"{name}:" for name in mount.configs)
+        current_mcp = [
+            schema
+            for schema in self.tool_registry.schemas
+            if isinstance(schema.get("name"), str)
+            and schema["name"].startswith(mcp_prefixes)
+        ]
+        if not self._provided_tool_schemas:
             self.tool_schemas = list(self.tool_registry.schemas)
+            return
+        self.tool_schemas = [
+            schema
+            for schema in self.tool_schemas
+            if not (
+                isinstance(schema.get("name"), str)
+                and schema["name"].startswith(mcp_prefixes)
+            )
+        ] + current_mcp
 
     async def ensure_mcp_servers(self) -> None:
         """Connect MCP servers before a direct tool resume."""

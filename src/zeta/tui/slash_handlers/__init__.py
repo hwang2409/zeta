@@ -58,6 +58,7 @@ class SlashHandlerMixin:
             usage_cost_by_model=self._usage_tracker.cost_by_model,
             compaction_history=compaction_history_data,
             model_window=MODEL_CONTEXT_WINDOWS.get(self.provider, {}).get(self.model),
+            mcp_summary=self.loop.mcp_summary,
         )
 
     def slash_model(self, args: str) -> str:

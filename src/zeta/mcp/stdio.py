@@ -6,9 +6,7 @@ import asyncio
 import json
 import logging
 import os
-import re
-from collections.abc import Mapping
-from pathlib import Path
+from collections.abc import Callable, Mapping
 from typing import BinaryIO
 
 from ..core.abort import AbortSignal
@@ -26,10 +24,9 @@ from .client import (
     tools_from_result,
     translate_call_result,
 )
-from .config import MCPServerConfig
+from .config import MCPServerConfig, mcp_log_path
 
 logger = logging.getLogger(__name__)
-_SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 class StdioMCPClient(MCPClient):
@@ -43,14 +40,25 @@ class StdioMCPClient(MCPClient):
         self._next_id = 0
         self._pending: dict[int, asyncio.Future[dict[str, object]]] = {}
         self._closed = False
+        self._suppress_failure = False
+        self._failure_sink: Callable[[str], None] | None = None
+
+    def set_failure_sink(self, sink: Callable[[str], None] | None) -> None:
+        """Set a callback for unexpected transport termination."""
+
+        self._failure_sink = sink
+
+    def _report_failure(self, error: BaseException) -> None:
+        if self._failure_sink is not None and not self._suppress_failure:
+            self._failure_sink(_error_text(error))
 
     async def connect(self) -> None:
         if self._process is not None:
             return
-        log_root = Path(os.environ.get("WIKI_AGENT_RUNTIME_DIR", Path.home() / ".zeta")).expanduser() / "mcp-logs"
+        log_path = mcp_log_path(self.config.name)
+        log_root = log_path.parent
         log_root.mkdir(parents=True, exist_ok=True)
-        log_name = _SAFE_NAME.sub("_", self.config.name) or "server"
-        log_handle = (log_root / f"{log_name}.log").open("ab")
+        log_handle = log_path.open("ab")
         try:
             child_env = os.environ.copy()
             child_env.update(self.config.env)
@@ -96,6 +104,9 @@ class StdioMCPClient(MCPClient):
             result = await self._request("tools/call", {"name": name, "arguments": dict(arguments)}, abort_signal)
         except MCPCanceled:
             return canceled_result()
+        except MCPError as exc:
+            self._report_failure(exc)
+            return make_error_result(str(exc))
         except Exception as exc:  # noqa: BLE001 - remote failures become tool results
             return make_error_result(str(exc))
         return translate_call_result(result)
@@ -104,6 +115,7 @@ class StdioMCPClient(MCPClient):
         if self._closed:
             return
         self._closed = True
+        self._suppress_failure = True
         process = self._process
         reader_task = self._reader_task
         self._process = None
@@ -153,7 +165,7 @@ class StdioMCPClient(MCPClient):
                             )
                         except Exception:  # noqa: BLE001 - cancellation must continue to cleanup
                             logger.debug("MCP %s did not accept cancellation", self.config.name)
-                        await self._terminate_process()
+                        await self._terminate_process(report_failure=True)
                         raise MCPCanceled()
                     raw_response = await response
                 finally:
@@ -167,7 +179,7 @@ class StdioMCPClient(MCPClient):
                 current = asyncio.current_task()
                 if current is not None:
                     current.uncancel()
-                await self._terminate_process()
+                await self._terminate_process(report_failure=True)
             raise
         finally:
             self._pending.pop(request_id, None)
@@ -181,11 +193,12 @@ class StdioMCPClient(MCPClient):
             process.stdin.write((json.dumps(message, separators=(",", ":")) + "\n").encode())
             await process.stdin.drain()
 
-    async def _terminate_process(self) -> None:
+    async def _terminate_process(self, *, report_failure: bool = False) -> None:
         process = self._process
         reader_task = self._reader_task
         if process is None:
             return
+        self._suppress_failure = True
         try:
             await asyncio.wait_for(asyncio.shield(process.wait()), timeout=0.25)
         except TimeoutError:
@@ -197,13 +210,17 @@ class StdioMCPClient(MCPClient):
         await process.wait()
         if reader_task is not None and not reader_task.done():
             await asyncio.gather(reader_task, return_exceptions=True)
-        self._fail_pending(MCPError("MCP stdio server terminated after cancellation"))
+        error = MCPError("MCP stdio server terminated after cancellation")
+        self._fail_pending(error)
         self._process = None
         self._reader_task = None
         stderr = self._stderr
         self._stderr = None
         if stderr is not None:
             stderr.close()
+        if report_failure:
+            self._suppress_failure = False
+            self._report_failure(error)
 
     async def _read_stdout(self) -> None:
         process = self._process
@@ -237,7 +254,10 @@ class StdioMCPClient(MCPClient):
                 except asyncio.CancelledError:
                     return
             if self._process is process:
-                self._fail_pending(MCPError(f"MCP stdio server exited with code {process.returncode}"))
+                error = MCPError(f"MCP stdio server exited with code {process.returncode}")
+                self._fail_pending(error)
+                if not self._suppress_failure and self._failure_sink is not None:
+                    self._failure_sink(str(error))
 
     def _fail_pending(self, error: BaseException) -> None:
         for future in self._pending.values():
@@ -246,3 +266,10 @@ class StdioMCPClient(MCPClient):
 
 
 __all__ = ["StdioMCPClient"]
+
+
+def _error_text(error: BaseException) -> str:
+    try:
+        return str(error).strip() or type(error).__name__
+    except Exception:  # noqa: BLE001 - error reporting must not mask the failure
+        return type(error).__name__

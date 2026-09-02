@@ -89,17 +89,17 @@ def canceled_result() -> StructuredToolResult:
 
 def translate_call_result(value: object) -> StructuredToolResult:
     if type(value) is not dict:
-        return make_error_result("MCP response result must be an object")
+        raise MCPProtocolError("MCP response result must be an object")
     content_value = value.get("content", [])
     if type(content_value) is not list:
-        return make_error_result("MCP tool result content must be an array")
+        raise MCPProtocolError("MCP tool result content must be an array")
     blocks: list[ToolContentBlock] = []
     for index, item in enumerate(content_value):
         if type(item) is not dict:
-            return make_error_result(f"MCP content[{index}] must be an object")
+            raise MCPProtocolError(f"MCP content[{index}] must be an object")
         if item.get("type") == "text":
             if type(item.get("text")) is not str:
-                return make_error_result(
+                raise MCPProtocolError(
                     f"invalid MCP content[{index}].text: must be a string"
                 )
             blocks.append(text_block(item["text"]))
@@ -107,22 +107,22 @@ def translate_call_result(value: object) -> StructuredToolResult:
         try:
             block = validate_tool_content_block(index, item)
         except ValueError as exc:
-            return make_error_result(f"invalid MCP content[{index}]: {exc}")
+            raise MCPProtocolError(f"invalid MCP content[{index}]: {exc}") from exc
         if block["type"] == "text":
             blocks.append(text_block(block["text"]))
         else:
             blocks.append(block)
     is_error = value.get("isError", False)
     if type(is_error) is not bool:
-        return make_error_result("MCP tool result isError must be a boolean")
+        raise MCPProtocolError("MCP tool result isError must be a boolean")
     structured = value.get("structuredContent")
     if structured is not None:
         if type(structured) is not dict:
-            return make_error_result("MCP structuredContent must be an object")
+            raise MCPProtocolError("MCP structuredContent must be an object")
         try:
             _validate_json_value(structured)
         except ValueError as exc:
-            return make_error_result(f"MCP structuredContent is invalid: {exc}")
+            raise MCPProtocolError(f"MCP structuredContent is invalid: {exc}") from exc
         structured_content = structured
     else:
         structured_content = None
@@ -156,7 +156,11 @@ def parse_rpc_response(value: object, request_id: int) -> dict[str, object]:
     if error is not None:
         if type(error) is not dict:
             raise MCPProtocolError("MCP JSON-RPC error must be an object")
-        raise MCPProtocolError(str(error.get("message", "unknown MCP error")))
+        code = error.get("code")
+        message = error.get("message")
+        if type(code) is not int or type(message) is not str:
+            raise MCPProtocolError("MCP JSON-RPC error has an invalid shape")
+        return make_error_result(message)
     result = value.get("result")
     if type(result) is not dict:
         raise MCPProtocolError("MCP JSON-RPC response result must be an object")

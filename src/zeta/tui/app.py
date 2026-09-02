@@ -88,8 +88,7 @@ from .theme import (
     COMMAND,
     COMPOSER_BORDER,
     COMPOSER_FOCUS,
-    DIM,
-    RICH_THEME,
+    DIM, ERROR, RICH_THEME,
 )
 from .todo import TodoWidget
 from .transcript import TranscriptWidget, stream_key
@@ -223,6 +222,7 @@ class TUIApp(
             lambda renderable: self._print(renderable),
         )
         self.loop.set_background_event_sink(self._handle_background_event)
+        self.loop.set_mcp_notice_sink(lambda message: background_notice(self, message))
         self._fork_rebuilt = False
 
     @property
@@ -746,7 +746,7 @@ class TUIApp(
         self._thinking_duration = self._thinking_started_at = None
 
     def _print_system(self, output: str) -> None:
-        self._print_unit(Text(f"system · {output}", style=CHROME))
+        self._print_unit(Text(f"system · {output}", style=ERROR if output.startswith("mcp error:") else CHROME))
 
     def _print_hook_notice(self, output: str) -> None:
         self._print_unit(Text(f"hook · {output}", style=DIM))

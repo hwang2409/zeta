@@ -7,13 +7,25 @@ from .config import (
     MCPServerConfig,
     default_config_path,
     load_mcp_config,
+    mcp_log_path,
 )
 from .http import StreamableHTTPMCPClient
-from .mount import MCPMount, mount_mcp_servers
+from .mount import MCPMount, MCPServerState, MCPServerStatus, mount_mcp_servers
 from .stdio import StdioMCPClient
 
 __all__ = [
-    "MCPClient", "MCPConfig", "MCPConfigError", "MCPMount", "MCPServerConfig",
-    "MCPTool", "StdioMCPClient", "StreamableHTTPMCPClient", "default_config_path",
-    "load_mcp_config", "mount_mcp_servers",
+    "MCPClient",
+    "MCPConfig",
+    "MCPConfigError",
+    "MCPMount",
+    "MCPServerConfig",
+    "MCPServerState",
+    "MCPServerStatus",
+    "MCPTool",
+    "StdioMCPClient",
+    "StreamableHTTPMCPClient",
+    "default_config_path",
+    "load_mcp_config",
+    "mcp_log_path",
+    "mount_mcp_servers",
 ]

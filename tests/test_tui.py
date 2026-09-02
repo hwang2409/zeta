@@ -48,7 +48,7 @@ from zeta.core.store import ConversationStore
 from zeta.providers.anthropic import AnthropicBackend, AnthropicCredentialStore, OAuthTokens
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
 from zeta.tools import ToolStreamPublisher
-from zeta.tui.app import FullScreenPromptSession, TUIApp
+from zeta.tui.app import FullScreenPromptSession, TUIApp, background_notice
 from zeta.tui.agent_card import AgentCard
 from zeta.tui.composer import (
     UndoCandidate,
@@ -78,7 +78,7 @@ from zeta.tui.render import (
     tool_render_mode,
     _render_tool_output,
 )
-from zeta.tui.theme import ACCENT, BODY, DIM, RICH_THEME
+from zeta.tui.theme import ACCENT, BODY, DIM, ERROR, RICH_THEME
 from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
 from zeta.types import (
     CompletionBackend,
@@ -107,6 +107,38 @@ def _test_console(output: StringIO | None = None, *, width: int = 80) -> Console
         width=width,
         theme=RICH_THEME,
     )
+
+
+def test_mcp_background_notice_is_dim_in_forced_terminal() -> None:
+    output = StringIO()
+    console = _test_console(output)
+    rendered: list[Text] = []
+
+    def print_notice(value: Text) -> None:
+        rendered.append(value)
+        console.print(value)
+
+    background_notice(
+        SimpleNamespace(_print=print_notice, _invalidate_prompt=lambda: None),
+        "mcp · server mounted",
+    )
+
+    assert rendered[0].style == DIM
+    assert "\x1b[" in output.getvalue()
+
+
+def test_mcp_slash_error_uses_error_style(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path), skip_mcp_mount=True),
+        provider="fake",
+        model="offline",
+    )
+    rendered: list[Text] = []
+    app._presenter.print_unit = lambda value: rendered.append(value)
+
+    app._print_system("mcp error: unknown MCP server: absent")
+
+    assert rendered[0].style == ERROR
 
 
 def test_background_agent_card_survives_parent_tool_completion() -> None:
@@ -5880,7 +5912,7 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
     async def observe_tool_spinner() -> tuple[int, int, str]:
         await tool_started.wait()
         frame_before = app._spinner_frame
-        await asyncio.sleep(0.75)
+        await wait_until(lambda: app._spinner_frame > frame_before)
         frame_after = app._spinner_frame
         toolbar = "".join(value for _, value in app._status_toolbar())
         return frame_before, frame_after, toolbar
@@ -5890,9 +5922,8 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
     )
     await backend.second_started.wait()
     starting_frame = app._spinner_frame
-    await asyncio.sleep(0.06)
     first_provider_frame = app._spinner_frame
-    await asyncio.sleep(0.39)
+    await wait_until(lambda: app._spinner_frame - starting_frame >= 2)
     ending_frame = app._spinner_frame
     backend.release_second.set()
     await turn
