@@ -183,6 +183,7 @@ class TUIApp(
         self._spinner_reset = asyncio.Event()
         self._abort_requested = False
         self._macro_abort_signal = self._macro_call_id = None
+        self._inline_abort_signal = None
         self._macro_receipts = deque()
         self._input_loop_active = False
         self._resuming_tool = False

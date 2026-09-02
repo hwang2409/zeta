@@ -24,6 +24,9 @@ from ..mcp.prompt_commands import (
 from .store import ConversationEntry
 
 COMMAND_FILE_SIZE_LIMIT = 64 * 1024
+INLINE_SHELL_RE = re.compile(r"!`([^`\n]+)`")
+
+InlineShellRunner = Callable[[tuple[str, ...]], Awaitable[tuple[str, ...]]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +40,7 @@ class CustomCommand:
     source: str
     kind: str = "prompt"
     timeout: float = 300.0
+    background: bool = False
 
     def render(self, arguments: str) -> str:
         """Substitute the raw argument tail and positional arguments."""
@@ -124,6 +128,7 @@ def _read_command(path: Path, source: str) -> tuple[CustomCommand | None, str | 
         if type(kind) is not str or kind not in {"prompt", "exec"}:
             raise ValueError(f"unknown command kind: {kind!r}")
         timeout_value = 300.0
+        background = False
         if kind == "exec":
             timeout = metadata.get("timeout", 300.0)
             try:
@@ -137,6 +142,10 @@ def _read_command(path: Path, source: str) -> tuple[CustomCommand | None, str | 
                 or timeout_value <= 0
             ):
                 raise ValueError("timeout must be a positive finite number")
+            background_value = metadata.get("background", False)
+            if type(background_value) is not bool:
+                raise ValueError("background must be a boolean")
+            background = background_value
         if not body:
             raise ValueError("prompt body is empty")
     except (
@@ -155,6 +164,7 @@ def _read_command(path: Path, source: str) -> tuple[CustomCommand | None, str | 
         source,
         kind,
         timeout_value,
+        background,
     ), None
 
 
@@ -826,6 +836,32 @@ class SlashCommandRegistry:
             return value
         arguments = parts[1] if len(parts) == 2 else ""
         return command.render(arguments)
+
+    async def resolve_for_model(
+        self,
+        value: str,
+        inline_shell: InlineShellRunner,
+    ) -> str:
+        """Expand a prompt macro and resolve its inline shell spans."""
+
+        rendered = self.input_for_model(value)
+        first_line = value.split("\n", 1)[0]
+        if not first_line.startswith("/") or first_line.startswith("//"):
+            return rendered
+        parts = first_line[1:].split(maxsplit=1)
+        if not parts:
+            return rendered
+        command = self._custom_commands.get(parts[0])
+        if command is None or command.kind != "prompt":
+            return rendered
+        matches = tuple(INLINE_SHELL_RE.finditer(rendered))
+        if not matches:
+            return rendered
+        replacements = await inline_shell(tuple(match.group(1) for match in matches))
+        if len(replacements) != len(matches):
+            raise ValueError("inline shell resolver returned the wrong result count")
+        replacement_iter = iter(replacements)
+        return INLINE_SHELL_RE.sub(lambda _match: next(replacement_iter), rendered)
 
     def help_text(self) -> str:
         """Format the built-in and loaded custom commands for /help."""

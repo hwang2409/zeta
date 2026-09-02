@@ -339,6 +339,8 @@ def _tool_receipt(event: StreamEvent) -> Text:
             status = "denied"
         elif structured.get("timed_out") is True:
             status = "timeout"
+        elif structured.get("status") == "running":
+            status = "running"
         else:
             exit_code = structured.get("exit_code")
             status = f"exit {exit_code}" if exit_code is not None else "failed"

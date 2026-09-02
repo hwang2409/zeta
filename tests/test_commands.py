@@ -26,7 +26,7 @@ from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.tools import ToolRegistry
-from zeta.tools.exec import MacroDisplay, run_exec_macro
+from zeta.tools.exec import MacroDisplay, run_exec_macro, run_inline_shell_batch
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import (
     FullScreenPromptSession,
@@ -477,6 +477,179 @@ async def test_custom_command_becomes_the_model_user_message(
         if message.role.value == "user"
     )
     assert user_message.content[0].text == "Review changes"
+
+
+async def test_prompt_macro_resolves_inline_shell_and_template_attachments(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    notes = tmp_path / "notes.txt"
+    image = tmp_path / "image.png"
+    notes.write_text("template note", encoding="utf-8")
+    image.write_bytes(
+        bytes.fromhex(
+            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+            "0000000d49444154789c6360606000000004000000a6f645"
+            "0000000049454e44ae426082"
+        )
+    )
+    _write_command(
+        home / "commands",
+        "inspect",
+        "read !`printf shell-value` @./notes.txt @./image.png",
+    )
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+        ),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+
+    await app._handle_prompt_value("/inspect")
+    await app._active_task
+
+    user_message = next(
+        message
+        for message in backend.calls[0][0]
+        if message.role.value == "user"
+    )
+    assert user_message.content[0].text == "read shell-value @./notes.txt @./image.png"
+    assert any(
+        isinstance(block, TextContent) and block.text.endswith("template note")
+        for block in user_message.content
+    )
+    assert any(block.type.value == "image" for block in user_message.content)
+
+
+async def test_inline_shell_approval_covers_the_complete_batch(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_command(
+        home / "commands",
+        "inspect",
+        "values !`printf first` and !`printf second`",
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        approval_policy=policy,
+        console=Console(file=output, force_terminal=True, width=120),
+    )
+
+    task = asyncio.create_task(app._handle_prompt_value("/inspect"))
+    for _ in range(100):
+        if app.pending_approvals:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("inline shell approval did not appear")
+    assert len(app.pending_approvals) == 1
+    assert "printf first" in output.getvalue()
+    assert "printf second" in output.getvalue()
+    assert policy.approve(app.pending_approvals[0].key)
+    await task
+    await app._active_task
+
+    user_message = next(
+        message
+        for message in backend.calls[0][0]
+        if message.role.value == "user"
+    )
+    assert user_message.content[0].text == "values first and second"
+
+
+async def test_inline_shell_failure_and_output_are_bounded(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_command(
+        home / "commands",
+        "inspect",
+        "bad !`sh -c 'printf bad >&2; exit 4'` long !`printf '%020000d' 1`",
+    )
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+        ),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+
+    await app._handle_prompt_value("/inspect")
+    await app._active_task
+    user_message = next(
+        message
+        for message in backend.calls[0][0]
+        if message.role.value == "user"
+    )
+    assert "[inline shell failed: exit 4]" in user_message.content[0].text
+    assert len(user_message.content[0].text) < 10_000
+    assert await run_inline_shell_batch(
+        ToolRegistry(tmp_path),
+        ("sleep 1",),
+        lifecycle_sink=lambda _kind, _call: None,
+        timeout=0.01,
+    ) == ("[inline shell failed: timed out]",)
+
+
+async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(
+        home / "commands",
+        "background",
+        "---\nkind: exec\nbackground: true\n---\nprintf complete\n",
+    )
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=output, force_terminal=True),
+    )
+
+    await app._handle_prompt_value("/background")
+    assert "/background · running" in output.getvalue()
+    await app.loop._background_owner.wait()
+    assert store.agent_notifications()[0].data["status"] == "completed"
+
+    await app._handle_prompt_value("continue")
+    await app._active_task
+    assert "background · /background · completed" in output.getvalue()
+
+    slow_home = tmp_path / "slow-home"
+    _write_command(
+        slow_home / "commands",
+        "slow",
+        "---\nkind: exec\nbackground: true\n---\nsleep 30\n",
+    )
+    slow_store = ConversationStore(tmp_path / "slow-sessions", cwd=tmp_path)
+    slow_app = TUIApp(
+        AgentLoop(FakeBackend([]), slow_store),
+        provider="fake",
+        model="offline",
+        zeta_home=slow_home,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    await slow_app._handle_prompt_value("/slow")
+    await slow_app.loop.close()
+    assert slow_store.agent_notifications()[0].data["status"] == "canceled"
 
 
 def test_exec_kind_loads_and_unknown_kind_fails_open(tmp_path: Path) -> None:

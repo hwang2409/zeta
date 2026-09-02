@@ -569,6 +569,7 @@ class ToolRegistry:
         _lifecycle_sink: ToolLifecycleSink | None = None,
         _persist_approval: bool = True,
         _log_path: str | Path | None = None,
+        _background: bool = False, _capture_output: bool = False, _skip_approval: bool = False,
     ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
         if _boundary_signal is not None and _signal_is_set(_boundary_signal):
@@ -614,7 +615,7 @@ class ToolRegistry:
             signal_state,
             lambda current: self._next_abort_generation(current, _scope_signal),
             _lifecycle_sink,
-            skip_approval=not definition.requires_approval,
+            skip_approval=_skip_approval or not definition.requires_approval,
             persist_request=_persist_approval,
         )
         if gate_result is not None:
@@ -637,9 +638,7 @@ class ToolRegistry:
         )
         execution_context = ToolExecutionContext(tool_call, self._agent_runner, _lifecycle_sink)
         handler = _bind_execution_context(definition.handler, execution_context)
-        execution_arguments = dict(arguments)
-        if _log_path is not None:
-            execution_arguments["_log_path"] = str(_log_path)
+        execution_arguments = dict(arguments, **({"_log_path": str(_log_path), "_background": _background, "_capture_output": _capture_output} if _log_path is not None or _background or _capture_output else {}))
         result = await self._invoke_handler_with_abort(
             handler,
             execution_arguments,

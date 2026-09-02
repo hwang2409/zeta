@@ -200,7 +200,9 @@ class SubmissionMixin:
                 self._print_system(slash_output)
             return
         else:
-            model_input = self._slash_commands.input_for_model(parsed)
+            model_input = await self._slash_commands.resolve_for_model(
+                parsed, self._resolve_inline_shell
+            )
         pending_attachments = list(submission.attachment_paths)
         pending_attachment_tokens = dict(submission.attachment_tokens)
         user_message = self._prepare_user_message(

@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ..core.abort import AbortSignal
 from ..types import (
@@ -28,6 +29,9 @@ from .registry import (
     _ToolCanceled,
     validate_tool_result,
 )
+
+INLINE_SHELL_TIMEOUT = 10.0
+INLINE_SHELL_OUTPUT_LIMIT = 8_192
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +163,33 @@ async def _exec(
     timeout = arguments.get("timeout", 30.0)
     output_limit = arguments.get("max_output", registry.max_output_chars)
     log_path = arguments.get("_log_path")
+    if arguments.get("_background") is True:
+        task_id, pid = await registry.background_tasks.start(
+            arguments["command"],
+            registry.cwd,
+            log_path=log_path,
+        )
+        return _success_result(
+            {
+                "type": "text",
+                "text": f"background task {task_id} started (pid {pid})",
+                "truncated": False,
+                "full_size": len(
+                    f"background task {task_id} started (pid {pid})".encode()
+                ),
+            },
+            structured_content={
+                "status": "running",
+                "task_id": task_id,
+                "pid": pid,
+                "cwd": str(registry.cwd),
+                **(
+                    {"log_path": str(log_path)}
+                    if log_path is not None
+                    else {}
+                ),
+            },
+        )
     log_handle = (
         await asyncio.to_thread(Path(log_path).open, "wb")
         if log_path is not None
@@ -221,32 +252,49 @@ async def _exec(
                     stdout_full_size=stdout_capture.full_size,
                     stderr_full_size=stderr_capture.full_size,
                 )
+                structured_content = {
+                    "exit_code": process.returncode,
+                    "cwd": str(registry.cwd),
+                    **(
+                        {"log_path": str(log_path)}
+                        if log_path is not None
+                        else {}
+                    ),
+                }
+                if arguments.get("_capture_output") is True:
+                    structured_content.update(
+                        {
+                            "stdout": stdout_capture.data.decode(errors="replace"),
+                            "stderr": stderr_capture.data.decode(errors="replace"),
+                        }
+                    )
                 if process.returncode:
                     return {
                         "content": [result],
                         "isError": True,
-                        "structuredContent": {
-                            "exit_code": process.returncode,
-                            "cwd": str(registry.cwd),
-                            **(
-                                {"log_path": str(log_path)}
-                                if log_path is not None
-                                else {}
-                            ),
-                        },
+                        "structuredContent": structured_content,
                     }
                 return _success_result(
                     result,
-                    structured_content={
-                        "exit_code": process.returncode,
-                        "cwd": str(registry.cwd),
-                        **({"log_path": str(log_path)} if log_path is not None else {}),
-                    },
+                    structured_content=structured_content,
                 )
             if timeout_wait in done:
                 break
 
         await _kill_and_reap(process, process_tasks)
+        structured_content = {
+            "timed_out": True,
+            "exit_code": process.returncode,
+            "cwd": str(registry.cwd),
+            **({"log_path": str(log_path)} if log_path is not None else {}),
+        }
+        if arguments.get("_capture_output") is True:
+            structured_content.update(
+                {
+                    "stdout": stdout_capture.data.decode(errors="replace"),
+                    "stderr": stderr_capture.data.decode(errors="replace"),
+                }
+            )
         return {
             "content": [
                 _format_exec_result(
@@ -260,12 +308,7 @@ async def _exec(
                 )
             ],
             "isError": True,
-            "structuredContent": {
-                "timed_out": True,
-                "exit_code": process.returncode,
-                "cwd": str(registry.cwd),
-                **({"log_path": str(log_path)} if log_path is not None else {}),
-            },
+            "structuredContent": structured_content,
         }
     except asyncio.CancelledError:
         await _kill_and_reap(process, process_tasks)
@@ -290,6 +333,7 @@ async def run_exec_macro(
     stream_sink: Callable[[StreamEvent], None],
     lifecycle_sink: Callable[[str], None],
     abort_signal: AbortSignal | None = None,
+    background: bool = False,
 ) -> ToolResult:
     """Run an approved macro without persisting tool conversation entries."""
 
@@ -304,6 +348,7 @@ async def run_exec_macro(
             _lifecycle_sink=lifecycle_sink,
             _persist_approval=False,
             _log_path=log_path,
+            _background=background,
         )
         result = validate_tool_result(raw_result)
         structured = dict(result["structuredContent"] or {})
@@ -323,6 +368,94 @@ async def run_exec_macro(
             True,
             structured_content={"log_path": str(log_path)},
         )
+
+
+async def run_inline_shell_batch(
+    registry: ToolRegistry,
+    commands: tuple[str, ...],
+    *,
+    lifecycle_sink: Callable[[str, ToolCall], None],
+    abort_signal: AbortSignal | None = None,
+    timeout: float = INLINE_SHELL_TIMEOUT,
+    output_limit: int = INLINE_SHELL_OUTPUT_LIMIT,
+) -> tuple[str, ...]:
+    """Run inline shell spans with one approval for the complete batch."""
+
+    if not commands:
+        return ()
+    scope_signal = abort_signal or registry.abort_signal.registry.new_generation()
+    first_call_id = f"inline-{uuid4().hex}"
+    register_macro_display(first_call_id, command="\n".join(commands), argv=())
+    outputs: list[str] = []
+    try:
+        for index, command in enumerate(commands):
+            call_id = first_call_id if index == 0 else f"inline-{uuid4().hex}"
+            call = ToolCall(
+                call_id,
+                "exec",
+                {
+                    "command": command,
+                    "timeout": timeout,
+                    "max_output": output_limit,
+                },
+            )
+            result = await registry.execute(
+                call,
+                abort_signal=scope_signal,
+                _scope_signal=scope_signal,
+                _persist_approval=False,
+                _capture_output=True,
+                _skip_approval=index > 0,
+                _lifecycle_sink=(
+                    lambda kind, call=call: lifecycle_sink(kind, call)
+                    if kind in {"approval_start", "approval_end"}
+                    else None
+                )
+                if index == 0
+                else None,
+            )
+            structured = result.get("structuredContent")
+            if result.get("isError") is not True and isinstance(structured, dict):
+                stdout = structured.get("stdout")
+                if isinstance(stdout, str):
+                    outputs.append(stdout)
+                    continue
+            outputs.append(_inline_shell_failure(result))
+            if _inline_shell_was_canceled(result):
+                outputs.extend("[inline shell failed: canceled]" for _ in commands[index + 1 :])
+                break
+    finally:
+        if registry.approval_policy is not None:
+            registry.approval_policy.forget_ephemeral(first_call_id)
+        forget_macro_display(first_call_id)
+    return tuple(outputs)
+
+
+def _inline_shell_was_canceled(result: StructuredToolResult) -> bool:
+    content = result.get("content")
+    return result.get("isError") is True and isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("text") == "tool execution canceled"
+        for block in content
+    )
+
+
+def _inline_shell_failure(result: StructuredToolResult) -> str:
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict) and structured.get("timed_out") is True:
+        reason = "timed out"
+    elif isinstance(structured, dict) and isinstance(structured.get("exit_code"), int):
+        reason = f"exit {structured['exit_code']}"
+    else:
+        content = result.get("content")
+        content_text = (
+            content[0].get("text")
+            if isinstance(content, list)
+            and content
+            and isinstance(content[0], dict)
+            else None
+        )
+        reason = "denied" if content_text == "tool execution denied" else "canceled"
+    return f"[inline shell failed: {reason}]"
 
 
 def register(registry: ToolRegistry) -> None:
