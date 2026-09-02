@@ -7,6 +7,7 @@ from typing import Any
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
+from ..model_catalog import known_model_names
 from ..types import Message, MessageRole, ToolCall, ToolUseContent
 from .agent_presets import (
     AgentType,
@@ -221,7 +222,8 @@ def register(registry: ToolRegistry) -> None:
             "Delegate multi-step exploration or research that would pollute the "
             "main context. The child has its own bounded context and may spawn "
             "one level of grandchildren, but grandchildren cannot spawn agents. "
-            "Built-in types: "
+            "Pass model to run the child on another provider's model and "
+            "orchestrate it from here. Built-in types: "
             f"{agent_type_description()}"
         ),
         parameters={
@@ -233,6 +235,16 @@ def register(registry: ToolRegistry) -> None:
                     "type": "string",
                     "enum": agent_type_names(),
                     "description": agent_type_description(),
+                },
+                "model": {
+                    "type": "string",
+                    "enum": known_model_names(),
+                    "description": (
+                        "Run the child on this model instead of inheriting the "
+                        "parent's. The provider follows from the model, so this "
+                        "is how one provider delegates to another. Implies "
+                        "background unless background is passed explicitly."
+                    ),
                 },
                 "background": {
                     "type": "boolean",

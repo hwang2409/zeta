@@ -12,6 +12,8 @@ from .agent_budget import MAX_AGENT_DEPTH, SharedTurnBudget
 from .agent_budget import child_depth as next_agent_depth
 from .core.abort import AbortSignal as ToolAbortSignal
 from .core.store import ConversationStore
+from .model_catalog import provider_for_model
+from .providers.factory import build_backend, credential_store
 from .tools import ToolStreamPublisher
 from .tools.agent import ChildApprovalPolicy
 from .tools.agent_presets import (
@@ -22,6 +24,7 @@ from .tools.agent_presets import (
 )
 from .tools.registry import ToolExecutionContext
 from .types import (
+    CompletionBackend,
     Message,
     MessageRole,
     StreamEvent,
@@ -155,6 +158,41 @@ async def consume_child(
     return child_result(final_text, error=False)
 
 
+def resolve_child_backend(
+    loop: AgentLoop,
+    model: object,
+) -> tuple[CompletionBackend | None, str | None]:
+    """Pick the backend a child runs on, returning an error message instead of raising.
+
+    Without a model the child inherits the parent's backend, which is what every
+    agent did before cross-provider spawning existed.
+    """
+
+    if model is None:
+        return loop.backend, None
+    if type(model) is not str or not model.strip():
+        return None, "agent error: model must be a nonempty string"
+    try:
+        provider = provider_for_model(model)
+    except ValueError as exc:
+        return None, f"agent error: {exc}"
+    # Check credentials up front: the alternative is a child that spawns, burns a
+    # turn, and dies on an auth error the parent cannot act on.
+    store = credential_store(provider)
+    if store is not None:
+        tokens = store.read()
+        if tokens is None or not tokens.is_valid():
+            return None, (
+                f"agent error: not logged in to {provider}; "
+                f"run zeta login --provider {provider}"
+            )
+    try:
+        backend, _ = build_backend(provider, model)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, f"agent error: could not start {provider} backend: {exc}"
+    return backend, None
+
+
 async def run_agent_tool(
     loop: AgentLoop,
     tool_call: ToolCall,
@@ -168,7 +206,10 @@ async def run_agent_tool(
     prompt = arguments.get("prompt")
     description = arguments.get("description")
     agent_type = arguments.get("agent_type", GENERAL_PRESET.name)
-    background = arguments.get("background", False)
+    model = arguments.get("model")
+    # A run on someone else's model is the long kind, so it defaults to
+    # background; an explicit background argument still wins.
+    background = arguments.get("background", model is not None)
     if type(prompt) is not str or not prompt.strip():
         return loop._child_result_payload(
             tool_call.id,
@@ -185,6 +226,13 @@ async def run_agent_tool(
         return loop._child_result_payload(
             tool_call.id,
             "agent error: background must be a boolean",
+            error=True,
+        )
+    child_backend, backend_error = resolve_child_backend(loop, model)
+    if backend_error is not None:
+        return loop._child_result_payload(
+            tool_call.id,
+            backend_error,
             error=True,
         )
     child_depth, nesting_error = next_agent_depth(loop.agent_depth, background)
@@ -260,7 +308,7 @@ async def run_agent_tool(
     from .loop import AgentLoop
 
     child_loop = AgentLoop(
-        loop.backend,
+        child_backend,
         child_store,
         registry=child_registry,
         max_turns=preset.turn_cap,
