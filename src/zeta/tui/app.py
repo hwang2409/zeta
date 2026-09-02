@@ -29,7 +29,12 @@ from ..core.project_context import (
     load_project_context,
 )
 from ..core.session import SessionError, SessionManager, env_home
-from ..core.slash import UsageTracker, create_slash_registry
+from ..core.slash import (
+    UsageTracker,
+    context_window,
+    create_slash_registry,
+    resolve_session_budget,
+)
 from ..loop import AgentLoop
 from ..persistence import DraftPersistence, history_for
 from ..providers.anthropic import AnthropicBackend, AnthropicCredentialStore
@@ -151,6 +156,7 @@ class TUIApp(
         on_model_change: Callable[[str], None] | None = None,
         vim_mode: bool = True,
         on_vim_mode_change: Callable[[bool], None] | None = None,
+        on_budget_change: Callable[[int], None] | None = None,
         model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
     ) -> None:
         self.loop = loop
@@ -205,6 +211,7 @@ class TUIApp(
         self._on_model_change = on_model_change
         self.vim_mode = vim_mode
         self._on_vim_mode_change = on_vim_mode_change
+        self._on_budget_change = on_budget_change
         self._model_catalog_loader = model_catalog_loader or _load_model_catalog
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
@@ -543,7 +550,7 @@ class TUIApp(
             width=width,
             spinner_frame=self._spinner_frame,
             spinner_active=self._spinner_active,
-            model_window=self.loop.context_assembler.token_budget,
+            model_window=context_window(self.provider, self.model),
             vim_state=vim_state_label(self.vim_mode),
             background_count=self.loop.tool_registry.background_tasks.running_count,
             undo_available=(
@@ -1006,12 +1013,17 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             repo_root=discover_repo_root(Path.cwd()),
             zeta_home=home,
         )
+        created_budget, created_pin = resolve_session_budget(
+            0, False, provider, selected_model, getattr(args, "token_budget", None)
+        )
         opened = manager.create(
             provider=provider,
             model=selected_model,
             cwd=Path.cwd(),
+            compaction_budget=created_budget,
             system_prompt=project_context.system_prompt,
             context_files=[str(path) for path in project_context.files],
+            budget_pinned=created_pin,
         )
         metadata = opened.metadata
         store = opened.store
@@ -1048,12 +1060,20 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             return
         manager.record_override(metadata, provider=None, model=model_name)
 
-    token_budget_override = getattr(args, "token_budget", None)
-    effective_token_budget = (
-        token_budget_override
-        if token_budget_override is not None and token_budget_override > 0
-        else max(metadata.compaction_budget, 200_000)
+    effective_token_budget, budget_pinned = resolve_session_budget(
+        metadata.compaction_budget,
+        metadata.budget_pinned,
+        provider,
+        selected_model,
+        getattr(args, "token_budget", None),
     )
+    if (
+        effective_token_budget != metadata.compaction_budget
+        or budget_pinned != metadata.budget_pinned
+    ):
+        manager.record_budget(
+            metadata, budget=effective_token_budget, pinned=budget_pinned
+        )
     max_turns_override = getattr(args, "max_turns", None)
     loop_kwargs: dict[str, Any] = {
         "approval_policy": approval_policy,
@@ -1077,6 +1097,13 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         context_files=[str(path) for path in project_context.files],
         on_model_change=model_changed,
         vim_mode=metadata.vim_mode,
+        on_budget_change=(
+            None
+            if budget_pinned
+            else lambda budget: manager.record_budget(
+                metadata, budget=budget, pinned=False
+            )
+        ),
         on_vim_mode_change=lambda enabled: manager.record_vim_mode(
             metadata, enabled=enabled
         ),

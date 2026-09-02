@@ -884,7 +884,8 @@ async def test_forced_override_commits_after_first_successful_request(
     )
     assert create_slash_registry().dispatch(app, "/model claude-opus-4-1") == (
         "model: claude-opus-4-1 "
-        "(model catalog unavailable for claude — using anyway)"
+        "(model catalog unavailable for claude — using anyway; "
+        "context budget 1,000,000 -> 200,000)"
     )
     assert json.loads(
         (home / "sessions" / session_id / "meta.json").read_text()
@@ -1689,3 +1690,116 @@ def test_future_metadata_version_is_rejected(
 
     with pytest.raises(SessionError, match="unsupported session metadata version"):
         SessionManager(home).open(first.loop.store.session_id)
+
+
+def test_new_session_stores_the_model_derived_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider: None)
+    app = create_app(
+        build_parser().parse_args(
+            ["--provider", "claude", "--model", "claude-sonnet-4-6"]
+        )
+    )
+    session_id = app.loop.store.session_id
+    metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
+    assert metadata["compaction_budget"] == 1_000_000
+    assert metadata["budget_pinned"] is False
+    assert app.loop.context_assembler.token_budget == 1_000_000
+
+
+def test_unknown_model_falls_back_to_the_default_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    app = create_app(_args())
+    assert app.loop.context_assembler.token_budget == 200_000
+
+
+def test_token_budget_override_pins_and_survives_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider: None)
+    first = create_app(
+        build_parser().parse_args(
+            [
+                "--provider",
+                "claude",
+                "--model",
+                "claude-sonnet-4-6",
+                "--token-budget",
+                "12345",
+            ]
+        )
+    )
+    session_id = first.loop.store.session_id
+    assert first.loop.context_assembler.token_budget == 12345
+    metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
+    assert metadata["compaction_budget"] == 12345
+    assert metadata["budget_pinned"] is True
+
+    resumed = create_app(build_parser().parse_args(["--resume", session_id]))
+    assert resumed.loop.context_assembler.token_budget == 12345
+    assert resumed._on_budget_change is None
+
+
+def test_resume_retunes_an_unpinned_budget_to_the_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider: None)
+    session_id = create_app(
+        build_parser().parse_args(
+            ["--provider", "claude", "--model", "claude-opus-4-5"]
+        )
+    ).loop.store.session_id
+    assert json.loads(
+        (home / "sessions" / session_id / "meta.json").read_text()
+    )["compaction_budget"] == 200_000
+
+    resumed = create_app(
+        build_parser().parse_args(
+            [
+                "--resume",
+                session_id,
+                "--model",
+                "claude-sonnet-4-6",
+                "--force-provider",
+            ]
+        )
+    )
+    assert resumed.loop.context_assembler.token_budget == 1_000_000
+    assert json.loads(
+        (home / "sessions" / session_id / "meta.json").read_text()
+    )["compaction_budget"] == 1_000_000
+
+
+def test_model_command_leaves_a_pinned_budget_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.setattr("zeta.tui.app._load_model_catalog", lambda provider: None)
+    app = create_app(
+        build_parser().parse_args(
+            [
+                "--provider",
+                "claude",
+                "--model",
+                "claude-opus-4-5",
+                "--token-budget",
+                "9000",
+            ]
+        )
+    )
+    assert create_slash_registry().dispatch(app, "/model claude-sonnet-4-6") == (
+        "model: claude-sonnet-4-6 "
+        "(model catalog unavailable for claude — using anyway)"
+    )
+    assert app.loop.context_assembler.token_budget == 9000

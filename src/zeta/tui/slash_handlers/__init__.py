@@ -8,7 +8,12 @@ from __future__ import annotations
 
 from prompt_toolkit.enums import EditingMode
 
-from ...core.slash import MODEL_CONTEXT_WINDOWS, SlashStatus, compaction_history
+from ...core.slash import (
+    MODEL_CONTEXT_WINDOWS,
+    SlashStatus,
+    budget_for_model,
+    compaction_history,
+)
 from ...core.todo import todo_count_tuple
 from ..models import validate_model_name
 
@@ -87,9 +92,28 @@ class SlashHandlerMixin:
             self.loop.set_model(previous)
             return f"model unchanged: {exc}"
         self.model = model
-        if catalog_warning is not None:
-            return f"model: {model} ({catalog_warning})"
+        budget_note = self._retune_budget_for_model()
+        notes = [note for note in (catalog_warning, budget_note) if note]
+        if notes:
+            return f"model: {model} ({'; '.join(notes)})"
         return f"model: {model}"
+
+    def _retune_budget_for_model(self) -> str | None:
+        """Track the new model's context window unless the budget is pinned."""
+
+        if self._on_budget_change is None:
+            return None
+        budget = budget_for_model(self.provider, self.model)
+        assembler = self.loop.context_assembler
+        if budget == assembler.token_budget:
+            return None
+        previous = assembler.token_budget
+        try:
+            self._on_budget_change(budget)
+        except Exception as exc:
+            return f"context budget unchanged: {exc}"
+        assembler.token_budget = budget
+        return f"context budget {previous:,} -> {budget:,}"
 
     def slash_vim(self, args: str) -> str:
         requested = args.strip().lower()

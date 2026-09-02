@@ -328,6 +328,44 @@ MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int | None]] = {
     },
 }
 
+# Used when a model has no published window: unrecognized names, and the
+# entries above that are deliberately None.
+DEFAULT_TOKEN_BUDGET = 200_000
+
+
+def context_window(provider: str, model: str) -> int | None:
+    """Return a model's published context window, or None when unknown."""
+
+    return MODEL_CONTEXT_WINDOWS.get(provider, {}).get(model)
+
+
+def budget_for_model(provider: str, model: str) -> int:
+    """Return the compaction budget to use for one model."""
+
+    window = context_window(provider, model)
+    return DEFAULT_TOKEN_BUDGET if window is None else window
+
+
+def resolve_session_budget(
+    stored_budget: int,
+    stored_pin: bool,
+    provider: str,
+    model: str,
+    override: int | None,
+) -> tuple[int, bool]:
+    """Choose a session's budget and whether the choice is pinned.
+
+    An explicit --token-budget pins the value so later model changes never
+    overwrite it. Otherwise the budget tracks the model's window.
+    """
+
+    if override is not None and override > 0:
+        return override, True
+    if stored_pin:
+        return stored_budget, True
+    return budget_for_model(provider, model), False
+
+
 def context_fill_percent(
     token_count: int | None,
     model_window: int | None,
