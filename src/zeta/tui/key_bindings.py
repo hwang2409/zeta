@@ -130,6 +130,7 @@ def build_key_bindings(
     on_approve: Callable[[], None] | None = None,
     on_deny: Callable[[], None] | None = None,
     approval_active: Callable[[], bool] | None = None,
+    on_plan_toggle: Callable[[], None] | None = None,
     on_scroll_up: Callable[[], None] | None = None,
     on_scroll_down: Callable[[], None] | None = None,
 ) -> KeyBindings:
@@ -456,6 +457,20 @@ def build_key_bindings(
         def deny(event: KeyPressEvent) -> None:
             del event
             on_deny()
+
+    if on_plan_toggle is not None:
+        # Shift+Tab cycles modes in the harnesses people arrive from, so it
+        # toggles plan mode here. It stands down while the completion menu is
+        # open, where the terminal's own back-tab walks the list, and during
+        # either search, which takes the keyboard whole.
+        @bindings.add(
+            Keys.BackTab,
+            filter=~has_completions & ~transcript_search_mode & ~is_searching,
+            eager=True,
+        )
+        def toggle_plan_mode(event: KeyPressEvent) -> None:
+            del event
+            on_plan_toggle()
 
     # Terminals report the wheel as mouse events, which the transcript window
     # handles itself; these keys only exist for the few that send \x1b[62~ and

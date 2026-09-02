@@ -51,6 +51,7 @@ class SlashHandlerMixin:
             output_tokens_this_session=context_assembler.output_tokens_this_session,
             context_files=self._context_files,
             vim_mode=self.vim_mode,
+            plan_mode=self.loop.plan_mode,
             hooks=(() if self._hooks is None else self._hooks.status_entries),
             todo_counts=todo_count_tuple(items) if items else None,
             usage_history=self._usage_tracker.history,
@@ -97,6 +98,35 @@ class SlashHandlerMixin:
         if notes:
             return f"model: {model} ({'; '.join(notes)})"
         return f"model: {model}"
+
+    def slash_plan(self, args: str) -> str:
+        """Show or change plan mode, which restricts the agent to reading."""
+
+        requested = args.strip().lower()
+        if not args:
+            return f"plan mode: {'on' if self.loop.plan_mode else 'off'}"
+        if requested not in {"on", "off", "toggle"}:
+            return "plan mode unchanged: use /plan on, /plan off, or /plan toggle"
+        enabled = (
+            not self.loop.plan_mode if requested == "toggle" else requested == "on"
+        )
+        if enabled == self.loop.plan_mode:
+            return f"plan mode: {'on' if enabled else 'off'}"
+        if self.active or self.pending_approvals:
+            return (
+                "plan mode unchanged: cannot change plan mode while a turn or "
+                "approval is active"
+            )
+        self.loop.set_plan_mode(enabled)
+        self._invalidate_prompt()
+        if enabled:
+            return "plan mode: on (read-only tools until you approve a plan)"
+        return "plan mode: off"
+
+    def toggle_plan_mode(self) -> None:
+        """Toggle plan mode from the keyboard, reporting the same notice."""
+
+        self._print_system(self.slash_plan("toggle"))
 
     def _retune_budget_for_model(self) -> str | None:
         """Track the new model's context window unless the budget is pinned."""
