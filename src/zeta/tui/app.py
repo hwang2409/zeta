@@ -36,6 +36,7 @@ from ..core.slash import (
     resolve_session_budget,
 )
 from ..loop import AgentLoop
+from ..tools.plan_mode import EXIT_PLAN_MODE
 from ..persistence import DraftPersistence, history_for
 from ..providers.anthropic import AnthropicBackend, AnthropicCredentialStore
 from ..providers.codex import CodexBackend, CodexCredentialStore
@@ -539,6 +540,7 @@ class TUIApp(
             spinner_active=self._spinner_active,
             model_window=context_window(self.provider, self.model),
             vim_state=vim_state_label(self.vim_mode),
+            plan_state="PLAN" if self.loop.plan_mode else None,
             background_count=self.loop.tool_registry.background_tasks.running_count,
             undo_available=(
                 self._undo_candidate is not None
@@ -1020,7 +1022,9 @@ def create_app(args: argparse.Namespace) -> TUIApp:
     approval_default = (
         ApprovalDecision.ALLOW if getattr(args, "yolo", False) else ApprovalDecision.ASK
     )
-    approval_policy = ApprovalPolicy(store=store, default=approval_default)
+    approval_policy = ApprovalPolicy(
+        store=store, default=approval_default, always_ask={EXIT_PLAN_MODE}
+    )
     pending_override = None
     if resuming and mismatches:
         pending_override = (

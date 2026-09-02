@@ -580,6 +580,7 @@ class SlashStatus:
     output_tokens_this_session: int = 0
     context_files: tuple[str, ...] = ()
     vim_mode: bool = True
+    plan_mode: bool = False
     hooks: tuple[str, ...] = ()
     todo_counts: tuple[int, int, int] | None = None
     usage_history: tuple[UsageSnapshot, ...] = ()
@@ -594,6 +595,8 @@ class SlashSession(Protocol):
     def slash_model(self, args: str) -> str: ...
 
     def slash_vim(self, args: str) -> str: ...
+
+    def slash_plan(self, args: str) -> str: ...
 
     def slash_paste(self, args: str) -> str: ...
 
@@ -786,6 +789,7 @@ def _format_status(status: SlashStatus) -> str:
         f"provider: {status.provider}",
         f"model: {status.model}",
         f"vim_mode: {'on' if status.vim_mode else 'off'}",
+        f"plan_mode: {'on' if status.plan_mode else 'off'}",
         f"retained_tail: {status.retained_tail}",
         f"tokens_used_this_session: {status.tokens_used_this_session}",
         f"tokens_in_current_context: {context_tokens}",
@@ -875,6 +879,10 @@ def _run_vim(session: SlashSession, args: str) -> str:
     return session.slash_vim(args.strip())
 
 
+def _run_plan(session: SlashSession, args: str) -> str:
+    return session.slash_plan(args.strip())
+
+
 async def _run_compact(session: SlashSession, args: str) -> str:
     del args
     return await session.slash_compact()
@@ -903,6 +911,9 @@ def create_slash_registry(
     registry.register(SlashCommand("status", _run_status, "show session status"))
     registry.register(SlashCommand("model", _run_model, "show or change the model"))
     registry.register(SlashCommand("vim", _run_vim, "show or change vim mode"))
+    registry.register(
+        SlashCommand("plan", _run_plan, "show or change plan mode")
+    )
     registry.register(SlashCommand("paste", _run_paste, "paste an image"))
     registry.register(SlashCommand("compact", _run_compact, "compact the context"))
     registry.register(SlashCommand("checkpoint", _run_checkpoint, "save a checkpoint"))

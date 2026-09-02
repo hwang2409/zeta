@@ -48,11 +48,13 @@ class ApprovalPolicy:
         *,
         always_allow: Iterable[str] = (),
         always_deny: Iterable[str] = (),
+        always_ask: Iterable[str] = (),
         default: ApprovalDecision | str = ApprovalDecision.ASK,
         store: ConversationStore | None = None,
     ) -> None:
         self.always_allow = frozenset(always_allow)
         self.always_deny = frozenset(always_deny)
+        self.always_ask = frozenset(always_ask)
         self.default = _decision(default)
         self._store = store
         self._delegated: dict[
@@ -70,6 +72,8 @@ class ApprovalPolicy:
         del arguments
         if tool_name in self.always_deny:
             return ApprovalDecision.DENY
+        if tool_name in self.always_ask:
+            return ApprovalDecision.ASK
         if tool_name in self.always_allow:
             return ApprovalDecision.ALLOW
         return self.default

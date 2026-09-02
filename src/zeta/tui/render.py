@@ -42,6 +42,7 @@ from .theme import (
     COMMAND,
     DIM,
     ERROR,
+    PLAN_STATE,
     RECEIPT,
     THOUGHT,
     VIM_STATE,
@@ -995,6 +996,7 @@ def format_status(
     spinner_active: bool | None = None,
     model_window: int | None = None,
     vim_state: str | None = None,
+    plan_state: str | None = None,
     background_count: int = 0,
     undo_available: bool = False,
     transcript_navigation: bool = False,
@@ -1035,6 +1037,8 @@ def format_status(
     left_segments = [state_segment]
     if vim_state:
         left_segments.insert(0, vim_state)
+    if plan_state:
+        left_segments.insert(0, plan_state)
     if background_count > 0:
         left_segments.append(f"bg {background_count}")
     if transcript_position:
@@ -1104,9 +1108,14 @@ def format_status(
                     break
         candidates = (value,)
         if transcript_search is None:
-            candidates = (left, state_segment)
+            prefix = f"{plan_state}  " if plan_state else ""
+            candidates = (left, f"{prefix}{state_segment}")
             if vim_state and background_count > 0:
-                candidates = (left, f"{vim_state}  {state_segment}", state_segment)
+                candidates = (
+                    left,
+                    f"{prefix}{vim_state}  {state_segment}",
+                    f"{prefix}{state_segment}",
+                )
         for candidate_left in candidates:
             value = candidate_left
             for start in range(len(right_segments)):
@@ -1122,6 +1131,10 @@ def format_status(
             fitted.truncate(width, overflow="ellipsis")
             value = fitted.plain.rstrip(" ·")
     rendered = Text(value, style=CHROME)
-    if vim_state and value.startswith(vim_state):
-        rendered.stylize(VIM_STATE, 0, len(vim_state))
+    offset = 0
+    if plan_state and value.startswith(plan_state):
+        rendered.stylize(PLAN_STATE, 0, len(plan_state))
+        offset = len(plan_state) + 2
+    if vim_state and value[offset:].startswith(vim_state):
+        rendered.stylize(VIM_STATE, offset, offset + len(vim_state))
     return rendered

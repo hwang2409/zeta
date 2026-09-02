@@ -32,7 +32,13 @@ from .prompts import load_identity
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from .tools.agent import agent_result
 from .tools.agent_presets import (
+    compose_system_prompt,
     get_agent_preset,
+)
+from .tools.plan_mode import (
+    EXIT_PLAN_MODE,
+    PLAN_MODE_PREAMBLE,
+    PLAN_MODE_TOOLS,
 )
 from .tools.registry import (
     ToolExecutionContext,
@@ -257,8 +263,87 @@ class AgentLoop:
             self.hooks.bind_session(store.session_id)
             if self.tool_registry.pre_execute_hook is None:
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
+        self._plan_mode = False
+        self._plan_mode_prior_prompt: Message | None = None
+        self._plan_mode_prior_deny: frozenset[str] | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
+
+    @property
+    def plan_mode(self) -> bool:
+        return self._plan_mode
+
+    def set_plan_mode(self, enabled: bool) -> None:
+        """Restrict the assistant to read-only tools, or lift the restriction.
+
+        Both edges rewrite the system prompt and the advertised tools, which
+        Anthropic caches as one prefix, so each toggle costs a cache miss. That
+        is fine for an occasional mode change and is why nothing flips this
+        per turn.
+        """
+
+        if enabled == self._plan_mode:
+            return
+        assembler = self.context_assembler
+        if enabled:
+            self._plan_mode_prior_prompt = assembler.system_prompt
+            composed = compose_system_prompt(
+                assembler.system_prompt, PLAN_MODE_PREAMBLE
+            )
+            assert isinstance(composed, Message)
+            assembler.system_prompt = composed
+        elif self._plan_mode_prior_prompt is not None:
+            assembler.system_prompt = self._plan_mode_prior_prompt
+            self._plan_mode_prior_prompt = None
+        self._apply_plan_mode_denials(enabled)
+        self._plan_mode = enabled
+
+    def _apply_plan_mode_denials(self, enabled: bool) -> None:
+        """Deny the mutating tools outright, not just hide their schemas.
+
+        Withholding a schema stops a well-behaved model, not a determined one
+        replaying an older tool name, so plan mode also refuses the calls.
+        """
+
+        policy = self.tool_registry.approval_policy
+        if policy is None:
+            return
+        if enabled:
+            self._plan_mode_prior_deny = policy.always_deny
+            allowed = PLAN_MODE_TOOLS | {EXIT_PLAN_MODE}
+            policy.always_deny = policy.always_deny | {
+                name
+                for name in self.tool_registry.definitions_by_name
+                if name not in allowed
+            }
+        elif self._plan_mode_prior_deny is not None:
+            policy.always_deny = self._plan_mode_prior_deny
+            self._plan_mode_prior_deny = None
+
+    def _active_tool_schemas(self) -> list[ToolSchema]:
+        """Return the schemas this turn advertises, honoring plan mode."""
+
+        if not self._plan_mode:
+            return [
+                schema
+                for schema in self.tool_schemas
+                if schema.get("name") != EXIT_PLAN_MODE
+            ]
+        allowed = PLAN_MODE_TOOLS | {EXIT_PLAN_MODE}
+        return [
+            schema for schema in self.tool_schemas if schema.get("name") in allowed
+        ]
+
+    def _approved_plan_exit(self, calls: Sequence[ToolCall]) -> bool:
+        """Report whether this batch carried an approved exit_plan_mode call."""
+
+        for call in calls:
+            if call.name != EXIT_PLAN_MODE:
+                continue
+            result = self._existing_tool_result(call.id)
+            if result is not None and not result.is_error:
+                return True
+        return False
 
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
@@ -623,7 +708,9 @@ class AgentLoop:
                             "token_count": context.token_count,
                         },
                     )
-                completion = self.backend.complete(context_messages, self.tool_schemas)
+                completion = self.backend.complete(
+                    context_messages, self._active_tool_schemas()
+                )
                 async for event in completion:
                     self.context_assembler.observe_event(event)
                     if event.type is StreamEventType.ERROR:
@@ -752,6 +839,8 @@ class AgentLoop:
                     yield event
             finally:
                 await dispatch.aclose()
+            if self._plan_mode and self._approved_plan_exit(calls):
+                self.set_plan_mode(False)
             yield StreamEvent(
                 StreamEventType.TURN_END,
                 message=assistant_message,
