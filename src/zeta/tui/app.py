@@ -41,6 +41,8 @@ from ..loop import AgentLoop
 from ..persistence import DraftPersistence, history_for
 from ..providers.anthropic import AnthropicBackend, AnthropicCredentialStore
 from ..providers.codex import CodexBackend, CodexCredentialStore
+from ..providers.factory import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL
+from ..providers.factory import build_backend as build_network_backend
 from ..submission import Submission, SubmissionMixin, SubmissionQueue
 from ..types import (
     CompletionBackend,
@@ -92,8 +94,6 @@ from .todo import TodoWidget
 from .transcript import TranscriptWidget, stream_key
 from .transcript_presenter import TranscriptPresenter
 
-DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
-DEFAULT_CODEX_MODEL = "gpt-5.4"
 RECENT_SESSION_LIMIT = 20
 
 
@@ -116,23 +116,10 @@ def build_backend(
 ) -> tuple[CompletionBackend, str]:
     """Build the selected provider without loading network credentials for fake."""
 
-    auth_home = Path(home) if home is not None else env_home()
     if provider == "fake":
         selected_model = model or "offline"
         return FakeInteractiveBackend(model=selected_model), selected_model
-    if provider == "claude":
-        selected_model = model or DEFAULT_CLAUDE_MODEL
-        return AnthropicBackend(
-            model=selected_model,
-            token_store=AnthropicCredentialStore(auth_home / "anthropic-oauth.json"),
-        ), selected_model
-    if provider == "codex":
-        selected_model = model or DEFAULT_CODEX_MODEL
-        return CodexBackend(
-            model=selected_model,
-            token_store=CodexCredentialStore(auth_home / "codex-oauth.json"),
-        ), selected_model
-    raise ValueError(f"unsupported provider: {provider}")
+    return build_network_backend(provider, model, home=home)
 
 
 class TUIApp(

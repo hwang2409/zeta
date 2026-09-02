@@ -1999,3 +1999,233 @@ def test_resume_preserves_typed_child_receipt(tmp_path: Path) -> None:
     assert result.structured_content["agent_type"] == "explore"
     reopened_child = ConversationStore(store.session_dir / "agents", session_id="1")
     assert reopened_child.agent_type() == "explore"
+
+
+def _model_agent_call(
+    model: str = "gpt-5.4",
+    call_id: str = "agent-model-1",
+    **extra: object,
+) -> ToolCall:
+    arguments: dict[str, object] = {
+        "prompt": "inspect the task",
+        "description": "cross provider research",
+        "model": model,
+    }
+    arguments.update(extra)
+    return ToolCall(call_id, "agent", arguments)
+
+
+class _ValidTokens:
+    def is_valid(self, *, skew: float = 60) -> bool:
+        del skew
+        return True
+
+
+class _FakeCredentialStore:
+    """Stand in for an OAuth store without touching the real credential files."""
+
+    def __init__(self, tokens: object | None) -> None:
+        self._tokens = tokens
+
+    def read(self) -> object | None:
+        return self._tokens
+
+
+def _stub_backend_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    child_backend: CompletionBackend,
+    *,
+    tokens: object | None = None,
+) -> list[tuple[str, str | None]]:
+    """Record what the runner asks the factory for, and hand back child_backend."""
+
+    requested: list[tuple[str, str | None]] = []
+
+    def build(provider: str, model: str | None, **kwargs: object):
+        del kwargs
+        requested.append((provider, model))
+        return child_backend, model or ""
+
+    monkeypatch.setattr("zeta.agent_runner.build_backend", build)
+    monkeypatch.setattr(
+        "zeta.agent_runner.credential_store",
+        lambda provider, **kwargs: _FakeCredentialStore(
+            _ValidTokens() if tokens is None else tokens
+        ),
+    )
+    return requested
+
+
+def test_provider_for_model_maps_each_catalog_entry() -> None:
+    from zeta.model_catalog import PROVIDER_MODELS, provider_for_model
+
+    for provider, models in PROVIDER_MODELS.items():
+        for model in models:
+            assert provider_for_model(model) == provider
+
+
+def test_provider_for_model_rejects_an_unknown_name() -> None:
+    from zeta.model_catalog import provider_for_model
+
+    with pytest.raises(ValueError) as excinfo:
+        provider_for_model("gpt-nonexistent")
+    message = str(excinfo.value)
+    assert "gpt-nonexistent" in message
+    assert "claude-opus-5" in message
+
+
+def test_agent_schema_offers_every_known_model(tmp_path: Path) -> None:
+    from zeta.model_catalog import known_model_names
+
+    registry = ToolRegistry(tmp_path)
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    AgentLoop(FakeBackend([]), store, registry=registry)
+
+    agent_schema = next(
+        schema for schema in registry.schemas if schema["name"] == "agent"
+    )
+    model_schema = agent_schema["parameters"]["properties"]["model"]
+    assert model_schema["enum"] == known_model_names()
+    assert "claude-opus-5" in model_schema["enum"]
+    assert "gpt-5.4" in model_schema["enum"]
+
+
+@pytest.mark.asyncio
+async def test_agent_without_a_model_still_inherits_the_parent_backend(
+    tmp_path: Path,
+) -> None:
+    """The pre-existing spawn path must keep using loop.backend."""
+
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[_agent_call()]), ScriptedTurn([TextContent("done")])]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.content == "done"
+    # Parent and child both ran on the one backend, so it saw both turns.
+    assert len(backend.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_with_a_model_runs_the_child_on_that_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_backend = FakeBackend([ScriptedTurn([TextContent("codex done")])])
+    requested = _stub_backend_factory(monkeypatch, child_backend)
+    parent_backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[_model_agent_call(background=False)])]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(parent_backend, store, max_turns=1).run_turn("start"))
+
+    assert requested == [("codex", "gpt-5.4")]
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.content == "codex done"
+    # The child talked to the substitute, never to the parent's backend.
+    assert len(child_backend.calls) == 1
+    assert len(parent_backend.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_model_implies_background(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_backend = FakeBackend([ScriptedTurn([TextContent("codex done")])])
+    _stub_backend_factory(monkeypatch, child_backend)
+    parent_backend = FakeBackend([ScriptedTurn(tool_calls=[_model_agent_call()])])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(parent_backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.structured_content is not None
+    assert result.structured_content["status"] == "running"
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_rejects_an_unknown_model_before_spawning(tmp_path: Path) -> None:
+    """The schema enum catches a bad model name before the runner is reached."""
+
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[_model_agent_call(model="gpt-nonexistent")])]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.is_error
+    assert "model is not an allowed value" in result.content
+    assert not (store.session_dir / "agents").exists()
+
+
+def test_resolve_child_backend_guards_bad_models(tmp_path: Path) -> None:
+    """Second line of defence, for any caller that skips schema validation."""
+
+    from zeta.agent_runner import resolve_child_backend
+
+    parent_backend = FakeBackend([])
+    loop = AgentLoop(parent_backend, ConversationStore(tmp_path))
+
+    # No model at all keeps the parent's backend.
+    assert resolve_child_backend(loop, None) == (parent_backend, None)
+
+    backend, error = resolve_child_backend(loop, "gpt-nonexistent")
+    assert backend is None
+    assert error is not None and "unknown model" in error
+
+    backend, error = resolve_child_backend(loop, "")
+    assert backend is None
+    assert error is not None and "nonempty string" in error
+
+    backend, error = resolve_child_backend(loop, 7)
+    assert backend is None
+    assert error is not None and "nonempty string" in error
+
+
+@pytest.mark.asyncio
+async def test_agent_reports_a_missing_provider_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_backend = FakeBackend([ScriptedTurn([TextContent("unreachable")])])
+    _stub_backend_factory(monkeypatch, child_backend, tokens=None)
+    monkeypatch.setattr(
+        "zeta.agent_runner.credential_store",
+        lambda provider, **kwargs: _FakeCredentialStore(None),
+    )
+    backend = FakeBackend([ScriptedTurn(tool_calls=[_model_agent_call()])])
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.is_error
+    assert "not logged in to codex" in result.content
+    assert "zeta login --provider codex" in result.content
+    assert not child_backend.calls
+
+
+def test_agent_loop_turn_cap_allows_long_runs(tmp_path: Path) -> None:
+    """50 turns was too few for real work; the default has to clear it."""
+
+    import inspect
+
+    default = inspect.signature(AgentLoop.__init__).parameters["max_turns"].default
+    assert default == 150
+    assert AgentLoop(FakeBackend([]), ConversationStore(tmp_path)).max_turns == 150

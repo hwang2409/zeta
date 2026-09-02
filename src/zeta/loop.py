@@ -155,7 +155,7 @@ class AgentLoop:
         registry: ToolRegistry | None = None,
         approval_policy: ApprovalPolicy | None = None,
         tool_schemas: Sequence[ToolSchema] | None = None,
-        max_turns: int = 50,
+        max_turns: int = 150,
         context_assembler: ContextAssembler | None = None,
         system_prompt: str | Message | None = None,
         token_budget: int = 200_000,
