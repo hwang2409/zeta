@@ -19,6 +19,7 @@ from rich.table import Table
 from rich import box
 from mdit_py_plugins.tasklists import tasklists_plugin
 
+from ..tools.exec import MacroDisplay
 from ..types import (
     ErrorInfo,
     flatten_tool_content,
@@ -272,11 +273,15 @@ def render_approval_card(
     label: str | None = None,
     key: str | None = None,
     shortcut: bool = True,
+    trusted_display: MacroDisplay | None = None,
 ) -> Panel:
     """Render an inline permission-request card styled like Claude/Codex.
 
     `shortcut` marks the request the y/n keys answer: the rest have to be
     named, so they show their key instead of an affordance they do not have.
+
+    Display strings (`trusted_display`) are harness-side only; the arguments
+    dict is provider-visible and can never override what the card shows.
     """
 
     header = Text.assemble(
@@ -287,18 +292,21 @@ def render_approval_card(
     if key is not None:
         header.append(f"  [{key}]", style=DIM)
     body_parts: list[RenderableType] = [header]
-    command = arguments.get("display_command") or _command(arguments)
-    command = str(command) if command is not None else None
+    if trusted_display is not None:
+        command = trusted_display.command
+        argv: tuple[str, ...] = trusted_display.argv
+    else:
+        raw_command = _command(arguments)
+        command = str(raw_command) if raw_command is not None else None
+        argv = ()
     if command is not None:
         body_parts.append(Text(f"command={command}", style=DIM, overflow="fold"))
-        display_argv = arguments.get("display_argv")
-        if isinstance(display_argv, (list, tuple)):
+        if argv:
             body_parts.append(Text("argv:", style=DIM))
-            for index, value in enumerate(display_argv, 1):
-                if isinstance(value, str):
-                    body_parts.append(
-                        Text(f"  [{index}] {value}", style=DIM, overflow="fold")
-                    )
+            for index, value in enumerate(argv, 1):
+                body_parts.append(
+                    Text(f"  [{index}] {value}", style=DIM, overflow="fold")
+                )
     else:
         arg_line = _arguments(arguments)
         if arg_line:

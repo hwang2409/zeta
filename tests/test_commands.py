@@ -23,7 +23,7 @@ from zeta.core.slash import (
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.tools import ToolRegistry
-from zeta.tools.exec import run_exec_macro
+from zeta.tools.exec import MacroDisplay, run_exec_macro
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import (
     FullScreenPromptSession,
@@ -512,15 +512,18 @@ async def test_exec_macro_approval_is_ephemeral_and_uses_substituted_script(
 
 
 def test_exec_macro_approval_card_keeps_script_and_every_argv_value() -> None:
-    arguments = {
-        "command": "printf '%s\\n' \"$@\"",
-        "display_command": "printf '%s\\n' \"$@\"",
-        "display_argv": ["first-target", "second target", "$HOME"],
-    }
+    trusted = MacroDisplay(
+        "printf '%s\\n' \"$@\"",
+        ("first-target", "second target", "$HOME"),
+    )
 
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(
-        render_approval_card("exec", arguments)
+        render_approval_card(
+            "exec",
+            {"command": "sh -c 'printf ...'"},
+            trusted_display=trusted,
+        )
     )
 
     card = output.getvalue()
@@ -528,6 +531,70 @@ def test_exec_macro_approval_card_keeps_script_and_every_argv_value() -> None:
     assert "[1] first-target" in card
     assert "[2] second target" in card
     assert "[3] $HOME" in card
+
+
+def test_render_approval_card_ignores_provider_supplied_display_fields() -> None:
+    """Provider-injected display fields must never override the real command."""
+
+    arguments = {
+        "command": "rm -rf /tmp/real-target",
+        "display_command": "printf safe",
+        "display_argv": ["harmless"],
+    }
+
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=120).print(
+        render_approval_card("exec", arguments)
+    )
+
+    card = output.getvalue()
+    assert "command=rm -rf /tmp/real-target" in card
+    assert "printf safe" not in card
+    assert "harmless" not in card
+    assert "argv:" not in card
+
+
+async def test_exec_macro_approval_card_shows_argv_via_trusted_display(
+    tmp_path: Path,
+) -> None:
+    """The rendered card must show argv for the actual macro tool call."""
+
+    home = tmp_path / "home"
+    _write_command(
+        home / "commands",
+        "deploy",
+        "---\nkind: exec\n---\nprintf '%s\\n' \"$@\"\n",
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        approval_policy=policy,
+        console=Console(file=output, force_terminal=False, width=120),
+    )
+
+    task = asyncio.create_task(
+        app._handle_prompt_value("/deploy staging release-42 $HOME")
+    )
+    for _ in range(100):
+        if app.pending_approvals:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("macro approval did not appear")
+
+    card = output.getvalue()
+    assert "argv:" in card
+    assert "[1] staging" in card
+    assert "[2] release-42" in card
+    assert "[3] $HOME" in card
+
+    assert policy.approve(app.pending_approvals[0].key)
+    await task
 
 
 async def test_exec_macro_deny_renders_denied_receipt(tmp_path: Path) -> None:
@@ -719,6 +786,65 @@ async def test_queued_prompt_consumes_macro_receipt_at_provider_start(
         if message.role.value == "user"
     )
     assert user_message.content[0].text == "ran /slow, exit 0\n\ncontinue"
+
+
+async def test_two_macros_queued_prompt_and_abort_keep_receipt_order(
+    tmp_path: Path,
+) -> None:
+    """The provider must see receipts in insertion order: first, second, then abort receipt."""
+
+    home = tmp_path / "home"
+    _write_command(home / "commands", "first", "---\nkind: exec\n---\nprintf first")
+    _write_command(home / "commands", "second", "---\nkind: exec\n---\nsleep 30\n")
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._input_loop_active = True
+
+    await app._handle_prompt_value("/first")
+    if app._active_task is not None:
+        await asyncio.wait_for(app._active_task, timeout=3)
+        app._active_task = None
+    assert list(app._macro_receipts) == ["ran /first, exit 0"]
+
+    await app._handle_prompt_value("/second")
+    for _ in range(100):
+        if app.active:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("second macro did not start")
+
+    await app._handle_prompt_value("continue")
+    assert len(app._queued) == 1
+
+    macro_task = app._active_task
+    app.abort_active()
+    assert macro_task is not None
+    await asyncio.wait_for(macro_task, timeout=3)
+    assert list(app._macro_receipts) == [
+        "ran /first, exit 0",
+        "ran /second, canceled",
+    ]
+
+    app._active_task = None
+    app._start_queued_turn()
+    await asyncio.wait_for(app._active_task, timeout=3)
+
+    user_message = next(
+        message
+        for message in backend.calls[0][0]
+        if message.role.value == "user"
+    )
+    assert user_message.content[0].text == (
+        "ran /first, exit 0\nran /second, canceled\n\ncontinue"
+    )
 
 
 async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> None:

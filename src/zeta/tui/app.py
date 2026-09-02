@@ -43,6 +43,7 @@ from ..providers.codex import CodexBackend, CodexCredentialStore
 from ..providers.factory import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL
 from ..providers.factory import build_backend as build_network_backend
 from ..submission import Submission, SubmissionMixin, SubmissionQueue
+from ..tools.exec import trusted_macro_display
 from ..types import (
     CompletionBackend,
     Message,
@@ -301,6 +302,7 @@ class TUIApp(
                     label=request.label,
                     key=str(request.key),
                     shortcut=index == 0,
+                    trusted_display=trusted_macro_display(request.tool_call.id),
                 )
             )
 

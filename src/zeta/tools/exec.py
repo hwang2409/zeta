@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,35 @@ from .registry import (
     _ToolCanceled,
     validate_tool_result,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class MacroDisplay:
+    """Trusted, harness-side display data for a macro's tool call."""
+
+    command: str
+    argv: tuple[str, ...] = ()
+
+
+_trusted_macro_display: dict[str, MacroDisplay] = {}
+
+
+def register_macro_display(call_id: str, *, command: str, argv: tuple[str, ...]) -> None:
+    """Bind trusted display strings to a macro tool call the harness created."""
+
+    _trusted_macro_display[call_id] = MacroDisplay(command, argv)
+
+
+def trusted_macro_display(call_id: str) -> MacroDisplay | None:
+    """Return the trusted display data for a call the macro runner registered."""
+
+    return _trusted_macro_display.get(call_id)
+
+
+def forget_macro_display(call_id: str) -> None:
+    """Drop the trusted display entry once its owning macro is done."""
+
+    _trusted_macro_display.pop(call_id, None)
 
 
 class _BoundedOutput:
@@ -265,18 +295,9 @@ async def run_exec_macro(
 
     Path(log_path).touch()
     scope_signal = abort_signal or registry.abort_signal.registry.new_generation()
-    execution_call = ToolCall(
-        call.id,
-        call.name,
-        {
-            key: value
-            for key, value in call.arguments.items()
-            if key != "display_argv"
-        },
-    )
     try:
         raw_result = await registry.execute(
-            execution_call,
+            call,
             abort_signal=scope_signal,
             _scope_signal=scope_signal,
             _stream_sink=stream_sink,
@@ -316,7 +337,6 @@ def register(registry: ToolRegistry) -> None:
             "type": "object",
             "properties": {
                 "command": {"type": "string", "minLength": 1},
-                "display_command": {"type": "string", "minLength": 1},
                 "timeout": {"type": "number", "exclusiveMinimum": 0},
                 "max_output": {"type": "integer", "minimum": 1},
             },

@@ -25,7 +25,7 @@ from prompt_toolkit.key_binding.vi_state import InputMode
 from rich.text import Text
 
 from ..core.slash import CustomCommand, SlashCommandRegistry
-from ..tools.exec import run_exec_macro
+from ..tools.exec import forget_macro_display, register_macro_display, run_exec_macro
 from ..types import (
     ErrorInfo,
     ImageContent,
@@ -765,10 +765,13 @@ class ComposerAttachmentMixin:
             "exec",
             {
                 "command": command.render_exec(args),
-                "display_command": command.render(args),
-                "display_argv": args.split(),
                 "timeout": command.timeout,
             },
+        )
+        register_macro_display(
+            call.id,
+            command=command.render(args),
+            argv=tuple(args.split()),
         )
         abort_signal = self.loop.tool_registry.abort_signal.registry.new_generation()
         self._macro_abort_signal = abort_signal
@@ -836,6 +839,7 @@ class ComposerAttachmentMixin:
         finally:
             if self._approval_policy is not None:
                 self._approval_policy.forget_ephemeral(call.id)
+            forget_macro_display(call.id)
         self._handle_tool_event(
             StreamEvent(
                 StreamEventType.TOOL_EXECUTION_END,
