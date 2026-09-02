@@ -9,6 +9,7 @@ from .config import (
     MCPConfigError,
     MCPServerConfig,
     read_mcp_config_file,
+    resolve_server_config,
     server_to_json,
     write_mcp_config,
 )
@@ -72,29 +73,33 @@ async def add_and_mount(
 ) -> None:
     """Write a new entry to the target file and live-mount it, rolling back on failure."""
 
-    if server_config.name in mount.configs:
-        raise MCPCommandError(f"MCP server already configured: {server_config.name}")
-    rewrite_mcp_file(
-        target,
-        lambda servers: {
-            **servers,
-            server_config.name: server_to_json(server_config),
-        },
-    )
-    try:
-        await mount.add_server(
-            server_config, source=target, notice_sink=notice_sink
-        )
-    except BaseException:
+    name = server_config.name
+
+    def prepare() -> None:
+        def add_entry(
+            servers: dict[str, dict[str, object]],
+        ) -> dict[str, dict[str, object]]:
+            if name in servers:
+                raise MCPCommandError(f"MCP server already configured: {name}")
+            return {**servers, name: server_to_json(server_config)}
+
+        rewrite_mcp_file(target, add_entry)
+
+    def rollback() -> None:
         rewrite_mcp_file(
             target,
             lambda servers: {
-                name: entry
-                for name, entry in servers.items()
-                if name != server_config.name
+                key: entry for key, entry in servers.items() if key != name
             },
         )
-        raise
+
+    await mount.add_server(
+        resolve_server_config(server_config),
+        source=target,
+        notice_sink=notice_sink,
+        prepare=prepare,
+        rollback=rollback,
+    )
 
 
 async def remove_and_unshadow(
@@ -110,19 +115,29 @@ async def remove_and_unshadow(
     source = mount.sources.get(name)
     if source is None:
         raise MCPCommandError(f"unknown MCP server: {name}")
-    rewrite_mcp_file(
-        source,
-        lambda servers: {
-            key: entry for key, entry in servers.items() if key != name
-        },
+
+    def persist() -> None:
+        rewrite_mcp_file(
+            source,
+            lambda servers: {
+                key: entry for key, entry in servers.items() if key != name
+            },
+        )
+
+    def replacement() -> tuple[MCPServerConfig, Path] | None:
+        if home_path is None or home_path.resolve() == source.resolve():
+            return None
+        entry = load_home().get(name)
+        if entry is None:
+            return None
+        return resolve_server_config(entry), home_path
+
+    await mount.replace_server(
+        name,
+        persist=persist,
+        replacement=replacement,
+        notice_sink=notice_sink,
     )
-    await mount.remove_server(name)
-    if home_path is None or home_path.resolve() == source.resolve():
-        return
-    entry = load_home().get(name)
-    if entry is None:
-        return
-    await mount.add_server(entry, source=home_path, notice_sink=notice_sink)
 
 
 __all__ = [

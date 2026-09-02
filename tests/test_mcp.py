@@ -905,6 +905,30 @@ def test_write_mcp_config_leaves_no_partial_on_failure(
     del original_replace
 
 
+def test_write_mcp_config_preserves_extra_root_fields(tmp_path: Path) -> None:
+    target = tmp_path / "mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "metadata": {"owner": "test"},
+                "servers": {"old": {"transport": "stdio", "command": "old"}},
+            }
+        )
+    )
+
+    write_mcp_config(
+        target,
+        {"new": {"transport": "stdio", "command": "new"}},
+    )
+
+    assert json.loads(target.read_text()) == {
+        "version": 2,
+        "metadata": {"owner": "test"},
+        "servers": {"new": {"transport": "stdio", "command": "new"}},
+    }
+
+
 def test_server_to_json_round_trips_stdio_and_http() -> None:
     stdio = MCPServerConfig(
         name="s", transport="stdio", command="cmd", args=("a", "b"), env={"K": "V"}
@@ -1106,4 +1130,198 @@ async def test_slash_mcp_lists_malformed_with_reason(
     output = await loop.slash_mcp("")
     assert "broken: malformed" in output
     assert "transport" in output
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_mcp_rejects_unmatched_quotes_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
+
+    output = await loop.slash_mcp('add bad --stdio command "unterminated')
+
+    assert "No closing quotation" in output
+    assert not project_config_path(project).exists()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_project_config_does_not_fall_back_to_ambient_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ambient = tmp_path / "ambient"
+    project = tmp_path / "proj"
+    project.mkdir()
+    _write_json(
+        home_config_path(ambient),
+        {"sentinel": {"transport": "stdio", "command": "must-not-run"}},
+    )
+    project_config_path(project).parent.mkdir(parents=True, exist_ok=True)
+    project_config_path(project).write_text("{")
+    monkeypatch.setenv("ZETA_HOME", str(ambient))
+    monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
+
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=ambient, project_dir=project)
+
+    output = await loop.slash_mcp("")
+
+    assert "could not read MCP config" in output
+    assert str(project_config_path(project)) in output
+    assert loop._mcp_mount is not None
+    assert "sentinel" not in loop._mcp_mount.configs
+    assert loop._mcp_mount.clients == ()
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_mcp_add_interpolates_only_the_live_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.setenv("MCP_TEST_COMMAND", "resolved-command")
+    monkeypatch.setenv("MCP_TEST_ARG", "hello world")
+    seen: list[MCPServerConfig] = []
+
+    def build_client(config: MCPServerConfig) -> _FakeClient:
+        seen.append(config)
+        return _FakeClient(config)
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
+
+    await loop.slash_mcp(
+        'add live --stdio "${MCP_TEST_COMMAND}" "${MCP_TEST_ARG}"'
+    )
+
+    assert seen[0].command == "resolved-command"
+    assert seen[0].args == ("hello world",)
+    raw = json.loads(project_config_path(project).read_text())["servers"]["live"]
+    assert raw["command"] == "${MCP_TEST_COMMAND}"
+    assert raw["args"] == ["${MCP_TEST_ARG}"]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_mcp_add_skips_missing_live_env_without_spawning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.delenv("MCP_MISSING_ADD", raising=False)
+    spawned: list[MCPServerConfig] = []
+
+    def build_client(config: MCPServerConfig) -> _FakeClient:
+        spawned.append(config)
+        return _FakeClient(config)
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
+
+    output = await loop.slash_mcp(
+        "add missing --stdio '${MCP_MISSING_ADD}'"
+    )
+
+    assert "missing: skipped-missing-env" in output
+    assert not spawned
+    assert json.loads(project_config_path(project).read_text())["servers"][
+        "missing"
+    ]["command"] == "${MCP_MISSING_ADD}"
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_canceled_mcp_add_leaves_no_ghost_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_connect_and_list(client: _FakeClient) -> list[MCPTool]:
+        del client
+        started.set()
+        await release.wait()
+        return []
+
+    monkeypatch.setattr(mount_module, "_build_client", _FakeClient)
+    monkeypatch.setattr(mount_module, "_connect_and_list", slow_connect_and_list)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
+    task = asyncio.create_task(loop.slash_mcp("add ghost --stdio command"))
+    await started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert loop._mcp_mount is not None
+    assert "ghost" not in loop._mcp_mount.configs
+    assert "ghost" not in loop._mcp_mount.statuses
+    assert "ghost" not in loop._mcp_mount.sources
+    assert "ghost" not in json.loads(
+        project_config_path(project).read_text()
+    ).get("servers", {})
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_mcp_adds_keep_both_disk_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    async def yield_then_list(client: _FakeClient) -> list[MCPTool]:
+        del client
+        await asyncio.sleep(0)
+        return []
+
+    monkeypatch.setattr(mount_module, "_build_client", _FakeClient)
+    monkeypatch.setattr(mount_module, "_connect_and_list", yield_then_list)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
+
+    await asyncio.gather(
+        loop.slash_mcp("add first --stdio command-one"),
+        loop.slash_mcp("add second --stdio command-two"),
+    )
+
+    servers = json.loads(project_config_path(project).read_text())["servers"]
+    assert set(servers) == {"first", "second"}
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_remove_clears_provider_schema_after_unmount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    async def fake_connect_and_list(client: _FakeClient) -> list[MCPTool]:
+        del client
+        return [MCPTool("echo", "", {"type": "object"})]
+
+    monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(project),
+        tool_schemas=[{"name": "dead:echo", "description": "", "parameters": {}}],
+    )
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
+
+    await loop.slash_mcp("add dead --http https://mcp.example")
+    assert "dead:echo" in {schema["name"] for schema in loop.tool_schemas}
+    await loop.slash_mcp("remove dead")
+
+    assert "dead:echo" not in {schema["name"] for schema in loop.tool_schemas}
     await loop.close()

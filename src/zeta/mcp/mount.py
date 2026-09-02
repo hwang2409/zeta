@@ -63,6 +63,7 @@ class MCPMount:
     sources: dict[str, Path]
     _clients: dict[str, MCPClient] = field(default_factory=dict)
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    _config_lock: asyncio.Lock = field(init=False)
     _schema_refresh: Callable[[MCPMount], None] | None = None
     _closed: bool = False
 
@@ -94,6 +95,7 @@ class MCPMount:
         self._locks = _locks or {
             name: asyncio.Lock() for name in server_configs
         }
+        self._config_lock = asyncio.Lock()
         self._schema_refresh = _schema_refresh
         self._closed = _closed
 
@@ -142,39 +144,107 @@ class MCPMount:
         *,
         source: Path,
         notice_sink: NoticeSink | None = None,
+        prepare: Callable[[], None] | None = None,
+        rollback: Callable[[], None] | None = None,
     ) -> MCPServerStatus:
         """Mount one new server live, without touching existing clients."""
 
         name = server_config.name
-        if name in self.configs:
-            raise ValueError(f"MCP server already mounted: {name}")
-        self.configs[name] = server_config
-        self.sources[name] = source
-        try:
-            return await self._mount_one(
-                name, server_config, notice_sink=notice_sink
-            )
-        except BaseException:
-            self.configs.pop(name, None)
-            self.sources.pop(name, None)
-            self._locks.pop(name, None)
-            raise
+        lock = self._locks.setdefault(name, asyncio.Lock())
+        async with self._config_lock:
+            async with lock:
+                if name in self.configs:
+                    raise ValueError(f"MCP server already configured: {name}")
+                if prepare is not None:
+                    prepare()
+                self._transition(
+                    name,
+                    client=None,
+                    config=server_config,
+                    source=source,
+                )
+                try:
+                    return await self._mount_one_locked(
+                        name, server_config, notice_sink=notice_sink
+                    )
+                except BaseException:
+                    self._transition(
+                        name,
+                        client=self._clients.get(name),
+                        allow_closed=True,
+                        remove_config=True,
+                        remove_source=True,
+                    )
+                    if rollback is not None:
+                        try:
+                            rollback()
+                        except BaseException:
+                            logger.exception("failed to roll back MCP config %s", name)
+                    raise
+
+    async def replace_server(
+        self,
+        name: str,
+        *,
+        persist: Callable[[], None],
+        replacement: Callable[[], tuple[MCPServerConfig, Path] | None],
+        notice_sink: NoticeSink | None = None,
+    ) -> None:
+        """Replace one server while holding its lifecycle lock."""
+
+        lock = self._locks.setdefault(name, asyncio.Lock())
+        async with self._config_lock:
+            async with lock:
+                if name not in self.configs:
+                    raise ValueError(f"unknown MCP server: {name}")
+                persist()
+                await self._remove_server_locked(name)
+                next_server = replacement()
+                if next_server is None:
+                    return
+                server_config, source = next_server
+                self._transition(
+                    name,
+                    client=None,
+                    config=server_config,
+                    source=source,
+                )
+                try:
+                    await self._mount_one_locked(
+                        name, server_config, notice_sink=notice_sink
+                    )
+                except BaseException:
+                    self._transition(
+                        name,
+                        client=self._clients.get(name),
+                        allow_closed=True,
+                        remove_config=True,
+                        remove_source=True,
+                    )
+                    raise
 
     async def remove_server(self, name: str) -> None:
         """Unmount one server live and drop its bookkeeping."""
 
-        if name not in self.configs:
-            raise ValueError(f"unknown MCP server: {name}")
         lock = self._locks.setdefault(name, asyncio.Lock())
         async with lock:
-            client = self._clients.get(name)
-            self._transition(
-                name, client=client, allow_closed=True, remove_config=True
-            )
-            if client is not None:
-                await _close_failed_client(client)
-        self.sources.pop(name, None)
-        self._locks.pop(name, None)
+            if name not in self.configs:
+                raise ValueError(f"unknown MCP server: {name}")
+            await self._remove_server_locked(name)
+
+    async def _remove_server_locked(self, name: str) -> None:
+        """Remove one server while its lifecycle lock is held."""
+
+        client = self._clients.get(name)
+        self._transition(
+            name,
+            client=client,
+            allow_closed=True,
+            remove_config=True,
+            remove_source=True,
+        )
+        if client is not None:
+            await _close_failed_client(client)
 
     async def _mount_one(
         self,
@@ -185,30 +255,43 @@ class MCPMount:
     ) -> MCPServerStatus:
         lock = self._locks.setdefault(name, asyncio.Lock())
         async with lock:
-            if self._closed:
-                raise ValueError("MCP mount is closed")
-            client = self._clients.get(name)
-            self._transition(name, client=client)
-            if client is not None:
-                await _close_failed_client(client)
-            try:
-                setup = await _setup_server(
-                    server_config,
-                    notice_sink=notice_sink,
-                    client_ready=lambda replacement: self._arm_client(
-                        name, replacement
-                    ),
-                )
-            except BaseException as exc:
-                self._transition(
-                    name,
-                    client=self._clients.get(name),
-                    state="failed",
-                    reason=_error_text(exc),
-                )
-                raise
-            self._finish_setup(setup)
-            return setup.public
+            return await self._mount_one_locked(
+                name, server_config, notice_sink=notice_sink
+            )
+
+    async def _mount_one_locked(
+        self,
+        name: str,
+        server_config: MCPServerConfig,
+        *,
+        notice_sink: NoticeSink | None,
+    ) -> MCPServerStatus:
+        """Mount one server while its lifecycle lock is held."""
+
+        if self._closed:
+            raise ValueError("MCP mount is closed")
+        client = self._clients.get(name)
+        self._transition(name, client=client)
+        if client is not None:
+            await _close_failed_client(client)
+        try:
+            setup = await _setup_server(
+                server_config,
+                notice_sink=notice_sink,
+                client_ready=lambda replacement: self._arm_client(
+                    name, replacement
+                ),
+            )
+        except BaseException as exc:
+            self._transition(
+                name,
+                client=self._clients.get(name),
+                state="failed",
+                reason=_error_text(exc),
+            )
+            raise
+        self._finish_setup(setup)
+        return setup.public
 
     async def close(self) -> None:
         if self._closed:
@@ -248,11 +331,14 @@ class MCPMount:
         name: str,
         *,
         client: MCPClient | None,
+        config: MCPServerConfig | None = None,
+        source: Path | None = None,
         state: MCPServerState | None = None,
         reason: str | None = None,
         tools: tuple[MCPTool, ...] = (),
         allow_closed: bool = False,
         remove_config: bool = False,
+        remove_source: bool = False,
     ) -> bool:
         """Apply one server state and keep registry and schemas in sync."""
 
@@ -261,6 +347,10 @@ class MCPMount:
         current = self._clients.get(name)
         if client is not None and current is not None and current is not client:
             return False
+        if config is not None:
+            self.configs[name] = config
+        if source is not None:
+            self.sources[name] = source
         if state == "mounted":
             if client is None or current is not client:
                 return False
@@ -299,6 +389,8 @@ class MCPMount:
         if remove_config:
             self.configs.pop(name, None)
             self.statuses.pop(name, None)
+        if remove_source:
+            self.sources.pop(name, None)
         if self._schema_refresh is not None:
             self._schema_refresh(self)
         return True

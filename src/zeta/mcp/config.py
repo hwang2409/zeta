@@ -115,7 +115,9 @@ def write_mcp_config(path: str | Path, servers: dict[str, dict[str, object]]) ->
 
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"servers": servers}, indent=2, sort_keys=True) + "\n"
+    root = _read_mcp_document(target) if target.exists() else {}
+    root["servers"] = servers
+    payload = json.dumps(root, indent=2, sort_keys=True) + "\n"
     fd, tmp_name = tempfile.mkstemp(
         prefix=".mcp.", suffix=".json.tmp", dir=str(target.parent)
     )
@@ -135,24 +137,30 @@ def read_mcp_config_file(path: str | Path) -> dict[str, dict[str, object]]:
     """Read the raw servers mapping from one config file, or {} if absent."""
 
     target = Path(path).expanduser()
-    if not target.exists():
+    value = _read_mcp_document(target)
+    raw_servers = value.get("servers", {})
+    return dict(raw_servers)
+
+
+def _read_mcp_document(path: Path) -> dict[str, object]:
+    if not path.exists():
         return {}
     try:
-        with target.open(encoding="utf-8") as handle:
+        with path.open(encoding="utf-8") as handle:
             value = json.load(handle)
     except (json.JSONDecodeError, OSError) as exc:
-        raise MCPConfigError(f"could not read MCP config {target}: {exc}") from exc
+        raise MCPConfigError(f"could not read MCP config {path}: {exc}") from exc
     if type(value) is not dict:
-        raise MCPConfigError(f"MCP config must be an object: {target}")
+        raise MCPConfigError(f"MCP config must be an object: {path}")
     raw_servers = value.get("servers", {})
     if type(raw_servers) is not dict:
-        raise MCPConfigError(f"MCP config servers must be an object: {target}")
+        raise MCPConfigError(f"MCP config servers must be an object: {path}")
     for name in raw_servers:
         if type(name) is not str or not name:
             raise MCPConfigError(
-                f"MCP server names must be nonempty strings: {target}"
+                f"MCP server names must be nonempty strings: {path}"
             )
-    return dict(raw_servers)
+    return dict(value)
 
 
 def _load_single(selected_path: Path) -> MCPConfig:
@@ -346,6 +354,24 @@ def server_to_json(config: MCPServerConfig) -> dict[str, object]:
     return payload
 
 
+def resolve_server_config(config: MCPServerConfig) -> MCPServerConfig:
+    """Resolve environment values for a live server config."""
+
+    try:
+        resolved, missing = _interpolate(server_to_json(config), set())
+    except ValueError as exc:
+        return replace(config, malformed_reason=str(exc))
+    if missing:
+        return replace(
+            _server_config_for_missing_env(config.name, resolved),
+            missing_env=tuple(sorted(missing)),
+        )
+    try:
+        return _parse_server(config.name, resolved)
+    except ValueError as exc:
+        return replace(config, malformed_reason=str(exc))
+
+
 __all__ = [
     "MCPConfig",
     "MCPConfigError",
@@ -357,6 +383,7 @@ __all__ = [
     "mcp_log_path",
     "project_config_path",
     "read_mcp_config_file",
+    "resolve_server_config",
     "server_to_json",
     "write_mcp_config",
 ]

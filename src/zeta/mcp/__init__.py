@@ -12,6 +12,7 @@ from .config import (
     mcp_log_path,
     project_config_path,
     read_mcp_config_file,
+    resolve_server_config,
     server_to_json,
     write_mcp_config,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "mount_mcp_servers",
     "project_config_path",
     "read_mcp_config_file",
+    "resolve_server_config",
     "server_to_json",
     "write_mcp_config",
 ]

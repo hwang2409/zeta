@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shlex
 import warnings
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
@@ -249,7 +251,11 @@ class AgentLoop:
         self._mcp_mount_attempted = skip_mcp_mount
         self._mcp_mount_task: asyncio.Task[None] | None = None
         self._mcp_home_hint: str | None = None
-        self._mcp_project_dir_value: Path | None = None
+        self._mcp_project_dir_value: Path | None = (
+            Path(self.store.cwd).expanduser().resolve()
+        )
+        self._mcp_config_error: str | None = None
+        self._mcp_schema_names: set[str] = set()
         self._provided_tool_schemas = tool_schemas is not None
         self.tool_registry.bind_session_store(store)
         if (
@@ -403,9 +409,14 @@ class AgentLoop:
 
         await self._ensure_mcp_servers()
         mount = self._mcp_mount
+        try:
+            parts = shlex.split(args)
+        except ValueError as exc:
+            return f"mcp error: {exc}"
+        if self._mcp_config_error is not None:
+            return f"mcp error: {self._mcp_config_error}"
         if mount is None:
             return "mcp: no configured servers"
-        parts = args.split()
         if not parts:
             return mount.render()
         verb = parts[0]
@@ -429,7 +440,7 @@ class AgentLoop:
                 await remove_and_unshadow(
                     mount,
                     parts[1],
-                    home_path=home_config_path(self._mcp_home_hint),
+                    home_path=self._mcp_home_path(),
                     load_home=lambda: load_mcp_config_overlay(
                         home=self._mcp_home_hint, project_dir=None
                     ).configured_servers,
@@ -441,10 +452,16 @@ class AgentLoop:
         return MCP_USAGE
 
     def _mcp_add_target(self) -> Path:
-        project_dir = self._mcp_project_dir_value or self.store.cwd
+        project_dir = self._mcp_project_dir_value
         if project_dir is not None:
             return project_config_path(project_dir)
         return home_config_path(self._mcp_home_hint)
+
+    def _mcp_home_path(self) -> Path:
+        override = os.environ.get("ZETA_MCP_CONFIG")
+        if override:
+            return Path(override).expanduser().resolve()
+        return home_config_path(self._mcp_home_hint).resolve()
 
     @property
     def background_children_running(self) -> bool:
@@ -618,15 +635,14 @@ class AgentLoop:
         try:
             config = load_mcp_config_overlay(
                 home=self._mcp_home_hint,
-                project_dir=self._mcp_project_dir_value or self.store.cwd,
+                project_dir=self._mcp_project_dir_value,
             )
             self._mcp_mount = await mount_mcp_servers(
                 self.tool_registry, config, notice_sink=self._mcp_notice_sink
             )
-        except MCPConfigError:
-            self._mcp_mount = await mount_mcp_servers(
-                self.tool_registry, notice_sink=self._mcp_notice_sink
-            )
+        except MCPConfigError as exc:
+            self._mcp_config_error = str(exc)
+            self._mcp_mount = MCPMount(self.tool_registry, {}, {})
         self._mcp_mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
         self._mcp_mount_attempted = True
 
@@ -654,17 +670,25 @@ class AgentLoop:
             if isinstance(schema.get("name"), str)
             and schema["name"].startswith(mcp_prefixes)
         ]
+        current_names = {
+            schema["name"]
+            for schema in current_mcp
+            if isinstance(schema.get("name"), str)
+        }
         if not self._provided_tool_schemas:
             self.tool_schemas = list(self.tool_registry.schemas)
+            self._mcp_schema_names = current_names
             return
+        stale_names = self._mcp_schema_names - current_names
         self.tool_schemas = [
             schema
             for schema in self.tool_schemas
             if not (
                 isinstance(schema.get("name"), str)
-                and schema["name"].startswith(mcp_prefixes)
+                and schema["name"] in stale_names
             )
         ] + current_mcp
+        self._mcp_schema_names = current_names
 
     async def ensure_mcp_servers(self) -> None:
         """Connect MCP servers before a direct tool resume."""
