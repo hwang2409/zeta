@@ -24,6 +24,7 @@ from .tools import ToolStreamPublisher
 from .tools.agent import ChildApprovalPolicy, agent_stats
 from .tools.agent_presets import (
     GENERAL_PRESET,
+    RUN_PRESET,
     agent_type_names,
     compose_system_prompt,
     get_agent_preset,
@@ -193,6 +194,35 @@ async def consume_child(
     return terminal_result(state="completed", text=final_text)
 
 
+async def consume_run(
+    child_loop: AgentLoop,
+    prompt: str,
+    *,
+    child_store: ConversationStore,
+    **kwargs: Any,
+) -> dict[str, object]:
+    """Consume a run, delivering queued follow-ups at each turn boundary.
+
+    run_turn is one-shot, so a follow-up cannot be injected into a turn already
+    in flight -- splicing a user message between a tool call and its result
+    would not survive the provider's message shape. Instead the run takes
+    another turn on the same loop once the current one ends, which is how the
+    composer already delivers the follow-ups you type while a turn runs.
+
+    The run finishes when it has nothing left to do and nothing queued.
+    """
+
+    result = await consume_child(child_loop, prompt, **kwargs)
+    while not result.get("isError"):
+        pending = child_store.pending_prompts()
+        if not pending:
+            return result
+        entry = pending[0]
+        child_store.acknowledge_pending_prompt(entry.id)
+        result = await consume_child(child_loop, entry.data["text"], **kwargs)
+    return result
+
+
 def resolve_child_backend(
     loop: AgentLoop,
     model: object,
@@ -242,9 +272,12 @@ async def run_agent_tool(
     description = arguments.get("description")
     agent_type = arguments.get("agent_type", GENERAL_PRESET.name)
     model = arguments.get("model")
-    # A run on someone else's model is the long kind, so it defaults to
-    # background; an explicit background argument still wins.
-    background = arguments.get("background", model is not None)
+    # The long kinds default to background -- a run on someone else's model, or
+    # one sized for a big task. Waiting on either blocks the orchestrator for
+    # the whole thing. An explicit background argument still wins.
+    background = arguments.get(
+        "background", model is not None or agent_type == RUN_PRESET.name
+    )
     if type(prompt) is not str or not prompt.strip():
         return loop._child_result_payload(
             tool_call.id,
@@ -333,6 +366,11 @@ async def run_agent_tool(
             f"agent error: {error_message(exc)}",
             state="failed",
         )
+    # ZETA-62 already gives every top-level agent() call its own fresh
+    # AgentTree budget (ensure_budget above), so a run needs no special-cased
+    # budget of its own -- it just needs routing to consume_run below for
+    # follow-up delivery.
+    is_run = preset.name == RUN_PRESET.name
     stored_agent_type = None if preset.name == GENERAL_PRESET.name else preset.name
     child_number = loop.store.allocate_agent_index()
     agents_root = loop.store.session_dir / "agents"
@@ -537,10 +575,13 @@ async def run_agent_tool(
     def update_tool_calls(tool_calls: int) -> None:
         child_store.update_agent_lifecycle(tool_calls=tool_calls)
 
+    consume = consume_run if is_run else consume_child
+    run_kwargs: dict[str, Any] = {"child_store": child_store} if is_run else {}
     child_task = loop._create_task(
-        consume_child(
+        consume(
             child_loop,
             prompt,
+            **run_kwargs,
             turn_cap=child_turn_cap,
             child_path=child_path,
             publish=publish,

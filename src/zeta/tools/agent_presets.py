@@ -7,7 +7,7 @@ from typing import Literal
 
 from ..types import Message, MessageRole, TextContent
 
-AgentType = Literal["general", "explore", "plan"]
+AgentType = Literal["general", "explore", "plan", "run"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,9 +68,25 @@ PLAN_PRESET = AgentPreset(
     ),
 )
 
+RUN_PRESET = AgentPreset(
+    name="run",
+    turn_cap=150,
+    tool_names=None,
+    preamble=(
+        "You are a long-horizon agent run. Work the task to completion rather "
+        "than returning a summary early. The orchestrator may send follow-up "
+        "instructions while you work; you will see them as new user messages "
+        "between turns, so re-read the conversation before continuing."
+    ),
+    selection_guidance=(
+        "full tool set, up to 150 turns, runs in the background and accepts "
+        "follow-up messages; use for a big task rather than a single lookup"
+    ),
+)
+
 AGENT_PRESETS: dict[AgentType, AgentPreset] = {
     preset.name: preset
-    for preset in (GENERAL_PRESET, EXPLORE_PRESET, PLAN_PRESET)
+    for preset in (GENERAL_PRESET, EXPLORE_PRESET, PLAN_PRESET, RUN_PRESET)
 }
 
 

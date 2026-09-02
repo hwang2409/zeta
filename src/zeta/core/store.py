@@ -28,6 +28,7 @@ from .todo import TodoItem, parse_todo_items
 
 SCHEMA = "zeta.conversation.v1"
 MAX_AGENT_NOTIFICATION_TEXT = 10_000
+MAX_PENDING_PROMPT_TEXT = 16_000
 
 
 def _valid_agent_stats(value: object) -> bool:
@@ -331,6 +332,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         approval_resolutions: set[str] = set()
         notifications: set[str] = set()
         notification_acks: set[str] = set()
+        pending_prompts: set[str] = set()
+        pending_prompt_acks: set[str] = set()
         by_id = {entry.id: entry for entry in self._entries}
         active_ids: set[str] = set()
         current = self._entries[-1] if self._entries else None
@@ -405,6 +408,19 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                         f"duplicate notification acknowledgement: {notification_id}"
                     )
                 notification_acks.add(notification_id)
+            elif entry.type == "pending_prompt":
+                pending_prompts.add(entry.id)
+            elif entry.type == "pending_prompt_ack":
+                prompt_id = entry.data.get("prompt_id")
+                if prompt_id not in pending_prompts:
+                    raise ConversationIntegrityError(
+                        f"pending prompt acknowledgement is not linked: {prompt_id}"
+                    )
+                if prompt_id in pending_prompt_acks:
+                    raise ConversationIntegrityError(
+                        f"duplicate pending prompt acknowledgement: {prompt_id}"
+                    )
+                pending_prompt_acks.add(prompt_id)
             ids.add(entry.id)
 
     @staticmethod
@@ -519,6 +535,16 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 notification_id = entry.data.get("notification_id")
                 if type(notification_id) is not str or not notification_id:
                     raise ValueError("notification id must be a nonempty string")
+            elif entry.type == "pending_prompt":
+                text = entry.data.get("text")
+                if type(text) is not str or not text:
+                    raise ValueError("pending prompt text must be a nonempty string")
+                if len(text) > MAX_PENDING_PROMPT_TEXT:
+                    raise ValueError("pending prompt text is too long")
+            elif entry.type == "pending_prompt_ack":
+                prompt_id = entry.data.get("prompt_id")
+                if type(prompt_id) is not str or not prompt_id:
+                    raise ValueError("pending prompt id must be a nonempty string")
             else:
                 raise ValueError(f"unsupported conversation entry type: {entry.type}")
         except (KeyError, TypeError, ValueError) as exc:
@@ -646,6 +672,56 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         ):
             return
         self._append_row("notification_ack", {"notification_id": notification_id})
+
+    def append_pending_prompt(self, text: str) -> ConversationEntry:
+        """Queue a follow-up for a run to pick up at its next turn boundary.
+
+        Written into the run's own store, by the parent or the UI rather than by
+        the run itself. It stays out of the run's context until the driver hands
+        it to run_turn, because context assembly keeps only message entries.
+        """
+
+        if type(text) is not str or not text.strip():
+            raise ValueError("pending prompt text must be a nonempty string")
+        if len(text) > MAX_PENDING_PROMPT_TEXT:
+            raise ValueError("pending prompt text is too long")
+        return self._append_row("pending_prompt", {"text": text})
+
+    def pending_prompts(self) -> list[ConversationEntry]:
+        """Return queued follow-ups the run has not consumed yet.
+
+        Reloads first: the queue is written by the parent or the UI through a
+        different handle on the same directory, so an in-memory branch would
+        never show a follow-up that arrived after this handle's last write.
+        """
+
+        with self._append_lock():
+            self._load()
+        branch = self.replay()
+        acknowledged = {
+            entry.data["prompt_id"]
+            for entry in branch
+            if entry.type == "pending_prompt_ack"
+        }
+        return [
+            entry
+            for entry in branch
+            if entry.type == "pending_prompt" and entry.id not in acknowledged
+        ]
+
+    def acknowledge_pending_prompt(self, prompt_id: str) -> None:
+        """Durably mark one queued follow-up as delivered to the run."""
+
+        prompts = [entry for entry in self.replay() if entry.type == "pending_prompt"]
+        if not any(entry.id == prompt_id for entry in prompts):
+            raise ValueError(f"unknown pending prompt: {prompt_id}")
+        if any(
+            entry.data["prompt_id"] == prompt_id
+            for entry in self.replay()
+            if entry.type == "pending_prompt_ack"
+        ):
+            return
+        self._append_row("pending_prompt_ack", {"prompt_id": prompt_id})
 
     def append_compaction_marker(
         self,

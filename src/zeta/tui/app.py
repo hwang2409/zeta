@@ -54,6 +54,7 @@ from ..types import (
     assistant_text,
 )
 from . import theme
+from .agent_card import AgentRunCommandMixin
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
@@ -125,6 +126,7 @@ class TUIApp(
     ComposerAttachmentMixin,
     CommandRuntimeMixin,
     SlashHandlerMixin,
+    AgentRunCommandMixin,
 ):
     """Full-screen transcript, persistent composer, and follow-up queue."""
 

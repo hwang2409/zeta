@@ -19,6 +19,7 @@ from ..agent_receipt import (
     has_agent_receipt_suffix,
     terminal_state,
 )
+from ..tools.agent import send_to_run
 from ..tools.agent_presets import GENERAL_PRESET, get_agent_preset
 from ..types import StreamEvent, StreamEventType, ToolCall
 from . import theme
@@ -525,3 +526,39 @@ def render_agent_receipt(
         turns_used=turns_used,
         depth=depth,
     )
+
+
+class AgentRunCommandMixin:
+    """Let the user list and steer live agent runs from the composer.
+
+    Lives here rather than in app.py, which is at the module line cap, and
+    reaches a run through the same seam the agent_send tool uses.
+    """
+
+    def slash_runs(self, args: str) -> str:
+        del args
+        children = self.loop.store.agent_children()
+        runs = [
+            (marker_key, marker)
+            for marker_key, marker in children.items()
+            if marker.get("background")
+        ]
+        if not runs:
+            return "no live runs"
+        lines = []
+        for marker_key, marker in sorted(runs):
+            turns = marker.get("turns_used", 0)
+            lines.append(
+                f"{marker_key}  {marker['description']}  ({turns} turns)"
+            )
+        return "\n".join(lines)
+
+    def slash_send(self, args: str) -> str:
+        parts = args.strip().split(maxsplit=1)
+        if len(parts) != 2:
+            return "use /send <run-id> <message>; /runs lists the live ones"
+        run_id, message = parts
+        error = send_to_run(self.loop.store, run_id, message)
+        if error is not None:
+            return error
+        return f"queued for {run_id}; it arrives at the run's next turn boundary"
