@@ -6,9 +6,12 @@ import json
 import logging
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
+
+from ..core.session import env_home
 
 logger = logging.getLogger(__name__)
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -30,6 +33,7 @@ class MCPServerConfig:
     auth_type: Literal["none", "bearer"] = "none"
     auth_token: str | None = None
     missing_env: tuple[str, ...] = ()
+    malformed_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,65 +41,140 @@ class MCPConfig:
     path: Path
     servers: dict[str, MCPServerConfig] = field(default_factory=dict)
     skipped_servers: dict[str, MCPServerConfig] = field(default_factory=dict)
+    malformed_servers: dict[str, MCPServerConfig] = field(default_factory=dict)
+    sources: dict[str, Path] = field(default_factory=dict)
 
     @property
     def configured_servers(self) -> dict[str, MCPServerConfig]:
-        """Return every valid server declaration, including skipped servers."""
+        """Return every declared server, valid or reportable."""
 
-        return {**self.servers, **self.skipped_servers}
+        return {**self.servers, **self.skipped_servers, **self.malformed_servers}
+
+
+def home_config_path(home: str | Path | None = None) -> Path:
+    """Return the home-level MCP config path for a given zeta home."""
+
+    root = Path(home).expanduser() if home is not None else env_home()
+    return root / "mcp.json"
+
+
+def project_config_path(project_dir: str | Path) -> Path:
+    """Return the per-project overlay MCP config path."""
+
+    return Path(project_dir).expanduser() / ".zeta" / "mcp.json"
 
 
 def default_config_path() -> Path:
-    configured_home = os.environ.get("ZETA_HOME")
-    home = Path(configured_home).expanduser() if configured_home else Path.home() / ".zeta"
-    return home / "mcp.json"
+    return home_config_path()
 
 
 def mcp_log_path(name: str) -> Path:
     """Return the stderr log path used by MCP transports."""
 
     runtime_root = Path(
-        os.environ.get("WIKI_AGENT_RUNTIME_DIR", Path.home() / ".zeta")
+        os.environ.get("WIKI_AGENT_RUNTIME_DIR", env_home())
     ).expanduser()
     safe_name = _SAFE_NAME.sub("_", name) or "server"
     return runtime_root / "mcp-logs" / f"{safe_name}.log"
 
 
 def load_mcp_config(path: str | Path | None = None) -> MCPConfig:
-    """Load MCP config, skipping missing environment-backed servers."""
+    """Load MCP config from one file, tolerating missing-env and bad entries."""
 
     selected_path = Path(
         path
         if path is not None
         else os.environ.get("ZETA_MCP_CONFIG", default_config_path())
     ).expanduser()
-    if not selected_path.exists():
-        logger.info("MCP config not found; continuing without MCP servers: %s", selected_path)
-        return MCPConfig(selected_path)
+    return _load_single(selected_path)
+
+
+def load_mcp_config_overlay(
+    *,
+    home: str | Path | None = None,
+    project_dir: str | Path | None = None,
+) -> MCPConfig:
+    """Load home config with a per-project overlay merged on top."""
+
+    override = os.environ.get("ZETA_MCP_CONFIG")
+    home_path = (
+        Path(override).expanduser() if override else home_config_path(home)
+    )
+    home_config = _load_single(home_path)
+    project_path = (
+        project_config_path(project_dir) if project_dir is not None else None
+    )
+    if project_path is None or project_path.resolve() == home_path.resolve():
+        return home_config
+    project_config = _load_single(project_path)
+    return _overlay(home_config, project_config)
+
+
+def write_mcp_config(path: str | Path, servers: dict[str, dict[str, object]]) -> None:
+    """Write a JSON MCP config to path atomically (tmp + rename)."""
+
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"servers": servers}, indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".mcp.", suffix=".json.tmp", dir=str(target.parent)
+    )
+    tmp_path = Path(tmp_name)
     try:
-        with selected_path.open(encoding="utf-8") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def read_mcp_config_file(path: str | Path) -> dict[str, dict[str, object]]:
+    """Read the raw servers mapping from one config file, or {} if absent."""
+
+    target = Path(path).expanduser()
+    if not target.exists():
+        return {}
+    try:
+        with target.open(encoding="utf-8") as handle:
             value = json.load(handle)
-    except json.JSONDecodeError as exc:
-        raise MCPConfigError(
-            f"could not parse MCP config {selected_path}: {exc.msg}"
-        ) from exc
-    except OSError as exc:
-        raise MCPConfigError(f"could not read MCP config {selected_path}: {exc}") from exc
+    except (json.JSONDecodeError, OSError) as exc:
+        raise MCPConfigError(f"could not read MCP config {target}: {exc}") from exc
     if type(value) is not dict:
-        raise MCPConfigError(f"MCP config must be an object: {selected_path}")
+        raise MCPConfigError(f"MCP config must be an object: {target}")
     raw_servers = value.get("servers", {})
     if type(raw_servers) is not dict:
-        raise MCPConfigError(f"MCP config servers must be an object: {selected_path}")
+        raise MCPConfigError(f"MCP config servers must be an object: {target}")
+    for name in raw_servers:
+        if type(name) is not str or not name:
+            raise MCPConfigError(
+                f"MCP server names must be nonempty strings: {target}"
+            )
+    return dict(raw_servers)
 
+
+def _load_single(selected_path: Path) -> MCPConfig:
+    if not selected_path.exists():
+        logger.info(
+            "MCP config not found; continuing without MCP servers: %s", selected_path
+        )
+        return MCPConfig(selected_path)
+    raw_servers = read_mcp_config_file(selected_path)
     servers: dict[str, MCPServerConfig] = {}
     skipped: dict[str, MCPServerConfig] = {}
+    malformed: dict[str, MCPServerConfig] = {}
+    sources: dict[str, Path] = {}
     for name, raw_server in raw_servers.items():
-        if type(name) is not str or not name:
-            raise MCPConfigError(f"MCP server names must be nonempty strings: {selected_path}")
         try:
             resolved, missing = _interpolate(raw_server, set())
         except ValueError as exc:
-            raise MCPConfigError(f"invalid MCP server {name!r}: {exc}") from exc
+            malformed[name] = MCPServerConfig(
+                name, "stdio", malformed_reason=str(exc)
+            )
+            sources[name] = selected_path
+            continue
         if missing:
             names = tuple(sorted(missing))
             logger.warning(
@@ -107,13 +186,37 @@ def load_mcp_config(path: str | Path | None = None) -> MCPConfig:
                 _server_config_for_missing_env(name, resolved),
                 missing_env=names,
             )
+            sources[name] = selected_path
             continue
         try:
             server = _parse_server(name, resolved)
         except ValueError as exc:
-            raise MCPConfigError(f"invalid MCP server {name!r} in {selected_path}: {exc}") from exc
+            malformed[name] = replace(
+                _server_config_for_missing_env(name, resolved),
+                malformed_reason=str(exc),
+            )
+            sources[name] = selected_path
+            continue
         servers[name] = server
-    return MCPConfig(selected_path, servers, skipped)
+        sources[name] = selected_path
+    return MCPConfig(selected_path, servers, skipped, malformed, sources)
+
+
+def _overlay(base: MCPConfig, top: MCPConfig) -> MCPConfig:
+    """Merge two configs so that top's entries win by name."""
+
+    servers = dict(base.servers)
+    skipped = dict(base.skipped_servers)
+    malformed = dict(base.malformed_servers)
+    for name in {*top.servers, *top.skipped_servers, *top.malformed_servers}:
+        for bucket in (servers, skipped, malformed):
+            bucket.pop(name, None)
+    servers.update(top.servers)
+    skipped.update(top.skipped_servers)
+    malformed.update(top.malformed_servers)
+    return MCPConfig(
+        top.path, servers, skipped, malformed, {**base.sources, **top.sources}
+    )
 
 
 def _interpolate(value: object, missing: set[str]) -> tuple[object, set[str]]:
@@ -194,7 +297,7 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
 
 
 def _server_config_for_missing_env(name: str, value: object) -> MCPServerConfig:
-    """Keep enough shape to report a server skipped for missing variables."""
+    """Keep enough shape to report a server skipped or malformed."""
 
     if type(value) is not dict:
         return MCPServerConfig(name, "stdio")
@@ -224,11 +327,36 @@ def _server_config_for_missing_env(name: str, value: object) -> MCPServerConfig:
     return MCPServerConfig(name, transport, command=command, args=args, env=env, url=url)
 
 
+def server_to_json(config: MCPServerConfig) -> dict[str, object]:
+    """Serialize one server config to a JSON-safe object, redacted where safe."""
+
+    payload: dict[str, object] = {"transport": config.transport}
+    if config.transport == "stdio":
+        if config.command is not None:
+            payload["command"] = config.command
+        if config.args:
+            payload["args"] = list(config.args)
+    else:
+        if config.url is not None:
+            payload["url"] = config.url
+    if config.env:
+        payload["env"] = dict(config.env)
+    if config.auth_type == "bearer" and config.auth_token is not None:
+        payload["auth"] = {"type": "bearer", "token": config.auth_token}
+    return payload
+
+
 __all__ = [
     "MCPConfig",
     "MCPConfigError",
     "MCPServerConfig",
     "default_config_path",
+    "home_config_path",
     "load_mcp_config",
+    "load_mcp_config_overlay",
     "mcp_log_path",
+    "project_config_path",
+    "read_mcp_config_file",
+    "server_to_json",
+    "write_mcp_config",
 ]

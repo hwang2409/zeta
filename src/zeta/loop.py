@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import warnings
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
+from pathlib import Path
 from typing import Any, TypeVar
 
 import httpx
@@ -27,7 +28,21 @@ from .core.context import ContextAssembler
 from .core.hooks import HookManager
 from .core.store import ConversationStore
 from .core.tool_dispatch import dispatch_tool_calls
-from .mcp import MCPMount, mount_mcp_servers
+from .mcp import (
+    MCPConfigError,
+    MCPMount,
+    home_config_path,
+    load_mcp_config_overlay,
+    mount_mcp_servers,
+    project_config_path,
+)
+from .mcp.commands import (
+    MCP_USAGE,
+    MCPCommandError,
+    add_and_mount,
+    parse_add_command,
+    remove_and_unshadow,
+)
 from .prompts import load_identity
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from .tools.agent import agent_result
@@ -233,6 +248,8 @@ class AgentLoop:
         self._mcp_mount: MCPMount | None = None
         self._mcp_mount_attempted = skip_mcp_mount
         self._mcp_mount_task: asyncio.Task[None] | None = None
+        self._mcp_home_hint: str | None = None
+        self._mcp_project_dir_value: Path | None = None
         self._provided_tool_schemas = tool_schemas is not None
         self.tool_registry.bind_session_store(store)
         if (
@@ -382,7 +399,7 @@ class AgentLoop:
         return self._mcp_mount.summary
 
     async def slash_mcp(self, args: str) -> str:
-        """Show MCP state or reconnect one configured server."""
+        """Show MCP state, reconnect, add, or remove one configured server."""
 
         await self._ensure_mcp_servers()
         mount = self._mcp_mount
@@ -391,13 +408,43 @@ class AgentLoop:
         parts = args.split()
         if not parts:
             return mount.render()
-        if parts[0] != "reconnect" or len(parts) != 2:
-            return "mcp usage: /mcp or /mcp reconnect <server>"
+        verb = parts[0]
         try:
-            await mount.reconnect(parts[1], notice_sink=self._mcp_notice_sink)
-        except ValueError as exc:
+            if verb == "reconnect":
+                if len(parts) != 2:
+                    return MCP_USAGE
+                await mount.reconnect(parts[1], notice_sink=self._mcp_notice_sink)
+                return mount.render()
+            if verb == "add":
+                await add_and_mount(
+                    mount,
+                    parse_add_command(parts[1:]),
+                    target=self._mcp_add_target(),
+                    notice_sink=self._mcp_notice_sink,
+                )
+                return mount.render()
+            if verb == "remove":
+                if len(parts) != 2:
+                    return MCP_USAGE
+                await remove_and_unshadow(
+                    mount,
+                    parts[1],
+                    home_path=home_config_path(self._mcp_home_hint),
+                    load_home=lambda: load_mcp_config_overlay(
+                        home=self._mcp_home_hint, project_dir=None
+                    ).configured_servers,
+                    notice_sink=self._mcp_notice_sink,
+                )
+                return mount.render()
+        except (MCPCommandError, ValueError) as exc:
             return f"mcp error: {exc}"
-        return mount.render()
+        return MCP_USAGE
+
+    def _mcp_add_target(self) -> Path:
+        project_dir = self._mcp_project_dir_value or self.store.cwd
+        if project_dir is not None:
+            return project_config_path(project_dir)
+        return home_config_path(self._mcp_home_hint)
 
     @property
     def background_children_running(self) -> bool:
@@ -568,15 +615,33 @@ class AgentLoop:
         await asyncio.shield(self._mcp_mount_task)
 
     async def _mount_mcp_servers(self) -> None:
-        if self._mcp_notice_sink is None:
-            self._mcp_mount = await mount_mcp_servers(self.tool_registry)
-        else:
+        try:
+            config = load_mcp_config_overlay(
+                home=self._mcp_home_hint,
+                project_dir=self._mcp_project_dir_value or self.store.cwd,
+            )
             self._mcp_mount = await mount_mcp_servers(
-                self.tool_registry,
-                notice_sink=self._mcp_notice_sink,
+                self.tool_registry, config, notice_sink=self._mcp_notice_sink
+            )
+        except MCPConfigError:
+            self._mcp_mount = await mount_mcp_servers(
+                self.tool_registry, notice_sink=self._mcp_notice_sink
             )
         self._mcp_mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
         self._mcp_mount_attempted = True
+
+    def set_mcp_scope(
+        self,
+        *,
+        home: str | Path | None = None,
+        project_dir: str | Path | None = None,
+    ) -> None:
+        """Set the home + project scope this loop uses for MCP config files."""
+
+        self._mcp_home_hint = None if home is None else str(home)
+        self._mcp_project_dir_value = (
+            None if project_dir is None else Path(project_dir).expanduser().resolve()
+        )
 
     def _refresh_mcp_tool_schemas(self, mount: MCPMount | None = None) -> None:
         mount = mount or self._mcp_mount

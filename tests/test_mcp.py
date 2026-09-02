@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import json
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -20,8 +21,14 @@ from zeta.mcp import (
     MCPTool,
     StdioMCPClient,
     StreamableHTTPMCPClient,
+    home_config_path,
     load_mcp_config,
+    load_mcp_config_overlay,
     mount_mcp_servers,
+    project_config_path,
+    read_mcp_config_file,
+    server_to_json,
+    write_mcp_config,
 )
 from zeta.mcp.client import (
     MCPProtocolError,
@@ -246,10 +253,10 @@ async def test_agent_loop_bootstrap_checks_missing_mcp_config(
     calls = 0
     original_mount = mount_module.mount_mcp_servers
 
-    async def observe_mount(registry: ToolRegistry):
+    async def observe_mount(registry: ToolRegistry, config=None, *, notice_sink=None):
         nonlocal calls
         calls += 1
-        return await original_mount(registry)
+        return await original_mount(registry, config, notice_sink=notice_sink)
 
     monkeypatch.setattr("zeta.loop.mount_mcp_servers", observe_mount)
     backend = FakeBackend([ScriptedTurn([TextContent("booted")])])
@@ -790,10 +797,10 @@ async def test_mcp_status_waits_for_one_shared_initial_mount(
     calls = 0
 
     async def delayed_mount(
-        registry: ToolRegistry, *, notice_sink=None
+        registry: ToolRegistry, config=None, *, notice_sink=None
     ) -> MCPMount:
         nonlocal calls
-        del notice_sink
+        del notice_sink, config
         calls += 1
         started.set()
         await release.wait()
@@ -811,4 +818,292 @@ async def test_mcp_status_waits_for_one_shared_initial_mount(
     await ensure_task
     assert await status_task == "mcp: 0 mounted, 0 failed"
     assert calls == 1
+    await loop.close()
+
+
+def _write_json(path: Path, servers: dict[str, dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"servers": servers}))
+
+
+def test_overlay_project_shadows_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "proj"
+    monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
+    _write_json(
+        home_config_path(home),
+        {
+            "shared": {"transport": "stdio", "command": "home-cmd"},
+            "home_only": {"transport": "stdio", "command": "home-only"},
+        },
+    )
+    _write_json(
+        project_config_path(project),
+        {
+            "shared": {"transport": "stdio", "command": "project-cmd"},
+            "project_only": {"transport": "stdio", "command": "project-only"},
+        },
+    )
+
+    config = load_mcp_config_overlay(home=home, project_dir=project)
+
+    assert config.servers["shared"].command == "project-cmd"
+    assert config.servers["home_only"].command == "home-only"
+    assert config.servers["project_only"].command == "project-only"
+    assert config.sources["shared"] == project_config_path(project)
+    assert config.sources["home_only"] == home_config_path(home)
+
+
+def test_overlay_records_malformed_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
+    home = tmp_path / "home"
+    _write_json(
+        home_config_path(home),
+        {
+            "good": {"transport": "stdio", "command": "ok"},
+            "bad": {"transport": "sockets", "command": "nope"},
+        },
+    )
+
+    config = load_mcp_config_overlay(home=home, project_dir=None)
+
+    assert set(config.servers) == {"good"}
+    assert "bad" in config.malformed_servers
+    assert config.malformed_servers["bad"].malformed_reason is not None
+    assert "transport" in config.malformed_servers["bad"].malformed_reason
+
+
+def test_write_mcp_config_is_atomic(tmp_path: Path) -> None:
+    target = tmp_path / "nested" / "mcp.json"
+    write_mcp_config(target, {"a": {"transport": "stdio", "command": "x"}})
+
+    assert json.loads(target.read_text())["servers"]["a"]["command"] == "x"
+    assert list(target.parent.glob("*.json.tmp")) == []
+    assert list(target.parent.glob(".mcp.*")) == []
+
+
+def test_write_mcp_config_leaves_no_partial_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "mcp.json"
+    target.write_text('{"servers": {"keep": {"transport": "stdio", "command": "orig"}}}')
+    original_replace = os.replace
+
+    def boom(src, dst):  # noqa: ANN001
+        raise RuntimeError("simulated rename failure")
+
+    monkeypatch.setattr("zeta.mcp.config.os.replace", boom)
+    with pytest.raises(RuntimeError, match="simulated"):
+        write_mcp_config(target, {"new": {"transport": "stdio", "command": "x"}})
+
+    assert json.loads(target.read_text())["servers"] == {
+        "keep": {"transport": "stdio", "command": "orig"}
+    }
+    assert list(tmp_path.glob(".mcp.*")) == []
+    del original_replace
+
+
+def test_server_to_json_round_trips_stdio_and_http() -> None:
+    stdio = MCPServerConfig(
+        name="s", transport="stdio", command="cmd", args=("a", "b"), env={"K": "V"}
+    )
+    http = MCPServerConfig(
+        name="h",
+        transport="streamable-http",
+        url="https://example",
+        auth_type="bearer",
+        auth_token="secret",
+    )
+    assert server_to_json(stdio) == {
+        "transport": "stdio",
+        "command": "cmd",
+        "args": ["a", "b"],
+        "env": {"K": "V"},
+    }
+    assert server_to_json(http) == {
+        "transport": "streamable-http",
+        "url": "https://example",
+        "auth": {"type": "bearer", "token": "secret"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_slash_mcp_add_stdio_writes_project_file_and_mounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+
+    def build_client(config: MCPServerConfig) -> _FakeClient:
+        return _FakeClient(config)
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=home, project_dir=project)
+
+    output = await loop.slash_mcp("add live --stdio server-cmd arg1 arg2")
+
+    assert "live: mounted" in output
+    project_file = project_config_path(project)
+    entry = json.loads(project_file.read_text())["servers"]["live"]
+    assert entry == {
+        "transport": "stdio",
+        "command": "server-cmd",
+        "args": ["arg1", "arg2"],
+    }
+    assert loop._mcp_mount is not None
+    assert loop._mcp_mount.statuses["live"].state == "mounted"
+    assert "live:echo" in {schema["name"] for schema in loop.tool_registry.schemas}
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_mcp_add_http_writes_and_registers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+
+    async def fake_connect_and_list(client):
+        return [MCPTool("ping", "", {"type": "object"})]
+
+    monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=home, project_dir=project)
+
+    output = await loop.slash_mcp("add remote --http https://mcp.example")
+    assert "remote: mounted" in output
+    entry = json.loads(project_config_path(project).read_text())["servers"]["remote"]
+    assert entry == {"transport": "streamable-http", "url": "https://mcp.example"}
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_mcp_add_rejects_duplicate_and_bad_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+
+    async def fake_connect_and_list(client):
+        return []
+
+    monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=home, project_dir=project)
+
+    await loop.slash_mcp("add remote --http https://mcp.example")
+    duplicate = await loop.slash_mcp("add remote --http https://mcp.example")
+    assert "already configured" in duplicate
+    bad_flag = await loop.slash_mcp("add other --socket cmd")
+    assert "unknown add flag" in bad_flag
+    bad_http = await loop.slash_mcp("add three --http a b c")
+    assert "--http takes exactly one" in bad_http
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_mcp_remove_deletes_entry_and_unmounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+
+    async def fake_connect_and_list(client):
+        return [MCPTool("ping", "", {"type": "object"})]
+
+    monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=home, project_dir=project)
+
+    await loop.slash_mcp("add live --http https://mcp.example")
+    assert "live:ping" in {schema["name"] for schema in loop.tool_registry.schemas}
+    output = await loop.slash_mcp("remove live")
+
+    assert "live" not in output
+    assert loop._mcp_mount is not None
+    assert "live" not in loop._mcp_mount.configs
+    assert "live:ping" not in {schema["name"] for schema in loop.tool_registry.schemas}
+    data = json.loads(project_config_path(project).read_text())["servers"]
+    assert "live" not in data
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_mcp_remove_project_entry_unshadows_home_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    _write_json(
+        home_config_path(home),
+        {"shared": {"transport": "streamable-http", "url": "https://home"}},
+    )
+    _write_json(
+        project_config_path(project),
+        {"shared": {"transport": "streamable-http", "url": "https://project"}},
+    )
+
+    seen: list[str] = []
+
+    async def fake_connect_and_list(client):
+        seen.append(client.config.url or "?")
+        return [MCPTool("ping", "", {"type": "object"})]
+
+    monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=home, project_dir=project)
+
+    await loop.ensure_mcp_servers()
+    assert loop._mcp_mount is not None
+    assert loop._mcp_mount.configs["shared"].url == "https://project"
+    await loop.slash_mcp("remove shared")
+
+    assert loop._mcp_mount.configs["shared"].url == "https://home"
+    assert loop._mcp_mount.statuses["shared"].state == "mounted"
+    assert loop._mcp_mount.sources["shared"] == home_config_path(home)
+    project_data = json.loads(project_config_path(project).read_text())["servers"]
+    assert "shared" not in project_data
+    home_data = json.loads(home_config_path(home).read_text())["servers"]
+    assert "shared" in home_data
+    assert seen == ["https://project", "https://home"]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_mcp_lists_malformed_with_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    _write_json(
+        home_config_path(home),
+        {"broken": {"transport": "carrier-pigeon", "command": "nope"}},
+    )
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=home, project_dir=project)
+
+    output = await loop.slash_mcp("")
+    assert "broken: malformed" in output
+    assert "transport" in output
     await loop.close()

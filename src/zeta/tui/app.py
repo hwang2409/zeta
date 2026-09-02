@@ -1070,6 +1070,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
     if max_turns_override is not None and max_turns_override > 0:
         loop_kwargs["max_turns"] = max_turns_override
     loop = AgentLoop(backend, store, **loop_kwargs)
+    loop.set_mcp_scope(home=home, project_dir=discover_repo_root(Path(store.cwd)))
     return TUIApp(
         loop,
         provider=provider,

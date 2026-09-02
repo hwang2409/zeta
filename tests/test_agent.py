@@ -1074,7 +1074,10 @@ async def test_restricted_child_cannot_use_mounted_mcp_write_tool(
 ) -> None:
     mount_calls = 0
 
-    async def mount_write_tool(registry: ToolRegistry) -> MCPMount:
+    async def mount_write_tool(
+        registry: ToolRegistry, config=None, *, notice_sink=None
+    ) -> MCPMount:
+        del config, notice_sink
         nonlocal mount_calls
         mount_calls += 1
 

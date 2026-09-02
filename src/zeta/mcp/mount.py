@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Literal
 
 from ..core.abort import AbortSignal
@@ -25,7 +26,9 @@ from .stdio import StdioMCPClient
 logger = logging.getLogger(__name__)
 # One quiet server cannot hold session startup longer than this bound.
 SERVER_SETUP_TIMEOUT_SECONDS = 10.0
-MCPServerState = Literal["mounted", "failed", "skipped-missing-env", "timed-out"]
+MCPServerState = Literal[
+    "mounted", "failed", "skipped-missing-env", "timed-out", "malformed"
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +60,7 @@ class MCPMount:
     registry: ToolRegistry | None
     configs: dict[str, MCPServerConfig]
     statuses: dict[str, MCPServerStatus]
+    sources: dict[str, Path]
     _clients: dict[str, MCPClient] = field(default_factory=dict)
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     _schema_refresh: Callable[[MCPMount], None] | None = None
@@ -71,6 +75,7 @@ class MCPMount:
         _locks: dict[str, asyncio.Lock] | None = None,
         _schema_refresh: Callable[[MCPMount], None] | None = None,
         _closed: bool = False,
+        sources: dict[str, Path] | None = None,
     ) -> None:
         if isinstance(registry, ToolRegistry):
             clients = _clients or {}
@@ -84,6 +89,7 @@ class MCPMount:
         self.registry = registry
         self.configs = server_configs
         self.statuses = statuses or {}
+        self.sources = sources or {}
         self._clients = clients
         self._locks = _locks or {
             name: asyncio.Lock() for name in server_configs
@@ -101,7 +107,7 @@ class MCPMount:
     def summary(self) -> str:
         mounted = sum(status.state == "mounted" for status in self.statuses.values())
         failed = sum(
-            status.state in {"failed", "timed-out"}
+            status.state in {"failed", "timed-out", "malformed"}
             for status in self.statuses.values()
         )
         return f"mcp: {mounted} mounted, {failed} failed"
@@ -128,6 +134,55 @@ class MCPMount:
 
         if name not in self.configs:
             raise ValueError(f"unknown MCP server: {name}")
+        return await self._mount_one(name, self.configs[name], notice_sink=notice_sink)
+
+    async def add_server(
+        self,
+        server_config: MCPServerConfig,
+        *,
+        source: Path,
+        notice_sink: NoticeSink | None = None,
+    ) -> MCPServerStatus:
+        """Mount one new server live, without touching existing clients."""
+
+        name = server_config.name
+        if name in self.configs:
+            raise ValueError(f"MCP server already mounted: {name}")
+        self.configs[name] = server_config
+        self.sources[name] = source
+        try:
+            return await self._mount_one(
+                name, server_config, notice_sink=notice_sink
+            )
+        except BaseException:
+            self.configs.pop(name, None)
+            self.sources.pop(name, None)
+            self._locks.pop(name, None)
+            raise
+
+    async def remove_server(self, name: str) -> None:
+        """Unmount one server live and drop its bookkeeping."""
+
+        if name not in self.configs:
+            raise ValueError(f"unknown MCP server: {name}")
+        lock = self._locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            client = self._clients.get(name)
+            self._transition(
+                name, client=client, allow_closed=True, remove_config=True
+            )
+            if client is not None:
+                await _close_failed_client(client)
+        self.sources.pop(name, None)
+        self._locks.pop(name, None)
+
+    async def _mount_one(
+        self,
+        name: str,
+        server_config: MCPServerConfig,
+        *,
+        notice_sink: NoticeSink | None,
+    ) -> MCPServerStatus:
         lock = self._locks.setdefault(name, asyncio.Lock())
         async with lock:
             if self._closed:
@@ -138,7 +193,7 @@ class MCPMount:
                 await _close_failed_client(client)
             try:
                 setup = await _setup_server(
-                    self.configs[name],
+                    server_config,
                     notice_sink=notice_sink,
                     client_ready=lambda replacement: self._arm_client(
                         name, replacement
@@ -197,6 +252,7 @@ class MCPMount:
         reason: str | None = None,
         tools: tuple[MCPTool, ...] = (),
         allow_closed: bool = False,
+        remove_config: bool = False,
     ) -> bool:
         """Apply one server state and keep registry and schemas in sync."""
 
@@ -240,6 +296,9 @@ class MCPMount:
                     tool_count=0,
                     reason=reason,
                 )
+        if remove_config:
+            self.configs.pop(name, None)
+            self.statuses.pop(name, None)
         if self._schema_refresh is not None:
             self._schema_refresh(self)
         return True
@@ -283,6 +342,7 @@ async def mount_mcp_servers(
         configs,
         {},
         _locks={name: asyncio.Lock() for name in configs},
+        sources=dict(config.sources),
     )
     try:
         results = await asyncio.gather(
@@ -311,6 +371,19 @@ async def _setup_server(
     notice_sink: NoticeSink | None = None,
     client_ready: Callable[[MCPClient], None] | None = None,
 ) -> _SetupResult:
+    if server_config.malformed_reason is not None:
+        public = MCPServerStatus(
+            server_config.name,
+            server_config.transport,
+            "malformed",
+            reason=server_config.malformed_reason,
+            stderr_log_path=str(mcp_log_path(server_config.name)),
+        )
+        _notice(
+            notice_sink,
+            f"mcp · {server_config.name} malformed ({server_config.malformed_reason})",
+        )
+        return _SetupResult(public)
     if server_config.missing_env:
         variables = ", ".join(server_config.missing_env)
         reason = f"missing environment variable(s): {variables}"
