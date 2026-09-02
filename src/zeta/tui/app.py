@@ -54,6 +54,7 @@ from ..types import (
     assistant_text,
 )
 from .checkpoints import CheckpointTranscriptMixin
+from .slash_handlers.command_runtime import CommandRuntimeMixin
 from .composer import (
     ComposerAttachmentMixin,
     FullScreenPromptSession,
@@ -123,6 +124,7 @@ class TUIApp(
     TurnConsumerMixin,
     CheckpointTranscriptMixin,
     ComposerAttachmentMixin,
+    CommandRuntimeMixin,
     SlashHandlerMixin,
 ):
     """Full-screen transcript, persistent composer, and follow-up queue."""
@@ -186,6 +188,7 @@ class TUIApp(
         self._inline_abort_signal = None
         self._macro_receipts = deque()
         self._input_loop_active = False
+        self._preprocessing_task: asyncio.Task[None] | None = None
         self._resuming_tool = False
         self._session = session
         self._history_path = (
@@ -246,7 +249,13 @@ class TUIApp(
 
     @property
     def active(self) -> bool:
-        return self._active_task is not None and not self._active_task.done()
+        return (
+            self._active_task is not None
+            and not self._active_task.done()
+        ) or (
+            self._preprocessing_task is not None
+            and not self._preprocessing_task.done()
+        )
 
     def retry_available(self) -> bool:
         """Return whether the last failed turn can be retried."""
@@ -805,9 +814,15 @@ class TUIApp(
                 wait_for: set[asyncio.Task[Any]] = {prompt_task, input_task}
                 if self._active_task is not None:
                     wait_for.add(self._active_task)
+                if self._preprocessing_task is not None:
+                    wait_for.add(self._preprocessing_task)
                 done, _ = await asyncio.wait(
                     wait_for, return_when=asyncio.FIRST_COMPLETED
                 )
+                if self._preprocessing_task is not None and self._preprocessing_task in done:
+                    preprocessing_task = self._preprocessing_task
+                    self._preprocessing_task = None
+                    await preprocessing_task
                 if self._active_task is not None and self._active_task in done:
                     try:
                         await self._active_task
@@ -834,6 +849,9 @@ class TUIApp(
             if not input_task.done():
                 input_task.cancel()
                 await asyncio.gather(input_task, return_exceptions=True)
+            if self._preprocessing_task is not None and not self._preprocessing_task.done():
+                self._preprocessing_task.cancel()
+                await asyncio.gather(self._preprocessing_task, return_exceptions=True)
 
     def _install_full_screen_layout(self, session: FullScreenPromptSession) -> None:
         root = session.layout.container
@@ -877,10 +895,16 @@ class TUIApp(
                 wait_for: set[asyncio.Task[Any]] = {prompt_task}
                 if self._active_task is not None:
                     wait_for.add(self._active_task)
+                if self._preprocessing_task is not None:
+                    wait_for.add(self._preprocessing_task)
                 done, _ = await asyncio.wait(
                     wait_for, return_when=asyncio.FIRST_COMPLETED
                 )
 
+                if self._preprocessing_task is not None and self._preprocessing_task in done:
+                    preprocessing_task = self._preprocessing_task
+                    self._preprocessing_task = None
+                    await preprocessing_task
                 if self._active_task is not None and self._active_task in done:
                     try:
                         await self._active_task
@@ -907,6 +931,9 @@ class TUIApp(
             if self._active_task is not None and not self._active_task.done():
                 self._active_task.cancel()
                 await asyncio.gather(self._active_task, return_exceptions=True)
+            if self._preprocessing_task is not None and not self._preprocessing_task.done():
+                self._preprocessing_task.cancel()
+                await asyncio.gather(self._preprocessing_task, return_exceptions=True)
             if isinstance(session, FullScreenPromptSession):
                 session.restore_terminal()
             await self.loop.close()

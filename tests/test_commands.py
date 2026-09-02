@@ -1,4 +1,5 @@
 import asyncio
+import shlex
 import subprocess
 from io import StringIO
 from pathlib import Path
@@ -26,7 +27,14 @@ from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.tools import ToolRegistry
-from zeta.tools.exec import MacroDisplay, run_exec_macro, run_inline_shell_batch
+from zeta.tools.exec import (
+    INLINE_SHELL_BATCH_TIMEOUT_MESSAGE,
+    INLINE_SHELL_OUTPUT_LIMIT_MESSAGE,
+    INLINE_SHELL_SPAN_LIMIT_MESSAGE,
+    MacroDisplay,
+    run_exec_macro,
+    run_inline_shell_batch,
+)
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import (
     FullScreenPromptSession,
@@ -566,6 +574,140 @@ async def test_inline_shell_approval_covers_the_complete_batch(tmp_path: Path) -
         if message.role.value == "user"
     )
     assert user_message.content[0].text == "values first and second"
+
+
+async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "inspect", "value !`printf ready`")
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    app = TUIApp(
+        AgentLoop(backend, store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    app._input_loop_active = True
+
+    submission_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
+    for _ in range(100):
+        if app.pending_approvals:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("inline shell approval did not appear")
+
+    await app._handle_prompt_value(f"approve {app.pending_approvals[0].key}")
+    await submission_task
+    assert app._preprocessing_task is not None
+    await app._preprocessing_task
+    app._preprocessing_task = None
+    assert app._active_task is not None
+    await app._active_task
+    assert backend.calls
+
+
+async def test_inline_shell_abort_stops_before_provider_dispatch(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "inspect", "value !`sleep 30`")
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("must not run")])])
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+        ),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    app._input_loop_active = True
+
+    submission_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
+    for _ in range(100):
+        if app._inline_abort_signal is not None:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("inline shell did not start")
+    app.abort_active()
+    await submission_task
+    assert app._preprocessing_task is not None
+    await app._preprocessing_task
+    app._preprocessing_task = None
+    assert backend.calls == []
+
+
+async def test_inline_shell_denial_prevents_later_commands(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    registry = ToolRegistry(tmp_path, approval_policy=policy)
+    marker = tmp_path / "must-not-execute"
+    lifecycle_calls: list[str] = []
+    task = asyncio.create_task(
+        run_inline_shell_batch(
+            registry,
+            ("printf first", f"touch {shlex.quote(str(marker))}"),
+            lifecycle_sink=lambda _kind, call: lifecycle_calls.append(call.id),
+        )
+    )
+    for _ in range(100):
+        if policy.pending_requests():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("inline shell approval did not appear")
+    assert policy.deny(policy.pending_requests()[0].key)
+    output = await task
+
+    assert output == ("[inline shell failed: denied]", "[inline shell failed: denied]")
+    assert not marker.exists()
+    assert lifecycle_calls
+
+
+async def test_capture_output_does_not_create_file_named_none(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+
+    await registry.execute(
+        ToolCall("capture", "exec", {"command": "printf output"}),
+        _capture_output=True,
+    )
+
+    assert not (tmp_path / "None").exists()
+
+
+async def test_inline_shell_caps_spans_output_and_batch_time(tmp_path: Path) -> None:
+    registry = ToolRegistry(tmp_path)
+    marker = tmp_path / "span-cap-marker"
+    span_output = await run_inline_shell_batch(
+        registry,
+        ("printf first", f"touch {shlex.quote(str(marker))}"),
+        lifecycle_sink=lambda _kind, _call: None,
+        max_spans=1,
+    )
+    output_cap = await run_inline_shell_batch(
+        registry,
+        ("printf 123", "printf never"),
+        lifecycle_sink=lambda _kind, _call: None,
+        total_output_limit=3,
+    )
+    time_cap = await run_inline_shell_batch(
+        registry,
+        ("sleep 1", "printf never"),
+        lifecycle_sink=lambda _kind, _call: None,
+        timeout=1.0,
+        batch_timeout=0.01,
+    )
+
+    assert span_output == ("first", INLINE_SHELL_SPAN_LIMIT_MESSAGE)
+    assert not marker.exists()
+    assert output_cap == ("123", INLINE_SHELL_OUTPUT_LIMIT_MESSAGE)
+    assert time_cap == (INLINE_SHELL_BATCH_TIMEOUT_MESSAGE,) * 2
 
 
 async def test_inline_shell_failure_and_output_are_bounded(tmp_path: Path) -> None:

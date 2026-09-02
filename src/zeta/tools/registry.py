@@ -638,7 +638,7 @@ class ToolRegistry:
         )
         execution_context = ToolExecutionContext(tool_call, self._agent_runner, _lifecycle_sink)
         handler = _bind_execution_context(definition.handler, execution_context)
-        execution_arguments = dict(arguments, **({"_log_path": str(_log_path), "_background": _background, "_capture_output": _capture_output} if _log_path is not None or _background or _capture_output else {}))
+        execution_arguments = dict(arguments, **({"_log_path": str(_log_path)} if _log_path is not None else {}) | ({"_background": True} if _background else {}) | ({"_capture_output": True} if _capture_output else {}))
         result = await self._invoke_handler_with_abort(
             handler,
             execution_arguments,

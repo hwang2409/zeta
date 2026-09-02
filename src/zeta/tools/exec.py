@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,14 @@ from .registry import (
 
 INLINE_SHELL_TIMEOUT = 10.0
 INLINE_SHELL_OUTPUT_LIMIT = 8_192
+INLINE_SHELL_MAX_SPANS = 32
+INLINE_SHELL_TOTAL_OUTPUT_LIMIT = 64 * 1024
+INLINE_SHELL_BATCH_TIMEOUT = 30.0
+INLINE_SHELL_SPAN_LIMIT_MESSAGE = "[inline shell failed: span limit exceeded]"
+INLINE_SHELL_OUTPUT_LIMIT_MESSAGE = (
+    "[inline shell failed: aggregate output limit exceeded]"
+)
+INLINE_SHELL_BATCH_TIMEOUT_MESSAGE = "[inline shell failed: batch time limit exceeded]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +387,9 @@ async def run_inline_shell_batch(
     abort_signal: AbortSignal | None = None,
     timeout: float = INLINE_SHELL_TIMEOUT,
     output_limit: int = INLINE_SHELL_OUTPUT_LIMIT,
+    max_spans: int = INLINE_SHELL_MAX_SPANS,
+    total_output_limit: int = INLINE_SHELL_TOTAL_OUTPUT_LIMIT,
+    batch_timeout: float = INLINE_SHELL_BATCH_TIMEOUT,
 ) -> tuple[str, ...]:
     """Run inline shell spans with one approval for the complete batch."""
 
@@ -387,15 +399,30 @@ async def run_inline_shell_batch(
     first_call_id = f"inline-{uuid4().hex}"
     register_macro_display(first_call_id, command="\n".join(commands), argv=())
     outputs: list[str] = []
+    started_at = time.monotonic()
+    aggregate_output = 0
     try:
         for index, command in enumerate(commands):
+            if index >= max_spans:
+                outputs.extend(
+                    INLINE_SHELL_SPAN_LIMIT_MESSAGE
+                    for _ in commands[index:]
+                )
+                break
+            remaining_time = batch_timeout - (time.monotonic() - started_at)
+            if remaining_time <= 0:
+                outputs.extend(
+                    INLINE_SHELL_BATCH_TIMEOUT_MESSAGE
+                    for _ in commands[index:]
+                )
+                break
             call_id = first_call_id if index == 0 else f"inline-{uuid4().hex}"
             call = ToolCall(
                 call_id,
                 "exec",
                 {
                     "command": command,
-                    "timeout": timeout,
+                    "timeout": min(timeout, remaining_time),
                     "max_output": output_limit,
                 },
             )
@@ -414,11 +441,33 @@ async def run_inline_shell_batch(
                 if index == 0
                 else None,
             )
+            if time.monotonic() - started_at >= batch_timeout:
+                outputs.append(INLINE_SHELL_BATCH_TIMEOUT_MESSAGE)
+                outputs.extend(
+                    INLINE_SHELL_BATCH_TIMEOUT_MESSAGE
+                    for _ in commands[index + 1 :]
+                )
+                break
+            if _inline_shell_was_denied(result):
+                outputs.append(_inline_shell_failure(result))
+                outputs.extend(
+                    "[inline shell failed: denied]" for _ in commands[index + 1 :]
+                )
+                break
             structured = result.get("structuredContent")
             if result.get("isError") is not True and isinstance(structured, dict):
                 stdout = structured.get("stdout")
                 if isinstance(stdout, str):
+                    output_size = len(stdout.encode("utf-8"))
+                    if aggregate_output + output_size > total_output_limit:
+                        outputs.append(INLINE_SHELL_OUTPUT_LIMIT_MESSAGE)
+                        outputs.extend(
+                            INLINE_SHELL_OUTPUT_LIMIT_MESSAGE
+                            for _ in commands[index + 1 :]
+                        )
+                        break
                     outputs.append(stdout)
+                    aggregate_output += output_size
                     continue
             outputs.append(_inline_shell_failure(result))
             if _inline_shell_was_canceled(result):
@@ -435,6 +484,14 @@ def _inline_shell_was_canceled(result: StructuredToolResult) -> bool:
     content = result.get("content")
     return result.get("isError") is True and isinstance(content, list) and any(
         isinstance(block, dict) and block.get("text") == "tool execution canceled"
+        for block in content
+    )
+
+
+def _inline_shell_was_denied(result: StructuredToolResult) -> bool:
+    content = result.get("content")
+    return result.get("isError") is True and isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("text") == "tool execution denied"
         for block in content
     )
 

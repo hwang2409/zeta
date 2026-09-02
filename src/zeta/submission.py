@@ -187,7 +187,13 @@ class SubmissionMixin:
             self._restore_failed_submission(submission, slash_output.message)
             return
         if isinstance(slash_output, SlashModelInput):
-            model_input = slash_output.text
+            await self._finish_prompt_value(
+                submission,
+                parsed,
+                model_input=slash_output.text,
+                attachment_value=submission.text,
+            )
+            return
         elif slash_output is not None:
             self._release_attachment_paths(submission.attachment_paths)
             self._submissions.complete(submission)
@@ -199,19 +205,39 @@ class SubmissionMixin:
             elif slash_output:
                 self._print_system(slash_output)
             return
-        else:
+        if (
+            self._input_loop_active
+            and self._slash_commands.needs_inline_shell_resolution(parsed)
+        ):
+            self._preprocessing_task = asyncio.create_task(
+                self._finish_prompt_value(submission, parsed)
+            )
+            return
+        await self._finish_prompt_value(submission, parsed)
+
+    async def _finish_prompt_value(
+        self,
+        submission: Submission,
+        parsed: str,
+        *,
+        model_input: str | None = None,
+        attachment_value: str | None = None,
+    ) -> None:
+        if model_input is None:
             model_input = await self._slash_commands.resolve_for_model(
                 parsed, self._resolve_inline_shell
             )
+        if model_input is None:
+            self._release_attachment_paths(submission.attachment_paths)
+            self._submissions.complete(submission)
+            return
         pending_attachments = list(submission.attachment_paths)
         pending_attachment_tokens = dict(submission.attachment_tokens)
         user_message = self._prepare_user_message(
             model_input,
             pending_attachments=pending_attachments,
             pending_attachment_tokens=pending_attachment_tokens,
-            attachment_value=submission.text
-            if isinstance(slash_output, SlashModelInput)
-            else None,
+            attachment_value=attachment_value,
         )
         if user_message is None:
             session = self._active_session or self._session
@@ -241,7 +267,7 @@ class SubmissionMixin:
             self._release_attachment_paths(tuple(pending_attachments))
             self._present_pending_approvals()
             self._submissions.complete(submission)
-        elif self.active:
+        elif self._active_task is not None and not self._active_task.done():
             candidate = UndoCandidate.from_message(
                 submission.text,
                 user_message,
