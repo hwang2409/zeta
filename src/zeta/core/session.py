@@ -100,6 +100,7 @@ class SessionMetadata:
     system_prompt: str = ""
     context_files: list[str] = field(default_factory=list)
     vim_mode: bool = True
+    budget_pinned: bool = False
 
     @classmethod
     def new(
@@ -114,6 +115,7 @@ class SessionMetadata:
         system_prompt: str = "",
         context_files: list[str] | tuple[str, ...] = (),
         vim_mode: bool = True,
+        budget_pinned: bool = False,
     ) -> SessionMetadata:
         timestamp = _now()
         return cls(
@@ -129,6 +131,7 @@ class SessionMetadata:
             system_prompt=system_prompt,
             context_files=list(context_files),
             vim_mode=vim_mode,
+            budget_pinned=budget_pinned,
         )
 
     @classmethod
@@ -166,11 +169,13 @@ class SessionMetadata:
         system_prompt = value.get("system_prompt", "") if has_context_snapshot else ""
         context_files = value.get("context_files", []) if has_context_snapshot else []
         vim_mode = value.get("vim_mode", True)
+        budget_pinned = value.get("budget_pinned", False)
         if (
             type(system_prompt) is not str
             or type(context_files) is not list
             or any(type(item) is not str for item in context_files)
             or type(vim_mode) is not bool
+            or type(budget_pinned) is not bool
         ):
             raise SessionError(f"session metadata context is invalid: {path}")
         return cls(
@@ -187,6 +192,7 @@ class SessionMetadata:
             system_prompt=system_prompt,
             context_files=list(context_files),
             vim_mode=vim_mode,
+            budget_pinned=budget_pinned,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -204,6 +210,7 @@ class SessionMetadata:
             "system_prompt": self.system_prompt,
             "context_files": self.context_files,
             "vim_mode": self.vim_mode,
+            "budget_pinned": self.budget_pinned,
         }
 
 
@@ -231,6 +238,7 @@ class SessionManager:
         system_prompt: str = "",
         context_files: list[str] | tuple[str, ...] = (),
         vim_mode: bool = True,
+        budget_pinned: bool = False,
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -251,6 +259,7 @@ class SessionManager:
                 system_prompt=system_prompt,
                 context_files=context_files,
                 vim_mode=vim_mode,
+                budget_pinned=budget_pinned,
             )
             store = ConversationStore(
                 self.sessions_dir,
@@ -416,6 +425,30 @@ class SessionManager:
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
+    def record_budget(
+        self,
+        metadata: SessionMetadata,
+        *,
+        budget: int,
+        pinned: bool,
+    ) -> None:
+        """Persist the compaction budget with optimistic concurrency."""
+
+        expected = metadata.compaction_budget
+
+        def update(item: SessionMetadata) -> SessionMetadata:
+            if item.compaction_budget != expected:
+                raise SessionError(
+                    "session budget changed before commit; winner: "
+                    f"compaction_budget={item.compaction_budget!r}"
+                )
+            item.compaction_budget = budget
+            item.budget_pinned = pinned
+            return self._touch(item)
+
+        current = self._mutate(metadata.session_id, update)
+        self._copy_metadata(metadata, current)
+
     @staticmethod
     def _touch(metadata: SessionMetadata) -> SessionMetadata:
         metadata.updated_at = _now()
@@ -447,6 +480,7 @@ class SessionManager:
         target.system_prompt = source.system_prompt
         target.context_files = list(source.context_files)
         target.vim_mode = source.vim_mode
+        target.budget_pinned = source.budget_pinned
 
     def _read(self, session_id: str) -> SessionMetadata:
         path = self.sessions_dir / session_id / "meta.json"
