@@ -9,7 +9,7 @@ import platform
 import re
 import shutil
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from prompt_toolkit.application import get_app
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
@@ -33,6 +34,7 @@ from ..types import (
     TextContent,
     image_signature_matches,
 )
+from ..core.slash import SlashCommandRegistry
 from .key_bindings import (
     FullScreenPromptSession,
     VimCursorShapeConfig,
@@ -47,6 +49,7 @@ SPINNER_INTERVAL = 0.2
 
 __all__ = [
     "FullScreenPromptSession",
+    "SlashCompleter",
     "VimCursorShapeConfig",
     "build_key_bindings",
 ]
@@ -193,6 +196,36 @@ class TurnConsumerMixin:
 
 class AttachmentError(ValueError):
     """Raised when a composer attachment cannot be read or decoded."""
+
+
+class SlashCompleter(Completer):
+    """Complete slash commands with descriptions and custom-source badges."""
+
+    def __init__(self, registry: SlashCommandRegistry) -> None:
+        self.registry = registry
+
+    def get_completions(
+        self, document: Document, complete_event: CompleteEvent
+    ) -> Iterator[Completion]:
+        del complete_event
+        before_cursor = document.text_before_cursor
+        if not before_cursor.startswith("/") or any(
+            character.isspace() for character in before_cursor
+        ):
+            return
+        prefix = before_cursor[1:]
+        for name, description, source in self.registry.completion_entries:
+            if not name.startswith(prefix):
+                continue
+            meta = description
+            if source:
+                meta = f"[{source}] {description}".strip()
+            yield Completion(
+                name,
+                start_position=-len(prefix),
+                display=f"/{name}",
+                display_meta=meta,
+            )
 
 
 @dataclass(frozen=True, slots=True)

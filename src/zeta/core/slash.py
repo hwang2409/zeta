@@ -2,13 +2,129 @@
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Protocol
+
+import yaml
 
 from ..types import Message, MessageRole, StreamEventType, TextContent
 from .store import ConversationEntry
+
+COMMAND_FILE_SIZE_LIMIT = 64 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class CustomCommand:
+    """One prompt-template command loaded from a markdown file."""
+
+    name: str
+    description: str
+    body: str
+    path: Path
+    source: str
+
+    def render(self, arguments: str) -> str:
+        """Substitute the raw argument tail and positional arguments."""
+
+        values = arguments.split()
+
+        def replace(match: re.Match[str]) -> str:
+            token = match.group(1)
+            if token == "ARGUMENTS":
+                return arguments
+            index = int(token)
+            return values[index - 1] if index <= len(values) else ""
+
+        return re.sub(r"\$(ARGUMENTS|[1-9])(?!\d)", replace, self.body)
+
+
+@dataclass(frozen=True, slots=True)
+class CommandLoadResult:
+    """Commands and non-fatal notices found during one load."""
+
+    commands: tuple[CustomCommand, ...]
+    notices: tuple[str, ...]
+
+
+def load_custom_commands(
+    *,
+    home: str | Path | None,
+    project_dir: str | Path,
+) -> CommandLoadResult:
+    """Load project commands over home commands without touching other homes."""
+
+    commands: list[CustomCommand] = []
+    notices: list[str] = []
+    directories: list[tuple[str, Path]] = []
+    if home is not None:
+        directories.append(("home", Path(home).resolve() / "commands"))
+    directories.append(("project", Path(project_dir).resolve() / ".zeta" / "commands"))
+    for source, directory in directories:
+        for path in _markdown_files(directory, notices):
+            command, notice = _read_command(path, source)
+            if notice is not None:
+                notices.append(notice)
+            if command is not None:
+                commands.append(command)
+    return CommandLoadResult(tuple(commands), tuple(notices))
+
+
+def _markdown_files(directory: Path, notices: list[str]) -> list[Path]:
+    try:
+        if not directory.is_dir():
+            return []
+        return sorted(directory.glob("*.md"))
+    except OSError as exc:
+        notices.append(f"could not scan custom command directory {directory}: {exc}")
+        return []
+
+
+def _read_command(path: Path, source: str) -> tuple[CustomCommand | None, str | None]:
+    try:
+        if path.stat().st_size > COMMAND_FILE_SIZE_LIMIT:
+            raise ValueError(f"file exceeds {COMMAND_FILE_SIZE_LIMIT} byte limit")
+        text = path.read_text(encoding="utf-8")
+        metadata, body = _split_document(text, path)
+        name = path.stem
+        if not name or any(character.isspace() for character in name):
+            raise ValueError("filename stem must be one nonempty word")
+        description = metadata.get("description", "")
+        if type(description) is not str:
+            raise ValueError("description must be a string")
+        if not body:
+            raise ValueError("prompt body is empty")
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        RecursionError,
+        yaml.YAMLError,
+    ) as exc:
+        return None, f"ignored custom command {path}: {exc}"
+    return CustomCommand(name, description.strip(), body, path.resolve(), source), None
+
+
+def _split_document(text: str, path: Path) -> tuple[dict[str, object], str]:
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        try:
+            end = next(
+                index
+                for index, line in enumerate(lines[1:], 1)
+                if line.strip() == "---"
+            )
+        except StopIteration as exc:
+            raise ValueError("frontmatter is unterminated") from exc
+        metadata = yaml.safe_load("\n".join(lines[1:end]))
+        if not isinstance(metadata, dict):
+            raise ValueError(f"frontmatter in {path} must be a mapping")
+        body = "\n".join(lines[end + 1 :]).strip()
+        return metadata, body
+    return {}, text.strip()
 
 
 class UsageCounterSource(Protocol):
@@ -460,6 +576,7 @@ class SlashCommand:
 
     name: str
     handler: SlashHandler
+    description: str = ""
 
     def run(self, session: SlashSession, args: str) -> SlashResult:
         return self.handler(session, args)
@@ -470,6 +587,9 @@ class SlashCommandRegistry:
 
     def __init__(self) -> None:
         self._commands: dict[str, SlashCommand] = {}
+        self._custom_commands: dict[str, CustomCommand] = {}
+        self._notices: list[str] = []
+        self._warning_notices: set[str] = set()
 
     def register(self, command: SlashCommand) -> None:
         if not command.name or any(character.isspace() for character in command.name):
@@ -477,6 +597,53 @@ class SlashCommandRegistry:
         if command.name in self._commands:
             raise ValueError(f"slash command already registered: {command.name}")
         self._commands[command.name] = command
+
+    @property
+    def custom_commands(self) -> tuple[CustomCommand, ...]:
+        """Return loaded custom commands in stable name order."""
+
+        return tuple(self._custom_commands[name] for name in sorted(self._custom_commands))
+
+    @property
+    def notices(self) -> tuple[str, ...]:
+        """Return non-fatal load notices for the session-start display."""
+
+        return tuple(self._notices)
+
+    @property
+    def warning_notices(self) -> frozenset[str]:
+        """Return notices that need prominent display."""
+
+        return frozenset(self._warning_notices)
+
+    @property
+    def completion_entries(self) -> tuple[tuple[str, str, str], ...]:
+        """Return command names, descriptions, and custom source badges."""
+
+        builtins = tuple(
+            (command.name, command.description, "")
+            for command in self._commands.values()
+        )
+        custom = tuple(
+            (command.name, command.description, command.source)
+            for command in self.custom_commands
+        )
+        return builtins + custom
+
+    def register_custom(self, command: CustomCommand) -> None:
+        """Register a custom command unless a built-in owns its name."""
+
+        if command.name in self._commands:
+            notice = (
+                f"ignored custom command {command.path}: "
+                f"shadows built-in /{command.name}"
+            )
+            self._notices.append(notice)
+            self._warning_notices.add(notice)
+            return
+        if command.name in self._custom_commands and command.source == "home":
+            return
+        self._custom_commands[command.name] = command
 
     def _dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command from the first line, or pass the input through."""
@@ -507,11 +674,39 @@ class SlashCommandRegistry:
             return result
         return await result
 
-    @staticmethod
-    def input_for_model(value: str) -> str:
-        """Turn the double-slash escape into one literal leading slash."""
+    def input_for_model(self, value: str) -> str:
+        """Expand a custom command or turn an escape into a literal slash."""
 
-        return value[1:] if value.startswith("//") else value
+        if value.startswith("//"):
+            return value[1:]
+        first_line = value.split("\n", 1)[0]
+        if not first_line.startswith("/"):
+            return value
+        parts = first_line[1:].split(maxsplit=1)
+        if not parts:
+            return value
+        command = self._custom_commands.get(parts[0])
+        if command is None:
+            return value
+        arguments = parts[1] if len(parts) == 2 else ""
+        return command.render(arguments)
+
+    def help_text(self) -> str:
+        """Format the built-in and loaded custom commands for /help."""
+
+        lines = ["built-in commands:"]
+        for command in self._commands.values():
+            description = f" — {command.description}" if command.description else ""
+            lines.append(f"  /{command.name}{description}")
+        lines.append("custom commands:")
+        if not self._custom_commands:
+            lines.append("  none")
+        for command in self.custom_commands:
+            description = f" — {command.description}" if command.description else ""
+            lines.append(
+                f"  /{command.name}{description} (source: {command.path})"
+            )
+        return "\n".join(lines)
 
 
 def _format_status(status: SlashStatus) -> str:
@@ -659,15 +854,29 @@ def _run_fork(session: SlashSession, args: str) -> str:
     return session.slash_fork(args)
 
 
-def create_slash_registry() -> SlashCommandRegistry:
+def create_slash_registry(
+    *,
+    zeta_home: str | Path | None = None,
+    project_dir: str | Path | None = None,
+) -> SlashCommandRegistry:
     """Create the built-in registry."""
 
     registry = SlashCommandRegistry()
-    registry.register(SlashCommand("status", _run_status))
-    registry.register(SlashCommand("model", _run_model))
-    registry.register(SlashCommand("vim", _run_vim))
-    registry.register(SlashCommand("paste", _run_paste))
-    registry.register(SlashCommand("compact", _run_compact))
-    registry.register(SlashCommand("checkpoint", _run_checkpoint))
-    registry.register(SlashCommand("fork", _run_fork))
+    registry.register(SlashCommand("status", _run_status, "show session status"))
+    registry.register(SlashCommand("model", _run_model, "show or change the model"))
+    registry.register(SlashCommand("vim", _run_vim, "show or change vim mode"))
+    registry.register(SlashCommand("paste", _run_paste, "paste an image"))
+    registry.register(SlashCommand("compact", _run_compact, "compact the context"))
+    registry.register(SlashCommand("checkpoint", _run_checkpoint, "save a checkpoint"))
+    registry.register(SlashCommand("fork", _run_fork, "fork from a checkpoint"))
+    registry.register(
+        SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")
+    )
+    result = load_custom_commands(
+        home=zeta_home,
+        project_dir=project_dir or Path.cwd(),
+    )
+    registry._notices.extend(result.notices)
+    for command in result.commands:
+        registry.register_custom(command)
     return registry

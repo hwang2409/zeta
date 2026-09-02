@@ -11,7 +11,12 @@ from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.filters import Condition, is_searching, vi_insert_mode
+from prompt_toolkit.filters import (
+    Condition,
+    has_completions,
+    is_searching,
+    vi_insert_mode,
+)
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -277,9 +282,11 @@ def build_key_bindings(
         if not escape_chord_pending:
             escape_chord_cursor_position = None
 
-    @bindings.add(
-        "up", filter=vi_insert_history_navigation | emacs_history_navigation
-    )
+    history_navigation_filter = (
+        vi_insert_history_navigation | emacs_history_navigation
+    ) & ~has_completions
+
+    @bindings.add("up", filter=history_navigation_filter)
     def history_up(event: KeyPressEvent) -> None:
         nonlocal history_navigation_active, suppress_history_detach
         buffer = event.current_buffer
@@ -294,9 +301,7 @@ def build_key_bindings(
             suppress_history_detach = False
         history_navigation_active = buffer.text != ""
 
-    @bindings.add(
-        "down", filter=vi_insert_history_navigation | emacs_history_navigation
-    )
+    @bindings.add("down", filter=history_navigation_filter)
     def history_down(event: KeyPressEvent) -> None:
         nonlocal history_navigation_active, suppress_history_detach
         buffer = event.current_buffer
@@ -341,7 +346,7 @@ def build_key_bindings(
         @bindings.add("c-f", filter=full_screen_mode & ~transcript_search_mode, eager=True)
         def start_transcript_search(event: KeyPressEvent) -> None:
             nonlocal search_input_active
-            del event
+            event.current_buffer.cancel_completion()
             search_buffer.reset()
             search_input_active = True
             on_search_start()
