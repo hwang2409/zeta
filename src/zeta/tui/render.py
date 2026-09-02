@@ -291,6 +291,14 @@ def render_approval_card(
     command = str(command) if command is not None else None
     if command is not None:
         body_parts.append(Text(f"command={command}", style=DIM, overflow="fold"))
+        display_argv = arguments.get("display_argv")
+        if isinstance(display_argv, (list, tuple)):
+            body_parts.append(Text("argv:", style=DIM))
+            for index, value in enumerate(display_argv, 1):
+                if isinstance(value, str):
+                    body_parts.append(
+                        Text(f"  [{index}] {value}", style=DIM, overflow="fold")
+                    )
     else:
         arg_line = _arguments(arguments)
         if arg_line:
@@ -319,6 +327,8 @@ def _tool_receipt(event: StreamEvent) -> Text:
         structured = result.structured_content or {}
         if result.content == "tool execution canceled":
             status = "canceled"
+        elif result.content == "tool execution denied":
+            status = "denied"
         elif structured.get("timed_out") is True:
             status = "timeout"
         else:

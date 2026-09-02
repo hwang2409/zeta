@@ -30,6 +30,7 @@ from zeta.tui.composer import (
     SlashCompleter,
     build_key_bindings,
 )
+from zeta.tui.render import render_approval_card
 from zeta.types import TextContent, ToolCall
 
 
@@ -427,6 +428,25 @@ def test_exec_macro_timeout_defaults_and_reads_frontmatter(tmp_path: Path) -> No
     ]
 
 
+def test_prompt_timeout_metadata_is_ignored(tmp_path: Path) -> None:
+    _write_command(
+        tmp_path / "commands",
+        "prompt",
+        "---\ntimeout: not-a-number\n---\nuse the prompt",
+    )
+    _write_command(
+        tmp_path / "commands",
+        "exec",
+        "---\nkind: exec\ntimeout: not-a-number\n---\necho exec",
+    )
+
+    result = load_custom_commands(home=tmp_path, project_dir=tmp_path / "project")
+
+    assert [command.name for command in result.commands] == ["prompt"]
+    assert result.commands[0].timeout == 300.0
+    assert any("exec.md" in notice for notice in result.notices)
+
+
 async def test_exec_macro_streams_receipt_writes_log_and_skips_provider(
     tmp_path: Path,
 ) -> None:
@@ -486,9 +506,58 @@ async def test_exec_macro_approval_is_ephemeral_and_uses_substituted_script(
         raise AssertionError("macro approval did not appear")
     assert "command=printf approved-now" in output.getvalue()
     assert store.messages() == []
-
     assert policy.approve(app.pending_approvals[0].key)
     await task
+    assert store.messages() == []
+
+
+def test_exec_macro_approval_card_keeps_script_and_every_argv_value() -> None:
+    arguments = {
+        "command": "printf '%s\\n' \"$@\"",
+        "display_command": "printf '%s\\n' \"$@\"",
+        "display_argv": ["first-target", "second target", "$HOME"],
+    }
+
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=80).print(
+        render_approval_card("exec", arguments)
+    )
+
+    card = output.getvalue()
+    assert 'command=printf \'%s\\n\' "$@"' in card
+    assert "[1] first-target" in card
+    assert "[2] second target" in card
+    assert "[3] $HOME" in card
+
+
+async def test_exec_macro_deny_renders_denied_receipt(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "deploy", "---\nkind: exec\n---\nprintf deploy")
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        approval_policy=policy,
+        console=Console(file=output, force_terminal=False),
+    )
+
+    task = asyncio.create_task(app._handle_prompt_value("/deploy"))
+    for _ in range(100):
+        if app.pending_approvals:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("macro approval did not appear")
+
+    assert policy.deny(app.pending_approvals[0].key)
+    await task
+
+    assert "/deploy · denied" in output.getvalue()
+    assert "/deploy · failed" not in output.getvalue()
     assert store.messages() == []
 
 
@@ -610,6 +679,46 @@ async def test_macro_receipts_queue_until_the_next_provider_turn(tmp_path: Path)
     assert user_message.content[0].text.startswith(
         "ran /first, exit 0\nran /second, exit 0\n\ncontinue"
     )
+
+
+async def test_queued_prompt_consumes_macro_receipt_at_provider_start(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "slow", "---\nkind: exec\n---\nsleep 0.05")
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._input_loop_active = True
+
+    macro_task = asyncio.create_task(app._handle_prompt_value("/slow"))
+    for _ in range(100):
+        if app.active:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("slow macro did not start")
+
+    await app._handle_prompt_value("continue")
+    assert len(app._queued) == 1
+    await asyncio.wait_for(app._active_task, timeout=2)
+    await macro_task
+    app._active_task = None
+    app._start_queued_turn()
+    await app._active_task
+
+    user_message = next(
+        message
+        for message in backend.calls[0][0]
+        if message.role.value == "user"
+    )
+    assert user_message.content[0].text == "ran /slow, exit 0\n\ncontinue"
 
 
 async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> None:

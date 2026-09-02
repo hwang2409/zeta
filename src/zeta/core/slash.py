@@ -116,18 +116,20 @@ def _read_command(path: Path, source: str) -> tuple[CustomCommand | None, str | 
         kind = metadata.get("kind", "prompt")
         if type(kind) is not str or kind not in {"prompt", "exec"}:
             raise ValueError(f"unknown command kind: {kind!r}")
-        timeout = metadata.get("timeout", 300.0)
-        try:
-            timeout_value = float(timeout)
-        except (TypeError, ValueError, OverflowError):
-            timeout_value = 0.0
-        if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout_value)
-            or timeout_value <= 0
-        ):
-            raise ValueError("timeout must be a positive finite number")
+        timeout_value = 300.0
+        if kind == "exec":
+            timeout = metadata.get("timeout", 300.0)
+            try:
+                timeout_value = float(timeout)
+            except (TypeError, ValueError, OverflowError):
+                timeout_value = 0.0
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout_value)
+                or timeout_value <= 0
+            ):
+                raise ValueError("timeout must be a positive finite number")
         if not body:
             raise ValueError("prompt body is empty")
     except (

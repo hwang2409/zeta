@@ -265,9 +265,18 @@ async def run_exec_macro(
 
     Path(log_path).touch()
     scope_signal = abort_signal or registry.abort_signal.registry.new_generation()
+    execution_call = ToolCall(
+        call.id,
+        call.name,
+        {
+            key: value
+            for key, value in call.arguments.items()
+            if key != "display_argv"
+        },
+    )
     try:
         raw_result = await registry.execute(
-            call,
+            execution_call,
             abort_signal=scope_signal,
             _scope_signal=scope_signal,
             _stream_sink=stream_sink,

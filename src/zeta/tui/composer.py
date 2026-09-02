@@ -10,7 +10,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -83,6 +83,9 @@ class TurnConsumerMixin:
         user_message: Message | None = None,
         persist_user_message: bool = True,
     ) -> None:
+        user_text, user_message = self._consume_macro_receipts(
+            user_text, user_message
+        )
         self._abort_requested = False
         self._turn_had_visible_output = False
         self._loop_state = "streaming"
@@ -718,6 +721,24 @@ class ComposerAttachmentMixin:
         self._undo_candidate = candidate
         self._start_turn(user_text, user_message=user_message)
 
+    def _consume_macro_receipts(
+        self, user_text: str, user_message: Message | None
+    ) -> tuple[str, Message | None]:
+        if not self._macro_receipts:
+            return user_text, user_message
+        receipts = "\n".join(self._macro_receipts)
+        self._macro_receipts.clear()
+        user_text = f"{receipts}\n\n{user_text}"
+        if user_message is None:
+            return user_text, None
+        content = [
+            replace(block, text=user_text)
+            if isinstance(block, TextContent) and block.path is None
+            else block
+            for block in user_message.content
+        ]
+        return user_text, replace(user_message, content=content)
+
     def _start_turn(
         self,
         user_text: str,
@@ -745,6 +766,7 @@ class ComposerAttachmentMixin:
             {
                 "command": command.render_exec(args),
                 "display_command": command.render(args),
+                "display_argv": args.split(),
                 "timeout": command.timeout,
             },
         )
@@ -824,6 +846,8 @@ class ComposerAttachmentMixin:
         )
         if result.content == "tool execution canceled":
             status = "canceled"
+        elif result.content == "tool execution denied":
+            status = "denied"
         elif (result.structured_content or {}).get("timed_out") is True:
             status = "timeout"
         else:
