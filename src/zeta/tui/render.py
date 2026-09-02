@@ -1080,10 +1080,11 @@ def format_status(
                 query.truncate(max(1, available), overflow="ellipsis")
                 return f"{search_prefix}{query.plain}{search_suffix}"
 
+            position_segment = transcript_position or ""
             navigation_candidates = (
-                (state_segment, transcript_position),
-                (state_text, transcript_position),
-                ("", transcript_position),
+                (state_segment, position_segment),
+                (state_text, position_segment),
+                ("", position_segment),
                 (state_segment, ""),
                 (state_text, ""),
                 ("", ""),
