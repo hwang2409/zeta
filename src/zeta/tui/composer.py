@@ -221,7 +221,7 @@ class SlashCompleter(Completer):
             if source:
                 meta = f"[{source}] {description}".strip()
             yield Completion(
-                name[len(prefix) :],
+                name,
                 start_position=-len(prefix),
                 display=f"/{name}",
                 display_meta=meta,

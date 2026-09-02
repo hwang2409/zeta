@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import os
+import re
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-import os
 from pathlib import Path
-import re
 from typing import Protocol
 
 import yaml
 
 from ..types import Message, MessageRole, StreamEventType, TextContent
 from .store import ConversationEntry
+
+COMMAND_FILE_SIZE_LIMIT = 64 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,18 +53,18 @@ class CommandLoadResult:
 
 def load_custom_commands(
     *,
-    home: str | Path,
+    home: str | Path | None,
     project_dir: str | Path,
 ) -> CommandLoadResult:
     """Load project commands over home commands without touching other homes."""
 
     commands: list[CustomCommand] = []
     notices: list[str] = []
-    home_dir = Path(home).expanduser().resolve() / "commands"
-    project_commands = (
-        Path(project_dir).expanduser().resolve() / ".zeta" / "commands"
-    )
-    for source, directory in (("home", home_dir), ("project", project_commands)):
+    directories: list[tuple[str, Path]] = []
+    if home is not None:
+        directories.append(("home", Path(home).expanduser().resolve() / "commands"))
+    directories.append(("project", Path(project_dir).expanduser().resolve() / ".zeta" / "commands"))
+    for source, directory in directories:
         for path in _markdown_files(directory, notices):
             command, notice = _read_command(path, source)
             if notice is not None:
@@ -82,10 +84,10 @@ def _markdown_files(directory: Path, notices: list[str]) -> list[Path]:
         return []
 
 
-def _read_command(
-    path: Path, source: str
-) -> tuple[CustomCommand | None, str | None]:
+def _read_command(path: Path, source: str) -> tuple[CustomCommand | None, str | None]:
     try:
+        if path.stat().st_size > COMMAND_FILE_SIZE_LIMIT:
+            raise ValueError(f"file exceeds {COMMAND_FILE_SIZE_LIMIT} byte limit")
         text = path.read_text(encoding="utf-8")
         metadata, body = _split_document(text, path)
         name = path.stem
@@ -96,7 +98,13 @@ def _read_command(
             raise ValueError("description must be a string")
         if not body:
             raise ValueError("prompt body is empty")
-    except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        RecursionError,
+        yaml.YAMLError,
+    ) as exc:
         return None, f"ignored custom command {path}: {exc}"
     return CustomCommand(name, description.strip(), body, path.resolve(), source), None
 
@@ -582,6 +590,7 @@ class SlashCommandRegistry:
         self._commands: dict[str, SlashCommand] = {}
         self._custom_commands: dict[str, CustomCommand] = {}
         self._notices: list[str] = []
+        self._warning_notices: set[str] = set()
 
     def register(self, command: SlashCommand) -> None:
         if not command.name or any(character.isspace() for character in command.name):
@@ -603,6 +612,12 @@ class SlashCommandRegistry:
         return tuple(self._notices)
 
     @property
+    def warning_notices(self) -> frozenset[str]:
+        """Return notices that need prominent display."""
+
+        return frozenset(self._warning_notices)
+
+    @property
     def completion_entries(self) -> tuple[tuple[str, str, str], ...]:
         """Return command names, descriptions, and custom source badges."""
 
@@ -620,9 +635,12 @@ class SlashCommandRegistry:
         """Register a custom command unless a built-in owns its name."""
 
         if command.name in self._commands:
-            self._notices.append(
-                f"ignored custom command {command.path}: shadows built-in /{command.name}"
+            notice = (
+                f"ignored custom command {command.path}: "
+                f"shadows built-in /{command.name}"
             )
+            self._notices.append(notice)
+            self._warning_notices.add(notice)
             return
         if command.name in self._custom_commands and command.source == "home":
             return
@@ -856,7 +874,7 @@ def create_slash_registry(
         SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")
     )
     result = load_custom_commands(
-        home=zeta_home or os.environ.get("ZETA_HOME", Path.home() / ".zeta"),
+        home=(zeta_home if zeta_home is not None else os.environ.get("ZETA_HOME")),
         project_dir=project_dir or Path.cwd(),
     )
     registry._notices.extend(result.notices)

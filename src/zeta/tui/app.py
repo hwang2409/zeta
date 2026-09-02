@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -83,6 +82,7 @@ from .theme import (
     ACCENT,
     BODY,
     CHROME,
+    COMMAND,
     COMPOSER_BORDER,
     COMPOSER_FOCUS,
     DIM,
@@ -149,6 +149,7 @@ class TUIApp(
         *,
         provider: str,
         model: str,
+        zeta_home: str | Path | None = None,
         verbose: bool = False,
         console: Console | None = None,
         session: PromptSession[str] | None = None,
@@ -217,7 +218,7 @@ class TUIApp(
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
         self._model_catalog_task: asyncio.Task[None] | None = None
-        self._slash_commands = create_slash_registry(project_dir=self.loop.store.cwd)
+        self._slash_commands = create_slash_registry(zeta_home=zeta_home or env_home(), project_dir=self.loop.store.cwd)
         self._compaction_shown = False
         self._turn_had_visible_output = False
         self._failed_turn: tuple[str, Message] | None = None
@@ -970,7 +971,8 @@ class TUIApp(
         self.loop.session_start()
         self._rebuild_transcript()
         for notice in self._slash_commands.notices:
-            self._print_unit(Text(f"command · {notice}", style=DIM))
+            style = COMMAND if notice in self._slash_commands.warning_notices else DIM
+            self._print_unit(Text(f"command · {notice}", style=style))
         self._present_pending_approvals()
         prompt_task: asyncio.Task[str | None] | None = None
         try:
@@ -1168,6 +1170,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         loop,
         provider=provider,
         model=selected_model,
+        zeta_home=home,
         verbose=args.verbose,
         history_path=home / "history",
         approval_policy=approval_policy,
