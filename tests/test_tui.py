@@ -5335,6 +5335,23 @@ def test_footer_shows_transcript_navigation_and_search_state() -> None:
     assert "line 14/80" in narrow.plain
 
 
+def test_narrow_footer_search_survives_a_tail_anchored_transcript() -> None:
+    """position_indicator() is None while the viewport follows the tail."""
+
+    narrow = format_status(
+        "fake",
+        "offline",
+        "idle",
+        token_count=18,
+        width=50,
+        transcript_navigation=True,
+        transcript_search="target",
+        transcript_match=(2, 5),
+        transcript_position=None,
+    )
+    assert 'find "target" 2/5' in narrow.plain
+
+
 def test_footer_shows_vim_state_and_degrades_as_a_whole_segment() -> None:
     footer = format_status(
         "fake",
