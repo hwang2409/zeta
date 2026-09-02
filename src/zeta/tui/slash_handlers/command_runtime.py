@@ -20,9 +20,12 @@ class CommandRuntimeMixin:
     """Run inline spans and custom exec commands for the TUI."""
 
     async def _resolve_inline_shell(
-        self, commands: tuple[str, ...]
+        self, submission_id: int, commands: tuple[str, ...]
     ) -> InlineShellResult:
-        signal = self.loop.tool_registry.abort_signal.registry.new_generation()
+        signal = self._inline_abort_signals.get(submission_id)
+        if signal is None:
+            signal = self.loop.tool_registry.abort_signal.registry.new_generation()
+            self._inline_abort_signals[submission_id] = signal
         self._inline_abort_signal = signal
 
         def lifecycle_sink(kind: str, call: ToolCall) -> None:
@@ -52,7 +55,11 @@ class CommandRuntimeMixin:
             )
             return InlineShellResult(outputs, canceled=signal.is_set())
         finally:
-            self._inline_abort_signal = None
+            self._inline_abort_signals.pop(submission_id, None)
+            if self._inline_abort_signal is signal:
+                self._inline_abort_signal = next(
+                    reversed(tuple(self._inline_abort_signals.values())), None
+                )
 
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str:
         """Run one custom shell macro through the normal exec safety path."""

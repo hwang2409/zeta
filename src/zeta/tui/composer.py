@@ -423,12 +423,12 @@ class ComposerAttachmentMixin:
     """Attachment behavior shared by the TUI composition root."""
 
     def abort_active(self) -> None:
-        if self._inline_abort_signal is not None:
-            self._inline_abort_signal.abort()
+        if self._inline_abort_signals:
+            for signal in self._inline_abort_signals.values():
+                signal.abort()
             for request in self.pending_approvals:
                 self._abort_approval(request.key)
             self._invalidate_prompt()
-            return
         if self._active_task is not None and not self._active_task.done():
             macro_running = self._macro_abort_signal is not None
             if macro_running:
@@ -652,32 +652,42 @@ class ComposerAttachmentMixin:
             return
         session.app.current_buffer.set_document(Document(value, len(value)))
 
+    def _restore_pending_submission(self, submission: Any) -> None:
+        session = self._active_session or self._session
+        buffer = session.app.current_buffer if session is not None else None
+        self._draft.clear_submitted(submission.draft_revision)
+        if buffer is not None and buffer.text:
+            self._release_attachment_paths(submission.attachment_paths)
+            self._print_system(
+                f"undo kept the current draft; sent text: {submission.text}"
+            )
+            self._draft.schedule(buffer.text)
+            return
+        self._restore_composer(submission.text)
+        self._restore_pending_attachment_state(
+            submission.attachment_paths,
+            submission.attachment_tokens,
+            submission.next_image_token,
+        )
+        self._draft.schedule(
+            submission.text,
+            attachment_tokens=dict(submission.attachment_tokens),
+            next_image_token=submission.next_image_token,
+        )
+
     def undo_sent_turn(self) -> None:
         """Abort the current turn and restore its submitted text once."""
 
         pending_submission = self._submissions.cancel_current()
         if pending_submission is not None:
-            session = self._active_session or self._session
-            buffer = session.app.current_buffer if session is not None else None
-            self._draft.clear_submitted(pending_submission.draft_revision)
-            if buffer is not None and buffer.text:
-                self._release_attachment_paths(pending_submission.attachment_paths)
-                self._print_system(
-                    f"undo kept the current draft; sent text: {pending_submission.text}"
-                )
-                self._draft.schedule(buffer.text)
+            preprocessing_task = self._preprocessing_tasks.get(pending_submission.id)
+            if preprocessing_task is not None and not preprocessing_task.done():
+                self._undo_pending.add(pending_submission.id)
+                signal = self._inline_abort_signals.get(pending_submission.id)
+                if signal is not None:
+                    signal.abort()
                 return
-            self._restore_composer(pending_submission.text)
-            self._restore_pending_attachment_state(
-                pending_submission.attachment_paths,
-                pending_submission.attachment_tokens,
-                pending_submission.next_image_token,
-            )
-            self._draft.schedule(
-                pending_submission.text,
-                attachment_tokens=dict(pending_submission.attachment_tokens),
-                next_image_token=pending_submission.next_image_token,
-            )
+            self._restore_pending_submission(pending_submission)
             return
 
         candidate = self._undo_candidate

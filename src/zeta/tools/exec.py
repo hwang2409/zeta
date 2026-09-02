@@ -399,8 +399,18 @@ async def run_inline_shell_batch(
     first_call_id = f"inline-{uuid4().hex}"
     register_macro_display(first_call_id, command="\n".join(commands), argv=())
     outputs: list[str] = []
-    started_at = time.monotonic()
+    started_at: float | None = None
     aggregate_output = 0
+
+    def first_lifecycle(
+        kind: str, call: ToolCall | None = None
+    ) -> None:
+        nonlocal started_at
+        if kind == "execution_start" and started_at is None:
+            started_at = time.monotonic()
+        if kind in {"approval_start", "approval_end"} and call is not None:
+            lifecycle_sink(kind, call)
+
     try:
         for index, command in enumerate(commands):
             if index >= max_spans:
@@ -409,7 +419,11 @@ async def run_inline_shell_batch(
                     for _ in commands[index:]
                 )
                 break
-            remaining_time = batch_timeout - (time.monotonic() - started_at)
+            remaining_time = (
+                timeout
+                if started_at is None
+                else batch_timeout - (time.monotonic() - started_at)
+            )
             if remaining_time <= 0:
                 outputs.extend(
                     INLINE_SHELL_BATCH_TIMEOUT_MESSAGE
@@ -434,14 +448,14 @@ async def run_inline_shell_batch(
                 _capture_output=True,
                 _skip_approval=index > 0,
                 _lifecycle_sink=(
-                    lambda kind, call=call: lifecycle_sink(kind, call)
-                    if kind in {"approval_start", "approval_end"}
-                    else None
+                    lambda kind, call=call: first_lifecycle(kind, call)
                 )
                 if index == 0
                 else None,
             )
-            if time.monotonic() - started_at >= batch_timeout:
+            if started_at is not None and (
+                time.monotonic() - started_at >= batch_timeout
+            ):
                 outputs.append(INLINE_SHELL_BATCH_TIMEOUT_MESSAGE)
                 outputs.extend(
                     INLINE_SHELL_BATCH_TIMEOUT_MESSAGE

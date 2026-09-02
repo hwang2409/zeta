@@ -186,9 +186,12 @@ class TUIApp(
         self._abort_requested = False
         self._macro_abort_signal = self._macro_call_id = None
         self._inline_abort_signal = None
+        self._inline_abort_signals = {}
         self._macro_receipts = deque()
         self._input_loop_active = False
         self._preprocessing_task: asyncio.Task[None] | None = None
+        self._preprocessing_tasks: dict[int, asyncio.Task[None]] = {}
+        self._undo_pending: set[int] = set()
         self._resuming_tool = False
         self._session = session
         self._history_path = (
@@ -253,8 +256,10 @@ class TUIApp(
             self._active_task is not None
             and not self._active_task.done()
         ) or (
-            self._preprocessing_task is not None
-            and not self._preprocessing_task.done()
+            any(
+                not task.done()
+                for task in self._preprocessing_tasks.values()
+            )
         )
 
     def retry_available(self) -> bool:
@@ -814,15 +819,11 @@ class TUIApp(
                 wait_for: set[asyncio.Task[Any]] = {prompt_task, input_task}
                 if self._active_task is not None:
                     wait_for.add(self._active_task)
-                if self._preprocessing_task is not None:
-                    wait_for.add(self._preprocessing_task)
+                wait_for.update(self._preprocessing_wait_set())
                 done, _ = await asyncio.wait(
                     wait_for, return_when=asyncio.FIRST_COMPLETED
                 )
-                if self._preprocessing_task is not None and self._preprocessing_task in done:
-                    preprocessing_task = self._preprocessing_task
-                    self._preprocessing_task = None
-                    await preprocessing_task
+                await self._drain_preprocessing(done)
                 if self._active_task is not None and self._active_task in done:
                     try:
                         await self._active_task
@@ -849,9 +850,15 @@ class TUIApp(
             if not input_task.done():
                 input_task.cancel()
                 await asyncio.gather(input_task, return_exceptions=True)
-            if self._preprocessing_task is not None and not self._preprocessing_task.done():
-                self._preprocessing_task.cancel()
-                await asyncio.gather(self._preprocessing_task, return_exceptions=True)
+            preprocessing_tasks = self._preprocessing_wait_set()
+            for task in preprocessing_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*preprocessing_tasks, return_exceptions=True)
+            self._preprocessing_tasks.clear()
+            self._preprocessing_task = None
+            self._inline_abort_signals.clear()
+            self._undo_pending.clear()
 
     def _install_full_screen_layout(self, session: FullScreenPromptSession) -> None:
         root = session.layout.container
@@ -895,16 +902,12 @@ class TUIApp(
                 wait_for: set[asyncio.Task[Any]] = {prompt_task}
                 if self._active_task is not None:
                     wait_for.add(self._active_task)
-                if self._preprocessing_task is not None:
-                    wait_for.add(self._preprocessing_task)
+                wait_for.update(self._preprocessing_wait_set())
                 done, _ = await asyncio.wait(
                     wait_for, return_when=asyncio.FIRST_COMPLETED
                 )
 
-                if self._preprocessing_task is not None and self._preprocessing_task in done:
-                    preprocessing_task = self._preprocessing_task
-                    self._preprocessing_task = None
-                    await preprocessing_task
+                await self._drain_preprocessing(done)
                 if self._active_task is not None and self._active_task in done:
                     try:
                         await self._active_task
@@ -931,9 +934,15 @@ class TUIApp(
             if self._active_task is not None and not self._active_task.done():
                 self._active_task.cancel()
                 await asyncio.gather(self._active_task, return_exceptions=True)
-            if self._preprocessing_task is not None and not self._preprocessing_task.done():
-                self._preprocessing_task.cancel()
-                await asyncio.gather(self._preprocessing_task, return_exceptions=True)
+            preprocessing_tasks = self._preprocessing_wait_set()
+            for task in preprocessing_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*preprocessing_tasks, return_exceptions=True)
+            self._preprocessing_tasks.clear()
+            self._preprocessing_task = None
+            self._inline_abort_signals.clear()
+            self._undo_pending.clear()
             if isinstance(session, FullScreenPromptSession):
                 session.restore_terminal()
             await self.loop.close()

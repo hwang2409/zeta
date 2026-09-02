@@ -122,6 +122,20 @@ class SubmissionQueue:
 class SubmissionMixin:
     """Handle composer submissions without sharing mutable text state."""
 
+    def _preprocessing_wait_set(self) -> set[asyncio.Task[None]]:
+        return set(self._preprocessing_tasks.values())
+
+    async def _drain_preprocessing(
+        self, done: set[asyncio.Task[None]]
+    ) -> None:
+        for submission_id, task in tuple(self._preprocessing_tasks.items()):
+            if task not in done:
+                continue
+            self._preprocessing_tasks.pop(submission_id, None)
+            if self._preprocessing_task is task:
+                self._preprocessing_task = None
+            await task
+
     async def slash_mcp(self, args: str) -> str:
         return await self.loop.slash_mcp(args)
 
@@ -209,8 +223,13 @@ class SubmissionMixin:
             self._input_loop_active
             and self._slash_commands.needs_inline_shell_resolution(parsed)
         ):
-            self._preprocessing_task = asyncio.create_task(
+            preprocessing_task = asyncio.create_task(
                 self._finish_prompt_value(submission, parsed)
+            )
+            self._preprocessing_tasks[submission.id] = preprocessing_task
+            self._preprocessing_task = preprocessing_task
+            self._inline_abort_signals[submission.id] = (
+                self.loop.tool_registry.abort_signal.registry.new_generation()
             )
             return
         await self._finish_prompt_value(submission, parsed)
@@ -225,10 +244,15 @@ class SubmissionMixin:
     ) -> None:
         if model_input is None:
             model_input = await self._slash_commands.resolve_for_model(
-                parsed, self._resolve_inline_shell
+                parsed,
+                lambda commands: self._resolve_inline_shell(submission.id, commands),
             )
         if model_input is None:
-            self._release_attachment_paths(submission.attachment_paths)
+            if submission.id in self._undo_pending:
+                self._undo_pending.remove(submission.id)
+                self._restore_pending_submission(submission)
+            else:
+                self._release_attachment_paths(submission.attachment_paths)
             self._submissions.complete(submission)
             return
         pending_attachments = list(submission.attachment_paths)
