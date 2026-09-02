@@ -346,7 +346,7 @@ def build_key_bindings(
         @bindings.add("c-f", filter=full_screen_mode & ~transcript_search_mode, eager=True)
         def start_transcript_search(event: KeyPressEvent) -> None:
             nonlocal search_input_active
-            del event
+            event.current_buffer.cancel_completion()
             search_buffer.reset()
             search_input_active = True
             on_search_start()

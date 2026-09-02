@@ -31,7 +31,7 @@ def discover_repo_root(cwd: str | Path | None = None) -> Path:
         )
     except (OSError, subprocess.CalledProcessError):
         return directory
-    root = result.stdout.strip()
+    root = getattr(result, "stdout", "").strip()
     return Path(root).expanduser().resolve() if root else directory
 
 

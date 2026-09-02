@@ -218,7 +218,7 @@ class TUIApp(
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
         self._model_catalog_task: asyncio.Task[None] | None = None
-        self._slash_commands = create_slash_registry(zeta_home=zeta_home or env_home(), project_dir=self.loop.store.cwd)
+        self._slash_commands = create_slash_registry(zeta_home=Path(zeta_home).resolve() if zeta_home is not None else None, project_dir=discover_repo_root(Path(self.loop.store.cwd)))
         self._compaction_shown = False
         self._turn_had_visible_output = False
         self._failed_turn: tuple[str, Message] | None = None

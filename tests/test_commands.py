@@ -1,4 +1,5 @@
 import asyncio
+import subprocess
 from io import StringIO
 from pathlib import Path
 
@@ -20,7 +21,11 @@ from zeta.core.slash import (
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.tui.app import TUIApp
-from zeta.tui.composer import SlashCompleter, build_key_bindings
+from zeta.tui.composer import (
+    FullScreenPromptSession,
+    SlashCompleter,
+    build_key_bindings,
+)
 from zeta.types import TextContent
 
 
@@ -208,8 +213,44 @@ def test_tui_command_loading_uses_configured_home(
     live_home = tmp_path / "live-home"
     _write_command(live_home / "commands", "leak", "must not load")
     fake_home = tmp_path / "fake-home"
+    _write_command(fake_home / "commands", "configured", "must load")
     monkeypatch.setattr(Path, "home", lambda: live_home)
-    monkeypatch.setenv("ZETA_HOME", str(fake_home))
+
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+        ),
+        provider="fake",
+        model="offline",
+        zeta_home=fake_home,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    assert all(command.name != "leak" for command in app._slash_commands.custom_commands)
+    assert [command.name for command in app._slash_commands.custom_commands] == [
+        "configured"
+    ]
+
+
+def test_tui_command_loading_skips_host_home_without_configured_home(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sentinel_home = tmp_path / "sentinel-home"
+    sentinel_path = sentinel_home / ".zeta" / "commands" / "sentinel.md"
+    _write_command(sentinel_home / ".zeta" / "commands", "sentinel", "must not load")
+    reads: list[Path] = []
+    original_read_text = Path.read_text
+
+    def read_text(path: Path, *args, **kwargs) -> str:
+        if path == sentinel_path:
+            reads.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.delenv("ZETA_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(sentinel_home))
+    monkeypatch.setattr(Path, "home", lambda: sentinel_home)
+    monkeypatch.setattr(Path, "read_text", read_text)
 
     app = TUIApp(
         AgentLoop(
@@ -221,15 +262,110 @@ def test_tui_command_loading_uses_configured_home(
         console=Console(file=StringIO(), force_terminal=False),
     )
 
-    assert all(command.name != "leak" for command in app._slash_commands.custom_commands)
+    assert all(
+        command.name != "sentinel" for command in app._slash_commands.custom_commands
+    )
+    assert reads == []
+
+
+def test_tui_command_loading_uses_repository_root_from_nested_cwd(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    nested = repo / "src" / "nested"
+    nested.mkdir(parents=True)
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    _write_command(repo / ".zeta" / "commands", "review", "review the change")
+
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions", cwd=nested),
+        ),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    assert [command.name for command in app._slash_commands.custom_commands] == [
+        "review"
+    ]
+
+
+async def test_transcript_search_cancels_completion_before_up_navigation(
+    tmp_path: Path,
+) -> None:
+    _write_command(tmp_path / ".zeta" / "commands", "review", "review")
+    output_text = StringIO()
+    search_active = False
+
+    def start_search() -> None:
+        nonlocal search_active
+        search_active = True
+
+    def end_search() -> None:
+        nonlocal search_active
+        search_active = False
+
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=Vt100_Output(
+                output_text,
+                lambda: Size(rows=24, columns=80),
+            ),
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_search_start=start_search,
+                search_active=lambda: search_active,
+                on_search_input=lambda _value: None,
+                on_search_next=lambda: None,
+                on_search_end=end_search,
+            ),
+            completer=SlashCompleter(
+                create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path)
+            ),
+            multiline=True,
+        )
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await asyncio.sleep(0.05)
+        pipe.send_text("/r\t")
+        for _ in range(100):
+            if session.app.current_buffer.complete_state is not None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("completion menu did not open")
+
+        pipe.send_text("\x06")
+        for _ in range(100):
+            if search_active and session.app.current_buffer.complete_state is None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("transcript search did not cancel completion")
+
+        pipe.send_text("\r")
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x1b")
+        for _ in range(100):
+            if not search_active:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("transcript search did not end")
+
+        pipe.send_text("\x1b[A")
+        await asyncio.sleep(0.05)
+        assert session.app.current_buffer.text == "/r"
+        session.app.exit()
+        await task
 
 
 async def test_custom_command_becomes_the_model_user_message(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
     _write_command(home / "commands", "review", "Review $1")
-    monkeypatch.setenv("ZETA_HOME", str(home))
     backend = FakeBackend(
         [ScriptedTurn(content=[TextContent("done")])]
     )
@@ -237,6 +373,7 @@ async def test_custom_command_becomes_the_model_user_message(
         AgentLoop(backend, ConversationStore(tmp_path / "sessions", cwd=tmp_path)),
         provider="fake",
         model="offline",
+        zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
     )
 

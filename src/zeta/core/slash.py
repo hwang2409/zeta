@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -62,8 +61,8 @@ def load_custom_commands(
     notices: list[str] = []
     directories: list[tuple[str, Path]] = []
     if home is not None:
-        directories.append(("home", Path(home).expanduser().resolve() / "commands"))
-    directories.append(("project", Path(project_dir).expanduser().resolve() / ".zeta" / "commands"))
+        directories.append(("home", Path(home).resolve() / "commands"))
+    directories.append(("project", Path(project_dir).resolve() / ".zeta" / "commands"))
     for source, directory in directories:
         for path in _markdown_files(directory, notices):
             command, notice = _read_command(path, source)
@@ -874,7 +873,7 @@ def create_slash_registry(
         SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")
     )
     result = load_custom_commands(
-        home=(zeta_home if zeta_home is not None else os.environ.get("ZETA_HOME")),
+        home=zeta_home,
         project_dir=project_dir or Path.cwd(),
     )
     registry._notices.extend(result.notices)
