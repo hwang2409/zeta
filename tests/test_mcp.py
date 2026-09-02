@@ -14,6 +14,7 @@ from zeta.loop import AgentLoop
 from zeta.mcp import (
     MCPConfig,
     MCPConfigError,
+    MCPMount,
     MCPServerConfig,
     MCPTool,
     StdioMCPClient,
@@ -146,6 +147,21 @@ def test_config_interpolates_and_skips_missing(tmp_path: Path, monkeypatch: pyte
     assert "missing" not in config.servers
     assert config.skipped_servers["missing"].missing_env == ("MCP_MISSING",)
     assert set(config.configured_servers) == {"present", "missing"}
+
+
+def test_config_records_missing_transport_before_strict_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "mcp.json"
+    path.write_text(json.dumps({"servers": {
+        "missing": {"transport": "${MCP_TRANSPORT}", "command": "server"},
+        "valid": {"transport": "stdio", "command": "server"},
+    }}))
+
+    config = load_mcp_config(path)
+
+    assert set(config.servers) == {"valid"}
+    assert config.skipped_servers["missing"].missing_env == ("MCP_TRANSPORT",)
 
 
 def test_config_override_and_malformed_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -397,7 +413,7 @@ async def test_mount_reports_states_and_notices(
     assert mount.statuses["timed"].state == "timed-out"
     assert "missing environment variable(s): MCP_MISSING" in mount.render()
     assert "stderr:" in mount.render()
-    assert len(notices) == 8
+    assert len(notices) == 4
     await mount.close()
 
 
@@ -426,6 +442,31 @@ async def test_mount_reconnects_one_server_and_rejects_unknown(
     assert "recover:echo" in {schema["name"] for schema in registry.schemas}
     with pytest.raises(ValueError, match="unknown MCP server: absent"):
         await mount.reconnect("absent")
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_exit_updates_mount_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"dead": _stdio_config("dead")}),
+    )
+    client = mount._clients["dead"]
+    process = client._process
+    assert process is not None
+    process.terminate()
+    await process.wait()
+    for _ in range(100):
+        if mount.statuses["dead"].state == "failed":
+            break
+        await asyncio.sleep(0.01)
+
+    assert mount.statuses["dead"].state == "failed"
+    assert "dead:echo" not in {schema["name"] for schema in registry.schemas}
     await mount.close()
 
 
@@ -476,6 +517,40 @@ async def test_call_failure_does_not_affect_other_server(
     failed = await registry.execute(ToolCall("failed", "fail:echo", {"value": "x"}))
     healthy = await registry.execute(ToolCall("healthy", "good:echo", {"value": "ok"}))
     assert failed["isError"] is True
+    assert mount.statuses["fail"].state == "failed"
     assert healthy["isError"] is False
     assert healthy["content"][0]["text"] == "ok"
     await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_status_waits_for_one_shared_initial_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def delayed_mount(
+        registry: ToolRegistry, *, notice_sink=None
+    ) -> MCPMount:
+        nonlocal calls
+        del notice_sink
+        calls += 1
+        started.set()
+        await release.wait()
+        return MCPMount(registry, {}, {})
+
+    monkeypatch.setattr("zeta.loop.mount_mcp_servers", delayed_mount)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path))
+    ensure_task = asyncio.create_task(loop.ensure_mcp_servers())
+    await started.wait()
+    status_task = asyncio.create_task(loop.slash_mcp(""))
+    await asyncio.sleep(0)
+    assert not status_task.done()
+
+    release.set()
+    await ensure_task
+    assert await status_task == "mcp: 0 mounted, 0 failed"
+    assert calls == 1
+    await loop.close()

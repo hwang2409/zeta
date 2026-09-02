@@ -232,6 +232,7 @@ class AgentLoop:
             raise TypeError("tools must be a mapping or ToolRegistry")
         self._mcp_mount: MCPMount | None = None
         self._mcp_mount_attempted = skip_mcp_mount
+        self._mcp_mount_task: asyncio.Task[None] | None = None
         self._provided_tool_schemas = tool_schemas is not None
         self.tool_registry.bind_session_store(store)
         if (
@@ -551,6 +552,9 @@ class AgentLoop:
         if self._mcp_mount is not None:
             await self._mcp_mount.close()
             self._mcp_mount = None
+        if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
+            self._mcp_mount_task.cancel()
+            await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
         await self.tool_registry.background_tasks.close()
 
     def session_start(self) -> None:
@@ -560,7 +564,11 @@ class AgentLoop:
     async def _ensure_mcp_servers(self) -> None:
         if self._mcp_mount_attempted:
             return
-        self._mcp_mount_attempted = True
+        if self._mcp_mount_task is None:
+            self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
+        await asyncio.shield(self._mcp_mount_task)
+
+    async def _mount_mcp_servers(self) -> None:
         if self._mcp_notice_sink is None:
             self._mcp_mount = await mount_mcp_servers(self.tool_registry)
         else:
@@ -569,6 +577,7 @@ class AgentLoop:
                 notice_sink=self._mcp_notice_sink,
             )
         self._refresh_mcp_tool_schemas()
+        self._mcp_mount_attempted = True
 
     def _refresh_mcp_tool_schemas(self) -> None:
         if self._mcp_mount is None:

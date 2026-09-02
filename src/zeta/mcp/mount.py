@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from ..core.abort import AbortSignal
@@ -134,11 +134,17 @@ class MCPMount:
             if client is not None:
                 await _close_failed_client(client)
             setup = await _setup_server(self.configs[name], notice_sink=notice_sink)
+            self.statuses[name] = setup.public
             if setup.client is not None:
                 self._clients[name] = setup.client
+                self._attach_failure_handler(name, setup.client)
                 for tool in setup.tools:
-                    _register_tool(self.registry, setup.client, tool)
-            self.statuses[name] = setup.public
+                    _register_tool(
+                        self.registry,
+                        setup.client,
+                        tool,
+                        mount=self,
+                    )
             return setup.public
 
     async def close(self) -> None:
@@ -160,6 +166,24 @@ class MCPMount:
         for name in tuple(self.registry.definitions_by_name):
             if name.startswith(prefix):
                 self.registry.unregister(name)
+
+    def _attach_failure_handler(self, name: str, client: MCPClient) -> None:
+        set_failure_sink = getattr(client, "set_failure_sink", None)
+        if set_failure_sink is not None:
+            set_failure_sink(lambda reason: self._mark_failed(name, client, reason))
+
+    def _mark_failed(self, name: str, client: MCPClient, reason: str) -> None:
+        if self._closed or self._clients.get(name) is not client:
+            return
+        self._unregister_tools(name)
+        status = self.statuses.get(name)
+        if status is not None:
+            self.statuses[name] = replace(
+                status,
+                state="failed",
+                tool_count=0,
+                reason=reason,
+            )
 
 
 async def mount_mcp_servers(
@@ -194,8 +218,14 @@ async def mount_mcp_servers(
         mount.statuses[setup.public.name] = setup.public
         if setup.client is not None:
             mount._clients[setup.public.name] = setup.client
+            mount._attach_failure_handler(setup.public.name, setup.client)
             for tool in setup.tools:
-                _register_tool(registry, setup.client, tool)
+                _register_tool(
+                    registry,
+                    setup.client,
+                    tool,
+                    mount=mount,
+                )
     return mount
 
 
@@ -204,10 +234,6 @@ async def _setup_server(
     *,
     notice_sink: NoticeSink | None = None,
 ) -> _SetupResult:
-    _notice(
-        notice_sink,
-        f"mcp · mounting {server_config.name} ({server_config.transport})",
-    )
     if server_config.missing_env:
         variables = ", ".join(server_config.missing_env)
         reason = f"missing environment variable(s): {variables}"
@@ -294,6 +320,19 @@ async def _connect_and_list(client: MCPClient) -> list[MCPTool]:
     return await client.list_tools()
 
 
+def _call_error_text(result: StructuredToolResult) -> str:
+    content = result.get("content")
+    if type(content) is list:
+        text = " ".join(
+            block["text"]
+            for block in content
+            if type(block) is dict and type(block.get("text")) is str
+        ).strip()
+        if text:
+            return text
+    return "MCP tool call failed"
+
+
 async def _close_failed_client(client: MCPClient) -> None:
     try:
         await client.close()
@@ -301,13 +340,26 @@ async def _close_failed_client(client: MCPClient) -> None:
         logger.exception("failed to close MCP server %s", client.config.name)
 
 
-def _register_tool(registry: ToolRegistry, client: MCPClient, tool: MCPTool) -> None:
+def _register_tool(
+    registry: ToolRegistry,
+    client: MCPClient,
+    tool: MCPTool,
+    *,
+    mount: MCPMount,
+) -> None:
     name = f"{client.config.name}:{tool.name}"
 
     async def handler(
         arguments: dict[str, object], abort_signal: AbortSignal
     ) -> StructuredToolResult:
-        return await client.call_tool(tool.name, arguments, abort_signal)
+        try:
+            result = await client.call_tool(tool.name, arguments, abort_signal)
+        except Exception as exc:
+            mount._mark_failed(client.config.name, client, _error_text(exc))
+            raise
+        if result.get("isError") is True:
+            mount._mark_failed(client.config.name, client, _call_error_text(result))
+        return result
 
     try:
         registry.register(

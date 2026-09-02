@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import BinaryIO
 
 from ..core.abort import AbortSignal
@@ -40,6 +40,13 @@ class StdioMCPClient(MCPClient):
         self._next_id = 0
         self._pending: dict[int, asyncio.Future[dict[str, object]]] = {}
         self._closed = False
+        self._suppress_failure = False
+        self._failure_sink: Callable[[str], None] | None = None
+
+    def set_failure_sink(self, sink: Callable[[str], None] | None) -> None:
+        """Set a callback for unexpected transport termination."""
+
+        self._failure_sink = sink
 
     async def connect(self) -> None:
         if self._process is not None:
@@ -101,6 +108,7 @@ class StdioMCPClient(MCPClient):
         if self._closed:
             return
         self._closed = True
+        self._suppress_failure = True
         process = self._process
         reader_task = self._reader_task
         self._process = None
@@ -183,6 +191,7 @@ class StdioMCPClient(MCPClient):
         reader_task = self._reader_task
         if process is None:
             return
+        self._suppress_failure = True
         try:
             await asyncio.wait_for(asyncio.shield(process.wait()), timeout=0.25)
         except TimeoutError:
@@ -234,7 +243,10 @@ class StdioMCPClient(MCPClient):
                 except asyncio.CancelledError:
                     return
             if self._process is process:
-                self._fail_pending(MCPError(f"MCP stdio server exited with code {process.returncode}"))
+                error = MCPError(f"MCP stdio server exited with code {process.returncode}")
+                self._fail_pending(error)
+                if not self._suppress_failure and self._failure_sink is not None:
+                    self._failure_sink(str(error))
 
     def _fail_pending(self, error: BaseException) -> None:
         for future in self._pending.values():

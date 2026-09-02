@@ -96,10 +96,6 @@ def load_mcp_config(path: str | Path | None = None) -> MCPConfig:
             resolved, missing = _interpolate(raw_server, set())
         except ValueError as exc:
             raise MCPConfigError(f"invalid MCP server {name!r}: {exc}") from exc
-        try:
-            server = _parse_server(name, resolved)
-        except ValueError as exc:
-            raise MCPConfigError(f"invalid MCP server {name!r} in {selected_path}: {exc}") from exc
         if missing:
             names = tuple(sorted(missing))
             logger.warning(
@@ -107,9 +103,16 @@ def load_mcp_config(path: str | Path | None = None) -> MCPConfig:
                 name,
                 ", ".join(names),
             )
-            skipped[name] = replace(server, missing_env=names)
-        else:
-            servers[name] = server
+            skipped[name] = replace(
+                _server_config_for_missing_env(name, resolved),
+                missing_env=names,
+            )
+            continue
+        try:
+            server = _parse_server(name, resolved)
+        except ValueError as exc:
+            raise MCPConfigError(f"invalid MCP server {name!r} in {selected_path}: {exc}") from exc
+        servers[name] = server
     return MCPConfig(selected_path, servers, skipped)
 
 
@@ -188,6 +191,37 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
         auth_type=auth_type,
         auth_token=token if type(token) is str else None,
     )
+
+
+def _server_config_for_missing_env(name: str, value: object) -> MCPServerConfig:
+    """Keep enough shape to report a server skipped for missing variables."""
+
+    if type(value) is not dict:
+        return MCPServerConfig(name, "stdio")
+    transport = value.get("transport")
+    if transport not in {"stdio", "streamable-http"}:
+        transport = "stdio"
+    raw_args = value.get("args", [])
+    args = (
+        tuple(item for item in raw_args if type(item) is str)
+        if type(raw_args) is list
+        else ()
+    )
+    raw_env = value.get("env", {})
+    env = (
+        {
+            key: item
+            for key, item in raw_env.items()
+            if type(key) is str and type(item) is str
+        }
+        if type(raw_env) is dict
+        else {}
+    )
+    raw_command = value.get("command")
+    command = raw_command if type(raw_command) is str else None
+    raw_url = value.get("url")
+    url = raw_url if type(raw_url) is str else None
+    return MCPServerConfig(name, transport, command=command, args=args, env=env, url=url)
 
 
 __all__ = [
