@@ -56,6 +56,7 @@ from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
     FullScreenPromptSession,
+    SlashCompleter,
     TurnConsumerMixin,
     UndoCandidate,
     build_key_bindings,
@@ -107,10 +108,6 @@ def _validate_model_name(provider: str, model: str) -> None:
     validate_model_name(provider, model)
 
 
-def _zeta_home() -> Path:
-    return env_home()
-
-
 def build_backend(
     provider: str,
     model: str | None,
@@ -119,7 +116,7 @@ def build_backend(
 ) -> tuple[CompletionBackend, str]:
     """Build the selected provider without loading network credentials for fake."""
 
-    auth_home = Path(home) if home is not None else _zeta_home()
+    auth_home = Path(home) if home is not None else env_home()
     if provider == "fake":
         selected_model = model or "offline"
         return FakeInteractiveBackend(model=selected_model), selected_model
@@ -202,7 +199,7 @@ class TUIApp(
         self._resuming_tool = False
         self._session = session
         self._history_path = (
-            Path(history_path) if history_path else _zeta_home() / "history"
+            Path(history_path) if history_path else env_home() / "history"
         )
         self._history = None
         self._draft = DraftPersistence(
@@ -220,7 +217,7 @@ class TUIApp(
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
         self._model_catalog_task: asyncio.Task[None] | None = None
-        self._slash_commands = create_slash_registry()
+        self._slash_commands = create_slash_registry(project_dir=self.loop.store.cwd)
         self._compaction_shown = False
         self._turn_had_visible_output = False
         self._failed_turn: tuple[str, Message] | None = None
@@ -544,6 +541,8 @@ class TUIApp(
             placeholder=[("class:placeholder", "type a message...")],
             history=self._history,
             key_bindings=bindings,
+            completer=SlashCompleter(self._slash_commands),
+            reserve_space_for_menu=0,
             multiline=True,
             mouse_support=True,
             editing_mode=EditingMode.VI if self.vim_mode else EditingMode.EMACS,
@@ -970,6 +969,8 @@ class TUIApp(
             self._install_full_screen_layout(session)
         self.loop.session_start()
         self._rebuild_transcript()
+        for notice in self._slash_commands.notices:
+            self._print_unit(Text(f"command · {notice}", style=DIM))
         self._present_pending_approvals()
         prompt_task: asyncio.Task[str | None] | None = None
         try:
@@ -1017,7 +1018,7 @@ class TUIApp(
 
 
 def create_app(args: argparse.Namespace) -> TUIApp:
-    home = _zeta_home()
+    home = env_home()
     manager = SessionManager(home)
     continue_session = getattr(args, "continue_session", False)
     resume_id = getattr(args, "resume", None)
