@@ -601,11 +601,13 @@ class AgentLoop:
         *,
         user_message: Message | None = None,
         persist_user_message: bool = True,
+        abort_signal: ToolAbortSignal | None = None,
     ) -> AsyncIterator[StreamEvent]:
         return self._run_turn(
             user_text,
             user_message=user_message,
             persist_user_message=persist_user_message,
+            abort_signal=abort_signal,
         )
 
     async def close(self, *, cancel_background: bool = True) -> None:
@@ -809,6 +811,7 @@ class AgentLoop:
         *,
         user_message: Message | None = None,
         persist_user_message: bool = True,
+        abort_signal: ToolAbortSignal | None = None,
     ) -> AsyncIterator[StreamEvent]:
         if self.hooks is not None:
             self.hooks.user_prompt_submit(user_text)
@@ -852,6 +855,7 @@ class AgentLoop:
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
             self.tool_registry.start_batch()
+            turn_abort_signal = abort_signal or self.tool_registry.abort_signal
             yield StreamEvent(
                 StreamEventType.TURN_START,
                 data={"turn": turn_number},
@@ -1004,7 +1008,12 @@ class AgentLoop:
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
 
-            dispatch = dispatch_tool_calls(self, calls, _validated_tool_result)
+            dispatch = dispatch_tool_calls(
+                self,
+                calls,
+                _validated_tool_result,
+                abort_signal=turn_abort_signal,
+            )
             try:
                 async for event in dispatch:
                     yield event

@@ -684,6 +684,16 @@ class SlashCommandRegistry:
 
         return needs_inline_shell_resolution(value, self._custom_commands)
 
+    def exec_command_for(self, value: str) -> CustomCommand | None:
+        """Return the custom execution command named by one input value."""
+
+        first_line = value.split("\n", 1)[0]
+        if not first_line.startswith("/") or first_line.startswith("//"):
+            return None
+        name = first_line[1:].split(maxsplit=1)[0]
+        command = self._custom_commands.get(name)
+        return command if command is not None and command.kind == "exec" else None
+
     def help_text(self) -> str:
         """Format the built-in and loaded custom commands for /help."""
 

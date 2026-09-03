@@ -36,14 +36,11 @@ from ..core.slash import (
     resolve_session_budget,
 )
 from ..loop import AgentLoop
-from ..tools.plan_mode import EXIT_PLAN_MODE
 from ..persistence import DraftPersistence, history_for
-from ..providers.anthropic import AnthropicBackend, AnthropicCredentialStore
-from ..providers.codex import CodexBackend, CodexCredentialStore
-from ..providers.factory import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL
 from ..providers.factory import build_backend as build_network_backend
-from ..submission import Submission, SubmissionMixin, SubmissionQueue
+from ..submission_pipeline import SubmissionMixin, SubmissionPipeline
 from ..tools.exec import trusted_macro_display
+from ..tools.plan_mode import EXIT_PLAN_MODE
 from ..types import (
     CompletionBackend,
     Message,
@@ -54,7 +51,6 @@ from ..types import (
     assistant_text,
 )
 from .checkpoints import CheckpointTranscriptMixin
-from .slash_handlers.command_runtime import CommandRuntimeMixin
 from .composer import (
     ComposerAttachmentMixin,
     FullScreenPromptSession,
@@ -82,6 +78,7 @@ from .render import (
     render_thought_live,
 )
 from .slash_handlers import SlashHandlerMixin
+from .slash_handlers.command_runtime import CommandRuntimeMixin
 from .theme import (
     ACCENT,
     BODY,
@@ -89,7 +86,9 @@ from .theme import (
     COMMAND,
     COMPOSER_BORDER,
     COMPOSER_FOCUS,
-    DIM, ERROR, RICH_THEME,
+    DIM,
+    ERROR,
+    RICH_THEME,
 )
 from .todo import TodoWidget
 from .transcript import TranscriptWidget, stream_key
@@ -161,7 +160,6 @@ class TUIApp(
         self.verbose = verbose
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
-        self._queued: deque[tuple[Message, UndoCandidate]] = deque()
         self._pending_attachments: list[Path] = []
         self._pending_attachment_tokens: dict[str, Path] = {}
         self._next_image_token = 1
@@ -184,15 +182,8 @@ class TUIApp(
         self._spinner_frame = 0
         self._spinner_reset = asyncio.Event()
         self._abort_requested = False
-        self._macro_abort_signal = self._macro_call_id = None
-        self._inline_abort_signals = {}
-        self._approval_owners = {}
-        self._approval_queue = deque()
         self._macro_receipts = deque()
         self._input_loop_active = False
-        self._preprocessing_task: asyncio.Task[None] | None = None
-        self._preprocessing_tasks: dict[int, asyncio.Task[None]] = {}
-        self._undo_pending: set[int] = set()
         self._active_turn_submission_id: int | None = None
         self._resuming_tool = False
         self._session = session
@@ -205,7 +196,6 @@ class TUIApp(
         )
         self._draft_session: PromptSession[str] | None = None
         self._undo_candidate: UndoCandidate | None = None
-        self._submissions = SubmissionQueue()
         self._approval_policy = approval_policy
         self._context_files = tuple(context_files)
         self._on_model_change = on_model_change
@@ -220,6 +210,7 @@ class TUIApp(
         self.loop.set_mcp_prompt_refresh(
             lambda mount: self._slash_commands.set_mcp_prompts(mount.prompt_entries)
         )
+        self._submissions = SubmissionPipeline(self)
         self._compaction_shown = False
         self._turn_had_visible_output = False
         self._failed_turn: tuple[str, Message] | None = None
@@ -247,21 +238,15 @@ class TUIApp(
     def queued_messages(self) -> tuple[str, ...]:
         return tuple(
             block.text
-            for message, _candidate in self._queued
+            for message, _candidate in self._submissions.queued
             for block in message.content[:1]
             if isinstance(block, TextContent)
         )
 
     @property
     def active(self) -> bool:
-        return (
-            self._active_task is not None
-            and not self._active_task.done()
-        ) or (
-            any(
-                not task.done()
-                for task in self._preprocessing_tasks.values()
-            )
+        return self._submissions.active or (
+            self._active_task is not None and not self._active_task.done()
         )
 
     def retry_available(self) -> bool:
@@ -287,9 +272,7 @@ class TUIApp(
 
     @property
     def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
-        if self._approval_policy is None:
-            return ()
-        return tuple(self._approval_policy.pending_requests())
+        return self._submissions.pending_approvals
 
     def _start_model_catalog_load(self) -> None:
         if self._model_catalog_task is not None:
@@ -327,19 +310,22 @@ class TUIApp(
             )
 
     async def _handle_approval_input(self, value: str) -> bool:
-        parts = value.split(maxsplit=1)
-        if not parts or parts[0] not in {"approve", "deny"}:
+        action = self._submissions._approval_action_for(value)
+        if action is None:
             return False
+        decision, requested_key = action
+        if self._submissions.active:
+            await self._submissions.approval_action_wait(decision, requested_key)
+            return True
         pending = self.pending_approvals
         if not pending:
             self._print(Text("[approval] no pending requests", style="dim"))
             return True
-        if len(parts) != 2:
+        if requested_key is None:
             self._print(
-                Text(f"[approval] use {parts[0]} <approval-key>", style="yellow")
+                Text(f"[approval] use {value.split(maxsplit=1)[0]} <approval-key>", style="yellow")
             )
             return True
-        requested_key = parts[1].strip()
         request = next(
             (request for request in pending if str(request.key) == requested_key),
             None,
@@ -349,26 +335,23 @@ class TUIApp(
                 Text(f"[approval] unknown request: {requested_key}", style="yellow")
             )
             return True
+        if self._approval_policy is None:
+            return True
         key = request.key
-        request_id = request.request_id
         resolved = (
             self._approval_policy.approve(key)
-            if parts[0] == "approve"
+            if decision is ApprovalDecision.ALLOW
             else self._approval_policy.deny(key)
         )
         if resolved:
-            self._print(Text(f"[approval] {parts[0]}d {key}", style="green"))
-            # If a turn is already parked in the approval poll, it will pick up
-            # the resolution and execute the tool itself. Running the tool here
-            # would race that path and persist a duplicate tool_result — which
-            # Anthropic rejects (each tool_use must have a single result).
+            self._print(Text(f"[approval] {value.split(maxsplit=1)[0]}d {key}", style="green"))
             if self.active:
                 self._present_pending_approvals()
                 return True
 
             async def resume() -> Any:
                 return await self.loop.resume_pending_tool(
-                    request_id,
+                    request.request_id,
                     prepared=True,
                     event_sink=self._handle_resumed_tool_event,
                 )
@@ -376,7 +359,7 @@ class TUIApp(
             resume_task: asyncio.Task[Any] | None = None
             try:
                 await self.loop.ensure_mcp_servers()
-                if not self.loop.prepare_resume_pending_tool(request_id):
+                if not self.loop.prepare_resume_pending_tool(request.request_id):
                     self._present_pending_approvals()
                     return True
                 self._resuming_tool = True
@@ -390,10 +373,9 @@ class TUIApp(
                 )
                 self.loop.abort()
                 self._abort_approval(key)
-                self.loop.finalize_canceled(request_id)
+                self.loop.finalize_canceled(request.request_id)
                 if resume_task is not None:
                     resume_task.cancel()
-                if resume_task is not None:
                     await asyncio.gather(resume_task, return_exceptions=True)
                 self._print(Text("[aborted]", style="yellow"))
                 if parent_cancelled:
@@ -404,7 +386,6 @@ class TUIApp(
                 if resume_task is not None and self._active_task is resume_task:
                     self._active_task = None
         self._present_pending_approvals()
-        self._dispatch_approval_queue()
         return True
 
     def _prompt_style(self) -> Style:
@@ -591,20 +572,18 @@ class TUIApp(
 
     def _handle_tool_event(self, event: StreamEvent) -> bool:
         if event.type is StreamEventType.TOOL_APPROVAL_START:
-            if (
-                event.tool_call is not None
-                and self._active_turn_submission_id is not None
-            ):
-                self._approval_owners[event.tool_call.id] = (
-                    self._active_turn_submission_id
+            if event.tool_call is not None and not event.data.get("inline_shell"):
+                self._submissions.notify_approval_started(
+                    event.tool_call,
+                    event.data.get("submission_id", self._active_turn_submission_id),
                 )
             self._reset_stream_state()
             self._loop_state = "approval"
             self._present_pending_approvals()
             return False
         if event.type is StreamEventType.TOOL_APPROVAL_END:
-            if event.tool_call is not None:
-                self._approval_owners.pop(event.tool_call.id, None)
+            if event.tool_call is not None and not event.data.get("inline_shell"):
+                self._submissions.notify_approval_finished(event.tool_call)
             self._loop_state = "streaming"
             return False
         if event.type is StreamEventType.TOOL_EXECUTION_START:
@@ -822,58 +801,19 @@ class TUIApp(
 
     async def _run_full_screen(self, session: FullScreenPromptSession) -> None:
         prompt_task = asyncio.create_task(session.app.run_async())
-        input_task: asyncio.Task[Submission] = asyncio.create_task(
-            self._submissions.get()
-        )
         self._input_loop_active = True
         try:
             while not self._exit_requested:
-                wait_for: set[asyncio.Task[Any]] = {prompt_task, input_task}
-                if self._active_task is not None:
-                    wait_for.add(self._active_task)
-                wait_for.update(self._preprocessing_wait_set())
-                done, _ = await asyncio.wait(
-                    wait_for, return_when=asyncio.FIRST_COMPLETED
-                )
-                await self._drain_preprocessing(done)
-                if self._active_task is not None and self._active_task in done:
-                    try:
-                        await self._active_task
-                    except asyncio.CancelledError:
-                        pass
-                    self._active_task = None
-                    self._active_turn_submission_id = None
-                    if self._queued:
-                        self._start_queued_turn()
-                if prompt_task in done:
-                    try:
-                        await prompt_task
-                    except (EOFError, asyncio.CancelledError):
-                        pass
-                    break
-                if input_task in done:
-                    value = await input_task
-                    await self._handle_prompt_value(value)
-                    input_task = asyncio.create_task(self._submissions.get())
+                try:
+                    await prompt_task
+                except (EOFError, asyncio.CancelledError):
+                    pass
+                break
         finally:
             self._input_loop_active = False
             if not prompt_task.done():
                 prompt_task.cancel()
                 await asyncio.gather(prompt_task, return_exceptions=True)
-            if not input_task.done():
-                input_task.cancel()
-                await asyncio.gather(input_task, return_exceptions=True)
-            preprocessing_tasks = self._preprocessing_wait_set()
-            for task in preprocessing_tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*preprocessing_tasks, return_exceptions=True)
-            self._preprocessing_tasks.clear()
-            self._preprocessing_task = None
-            self._inline_abort_signals.clear()
-            self._approval_owners.clear()
-            self._approval_queue.clear()
-            self._undo_pending.clear()
 
     def _install_full_screen_layout(self, session: FullScreenPromptSession) -> None:
         root = session.layout.container
@@ -914,33 +854,14 @@ class TUIApp(
             prompt_task = asyncio.create_task(self._read_prompt(session))
             self._input_loop_active = True
             while prompt_task is not None and not self._exit_requested:
-                wait_for: set[asyncio.Task[Any]] = {prompt_task}
-                if self._active_task is not None:
-                    wait_for.add(self._active_task)
-                wait_for.update(self._preprocessing_wait_set())
-                done, _ = await asyncio.wait(
-                    wait_for, return_when=asyncio.FIRST_COMPLETED
-                )
-
-                await self._drain_preprocessing(done)
-                if self._active_task is not None and self._active_task in done:
-                    try:
-                        await self._active_task
-                    except asyncio.CancelledError:
-                        pass
-                    self._active_task = None
-                    self._active_turn_submission_id = None
-                    if self._queued:
-                        self._start_queued_turn()
-
-                if prompt_task in done:
-                    value = await prompt_task
-                    if value is None:
-                        break
-                    await self._handle_prompt_value(value)
-                    if self._exit_requested:
-                        break
-                    prompt_task = asyncio.create_task(self._read_prompt(session))
+                value = await prompt_task
+                if value is None:
+                    break
+                if not await self._handle_approval_input(value):
+                    self._submit_input(value)
+                if self._exit_requested:
+                    break
+                prompt_task = asyncio.create_task(self._read_prompt(session))
         finally:
             self._input_loop_active = False
             self._draft.flush()
@@ -950,17 +871,7 @@ class TUIApp(
             if self._active_task is not None and not self._active_task.done():
                 self._active_task.cancel()
                 await asyncio.gather(self._active_task, return_exceptions=True)
-            preprocessing_tasks = self._preprocessing_wait_set()
-            for task in preprocessing_tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*preprocessing_tasks, return_exceptions=True)
-            self._preprocessing_tasks.clear()
-            self._preprocessing_task = None
-            self._inline_abort_signals.clear()
-            self._approval_owners.clear()
-            self._approval_queue.clear()
-            self._undo_pending.clear()
+            await self._submissions.close()
             if isinstance(session, FullScreenPromptSession):
                 session.restore_terminal()
             await self.loop.close()
@@ -1157,8 +1068,8 @@ def create_app(args: argparse.Namespace) -> TUIApp:
 __all__ = [
     "FakeInteractiveBackend",
     "TUIApp",
-    "create_app",
     "build_backend",
+    "create_app",
     "main",
 ]
 

@@ -6,12 +6,13 @@ import asyncio
 from pathlib import Path
 from uuid import uuid4
 
-from ...core.commands.custom_commands import CustomCommand, InlineShellResult
+from ...core.abort import AbortSignal
+from ...core.commands.custom_commands import CustomCommand
+from ...submission import Submission
 from ...tools.exec import (
     forget_macro_display,
     register_macro_display,
     run_exec_macro,
-    run_inline_shell_batch,
 )
 from ...types import StreamEvent, StreamEventType, ToolCall, ToolResult
 
@@ -19,44 +20,33 @@ from ...types import StreamEvent, StreamEventType, ToolCall, ToolResult
 class CommandRuntimeMixin:
     """Run inline spans and custom exec commands for the TUI."""
 
-    async def _resolve_inline_shell(
-        self, submission_id: int, commands: tuple[str, ...]
-    ) -> InlineShellResult:
-        signal = self._inline_abort_signals.get(submission_id)
-        if signal is None:
-            signal = self.loop.tool_registry.abort_signal.registry.new_generation()
-            self._inline_abort_signals[submission_id] = signal
-        def lifecycle_sink(kind: str, call: ToolCall) -> None:
-            event_type = {
-                "approval_start": StreamEventType.TOOL_APPROVAL_START,
-                "approval_end": StreamEventType.TOOL_APPROVAL_END,
-            }.get(kind)
-            if event_type is None:
-                return
-            self._handle_tool_event(
-                StreamEvent(
-                    event_type,
-                    tool_call=call,
-                    data={"inline_shell": True},
-                )
-            )
-            if kind == "approval_start":
-                self._approval_owners[call.id] = submission_id
-                asyncio.get_running_loop().call_soon(self._present_pending_approvals)
-            elif kind == "approval_end":
-                self._approval_owners.pop(call.id, None)
-            self._invalidate_prompt()
+    async def _run_macro_submission(
+        self,
+        command: CustomCommand,
+        args: str,
+        submission: Submission,
+        abort_signal: AbortSignal,
+    ) -> str:
+        """Run a macro child owned by the submission pipeline."""
 
+        call = ToolCall(
+            f"macro-{uuid4().hex}",
+            "exec",
+            {"command": command.render_exec(args), "timeout": command.timeout},
+        )
+        register_macro_display(
+            call.id, command=command.render(args), argv=tuple(args.split())
+        )
         try:
-            outputs = await run_inline_shell_batch(
-                self.loop.tool_registry,
-                commands,
-                lifecycle_sink=lifecycle_sink,
-                abort_signal=signal,
+            await self._run_exec_macro(
+                command,
+                call,
+                abort_signal,
+                submission.id,
             )
-            return InlineShellResult(outputs, canceled=signal.is_set())
         finally:
-            self._inline_abort_signals.pop(submission_id, None)
+            forget_macro_display(call.id)
+        return ""
 
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str:
         """Run one custom shell macro through the normal exec safety path."""
@@ -77,29 +67,16 @@ class CommandRuntimeMixin:
             argv=tuple(args.split()),
         )
         abort_signal = self.loop.tool_registry.abort_signal.registry.new_generation()
-        self._macro_abort_signal = abort_signal
-        self._macro_call_id = call.id
-        task = asyncio.create_task(self._run_exec_macro(command, call))
-        self._active_task = task
-        self._loop_state = "tool-running"
-        if not self._input_loop_active:
-            try:
-                await asyncio.shield(task)
-            finally:
-                if self._active_task is task:
-                    self._active_task = None
+        await self._run_exec_macro(command, call, abort_signal, None)
         return ""
 
-    def _abort_macro(self) -> None:
-        signal = self._macro_abort_signal
-        if signal is None:
-            return
-        signal.abort()
-        for request in self.pending_approvals:
-            if request.tool_call.id == self._macro_call_id:
-                self._abort_approval(request.key)
-
-    async def _run_exec_macro(self, command: CustomCommand, call: ToolCall) -> None:
+    async def _run_exec_macro(
+        self,
+        command: CustomCommand,
+        call: ToolCall,
+        abort_signal: AbortSignal,
+        submission_id: int | None,
+    ) -> None:
         log_path = self.loop.store.session_dir / f"macro-{call.id[6:]}.log"
 
         def lifecycle_sink(kind: str) -> None:
@@ -114,7 +91,10 @@ class CommandRuntimeMixin:
                 StreamEvent(
                     event_type,
                     tool_call=call,
-                    data={"macro": command.name},
+                    data={
+                        "macro": command.name,
+                        "submission_id": submission_id,
+                    },
                 )
             )
             if kind == "approval_start":
@@ -123,6 +103,7 @@ class CommandRuntimeMixin:
 
         def stream_sink(event: StreamEvent) -> None:
             event.data["macro"] = command.name
+            event.data["submission_id"] = submission_id
             self._handle_tool_event(event)
             self._invalidate_prompt()
 
@@ -134,7 +115,7 @@ class CommandRuntimeMixin:
                 log_path,
                 stream_sink=stream_sink,
                 lifecycle_sink=lifecycle_sink,
-                abort_signal=self._macro_abort_signal,
+                abort_signal=abort_signal,
                 background=command.background,
             )
         except asyncio.CancelledError:
@@ -149,7 +130,10 @@ class CommandRuntimeMixin:
                 StreamEventType.TOOL_EXECUTION_END,
                 tool_call=call,
                 tool_result=result,
-                data={"macro": command.name},
+                data={
+                    "macro": command.name,
+                    "submission_id": submission_id,
+                },
             )
         )
         structured = result.structured_content or {}
@@ -170,9 +154,6 @@ class CommandRuntimeMixin:
                 self._watch_background_macro(command, call, task_id, log_path)
         else:
             self._macro_receipts.append(f"ran /{command.name}, {status}")
-        if self._macro_call_id == call.id:
-            self._macro_abort_signal = None
-            self._macro_call_id = None
         self._loop_state = "idle"
         self._streaming = False
         if canceled:

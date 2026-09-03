@@ -576,6 +576,61 @@ async def test_inline_shell_approval_covers_the_complete_batch(tmp_path: Path) -
     assert user_message.content[0].text == "values first and second"
 
 
+@pytest.mark.asyncio
+async def test_preprocessing_timing_cannot_reorder_provider_submissions(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "first", "first !`sleep 0.15; printf first`")
+    _write_command(home / "commands", "second", "second !`printf second`")
+    _write_command(home / "commands", "third", "third !`sleep 0.03; printf third`")
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ALLOW)
+    backend = FakeBackend(
+        [
+            ScriptedTurn(content=[TextContent("first reply")]),
+            ScriptedTurn(content=[TextContent("second reply")]),
+            ScriptedTurn(content=[TextContent("third reply")]),
+        ]
+    )
+    app = TUIApp(
+        AgentLoop(backend, store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        history_path=tmp_path / "history",
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    app._input_loop_active = True
+
+    await asyncio.gather(
+        *(app._handle_prompt_value(f"/{name}") for name in ("first", "second", "third"))
+    )
+    for _ in range(100):
+        if len(backend.calls) == 3:
+            break
+        await asyncio.sleep(0.01)
+
+    user_texts = [
+        next(
+            block.text
+            for message in reversed(messages)
+            if message.role.value == "user"
+            for block in message.content
+            if isinstance(block, TextContent) and block.path is None
+        )
+        for messages, _schemas in backend.calls
+    ]
+    assert user_texts == [
+        "first first",
+        "second second",
+        "third third",
+    ]
+    await app._submissions.close()
+    await app.loop.close()
+
+
 async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
     tmp_path: Path,
 ) -> None:
@@ -652,10 +707,12 @@ async def test_inline_approval_queues_unrelated_submission(
     first_preprocessing = next(iter(app._preprocessing_tasks.values()))
     await first_preprocessing
     await app._active_task
-    app._active_task = None
-    app._active_turn_submission_id = None
-    app._start_queued_turn()
-    await app._active_task
+    for _ in range(100):
+        if len(backend.calls) == 2:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("queued provider turn did not start")
 
     user_texts = [
         next(
@@ -711,6 +768,10 @@ async def test_undo_second_inline_submission_keeps_first_alive(
 
     first_id, second_id = app._inline_abort_signals
     app.undo_sent_turn()
+    for _ in range(100):
+        if app._inline_abort_signals[second_id].is_set():
+            break
+        await asyncio.sleep(0.01)
     assert not app._inline_abort_signals[first_id].is_set()
     assert app._inline_abort_signals[second_id].is_set()
     for _ in range(100):
@@ -769,6 +830,10 @@ async def test_scoped_inline_abort_keeps_other_submission_alive(
 
     first_id, second_id = app._inline_abort_signals
     app.abort_active(first_id)
+    for _ in range(100):
+        if app._inline_abort_signals[first_id].is_set():
+            break
+        await asyncio.sleep(0.01)
     assert app._inline_abort_signals[first_id].is_set()
     assert not app._inline_abort_signals[second_id].is_set()
     for _ in range(100):
@@ -1358,11 +1423,13 @@ async def test_queued_prompt_consumes_macro_receipt_at_provider_start(
 
     await app._handle_prompt_value("continue")
     assert len(app._queued) == 1
-    await asyncio.wait_for(app._active_task, timeout=2)
+    macro_child = app._active_task
+    assert macro_child is not None
+    await asyncio.wait_for(macro_child, timeout=2)
     await macro_task
-    app._active_task = None
-    app._start_queued_turn()
-    await app._active_task
+    provider_task = app._active_task
+    assert provider_task is not None
+    await asyncio.wait_for(provider_task, timeout=2)
 
     user_message = next(
         message
@@ -1409,17 +1476,12 @@ async def test_two_macros_queued_prompt_and_abort_keep_receipt_order(
     assert len(app._queued) == 1
 
     macro_task = app._active_task
-    app.abort_active()
     assert macro_task is not None
+    app.abort_active()
     await asyncio.wait_for(macro_task, timeout=3)
-    assert list(app._macro_receipts) == [
-        "ran /first, exit 0",
-        "ran /second, canceled",
-    ]
-
-    app._active_task = None
-    app._start_queued_turn()
-    await asyncio.wait_for(app._active_task, timeout=3)
+    provider_task = app._active_task
+    assert provider_task is not None
+    await asyncio.wait_for(provider_task, timeout=3)
 
     user_message = next(
         message
