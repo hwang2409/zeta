@@ -42,7 +42,7 @@ from zeta.tui.composer import (
     build_key_bindings,
 )
 from zeta.tui.render import render_approval_card
-from zeta.types import TextContent, ToolCall
+from zeta.types import MessageRole, TextContent, ToolCall
 
 
 def _write_command(directory: Path, name: str, content: str) -> None:
@@ -738,6 +738,87 @@ async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
     assert app._active_task is not None
     await app._active_task
     assert backend.calls
+
+
+@pytest.mark.asyncio
+async def test_unmapped_durable_approval_does_not_deny_inline_submission(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "inspect", "value !`printf ready`")
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    old_call = ToolCall("old-request", "danger", {})
+    store.append_approval_request(old_call.id, old_call)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    app = TUIApp(
+        AgentLoop(backend, store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    app._input_loop_active = True
+
+    submission_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
+    for _ in range(100):
+        if len(app.pending_approvals) == 2:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("old and inline approvals did not appear")
+
+    inline_key = next(
+        request.key
+        for request in app.pending_approvals
+        if request.key != old_call.id
+    )
+    await app._handle_prompt_value(f"deny {old_call.id}")
+    assert {request.key for request in app.pending_approvals} == {inline_key}
+
+    await app._handle_prompt_value(f"approve {inline_key}")
+    await submission_task
+    await app._preprocessing_task
+    app._preprocessing_task = None
+    await app._active_task
+    assert backend.calls
+    user_message = next(
+        message
+        for message in backend.calls[0][0]
+        if message.role is MessageRole.USER
+    )
+    assert isinstance(user_message.content[0], TextContent)
+    assert user_message.content[0].text == "value ready"
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_close_resolves_pending_submission_ack_and_rejects_new_sends(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "inspect", "value !`sleep 10`")
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ALLOW)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+
+    submission = asyncio.create_task(app._submissions.submit_text("/inspect"))
+    await asyncio.sleep(0.05)
+    assert not submission.done()
+
+    await app._submissions.close()
+    await asyncio.wait_for(submission, timeout=1)
+    with pytest.raises(RuntimeError, match="submission pipeline is closed"):
+        await app._submissions.submit_text("after close")
+    await app.loop.close()
 
 
 @pytest.mark.asyncio

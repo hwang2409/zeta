@@ -38,7 +38,7 @@ from ..core.slash import (
 from ..loop import AgentLoop
 from ..persistence import DraftPersistence, history_for
 from ..providers.factory import build_backend as build_network_backend
-from ..submission_pipeline import SubmissionMixin, SubmissionPipeline
+from ..submission_pipeline import SubmissionPipeline
 from ..tools.exec import trusted_macro_display
 from ..tools.plan_mode import EXIT_PLAN_MODE
 from ..types import (
@@ -55,6 +55,7 @@ from .composer import (
     ComposerAttachmentMixin,
     FullScreenPromptSession,
     SlashCompleter,
+    SubmissionMixin,
     TurnConsumerMixin,
     UndoCandidate,
     build_key_bindings,

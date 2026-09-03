@@ -2353,7 +2353,7 @@ async def test_rapid_buffer_sends_keep_the_newest_persisted_draft(
     await backend.started.wait()
     backend.release.set()
     await app._active_task
-    app._start_queued_turn()
+    await wait_until(lambda: len(backend.calls) == 2)
     await app._active_task
 
     assert session.default_buffer.text == "third draft"
@@ -2392,7 +2392,7 @@ async def test_rapid_buffer_sends_keep_each_staged_image_owned(
     await backend.started.wait()
     backend.release.set()
     await app._active_task
-    app._start_queued_turn()
+    await wait_until(lambda: len(backend.calls) == 2)
     await app._active_task
 
     assert first_image.exists()
@@ -6271,6 +6271,42 @@ async def test_run_delivers_queued_follow_up_after_current_turn(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("/checkpoint", "checkpoint_count"),
+        ("/compact", "compact: nothing to compact"),
+        ("/fork", "no checkpoints on the active branch"),
+        ("/model offline", "model: offline"),
+        ("/plan on", "plan mode: on"),
+    ],
+)
+async def test_control_command_does_not_reject_rapid_follow_up(
+    tmp_path: Path, command: str, expected: str
+) -> None:
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    store = ConversationStore(tmp_path / "sessions")
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, store),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    app._submit_input(command)
+    app._submit_input("probe")
+    await wait_until(lambda: len(backend.calls) == 1)
+    await app._active_task
+
+    if expected == "checkpoint_count":
+        assert store.checkpoint_count() == 1
+    else:
+        assert expected in output.getvalue()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
 async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> None:
     backend = GateBackend()
     store = ConversationStore(tmp_path / "sessions")
@@ -6287,7 +6323,7 @@ async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> N
 
     backend.release.set()
     await app._active_task
-    app._start_queued_turn()
+    await wait_until(lambda: len(backend.calls) == 2)
     await app._active_task
 
     user_texts = [

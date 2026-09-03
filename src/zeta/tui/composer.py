@@ -24,6 +24,8 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding.vi_state import InputMode
 from rich.text import Text
 
+from ..core.abort import AbortSignal
+from ..core.approval import ApprovalRequest
 from ..core.slash import SlashCommandRegistry
 from ..types import (
     ErrorInfo,
@@ -735,9 +737,6 @@ class ComposerAttachmentMixin:
                 )
         self._presenter.print_user(rendered)
 
-    def _start_queued_turn(self) -> None:
-        self._submissions._dispatch_oldest_ready()
-
     def _consume_macro_receipts(
         self, user_text: str, user_message: Message | None
     ) -> tuple[str, Message | None]:
@@ -777,6 +776,134 @@ class ComposerAttachmentMixin:
         )
         self._active_task = task
         return task
+
+
+class SubmissionMixin:
+    """Translate composer callbacks into pipeline messages."""
+
+    def _submit_input(self, value: str) -> None:
+        if (
+            self._submissions._approval_action_for(value) is not None
+            and not self._submissions.active
+        ):
+            task = asyncio.create_task(self._handle_approval_input(value))
+            self._active_task = task
+            task.add_done_callback(self._clear_approval_task)
+            return
+        draft_revision = self._draft.mark_submitted()
+        paths, tokens, next_image_token = self._capture_pending_attachment_state()
+        self._submissions.submit(
+            value,
+            draft_revision=draft_revision,
+            attachment_paths=paths,
+            attachment_tokens=dict(tokens),
+            next_image_token=next_image_token,
+        )
+
+    def _clear_approval_task(self, task: asyncio.Task[Any]) -> None:
+        if self._active_task is task:
+            self._active_task = None
+
+    async def _handle_prompt_value(self, value: str) -> None:
+        if self._input_loop_active:
+            self._submit_input(value)
+            await asyncio.sleep(0)
+            return
+        draft_revision = self._draft.mark_submitted()
+        paths, tokens, next_image_token = self._capture_pending_attachment_state()
+        await self._submissions.submit_text(
+            value,
+            draft_revision=draft_revision,
+            attachment_paths=paths,
+            attachment_tokens=dict(tokens),
+            next_image_token=next_image_token,
+        )
+
+    async def _handle_approval_input(self, value: str) -> bool:
+        action = self._submissions._approval_action_for(value)
+        if action is None:
+            return False
+        decision, requested_key = action
+        await self._submissions.approval_action_wait(decision, requested_key)
+        return True
+
+    def _pending_approvals_for_submission(
+        self, submission_id: int
+    ) -> tuple[ApprovalRequest, ...]:
+        owners = self._submissions.approval_owners
+        return tuple(
+            request
+            for request in self.pending_approvals
+            if owners.get(request.key) == submission_id
+        )
+
+    def _preprocessing_wait_set(self) -> set[asyncio.Task[Any]]:
+        return set(self._submissions.preprocessing_tasks.values())
+
+    def _drain_preprocessing(self, done: set[asyncio.Task[Any]]) -> None:
+        del done
+
+    def _set_pipeline_task(self, task: asyncio.Task[Any]) -> None:
+        self._active_task = task
+
+    def _record_macro_receipt(self, receipt: str) -> None:
+        self._macro_receipts.append(receipt)
+
+    def _handle_slash_output(self, output: str) -> None:
+        if self._fork_rebuilt:
+            self._fork_rebuilt = False
+        elif output.startswith("[Image #"):
+            self._insert_paste_token(output)
+        elif output:
+            self._print_system(output)
+
+    @property
+    def _preprocessing_tasks(self) -> dict[int, asyncio.Task[Any]]:
+        return self._submissions.preprocessing_tasks
+
+    @property
+    def _preprocessing_task(self) -> asyncio.Task[Any] | None:
+        return self._submissions.preprocessing_task
+
+    @_preprocessing_task.setter
+    def _preprocessing_task(self, value: asyncio.Task[Any] | None) -> None:
+        del value
+
+    @property
+    def _inline_abort_signals(self) -> dict[int, AbortSignal]:
+        return self._submissions.inline_abort_signals
+
+    @property
+    def _approval_owners(self) -> dict[str | tuple[str, str], int]:
+        return self._submissions.approval_owners
+
+    @property
+    def _approval_queue(self) -> tuple[tuple[Any, UndoCandidate], ...]:
+        return self._submissions.approval_queue
+
+    @property
+    def _queued(self) -> tuple[tuple[Any, UndoCandidate], ...]:
+        return self._submissions.queued
+
+    def _set_undo_candidate(self, candidate: UndoCandidate) -> None:
+        self._undo_candidate = candidate
+
+    def _restore_undo_candidate(self, candidate: UndoCandidate) -> None:
+        session = self._active_session or self._session
+        buffer = session.app.current_buffer if session is not None else None
+        if buffer is not None and buffer.text:
+            self._release_attachment_paths(candidate.attachment_paths)
+            self._print_system(
+                f"undo kept the current draft; sent text: {candidate.text}"
+            )
+            self._draft.schedule(buffer.text)
+            return
+        self._restore_composer(candidate.text)
+        self._pending_attachments[:] = list(candidate.attachment_paths)
+        self._pending_attachment_tokens.clear()
+        self._pending_attachment_tokens.update(candidate.attachment_tokens)
+        self._next_image_token = candidate.next_image_token
+        self._draft.schedule(candidate.text)
 
 def vim_state_label(vim_mode: bool) -> str | None:
     """Return the native prompt-toolkit vi state for the footer."""
