@@ -264,10 +264,8 @@ class TUIApp(
         if failed_turn is None:
             return
         user_text, user_message = failed_turn
-        self._start_turn(
-            user_text,
-            user_message=user_message,
-            persist_user_message=False,
+        self._active_task = asyncio.create_task(
+            self._submissions.retry(user_text, user_message)
         )
 
     @property

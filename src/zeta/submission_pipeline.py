@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -68,6 +69,7 @@ class SubmissionHost(Protocol):
         user_message: Any,
         submission_id: int,
         abort_signal: AbortSignal,
+        persist_user_message: bool = True,
     ) -> asyncio.Task[None]: ...
     def _set_pipeline_task(self, task: asyncio.Task[Any]) -> None: ...
     async def _run_macro_submission(
@@ -80,6 +82,7 @@ class SubmissionHost(Protocol):
     def _set_undo_candidate(self, candidate: UndoCandidate) -> None: ...
     def _invalidate_prompt(self) -> None: ...
     def _handle_slash_output(self, output: str) -> None: ...
+    def _record_macro_receipt(self, receipt: str) -> None: ...
 
 
 class _Message(Protocol):
@@ -93,6 +96,13 @@ class _Submit:
 
 
 @dataclass(frozen=True, slots=True)
+class _Retry:
+    submission: Submission
+    user_message: Any
+    acknowledged: asyncio.Future[None]
+
+
+@dataclass(frozen=True, slots=True)
 class _PreprocessingDone:
     submission: Submission
     model_input: str | None = None
@@ -102,6 +112,7 @@ class _PreprocessingDone:
 @dataclass(frozen=True, slots=True)
 class _CommandDone:
     submission: Submission
+    receipt: str | None = None
     error: BaseException | None = None
 
 
@@ -146,6 +157,8 @@ class _Entry:
     signal: AbortSignal | None = None
     child_task: asyncio.Task[Any] | None = None
     preprocessing: bool = False
+    persist_user_message: bool = True
+    acknowledge_on_provider_done: bool = False
     completion: asyncio.Future[None] | None = None
     acknowledged: asyncio.Future[None] | None = None
     undo_requested: bool = False
@@ -172,10 +185,11 @@ class SubmissionPipeline:
         self._entries: dict[int, _Entry] = {}
         self._approval_owners: dict[str | tuple[str, str], Submission] = {}
         self._preprocessing_waiters: dict[int, asyncio.Task[None]] = {}
-        self._manual_submissions: asyncio.Queue[Submission] = asyncio.Queue()
-        self._manual_canceled: dict[int, Submission] = {}
+        self._command_order: deque[int] = deque()
+        self._command_results: dict[int, str | None] = {}
         self._provider_entry: _Entry | None = None
         self._provider_task: asyncio.Task[None] | None = None
+        self._control_entry: _Entry | None = None
         self._closed = False
         self._shutting_down = False
 
@@ -194,13 +208,16 @@ class SubmissionPipeline:
     @property
     def active(self) -> bool:
         return any(
-            entry.state in self._NONTERMINAL or entry is self._provider_entry
+            (
+                entry.state in self._NONTERMINAL or entry is self._provider_entry
+            )
+            and entry is not self._control_entry
             for entry in self._entries.values()
-        )
+        ) or any(isinstance(message, (_Submit, _Retry)) for message in self._messages._queue)
 
     @property
     def has_pending(self) -> bool:
-        return self.active or not self._manual_submissions.empty()
+        return self.active
 
     @property
     def preprocessing_tasks(self) -> dict[int, asyncio.Task[Any]]:
@@ -257,10 +274,7 @@ class SubmissionPipeline:
             attachment_tokens,
             next_image_token,
         )
-        if self._host._input_loop_active:
-            self._send(_Submit(submission))
-        else:
-            self._manual_submissions.put_nowait(submission)
+        self._send(_Submit(submission))
         return submission
 
     async def submit_text(
@@ -279,38 +293,20 @@ class SubmissionPipeline:
             attachment_tokens,
             next_image_token,
         )
-        await self._submit_existing(submission)
-
-    async def _submit_existing(self, submission: Submission) -> None:
-        canceled = self._manual_canceled.pop(submission.id, None)
-        if canceled is not None:
-            self._host._restore_pending_submission(canceled)
-            return
-        self._ensure_consumer()
         acknowledged = asyncio.get_running_loop().create_future()
         self._send(_Submit(submission, acknowledged))
         await acknowledged
 
-    async def get(self) -> Submission:
-        """Return an intake item for old direct test callers."""
-
-        return await self._manual_submissions.get()
-
-    def take_pending(self) -> Submission | None:
-        """Claim a manually queued item for old direct test callers."""
-
-        try:
-            return self._manual_submissions.get_nowait()
-        except asyncio.QueueEmpty:
-            return None
+    async def retry(self, text: str, user_message: Any) -> None:
+        submission = self._new_submission(text, 0, (), None, 1)
+        acknowledged = asyncio.get_running_loop().create_future()
+        self._send(_Retry(submission, user_message, acknowledged))
+        await acknowledged
 
     def abort(self, submission_id: int | None = None) -> None:
         self._send(_AbortAction(submission_id))
 
     def undo(self) -> None:
-        if not self._manual_submissions.empty():
-            pending = self._manual_submissions._queue[-1]
-            self._manual_canceled[pending.id] = pending
         self._send(_UndoAction())
 
     def approval_action(
@@ -412,6 +408,8 @@ class SubmissionPipeline:
             try:
                 if isinstance(message, _Submit):
                     await self._on_submit(message)
+                elif isinstance(message, _Retry):
+                    self._on_retry(message)
                 elif isinstance(message, _PreprocessingDone):
                     self._on_preprocessing_done(message)
                 elif isinstance(message, _CommandDone):
@@ -428,8 +426,11 @@ class SubmissionPipeline:
                     self._on_undo()
             except Exception as exc:
                 self._host._print_system(f"submission failed: {exc}")
-            self._dispatch_oldest_ready()
+                self._fail_message(message)
             self._resolve_preprocessing_completions()
+            self._prune_finished()
+            if self._messages.empty():
+                self._dispatch_oldest_ready()
 
     async def _on_submit(self, message: _Submit) -> None:
         entry = _Entry(message.submission)
@@ -453,9 +454,13 @@ class SubmissionPipeline:
                 elif self._host._slash_commands.needs_inline_shell_resolution(parsed):
                     self._start_preprocessing(entry)
                 else:
-                    slash_output = await self._host._slash_commands.dispatch_async(
-                        self._host, parsed
-                    )
+                    self._control_entry = entry
+                    try:
+                        slash_output = await self._host._slash_commands.dispatch_async(
+                            self._host, parsed
+                        )
+                    finally:
+                        self._control_entry = None
                     if slash_output is not None:
                         self._host._release_attachment_paths(
                             entry.submission.attachment_paths
@@ -473,6 +478,23 @@ class SubmissionPipeline:
             SubmissionState.DISPATCHED,
         }:
             self._ack_entry(entry)
+
+    def _on_retry(self, message: _Retry) -> None:
+        entry = _Entry(message.submission)
+        entry.acknowledged = message.acknowledged
+        entry.message = message.user_message
+        entry.persist_user_message = False
+        entry.acknowledge_on_provider_done = True
+        entry.candidate = UndoCandidate.from_message(
+            message.submission.text,
+            message.user_message,
+            {},
+            1,
+            submission_id=message.submission.id,
+        )
+        entry.signal = self._new_signal()
+        entry.state = SubmissionState.READY
+        self._entries[entry.submission.id] = entry
 
     def _approval_action_for(
         self, value: str
@@ -494,9 +516,7 @@ class SubmissionPipeline:
         entry.completion = asyncio.get_running_loop().create_future()
         task = asyncio.create_task(self._preprocess(entry.submission, entry.signal))
         entry.child_task = task
-        self._preprocessing_waiters[entry.submission.id] = asyncio.create_task(
-            self._wait_for_preprocessing(task, entry.completion)
-        )
+        self._track_waiter(entry, task)
         task.add_done_callback(
             lambda completed, submission=entry.submission: self._preprocess_done(
                 submission, completed
@@ -572,6 +592,7 @@ class SubmissionPipeline:
             forget_macro_display(first_call_id)
 
     def _start_command(self, entry: _Entry, command: CustomCommand) -> None:
+        self._command_order.append(entry.submission.id)
         entry.state = SubmissionState.PREPROCESSING
         entry.preprocessing = True
         entry.signal = self._new_signal()
@@ -583,12 +604,8 @@ class SubmissionPipeline:
             )
         )
         entry.child_task = task
-        self._preprocessing_waiters[entry.submission.id] = asyncio.create_task(
-            self._wait_for_preprocessing(task, entry.completion)
-        )
-        self._host._set_pipeline_task(
-            self._preprocessing_waiters[entry.submission.id]
-        )
+        waiter = self._track_waiter(entry, task)
+        self._host._set_pipeline_task(waiter)
         task.add_done_callback(
             lambda completed, submission=entry.submission: self._command_done(
                 submission, completed
@@ -602,8 +619,7 @@ class SubmissionPipeline:
             result = _CommandDone(submission)
         else:
             try:
-                task.result()
-                result = _CommandDone(submission)
+                result = _CommandDone(submission, receipt=task.result() or None)
             except BaseException as exc:
                 result = _CommandDone(submission, error=exc)
         self._send(result)
@@ -644,14 +660,23 @@ class SubmissionPipeline:
         entry.child_task = None
         if message.error is not None:
             self._host._print_system(f"inline shell failed: {message.error}")
+            if entry.denied:
+                self._finish_denied(entry)
+            else:
+                self._cancel_or_restore(entry)
+        elif entry.state is SubmissionState.CANCELED:
             self._cancel_or_restore(entry)
-        elif entry.state is SubmissionState.CANCELED or message.model_input is None:
+        elif entry.denied:
+            self._finish_denied(entry)
+        elif message.model_input is None:
             self._cancel_or_restore(entry)
         else:
             entry.model_input = message.model_input
             self._prepare_submission(entry, entry.parsed)
 
     def _on_command_done(self, message: _CommandDone) -> None:
+        self._command_results[message.submission.id] = message.receipt
+        self._commit_command_receipts()
         entry = self._entry_for(message.submission)
         if entry is None:
             return
@@ -660,9 +685,7 @@ class SubmissionPipeline:
             self._cancel_or_restore(entry)
             return
         if entry.denied:
-            self._host._release_attachment_paths(entry.submission.attachment_paths)
-            self._host._record_prompt(entry.parsed, entry.submission.draft_revision)
-            self._finish_entry(entry, SubmissionState.DENIED)
+            self._finish_denied(entry)
             return
         if message.error is not None:
             self._host._print_system(f"command failed: {message.error}")
@@ -670,6 +693,13 @@ class SubmissionPipeline:
         self._host._record_prompt(entry.parsed, entry.submission.draft_revision)
         entry.state = SubmissionState.DISPATCHED
         self._ack_entry(entry)
+
+    def _commit_command_receipts(self) -> None:
+        while self._command_order and self._command_order[0] in self._command_results:
+            submission_id = self._command_order.popleft()
+            receipt = self._command_results.pop(submission_id)
+            if receipt:
+                self._host._record_macro_receipt(receipt)
 
     def _dispatch_oldest_ready(self) -> None:
         if any(
@@ -723,9 +753,11 @@ class SubmissionPipeline:
             user_message=entry.message,
             submission_id=entry.submission.id,
             abort_signal=entry.signal or self._new_signal(),
+            persist_user_message=entry.persist_user_message,
         )
         self._provider_task = task
-        self._ack_entry(entry)
+        if not entry.acknowledge_on_provider_done:
+            self._ack_entry(entry)
         task.add_done_callback(
             lambda completed, submission=entry.submission: self._send(
                 _ProviderDone(submission, completed)
@@ -739,6 +771,7 @@ class SubmissionPipeline:
             or self._provider_task is not message.task
         ):
             return
+        self._ack_entry(self._provider_entry)
         self._provider_entry = None
         self._provider_task = None
 
@@ -754,6 +787,20 @@ class SubmissionPipeline:
         except Exception:
             pass
         await completion
+
+    def _track_waiter(
+        self, entry: _Entry, child: asyncio.Task[Any]
+    ) -> asyncio.Task[None]:
+        waiter = asyncio.create_task(
+            self._wait_for_preprocessing(child, entry.completion)
+        )
+        self._preprocessing_waiters[entry.submission.id] = waiter
+        waiter.add_done_callback(
+            lambda completed, submission_id=entry.submission.id: self._drop_waiter(
+                submission_id, completed
+            )
+        )
+        return waiter
 
     def _resolve_preprocessing_completions(self) -> None:
         for entry in self._entries.values():
@@ -782,9 +829,7 @@ class SubmissionPipeline:
             for key, owner in self._approval_owners.items()
             if owner is not entry.submission or key != message.call.id
         }
-        if entry.state is SubmissionState.AWAITING_APPROVAL or (
-            entry.state is SubmissionState.DENIED and entry.child_task is not None
-        ):
+        if entry.state is SubmissionState.AWAITING_APPROVAL:
             entry.state = SubmissionState.PREPROCESSING
 
     def _on_approval_action(self, message: _ApprovalAction) -> None:
@@ -874,8 +919,9 @@ class SubmissionPipeline:
             SubmissionState.AWAITING_APPROVAL,
         }
         self._abort_entry(entry)
-        if entry is self._provider_entry and entry.candidate is not None:
-            self._host._restore_undo_candidate(entry.candidate)
+        if entry is self._provider_entry:
+            if entry.candidate is not None:
+                self._host._restore_undo_candidate(entry.candidate)
         elif not was_waiting:
             self._cancel_or_restore(entry)
 
@@ -937,6 +983,49 @@ class SubmissionPipeline:
         entry.child_task = None
         self._ack_entry(entry)
 
+    def _finish_denied(self, entry: _Entry) -> None:
+        self._host._release_attachment_paths(entry.submission.attachment_paths)
+        self._host._record_prompt(entry.parsed, entry.submission.draft_revision)
+        self._finish_entry(entry, SubmissionState.DENIED)
+
+    def _drop_waiter(
+        self, submission_id: int, completed: asyncio.Future[None]
+    ) -> None:
+        if self._preprocessing_waiters.get(submission_id) is completed:
+            self._preprocessing_waiters.pop(submission_id)
+
+    def _prune_finished(self) -> None:
+        for submission_id, entry in tuple(self._entries.items()):
+            if (
+                entry is self._provider_entry
+                or entry.state in self._NONTERMINAL
+                or entry.child_task is not None
+                or entry.completion is not None
+                and not entry.completion.done()
+                or any(owner is entry.submission for owner in self._approval_owners.values())
+            ):
+                continue
+            self._entries.pop(submission_id, None)
+
+    def _fail_message(self, message: _Message) -> None:
+        submission = self._submission_for_message(message)
+        entry = self._entry_for(submission)
+        if entry is None or entry.state not in self._NONTERMINAL:
+            return
+        self._host._release_attachment_paths(entry.submission.attachment_paths)
+        self._finish_entry(entry, SubmissionState.CANCELED)
+
+    @staticmethod
+    def _submission_for_message(message: _Message) -> Submission | None:
+        if isinstance(
+            message,
+            (_Submit, _Retry, _PreprocessingDone, _CommandDone, _ProviderDone),
+        ):
+            return message.submission
+        if isinstance(message, _ApprovalLifecycle):
+            return message.submission
+        return None
+
     def _entry_for(self, submission: Submission | None) -> _Entry | None:
         if submission is None:
             return None
@@ -982,17 +1071,10 @@ class SubmissionMixin:
         if self._active_task is task:
             self._active_task = None
 
-    async def _handle_prompt_value(self, value: Submission | str) -> None:
-        if isinstance(value, Submission):
-            await self._submissions._submit_existing(value)
-            return
+    async def _handle_prompt_value(self, value: str) -> None:
         if self._input_loop_active:
             self._submit_input(value)
             await asyncio.sleep(0)
-            return
-        pending = self._submissions.take_pending()
-        if pending is not None:
-            await self._submissions._submit_existing(pending)
             return
         draft_revision = self._draft.mark_submitted()
         paths, tokens, next_image_token = self._capture_pending_attachment_state()
@@ -1030,6 +1112,9 @@ class SubmissionMixin:
 
     def _set_pipeline_task(self, task: asyncio.Task[Any]) -> None:
         self._active_task = task
+
+    def _record_macro_receipt(self, receipt: str) -> None:
+        self._macro_receipts.append(receipt)
 
     def _handle_slash_output(self, output: str) -> None:
         if self._fork_rebuilt:
@@ -1077,6 +1162,15 @@ class SubmissionMixin:
         self._undo_candidate = candidate
 
     def _restore_undo_candidate(self, candidate: UndoCandidate) -> None:
+        session = self._active_session or self._session
+        buffer = session.app.current_buffer if session is not None else None
+        if buffer is not None and buffer.text:
+            self._release_attachment_paths(candidate.attachment_paths)
+            self._print_system(
+                f"undo kept the current draft; sent text: {candidate.text}"
+            )
+            self._draft.schedule(buffer.text)
+            return
         self._restore_composer(candidate.text)
         self._pending_attachments[:] = list(candidate.attachment_paths)
         self._pending_attachment_tokens.clear()

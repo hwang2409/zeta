@@ -38,7 +38,7 @@ class CommandRuntimeMixin:
             call.id, command=command.render(args), argv=tuple(args.split())
         )
         try:
-            await self._run_exec_macro(
+            receipt = await self._run_exec_macro(
                 command,
                 call,
                 abort_signal,
@@ -46,7 +46,7 @@ class CommandRuntimeMixin:
             )
         finally:
             forget_macro_display(call.id)
-        return ""
+        return receipt or ""
 
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str:
         """Run one custom shell macro through the normal exec safety path."""
@@ -67,7 +67,9 @@ class CommandRuntimeMixin:
             argv=tuple(args.split()),
         )
         abort_signal = self.loop.tool_registry.abort_signal.registry.new_generation()
-        await self._run_exec_macro(command, call, abort_signal, None)
+        receipt = await self._run_exec_macro(command, call, abort_signal, None)
+        if receipt is not None:
+            self._record_macro_receipt(receipt)
         return ""
 
     async def _run_exec_macro(
@@ -76,7 +78,7 @@ class CommandRuntimeMixin:
         call: ToolCall,
         abort_signal: AbortSignal,
         submission_id: int | None,
-    ) -> None:
+    ) -> str | None:
         log_path = self.loop.store.session_dir / f"macro-{call.id[6:]}.log"
 
         def lifecycle_sink(kind: str) -> None:
@@ -107,7 +109,6 @@ class CommandRuntimeMixin:
             self._handle_tool_event(event)
             self._invalidate_prompt()
 
-        canceled = False
         try:
             result = await run_exec_macro(
                 self.loop.tool_registry,
@@ -120,7 +121,6 @@ class CommandRuntimeMixin:
             )
         except asyncio.CancelledError:
             result = ToolResult(call.id, "tool execution canceled", True)
-            canceled = True
         finally:
             if self._approval_policy is not None:
                 self._approval_policy.forget_ephemeral(call.id)
@@ -152,12 +152,12 @@ class CommandRuntimeMixin:
             task_id = structured.get("task_id")
             if isinstance(task_id, str):
                 self._watch_background_macro(command, call, task_id, log_path)
+            receipt = None
         else:
-            self._macro_receipts.append(f"ran /{command.name}, {status}")
+            receipt = f"ran /{command.name}, {status}"
         self._loop_state = "idle"
         self._streaming = False
-        if canceled:
-            raise asyncio.CancelledError
+        return receipt
 
     def _watch_background_macro(
         self,

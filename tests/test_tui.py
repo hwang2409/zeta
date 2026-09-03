@@ -2319,7 +2319,6 @@ async def test_submitted_revision_does_not_clear_a_rapid_new_draft(
     session.default_buffer.reset()
     session.default_buffer.insert_text("new rapid draft")
 
-    await app._handle_prompt_value("sent prompt")
     await asyncio.sleep(0.25)
 
     assert app._draft.load() == "new rapid draft"
@@ -2351,13 +2350,8 @@ async def test_rapid_buffer_sends_keep_the_newest_persisted_draft(
     session.default_buffer.insert_text("third draft")
     await asyncio.sleep(0.25)
 
-    first = await app._submissions.get()
-    first_task = asyncio.create_task(app._handle_prompt_value(first))
     await backend.started.wait()
-    second = await app._submissions.get()
-    await app._handle_prompt_value(second)
     backend.release.set()
-    await first_task
     await app._active_task
     app._start_queued_turn()
     await app._active_task
@@ -2395,13 +2389,8 @@ async def test_rapid_buffer_sends_keep_each_staged_image_owned(
     app._submit_input(session.default_buffer.text)
     session.default_buffer.reset()
 
-    first = await app._submissions.get()
-    first_task = asyncio.create_task(app._handle_prompt_value(first))
     await backend.started.wait()
-    second = await app._submissions.get()
-    await app._handle_prompt_value(second)
     backend.release.set()
-    await first_task
     await app._active_task
     app._start_queued_turn()
     await app._active_task
@@ -6294,14 +6283,9 @@ async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> N
 
     app._submit_input("first")
     app._submit_input("second")
-    first = await app._submissions.get()
-    first_task = asyncio.create_task(app._handle_prompt_value(first))
     await backend.started.wait()
-    second = await app._submissions.get()
-    await app._handle_prompt_value(second)
 
     backend.release.set()
-    await first_task
     await app._active_task
     app._start_queued_turn()
     await app._active_task
@@ -6330,11 +6314,11 @@ async def test_submission_undo_cancels_only_the_exact_rapid_enter(tmp_path: Path
     app._submit_input("same")
     app.undo_sent_turn()
     app._submit_input("same")
-    first = await app._submissions.get()
-    second = await app._submissions.get()
-    await app._handle_prompt_value(first)
-    await app._handle_prompt_value(second)
-    await app._active_task
+    await asyncio.sleep(0)
+    await asyncio.gather(app._active_task, return_exceptions=True)
+    await asyncio.sleep(0)
+    if app._active_task is not None:
+        await app._active_task
 
     user_texts = [
         block.text
@@ -7305,7 +7289,7 @@ async def test_undo_restores_submission_before_turn_creation(tmp_path: Path) -> 
     session.default_buffer.reset()
 
     app.undo_sent_turn()
-    await app._handle_prompt_value("sent too early")
+    await asyncio.sleep(0)
 
     assert session.default_buffer.text == "sent too early"
     assert app._active_task is None
@@ -7327,8 +7311,9 @@ async def test_pending_undo_keeps_a_new_buffer_draft(tmp_path: Path) -> None:
     session.default_buffer.insert_text("new draft")
 
     app.undo_sent_turn()
-    submission = await app._submissions.get()
-    await app._handle_prompt_value(submission)
+    await asyncio.sleep(0)
+    if app._active_task is not None:
+        await asyncio.gather(app._active_task, return_exceptions=True)
 
     assert session.default_buffer.text == "new draft"
     await app.loop.close()
