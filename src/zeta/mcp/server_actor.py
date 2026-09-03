@@ -182,6 +182,9 @@ class MCPServerActor:
         self._pending_starts: list[_StartOperation] = []
         self._pending_removes: list[asyncio.Future[None]] = []
         self._calls: dict[int, _CallRequest] = {}
+        self._scheduled_closes: dict[
+            int, tuple[MCPClient, asyncio.Task[object]]
+        ] = {}
         self._next_identifier = 0
         self._client: MCPClient | None = None
         self._tools: tuple[MCPTool, ...] = ()
@@ -198,24 +201,6 @@ class MCPServerActor:
     @property
     def name(self) -> str:
         return self.config.name
-
-    @property
-    def client(self) -> MCPClient | None:
-        """Return the latest published client snapshot."""
-
-        return self._client
-
-    @property
-    def generation(self) -> int:
-        """Return the actor's current tool lease generation."""
-
-        return self._generation
-
-    @property
-    def failure_count(self) -> int:
-        """Return the actor's retry count snapshot."""
-
-        return self._failure_count
 
     @property
     def status(self) -> MCPServerStatus:
@@ -322,27 +307,6 @@ class MCPServerActor:
         except asyncio.CancelledError:
             self._queue.put_nowait(_CancelCall(request.identifier))
             raise
-
-    async def force_auto_remount(
-        self,
-    ) -> None:
-        """Start an automatic remount through the actor queue."""
-
-        if self.is_terminal:
-            return
-        future: asyncio.Future[MCPServerStatus] = asyncio.get_running_loop().create_future()
-        self._next_identifier += 1
-        self._queue.put_nowait(
-            _StartOperation(
-                self._next_identifier,
-                "auto",
-                self.config,
-                self.source,
-                None,
-                future,
-            )
-        )
-        await asyncio.shield(future)
 
     async def _request_operation(
         self,
@@ -594,6 +558,8 @@ class MCPServerActor:
         self._children.discard(message.task)
         operation = self._operation
         if operation is None or operation.identifier != message.identifier:
+            if message.outcome is not None and message.outcome.client is not None:
+                self._schedule_close(message.outcome.client)
             return
         if message.outcome is None:
             self._finish_cancelled(operation)
@@ -707,6 +673,7 @@ class MCPServerActor:
             _set_result(operation.waiter.result, _degraded_result(self.name, self._status))
 
     def _finish_cancelled(self, operation: _Operation) -> None:
+        self._close_completed_setup_client(operation)
         self._client = None
         if operation.preserve_degraded:
             self._set_status(
@@ -915,6 +882,8 @@ class MCPServerActor:
             return
         self._closed = True
         operation = self._operation
+        if operation is not None:
+            self._close_completed_setup_client(operation)
         if operation is not None and operation.task is not None:
             operation.task.cancel()
         self._operation = None
@@ -1002,12 +971,27 @@ class MCPServerActor:
         *,
         detach: bool = True,
     ) -> asyncio.Task[object]:
+        existing = self._scheduled_closes.get(id(client))
+        if existing is not None:
+            return existing[1]
         if detach:
             self._detach_failure_sink(client)
         task = asyncio.create_task(_safe_close(client))
+        self._scheduled_closes[id(client)] = (client, task)
         self._children.add(task)
         task.add_done_callback(self._queue_child_finished)
         return task
+
+    def _close_completed_setup_client(self, operation: _Operation) -> None:
+        task = operation.task
+        if task is None or not task.done() or task.cancelled():
+            return
+        try:
+            outcome = task.result()
+        except BaseException:
+            return
+        if outcome.client is not None:
+            self._schedule_close(outcome.client)
 
     def _queue_child_finished(self, task: asyncio.Task[object]) -> None:
         self._queue.put_nowait(_ChildFinished(task))

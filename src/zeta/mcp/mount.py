@@ -8,7 +8,6 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from .client import MCPClient, MCPTool
 from .config import MCPConfig, MCPConfigError, MCPServerConfig, load_mcp_config
@@ -21,7 +20,6 @@ from .server_actor import (
     MCPServerStatus,
     NoticeSink,
     SERVER_SETUP_TIMEOUT_SECONDS,
-    _degraded_result,
     _retry_text,
 )
 from .stdio import StdioMCPClient
@@ -66,7 +64,7 @@ class MCPMount:
         self.sources = dict(sources or {})
         self._clients = clients
         self._actors: dict[str, MCPServerActor] = {}
-        self._removed_actors: dict[str, MCPServerActor] = {}
+        self._removed_actors: set[MCPServerActor] = set()
         self._config_lock = asyncio.Lock()
         self._schema_refresh: Callable[[MCPMount], None] | None = None
         self._closed = False
@@ -114,11 +112,24 @@ class MCPMount:
         *,
         notice_sink: NoticeSink | None = None,
     ) -> MCPServerStatus:
-        actor = await self._actor_for(name)
-        if self._closed:
-            return actor.status
-        if actor.is_terminal:
-            actor = await self._replace_terminal_actor(name, actor)
+        old_actor: MCPServerActor | None = None
+        async with self._config_lock:
+            actor = self._actors.get(name)
+            if actor is None:
+                raise ValueError(f"unknown MCP server: {name}")
+            if self._closed:
+                return actor.status
+            if actor.is_terminal:
+                old_actor = actor
+                replacement = self._make_actor(
+                    self.configs[name],
+                    self.sources[name],
+                )
+                self._actors[name] = replacement
+                replacement.start()
+                actor = replacement
+        if old_actor is not None:
+            await old_actor.close()
         return await actor.reconnect(notice_sink=notice_sink)
 
     async def add_server(
@@ -194,7 +205,7 @@ class MCPMount:
                 self.statuses.pop(name, None)
                 self.sources.pop(name, None)
                 self._clients.pop(name, None)
-                self._removed_actors[name] = actor
+                self._removed_actors.add(actor)
                 self._refresh_schemas()
             else:
                 server_config, next_source = next_server
@@ -203,8 +214,7 @@ class MCPMount:
         if next_server is None:
             await actor.remove_when_idle()
             async with self._config_lock:
-                if self._removed_actors.get(name) is actor:
-                    self._removed_actors.pop(name, None)
+                self._removed_actors.discard(actor)
             return
         await actor.replace(
             server_config,
@@ -224,26 +234,23 @@ class MCPMount:
             self.statuses.pop(name, None)
             self.sources.pop(name, None)
             self._clients.pop(name, None)
-            self._removed_actors[name] = actor
+            self._removed_actors.add(actor)
             self._refresh_schemas()
-        await self._remove_server_locked(name)
+        await self._remove_server_locked(actor)
 
-    async def _remove_server_locked(self, name: str) -> None:
-        actor = self._removed_actors.get(name)
-        if actor is not None:
-            try:
-                await actor.remove()
-            finally:
-                async with self._config_lock:
-                    if self._removed_actors.get(name) is actor:
-                        self._removed_actors.pop(name, None)
+    async def _remove_server_locked(self, actor: MCPServerActor) -> None:
+        try:
+            await actor.remove()
+        finally:
+            async with self._config_lock:
+                self._removed_actors.discard(actor)
 
     async def close(self) -> None:
         async with self._config_lock:
             if self._close_task is None:
                 self._closed = True
                 actors = tuple(self._actors.values())
-                actors += tuple(self._removed_actors.values())
+                actors += tuple(self._removed_actors)
                 self._close_task = asyncio.create_task(_close_actors(actors))
             close_task = self._close_task
         await asyncio.shield(close_task)
@@ -253,49 +260,6 @@ class MCPMount:
 
         self._schema_refresh = callback
         callback(self)
-
-    async def call_tool(
-        self,
-        server_name: str,
-        tool_name: str,
-        arguments: dict[str, object],
-        abort_signal: AbortSignal,
-        *,
-        generation: int,
-    ):
-        actor = self._actors.get(server_name)
-        if actor is None:
-            return _degraded_result(server_name, self.statuses.get(server_name))
-        return await actor.call_tool(
-            tool_name,
-            arguments,
-            abort_signal,
-            generation=generation,
-        )
-
-    async def _actor_for(self, name: str) -> MCPServerActor:
-        async with self._config_lock:
-            actor = self._actors.get(name)
-            if actor is None:
-                raise ValueError(f"unknown MCP server: {name}")
-            return actor
-
-    async def _replace_terminal_actor(
-        self,
-        name: str,
-        actor: MCPServerActor,
-    ) -> MCPServerActor:
-        async with self._config_lock:
-            current = self._actors.get(name)
-            if current is None:
-                raise ValueError(f"unknown MCP server: {name}")
-            if current is not actor or not current.is_terminal:
-                return current
-            replacement = self._make_actor(current.config, current.source)
-            self._actors[name] = replacement
-            replacement.start()
-        await actor.close()
-        return replacement
 
     def _make_actor(
         self,
