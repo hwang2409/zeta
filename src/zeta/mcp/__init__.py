@@ -6,8 +6,15 @@ from .config import (
     MCPConfigError,
     MCPServerConfig,
     default_config_path,
+    home_config_path,
     load_mcp_config,
+    load_mcp_config_overlay,
     mcp_log_path,
+    project_config_path,
+    read_mcp_config_file,
+    resolve_server_config,
+    server_to_json,
+    write_mcp_config,
 )
 from .http import StreamableHTTPMCPClient
 from .mount import MCPMount, MCPServerState, MCPServerStatus, mount_mcp_servers
@@ -25,7 +32,14 @@ __all__ = [
     "StdioMCPClient",
     "StreamableHTTPMCPClient",
     "default_config_path",
+    "home_config_path",
     "load_mcp_config",
+    "load_mcp_config_overlay",
     "mcp_log_path",
     "mount_mcp_servers",
+    "project_config_path",
+    "read_mcp_config_file",
+    "resolve_server_config",
+    "server_to_json",
+    "write_mcp_config",
 ]
