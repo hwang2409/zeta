@@ -1123,6 +1123,30 @@ async def test_abandoned_completed_auto_remount_closes_stale_client(
 
 
 @pytest.mark.asyncio
+async def test_completed_reconnect_closes_are_not_retained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("server", "stdio", "unused")
+    clients = [_LifecycleClient(config) for _ in range(21)]
+    client_iter = iter(clients)
+    monkeypatch.setattr(
+        mount_module, "_build_client", lambda config: next(client_iter)
+    )
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
+    )
+    actor = mount._actors["server"]
+
+    for _ in clients[1:]:
+        await mount.reconnect("server")
+        await asyncio.sleep(0)
+
+    assert actor._scheduled_closes == {}
+    await mount.close()
+
+
+@pytest.mark.asyncio
 async def test_degraded_tool_call_auto_remounts_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1504,6 +1528,37 @@ async def test_mount_close_tracks_actor_removed_during_cleanup(
     assert not mount_close_task.done()
     release_close.set()
     await asyncio.gather(remove_task, mount_close_task)
+
+
+@pytest.mark.asyncio
+async def test_canceled_remove_keeps_cleanup_owned_by_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    config = MCPServerConfig("server", "stdio", "unused")
+    client = _BlockingCloseClient(config, close_started, release_close)
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
+    )
+    actor = mount._actors["server"]
+
+    remove_task = asyncio.create_task(mount.remove_server("server"))
+    await close_started.wait()
+    remove_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await remove_task
+
+    assert actor in mount._removed_actors
+    mount_close_task = asyncio.create_task(mount.close())
+    await asyncio.sleep(0)
+    assert not mount_close_task.done()
+
+    release_close.set()
+    await mount_close_task
+    assert actor not in mount._removed_actors
 
 
 @pytest.mark.asyncio

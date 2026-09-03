@@ -65,6 +65,7 @@ class MCPMount:
         self._clients = clients
         self._actors: dict[str, MCPServerActor] = {}
         self._removed_actors: set[MCPServerActor] = set()
+        self._removal_tasks: set[asyncio.Task[None]] = set()
         self._config_lock = asyncio.Lock()
         self._schema_refresh: Callable[[MCPMount], None] | None = None
         self._closed = False
@@ -236,14 +237,25 @@ class MCPMount:
             self._clients.pop(name, None)
             self._removed_actors.add(actor)
             self._refresh_schemas()
-        await self._remove_server_locked(actor)
+        removal_task = asyncio.create_task(self._remove_server_locked(actor))
+        self._removal_tasks.add(removal_task)
+        removal_task.add_done_callback(
+            lambda task, removed_actor=actor: self._removal_finished(
+                removed_actor, task
+            )
+        )
+        await asyncio.shield(removal_task)
 
     async def _remove_server_locked(self, actor: MCPServerActor) -> None:
-        try:
-            await actor.remove()
-        finally:
-            async with self._config_lock:
-                self._removed_actors.discard(actor)
+        await actor.remove()
+
+    def _removal_finished(
+        self,
+        actor: MCPServerActor,
+        task: asyncio.Task[None],
+    ) -> None:
+        self._removal_tasks.discard(task)
+        self._removed_actors.discard(actor)
 
     async def close(self) -> None:
         async with self._config_lock:
@@ -251,7 +263,10 @@ class MCPMount:
                 self._closed = True
                 actors = tuple(self._actors.values())
                 actors += tuple(self._removed_actors)
-                self._close_task = asyncio.create_task(_close_actors(actors))
+                removal_tasks = tuple(self._removal_tasks)
+                self._close_task = asyncio.create_task(
+                    _close_actors(actors, removal_tasks)
+                )
             close_task = self._close_task
         await asyncio.shield(close_task)
 
@@ -339,9 +354,15 @@ async def mount_mcp_servers(
     return mount
 
 
-async def _close_actors(actors: tuple[MCPServerActor, ...]) -> None:
+async def _close_actors(
+    actors: tuple[MCPServerActor, ...],
+    removal_tasks: tuple[asyncio.Task[None], ...] = (),
+) -> None:
     unique = tuple(dict.fromkeys(actors))
-    await asyncio.gather(*(actor.close() for actor in unique))
+    await asyncio.gather(
+        *(actor.close() for actor in unique),
+        *removal_tasks,
+    )
 
 
 __all__ = ["MCPMount", "MCPServerState", "MCPServerStatus", "mount_mcp_servers"]

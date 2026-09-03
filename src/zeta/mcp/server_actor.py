@@ -979,8 +979,22 @@ class MCPServerActor:
         task = asyncio.create_task(_safe_close(client))
         self._scheduled_closes[id(client)] = (client, task)
         self._children.add(task)
-        task.add_done_callback(self._queue_child_finished)
+        task.add_done_callback(
+            lambda done, client_id=id(client): self._scheduled_close_finished(
+                client_id, done
+            )
+        )
         return task
+
+    def _scheduled_close_finished(
+        self,
+        client_id: int,
+        task: asyncio.Task[object],
+    ) -> None:
+        entry = self._scheduled_closes.get(client_id)
+        if entry is not None and entry[1] is task:
+            self._scheduled_closes.pop(client_id)
+        self._queue_child_finished(task)
 
     def _close_completed_setup_client(self, operation: _Operation) -> None:
         task = operation.task
