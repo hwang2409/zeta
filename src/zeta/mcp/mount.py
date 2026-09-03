@@ -277,9 +277,9 @@ class MCPMount:
             raise ValueError("MCP mount is closed")
         client = self._clients.get(name)
         self._transition(name, client=client)
-        if client is not None:
-            await _close_failed_client(client)
         try:
+            if client is not None:
+                await _close_failed_client(client)
             setup = await _setup_server(
                 server_config,
                 notice_sink=notice_sink,

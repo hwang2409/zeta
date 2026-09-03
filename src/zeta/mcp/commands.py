@@ -92,6 +92,7 @@ async def add_and_mount(
     """Write a new entry to the target file and live-mount it, rolling back on failure."""
 
     name = server_config.name
+    entry = server_to_json(server_config)
 
     def prepare() -> None:
         def add_entry(
@@ -99,17 +100,19 @@ async def add_and_mount(
         ) -> dict[str, dict[str, object]]:
             if name in servers:
                 raise MCPCommandError(f"MCP server already configured: {name}")
-            return {**servers, name: server_to_json(server_config)}
+            return {**servers, name: entry}
 
         rewrite_mcp_file(target, add_entry)
 
     def rollback() -> None:
-        rewrite_mcp_file(
-            target,
-            lambda servers: {
-                key: entry for key, entry in servers.items() if key != name
-            },
-        )
+        def remove_created_entry(
+            servers: dict[str, dict[str, object]],
+        ) -> dict[str, dict[str, object]]:
+            if servers.get(name) != entry:
+                return servers
+            return {key: value for key, value in servers.items() if key != name}
+
+        rewrite_mcp_file(target, remove_created_entry)
 
     await mount.add_server(
         resolve_server_config(server_config),

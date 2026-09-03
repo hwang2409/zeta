@@ -35,6 +35,7 @@ from zeta.mcp.client import (
     parse_rpc_response,
     translate_call_result,
 )
+from zeta.mcp.commands import rewrite_mcp_file
 from zeta.tools import ToolRegistry
 from zeta.types import TextContent, ToolCall
 
@@ -179,6 +180,23 @@ class _LifecycleClient(_FakeClient):
 
     async def close(self) -> None:
         self.closed = True
+
+
+class _BlockingCloseClient(_LifecycleClient):
+    def __init__(
+        self,
+        config: MCPServerConfig,
+        close_started: asyncio.Event,
+        release_close: asyncio.Event,
+    ) -> None:
+        super().__init__(config)
+        self.close_started = close_started
+        self.release_close = release_close
+
+    async def close(self) -> None:
+        self.closed = True
+        self.close_started.set()
+        await self.release_close.wait()
 
 
 class _ApplicationErrorClient(_LifecycleClient):
@@ -586,6 +604,39 @@ async def test_canceled_reconnect_keeps_mount_state_consistent(
     assert mount.clients == ()
     assert registry.schemas == []
     assert replacement.closed
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_canceled_reconnect_during_client_close_marks_mount_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    initial = _BlockingCloseClient(
+        MCPServerConfig("server", "stdio", "unused"),
+        close_started,
+        release_close,
+    )
+    replacement = _LifecycleClient(initial.config)
+    clients = iter((initial, replacement))
+
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"server": initial.config}),
+    )
+
+    reconnect = asyncio.create_task(mount.reconnect("server"))
+    await close_started.wait()
+    reconnect.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reconnect
+
+    assert mount.statuses["server"].state == "failed"
+    assert mount.clients == ()
+    assert registry.schemas == []
     await mount.close()
 
 
@@ -1305,6 +1356,45 @@ async def test_canceled_mcp_add_leaves_no_ghost_state(
     assert "ghost" not in json.loads(
         project_config_path(project).read_text()
     ).get("servers", {})
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_canceled_mcp_add_preserves_concurrent_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_connect_and_list(client: _FakeClient) -> list[MCPTool]:
+        del client
+        started.set()
+        await release.wait()
+        return []
+
+    monkeypatch.setattr(mount_module, "_build_client", _FakeClient)
+    monkeypatch.setattr(mount_module, "_connect_and_list", slow_connect_and_list)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
+    task = asyncio.create_task(loop.slash_mcp("add ghost --stdio original"))
+    await started.wait()
+
+    replacement = {"transport": "stdio", "command": "newer"}
+    rewrite_mcp_file(
+        project_config_path(project),
+        lambda servers: {**servers, "ghost": replacement},
+    )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert json.loads(project_config_path(project).read_text())["servers"][
+        "ghost"
+    ] == replacement
+    assert loop._mcp_mount is not None
+    assert "ghost" not in loop._mcp_mount.configs
     await loop.close()
 
 
