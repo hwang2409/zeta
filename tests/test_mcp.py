@@ -617,6 +617,114 @@ async def test_removed_handler_rejects_a_readded_same_name_server(
 
 
 @pytest.mark.asyncio
+async def test_canceled_add_does_not_clean_up_a_new_same_name_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = asyncio.Event()
+    never = asyncio.Event()
+    first_config = MCPServerConfig("same", "stdio", "first")
+    second_config = MCPServerConfig("same", "stdio", "second")
+    first_client = _LifecycleClient(first_config)
+    second_client = _LifecycleClient(second_config)
+    clients = iter((first_client, second_client))
+
+    def build_client(config: MCPServerConfig) -> _LifecycleClient:
+        return next(clients)
+
+    async def connect_and_list(client: _LifecycleClient) -> list[MCPTool]:
+        if client is first_client:
+            started.set()
+            await never.wait()
+        return await client.list_tools()
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = MCPMount(registry, {}, {})
+    rollback_calls = 0
+
+    def rollback() -> None:
+        nonlocal rollback_calls
+        rollback_calls += 1
+
+    add = asyncio.create_task(
+        mount.add_server(
+            first_config,
+            source=tmp_path / "first.json",
+            rollback=rollback,
+        )
+    )
+    await started.wait()
+    await mount.remove_server("same")
+    await mount.add_server(second_config, source=tmp_path / "second.json")
+
+    add.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await add
+
+    assert rollback_calls == 0
+    assert mount.configs["same"] is second_config
+    assert mount.clients == (second_client,)
+    assert not second_client.closed
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_canceled_replacement_does_not_mark_a_new_same_name_server_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = asyncio.Event()
+    never = asyncio.Event()
+    initial_config = MCPServerConfig("same", "stdio", "initial")
+    replacement_config = MCPServerConfig("same", "stdio", "replacement")
+    new_config = MCPServerConfig("same", "stdio", "new")
+    initial = _LifecycleClient(initial_config)
+    replacement = _LifecycleClient(replacement_config)
+    new_client = _LifecycleClient(new_config)
+    clients = iter((initial, replacement, new_client))
+
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
+
+    async def connect_and_list(client: _LifecycleClient) -> list[MCPTool]:
+        if client is replacement:
+            started.set()
+            await never.wait()
+        return await client.list_tools()
+
+    monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"same": initial_config}),
+    )
+    mount.sources["same"] = tmp_path / "initial.json"
+
+    replace = asyncio.create_task(
+        mount.replace_server(
+            "same",
+            persist=lambda _path: None,
+            replacement=lambda _path: (
+                replacement_config,
+                tmp_path / "replacement.json",
+            ),
+        )
+    )
+    await started.wait()
+    await mount.remove_server("same")
+    await mount.add_server(new_config, source=tmp_path / "new.json")
+
+    replace.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await replace
+
+    assert mount.configs["same"] is new_config
+    assert mount.statuses["same"].state == "mounted"
+    assert mount.clients == (new_client,)
+    assert not new_client.closed
+    await mount.close()
+
+
+@pytest.mark.asyncio
 async def test_hung_tool_call_does_not_block_reconnect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -698,6 +806,46 @@ async def test_failed_manual_reconnect_preserves_degraded_recovery(
 
 
 @pytest.mark.asyncio
+async def test_canceled_degraded_reconnect_propagates_and_preserves_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = asyncio.Event()
+    never = asyncio.Event()
+    config = MCPServerConfig("recover", "stdio", "unused")
+    initial = _LifecycleClient(config)
+    replacement = _LifecycleClient(config)
+    clients = iter((initial, replacement))
+
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
+
+    async def connect_and_list(client: _LifecycleClient) -> list[MCPTool]:
+        if client is replacement:
+            started.set()
+            await never.wait()
+        return await client.list_tools()
+
+    monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"recover": config}),
+    )
+    initial.fail_transport("server exited")
+    await asyncio.sleep(0)
+
+    reconnect = asyncio.create_task(mount.reconnect("recover"))
+    await started.wait()
+    reconnect.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reconnect
+
+    assert mount.statuses["recover"].state == "degraded"
+    assert mount.clients == ()
+    assert replacement.closed
+    await mount.close()
+
+
+@pytest.mark.asyncio
 async def test_remount_replaces_the_full_tool_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -740,11 +888,42 @@ async def test_auto_remount_backoff_caps_at_large_failure_count(
     mount._failure_counts["retry"] = 1024
     before = mount_module.time.monotonic()
 
-    await mount._auto_remount("retry")
+    await mount._auto_remount("retry", mount._generations["retry"])
 
     retry_at = mount.statuses["retry"].next_retry_at
     assert retry_at is not None
     assert retry_at - before <= 30.1
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_delayed_auto_remount_rejects_a_stale_same_name_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("same", "stdio", "old")
+    initial = _LifecycleClient(config)
+    new_config = MCPServerConfig("same", "stdio", "new")
+    new_client = _LifecycleClient(new_config)
+    clients = iter((initial, new_client))
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"same": config}),
+    )
+    initial.fail_transport("server exited")
+    await asyncio.sleep(0)
+    old_generation = mount._generations["same"]
+
+    await mount.remove_server("same")
+    await mount.add_server(new_config, source=tmp_path / "new.json")
+    delayed = asyncio.create_task(mount._auto_remount("same", old_generation))
+    await delayed
+
+    assert mount.configs["same"] is new_config
+    assert mount.statuses["same"].state == "mounted"
+    assert mount.clients == (new_client,)
+    assert not new_client.closed
     await mount.close()
 
 

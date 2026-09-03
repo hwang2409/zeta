@@ -202,9 +202,10 @@ class MCPMount:
             return await self._mount_one(name, server_config, notice_sink=notice_sink)
         except BaseException:
             client = None
+            accepted = False
             async with self._config_lock, lock:
                 client = self._clients.get(name)
-                self._transition(
+                accepted = self._transition(
                     name,
                     client=client,
                     generation=generation,
@@ -212,13 +213,15 @@ class MCPMount:
                     remove_config=True,
                     remove_source=True,
                 )
-                if rollback is not None:
+                if accepted and rollback is not None:
                     try:
                         rollback()
                     except BaseException:
                         logger.exception("failed to roll back MCP config %s", name)
-            if client is not None:
-                await _close_failed_client(client)
+            if accepted and client is not None:
+                await _close_failed_client(
+                    client, mount=self, generation=generation
+                )
             raise
 
     async def replace_server(
@@ -252,9 +255,11 @@ class MCPMount:
             )
             if next_server is None:
                 server_config = None
+                replacement_generation = None
             else:
                 server_config, source = next_server
                 next_generation = self._generations.get(name, 0) + 1
+                replacement_generation = next_generation
                 self._transition(
                     name,
                     client=None,
@@ -263,7 +268,7 @@ class MCPMount:
                     new_generation=next_generation,
                 )
         if client is not None:
-            await _close_failed_client(client)
+            await _close_failed_client(client, mount=self, generation=generation)
         if server_config is None:
             return
         try:
@@ -273,7 +278,7 @@ class MCPMount:
                 self._transition(
                     name,
                     client=self._clients.get(name),
-                    generation=self._generations.get(name),
+                    generation=replacement_generation,
                     state="failed",
                     reason=_error_text(exc),
                 )
@@ -287,17 +292,20 @@ class MCPMount:
             if name not in self.configs:
                 raise ValueError(f"unknown MCP server: {name}")
             client = self._clients.get(name)
+            generation = self._generations[name]
             await self._remove_server_locked(name)
         if client is not None:
-            await _close_failed_client(client)
+            await _close_failed_client(client, mount=self, generation=generation)
 
     async def _remove_server_locked(self, name: str) -> None:
         """Remove one server while its lifecycle lock is held."""
 
         client = self._clients.get(name)
+        generation = self._generations[name]
         self._transition(
             name,
             client=client,
+            generation=generation,
             allow_closed=True,
             remove_config=True,
             remove_source=True,
@@ -331,10 +339,14 @@ class MCPMount:
                 )
         try:
             if client is not None:
-                await _close_failed_client(client)
+                await _close_failed_client(
+                    client, mount=self, generation=generation
+                )
             setup = await _setup_server(
                 server_config,
                 notice_sink=notice_sink,
+                mount=self,
+                generation=generation,
                 client_ready=lambda replacement: self._arm_client(
                     name, replacement, generation
                 ),
@@ -342,6 +354,26 @@ class MCPMount:
         except BaseException as exc:
             async with lock:
                 current_status = self.statuses.get(name)
+                if isinstance(exc, asyncio.CancelledError):
+                    if preserve_degraded and current_status is not None:
+                        self._transition(
+                            name,
+                            client=self._clients.get(name),
+                            generation=generation,
+                            state="degraded",
+                            reason=current_status.reason,
+                            next_retry_at=current_status.next_retry_at,
+                            failure_count=self._failure_counts.get(name, 0),
+                        )
+                    else:
+                        self._transition(
+                            name,
+                            client=self._clients.get(name),
+                            generation=generation,
+                            state="failed",
+                            reason=_error_text(exc),
+                        )
+                    raise
                 if (
                     preserve_degraded
                     and current_status is not None
@@ -385,7 +417,9 @@ class MCPMount:
                 self._finish_setup(setup, generation)
                 return self.statuses[name]
         if stale_client is not None:
-            await _close_failed_client(stale_client)
+            await _close_failed_client(
+                stale_client, mount=self, generation=generation
+            )
         return self.statuses.get(name, setup.public)
 
     async def close(self) -> None:
@@ -402,6 +436,7 @@ class MCPMount:
             lock = self._locks.setdefault(name, asyncio.Lock())
             async with lock:
                 client = self._clients.get(name)
+                generation = self._generations.get(name)
                 self._transition(
                     name,
                     client=client,
@@ -410,7 +445,9 @@ class MCPMount:
                     allow_closed=True,
                 )
             if client is not None:
-                await _close_failed_client(client)
+                await _close_failed_client(
+                    client, mount=self, generation=generation
+                )
 
     def set_schema_refresh(self, callback: Callable[[MCPMount], None]) -> None:
         """Bind the owner of provider tool schemas after initial setup."""
@@ -432,7 +469,11 @@ class MCPMount:
             generation=generation,
         )
         if not accepted and client is not None:
-            asyncio.create_task(_close_failed_client(client))
+            asyncio.create_task(
+                _close_failed_client(
+                    client, mount=self, generation=generation
+                )
+            )
 
     def _transition(
         self,
@@ -625,20 +666,23 @@ class MCPMount:
                 next_retry_at=time.monotonic(),
                 failure_count=self._failure_counts.get(name, 0),
             )
-        await _close_failed_client(client)
+        await _close_failed_client(client, mount=self, generation=generation)
         if task is not None:
             async with lock:
                 self._transition(
                     name,
                     client=None,
+                    generation=generation,
                     clear_failure_task=task,
                     clear_failure_client=client,
                     allow_closed=True,
                 )
 
-    async def _wait_for_failure(self, client: MCPClient) -> None:
+    async def _wait_for_failure(self, client: MCPClient, generation: int) -> None:
         lock = self._locks.setdefault(client.config.name, asyncio.Lock())
         async with lock:
+            if self._generations.get(client.config.name) != generation:
+                return
             task = self._failure_tasks.get(id(client))
         if task is not None:
             await asyncio.shield(task)
@@ -690,7 +734,7 @@ class MCPMount:
                     if retry_at is not None and time.monotonic() < retry_at:
                         return _degraded_result(server_name, status)
                     auto_task = asyncio.create_task(
-                        self._auto_remount(server_name)
+                        self._auto_remount(server_name, generation)
                     )
                     accepted = self._transition(
                         server_name,
@@ -774,32 +818,35 @@ class MCPMount:
                     failure_count=self._failure_counts.get(server_name, 0),
                 )
                 close_client = client
-        await self._wait_for_failure(client)
+        await self._wait_for_failure(client, generation)
         if close_client is not None:
-            await _close_failed_client(close_client)
+            await _close_failed_client(
+                close_client, mount=self, generation=generation
+            )
         async with lock:
             status = self.statuses.get(server_name)
             if status is not None and status.state == "degraded":
                 return _degraded_result(server_name, status)
         return result
 
-    async def _auto_remount(self, name: str) -> None:
+    async def _auto_remount(self, name: str, generation: int) -> None:
         lock = self._locks.setdefault(name, asyncio.Lock())
         task = asyncio.current_task()
         try:
             async with lock:
                 config = self.configs.get(name)
                 status = self.statuses.get(name)
-                generation = self._generations.get(name)
                 if (
-                    config is None
+                    self._generations.get(name) != generation
+                    or config is None
                     or status is None
                     or status.state != "degraded"
-                    or generation is None
                 ):
                     return
             setup = await _setup_server(
                 config,
+                mount=self,
+                generation=generation,
                 client_ready=lambda client: self._arm_client(
                     name, client, generation
                 ),
@@ -835,13 +882,16 @@ class MCPMount:
                         failure_count=failure_count,
                     )
             if stale_client is not None:
-                await _close_failed_client(stale_client)
+                await _close_failed_client(
+                    stale_client, mount=self, generation=generation
+                )
         finally:
             if task is not None:
                 async with lock:
                     self._transition(
                         name,
                         client=None,
+                        generation=generation,
                         clear_auto_task=task,
                         allow_closed=True,
                     )
@@ -876,6 +926,8 @@ async def mount_mcp_servers(
                 _setup_server(
                     server_config,
                     notice_sink=notice_sink,
+                    mount=mount,
+                    generation=mount._generations[server_config.name],
                     client_ready=lambda client,
                     name=server_config.name,
                     generation=mount._generations[server_config.name]: mount._arm_client(
@@ -897,6 +949,8 @@ async def _setup_server(
     server_config: MCPServerConfig,
     *,
     notice_sink: NoticeSink | None = None,
+    mount: MCPMount | None = None,
+    generation: int | None = None,
     client_ready: Callable[[MCPClient], None] | None = None,
 ) -> _SetupResult:
     if server_config.malformed_reason is not None:
@@ -942,7 +996,9 @@ async def _setup_server(
             "timed out connecting to MCP server %s %s", server_config.name, reason
         )
         if client is not None:
-            await _close_failed_client(client)
+            await _close_failed_client(
+                client, mount=mount, generation=generation
+            )
         public = MCPServerStatus(
             server_config.name,
             server_config.transport,
@@ -956,7 +1012,9 @@ async def _setup_server(
         reason = _error_text(exc)
         logger.warning("failed to mount MCP server %s: %s", server_config.name, reason)
         if client is not None:
-            await _close_failed_client(client)
+            await _close_failed_client(
+                client, mount=mount, generation=generation
+            )
         public = MCPServerStatus(
             server_config.name,
             server_config.transport,
@@ -968,7 +1026,9 @@ async def _setup_server(
         return _SetupResult(public, client)
     except BaseException:
         if client is not None:
-            await _close_failed_client(client)
+            await _close_failed_client(
+                client, mount=mount, generation=generation
+            )
         raise
     public = MCPServerStatus(
         server_config.name,
@@ -1027,7 +1087,21 @@ async def _connect_and_list(client: MCPClient) -> list[MCPTool]:
     return await client.list_tools()
 
 
-async def _close_failed_client(client: MCPClient) -> None:
+async def _close_failed_client(
+    client: MCPClient,
+    *,
+    mount: MCPMount | None = None,
+    generation: int | None = None,
+) -> None:
+    if mount is not None and generation is not None:
+        lock = mount._locks.setdefault(client.config.name, asyncio.Lock())
+        async with lock:
+            current = mount._clients.get(client.config.name)
+            if (
+                current is client
+                and mount._generations.get(client.config.name) != generation
+            ):
+                return
     try:
         await client.close()
     except Exception:
