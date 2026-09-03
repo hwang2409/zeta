@@ -212,6 +212,19 @@ class _ListedClient(_LifecycleClient):
         return self.tools
 
 
+class _CallTrackingClient(_ListedClient):
+    def __init__(self, config: MCPServerConfig, calls: list[str]) -> None:
+        super().__init__(config, [MCPTool("echo", "", {"type": "object"})])
+        self.calls = calls
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, object], abort_signal: AbortSignal
+    ):
+        del arguments, abort_signal
+        self.calls.append(name)
+        return {"content": [], "isError": False, "structuredContent": None}
+
+
 class _BlockingCloseClient(_LifecycleClient):
     def __init__(
         self,
@@ -510,6 +523,44 @@ async def test_http_abort_closes_request() -> None:
     signal.abort()
     result = await task
     assert result["content"][0]["text"] == "tool execution canceled"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_generic_request_failure_notifies_sink() -> None:
+    client = StdioMCPClient(MCPServerConfig("stdio", "stdio", "unused"))
+    failures: list[str] = []
+    client.set_failure_sink(failures.append)
+
+    async def broken_request(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        raise BrokenPipeError("pipe closed")
+
+    client._request = broken_request  # type: ignore[method-assign]
+    result = await client.call_tool("echo", {}, AbortSignal())
+
+    assert result["isError"] is True
+    assert failures == ["pipe closed"]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_http_generic_request_failure_notifies_sink() -> None:
+    client = StreamableHTTPMCPClient(
+        MCPServerConfig("http", "streamable-http", url="https://mcp.test")
+    )
+    failures: list[str] = []
+    client.set_failure_sink(failures.append)
+
+    async def broken_request(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        raise BrokenPipeError("pipe closed")
+
+    client._request = broken_request  # type: ignore[method-assign]
+    result = await client.call_tool("echo", {}, AbortSignal())
+
+    assert result["isError"] is True
+    assert failures == ["pipe closed"]
     await client.close()
 
 
@@ -869,6 +920,32 @@ async def test_remount_replaces_the_full_tool_set(
 
 
 @pytest.mark.asyncio
+async def test_old_tool_lease_cannot_call_replacement_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("server", "stdio", "unused")
+    old_calls: list[str] = []
+    new_calls: list[str] = []
+    initial = _CallTrackingClient(config, old_calls)
+    replacement = _CallTrackingClient(config, new_calls)
+    clients = iter((initial, replacement))
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
+    )
+    old_handler = registry.definitions_by_name["server:echo"].handler
+
+    await mount.reconnect("server")
+    result = await old_handler({}, AbortSignal())
+
+    assert result["isError"] is True
+    assert old_calls == []
+    assert new_calls == []
+    await mount.close()
+
+
+@pytest.mark.asyncio
 async def test_auto_remount_backoff_caps_at_large_failure_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -893,6 +970,33 @@ async def test_auto_remount_backoff_caps_at_large_failure_count(
     retry_at = mount.statuses["retry"].next_retry_at
     assert retry_at is not None
     assert retry_at - before <= 30.1
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_auto_remount_drops_client_before_next_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("retry", "stdio", "unused")
+    initial = _LifecycleClient(config)
+    failed = _FakeClient(config, fail_connect=True)
+    replacement = _LifecycleClient(config)
+    clients = iter((initial, failed, replacement))
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"retry": config})
+    )
+
+    initial.fail_transport("server exited")
+    await asyncio.sleep(0)
+    failed_result = await registry.execute(ToolCall("retry", "retry:echo", {}))
+
+    assert failed_result["isError"] is True
+    assert mount.clients == ()
+    await mount.reconnect("retry")
+    assert mount.statuses["retry"].state == "mounted"
+    assert mount.clients == (replacement,)
     await mount.close()
 
 
@@ -1260,6 +1364,30 @@ async def test_mount_cancellation_closes_clients_created_during_setup(
         await task
 
     assert clients and all(client.closed for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_mount_close_waits_for_active_client_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    config = MCPServerConfig("server", "stdio", "unused")
+    client = _BlockingCloseClient(config, close_started, release_close)
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
+    )
+
+    client.fail_transport("server exited")
+    await close_started.wait()
+    close_task = asyncio.create_task(mount.close())
+    await asyncio.sleep(0)
+
+    assert not close_task.done()
+    release_close.set()
+    await close_task
 
 
 @pytest.mark.asyncio

@@ -108,6 +108,7 @@ class StdioMCPClient(MCPClient):
             self._report_failure(exc)
             return make_error_result(str(exc))
         except Exception as exc:  # noqa: BLE001 - remote failures become tool results
+            self._report_failure(exc)
             return make_error_result(str(exc))
         return translate_call_result(result)
 

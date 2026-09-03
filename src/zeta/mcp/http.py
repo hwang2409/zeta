@@ -80,6 +80,8 @@ class StreamableHTTPMCPClient(MCPClient):
                 self._failure_sink(str(exc))
             return make_error_result(str(exc))
         except Exception as exc:  # noqa: BLE001 - remote failures become tool results
+            if self._failure_sink is not None:
+                self._failure_sink(str(exc))
             return make_error_result(str(exc))
         return translate_call_result(result)
 
