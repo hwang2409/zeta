@@ -679,13 +679,13 @@ class AgentLoop:
             self.tool_schemas = list(self.tool_registry.schemas)
             self._mcp_schema_names = current_names
             return
-        stale_names = self._mcp_schema_names - current_names
+        names_to_replace = self._mcp_schema_names | current_names
         self.tool_schemas = [
             schema
             for schema in self.tool_schemas
             if not (
                 isinstance(schema.get("name"), str)
-                and schema["name"] in stale_names
+                and schema["name"] in names_to_replace
             )
         ] + current_mcp
         self._mcp_schema_names = current_names

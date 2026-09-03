@@ -134,9 +134,14 @@ class MCPMount:
     ) -> MCPServerStatus:
         """Replace one server without touching other server clients."""
 
-        if name not in self.configs:
-            raise ValueError(f"unknown MCP server: {name}")
-        return await self._mount_one(name, self.configs[name], notice_sink=notice_sink)
+        lock = self._locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            server_config = self.configs.get(name)
+            if server_config is None:
+                raise ValueError(f"unknown MCP server: {name}")
+            return await self._mount_one_locked(
+                name, server_config, notice_sink=notice_sink
+            )
 
     async def add_server(
         self,
@@ -186,8 +191,8 @@ class MCPMount:
         self,
         name: str,
         *,
-        persist: Callable[[], None],
-        replacement: Callable[[], tuple[MCPServerConfig, Path] | None],
+        persist: Callable[[Path], None],
+        replacement: Callable[[Path], tuple[MCPServerConfig, Path] | None],
         notice_sink: NoticeSink | None = None,
     ) -> None:
         """Replace one server while holding its lifecycle lock."""
@@ -197,10 +202,22 @@ class MCPMount:
             async with lock:
                 if name not in self.configs:
                     raise ValueError(f"unknown MCP server: {name}")
-                persist()
-                await self._remove_server_locked(name)
-                next_server = replacement()
+                source = self.sources.get(name)
+                if source is None:
+                    raise ValueError(f"unknown MCP server: {name}")
+                next_server = replacement(source)
+                persist(source)
+                client = self._clients.get(name)
+                self._transition(
+                    name,
+                    client=client,
+                    allow_closed=True,
+                    remove_config=True,
+                    remove_source=True,
+                )
                 if next_server is None:
+                    if client is not None:
+                        await _close_failed_client(client)
                     return
                 server_config, source = next_server
                 self._transition(
@@ -210,16 +227,17 @@ class MCPMount:
                     source=source,
                 )
                 try:
+                    if client is not None:
+                        await _close_failed_client(client)
                     await self._mount_one_locked(
                         name, server_config, notice_sink=notice_sink
                     )
-                except BaseException:
+                except BaseException as exc:
                     self._transition(
                         name,
                         client=self._clients.get(name),
-                        allow_closed=True,
-                        remove_config=True,
-                        remove_source=True,
+                        state="failed",
+                        reason=_error_text(exc),
                     )
                     raise
 
@@ -245,19 +263,6 @@ class MCPMount:
         )
         if client is not None:
             await _close_failed_client(client)
-
-    async def _mount_one(
-        self,
-        name: str,
-        server_config: MCPServerConfig,
-        *,
-        notice_sink: NoticeSink | None,
-    ) -> MCPServerStatus:
-        lock = self._locks.setdefault(name, asyncio.Lock())
-        async with lock:
-            return await self._mount_one_locked(
-                name, server_config, notice_sink=notice_sink
-            )
 
     async def _mount_one_locked(
         self,
@@ -409,6 +414,8 @@ class MCPMount:
             set_failure_sink(lambda reason: self._mark_failed(name, client, reason))
 
     def _mark_failed(self, name: str, client: MCPClient, reason: str) -> None:
+        if self._clients.get(name) is not client:
+            return
         if self._transition(name, client=client, state="failed", reason=reason):
             asyncio.create_task(_close_failed_client(client))
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import fcntl
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from .config import (
@@ -55,13 +57,29 @@ def rewrite_mcp_file(
     path: Path,
     edit: Callable[[dict[str, dict[str, object]]], dict[str, dict[str, object]]],
 ) -> None:
-    """Read one config file, apply edit, and atomically write it back."""
+    """Read, edit, validate, and atomically write one config file."""
 
-    try:
-        current = read_mcp_config_file(path)
-    except MCPConfigError as exc:
-        raise MCPCommandError(str(exc)) from exc
-    write_mcp_config(path, edit(current))
+    target = Path(path).expanduser()
+    with _config_transaction_lock(target):
+        try:
+            current = read_mcp_config_file(target)
+        except MCPConfigError as exc:
+            raise MCPCommandError(str(exc)) from exc
+        write_mcp_config(target, edit(current))
+
+
+@contextmanager
+def _config_transaction_lock(path: Path) -> Iterator[None]:
+    """Hold a stable cross-process lock for a complete config transaction."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 async def add_and_mount(
@@ -112,20 +130,16 @@ async def remove_and_unshadow(
 ) -> None:
     """Remove one entry from its owning file, unmount it, remount any home shadow."""
 
-    source = mount.sources.get(name)
-    if source is None:
-        raise MCPCommandError(f"unknown MCP server: {name}")
-
-    def persist() -> None:
+    def persist(locked_source: Path) -> None:
         rewrite_mcp_file(
-            source,
+            locked_source,
             lambda servers: {
                 key: entry for key, entry in servers.items() if key != name
             },
         )
 
-    def replacement() -> tuple[MCPServerConfig, Path] | None:
-        if home_path is None or home_path.resolve() == source.resolve():
+    def replacement(locked_source: Path) -> tuple[MCPServerConfig, Path] | None:
+        if home_path is None or home_path.resolve() == locked_source.resolve():
             return None
         entry = load_home().get(name)
         if entry is None:

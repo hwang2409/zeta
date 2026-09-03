@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import os
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -26,7 +27,6 @@ from zeta.mcp import (
     load_mcp_config_overlay,
     mount_mcp_servers,
     project_config_path,
-    read_mcp_config_file,
     server_to_json,
     write_mcp_config,
 )
@@ -586,6 +586,41 @@ async def test_canceled_reconnect_keeps_mount_state_consistent(
     assert mount.clients == ()
     assert registry.schemas == []
     assert replacement.closed
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_queued_behind_remove_does_not_mount_ghost_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remove_started = asyncio.Event()
+    release_remove = asyncio.Event()
+    client = _LifecycleClient(MCPServerConfig("server", "stdio", "unused"))
+
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"server": client.config}),
+    )
+    original_remove = mount._remove_server_locked
+
+    async def blocked_remove(_mount: MCPMount, name: str) -> None:
+        remove_started.set()
+        await release_remove.wait()
+        await original_remove(name)
+
+    monkeypatch.setattr(MCPMount, "_remove_server_locked", blocked_remove)
+    remove = asyncio.create_task(mount.remove_server("server"))
+    await remove_started.wait()
+    reconnect = asyncio.create_task(mount.reconnect("server"))
+    release_remove.set()
+
+    await remove
+    with pytest.raises(ValueError, match="unknown MCP server: server"):
+        await reconnect
+    assert mount.clients == ()
+    assert registry.schemas == []
     await mount.close()
 
 
@@ -1274,6 +1309,122 @@ async def test_canceled_mcp_add_leaves_no_ghost_state(
 
 
 @pytest.mark.asyncio
+async def test_canceled_mcp_unshadow_keeps_failed_home_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "proj"
+    project.mkdir()
+    _write_json(
+        home_config_path(home),
+        {"shared": {"transport": "streamable-http", "url": "https://home"}},
+    )
+    _write_json(
+        project_config_path(project),
+        {"shared": {"transport": "streamable-http", "url": "https://project"}},
+    )
+    started = asyncio.Event()
+    never = asyncio.Event()
+    initial = _LifecycleClient(
+        MCPServerConfig("shared", "streamable-http", url="https://project")
+    )
+    fallback = _LifecycleClient(
+        MCPServerConfig("shared", "streamable-http", url="https://home")
+    )
+    clients = iter((initial, fallback))
+
+    def build_client(config: MCPServerConfig) -> _LifecycleClient:
+        del config
+        return next(clients)
+
+    async def connect_and_list(client: _LifecycleClient) -> list[MCPTool]:
+        if client is fallback:
+            started.set()
+            await never.wait()
+        return await client.list_tools()
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=home, project_dir=project)
+    await loop.ensure_mcp_servers()
+
+    remove = asyncio.create_task(loop.slash_mcp("remove shared"))
+    await started.wait()
+    remove.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await remove
+
+    assert loop._mcp_mount is not None
+    assert loop._mcp_mount.configs["shared"].url == "https://home"
+    assert loop._mcp_mount.sources["shared"] == home_config_path(home)
+    assert loop._mcp_mount.statuses["shared"].state == "failed"
+    assert "shared" not in json.loads(
+        project_config_path(project).read_text()
+    )["servers"]
+    assert "shared" in json.loads(home_config_path(home).read_text())["servers"]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_mcp_removes_do_not_remount_removed_home_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "proj"
+    project.mkdir()
+    _write_json(
+        home_config_path(home),
+        {"shared": {"transport": "streamable-http", "url": "https://home"}},
+    )
+    _write_json(
+        project_config_path(project),
+        {"shared": {"transport": "streamable-http", "url": "https://project"}},
+    )
+    fallback_started = asyncio.Event()
+    release_fallback = asyncio.Event()
+    initial = _LifecycleClient(
+        MCPServerConfig("shared", "streamable-http", url="https://project")
+    )
+    fallback = _LifecycleClient(
+        MCPServerConfig("shared", "streamable-http", url="https://home")
+    )
+    second_fallback = _LifecycleClient(fallback.config)
+    clients = iter((initial, fallback, second_fallback))
+
+    def build_client(config: MCPServerConfig) -> _LifecycleClient:
+        del config
+        return next(clients)
+
+    async def connect_and_list(client: _LifecycleClient) -> list[MCPTool]:
+        if client is fallback:
+            fallback_started.set()
+            await release_fallback.wait()
+        return await client.list_tools()
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop.set_mcp_scope(home=home, project_dir=project)
+    await loop.ensure_mcp_servers()
+
+    first = asyncio.create_task(loop.slash_mcp("remove shared"))
+    await fallback_started.wait()
+    second = asyncio.create_task(loop.slash_mcp("remove shared"))
+    await asyncio.sleep(0)
+    release_fallback.set()
+    await asyncio.gather(first, second)
+
+    assert loop._mcp_mount is not None
+    assert "shared" not in loop._mcp_mount.configs
+    assert "shared" not in json.loads(home_config_path(home).read_text())["servers"]
+    assert "shared" not in json.loads(
+        project_config_path(project).read_text()
+    )["servers"]
+    await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_mcp_adds_keep_both_disk_entries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1298,6 +1449,39 @@ async def test_concurrent_mcp_adds_keep_both_disk_entries(
     servers = json.loads(project_config_path(project).read_text())["servers"]
     assert set(servers) == {"first", "second"}
     await loop.close()
+
+
+def test_concurrent_process_config_edits_keep_both_entries(tmp_path: Path) -> None:
+    target = tmp_path / "mcp.json"
+    script = """
+import sys
+import time
+from pathlib import Path
+from zeta.mcp.commands import rewrite_mcp_file
+
+target = Path(sys.argv[1])
+name = sys.argv[2]
+
+def edit(servers):
+    time.sleep(0.3)
+    servers[name] = {"transport": "stdio", "command": name}
+    return servers
+
+rewrite_mcp_file(target, edit)
+"""
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(target), name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for name in ("first", "second")
+    ]
+    results = [process.communicate(timeout=5) for process in processes]
+
+    assert all(process.returncode == 0 for process in processes), results
+    assert set(json.loads(target.read_text())["servers"]) == {"first", "second"}
 
 
 @pytest.mark.asyncio
@@ -1325,3 +1509,47 @@ async def test_mcp_remove_clears_provider_schema_after_unmount(
 
     assert "dead:echo" not in {schema["name"] for schema in loop.tool_schemas}
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_schema_refresh_does_not_duplicate_current_provider_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_connect_and_list(client: _FakeClient) -> list[MCPTool]:
+        del client
+        return [MCPTool("echo", "", {"type": "object"})]
+
+    monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path),
+        tool_schemas=[{"name": "live:echo", "description": "", "parameters": {}}],
+    )
+    loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "project")
+
+    await loop.slash_mcp("add live --http https://mcp.example")
+    loop._refresh_mcp_tool_schemas()
+
+    assert [schema["name"] for schema in loop.tool_schemas].count("live:echo") == 1
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_late_failure_from_removed_client_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _LifecycleClient(MCPServerConfig("dead", "stdio", "unused"))
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"dead": client.config}),
+    )
+
+    await mount.remove_server("dead")
+    client.fail_transport("late failure")
+
+    assert "dead" not in mount.statuses
+    assert mount.clients == ()
+    assert registry.schemas == []
+    await mount.close()
