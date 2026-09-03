@@ -11,7 +11,9 @@ from pathlib import Path
 
 from .core.slash import SlashModelInput
 from .mcp.prompt_commands import SlashPromptError
+from .core.approval import ApprovalRequest
 from .tui.composer import UndoCandidate, parse_input
+from .types import TextContent
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,7 +35,7 @@ class SubmissionQueue:
         self._next_id = count(1)
         self._pending: deque[Submission] = deque()
         self._ready = asyncio.Event()
-        self._current: Submission | None = None
+        self._active: dict[int, Submission] = {}
         self._cancelled: set[int] = set()
 
     def submit(
@@ -64,7 +66,7 @@ class SubmissionQueue:
         submission = self._pending.popleft()
         if not self._pending:
             self._ready.clear()
-        self._current = submission
+        self._active[submission.id] = submission
         return submission
 
     def take_pending(self) -> Submission | None:
@@ -75,7 +77,7 @@ class SubmissionQueue:
         submission = self._pending.popleft()
         if not self._pending:
             self._ready.clear()
-        self._current = submission
+        self._active[submission.id] = submission
         return submission
 
     def begin_direct(
@@ -97,25 +99,27 @@ class SubmissionQueue:
             tuple((attachment_tokens or {}).items()),
             next_image_token,
         )
-        self._current = submission
+        self._active[submission.id] = submission
         return submission
 
     def cancel_current(self) -> Submission | None:
         """Cancel the current submission, or the next queued submission."""
 
-        submission = self._current
+        submission = next(reversed(self._active.values()), None)
         if submission is None and self._pending:
-            submission = self._pending[0]
+            submission = self._pending[-1]
         if submission is not None:
             self._cancelled.add(submission.id)
         return submission
+
+    def latest_active(self) -> Submission | None:
+        return next(reversed(self._active.values()), None)
 
     def is_cancelled(self, submission: Submission) -> bool:
         return submission.id in self._cancelled
 
     def complete(self, submission: Submission) -> None:
-        if self._current is submission:
-            self._current = None
+        self._active.pop(submission.id, None)
         self._cancelled.discard(submission.id)
 
 
@@ -135,6 +139,46 @@ class SubmissionMixin:
             if self._preprocessing_task is task:
                 self._preprocessing_task = None
             await task
+
+    def _start_preprocessing(self, submission: Submission, parsed: str) -> None:
+        preprocessing_task = asyncio.create_task(
+            self._finish_prompt_value(submission, parsed)
+        )
+        self._preprocessing_tasks[submission.id] = preprocessing_task
+        self._preprocessing_task = preprocessing_task
+        self._inline_abort_signals[submission.id] = (
+            self.loop.tool_registry.abort_signal.registry.new_generation()
+        )
+
+    def _pending_approvals_for_submission(
+        self, submission_id: int
+    ) -> tuple[ApprovalRequest, ...]:
+        return tuple(
+            request
+            for request in self.pending_approvals
+            if self._approval_owners.get(request.key) == submission_id
+        )
+
+    def _dispatch_approval_queue(self) -> None:
+        if self.pending_approvals or not self._approval_queue:
+            return
+        if self._active_task is not None and not self._active_task.done():
+            self._queued.extend(self._approval_queue)
+            self._approval_queue.clear()
+            return
+        user_message, candidate = self._approval_queue.popleft()
+        self._print_user(user_message)
+        self._undo_candidate = candidate
+        user_text = next(
+            block.text
+            for block in user_message.content
+            if isinstance(block, TextContent) and block.path is None
+        )
+        self._start_turn(
+            user_text,
+            user_message=user_message,
+            submission_id=candidate.submission_id,
+        )
 
     async def slash_mcp(self, args: str) -> str:
         return await self.loop.slash_mcp(args)
@@ -175,6 +219,7 @@ class SubmissionMixin:
                 submission = self._begin_direct_submission(value)
         if self._submissions.is_cancelled(submission):
             self._submissions.complete(submission)
+            self._dispatch_approval_queue()
             return
         parsed = parse_input(submission.text)
         if parsed is None or self._exit_requested:
@@ -223,14 +268,7 @@ class SubmissionMixin:
             self._input_loop_active
             and self._slash_commands.needs_inline_shell_resolution(parsed)
         ):
-            preprocessing_task = asyncio.create_task(
-                self._finish_prompt_value(submission, parsed)
-            )
-            self._preprocessing_tasks[submission.id] = preprocessing_task
-            self._preprocessing_task = preprocessing_task
-            self._inline_abort_signals[submission.id] = (
-                self.loop.tool_registry.abort_signal.registry.new_generation()
-            )
+            self._start_preprocessing(submission, parsed)
             return
         await self._finish_prompt_value(submission, parsed)
 
@@ -254,6 +292,7 @@ class SubmissionMixin:
             else:
                 self._release_attachment_paths(submission.attachment_paths)
             self._submissions.complete(submission)
+            self._dispatch_approval_queue()
             return
         pending_attachments = list(submission.attachment_paths)
         pending_attachment_tokens = dict(submission.attachment_tokens)
@@ -288,6 +327,18 @@ class SubmissionMixin:
         self._record_prompt(parsed, submission.draft_revision)
         self._failed_turn = None
         if self.pending_approvals:
+            if not self._pending_approvals_for_submission(submission.id):
+                candidate = UndoCandidate.from_message(
+                    submission.text,
+                    user_message,
+                    pending_attachment_tokens,
+                    submission.next_image_token,
+                    submission_id=submission.id,
+                )
+                self._approval_queue.append((user_message, candidate))
+                self._submissions.complete(submission)
+                self._dispatch_approval_queue()
+                return
             self._release_attachment_paths(tuple(pending_attachments))
             self._present_pending_approvals()
             self._submissions.complete(submission)
@@ -297,6 +348,7 @@ class SubmissionMixin:
                 user_message,
                 pending_attachment_tokens,
                 submission.next_image_token,
+                submission_id=submission.id,
             )
             self._queued.append((user_message, candidate))
             self._submissions.complete(submission)
@@ -306,33 +358,14 @@ class SubmissionMixin:
                 user_message,
                 pending_attachment_tokens,
                 submission.next_image_token,
+                submission_id=submission.id,
             )
             self._print_user(user_message)
             self._undo_candidate = candidate
             self._submissions.complete(submission)
-            self._start_turn(model_input, user_message=user_message)
-
-    def _restore_failed_submission(
-        self, submission: Submission, message: str
-    ) -> None:
-        """Show a slash error and return its captured composer state."""
-
-        self._print_system(message)
-        session = self._active_session or self._session
-        buffer = session.app.current_buffer if session is not None else None
-        if buffer is None or not buffer.text:
-            self._restore_composer(submission.text)
-            self._restore_pending_attachment_state(
-                submission.attachment_paths,
-                submission.attachment_tokens,
-                submission.next_image_token,
+            self._start_turn(
+                model_input,
+                user_message=user_message,
+                submission_id=candidate.submission_id,
             )
-            self._draft.schedule(
-                submission.text,
-                attachment_tokens=dict(submission.attachment_tokens),
-                next_image_token=submission.next_image_token,
-            )
-        else:
-            self._release_attachment_paths(submission.attachment_paths)
-            self._draft.schedule(buffer.text)
-        self._submissions.complete(submission)
+            self._dispatch_approval_queue()

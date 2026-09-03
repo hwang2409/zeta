@@ -185,13 +185,15 @@ class TUIApp(
         self._spinner_reset = asyncio.Event()
         self._abort_requested = False
         self._macro_abort_signal = self._macro_call_id = None
-        self._inline_abort_signal = None
         self._inline_abort_signals = {}
+        self._approval_owners = {}
+        self._approval_queue = deque()
         self._macro_receipts = deque()
         self._input_loop_active = False
         self._preprocessing_task: asyncio.Task[None] | None = None
         self._preprocessing_tasks: dict[int, asyncio.Task[None]] = {}
         self._undo_pending: set[int] = set()
+        self._active_turn_submission_id: int | None = None
         self._resuming_tool = False
         self._session = session
         self._history_path = (
@@ -402,6 +404,7 @@ class TUIApp(
                 if resume_task is not None and self._active_task is resume_task:
                     self._active_task = None
         self._present_pending_approvals()
+        self._dispatch_approval_queue()
         return True
 
     def _prompt_style(self) -> Style:
@@ -588,11 +591,20 @@ class TUIApp(
 
     def _handle_tool_event(self, event: StreamEvent) -> bool:
         if event.type is StreamEventType.TOOL_APPROVAL_START:
+            if (
+                event.tool_call is not None
+                and self._active_turn_submission_id is not None
+            ):
+                self._approval_owners[event.tool_call.id] = (
+                    self._active_turn_submission_id
+                )
             self._reset_stream_state()
             self._loop_state = "approval"
             self._present_pending_approvals()
             return False
         if event.type is StreamEventType.TOOL_APPROVAL_END:
+            if event.tool_call is not None:
+                self._approval_owners.pop(event.tool_call.id, None)
             self._loop_state = "streaming"
             return False
         if event.type is StreamEventType.TOOL_EXECUTION_START:
@@ -830,6 +842,7 @@ class TUIApp(
                     except asyncio.CancelledError:
                         pass
                     self._active_task = None
+                    self._active_turn_submission_id = None
                     if self._queued:
                         self._start_queued_turn()
                 if prompt_task in done:
@@ -858,6 +871,8 @@ class TUIApp(
             self._preprocessing_tasks.clear()
             self._preprocessing_task = None
             self._inline_abort_signals.clear()
+            self._approval_owners.clear()
+            self._approval_queue.clear()
             self._undo_pending.clear()
 
     def _install_full_screen_layout(self, session: FullScreenPromptSession) -> None:
@@ -914,6 +929,7 @@ class TUIApp(
                     except asyncio.CancelledError:
                         pass
                     self._active_task = None
+                    self._active_turn_submission_id = None
                     if self._queued:
                         self._start_queued_turn()
 
@@ -942,6 +958,8 @@ class TUIApp(
             self._preprocessing_tasks.clear()
             self._preprocessing_task = None
             self._inline_abort_signals.clear()
+            self._approval_owners.clear()
+            self._approval_queue.clear()
             self._undo_pending.clear()
             if isinstance(session, FullScreenPromptSession):
                 session.restore_terminal()

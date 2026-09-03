@@ -612,6 +612,190 @@ async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
     assert backend.calls
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+async def test_inline_approval_queues_unrelated_submission(
+    tmp_path: Path, decision: str
+) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "inspect", "first !`printf first`")
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    backend = FakeBackend(
+        [ScriptedTurn(content=[TextContent("first reply")]),
+         ScriptedTurn(content=[TextContent("second reply")])]
+    )
+    app = TUIApp(
+        AgentLoop(backend, store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    app._input_loop_active = True
+
+    first_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
+    for _ in range(100):
+        if app.pending_approvals:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("inline shell approval did not appear")
+
+    await app._handle_prompt_value("second")
+    assert len(app._approval_queue) == 1
+    key = app.pending_approvals[0].key
+    await app._handle_prompt_value(f"{decision} {key}")
+    await first_task
+
+    first_preprocessing = next(iter(app._preprocessing_tasks.values()))
+    await first_preprocessing
+    await app._active_task
+    app._active_task = None
+    app._active_turn_submission_id = None
+    app._start_queued_turn()
+    await app._active_task
+
+    user_texts = [
+        next(
+            block.text
+            for message in reversed(messages)
+            if message.role.value == "user"
+            for block in message.content
+            if isinstance(block, TextContent) and block.path is None
+        )
+        for messages, _schemas in backend.calls
+    ]
+    assert user_texts == [
+        "first first" if decision == "approve" else "first [inline shell failed: denied]",
+        "second",
+    ]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_second_inline_submission_keeps_first_alive(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "first", "first !`printf first`")
+    _write_command(home / "commands", "second", "second !`printf second`")
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    app = TUIApp(
+        AgentLoop(backend, store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    app._input_loop_active = True
+
+    first_task = asyncio.create_task(app._handle_prompt_value("/first"))
+    for _ in range(100):
+        if app.pending_approvals:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("first inline shell approval did not appear")
+    second_task = asyncio.create_task(app._handle_prompt_value("/second"))
+    for _ in range(100):
+        if len(app.pending_approvals) == 2:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("second inline shell approval did not appear")
+
+    first_id, second_id = app._inline_abort_signals
+    app.undo_sent_turn()
+    assert not app._inline_abort_signals[first_id].is_set()
+    assert app._inline_abort_signals[second_id].is_set()
+    for _ in range(100):
+        if len(app.pending_approvals) == 1:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("undo did not close the second approval")
+
+    await app._handle_prompt_value(
+        f"approve {app.pending_approvals[0].key}"
+    )
+    await asyncio.gather(first_task, second_task)
+    await asyncio.gather(
+        *app._preprocessing_tasks.values(), return_exceptions=True
+    )
+    await app._active_task
+
+    user_message = next(
+        message
+        for message in backend.calls[0][0]
+        if message.role.value == "user"
+    )
+    assert user_message.content[0].text == "first first"
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_scoped_inline_abort_keeps_other_submission_alive(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "first", "first !`printf first`")
+    _write_command(home / "commands", "second", "second !`printf second`")
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    app = TUIApp(
+        AgentLoop(backend, store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=home,
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+    app._input_loop_active = True
+
+    first_task = asyncio.create_task(app._handle_prompt_value("/first"))
+    second_task = asyncio.create_task(app._handle_prompt_value("/second"))
+    for _ in range(100):
+        if len(app.pending_approvals) == 2:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("both inline shell approvals did not appear")
+
+    first_id, second_id = app._inline_abort_signals
+    app.abort_active(first_id)
+    assert app._inline_abort_signals[first_id].is_set()
+    assert not app._inline_abort_signals[second_id].is_set()
+    for _ in range(100):
+        if len(app.pending_approvals) == 1:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("scoped abort did not close the first approval")
+
+    await app._handle_prompt_value(
+        f"approve {app.pending_approvals[0].key}"
+    )
+    await asyncio.gather(first_task, second_task)
+    await asyncio.gather(
+        *app._preprocessing_tasks.values(), return_exceptions=True
+    )
+    await app._active_task
+
+    user_message = next(
+        message
+        for message in backend.calls[0][0]
+        if message.role.value == "user"
+    )
+    assert user_message.content[0].text == "second second"
+    await app.loop.close()
+
+
 async def test_inline_shell_abort_stops_before_provider_dispatch(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write_command(home / "commands", "inspect", "value !`sleep 30`")
@@ -630,7 +814,7 @@ async def test_inline_shell_abort_stops_before_provider_dispatch(tmp_path: Path)
 
     submission_task = asyncio.create_task(app._handle_prompt_value("/inspect"))
     for _ in range(100):
-        if app._inline_abort_signal is not None:
+        if app._inline_abort_signals:
             break
         await asyncio.sleep(0.01)
     else:

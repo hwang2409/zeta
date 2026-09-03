@@ -239,6 +239,7 @@ class UndoCandidate:
     attachment_paths: tuple[Path, ...] = ()
     attachment_tokens: tuple[tuple[str, Path], ...] = ()
     next_image_token: int = 1
+    submission_id: int | None = None
 
     @classmethod
     def from_message(
@@ -247,6 +248,8 @@ class UndoCandidate:
         message: Message,
         attachment_tokens: Mapping[str, Path],
         next_image_token: int,
+        *,
+        submission_id: int | None = None,
     ) -> UndoCandidate:
         paths = tuple(
             dict.fromkeys(
@@ -262,7 +265,7 @@ class UndoCandidate:
             for token, path in attachment_tokens.items()
             if path.resolve() in path_set
         )
-        return cls(text, paths, tokens, next_image_token)
+        return cls(text, paths, tokens, next_image_token, submission_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,20 +425,43 @@ end run
 class ComposerAttachmentMixin:
     """Attachment behavior shared by the TUI composition root."""
 
-    def abort_active(self) -> None:
-        if self._inline_abort_signals:
-            for signal in self._inline_abort_signals.values():
+    def abort_active(self, submission_id: int | None = None) -> None:
+        if submission_id is None:
+            signals = self._inline_abort_signals.values()
+            requests = self.pending_approvals
+        else:
+            signals = (
+                signal
+                for owner_id, signal in self._inline_abort_signals.items()
+                if owner_id == submission_id
+            )
+            requests = self._pending_approvals_for_submission(submission_id)
+        if self._inline_abort_signals or requests:
+            for signal in signals:
                 signal.abort()
-            for request in self.pending_approvals:
+            for request in requests:
                 self._abort_approval(request.key)
             self._invalidate_prompt()
-        if self._active_task is not None and not self._active_task.done():
+        active_task_is_owned = (
+            submission_id is None
+            or self._active_turn_submission_id == submission_id
+        )
+        if (
+            active_task_is_owned
+            and self._active_task is not None
+            and not self._active_task.done()
+        ):
             macro_running = self._macro_abort_signal is not None
             if macro_running:
                 self._abort_macro()
             else:
                 self.loop.abort()
-                for request in self.pending_approvals:
+                approval_requests = (
+                    self.pending_approvals
+                    if submission_id is None
+                    else requests
+                )
+                for request in approval_requests:
                     self._abort_approval(request.key)
                     self.loop.finalize_canceled(request.request_id)
             if macro_running or (
@@ -446,7 +472,7 @@ class ComposerAttachmentMixin:
                 self._active_task.cancel()
             self._loop_state = "interrupted"
             self._invalidate_prompt()
-        elif self.loop.background_children_running:
+        elif submission_id is None and self.loop.background_children_running:
             self.loop.abort()
             self._invalidate_prompt()
 
@@ -678,7 +704,22 @@ class ComposerAttachmentMixin:
     def undo_sent_turn(self) -> None:
         """Abort the current turn and restore its submitted text once."""
 
-        pending_submission = self._submissions.cancel_current()
+        candidate = self._undo_candidate
+        latest_submission = self._submissions.latest_active()
+        candidate_is_newer_active_turn = (
+            candidate is not None
+            and candidate.submission_id is not None
+            and self._active_turn_submission_id == candidate.submission_id
+            and (
+                latest_submission is None
+                or candidate.submission_id > latest_submission.id
+            )
+        )
+        pending_submission = (
+            None
+            if candidate_is_newer_active_turn
+            else self._submissions.cancel_current()
+        )
         if pending_submission is not None:
             preprocessing_task = self._preprocessing_tasks.get(pending_submission.id)
             if preprocessing_task is not None and not preprocessing_task.done():
@@ -690,7 +731,6 @@ class ComposerAttachmentMixin:
             self._restore_pending_submission(pending_submission)
             return
 
-        candidate = self._undo_candidate
         if (
             candidate is None
             or not self.active
@@ -700,7 +740,7 @@ class ComposerAttachmentMixin:
             self._print_unit(Text("undo unavailable: turn already completed", style=DIM))
             return
         self._undo_candidate = None
-        self.abort_active()
+        self.abort_active(candidate.submission_id)
         session = self._active_session or self._session
         buffer = session.app.current_buffer if session is not None else None
         if buffer is not None and buffer.text:
@@ -751,7 +791,11 @@ class ComposerAttachmentMixin:
         self._print_user(user_message)
         self._print(Text("[queued]", style="dim"))
         self._undo_candidate = candidate
-        self._start_turn(user_text, user_message=user_message)
+        self._start_turn(
+            user_text,
+            user_message=user_message,
+            submission_id=candidate.submission_id,
+        )
 
     def _consume_macro_receipts(
         self, user_text: str, user_message: Message | None
@@ -777,8 +821,10 @@ class ComposerAttachmentMixin:
         *,
         user_message: Message | None = None,
         persist_user_message: bool = True,
+        submission_id: int | None = None,
     ) -> None:
         self._loop_state = "streaming"
+        self._active_turn_submission_id = submission_id
         self._active_task = asyncio.create_task(
             self._consume_turn(
                 user_text,

@@ -26,8 +26,6 @@ class CommandRuntimeMixin:
         if signal is None:
             signal = self.loop.tool_registry.abort_signal.registry.new_generation()
             self._inline_abort_signals[submission_id] = signal
-        self._inline_abort_signal = signal
-
         def lifecycle_sink(kind: str, call: ToolCall) -> None:
             event_type = {
                 "approval_start": StreamEventType.TOOL_APPROVAL_START,
@@ -43,7 +41,10 @@ class CommandRuntimeMixin:
                 )
             )
             if kind == "approval_start":
+                self._approval_owners[call.id] = submission_id
                 asyncio.get_running_loop().call_soon(self._present_pending_approvals)
+            elif kind == "approval_end":
+                self._approval_owners.pop(call.id, None)
             self._invalidate_prompt()
 
         try:
@@ -56,10 +57,6 @@ class CommandRuntimeMixin:
             return InlineShellResult(outputs, canceled=signal.is_set())
         finally:
             self._inline_abort_signals.pop(submission_id, None)
-            if self._inline_abort_signal is signal:
-                self._inline_abort_signal = next(
-                    reversed(tuple(self._inline_abort_signals.values())), None
-                )
 
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str:
         """Run one custom shell macro through the normal exec safety path."""
