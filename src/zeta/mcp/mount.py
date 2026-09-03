@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ..tools.registry import ToolRegistry
-from .client import MCPClient, MCPTool
+from .client import MCPClient, MCPPrompt, MCPTool
 from .config import MCPConfig, MCPConfigError, MCPServerConfig, load_mcp_config
 from .http import StreamableHTTPMCPClient
 from .server_actor import (
@@ -68,6 +68,7 @@ class MCPMount:
         self._removal_tasks: set[asyncio.Task[None]] = set()
         self._config_lock = asyncio.Lock()
         self._schema_refresh: Callable[[MCPMount], None] | None = None
+        self._prompt_refresh: Callable[[MCPMount], None] | None = None
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
 
@@ -79,6 +80,38 @@ class MCPMount:
             self._clients[name]
             for name in self.configs
             if name in self._clients
+        )
+
+    @property
+    def prompt_entries(self) -> tuple[tuple[str, str, MCPPrompt], ...]:
+        """Return live prompt commands in configured server order."""
+
+        entries: list[tuple[str, str, MCPPrompt]] = []
+        for name in self.configs:
+            actor = self._actors.get(name)
+            if actor is None:
+                continue
+            for prompt in actor.prompts:
+                entries.append((f"{name}:{prompt.name}", name, prompt))
+        return tuple(entries)
+
+    async def get_prompt(self, name: str, arguments: dict[str, str]) -> str:
+        server, separator, prompt_name = name.partition(":")
+        if not separator or not server or not prompt_name:
+            raise ValueError(f"unknown MCP prompt: {name}")
+        actor = self._actors.get(server)
+        if actor is None:
+            raise ValueError(f"unknown MCP prompt: {name}")
+        prompt = next(
+            (candidate for candidate in actor.prompts if candidate.name == prompt_name),
+            None,
+        )
+        if prompt is None:
+            raise ValueError(f"unknown MCP prompt: {name}")
+        return await actor.get_prompt(
+            prompt.name,
+            arguments,
+            generation=actor.generation,
         )
 
     @property
@@ -276,6 +309,12 @@ class MCPMount:
         self._schema_refresh = callback
         callback(self)
 
+    def set_prompt_refresh(self, callback: Callable[[MCPMount], None]) -> None:
+        """Bind the owner of slash prompt commands after initial setup."""
+
+        self._prompt_refresh = callback
+        callback(self)
+
     def _make_actor(
         self,
         config: MCPServerConfig,
@@ -313,6 +352,8 @@ class MCPMount:
     def _refresh_schemas(self) -> None:
         if self._schema_refresh is not None:
             self._schema_refresh(self)
+        if self._prompt_refresh is not None:
+            self._prompt_refresh(self)
 
 async def mount_mcp_servers(
     registry: ToolRegistry,

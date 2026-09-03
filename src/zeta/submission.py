@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
 
+from .core.slash import SlashModelInput
 from .tui.composer import UndoCandidate, parse_input
 
 
@@ -123,6 +124,11 @@ class SubmissionMixin:
     async def slash_mcp(self, args: str) -> str:
         return await self.loop.slash_mcp(args)
 
+    async def slash_mcp_prompt(
+        self, name: str, arguments: dict[str, str]
+    ) -> str:
+        return await self.loop.slash_mcp_prompt(name, arguments)
+
     def _submit_input(self, value: str) -> None:
         draft_revision = self._draft.mark_submitted()
         paths, tokens, next_image_token = self._capture_pending_attachment_state()
@@ -171,11 +177,14 @@ class SubmissionMixin:
         if self._submissions.is_cancelled(submission):
             self._submissions.complete(submission)
             return
+        await self.loop.ensure_mcp_servers()
         slash_output = await self._slash_commands.dispatch_async(self, parsed)
         if self._submissions.is_cancelled(submission):
             self._submissions.complete(submission)
             return
-        if slash_output is not None:
+        if isinstance(slash_output, SlashModelInput):
+            model_input = slash_output.text
+        elif slash_output is not None:
             self._release_attachment_paths(submission.attachment_paths)
             self._submissions.complete(submission)
             self._record_prompt(parsed, submission.draft_revision)
@@ -186,7 +195,8 @@ class SubmissionMixin:
             elif slash_output:
                 self._print_system(slash_output)
             return
-        model_input = self._slash_commands.input_for_model(parsed)
+        else:
+            model_input = self._slash_commands.input_for_model(parsed)
         pending_attachments = list(submission.attachment_paths)
         pending_attachment_tokens = dict(submission.attachment_tokens)
         user_message = self._prepare_user_message(

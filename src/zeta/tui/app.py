@@ -208,6 +208,9 @@ class TUIApp(
         self._model_catalog_loaded = self._model_catalog is not None
         self._model_catalog_task: asyncio.Task[None] | None = None
         self._slash_commands = create_slash_registry(zeta_home=Path(zeta_home).resolve() if zeta_home is not None else None, project_dir=discover_repo_root(Path(self.loop.store.cwd)))
+        self.loop.set_mcp_prompt_refresh(
+            lambda mount: self._slash_commands.set_mcp_prompts(mount.prompt_entries)
+        )
         self._compaction_shown = False
         self._turn_had_visible_output = False
         self._failed_turn: tuple[str, Message] | None = None
@@ -856,6 +859,7 @@ class TUIApp(
         if isinstance(session, FullScreenPromptSession):
             self._install_full_screen_layout(session)
         self.loop.session_start()
+        await self.loop.ensure_mcp_servers()
         self._rebuild_transcript()
         for notice in self._slash_commands.notices:
             style = COMMAND if notice in self._slash_commands.warning_notices else DIM

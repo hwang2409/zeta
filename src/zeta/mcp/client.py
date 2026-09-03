@@ -55,15 +55,36 @@ class MCPTool:
         object.__setattr__(self, "input_schema", dict(input_schema))
 
 
+@dataclass(frozen=True, slots=True)
+class MCPPromptArgument:
+    name: str
+    description: str = ""
+    required: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class MCPPrompt:
+    name: str
+    description: str = ""
+    arguments: tuple[MCPPromptArgument, ...] = ()
+
+
 class MCPClient(Protocol):
     config: MCPServerConfig
     protocol_version: str | None
+    capabilities: dict[str, object]
 
     async def connect(self) -> None:
         """Open the transport and complete initialize."""
 
     async def list_tools(self) -> list[MCPTool]:
         """Discover tools exposed by the server."""
+
+    async def list_prompts(self) -> list[MCPPrompt]:
+        """Discover prompts exposed by the server."""
+
+    async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:
+        """Resolve one prompt into user-facing text."""
 
     async def call_tool(
         self,
@@ -194,17 +215,93 @@ def tools_from_result(value: Mapping[str, object]) -> list[MCPTool]:
     return tools
 
 
+def prompts_from_result(value: Mapping[str, object]) -> list[MCPPrompt]:
+    raw_prompts = value.get("prompts")
+    if type(raw_prompts) is not list:
+        raise MCPProtocolError("MCP prompts/list result must contain prompts")
+    prompts: list[MCPPrompt] = []
+    for item in raw_prompts:
+        if type(item) is not dict:
+            raise MCPProtocolError("MCP prompt declaration must be an object")
+        name = item.get("name")
+        description = item.get("description", "")
+        raw_arguments = item.get("arguments", [])
+        if type(name) is not str or not name:
+            raise MCPProtocolError("MCP prompt name must be a nonempty string")
+        if type(description) is not str:
+            description = ""
+        if type(raw_arguments) is not list:
+            raise MCPProtocolError(f"MCP prompt {name} arguments must be an array")
+        arguments: list[MCPPromptArgument] = []
+        for argument in raw_arguments:
+            if type(argument) is not dict:
+                raise MCPProtocolError(
+                    f"MCP prompt {name} argument must be an object"
+                )
+            argument_name = argument.get("name")
+            argument_description = argument.get("description", "")
+            required = argument.get("required", False)
+            if type(argument_name) is not str or not argument_name:
+                raise MCPProtocolError(
+                    f"MCP prompt {name} argument name must be a nonempty string"
+                )
+            if type(argument_description) is not str:
+                argument_description = ""
+            if type(required) is not bool:
+                raise MCPProtocolError(
+                    f"MCP prompt {name} argument {argument_name} required must be boolean"
+                )
+            arguments.append(
+                MCPPromptArgument(argument_name, argument_description, required)
+            )
+        prompts.append(MCPPrompt(name, description, tuple(arguments)))
+    return prompts
+
+
+def prompt_text_from_result(value: Mapping[str, object]) -> str:
+    messages = value.get("messages")
+    if messages is None and value.get("isError") is True:
+        content = value.get("content")
+        if type(content) is list and content and type(content[0]) is dict:
+            message = content[0].get("text")
+            if type(message) is str:
+                raise MCPProtocolError(message)
+        raise MCPProtocolError("MCP prompts/get failed")
+    if type(messages) is not list:
+        raise MCPProtocolError("MCP prompts/get result must contain messages")
+    text: list[str] = []
+    for index, message in enumerate(messages):
+        if type(message) is not dict:
+            raise MCPProtocolError(f"MCP prompt message[{index}] must be an object")
+        content = message.get("content")
+        if type(content) is not dict or content.get("type") != "text":
+            raise MCPProtocolError(
+                f"MCP prompt message[{index}] content must be text"
+            )
+        message_text = content.get("text")
+        if type(message_text) is not str:
+            raise MCPProtocolError(
+                f"MCP prompt message[{index}] text must be a string"
+            )
+        text.append(message_text)
+    return "\n".join(text)
+
+
 __all__ = [
     "MCPCanceled",
     "MCPClient",
     "MCPError",
     "MCPHTTPError",
+    "MCPPrompt",
+    "MCPPromptArgument",
     "MCPProtocolError",
     "MCPTool",
     "canceled_result",
     "initialize_params",
     "make_error_result",
     "parse_rpc_response",
+    "prompt_text_from_result",
+    "prompts_from_result",
     "tools_from_result",
     "translate_call_result",
 ]

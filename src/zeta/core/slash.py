@@ -13,6 +13,7 @@ from typing import Protocol
 
 import yaml
 
+from ..mcp.client import MCPPrompt
 from ..types import Message, MessageRole, StreamEventType, TextContent
 from .store import ConversationEntry
 
@@ -58,6 +59,13 @@ class CustomCommand:
                 *(shlex.quote(value) for value in argv),
             )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class SlashModelInput:
+    """Resolved input that should start a model turn."""
+
+    text: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -638,6 +646,10 @@ class SlashSession(Protocol):
 
     async def slash_mcp(self, args: str) -> str: ...
 
+    async def slash_mcp_prompt(
+        self, name: str, arguments: dict[str, str]
+    ) -> str: ...
+
     def slash_model(self, args: str) -> str: ...
 
     def slash_vim(self, args: str) -> str: ...
@@ -655,7 +667,7 @@ class SlashSession(Protocol):
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str: ...
 
 
-SlashResult = str | Awaitable[str]
+SlashResult = str | SlashModelInput | Awaitable[str | SlashModelInput]
 SlashHandler = Callable[[SlashSession, str], SlashResult]
 
 
@@ -677,6 +689,7 @@ class SlashCommandRegistry:
     def __init__(self) -> None:
         self._commands: dict[str, SlashCommand] = {}
         self._custom_commands: dict[str, CustomCommand] = {}
+        self._mcp_prompts: dict[str, tuple[str, MCPPrompt]] = {}
         self._notices: list[str] = []
         self._warning_notices: set[str] = set()
 
@@ -717,7 +730,28 @@ class SlashCommandRegistry:
             (command.name, command.description, command.source)
             for command in self.custom_commands
         )
-        return builtins + custom
+        prompts = tuple(
+            (name, prompt.description, server)
+            for name, (server, prompt) in self._mcp_prompts.items()
+        )
+        return builtins + custom + prompts
+
+    def set_mcp_prompts(
+        self, entries: Sequence[tuple[str, str, MCPPrompt]]
+    ) -> None:
+        """Replace live MCP prompt commands from one mount snapshot."""
+        prompts: dict[str, tuple[str, MCPPrompt]] = {}
+        for name, server, prompt in entries:
+            if name.count(":") != 1 or any(
+                character.isspace() for character in name
+            ):
+                notice = f"ignored MCP prompt with invalid name /{name}"
+                if notice not in self._notices:
+                    self._notices.append(notice)
+                    self._warning_notices.add(notice)
+                continue
+            prompts[name] = (server, prompt)
+        self._mcp_prompts = prompts
 
     def register_custom(self, command: CustomCommand) -> None:
         """Register a custom command unless a built-in owns its name."""
@@ -726,6 +760,14 @@ class SlashCommandRegistry:
             notice = (
                 f"ignored custom command {command.path}: "
                 f"shadows built-in /{command.name}"
+            )
+            self._notices.append(notice)
+            self._warning_notices.add(notice)
+            return
+        if ":" in command.name:
+            notice = (
+                f"ignored custom command {command.path}: "
+                "colon names are reserved for MCP prompts"
             )
             self._notices.append(notice)
             self._warning_notices.add(notice)
@@ -747,6 +789,12 @@ class SlashCommandRegistry:
         if command is not None:
             return command.run(session, parts[1] if len(parts) == 2 else "")
         custom = self._custom_commands.get(parts[0])
+        prompt = self._mcp_prompts.get(parts[0])
+        if prompt is not None:
+            arguments = _prompt_arguments(parts[0], prompt[1], parts[1] if len(parts) == 2 else "")
+            if isinstance(arguments, str):
+                return arguments
+            return _run_mcp_prompt(session, parts[0], arguments)
         if custom is None or custom.kind != "exec":
             return None
         return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
@@ -756,7 +804,9 @@ class SlashCommandRegistry:
 
         return self._dispatch(session, value)
 
-    async def dispatch_async(self, session: SlashSession, value: str) -> str | None:
+    async def dispatch_async(
+        self, session: SlashSession, value: str
+    ) -> str | SlashModelInput | None:
         """Run a known command, awaiting it when the command is asynchronous."""
 
         result = self._dispatch(session, value)
@@ -800,6 +850,63 @@ class SlashCommandRegistry:
                 f"  /{command.name}{kind}{description} (source: {command.path})"
             )
         return "\n".join(lines)
+
+
+def _prompt_arguments(
+    name: str,
+    prompt: MCPPrompt,
+    raw_arguments: str,
+) -> dict[str, str] | str:
+    declarations = prompt.arguments
+    if not declarations:
+        if raw_arguments.strip():
+            return f"mcp prompt error: /{name} does not accept arguments"
+        return {}
+    if len(declarations) == 1:
+        if not raw_arguments.strip():
+            if declarations[0].required:
+                return (
+                    f"mcp prompt error: /{name} missing required argument "
+                    f"'{declarations[0].name}'"
+                )
+            return {}
+        return {declarations[0].name: raw_arguments}
+    try:
+        values = shlex.split(raw_arguments)
+    except ValueError as exc:
+        return f"mcp prompt error: {exc}"
+    if len(values) > len(declarations):
+        return (
+            f"mcp prompt error: /{name} accepts {len(declarations)} "
+            f"arguments, got {len(values)}"
+        )
+    arguments: dict[str, str] = {}
+    for index, declaration in enumerate(declarations):
+        if index >= len(values):
+            if declaration.required:
+                return (
+                    f"mcp prompt error: /{name} missing required argument "
+                    f"'{declaration.name}'"
+                )
+            continue
+        if not values[index] and declaration.required:
+            return (
+                f"mcp prompt error: /{name} missing required argument "
+                f"'{declaration.name}'"
+            )
+        arguments[declaration.name] = values[index]
+    return arguments
+
+
+async def _run_mcp_prompt(
+    session: SlashSession,
+    name: str,
+    arguments: dict[str, str],
+) -> SlashModelInput | str:
+    try:
+        return SlashModelInput(await session.slash_mcp_prompt(name, arguments))
+    except Exception as exc:  # noqa: BLE001 - composer gets a loud error
+        return f"mcp prompt error: {exc}"
 
 
 def _format_status(status: SlashStatus) -> str:

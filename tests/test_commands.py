@@ -3,6 +3,7 @@ import subprocess
 from io import StringIO
 from pathlib import Path
 
+import pytest
 from prompt_toolkit import PromptSession
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import CompleteEvent
@@ -17,11 +18,13 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.slash import (
     COMMAND_FILE_SIZE_LIMIT,
     CustomCommand,
+    SlashModelInput,
     create_slash_registry,
     load_custom_commands,
 )
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
+from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.tools import ToolRegistry
 from zeta.tools.exec import MacroDisplay, run_exec_macro
 from zeta.tui.app import TUIApp
@@ -129,6 +132,88 @@ def test_completion_applies_to_a_real_buffer(tmp_path: Path) -> None:
     buffer.apply_completion(completion)
 
     assert buffer.text == "/review"
+
+
+@pytest.mark.asyncio
+async def test_mcp_prompt_completion_and_resolution() -> None:
+    registry = create_slash_registry(
+        zeta_home=Path("/does/not/exist"),
+        project_dir=Path("/does/not/exist"),
+    )
+    registry.set_mcp_prompts(
+        [
+            (
+                "server:review",
+                "server",
+                MCPPrompt(
+                    "review",
+                    "review code",
+                    (MCPPromptArgument("topic", required=True),),
+                ),
+            )
+        ]
+    )
+
+    class Session:
+        async def slash_mcp_prompt(
+            self, name: str, arguments: dict[str, str]
+        ) -> str:
+            assert name == "server:review"
+            return f"resolved {arguments['topic']}"
+
+    completions = list(
+        SlashCompleter(registry).get_completions(
+            Document("/server:rev"), CompleteEvent(completion_requested=True)
+        )
+    )
+    result = await registry.dispatch_async(Session(), "/server:review tests")
+
+    assert completions[0].display_meta[0][1] == "[server] review code"
+    assert isinstance(result, SlashModelInput)
+    assert result.text == "resolved tests"
+
+
+@pytest.mark.asyncio
+async def test_mcp_prompt_missing_required_argument_does_not_call_session() -> None:
+    registry = create_slash_registry(
+        zeta_home=Path("/does/not/exist"),
+        project_dir=Path("/does/not/exist"),
+    )
+    registry.set_mcp_prompts(
+        [
+            (
+                "server:review",
+                "server",
+                MCPPrompt(
+                    "review",
+                    "review code",
+                    (MCPPromptArgument("topic", required=True),),
+                ),
+            )
+        ]
+    )
+
+    class Session:
+        async def slash_mcp_prompt(
+            self, name: str, arguments: dict[str, str]
+        ) -> str:
+            raise AssertionError("missing argument made a remote call")
+
+    result = await registry.dispatch_async(Session(), "/server:review")
+
+    assert isinstance(result, str)
+    assert "missing required argument" in result
+
+
+def test_custom_colon_name_is_rejected_for_mcp_namespace(tmp_path: Path) -> None:
+    _write_command(tmp_path / "commands", "user:prompt", "body")
+
+    registry = create_slash_registry(
+        zeta_home=tmp_path, project_dir=tmp_path / "project"
+    )
+
+    assert all(command.name != "user:prompt" for command in registry.custom_commands)
+    assert any("colon names" in notice for notice in registry.notices)
 
 
 async def test_completion_menu_arrows_do_not_navigate_history(tmp_path: Path) -> None:

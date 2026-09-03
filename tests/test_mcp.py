@@ -15,10 +15,12 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.mcp import (
+    MCPClient,
     MCPConfig,
     MCPConfigError,
-    MCPClient,
     MCPMount,
+    MCPPrompt,
+    MCPPromptArgument,
     MCPServerConfig,
     MCPTool,
     StdioMCPClient,
@@ -210,6 +212,30 @@ class _ListedClient(_LifecycleClient):
 
     async def list_tools(self) -> list[MCPTool]:
         return self.tools
+
+
+class _PromptClient(_ListedClient):
+    def __init__(
+        self,
+        config: MCPServerConfig,
+        prompts: list[MCPPrompt],
+        *,
+        fail_list: bool = False,
+    ) -> None:
+        super().__init__(config, [])
+        self.capabilities = {"prompts": {}}
+        self.prompts = prompts
+        self.prompt_calls: list[tuple[str, dict[str, str]]] = []
+        self.fail_list = fail_list
+
+    async def list_prompts(self) -> list[MCPPrompt]:
+        if self.fail_list:
+            raise RuntimeError("prompt list failed")
+        return self.prompts
+
+    async def get_prompt(self, name: str, arguments: dict[str, str]) -> str:
+        self.prompt_calls.append((name, arguments))
+        return f"resolved {arguments['topic']}"
 
 
 class _CallTrackingClient(_ListedClient):
@@ -572,6 +598,56 @@ async def test_mount_registers_prefixed_tool(tmp_path: Path, monkeypatch: pytest
     result = await registry.execute(ToolCall("call", "fake:echo", {"value": "mounted"}))
     assert result["content"][0]["text"] == "mounted"
     assert registry.schemas[0]["parameters"]["$defs"] == {"value": {"type": "string"}}
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mount_discovers_and_resolves_prompts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("fake", "stdio", "unused")
+    client = _PromptClient(
+        config,
+        [
+            MCPPrompt(
+                "review",
+                "review code",
+                (MCPPromptArgument("topic", required=True),),
+            )
+        ],
+    )
+    monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"fake": config})
+    )
+
+    assert mount.prompt_entries[0][0:2] == ("fake:review", "fake")
+    assert await mount.get_prompt("fake:review", {"topic": "tests"}) == (
+        "resolved tests"
+    )
+    assert client.prompt_calls == [("review", {"topic": "tests"})]
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_prompt_list_failure_keeps_tools_and_notifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("fake", "stdio", "unused")
+    client = _PromptClient(config, [], fail_list=True)
+    monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
+    notices: list[str] = []
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(tmp_path / "mcp.json", {"fake": config}),
+        notice_sink=notices.append,
+    )
+
+    assert mount.statuses["fake"].state == "mounted"
+    assert mount.prompt_entries == ()
+    assert any("prompts unavailable" in notice for notice in notices)
     await mount.close()
 
 

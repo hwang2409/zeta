@@ -15,12 +15,15 @@ from .client import (
     MCPClient,
     MCPError,
     MCPHTTPError,
+    MCPPrompt,
     MCPProtocolError,
     MCPTool,
     canceled_result,
     initialize_params,
     make_error_result,
     parse_rpc_response,
+    prompt_text_from_result,
+    prompts_from_result,
     tools_from_result,
     translate_call_result,
 )
@@ -37,6 +40,7 @@ class StreamableHTTPMCPClient(MCPClient):
         self._owns_client = client is None
         self._session_id: str | None = None
         self.protocol_version: str | None = None
+        self.capabilities: dict[str, object] = {}
         self._next_id = 0
         self._closed = False
         self._failure_sink: Callable[[str], None] | None = None
@@ -52,6 +56,8 @@ class StreamableHTTPMCPClient(MCPClient):
         if type(protocol_version) is not str or not protocol_version:
             raise MCPProtocolError("MCP initialize response omitted protocolVersion")
         self.protocol_version = protocol_version
+        capabilities = result.get("capabilities", {})
+        self.capabilities = dict(capabilities) if type(capabilities) is dict else {}
         await self._send_notification("notifications/initialized", {})
 
     async def list_tools(self) -> list[MCPTool]:
@@ -69,6 +75,33 @@ class StreamableHTTPMCPClient(MCPClient):
             if next_cursor == cursor:
                 raise MCPProtocolError("MCP tools/list cursor did not advance")
             cursor = next_cursor
+
+    async def list_prompts(self) -> list[MCPPrompt]:
+        prompts: list[MCPPrompt] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, object] = {}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await self._request("prompts/list", params)
+            prompts.extend(prompts_from_result(result))
+            next_cursor = result.get("nextCursor")
+            if type(next_cursor) is not str or not next_cursor:
+                return prompts
+            if next_cursor == cursor:
+                raise MCPProtocolError("MCP prompts/list cursor did not advance")
+            cursor = next_cursor
+
+    async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:
+        try:
+            result = await self._request(
+                "prompts/get", {"name": name, "arguments": dict(arguments)}
+            )
+            return prompt_text_from_result(result)
+        except Exception as exc:
+            if self._failure_sink is not None:
+                self._failure_sink(str(exc))
+            raise
 
     async def call_tool(self, name: str, arguments: Mapping[str, object], abort_signal: AbortSignal):
         try:
