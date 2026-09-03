@@ -29,7 +29,13 @@ class MCPHTTPError(MCPError):
     """Raised for an unsuccessful streamable-http response."""
 
     def __init__(self, status_code: int, detail: str) -> None:
-        super().__init__(f"MCP HTTP {status_code}: {detail}")
+        if status_code == 401:
+            message = f"MCP HTTP 401: bearer token rejected by MCP server: {detail}"
+        elif status_code == 0:
+            message = f"MCP HTTP 0: MCP connection failed: {detail}"
+        else:
+            message = f"MCP HTTP {status_code}: {detail}"
+        super().__init__(message)
         self.status_code = status_code
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -12,7 +14,7 @@ from typing import Literal
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..types import StructuredToolResult
-from .client import MCPClient, MCPError, MCPTool
+from .client import MCPClient, MCPError, MCPTool, make_error_result
 from .config import (
     MCPConfig,
     MCPConfigError,
@@ -26,8 +28,15 @@ from .stdio import StdioMCPClient
 logger = logging.getLogger(__name__)
 # One quiet server cannot hold session startup longer than this bound.
 SERVER_SETUP_TIMEOUT_SECONDS = 10.0
+AUTO_RECONNECT_BASE_DELAY_SECONDS = 1.0
+AUTO_RECONNECT_MAX_DELAY_SECONDS = 30.0
 MCPServerState = Literal[
-    "mounted", "failed", "skipped-missing-env", "timed-out", "malformed"
+    "mounted",
+    "degraded",
+    "failed",
+    "skipped-missing-env",
+    "timed-out",
+    "malformed",
 ]
 
 
@@ -41,6 +50,7 @@ class MCPServerStatus:
     tool_count: int = 0
     reason: str | None = None
     stderr_log_path: str = ""
+    next_retry_at: float | None = None
 
 
 NoticeSink = Callable[[str], None]
@@ -63,6 +73,10 @@ class MCPMount:
     sources: dict[str, Path]
     _clients: dict[str, MCPClient] = field(default_factory=dict)
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    _auto_remount_tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    _failure_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
+    _failure_reasons: dict[int, str] = field(default_factory=dict)
+    _failure_counts: dict[str, int] = field(default_factory=dict)
     _config_lock: asyncio.Lock = field(init=False)
     _schema_refresh: Callable[[MCPMount], None] | None = None
     _closed: bool = False
@@ -74,6 +88,10 @@ class MCPMount:
         statuses: dict[str, MCPServerStatus] | None = None,
         _clients: dict[str, MCPClient] | None = None,
         _locks: dict[str, asyncio.Lock] | None = None,
+        _auto_remount_tasks: dict[str, asyncio.Task[None]] | None = None,
+        _failure_tasks: dict[int, asyncio.Task[None]] | None = None,
+        _failure_reasons: dict[int, str] | None = None,
+        _failure_counts: dict[str, int] | None = None,
         _schema_refresh: Callable[[MCPMount], None] | None = None,
         _closed: bool = False,
         sources: dict[str, Path] | None = None,
@@ -95,6 +113,10 @@ class MCPMount:
         self._locks = _locks or {
             name: asyncio.Lock() for name in server_configs
         }
+        self._auto_remount_tasks = _auto_remount_tasks or {}
+        self._failure_tasks = _failure_tasks or {}
+        self._failure_reasons = _failure_reasons or {}
+        self._failure_counts = _failure_counts or {}
         self._config_lock = asyncio.Lock()
         self._schema_refresh = _schema_refresh
         self._closed = _closed
@@ -109,7 +131,7 @@ class MCPMount:
     def summary(self) -> str:
         mounted = sum(status.state == "mounted" for status in self.statuses.values())
         failed = sum(
-            status.state in {"failed", "timed-out", "malformed"}
+            status.state in {"degraded", "failed", "timed-out", "malformed"}
             for status in self.statuses.values()
         )
         return f"mcp: {mounted} mounted, {failed} failed"
@@ -123,6 +145,8 @@ class MCPMount:
             )
             if status.reason:
                 line += f" | reason: {status.reason}"
+            if status.state == "degraded":
+                line += f" | next retry: {_retry_text(status.next_retry_at)}"
             lines.append(line)
         return "\n".join(lines)
 
@@ -302,6 +326,11 @@ class MCPMount:
         if self._closed:
             return
         self._closed = True
+        auto_tasks = tuple(self._auto_remount_tasks.values())
+        for task in auto_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*auto_tasks, return_exceptions=True)
         for name in tuple(set(self.configs) | set(self._clients)):
             lock = self._locks.setdefault(name, asyncio.Lock())
             async with lock:
@@ -341,6 +370,8 @@ class MCPMount:
         state: MCPServerState | None = None,
         reason: str | None = None,
         tools: tuple[MCPTool, ...] = (),
+        next_retry_at: float | None = None,
+        failure_count: int = 0,
         allow_closed: bool = False,
         remove_config: bool = False,
         remove_source: bool = False,
@@ -369,9 +400,28 @@ class MCPMount:
                 state="mounted",
                 tool_count=len(tools),
                 reason=None,
+                next_retry_at=None,
             )
+            self._failure_counts.pop(name, None)
             for tool in tools:
                 _register_tool(self.registry, client, tool, mount=self)
+        elif state == "degraded":
+            if client is not None and current is not client:
+                return False
+            previous = self.statuses.get(name) or MCPServerStatus(
+                name,
+                self.configs[name].transport,
+                "degraded",
+            )
+            self.statuses[name] = replace(
+                previous,
+                state="degraded",
+                reason=reason,
+                next_retry_at=next_retry_at,
+            )
+            if current is not None and current is client:
+                self._clients.pop(name, None)
+            self._failure_counts[name] = failure_count
         elif state is None and client is not None and current is None:
             self._clients[name] = client
             self._attach_failure_handler(name, client)
@@ -390,7 +440,10 @@ class MCPMount:
                     state=state,
                     tool_count=0,
                     reason=reason,
+                    next_retry_at=next_retry_at,
                 )
+                if state != "degraded":
+                    self._failure_counts.pop(name, None)
         if remove_config:
             self.configs.pop(name, None)
             self.statuses.pop(name, None)
@@ -414,10 +467,164 @@ class MCPMount:
             set_failure_sink(lambda reason: self._mark_failed(name, client, reason))
 
     def _mark_failed(self, name: str, client: MCPClient, reason: str) -> None:
-        if self._clients.get(name) is not client:
-            return
-        if self._transition(name, client=client, state="failed", reason=reason):
-            asyncio.create_task(_close_failed_client(client))
+        self._failure_reasons[id(client)] = reason
+        task = asyncio.create_task(self._degrade_client(name, client, reason))
+        self._failure_tasks[id(client)] = task
+
+    async def _degrade_client(
+        self, name: str, client: MCPClient, reason: str
+    ) -> None:
+        lock = self._locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            current = self._clients.get(name)
+            if current is not client or name not in self.configs:
+                return
+            self._failure_reasons.pop(id(client), None)
+            self._transition(
+                name,
+                client=client,
+                state="degraded",
+                reason=reason,
+                next_retry_at=time.monotonic(),
+                failure_count=self._failure_counts.get(name, 0),
+            )
+        await _close_failed_client(client)
+
+    async def _wait_for_failure(self, client: MCPClient) -> None:
+        task = self._failure_tasks.get(id(client))
+        if task is not None:
+            await asyncio.shield(task)
+
+    async def call_tool(
+        self,
+        server_name: str,
+        tool_name: str,
+        arguments: dict[str, object],
+        abort_signal: AbortSignal,
+    ) -> StructuredToolResult:
+        """Call one tool while coordinating degradation and remounts."""
+
+        lock = self._locks.setdefault(server_name, asyncio.Lock())
+        auto_task: asyncio.Task[None] | None = None
+        started_auto_remount = False
+        async with lock:
+            status = self.statuses.get(server_name)
+            client = self._clients.get(server_name)
+            if status is not None and status.state == "mounted" and client is not None:
+                pass
+            elif status is None or status.state != "degraded":
+                return make_error_result(
+                    f"MCP server '{server_name}' is unavailable. "
+                    f"Use /mcp reconnect {server_name}."
+                )
+            else:
+                auto_task = self._auto_remount_tasks.get(server_name)
+                if auto_task is None or auto_task.done():
+                    if auto_task is not None:
+                        self._auto_remount_tasks.pop(server_name, None)
+                    retry_at = status.next_retry_at
+                    if retry_at is not None and time.monotonic() < retry_at:
+                        return _degraded_result(server_name, status)
+                    auto_task = asyncio.create_task(self._auto_remount(server_name))
+                    self._auto_remount_tasks[server_name] = auto_task
+                    started_auto_remount = True
+                else:
+                    return _degraded_result(server_name, status)
+        if client is not None and status is not None and status.state == "mounted":
+            return await self._call_mounted_tool(
+                server_name, client, tool_name, arguments, abort_signal
+            )
+        if not started_auto_remount or auto_task is None:
+            return _degraded_result(server_name, status)
+        await asyncio.shield(auto_task)
+        return await self._call_mounted_tool(
+            server_name, None, tool_name, arguments, abort_signal
+        )
+
+    async def _call_mounted_tool(
+        self,
+        server_name: str,
+        expected_client: MCPClient | None,
+        tool_name: str,
+        arguments: dict[str, object],
+        abort_signal: AbortSignal,
+    ) -> StructuredToolResult:
+        close_client: MCPClient | None = None
+        lock = self._locks.setdefault(server_name, asyncio.Lock())
+        async with lock:
+            status = self.statuses.get(server_name)
+            client = self._clients.get(server_name)
+            if (
+                status is None
+                or status.state != "mounted"
+                or client is None
+                or (expected_client is not None and client is not expected_client)
+            ):
+                return _degraded_result(server_name, status)
+            try:
+                result = await client.call_tool(tool_name, arguments, abort_signal)
+            except MCPError as exc:
+                self._mark_failed(server_name, client, _error_text(exc))
+                result = make_error_result(_error_text(exc))
+            except Exception as exc:  # noqa: BLE001 - transport adapters fail closed
+                self._mark_failed(server_name, client, _error_text(exc))
+                result = make_error_result(_error_text(exc))
+            pending_reason = self._failure_reasons.pop(id(client), None)
+            if pending_reason is not None:
+                self._transition(
+                    server_name,
+                    client=client,
+                    state="degraded",
+                    reason=pending_reason,
+                    next_retry_at=time.monotonic(),
+                    failure_count=self._failure_counts.get(server_name, 0),
+                )
+                close_client = client
+        await self._wait_for_failure(client)
+        if close_client is not None:
+            await _close_failed_client(close_client)
+        async with lock:
+            status = self.statuses.get(server_name)
+            if status is not None and status.state == "degraded":
+                return _degraded_result(server_name, status)
+        return result
+
+    async def _auto_remount(self, name: str) -> None:
+        lock = self._locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            config = self.configs.get(name)
+            status = self.statuses.get(name)
+            if config is None or status is None or status.state != "degraded":
+                return
+        setup = await _setup_server(config)
+        async with lock:
+            current_config = self.configs.get(name)
+            current_status = self.statuses.get(name)
+            if (
+                current_config is not config
+                or current_status is None
+                or current_status.state != "degraded"
+            ):
+                if setup.client is not None:
+                    await _close_failed_client(setup.client)
+                return
+            if setup.public.state == "mounted" and setup.client is not None:
+                self._transition(name, client=setup.client)
+                self._finish_setup(setup)
+                return
+            failure_count = self._failure_counts.get(name, 0) + 1
+            delay = min(
+                AUTO_RECONNECT_MAX_DELAY_SECONDS,
+                AUTO_RECONNECT_BASE_DELAY_SECONDS * 2 ** (failure_count - 1),
+            )
+            self._transition(
+                name,
+                client=None,
+                state="degraded",
+                reason=setup.public.reason or "automatic remount failed",
+                next_retry_at=time.monotonic() + delay,
+                failure_count=failure_count,
+            )
 
 
 async def mount_mcp_servers(
@@ -564,6 +771,29 @@ def _error_text(error: BaseException) -> str:
         return type(error).__name__
 
 
+def _retry_text(retry_at: float | None) -> str:
+    if retry_at is None:
+        return "when backoff expires"
+    remaining = retry_at - time.monotonic()
+    if remaining <= 0:
+        return "now"
+    return f"in {math.ceil(remaining * 10) / 10:.1f}s"
+
+
+def _degraded_result(
+    name: str, status: MCPServerStatus | None
+) -> StructuredToolResult:
+    reason = (
+        status.reason
+        if status is not None and status.reason
+        else "transport failure"
+    )
+    return make_error_result(
+        f"MCP server '{name}' is degraded: {reason}. "
+        f"Use /mcp reconnect {name}."
+    )
+
+
 def _build_client(config: MCPServerConfig) -> MCPClient:
     if config.transport == "stdio":
         return StdioMCPClient(config)
@@ -594,12 +824,12 @@ def _register_tool(
     async def handler(
         arguments: dict[str, object], abort_signal: AbortSignal
     ) -> StructuredToolResult:
-        try:
-            result = await client.call_tool(tool.name, arguments, abort_signal)
-        except MCPError as exc:
-            mount._mark_failed(client.config.name, client, _error_text(exc))
-            raise
-        return result
+        return await mount.call_tool(
+            client.config.name,
+            tool.name,
+            arguments,
+            abort_signal,
+        )
 
     try:
         registry.register(
