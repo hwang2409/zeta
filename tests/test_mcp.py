@@ -183,6 +183,35 @@ class _LifecycleClient(_FakeClient):
         self.closed = True
 
 
+class _BlockingCallClient(_LifecycleClient):
+    def __init__(
+        self,
+        config: MCPServerConfig,
+        call_started: asyncio.Event,
+        release_call: asyncio.Event,
+    ) -> None:
+        super().__init__(config)
+        self.call_started = call_started
+        self.release_call = release_call
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, object], abort_signal: AbortSignal
+    ):
+        del name, arguments, abort_signal
+        self.call_started.set()
+        await self.release_call.wait()
+        return {"content": [], "isError": False, "structuredContent": None}
+
+
+class _ListedClient(_LifecycleClient):
+    def __init__(self, config: MCPServerConfig, tools: list[MCPTool]) -> None:
+        super().__init__(config)
+        self.tools = tools
+
+    async def list_tools(self) -> list[MCPTool]:
+        return self.tools
+
+
 class _BlockingCloseClient(_LifecycleClient):
     def __init__(
         self,
@@ -562,6 +591,160 @@ async def test_mount_reconnects_one_server_and_rejects_unknown(
     assert "recover:echo" in {schema["name"] for schema in registry.schemas}
     with pytest.raises(ValueError, match="unknown MCP server: absent"):
         await mount.reconnect("absent")
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_removed_handler_rejects_a_readded_same_name_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("same", "stdio", "unused")
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: _LifecycleClient(config))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"same": config})
+    )
+    old_handler = registry.definitions_by_name["same:echo"].handler
+
+    await mount.remove_server("same")
+    await mount.add_server(config, source=tmp_path / "mcp.json")
+
+    result = await old_handler({}, AbortSignal())
+
+    assert result["isError"] is True
+    assert mount.statuses["same"].state == "mounted"
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_hung_tool_call_does_not_block_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    config = MCPServerConfig("server", "stdio", "unused")
+    initial = _BlockingCallClient(config, started, release)
+    replacement = _LifecycleClient(config)
+    clients = iter((initial, replacement))
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
+    )
+
+    call = asyncio.create_task(registry.execute(ToolCall("call", "server:echo", {})))
+    await started.wait()
+    await asyncio.wait_for(mount.reconnect("server"), timeout=0.2)
+    release.set()
+    await call
+
+    assert mount.statuses["server"].state == "mounted"
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_call_after_close_does_not_start_a_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("server", "stdio", "unused")
+    built: list[MCPClient] = []
+
+    def build_client(server_config: MCPServerConfig) -> MCPClient:
+        client = _LifecycleClient(server_config)
+        built.append(client)
+        return client
+
+    monkeypatch.setattr(mount_module, "_build_client", build_client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
+    )
+    old_handler = registry.definitions_by_name["server:echo"].handler
+
+    await mount.close()
+    result = await old_handler({}, AbortSignal())
+
+    assert result["isError"] is True
+    assert len(built) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_manual_reconnect_preserves_degraded_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("recover", "stdio", "unused")
+    initial = _LifecycleClient(config)
+    failed = _FakeClient(config, fail_connect=True)
+    replacement = _LifecycleClient(config)
+    clients = iter((initial, failed, replacement))
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"recover": config})
+    )
+    initial.fail_transport("server exited")
+    await asyncio.sleep(0)
+    await mount.reconnect("recover")
+
+    assert mount.statuses["recover"].state == "degraded"
+    assert mount.statuses["recover"].tool_count == 1
+    assert "recover:echo" in {schema["name"] for schema in registry.schemas}
+
+    result = await registry.execute(ToolCall("recover", "recover:echo", {}))
+
+    assert result["isError"] is False
+    assert mount.statuses["recover"].state == "mounted"
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_remount_replaces_the_full_tool_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("server", "stdio", "unused")
+    initial = _ListedClient(config, [MCPTool("old", "", {"type": "object"})])
+    replacement = _ListedClient(
+        config, [MCPTool("new", "", {"type": "object"})]
+    )
+    clients = iter((initial, replacement))
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
+    )
+
+    await mount.reconnect("server")
+
+    assert {schema["name"] for schema in registry.schemas} == {"server:new"}
+    assert mount.statuses["server"].tool_count == 1
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_remount_backoff_caps_at_large_failure_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("retry", "stdio", "unused")
+    initial = _LifecycleClient(config)
+    failed = _FakeClient(config, fail_connect=True)
+    clients = iter((initial, failed))
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
+    monkeypatch.setattr(mount_module, "AUTO_RECONNECT_BASE_DELAY_SECONDS", 1.0)
+    monkeypatch.setattr(mount_module, "AUTO_RECONNECT_MAX_DELAY_SECONDS", 30.0)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"retry": config})
+    )
+    initial.fail_transport("server exited")
+    await asyncio.sleep(0)
+    mount._failure_counts["retry"] = 1024
+    before = mount_module.time.monotonic()
+
+    await mount._auto_remount("retry")
+
+    retry_at = mount.statuses["retry"].next_retry_at
+    assert retry_at is not None
+    assert retry_at - before <= 30.1
     await mount.close()
 
 
