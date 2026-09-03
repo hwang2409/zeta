@@ -613,6 +613,9 @@ async def test_mount_reports_states_and_notices(
     assert mount.statuses["timed"].state == "timed-out"
     assert "missing environment variable(s): MCP_MISSING" in mount.render()
     assert "stderr:" in mount.render()
+    assert [line.split(":", 1)[0] for line in mount.render().splitlines()[1:]] == list(
+        mount.configs
+    )
     assert len(notices) == 4
     await mount.close()
 
@@ -710,10 +713,10 @@ async def test_canceled_add_does_not_clean_up_a_new_same_name_server(
     await mount.add_server(second_config, source=tmp_path / "second.json")
 
     add.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await add
+    add_status = await add
 
     assert rollback_calls == 0
+    assert add_status.state == "failed"
     assert mount.configs["same"] is second_config
     assert mount.clients == (second_client,)
     assert not second_client.closed
@@ -765,8 +768,7 @@ async def test_canceled_replacement_does_not_mark_a_new_same_name_server_failed(
     await mount.add_server(new_config, source=tmp_path / "new.json")
 
     replace.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await replace
+    await replace
 
     assert mount.configs["same"] is new_config
     assert mount.statuses["same"].state == "mounted"
@@ -795,9 +797,31 @@ async def test_hung_tool_call_does_not_block_reconnect(
     await started.wait()
     await asyncio.wait_for(mount.reconnect("server"), timeout=0.2)
     release.set()
-    await call
+    result = await call
 
     assert mount.statuses["server"].state == "mounted"
+    assert result["isError"] is True
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_call_children_are_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("server", "stdio", "unused")
+    client = _CallTrackingClient(config, [])
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
+    )
+    actor = mount._actors["server"]
+
+    for index in range(25):
+        result = await registry.execute(ToolCall(str(index), "server:echo", {}))
+        assert result["isError"] is False
+
+    assert not actor._children
     await mount.close()
 
 
@@ -962,10 +986,11 @@ async def test_auto_remount_backoff_caps_at_large_failure_count(
     )
     initial.fail_transport("server exited")
     await asyncio.sleep(0)
-    mount._failure_counts["retry"] = 1024
+    actor = mount._actors["retry"]
+    actor._failure_count = 1024
     before = mount_module.time.monotonic()
 
-    await mount._auto_remount("retry", mount._generations["retry"])
+    await actor.force_auto_remount()
 
     retry_at = mount.statuses["retry"].next_retry_at
     assert retry_at is not None
@@ -1017,11 +1042,11 @@ async def test_delayed_auto_remount_rejects_a_stale_same_name_generation(
     )
     initial.fail_transport("server exited")
     await asyncio.sleep(0)
-    old_generation = mount._generations["same"]
+    old_actor = mount._actors["same"]
 
     await mount.remove_server("same")
     await mount.add_server(new_config, source=tmp_path / "new.json")
-    delayed = asyncio.create_task(mount._auto_remount("same", old_generation))
+    delayed = asyncio.create_task(old_actor.force_auto_remount())
     await delayed
 
     assert mount.configs["same"] is new_config
@@ -1227,6 +1252,7 @@ async def test_canceled_reconnect_during_client_close_marks_mount_failed(
     assert mount.statuses["server"].state == "failed"
     assert mount.clients == ()
     assert registry.schemas == []
+    release_close.set()
     await mount.close()
 
 
@@ -1388,6 +1414,69 @@ async def test_mount_close_waits_for_active_client_cleanup(
     assert not close_task.done()
     release_close.set()
     await close_task
+
+
+@pytest.mark.asyncio
+async def test_mount_close_tracks_actor_removed_during_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    config = MCPServerConfig("server", "stdio", "unused")
+    client = _BlockingCloseClient(config, close_started, release_close)
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
+    )
+
+    remove_task = asyncio.create_task(mount.remove_server("server"))
+    await close_started.wait()
+    mount_close_task = asyncio.create_task(mount.close())
+    await asyncio.sleep(0)
+
+    assert not mount_close_task.done()
+    release_close.set()
+    await asyncio.gather(remove_task, mount_close_task)
+
+
+@pytest.mark.asyncio
+async def test_crashed_actor_is_replaced_by_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("server", "stdio", "unused")
+    initial = _LifecycleClient(config)
+    replacement = _LifecycleClient(config)
+    clients = iter((initial, replacement))
+    callback_armed = False
+
+    monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
+    )
+
+    def fail_schema_refresh(_mount: MCPMount) -> None:
+        if callback_armed:
+            raise RuntimeError("schema refresh failed")
+
+    mount.set_schema_refresh(fail_schema_refresh)
+    callback_armed = True
+    initial.fail_transport("server exited")
+    for _ in range(20):
+        if mount._actors["server"].is_terminal:
+            break
+        await asyncio.sleep(0)
+
+    assert mount.statuses["server"].state == "failed"
+    assert mount._actors["server"].is_terminal
+
+    callback_armed = False
+    await mount.reconnect("server")
+
+    assert mount.statuses["server"].state == "mounted"
+    assert mount.clients == (replacement,)
+    await mount.close()
 
 
 @pytest.mark.asyncio

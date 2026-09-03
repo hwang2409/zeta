@@ -65,8 +65,6 @@ class MCPMount:
         self.statuses = dict(statuses or {})
         self.sources = dict(sources or {})
         self._clients = clients
-        self._generations = {name: 1 for name in server_configs}
-        self._failure_counts: dict[str, int] = {}
         self._actors: dict[str, MCPServerActor] = {}
         self._removed_actors: dict[str, MCPServerActor] = {}
         self._config_lock = asyncio.Lock()
@@ -95,7 +93,10 @@ class MCPMount:
 
     def render(self) -> str:
         lines = [self.summary]
-        for status in self.statuses.values():
+        for name in self.configs:
+            status = self.statuses.get(name)
+            if status is None:
+                continue
             line = (
                 f"{status.name}: {status.state} | transport: {status.transport} | "
                 f"tools: {status.tool_count} | stderr: {status.stderr_log_path}"
@@ -114,6 +115,10 @@ class MCPMount:
         notice_sink: NoticeSink | None = None,
     ) -> MCPServerStatus:
         actor = await self._actor_for(name)
+        if self._closed:
+            return actor.status
+        if actor.is_terminal:
+            actor = await self._replace_terminal_actor(name, actor)
         return await actor.reconnect(notice_sink=notice_sink)
 
     async def add_server(
@@ -138,7 +143,6 @@ class MCPMount:
             actor = self._make_actor(
                 server_config,
                 source,
-                initial_generation=self._generations.get(name, 0) + 1,
             )
             self.configs[name] = server_config
             self.sources[name] = source
@@ -198,7 +202,9 @@ class MCPMount:
                 self.sources[name] = next_source
         if next_server is None:
             await actor.remove_when_idle()
-            self._removed_actors.pop(name, None)
+            async with self._config_lock:
+                if self._removed_actors.get(name) is actor:
+                    self._removed_actors.pop(name, None)
             return
         await actor.replace(
             server_config,
@@ -223,11 +229,14 @@ class MCPMount:
         await self._remove_server_locked(name)
 
     async def _remove_server_locked(self, name: str) -> None:
-        """Compatibility seam; removal still runs through the actor queue."""
-
-        actor = self._removed_actors.pop(name, None)
+        actor = self._removed_actors.get(name)
         if actor is not None:
-            await actor.remove()
+            try:
+                await actor.remove()
+            finally:
+                async with self._config_lock:
+                    if self._removed_actors.get(name) is actor:
+                        self._removed_actors.pop(name, None)
 
     async def close(self) -> None:
         async with self._config_lock:
@@ -271,12 +280,27 @@ class MCPMount:
                 raise ValueError(f"unknown MCP server: {name}")
             return actor
 
+    async def _replace_terminal_actor(
+        self,
+        name: str,
+        actor: MCPServerActor,
+    ) -> MCPServerActor:
+        async with self._config_lock:
+            current = self._actors.get(name)
+            if current is None:
+                raise ValueError(f"unknown MCP server: {name}")
+            if current is not actor or not current.is_terminal:
+                return current
+            replacement = self._make_actor(current.config, current.source)
+            self._actors[name] = replacement
+            replacement.start()
+        await actor.close()
+        return replacement
+
     def _make_actor(
         self,
         config: MCPServerConfig,
         source: Path,
-        *,
-        initial_generation: int | None = None,
     ) -> MCPServerActor:
         return MCPServerActor(
             config,
@@ -285,7 +309,6 @@ class MCPMount:
             publish=self._publish,
             build_client=_build_client,
             connect_and_list=_connect_and_list,
-            initial_generation=initial_generation or self._generations.get(config.name, 1),
             setup_timeout=SERVER_SETUP_TIMEOUT_SECONDS,
             auto_base_delay=AUTO_RECONNECT_BASE_DELAY_SECONDS,
             auto_max_delay=AUTO_RECONNECT_MAX_DELAY_SECONDS,
@@ -296,16 +319,12 @@ class MCPMount:
         actor: MCPServerActor,
         status: MCPServerStatus,
         client: MCPClient | None,
-        generation: int,
-        failure_count: int,
     ) -> None:
         if self._actors.get(actor.name) is not actor:
             return
         self.configs[actor.name] = actor.config
         self.sources[actor.name] = actor.source
         self.statuses[actor.name] = status
-        self._generations[actor.name] = generation
-        self._failure_counts[actor.name] = failure_count
         if client is None:
             self._clients.pop(actor.name, None)
         else:
@@ -315,16 +334,6 @@ class MCPMount:
     def _refresh_schemas(self) -> None:
         if self._schema_refresh is not None:
             self._schema_refresh(self)
-
-    async def _auto_remount(self, name: str, generation: int) -> None:
-        """Keep the old lifecycle test hook as a message-only request."""
-
-        actor = await self._actor_for(name)
-        await actor.force_auto_remount(
-            generation,
-            failure_count_override=self._failure_counts.get(name),
-        )
-
 
 async def mount_mcp_servers(
     registry: ToolRegistry,

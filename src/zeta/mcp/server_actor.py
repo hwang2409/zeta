@@ -67,8 +67,6 @@ class _Operation:
     waiter: "_CallRequest | None" = None
     task: asyncio.Task[_SetupOutcome] | None = None
     failure_reason: str | None = None
-    failure_count_override: int | None = None
-    cleanup: asyncio.Task[object] | None = None
 
 
 @dataclass(slots=True)
@@ -92,12 +90,12 @@ class _StartOperation:
     notice_sink: NoticeSink | None
     request: asyncio.Future[MCPServerStatus] | None
     waiter: _CallRequest | None = None
-    failure_count_override: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _SetupFinished:
     identifier: int
+    task: asyncio.Task[_SetupOutcome]
     outcome: _SetupOutcome | None
 
 
@@ -111,8 +109,14 @@ class _TransportFailure:
 @dataclass(frozen=True, slots=True)
 class _CallFinished:
     request: _CallRequest
+    task: asyncio.Task[StructuredToolResult]
     result: StructuredToolResult | None
     error: BaseException | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ChildFinished:
+    task: asyncio.Task[object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,11 +128,6 @@ class _CancelOperation:
 @dataclass(frozen=True, slots=True)
 class _CancelCall:
     identifier: int
-
-
-@dataclass(frozen=True, slots=True)
-class _RetryDue:
-    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +146,7 @@ class _Close:
 
 
 PublishSnapshot = Callable[
-    ["MCPServerActor", MCPServerStatus, MCPClient | None, int, int], None
+    ["MCPServerActor", MCPServerStatus, MCPClient | None], None
 ]
 
 
@@ -163,7 +162,6 @@ class MCPServerActor:
         publish: PublishSnapshot,
         build_client: Callable[[MCPServerConfig], MCPClient],
         connect_and_list: Callable[[MCPClient], Awaitable[list[MCPTool]]],
-        initial_generation: int = 1,
         setup_timeout: float = SERVER_SETUP_TIMEOUT_SECONDS,
         auto_base_delay: float = AUTO_RECONNECT_BASE_DELAY_SECONDS,
         auto_max_delay: float = AUTO_RECONNECT_MAX_DELAY_SECONDS,
@@ -187,7 +185,7 @@ class MCPServerActor:
         self._next_identifier = 0
         self._client: MCPClient | None = None
         self._tools: tuple[MCPTool, ...] = ()
-        self._generation = initial_generation
+        self._generation = 0
         self._failure_count = 0
         self._status = MCPServerStatus(
             config.name,
@@ -196,8 +194,6 @@ class MCPServerActor:
             stderr_log_path=str(mcp_log_path(config.name)),
         )
         self._closed = False
-        self._retry_timer: asyncio.Task[object] | None = None
-        self._retry_due = False
 
     @property
     def name(self) -> str:
@@ -225,6 +221,10 @@ class MCPServerActor:
     def status(self) -> MCPServerStatus:
         return self._status
 
+    @property
+    def is_terminal(self) -> bool:
+        return self._closed or (self._task is not None and self._task.done())
+
     def start(self) -> asyncio.Task[None]:
         if self._task is None:
             self._task = asyncio.create_task(self._run())
@@ -234,6 +234,8 @@ class MCPServerActor:
         self,
         notice_sink: NoticeSink | None = None,
     ) -> MCPServerStatus:
+        if self.is_terminal:
+            return _unavailable_status(self.name, self.config)
         future: asyncio.Future[MCPServerStatus] = asyncio.get_running_loop().create_future()
         self._next_identifier += 1
         self._queue.put_nowait(
@@ -267,11 +269,15 @@ class MCPServerActor:
         )
 
     async def remove(self) -> None:
+        if self.is_terminal:
+            return
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._queue.put_nowait(_Remove(future))
         await asyncio.shield(future)
 
     async def remove_when_idle(self) -> None:
+        if self.is_terminal:
+            return
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._queue.put_nowait(_RemoveWhenIdle(future))
         await asyncio.shield(future)
@@ -281,6 +287,9 @@ class MCPServerActor:
             return
         if self._task.done():
             await asyncio.gather(self._task, return_exceptions=True)
+            return
+        if self._closed:
+            await asyncio.shield(self._task)
             return
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._queue.put_nowait(_Close(future))
@@ -305,7 +314,7 @@ class MCPServerActor:
             generation,
             future,
         )
-        if self._task is None or self._task.done():
+        if self.is_terminal:
             return _unavailable_result(self.name)
         self._queue.put_nowait(request)
         try:
@@ -316,13 +325,10 @@ class MCPServerActor:
 
     async def force_auto_remount(
         self,
-        generation: int,
-        *,
-        failure_count_override: int | None = None,
     ) -> None:
-        """Start an automatic remount for compatibility with lifecycle tests."""
+        """Start an automatic remount through the actor queue."""
 
-        if self._task is None or self._task.done() or generation != self._generation:
+        if self.is_terminal:
             return
         future: asyncio.Future[MCPServerStatus] = asyncio.get_running_loop().create_future()
         self._next_identifier += 1
@@ -334,10 +340,8 @@ class MCPServerActor:
                 self.source,
                 None,
                 future,
-                failure_count_override=failure_count_override,
             )
         )
-        del generation
         await asyncio.shield(future)
 
     async def _request_operation(
@@ -348,6 +352,8 @@ class MCPServerActor:
         config: MCPServerConfig | None = None,
         source: Path | None = None,
     ) -> MCPServerStatus:
+        if self.is_terminal:
+            return _unavailable_status(self.name, self.config)
         future: asyncio.Future[MCPServerStatus] = asyncio.get_running_loop().create_future()
         self._next_identifier += 1
         identifier = self._next_identifier
@@ -371,6 +377,7 @@ class MCPServerActor:
             raise
 
     async def _run(self) -> None:
+        message: object | None = None
         try:
             while True:
                 message = await self._queue.get()
@@ -391,8 +398,8 @@ class MCPServerActor:
                     self._handle_cancel_operation(message)
                 elif isinstance(message, _CancelCall):
                     self._handle_cancel_call(message)
-                elif isinstance(message, _RetryDue):
-                    self._retry_due = True
+                elif isinstance(message, _ChildFinished):
+                    self._children.discard(message.task)
                 elif isinstance(message, _Remove):
                     await self._handle_remove(message.result)
                     return
@@ -407,8 +414,10 @@ class MCPServerActor:
                     await self._handle_remove(self._pending_removes.pop(0))
                     return
         except asyncio.CancelledError:
-            await self._shutdown_children()
+            await asyncio.shield(self._finalize_terminal(message, None))
             raise
+        except BaseException as exc:
+            await self._finalize_terminal(message, exc)
 
     def _handle_start(self, message: _StartOperation) -> None:
         if self._closed:
@@ -427,15 +436,9 @@ class MCPServerActor:
             else:
                 self._pending_starts.append(message)
                 return
-        if message.kind == "manual":
-            self._cancel_retry_timer()
-            self._retry_due = False
-        elif self._operation is not None:
-            return
         self.config = message.config
         self.source = message.source
         preserve_degraded = self._status.state == "degraded"
-        cleanup: asyncio.Task[object] | None = None
         if message.kind == "manual" and self._client is not None:
             old_client = self._client
             self._client = None
@@ -450,7 +453,7 @@ class MCPServerActor:
                     stderr_log_path=str(mcp_log_path(self.name)),
                 )
             )
-            cleanup = self._schedule_close(old_client)
+            self._schedule_close(old_client)
         setup_generation = self._generation + 1
         operation = _Operation(
             message.identifier,
@@ -461,8 +464,6 @@ class MCPServerActor:
             preserve_degraded,
             message.request,
             message.waiter,
-            failure_count_override=message.failure_count_override,
-            cleanup=cleanup,
         )
         self._operation = operation
         task = asyncio.create_task(
@@ -485,14 +486,14 @@ class MCPServerActor:
         identifier: int,
     ) -> None:
         if task.cancelled():
-            self._queue.put_nowait(_SetupFinished(identifier, None))
+            self._queue.put_nowait(_SetupFinished(identifier, task, None))
             return
         try:
             outcome = task.result()
         except BaseException:
-            self._queue.put_nowait(_SetupFinished(identifier, None))
+            self._queue.put_nowait(_SetupFinished(identifier, task, None))
         else:
-            self._queue.put_nowait(_SetupFinished(identifier, outcome))
+            self._queue.put_nowait(_SetupFinished(identifier, task, outcome))
 
     async def _prepare(
         self,
@@ -590,13 +591,12 @@ class MCPServerActor:
         return _SetupOutcome(status, client, tuple(tools), failure_reason)
 
     def _handle_setup_finished(self, message: _SetupFinished) -> None:
+        self._children.discard(message.task)
         operation = self._operation
         if operation is None or operation.identifier != message.identifier:
             return
-        self._operation = None
         if message.outcome is None:
             self._finish_cancelled(operation)
-            self._complete_operation(operation, self._status)
             return
         outcome = message.outcome
         reason = outcome.failure_reason or operation.failure_reason
@@ -612,7 +612,6 @@ class MCPServerActor:
                 outcome.client,
             )
         if outcome.status.state == "mounted" and outcome.client is not None:
-            self._cancel_retry_timer()
             self._unregister_tools()
             self.config = operation.config
             self.source = operation.source
@@ -635,11 +634,10 @@ class MCPServerActor:
                 self,
                 self._status,
                 self._client,
-                self._generation,
-                self._failure_count,
             )
             self._complete_operation(operation, self._status)
             if operation.waiter is not None:
+                operation.waiter.generation = self._generation
                 self._dispatch_call(operation.waiter, self._client)
             return
         if outcome.client is not None:
@@ -659,17 +657,13 @@ class MCPServerActor:
                     next_retry_at=time.monotonic(),
                 )
             )
-            self._arm_retry_timer()
             self._complete_operation(operation, self._status)
             if operation.waiter is not None:
                 _set_result(operation.waiter.result, _degraded_result(self.name, self._status))
             return
         if operation.kind == "auto":
-            failure_count = operation.failure_count_override
-            if failure_count is None:
-                failure_count = self._failure_count + 1
-            self._failure_count = failure_count
-            exponent = min(max(failure_count - 1, 0), 30)
+            self._failure_count += 1
+            exponent = min(max(self._failure_count - 1, 0), 30)
             delay = min(
                 self._auto_max_delay,
                 self._auto_base_delay * 2**exponent,
@@ -685,7 +679,6 @@ class MCPServerActor:
                     next_retry_at=time.monotonic() + delay,
                 )
             )
-            self._arm_retry_timer()
             self._complete_operation(operation, self._status)
             if operation.waiter is not None:
                 _set_result(operation.waiter.result, _degraded_result(self.name, self._status))
@@ -709,7 +702,6 @@ class MCPServerActor:
             self._client = None
             self._tools = ()
             self._set_status(outcome.status)
-        self._arm_retry_timer()
         self._complete_operation(operation, self._status)
         if operation.waiter is not None:
             _set_result(operation.waiter.result, _degraded_result(self.name, self._status))
@@ -741,6 +733,7 @@ class MCPServerActor:
             )
         if operation.waiter is not None:
             _set_result(operation.waiter.result, _degraded_result(self.name, self._status))
+        self._complete_operation(operation, self._status)
 
     def _handle_transport_failure(self, message: _TransportFailure) -> None:
         operation = self._operation
@@ -769,7 +762,6 @@ class MCPServerActor:
                 next_retry_at=time.monotonic(),
             )
         )
-        self._arm_retry_timer()
 
     def _handle_call(self, request: _CallRequest) -> None:
         if self._closed:
@@ -835,18 +827,22 @@ class MCPServerActor:
         request: _CallRequest,
     ) -> None:
         if task.cancelled():
-            self._queue.put_nowait(_CallFinished(request, None, asyncio.CancelledError()))
+            self._queue.put_nowait(
+                _CallFinished(request, task, None, asyncio.CancelledError())
+            )
             return
         try:
             result = task.result()
         except BaseException as exc:
-            self._queue.put_nowait(_CallFinished(request, None, exc))
+            self._queue.put_nowait(_CallFinished(request, task, None, exc))
         else:
-            self._queue.put_nowait(_CallFinished(request, result, None))
+            self._queue.put_nowait(_CallFinished(request, task, result, None))
 
     def _handle_call_finished(self, message: _CallFinished) -> None:
+        self._children.discard(message.task)
         request = self._calls.pop(message.request.identifier, message.request)
         if isinstance(message.error, asyncio.CancelledError):
+            _set_result(request.result, _unavailable_result(self.name))
             return
         current = (
             not self._closed
@@ -859,13 +855,14 @@ class MCPServerActor:
                 self._degrade_current(_error_text(message.error))
                 _set_result(request.result, _degraded_result(self.name, self._status))
             else:
-                _set_result(request.result, _degraded_result(self.name, self._status))
+                _set_result(request.result, _unavailable_result(self.name))
             return
         if not current:
             if self._status.state == "degraded":
-                _set_result(request.result, _degraded_result(self.name, self._status))
-            elif message.result is not None:
-                _set_result(request.result, message.result)
+                result = _degraded_result(self.name, self._status)
+            else:
+                result = _unavailable_result(self.name)
+            _set_result(request.result, result)
             return
         if message.result is not None:
             _set_result(request.result, message.result)
@@ -874,7 +871,6 @@ class MCPServerActor:
         operation = self._operation
         if operation is not None and operation.identifier == message.identifier:
             self._cancel_current_operation()
-            self._operation = None
             self._finish_cancelled(operation)
         _set_result(message.acknowledged, None)
 
@@ -884,89 +880,16 @@ class MCPServerActor:
             request.task.cancel()
 
     async def _handle_remove(self, result: asyncio.Future[None]) -> None:
-        if self._closed:
-            _set_result(result, None)
-            return
-        self._closed = True
-        self._cancel_retry_timer()
-        operation = self._operation
-        self._cancel_current_operation()
-        self._operation = None
-        if operation is not None:
-            self._finish_cancelled(operation)
-        self._reject_pending_starts()
-        self._resolve_pending_removes()
-        for request in self._calls.values():
-            if request.task is not None:
-                request.task.cancel()
-            _set_result(request.result, _unavailable_result(self.name))
-        self._calls.clear()
-        self._unregister_tools()
-        if self._client is not None:
-            self._schedule_close(self._client, detach=False)
-            self._client = None
-        await self._shutdown_children()
-        self._drain_queue()
-        _set_result(result, None)
+        await self._terminate(result)
 
     async def _handle_close(self, result: asyncio.Future[None]) -> None:
-        if self._closed:
-            await self._shutdown_children()
-            _set_result(result, None)
-            return
-        self._closed = True
-        self._cancel_retry_timer()
-        operation = self._operation
-        self._cancel_current_operation()
-        self._operation = None
-        if operation is not None:
-            self._finish_cancelled(operation)
-            self._complete_operation(operation, self._status)
-        self._reject_pending_starts()
-        self._resolve_pending_removes()
-        for request in self._calls.values():
-            if request.task is not None:
-                request.task.cancel()
-            _set_result(request.result, _unavailable_result(self.name))
-        self._calls.clear()
-        self._unregister_tools()
-        if self._client is not None:
-            self._schedule_close(self._client)
-            self._client = None
-        self._set_status(
-            MCPServerStatus(
-                self.name,
-                self.config.transport,
-                "failed",
-                reason="MCP mount is closed",
-                stderr_log_path=str(mcp_log_path(self.name)),
-            )
-        )
-        await self._shutdown_children()
-        self._drain_queue()
-        _set_result(result, None)
+        await self._terminate(result, reason="MCP mount is closed")
 
     def _cancel_current_operation(self) -> None:
         operation = self._operation
         if operation is not None:
             if operation.task is not None:
                 operation.task.cancel()
-            if operation.cleanup is not None:
-                operation.cleanup.cancel()
-
-    def _reject_pending_starts(self) -> None:
-        while self._pending_starts:
-            message = self._pending_starts.pop(0)
-            if message.request is not None:
-                _set_result(
-                    message.request,
-                    _unavailable_status(self.name, self.config),
-                )
-            if message.waiter is not None:
-                _set_result(
-                    message.waiter.result,
-                    _unavailable_result(self.name),
-                )
 
     def _resolve_pending_removes(self) -> None:
         while self._pending_removes:
@@ -977,8 +900,101 @@ class MCPServerActor:
         if operation is None:
             return
         self._cancel_current_operation()
-        self._operation = None
         self._finish_cancelled(operation)
+
+    async def _terminate(
+        self,
+        result: asyncio.Future[None] | None,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        if self._closed:
+            await self._shutdown_children()
+            if result is not None:
+                _set_result(result, None)
+            return
+        self._closed = True
+        operation = self._operation
+        if operation is not None and operation.task is not None:
+            operation.task.cancel()
+        self._operation = None
+        if operation is not None:
+            if operation.request is not None:
+                _set_result(
+                    operation.request,
+                    _unavailable_status(self.name, self.config),
+                )
+            if operation.waiter is not None:
+                _set_result(operation.waiter.result, _unavailable_result(self.name))
+        while self._pending_starts:
+            self._resolve_message(self._pending_starts.pop(0))
+        self._resolve_pending_removes()
+        for request in self._calls.values():
+            if request.task is not None:
+                request.task.cancel()
+            _set_result(request.result, _unavailable_result(self.name))
+        self._calls.clear()
+        self._unregister_tools()
+        if self._client is not None:
+            self._schedule_close(self._client, detach=False)
+            self._client = None
+        if reason is not None:
+            terminal_status = MCPServerStatus(
+                self.name,
+                self.config.transport,
+                "failed",
+                reason=reason,
+                stderr_log_path=str(mcp_log_path(self.name)),
+            )
+            self._status = terminal_status
+            try:
+                self._publish_callback(self, terminal_status, None)
+            except BaseException:  # noqa: BLE001 - finalization must complete
+                logger.exception("failed to publish terminal MCP state")
+        self._drain_queue()
+        await self._shutdown_children()
+        if result is not None:
+            _set_result(result, None)
+
+    async def _finalize_terminal(
+        self,
+        message: object | None,
+        error: BaseException | None,
+    ) -> None:
+        if error is not None:
+            logger.error(
+                "MCP server actor %s crashed: %s",
+                self.name,
+                _error_text(error),
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        await self._terminate(
+            None,
+            reason=(
+                "MCP server actor crashed"
+                if error is not None
+                else "MCP server actor cancelled"
+            ),
+        )
+        self._resolve_message(message)
+
+    def _resolve_message(self, message: object | None) -> None:
+        if isinstance(message, (_Remove, _RemoveWhenIdle, _Close)):
+            _set_result(message.result, None)
+        elif isinstance(message, _CancelOperation):
+            _set_result(message.acknowledged, None)
+        elif isinstance(message, _CallRequest):
+            _set_result(message.result, _unavailable_result(self.name))
+        elif isinstance(message, _CallFinished):
+            _set_result(message.request.result, _unavailable_result(self.name))
+        elif isinstance(message, _StartOperation):
+            if message.request is not None:
+                _set_result(
+                    message.request,
+                    _unavailable_status(self.name, self.config),
+                )
+            if message.waiter is not None:
+                _set_result(message.waiter.result, _unavailable_result(self.name))
 
     def _schedule_close(
         self,
@@ -990,7 +1006,11 @@ class MCPServerActor:
             self._detach_failure_sink(client)
         task = asyncio.create_task(_safe_close(client))
         self._children.add(task)
+        task.add_done_callback(self._queue_child_finished)
         return task
+
+    def _queue_child_finished(self, task: asyncio.Task[object]) -> None:
+        self._queue.put_nowait(_ChildFinished(task))
 
     def _detach_failure_sink(self, client: MCPClient) -> None:
         set_failure_sink = getattr(client, "set_failure_sink", None)
@@ -1010,27 +1030,16 @@ class MCPServerActor:
             except asyncio.QueueEmpty:
                 return
             if isinstance(message, _SetupFinished):
+                self._children.discard(message.task)
                 if message.outcome is not None and message.outcome.client is not None:
                     self._schedule_close(message.outcome.client)
-            elif isinstance(message, _CallRequest):
-                _set_result(message.result, _unavailable_result(self.name))
             elif isinstance(message, _CallFinished):
-                _set_result(message.request.result, _unavailable_result(self.name))
-            elif isinstance(message, _StartOperation):
-                if message.request is not None:
-                    _set_result(
-                        message.request,
-                        _unavailable_status(self.name, self.config),
-                    )
-                if message.waiter is not None:
-                    _set_result(
-                        message.waiter.result,
-                        _unavailable_result(self.name),
-                    )
-            elif isinstance(message, (_Remove, _RemoveWhenIdle, _Close)):
-                _set_result(message.result, None)
-            elif isinstance(message, _CancelOperation):
-                _set_result(message.acknowledged, None)
+                self._children.discard(message.task)
+                self._resolve_message(message)
+            elif isinstance(message, _ChildFinished):
+                self._children.discard(message.task)
+            else:
+                self._resolve_message(message)
 
     def _set_status(self, status: MCPServerStatus) -> None:
         self._status = status
@@ -1038,8 +1047,6 @@ class MCPServerActor:
             self,
             status,
             self._client,
-            self._generation,
-            self._failure_count,
         )
 
     def _register_tool(self, tool: MCPTool, generation: int) -> None:
@@ -1083,26 +1090,8 @@ class MCPServerActor:
     ) -> None:
         if operation.request is not None:
             _set_result(operation.request, status)
-
-    def _arm_retry_timer(self) -> None:
-        self._cancel_retry_timer()
-        retry_at = self._status.next_retry_at
-        if self._status.state != "degraded" or retry_at is None:
-            return
-        delay = max(0.0, retry_at - time.monotonic())
-        task = asyncio.create_task(self._retry_after(delay))
-        self._retry_timer = task
-        self._children.add(task)
-
-    async def _retry_after(self, delay: float) -> None:
-        await asyncio.sleep(delay)
-        self._queue.put_nowait(_RetryDue())
-
-    def _cancel_retry_timer(self) -> None:
-        if self._retry_timer is not None and not self._retry_timer.done():
-            self._retry_timer.cancel()
-        self._retry_timer = None
-
+        if self._operation is operation:
+            self._operation = None
 
 async def _safe_close(client: MCPClient) -> None:
     try:
