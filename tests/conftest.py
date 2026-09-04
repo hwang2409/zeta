@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from collections.abc import Generator
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 
@@ -49,7 +51,7 @@ def _audit_ledger_size(ledger: Path) -> int:
         return 0
 
 
-def _audit_records(ledger: Path, offset: int) -> list[dict[str, object]]:
+def _audit_records(ledger: Path, offset: int) -> list[tuple[int, dict[str, object]]]:
     try:
         with ledger.open("rb") as stream:
             stream.seek(offset)
@@ -57,15 +59,28 @@ def _audit_records(ledger: Path, offset: int) -> list[dict[str, object]]:
     except FileNotFoundError:
         return []
 
-    records: list[dict[str, object]] = []
-    for line in data.splitlines():
+    records: list[tuple[int, dict[str, object]]] = []
+    position = offset
+    for line in data.splitlines(keepends=True):
+        line_offset = position
+        position += len(line)
+        if not line.endswith(b"\n"):
+            continue
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
         if isinstance(record, dict):
-            records.append(record)
+            records.append((line_offset, record))
     return records
+
+
+@dataclass
+class _ExternalDeclaration:
+    path: Path
+    kind: str
+    ledger_offset: int
+    used: bool = False
 
 
 class LiveHomeWriteGuard:
@@ -77,11 +92,12 @@ class LiveHomeWriteGuard:
         self._original_live_home_env = os.environ.get("ZETA_TEST_LIVE_HOME")
         self._snapshot = _persistence_snapshot(self.live_home)
         self._original_snapshot = self._snapshot
-        self._root_session_id = os.getsid(0)
+        self._ownership_token = uuid.uuid4().hex
         audit_dir.mkdir(parents=True, exist_ok=True)
         self._ledger = audit_dir / f"{os.getpid()}.jsonl"
         self._ledger.touch()
         self._ledger_offset = _audit_ledger_size(self._ledger)
+        self._external_declarations: list[_ExternalDeclaration] = []
 
     def _violations(self) -> set[Path]:
         """Fail closed when a changed path has no attributable writer record."""
@@ -96,30 +112,56 @@ class LiveHomeWriteGuard:
             return set()
 
         records = _audit_records(self._ledger, self._ledger_offset)
-        recorded_by_path: dict[Path, set[int]] = {}
-        for record in records:
+        recorded_by_path: dict[Path, list[bool]] = {}
+        for offset, record in records:
             path_value = record.get("path")
-            session_id = record.get("session_id")
-            if not isinstance(path_value, str) or not isinstance(session_id, int):
+            kind = record.get("kind")
+            if not isinstance(path_value, str) or not isinstance(kind, str):
                 continue
             try:
                 path = Path(path_value).expanduser().resolve()
                 relative = path.relative_to(self.live_home)
             except (OSError, RuntimeError, ValueError):
                 continue
-            recorded_by_path.setdefault(relative, set()).add(session_id)
+            recorded_by_path.setdefault(relative, []).append(
+                self._record_is_tolerated(offset, record)
+            )
 
         violations: set[Path] = set()
         for path in changed:
-            sessions = {
-                session_id
-                for recorded_path, recorded_sessions in recorded_by_path.items()
+            relevant_records = [
+                tolerated
+                for recorded_path, path_records in recorded_by_path.items()
                 if recorded_path == path or recorded_path.is_relative_to(path)
-                for session_id in recorded_sessions
-            }
-            if not sessions or self._root_session_id in sessions:
+                for tolerated in path_records
+            ]
+            if not relevant_records or not all(relevant_records):
                 violations.add(self.live_home / path)
         return violations
+
+    def _record_is_tolerated(self, offset: int, record: dict[str, object]) -> bool:
+        if record.get("ownership_token") == self._ownership_token:
+            return False
+
+        path_value = record.get("path")
+        kind = record.get("kind")
+        if not isinstance(path_value, str) or not isinstance(kind, str):
+            return False
+        try:
+            path = Path(path_value).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+        for declaration in self._external_declarations:
+            if (
+                not declaration.used
+                and offset >= declaration.ledger_offset
+                and declaration.path == path
+                and declaration.kind == kind
+            ):
+                declaration.used = True
+                return True
+        return False
 
     def assert_clean(self) -> None:
         violations = self._violations()
@@ -130,6 +172,21 @@ class LiveHomeWriteGuard:
         os.environ["ZETA_TEST_LIVE_HOME"] = str(self.live_home)
         self._snapshot = _persistence_snapshot(self.live_home)
         self._ledger_offset = _audit_ledger_size(self._ledger)
+        self._external_declarations.clear()
+
+    def declare_external_mutation(self, path: Path, *, kind: str) -> None:
+        normalized_path = path.expanduser().resolve()
+        try:
+            normalized_path.relative_to(self.live_home)
+        except ValueError as exc:
+            raise ValueError("external mutation must be inside the watched home") from exc
+        self._external_declarations.append(
+            _ExternalDeclaration(
+                path=normalized_path,
+                kind=kind,
+                ledger_offset=_audit_ledger_size(self._ledger),
+            )
+        )
 
     def reset(self) -> None:
         self.live_home = self._original_live_home
@@ -139,6 +196,7 @@ class LiveHomeWriteGuard:
             os.environ["ZETA_TEST_LIVE_HOME"] = self._original_live_home_env
         self._snapshot = self._original_snapshot
         self._ledger_offset = _audit_ledger_size(self._ledger)
+        self._external_declarations.clear()
 
 
 @pytest.fixture(scope="session")
@@ -146,7 +204,8 @@ def live_home_write_guard(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> LiveHomeWriteGuard:
     audit_dir = tmp_path_factory.mktemp("zeta-live-home-audit")
-    return LiveHomeWriteGuard(LIVE_ZETA_HOME, audit_dir)
+    synthetic_live_home = tmp_path_factory.mktemp("zeta-synthetic-live-home")
+    return LiveHomeWriteGuard(synthetic_live_home, audit_dir)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -169,7 +228,12 @@ def isolate_zeta_home(
         monkeypatch.setenv("ZETA_HOME", str(isolated_home))
         monkeypatch.setenv("HOME", str(fake_home))
         monkeypatch.setenv("ZETA_TEST_AUDIT_LEDGER", str(live_home_write_guard._ledger))
-        monkeypatch.setenv("ZETA_TEST_LIVE_HOME", str(LIVE_ZETA_HOME))
+        monkeypatch.setenv(
+            "ZETA_TEST_LIVE_HOME", str(live_home_write_guard.live_home)
+        )
+        monkeypatch.setenv(
+            "ZETA_TEST_OWNERSHIP_TOKEN", live_home_write_guard._ownership_token
+        )
         monkeypatch.setenv("PYTHONPATH", pythonpath)
         yield
         assert (

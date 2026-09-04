@@ -45,7 +45,9 @@ def test_teardown_guard_allows_external_live_history_writer(
     live_home_write_guard.watch(live_home)
 
     try:
+        live_home_write_guard.declare_external_mutation(history, kind="append")
         external_env = os.environ.copy()
+        external_env.pop("ZETA_TEST_OWNERSHIP_TOKEN")
         subprocess.run(
             [
                 sys.executable,
@@ -62,6 +64,76 @@ def test_teardown_guard_allows_external_live_history_writer(
         )
 
         live_home_write_guard.assert_clean()
+    finally:
+        live_home_write_guard.reset()
+
+
+def test_teardown_guard_rejects_undeclared_external_live_history_writer(
+    tmp_path: Path, live_home_write_guard
+) -> None:
+    live_home = tmp_path / "live-home"
+    history = live_home / "history"
+    history.parent.mkdir()
+    history.write_text("before\n", encoding="utf-8")
+    live_home_write_guard.watch(live_home)
+
+    try:
+        external_env = os.environ.copy()
+        external_env.pop("ZETA_TEST_OWNERSHIP_TOKEN")
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "Path(__import__('sys').argv[1]).open('a').write('external' + chr(92) + 'n')"
+                ),
+                str(history),
+            ],
+            env=external_env,
+            start_new_session=True,
+            check=True,
+        )
+
+        with pytest.raises(AssertionError, match="tests wrote to live zeta home"):
+            live_home_write_guard.assert_clean()
+    finally:
+        live_home_write_guard.reset()
+
+
+def test_teardown_guard_rejects_unattributed_append_before_external_append(
+    tmp_path: Path, live_home_write_guard
+) -> None:
+    live_home = tmp_path / "live-home"
+    history = live_home / "history"
+    history.parent.mkdir()
+    history.write_text("before\n", encoding="utf-8")
+    live_home_write_guard.watch(live_home)
+
+    try:
+        external_env = os.environ.copy()
+        external_env.pop("ZETA_TEST_OWNERSHIP_TOKEN")
+        append_command = (
+            "from pathlib import Path; "
+            "Path(__import__('sys').argv[1]).open('a').write('external' + chr(92) + 'n')"
+        )
+        subprocess.run(
+            [sys.executable, "-c", append_command, str(history)],
+            env=external_env,
+            start_new_session=True,
+            check=True,
+        )
+
+        live_home_write_guard.declare_external_mutation(history, kind="append")
+        subprocess.run(
+            [sys.executable, "-c", append_command, str(history)],
+            env=external_env,
+            start_new_session=True,
+            check=True,
+        )
+
+        with pytest.raises(AssertionError, match="tests wrote to live zeta home"):
+            live_home_write_guard.assert_clean()
     finally:
         live_home_write_guard.reset()
 
@@ -104,6 +176,7 @@ def test_teardown_guard_rejects_stripped_home_child(
             ],
             check=True,
             env=child_env,
+            start_new_session=True,
         )
 
         with pytest.raises(AssertionError, match="tests wrote to live zeta home"):
@@ -148,6 +221,60 @@ def test_teardown_guard_rejects_tmux_pane_without_home(
             check=True,
         )
         assert history.exists()
+
+        with pytest.raises(AssertionError, match="tests wrote to live zeta home"):
+            live_home_write_guard.assert_clean()
+    finally:
+        subprocess.run(
+            ["tmux", "-L", socket, "kill-session", "-t", session],
+            check=False,
+        )
+        live_home_write_guard.reset()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+def test_teardown_guard_rejects_tmux_session_manager_child(
+    tmp_path: Path, live_home_write_guard
+) -> None:
+    live_home = tmp_path / "home" / ".zeta"
+    live_home.mkdir(parents=True)
+    live_home_write_guard.watch(live_home)
+    socket = f"zeta-test-session-manager-{os.getpid()}"
+    session = f"zeta-guard-session-manager-{os.getpid()}"
+    child_env = os.environ.copy()
+    child_env.pop("ZETA_HOME")
+    child_env["HOME"] = str(live_home.parent)
+    child_code = (
+        "from zeta.core.session import SessionManager; "
+        "SessionManager().create(provider='fake', model='fake')"
+    )
+    command = (
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(child_code)}; "
+        f"tmux -L {shlex.quote(socket)} wait-for -S zeta-session-manager-ready; "
+        "sleep 5"
+    )
+
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "-L",
+                socket,
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "sh",
+                "-c",
+                command,
+            ],
+            check=True,
+            env=child_env,
+        )
+        subprocess.run(
+            ["tmux", "-L", socket, "wait-for", "zeta-session-manager-ready"],
+            check=True,
+        )
 
         with pytest.raises(AssertionError, match="tests wrote to live zeta home"):
             live_home_write_guard.assert_clean()
