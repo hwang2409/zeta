@@ -15,6 +15,7 @@ from ...core.slash import (
     compaction_history,
 )
 from ...core.todo import todo_count_tuple
+from ...mcp.prompt_commands import SlashModelInput
 from ..models import validate_model_name
 
 
@@ -100,17 +101,46 @@ class SlashHandlerMixin:
             return f"model: {model} ({'; '.join(notes)})"
         return f"model: {model}"
 
-    def slash_plan(self, args: str) -> str:
-        """Show or change plan mode, which restricts the agent to reading."""
+    def slash_plan(self, args: str) -> str | SlashModelInput:
+        """Toggle plan mode or submit a prompt while entering it."""
 
-        requested = args.strip().lower()
-        if not args:
-            return f"plan mode: {'on' if self.loop.plan_mode else 'off'}"
-        if requested not in {"on", "off", "toggle"}:
-            return "plan mode unchanged: use /plan on, /plan off, or /plan toggle"
-        enabled = (
-            not self.loop.plan_mode if requested == "toggle" else requested == "on"
-        )
+        requested = args.strip()
+        normalized = requested.lower()
+        if not requested:
+            return self._set_plan_mode_from_command(not self.loop.plan_mode)
+        if normalized == "off":
+            return self._set_plan_mode_from_command(False)
+        if normalized == "on":
+            return self._set_plan_mode_from_command(True)
+        if normalized == "toggle":
+            return self._set_plan_mode_from_command(not self.loop.plan_mode)
+        if self.active or self.pending_approvals:
+            return (
+                "plan mode unchanged: cannot change plan mode while a turn or "
+                "approval is active"
+            )
+        if not self.loop.plan_mode:
+            self.loop.set_plan_mode(True)
+            self._invalidate_prompt()
+        return SlashModelInput(requested)
+
+    def slash_implement(self, args: str) -> str | SlashModelInput:
+        """Exit plan mode and submit the explicit implementation request."""
+
+        if args:
+            return "implement unchanged: /implement does not accept arguments"
+        if not self.loop.plan_mode:
+            return "implement unavailable: plan mode is off"
+        if self.active or self.pending_approvals:
+            return (
+                "implement unavailable: cannot leave plan mode while a turn or "
+                "approval is active"
+            )
+        self.loop.set_plan_mode(False)
+        self._invalidate_prompt()
+        return SlashModelInput("implement the plan you proposed above")
+
+    def _set_plan_mode_from_command(self, enabled: bool) -> str:
         if enabled == self.loop.plan_mode:
             return f"plan mode: {'on' if enabled else 'off'}"
         if self.active or self.pending_approvals:
@@ -121,7 +151,7 @@ class SlashHandlerMixin:
         self.loop.set_plan_mode(enabled)
         self._invalidate_prompt()
         if enabled:
-            return "plan mode: on (read-only tools until you approve a plan)"
+            return "plan mode: on (read-only tools; deliver the plan as your answer)"
         return "plan mode: off"
 
     def toggle_plan_mode(self) -> None:

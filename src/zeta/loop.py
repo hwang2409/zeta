@@ -52,7 +52,6 @@ from .tools.agent_presets import (
     get_agent_preset,
 )
 from .tools.plan_mode import (
-    EXIT_PLAN_MODE,
     PLAN_MODE_PREAMBLE,
     PLAN_MODE_TOOLS,
 )
@@ -340,7 +339,7 @@ class AgentLoop:
             return
         if enabled:
             self._plan_mode_prior_deny = policy.always_deny
-            allowed = PLAN_MODE_TOOLS | {EXIT_PLAN_MODE}
+            allowed = PLAN_MODE_TOOLS | {"agent"}
             policy.always_deny = policy.always_deny | {
                 name
                 for name in self.tool_registry.definitions_by_name
@@ -354,26 +353,11 @@ class AgentLoop:
         """Return the schemas this turn advertises, honoring plan mode."""
 
         if not self._plan_mode:
-            return [
-                schema
-                for schema in self.tool_schemas
-                if schema.get("name") != EXIT_PLAN_MODE
-            ]
-        allowed = PLAN_MODE_TOOLS | {EXIT_PLAN_MODE}
+            return list(self.tool_schemas)
+        allowed = PLAN_MODE_TOOLS | {"agent"}
         return [
             schema for schema in self.tool_schemas if schema.get("name") in allowed
         ]
-
-    def _approved_plan_exit(self, calls: Sequence[ToolCall]) -> bool:
-        """Report whether this batch carried an approved exit_plan_mode call."""
-
-        for call in calls:
-            if call.name != EXIT_PLAN_MODE:
-                continue
-            result = self._existing_tool_result(call.id)
-            if result is not None and not result.is_error:
-                return True
-        return False
 
     def set_model(self, model: str) -> None:
         """Set the model used by subsequent provider completions."""
@@ -1030,8 +1014,6 @@ class AgentLoop:
                     yield event
             finally:
                 await dispatch.aclose()
-            if self._plan_mode and self._approved_plan_exit(calls):
-                self.set_plan_mode(False)
             yield StreamEvent(
                 StreamEventType.TURN_END,
                 message=assistant_message,

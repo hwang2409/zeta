@@ -231,6 +231,21 @@ async def run_agent_tool(
             "agent error: background must be a boolean",
             error=True,
         )
+    preset = get_agent_preset(agent_type)
+    if preset is None:
+        return loop._child_result_payload(
+            tool_call.id,
+            "agent error: unknown agent_type "
+            f"{agent_type!r}; expected one of: {', '.join(agent_type_names())}",
+            error=True,
+        )
+    if loop.plan_mode and preset.name == GENERAL_PRESET.name:
+        return loop._child_result_payload(
+            tool_call.id,
+            "agent error: general agents are unavailable in plan mode; "
+            "use agent_type 'explore' or 'plan'",
+            error=True,
+        )
     child_backend, backend_error = resolve_child_backend(loop, model)
     if backend_error is not None:
         return loop._child_result_payload(
@@ -243,14 +258,6 @@ async def run_agent_tool(
         return loop._child_result_payload(
             tool_call.id,
             nesting_error,
-            error=True,
-        )
-    preset = get_agent_preset(agent_type)
-    if preset is None:
-        return loop._child_result_payload(
-            tool_call.id,
-            "agent error: unknown agent_type "
-            f"{agent_type!r}; expected one of: {', '.join(agent_type_names())}",
             error=True,
         )
     agent_tree = loop._agent_tree or AgentTree()
@@ -330,6 +337,8 @@ async def run_agent_tool(
         agent_tree=agent_tree,
         background_owner=loop._background_owner,
     )
+    if loop.plan_mode:
+        child_loop.set_plan_mode(True)
     child_loop.set_background_event_sink(loop._publish_background_event)
     lifecycle_sink = (
         execution_context.lifecycle_sink if execution_context is not None else None

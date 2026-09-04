@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 from zeta.cli import build_parser
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
@@ -12,7 +14,8 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
-from zeta.tools.plan_mode import EXIT_PLAN_MODE, PLAN_MODE_TOOLS
+from zeta.mcp.prompt_commands import SlashModelInput
+from zeta.tools.plan_mode import PLAN_MODE_TOOLS
 from zeta.tui.app import create_app
 from zeta.tui.render import format_status
 from zeta.types import StreamEvent, TextContent, ToolCall
@@ -39,14 +42,25 @@ def build_loop(tmp_path: Path, turns: list[ScriptedTurn]) -> AgentLoop:
     )
 
 
+def build_app(tmp_path: Path, turns: list[ScriptedTurn]):
+    from zeta.tui.app import TUIApp
+
+    return TUIApp(
+        build_loop(tmp_path, turns),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+    )
+
+
 # --- schema exposure -------------------------------------------------------
 
 
-async def test_exit_plan_mode_is_hidden_outside_plan_mode(tmp_path: Path) -> None:
+async def test_plan_mode_has_no_exit_tool(tmp_path: Path) -> None:
     loop = build_loop(tmp_path, [ScriptedTurn(content=[TextContent("ok")])])
     await collect(loop.run_turn("hi"))
     _, schemas = loop.backend.calls[0]
-    assert EXIT_PLAN_MODE not in schema_names(schemas)
+    assert "exit_plan_mode" not in schema_names(schemas)
     assert "bash" in schema_names(schemas)
 
 
@@ -58,8 +72,8 @@ async def test_plan_mode_narrows_the_schemas_the_provider_sees(
     await collect(loop.run_turn("hi"))
     _, schemas = loop.backend.calls[0]
     names = schema_names(schemas)
-    assert names == PLAN_MODE_TOOLS | {EXIT_PLAN_MODE}
-    assert not names & {"bash", "edit", "write", "exec", "agent"}
+    assert names == PLAN_MODE_TOOLS | {"agent"}
+    assert not names & {"bash", "edit", "write", "exec"}
 
 
 async def test_leaving_plan_mode_restores_the_full_schemas(tmp_path: Path) -> None:
@@ -76,7 +90,7 @@ async def test_leaving_plan_mode_restores_the_full_schemas(tmp_path: Path) -> No
     await collect(loop.run_turn("again"))
     assert "bash" not in schema_names(loop.backend.calls[0][1])
     assert "bash" in schema_names(loop.backend.calls[1][1])
-    assert EXIT_PLAN_MODE not in schema_names(loop.backend.calls[1][1])
+    assert "exit_plan_mode" not in schema_names(loop.backend.calls[1][1])
 
 
 def test_plan_mode_is_idempotent(tmp_path: Path) -> None:
@@ -103,7 +117,8 @@ def test_plan_mode_wraps_and_restores_the_system_prompt(tmp_path: Path) -> None:
         if isinstance(block, TextContent)
     )
     assert "PLAN MODE" in text
-    assert EXIT_PLAN_MODE in text
+    assert "deliver" in text
+    assert "approve" not in text
     loop.set_plan_mode(False)
     assert loop.context_assembler.system_prompt is original
 
@@ -119,74 +134,122 @@ def test_plan_mode_denies_the_mutating_tools(tmp_path: Path) -> None:
 
     loop.set_plan_mode(True)
     for name in ("bash", "edit", "write", "exec", "agent"):
-        assert policy.decide(name, {}) is ApprovalDecision.DENY, name
+        if name == "agent":
+            assert policy.decide(name, {}) is not ApprovalDecision.DENY, name
+        else:
+            assert policy.decide(name, {}) is ApprovalDecision.DENY, name
     for name in sorted(PLAN_MODE_TOOLS):
         assert policy.decide(name, {}) is not ApprovalDecision.DENY, name
-    assert policy.decide(EXIT_PLAN_MODE, {}) is not ApprovalDecision.DENY
 
     loop.set_plan_mode(False)
     assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
 
 
-# --- the approve / reject transition ---------------------------------------
+# --- turn boundaries and persistence --------------------------------------
 
 
-async def test_approved_plan_leaves_plan_mode_and_restores_tools(
+async def test_plan_delivery_ends_the_turn_without_implementation(
     tmp_path: Path,
 ) -> None:
     loop = build_loop(
         tmp_path,
-        [
-            ScriptedTurn(
-                tool_calls=[
-                    ToolCall("call-1", EXIT_PLAN_MODE, {"plan": "1. do the thing"})
-                ]
-            ),
-            ScriptedTurn(content=[TextContent("done")]),
-        ],
-    )
-    loop.set_plan_mode(True)
-    await collect(loop.run_turn("plan it"))
-    assert loop.plan_mode is False
-    # The turn after approval carries the plan out with the full tool set.
-    assert "bash" in schema_names(loop.backend.calls[1][1])
-
-
-async def test_a_rejected_plan_keeps_plan_mode_on(tmp_path: Path) -> None:
-    backend = FakeBackend(
-        [
-            ScriptedTurn(
-                tool_calls=[ToolCall("call-1", EXIT_PLAN_MODE, {"plan": "x"})]
-            ),
-            ScriptedTurn(content=[TextContent("revising")]),
-        ]
-    )
-    store = ConversationStore(tmp_path, cwd=str(tmp_path))
-    loop = AgentLoop(
-        backend,
-        store,
-        approval_policy=ApprovalPolicy(store=store, default=ApprovalDecision.DENY),
-        skip_mcp_mount=True,
+        [ScriptedTurn(content=[TextContent("1. do the thing")])],
     )
     loop.set_plan_mode(True)
     await collect(loop.run_turn("plan it"))
     assert loop.plan_mode is True
-    assert "bash" not in schema_names(backend.calls[1][1])
+    assert len(loop.backend.calls) == 1
 
 
-async def test_an_empty_plan_does_not_leave_plan_mode(tmp_path: Path) -> None:
+async def test_plan_mode_persists_across_follow_up_turns(tmp_path: Path) -> None:
     loop = build_loop(
         tmp_path,
         [
-            ScriptedTurn(
-                tool_calls=[ToolCall("call-1", EXIT_PLAN_MODE, {"plan": "   "})]
-            ),
-            ScriptedTurn(content=[TextContent("retry")]),
+            ScriptedTurn(content=[TextContent("first plan")]),
+            ScriptedTurn(content=[TextContent("revised plan")]),
         ],
     )
     loop.set_plan_mode(True)
     await collect(loop.run_turn("plan it"))
+    await collect(loop.run_turn("revise it"))
     assert loop.plan_mode is True
+    assert all(
+        schema_names(call[1]) == PLAN_MODE_TOOLS | {"agent"}
+        for call in loop.backend.calls
+    )
+
+
+async def test_plan_prompt_enters_mode_and_submits_in_one_action(
+    tmp_path: Path,
+) -> None:
+    app = build_app(tmp_path, [ScriptedTurn(content=[TextContent("the plan")])])
+    await app._handle_prompt_value("/plan inspect the repository")
+    assert app._active_task is not None
+    await app._active_task
+
+    assert app.loop.plan_mode is True
+    assert len(app.loop.backend.calls) == 1
+    user_message = next(
+        message
+        for message in app.loop.backend.calls[0][0]
+        if message.role.value == "user"
+    )
+    assert user_message.content[0].text == "inspect the repository"
+
+
+async def test_implement_exits_plan_mode_on_a_later_turn(
+    tmp_path: Path,
+) -> None:
+    app = build_app(
+        tmp_path,
+        [
+            ScriptedTurn(content=[TextContent("the plan")]),
+            ScriptedTurn(content=[TextContent("implemented")]),
+        ],
+    )
+    await app._handle_prompt_value("/plan inspect the repository")
+    assert app._active_task is not None
+    await app._active_task
+    assert app.loop.plan_mode is True
+
+    await app._handle_prompt_value("/implement")
+    assert app._active_task is not None
+    await app._active_task
+
+    assert app.loop.plan_mode is False
+    assert len(app.loop.backend.calls) == 2
+    second_user_message = [
+        message
+        for message in app.loop.backend.calls[1][0]
+        if message.role.value == "user"
+    ][-1]
+    assert second_user_message.content[0].text == (
+        "implement the plan you proposed above"
+    )
+    assert "bash" in schema_names(app.loop.backend.calls[1][1])
+
+
+async def test_general_sub_agents_are_rejected_in_plan_mode(tmp_path: Path) -> None:
+    loop = build_loop(
+        tmp_path,
+        [],
+    )
+    loop.set_plan_mode(True)
+    result = await loop.tool_registry.execute(
+        ToolCall(
+            "call-1",
+            "agent",
+            {
+                "prompt": "inspect this",
+                "description": "inspect this",
+                "agent_type": "general",
+            },
+        )
+    )
+    assert result["isError"] is True
+    assert "general agents are unavailable in plan mode" in result["content"][0][
+        "text"
+    ]
 
 
 # --- the /plan command -----------------------------------------------------
@@ -206,7 +269,7 @@ class PlanSession:
         return None
 
 
-def dispatch(session: object, value: str) -> str | None:
+def dispatch(session: object, value: str) -> str | SlashModelInput | None:
     return create_slash_registry().dispatch(session, value)
 
 
@@ -217,27 +280,29 @@ def test_plan_command_reports_and_toggles() -> None:
         pass
 
     session = Session()
-    assert dispatch(session, "/plan") == "plan mode: off"
-    assert dispatch(session, "/plan on") == (
-        "plan mode: on (read-only tools until you approve a plan)"
+    assert dispatch(session, "/plan") == (
+        "plan mode: on (read-only tools; deliver the plan as your answer)"
     )
     assert session.plan_mode is True
-    assert dispatch(session, "/plan") == "plan mode: on"
-    assert dispatch(session, "/plan toggle") == "plan mode: off"
+    assert dispatch(session, "/plan") == "plan mode: off"
+    assert dispatch(session, "/plan on") == (
+        "plan mode: on (read-only tools; deliver the plan as your answer)"
+    )
+    assert dispatch(session, "/plan off") == "plan mode: off"
     assert session.plan_mode is False
 
 
-def test_plan_command_rejects_an_unknown_argument() -> None:
+def test_plan_command_submits_prompt_when_text_is_present() -> None:
     from zeta.tui.slash_handlers import SlashHandlerMixin
 
     class Session(SlashHandlerMixin, PlanSession):
         pass
 
     session = Session()
-    assert dispatch(session, "/plan sideways") == (
-        "plan mode unchanged: use /plan on, /plan off, or /plan toggle"
-    )
-    assert session.plan_mode is False
+    result = dispatch(session, "/plan inspect the repository")
+    assert isinstance(result, SlashModelInput)
+    assert result.text == "inspect the repository"
+    assert session.plan_mode is True
 
 
 def test_plan_command_refuses_while_a_turn_is_active() -> None:
@@ -257,6 +322,21 @@ def test_plan_command_refuses_while_a_turn_is_active() -> None:
 
 def test_plan_command_is_listed_in_help() -> None:
     assert "/plan" in create_slash_registry().help_text()
+    assert "/implement" in create_slash_registry().help_text()
+
+
+def test_implement_exits_and_submits_the_explicit_request() -> None:
+    from zeta.tui.slash_handlers import SlashHandlerMixin
+
+    class Session(SlashHandlerMixin, PlanSession):
+        pass
+
+    session = Session()
+    session.set_plan_mode(True)
+    result = dispatch(session, "/implement")
+    assert isinstance(result, SlashModelInput)
+    assert result.text == "implement the plan you proposed above"
+    assert session.plan_mode is False
 
 
 # --- surfaces --------------------------------------------------------------
@@ -275,7 +355,7 @@ def test_status_bar_omits_the_plan_segment_when_off() -> None:
     assert "PLAN" not in rendered.plain
 
 
-def test_yolo_still_asks_before_leaving_plan_mode(
+def test_yolo_has_no_plan_mode_approval_flow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
@@ -285,7 +365,6 @@ def test_yolo_still_asks_before_leaving_plan_mode(
     policy = app.loop.tool_registry.approval_policy
     assert policy is not None
     assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
-    assert policy.decide(EXIT_PLAN_MODE, {}) is ApprovalDecision.ASK
 
 
 def test_status_command_reports_plan_mode(
@@ -376,7 +455,9 @@ def test_key_toggle_reports_through_the_same_path_as_the_command() -> None:
     session = Session()
     session.toggle_plan_mode()
     assert session.plan_mode is True
-    assert printed == ["plan mode: on (read-only tools until you approve a plan)"]
+    assert printed == [
+        "plan mode: on (read-only tools; deliver the plan as your answer)"
+    ]
     session.toggle_plan_mode()
     assert session.plan_mode is False
     assert printed[-1] == "plan mode: off"

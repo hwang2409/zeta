@@ -40,7 +40,6 @@ from ..persistence import DraftPersistence, history_for
 from ..providers.factory import build_backend as build_network_backend
 from ..submission_pipeline import SubmissionPipeline
 from ..tools.exec import trusted_macro_display
-from ..tools.plan_mode import EXIT_PLAN_MODE
 from ..types import (
     CompletionBackend,
     Message,
@@ -984,9 +983,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
     approval_default = (
         ApprovalDecision.ALLOW if getattr(args, "yolo", False) else ApprovalDecision.ASK
     )
-    approval_policy = ApprovalPolicy(
-        store=store, default=approval_default, always_ask={EXIT_PLAN_MODE}
-    )
+    approval_policy = ApprovalPolicy(store=store, default=approval_default)
     pending_override = None
     if resuming and mismatches:
         pending_override = (
