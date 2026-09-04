@@ -1,46 +1,78 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Generator
-from hashlib import sha256
 from pathlib import Path
 
 import httpx
 import pytest
 from rich.console import Console
 
-
 LIVE_ZETA_HOME = Path.home() / ".zeta"
 
 
-def _persistence_snapshot() -> dict[Path, tuple[object, ...]]:
-    paths = [LIVE_ZETA_HOME / "history"]
-    sessions_dir = LIVE_ZETA_HOME / "sessions"
-    if sessions_dir.is_dir():
-        paths.extend(sessions_dir.glob("*/draft"))
-    snapshot: dict[Path, tuple[object, ...]] = {}
-    for path in paths:
-        try:
-            metadata = path.stat()
-            content = sha256(path.read_bytes()).digest()
-        except FileNotFoundError:
-            continue
-        snapshot[path] = (
-            metadata.st_mode,
-            metadata.st_ino,
-            metadata.st_size,
-            metadata.st_mtime_ns,
-            metadata.st_ctime_ns,
-            content,
-        )
-    return snapshot
+class LiveHomeWriteGuard:
+    """Attribute live-home writes to this test process."""
+
+    def __init__(self, live_home: Path) -> None:
+        self._original_live_home = live_home
+        self.live_home = live_home
+        self.writes: set[Path] = set()
+
+    def audit(self, event: str, args: tuple[object, ...]) -> None:
+        if event == "open":
+            if not args or not isinstance(args[0], (str, bytes)):
+                return
+            mode = args[1] if len(args) > 1 else None
+            flags = args[2] if len(args) > 2 else 0
+            if not (isinstance(mode, str) and any(marker in mode for marker in "wax+")) and not (
+                isinstance(flags, int) and flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT)
+            ):
+                return
+            paths = (args[0],)
+        elif event in {"os.mkdir", "os.remove", "os.rename", "os.replace", "os.rmdir"}:
+            paths = args[:2]
+        else:
+            return
+        for candidate in paths:
+            if not isinstance(candidate, (str, bytes)):
+                continue
+            try:
+                path = Path(candidate).expanduser().resolve()
+                path.relative_to(self.live_home.resolve())
+            except (OSError, RuntimeError, ValueError):
+                continue
+            self.writes.add(path)
+
+    def assert_clean(self) -> None:
+        assert not self.writes, f"tests wrote to live zeta home: {sorted(self.writes)}"
+
+    def clear(self) -> None:
+        self.writes.clear()
+
+    def watch(self, live_home: Path) -> None:
+        self.live_home = live_home
+        self.clear()
+
+    def reset(self) -> None:
+        self.watch(self._original_live_home)
+
+
+@pytest.fixture(scope="session")
+def live_home_write_guard() -> LiveHomeWriteGuard:
+    guard = LiveHomeWriteGuard(LIVE_ZETA_HOME)
+    sys.addaudithook(guard.audit)
+    return guard
 
 
 @pytest.fixture(scope="session", autouse=True)
-def isolate_zeta_home(tmp_path_factory: pytest.TempPathFactory) -> Generator[None, None, None]:
+def isolate_zeta_home(
+    tmp_path_factory: pytest.TempPathFactory,
+    live_home_write_guard: LiveHomeWriteGuard,
+) -> Generator[None, None, None]:
     """Keep every test away from the developer's real zeta home."""
 
-    live_persistence = _persistence_snapshot()
     isolated_home = tmp_path_factory.mktemp("zeta-home")
     fake_home = isolated_home.parent / "home"
     with pytest.MonkeyPatch.context() as monkeypatch:
@@ -48,9 +80,7 @@ def isolate_zeta_home(tmp_path_factory: pytest.TempPathFactory) -> Generator[Non
         monkeypatch.setenv("HOME", str(fake_home))
         yield
         assert Path(os.environ["ZETA_HOME"]) != LIVE_ZETA_HOME
-        assert _persistence_snapshot() == live_persistence, (
-            "tests changed live zeta history or draft state"
-        )
+        live_home_write_guard.assert_clean()
 
 
 @pytest.fixture(autouse=True)
