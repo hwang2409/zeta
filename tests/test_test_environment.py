@@ -26,6 +26,10 @@ def test_test_home_is_isolated() -> None:
     assert Path(os.environ["ZETA_HOME"]) != LIVE_ZETA_HOME
 
 
+def test_teardown_guard_defaults_to_live_zeta_home(live_home_write_guard) -> None:
+    assert live_home_write_guard.live_home == LIVE_ZETA_HOME.resolve()
+
+
 def test_path_home_follows_home_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -46,8 +50,6 @@ def test_teardown_guard_allows_external_live_history_writer(
 
     try:
         live_home_write_guard.declare_external_mutation(history, kind="append")
-        external_env = os.environ.copy()
-        external_env.pop("ZETA_TEST_OWNERSHIP_TOKEN")
         subprocess.run(
             [
                 sys.executable,
@@ -58,7 +60,7 @@ def test_teardown_guard_allows_external_live_history_writer(
                 ),
                 str(history),
             ],
-            env=external_env,
+            env={},
             start_new_session=True,
             check=True,
         )
@@ -78,8 +80,6 @@ def test_teardown_guard_rejects_undeclared_external_live_history_writer(
     live_home_write_guard.watch(live_home)
 
     try:
-        external_env = os.environ.copy()
-        external_env.pop("ZETA_TEST_OWNERSHIP_TOKEN")
         subprocess.run(
             [
                 sys.executable,
@@ -90,7 +90,7 @@ def test_teardown_guard_rejects_undeclared_external_live_history_writer(
                 ),
                 str(history),
             ],
-            env=external_env,
+            env={},
             start_new_session=True,
             check=True,
         )
@@ -111,15 +111,13 @@ def test_teardown_guard_rejects_unattributed_append_before_external_append(
     live_home_write_guard.watch(live_home)
 
     try:
-        external_env = os.environ.copy()
-        external_env.pop("ZETA_TEST_OWNERSHIP_TOKEN")
         append_command = (
             "from pathlib import Path; "
             "Path(__import__('sys').argv[1]).open('a').write('external' + chr(92) + 'n')"
         )
         subprocess.run(
             [sys.executable, "-c", append_command, str(history)],
-            env=external_env,
+            env={},
             start_new_session=True,
             check=True,
         )
@@ -127,7 +125,7 @@ def test_teardown_guard_rejects_unattributed_append_before_external_append(
         live_home_write_guard.declare_external_mutation(history, kind="append")
         subprocess.run(
             [sys.executable, "-c", append_command, str(history)],
-            env=external_env,
+            env={},
             start_new_session=True,
             check=True,
         )
