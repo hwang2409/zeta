@@ -22,11 +22,44 @@ class TodoWidget(UIControl):
 
     def __init__(self, store: ConversationStore) -> None:
         self.store = store
+        self._last_revision = store.todo_revision
+        self._dismissed = False
+
+    def turn_boundary(self) -> None:
+        """Hide a completed receipt when the next model turn begins."""
+
+        self._sync_state()
+        if self._is_terminal(self.store.todo_items()):
+            self._dismissed = True
+
+    @property
+    def visible(self) -> bool:
+        """Return whether the widget has content to render."""
+
+        self._sync_state()
+        return bool(self.store.todo_items()) and not self._dismissed
+
+    def _sync_state(self) -> None:
+        revision = self.store.todo_revision
+        if revision != self._last_revision:
+            self._last_revision = revision
+            self._dismissed = False
+
+    @staticmethod
+    def _is_terminal(items: list[TodoItem]) -> bool:
+        return bool(items) and all(
+            item["status"] not in {"pending", "in_progress"} for item in items
+        )
 
     def _render_lines(
         self, width: int, max_height: int | None = None
     ) -> list[StyleAndTextTuples]:
+        self._sync_state()
         items = self.store.todo_items()
+        if self._dismissed:
+            return []
+        if self._is_terminal(items):
+            return [[(f"fg:{DIM}", f"todos done ({len(items)})")]]
         if max_height is not None and max_height <= 0:
             return []
         visible_rows = min(VISIBLE_ROWS, len(items))

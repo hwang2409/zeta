@@ -285,6 +285,59 @@ def test_todo_widget_hides_empty_lists_and_bounds_visible_rows(tmp_path: Path) -
     assert all(len(line) <= 80 for line in rendered)
 
 
+def test_todo_widget_collapses_completed_list_and_dismisses_at_boundary(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    widget = TodoWidget(store)
+    store.set_todo_items(
+        [
+            {"content": "first", "status": "completed"},
+            {"content": "second", "status": "completed"},
+        ]
+    )
+
+    content = widget.create_content(80, 20)
+    assert content.line_count == 1
+    assert "todos done (2)" in "".join(fragment[1] for fragment in content.get_line(0))
+    assert widget.visible
+
+    widget.turn_boundary()
+
+    assert not widget.visible
+    assert widget.create_content(80, 20).line_count == 0
+
+
+def test_todo_widget_repins_after_a_new_write(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    widget = TodoWidget(store)
+    store.set_todo_items([{"content": "done", "status": "completed"}])
+    widget.create_content(80, 20)
+    widget.turn_boundary()
+    assert not widget.visible
+
+    store.set_todo_items([{"content": "new", "status": "pending"}])
+
+    assert widget.visible
+    assert widget.create_content(80, 20).line_count == 1
+
+
+def test_todo_widget_keeps_mixed_lists_pinned(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    widget = TodoWidget(store)
+    store.set_todo_items(
+        [
+            {"content": "done", "status": "completed"},
+            {"content": "work", "status": "in_progress"},
+        ]
+    )
+
+    widget.turn_boundary()
+
+    assert widget.visible
+    assert widget.create_content(80, 20).line_count == 2
+
+
 @pytest.mark.asyncio
 async def test_todo_widget_keeps_overflow_summary_in_an_80_by_24_terminal(
     tmp_path: Path,

@@ -60,6 +60,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
         self._todo_items: list[TodoItem] = []
+        self._todo_revision = 0
         self._agent_counter = 0
         self._agent_children: dict[str, dict[str, Any]] = {}
         self._agent_parent: dict[str, Any] | None = None
@@ -186,6 +187,12 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
 
         return [dict(item) for item in self._todo_items]
 
+    @property
+    def todo_revision(self) -> int:
+        """Return the in-process revision of the todo list."""
+
+        return self._todo_revision
+
     def set_todo_items(self, items: object) -> None:
         """Replace the session todo list in one atomic state-file update."""
 
@@ -194,6 +201,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             self._load()
             self._write_session_state(self.bash_cwd, normalized)
             self._todo_items = [dict(item) for item in normalized]
+            self._todo_revision += 1
 
     def _load_session_state(self) -> None:
         if not self.state_path.exists():
