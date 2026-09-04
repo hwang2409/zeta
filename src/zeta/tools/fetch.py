@@ -118,6 +118,9 @@ async def get_response(
     user_agent: str,
     max_bytes: int = MAX_RESPONSE_BYTES,
     params: Mapping[str, str] | None = None,
+    method: str = "GET",
+    data: Mapping[str, str] | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> httpx.Response:
     """Make a bounded, manually redirected request.
 
@@ -129,13 +132,18 @@ async def get_response(
     """
 
     try:
+        request_headers = {"User-Agent": user_agent}
+        if headers is not None:
+            request_headers.update(headers)
         async with httpx.AsyncClient(
             timeout=HTTP_TIMEOUT_SECONDS,
             follow_redirects=False,
             trust_env=False,
-            headers={"User-Agent": user_agent},
+            headers=request_headers,
         ) as client:
             current_url = url
+            current_method = method
+            current_data = data
             redirects_followed = 0
             while True:
                 _validate_url(current_url)
@@ -143,9 +151,10 @@ async def get_response(
                 private_target = _classify_target(addresses)
                 address = addresses[0]
                 async with client.stream(
-                    "GET",
+                    current_method,
                     _pinned_url(current_url, address),
                     params=params if redirects_followed == 0 else None,
+                    data=current_data,
                     headers={"Host": _host_header(current_url)},
                     extensions={"sni_hostname": urlsplit(current_url).hostname},
                 ) as response:
@@ -159,6 +168,9 @@ async def get_response(
                             raise ValueError(
                                 f"request failed: redirect limit exceeded ({MAX_REDIRECTS})"
                             )
+                        if response.status_code in {301, 302, 303}:
+                            current_method = "GET"
+                            current_data = None
                         current_url = urljoin(current_url, location)
                         redirects_followed += 1
                         continue
@@ -238,7 +250,7 @@ async def get_response(
                         response.status_code,
                         headers=headers,
                         content=b"".join(chunks),
-                        request=httpx.Request("GET", current_url),
+                        request=httpx.Request(current_method, current_url),
                         extensions={
                             **response.extensions,
                             _PRIVATE_TARGET_EXTENSION: private_target,
