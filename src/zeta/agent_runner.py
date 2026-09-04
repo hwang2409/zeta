@@ -53,6 +53,7 @@ async def consume_child(
     child_turns: Callable[[], int],
     update_turns: Callable[[int], None],
     update_step: Callable[[str], None],
+    update_tool_calls: Callable[[int], None],
     finish_lifecycle: Callable[[str, str], None],
     publish_lifecycle: Callable[..., None],
     child_result: Callable[..., dict[str, object]],
@@ -65,6 +66,7 @@ async def consume_child(
     cap_hit = False
     failure_message: str | None = None
     budget_exhausted = False
+    tool_calls = 0
 
     def terminal_result(
         result: dict[str, object], *, state: str, text: str
@@ -100,6 +102,8 @@ async def consume_child(
                     depth=lifecycle_depth(event.tool_call),
                 )
             elif event.type is StreamEventType.TOOL_EXECUTION_START:
+                tool_calls += 1
+                update_tool_calls(tool_calls)
                 name = event.tool_call.name if event.tool_call is not None else "tool"
                 arguments = (
                     event.tool_call.arguments if event.tool_call is not None else {}
@@ -463,6 +467,9 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(turns_used=turns)
         loop.store.update_agent_child_turns(child_marker_key, turns)
 
+    def update_tool_calls(tool_calls: int) -> None:
+        child_store.update_agent_lifecycle(tool_calls=tool_calls)
+
     child_task = loop._create_task(
         consume_child(
             child_loop,
@@ -472,6 +479,7 @@ async def run_agent_tool(
             publish=publish,
             child_turns=child_turns,
             update_turns=update_turns,
+            update_tool_calls=update_tool_calls,
             update_step=update_step,
             finish_lifecycle=finish_lifecycle,
             publish_lifecycle=publish_lifecycle,

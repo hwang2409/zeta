@@ -19,6 +19,31 @@ from .types import (
 )
 
 
+def _agent_stats(
+    lifecycle: dict[str, object] | None,
+    *,
+    status: str,
+    turns_used: int = 0,
+) -> dict[str, object]:
+    lifecycle = lifecycle or {}
+    elapsed = lifecycle.get("elapsed", 0.0)
+    if type(elapsed) not in {int, float} or elapsed < 0:
+        elapsed = 0.0
+    turns = lifecycle.get("turns_used", turns_used)
+    if type(turns) is not int or turns < 0:
+        turns = turns_used
+    tool_calls = lifecycle.get("tool_calls", 0)
+    if type(tool_calls) is not int or tool_calls < 0:
+        tool_calls = 0
+    return {
+        "turns_used": turns,
+        "elapsed": elapsed,
+        "tool_calls": tool_calls,
+        "error": status == "error",
+        "canceled": status == "canceled",
+    }
+
+
 class _AgentLoopForRecovery(Protocol):
     store: ConversationStore
     _background_owner: BackgroundAgentOwner
@@ -236,6 +261,7 @@ def _recover_nested_children(
         existing_result = _existing_tool_result(store, tool_call.id)
         notification_status: str | None = None
         notification_text: str | None = None
+        notification_stats: dict[str, object] | None = None
         if marker.get("background"):
             child_instance_id = marker.get(
                 "child_instance_id", f"{store.session_id}:{child_path.name}"
@@ -259,16 +285,25 @@ def _recover_nested_children(
                     if type(lifecycle_text) is str and lifecycle_text
                     else "background child canceled when the parent session exited"
                 )
+                notification_stats = _agent_stats(
+                    lifecycle,
+                    status=notification_status,
+                    turns_used=marker.get("turns_used", 0),
+                )
                 notification_store.append_agent_notification(
                     child_instance_id,
                     child_session_path=str(child_path),
                     description=marker["description"],
                     status=notification_status,
                     text=notification_text,
+                    stats=notification_stats,
                 )
             else:
                 notification_status = existing.data["status"]
                 notification_text = existing.data["text"]
+                existing_stats = existing.data.get("stats")
+                if type(existing_stats) is dict:
+                    notification_stats = existing_stats
             if (
                 notification_store is not store
                 and _agent_notification(store, child_instance_id) is None
@@ -283,6 +318,7 @@ def _recover_nested_children(
                         if notification_status == "canceled"
                         else "background child completed"
                     ),
+                    stats=notification_stats,
                 )
         elif not existing_result:
             lifecycle_result = (
@@ -367,12 +403,18 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                     if type(terminal_text) is str and terminal_text
                     else "background child canceled when the parent session exited"
                 )
+                recovered_stats = _agent_stats(
+                    lifecycle,
+                    status=recovered_status,
+                    turns_used=marker.get("turns_used", 0),
+                )
                 loop._background_owner.notification_store.append_agent_notification(
                     child_instance_id,
                     child_session_path=marker["child_session_path"],
                     description=marker["description"],
                     status=recovered_status,
                     text=recovered_text,
+                    stats=recovered_stats,
                 )
                 if loop._background_owner.notification_store is not loop.store:
                     loop.store.append_agent_notification(
@@ -381,6 +423,7 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                         description=marker["description"],
                         status=recovered_status,
                         text=recovered_text,
+                        stats=recovered_stats,
                     )
                 if child_store is not None:
                     if recovered_status == "canceled" and terminal_state != "canceled":
@@ -520,6 +563,11 @@ async def finish_background_child(
             description=description,
             status=status,
             text=notification_text or "background child completed",
+            stats=_agent_stats(
+                child_store.agent_lifecycle(),
+                status=status,
+                turns_used=child_turns(),
+            ),
         )
         if notification_store is not effective_parent_store:
             effective_parent_store.append_agent_notification(
@@ -528,6 +576,7 @@ async def finish_background_child(
                 description=description,
                 status=status,
                 text=notification_text or "background child completed",
+                stats=notification.data.get("stats"),
             )
         effective_parent_store.finish_agent_child(marker_key or tool_call.id)
         terminal_payload = build_result(

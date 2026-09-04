@@ -48,7 +48,7 @@ from .theme import (
     THOUGHT,
     VIM_STATE,
 )
-from .agent_card import AgentCard
+from .agent_card import AgentCard, format_agent_stats
 
 
 MAX_ARGUMENTS = 140
@@ -978,8 +978,9 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         if not all(type(value) is str for value in (description, status, text, path)):
             return Text("background agent notification unavailable", style=ERROR)
         style = ERROR if status in {"error", "canceled"} else RECEIPT
+        stats_suffix = format_agent_stats(event.data.get("stats"))
         return Text(
-            f"background · {description} · {status} · {text} · {path}",
+            f"background · {description} · {status} · {text}{stats_suffix} · {path}",
             style=style,
             overflow="ellipsis",
         )

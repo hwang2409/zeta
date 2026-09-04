@@ -1055,6 +1055,7 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
     child_schemas = {schema["name"] for schema in backend.calls[1][1]}
     assert child_schemas == {
         "agent",
+        "agent_output",
         "agent_status",
         "fetch",
         "read",
@@ -1148,6 +1149,7 @@ async def test_plan_child_includes_todo_and_only_read_only_tools(tmp_path: Path)
 
     assert {schema["name"] for schema in backend.calls[1][1]} == {
         "agent",
+        "agent_output",
         "agent_status",
         "fetch",
         "read",
@@ -1468,6 +1470,7 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
     grandchild_tools = {schema["name"] for schema in backend.calls[2][1]}
     assert child_tools == {
         "agent",
+        "agent_output",
         "agent_status",
         "fetch",
         "read",
@@ -1476,6 +1479,7 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
     }
     assert grandchild_tools == {
         "agent_status",
+        "agent_output",
         "fetch",
         "read",
         "skill",

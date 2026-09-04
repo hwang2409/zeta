@@ -48,6 +48,40 @@ def _arguments(arguments: dict[str, Any]) -> str:
     return _truncate(" ".join(parts), MAX_ARGUMENTS)
 
 
+def _read_lifecycle(path: str) -> dict[str, Any]:
+    if not path:
+        return {}
+    try:
+        value = json.loads(
+            (Path(path) / "agent_lifecycle.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError, RecursionError):
+        return {}
+    return value if type(value) is dict else {}
+
+
+def format_agent_stats(stats: object) -> str:
+    if type(stats) is not dict:
+        return ""
+    turns = stats.get("turns_used")
+    elapsed = stats.get("elapsed")
+    tool_calls = stats.get("tool_calls")
+    error = stats.get("error")
+    canceled = stats.get("canceled")
+    if (
+        type(turns) is not int
+        or type(elapsed) not in {int, float}
+        or type(tool_calls) is not int
+        or type(error) is not bool
+        or type(canceled) is not bool
+    ):
+        return ""
+    return (
+        f" · {turns} turns · {elapsed:.1f}s · {tool_calls} tool calls"
+        f" · error={str(error).lower()} · canceled={str(canceled).lower()}"
+    )
+
+
 class AgentCard:
     """Own one agent card's rendering state, including its bounded tail."""
 
@@ -269,6 +303,13 @@ class AgentCard:
         result = event.tool_result
         if call is None or result is None or call.name.casefold() != "agent":
             return None
+        structured = result.structured_content or {}
+        child_path = structured.get("child_session_path")
+        lifecycle = _read_lifecycle(child_path if type(child_path) is str else "")
+        if lifecycle:
+            lifecycle_elapsed = lifecycle.get("elapsed")
+            if type(lifecycle_elapsed) in {int, float} and lifecycle_elapsed >= 0:
+                elapsed_seconds = float(lifecycle_elapsed)
         elapsed = elapsed_seconds
         if elapsed is None:
             value = event.data.get("elapsed_seconds")
@@ -297,7 +338,6 @@ class AgentCard:
             ):
                 display_depth = value
         turns = turns or 0
-        structured = result.structured_content or {}
         structured_status = structured.get("status")
         if structured_status in {"running", "completed", "error", "canceled"}:
             status = structured_status
@@ -307,10 +347,20 @@ class AgentCard:
             )
         agent_type = cls._agent_type(call)
         prefix = f"{agent_type} · " if agent_type else ""
+        stats_suffix = ""
+        tool_call_count = lifecycle.get("tool_calls")
+        if type(tool_call_count) is int and tool_call_count >= 0:
+            state = lifecycle.get("state")
+            error = state in {"failed"} or result.is_error
+            canceled = state == "canceled" or status == "canceled"
+            stats_suffix = (
+                f" · {tool_call_count} tool calls · error={str(error).lower()}"
+                f" · canceled={str(canceled).lower()}"
+            )
         return Text(
             f"{prefix}{cls._description(call)} · {turns} turns · "
             f"{max(0.0, elapsed or 0.0):.1f}s · {status} · "
-            f"depth {display_depth} · expand: ctrl+x ctrl+o",
+            f"depth {display_depth}{stats_suffix} · expand: ctrl+x ctrl+o",
             style=ERROR if status in {"fail", "error", "canceled"} else RECEIPT,
             no_wrap=True,
             overflow="ellipsis",

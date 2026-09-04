@@ -11,12 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
+from ..core.checkpoints import ConversationIntegrityError
 from ..core.store import ConversationStore
 from ..model_catalog import known_model_names
 from ..types import (
     Message,
     MessageRole,
     StructuredContentValue,
+    TextContent,
     ToolCall,
     ToolUseContent,
 )
@@ -223,6 +225,107 @@ def _active_agent_receipts(store: object) -> dict[str, Path]:
     return receipts
 
 
+def _agent_output_text(message: Message) -> str:
+    parts: list[str] = []
+    for block in message.content:
+        if isinstance(block, TextContent):
+            parts.append(block.text)
+        elif isinstance(block, ToolUseContent):
+            arguments = json.dumps(
+                block.tool_call.arguments, ensure_ascii=False, sort_keys=True
+            )
+            parts.append(f"[tool call: {block.tool_call.name} {arguments}]")
+    if message.tool_result is not None and not parts:
+        parts.append(message.tool_result.content)
+    return "\n".join(parts)
+
+
+def _serialize_agent_transcript(messages: list[Message]) -> str:
+    lines: list[str] = []
+    for message in messages:
+        text = _agent_output_text(message)
+        if text:
+            lines.append(f"{message.role.value}: {text}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _agent_output_page(
+    output: str,
+    *,
+    handle: str,
+    offset: int,
+    limit: int | None,
+    max_bytes: int,
+) -> dict[str, object] | None:
+    total = len(output)
+    requested_end = total if limit is None else min(total, offset + limit)
+
+    def build(candidate: str, candidate_end: int) -> dict[str, object]:
+        block = text_block(candidate, full_size=len(output.encode("utf-8")))
+        block["full_size_chars"] = total
+        block["truncated"] = candidate_end < total
+        if candidate_end < total:
+            block["next_offset"] = candidate_end
+        return {
+            "content": [block],
+            "isError": False,
+            "structuredContent": {
+                "handle": handle,
+                "offset": offset,
+                "truncated": candidate_end < total,
+                "total": total,
+                **({"next_offset": candidate_end} if candidate_end < total else {}),
+            },
+        }
+
+    low = offset
+    high = requested_end
+    while low < high:
+        middle = (low + high + 1) // 2
+        result = build(output[offset:middle], middle)
+        if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= max_bytes:
+            low = middle
+        else:
+            high = middle - 1
+    result = build(output[offset:low], low)
+    return (
+        result
+        if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= max_bytes
+        else None
+    )
+
+
+def _read_agent_output(
+    store: object,
+    *,
+    requested_handle: str,
+    offset: int,
+    limit: int | None,
+    max_bytes: int,
+) -> dict[str, object]:
+    receipts = _active_agent_receipts(store)
+    child_path = receipts.get(requested_handle)
+    if child_path is None:
+        raise ValueError(f"unknown child handle: {requested_handle}")
+    try:
+        if not child_path.is_dir() or not (child_path / "conversation.jsonl").is_file():
+            raise OSError("child transcript is missing")
+        child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+        output = _serialize_agent_transcript(child_store.messages())
+    except (OSError, ValueError, ConversationIntegrityError) as exc:
+        raise ValueError(f"could not read child transcript: {child_path}") from exc
+    result = _agent_output_page(
+        output,
+        handle=requested_handle,
+        offset=offset,
+        limit=limit,
+        max_bytes=max_bytes,
+    )
+    if result is None:
+        raise ValueError("transcript page exceeds response limit")
+    return result
+
+
 def _read_agent_status(
     store: object,
     *,
@@ -267,6 +370,7 @@ def _read_agent_status(
                 stored_elapsed=lifecycle.get("elapsed"),
             ),
             "turns_used": lifecycle.get("turns_used", 0),
+            "tool_calls": lifecycle.get("tool_calls", 0),
             "tree_budget": lifecycle.get("tree_budget", 0),
             "current_step": _bounded_status_text(
                 lifecycle.get("current_step", "unknown"), MAX_AGENT_STATUS_STEP
@@ -396,6 +500,51 @@ async def _agent_status(
             "total": count,
         },
     }
+
+
+async def _agent_output(
+    registry: ToolRegistry,
+    arguments: dict[str, Any],
+    abort_signal: AbortSignal,
+    stream_publisher: object = None,
+    execution_context: ToolExecutionContext | None = None,
+) -> dict[str, object]:
+    del abort_signal, stream_publisher, execution_context
+    handle = arguments.get("handle")
+    if type(handle) is not str or not handle:
+        return {
+            "content": [text_block("agent error: handle must be a nonempty string")],
+            "isError": True,
+            "structuredContent": None,
+        }
+    offset = arguments.get("offset", 0)
+    limit = arguments.get("limit")
+    if type(offset) is not int or offset < 0:
+        return {
+            "content": [text_block("agent error: offset must be a nonnegative integer")],
+            "isError": True,
+            "structuredContent": None,
+        }
+    if limit is not None and (type(limit) is not int or limit < 1):
+        return {
+            "content": [text_block("agent error: limit must be a positive integer")],
+            "isError": True,
+            "structuredContent": None,
+        }
+    try:
+        return _read_agent_output(
+            registry.session_store,
+            requested_handle=handle,
+            offset=offset,
+            limit=limit,
+            max_bytes=registry.max_output_chars,
+        )
+    except (TypeError, ValueError) as exc:
+        return {
+            "content": [text_block(f"agent error: {exc}")],
+            "isError": True,
+            "structuredContent": None,
+        }
 
 
 def agent_result(
@@ -530,6 +679,38 @@ def register(registry: ToolRegistry) -> None:
                     "description": "Maximum number of children in this status page.",
                 },
             },
+            "additionalProperties": False,
+        },
+        parallel_safe=True,
+        requires_approval=False,
+    )
+    registry.register_session_tool(
+        "agent_output",
+        _agent_output,
+        description=(
+            "Read a child agent transcript by handle. Output is bounded and "
+            "paginated by character offset. This is read-only."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "handle": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Stable child handle returned by the agent tool.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Readable transcript character offset.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum readable transcript characters.",
+                },
+            },
+            "required": ["handle"],
             "additionalProperties": False,
         },
         parallel_safe=True,
