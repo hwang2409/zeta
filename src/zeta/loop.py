@@ -19,8 +19,8 @@ from .agent_background import (
 )
 from .agent_budget import (
     MAX_AGENT_DEPTH,
-    SharedTurnBudget,
-    configure_budget,
+    AgentTree,
+    agent_tree_context,
     consume_turn,
 )
 from .agent_runner import run_agent_tool
@@ -189,7 +189,7 @@ class AgentLoop:
         agent_depth: int = 0,
         agent_instance_id: str | None = None,
         agent_turn_budget: int | None = None,
-        shared_agent_budget: SharedTurnBudget | None = None,
+        agent_tree: AgentTree | None = None,
         background_owner: BackgroundAgentOwner | None = None,
     ) -> None:
         if type(agent_depth) is not int or not 0 <= agent_depth <= MAX_AGENT_DEPTH:
@@ -198,9 +198,12 @@ class AgentLoop:
         self.store = store
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
-        self._shared_agent_budget = configure_budget(
-            agent_turn_budget, shared_agent_budget
-        )
+        if agent_turn_budget is not None and (
+            type(agent_turn_budget) is not int or agent_turn_budget < 1
+        ):
+            raise ValueError("agent turn budget must be a positive integer")
+        self._agent_turn_budget = agent_turn_budget
+        self._agent_tree = agent_tree
         self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
@@ -823,6 +826,7 @@ class AgentLoop:
             self.store.append_message(user_message)
         elif user_message not in self.store.messages():
             raise ValueError("cannot reuse a user message that is not persisted")
+        agent_tree = AgentTree() if self.agent_depth == 0 else None
         setup_error: ErrorInfo | None = None
         try:
             await self._ensure_mcp_servers()
@@ -849,7 +853,14 @@ class AgentLoop:
         for turn_number in range(1, self.max_turns + 1):
             if (
                 self.agent_depth
-                and (error := consume_turn(self._shared_agent_budget)) is not None
+                and (
+                    error := consume_turn(
+                        self._agent_tree.budget
+                        if self._agent_tree is not None
+                        else None
+                    )
+                )
+                is not None
             ):
                 yield StreamEvent(StreamEventType.ERROR, error=error)
                 yield StreamEvent(StreamEventType.AGENT_END)
@@ -1014,11 +1025,12 @@ class AgentLoop:
                 _validated_tool_result,
                 abort_signal=turn_abort_signal,
             )
-            try:
-                async for event in dispatch:
-                    yield event
-            finally:
-                await dispatch.aclose()
+            with agent_tree_context(agent_tree):
+                try:
+                    async for event in dispatch:
+                        yield event
+                finally:
+                    await dispatch.aclose()
             if self._plan_mode and self._approved_plan_exit(calls):
                 self.set_plan_mode(False)
             yield StreamEvent(

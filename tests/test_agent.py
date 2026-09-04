@@ -1524,6 +1524,80 @@ async def test_shared_turn_budget_covers_parallel_siblings(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_top_level_agent_calls_get_fresh_shared_turn_budgets(
+    tmp_path: Path,
+) -> None:
+    first = _agent_call("first")
+    second = _agent_call("second")
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[first]),
+            ScriptedTurn([TextContent("first complete")]),
+            ScriptedTurn(tool_calls=[second]),
+            ScriptedTurn([TextContent("second complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1)
+
+    await _collect(loop.run_turn("start"))
+    await _collect(loop.run_turn("follow up"))
+
+    results = [
+        message.tool_result for message in store.messages() if message.tool_result
+    ]
+    assert [result.content for result in results if result is not None] == [
+        "first complete",
+        "second complete",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_top_level_agent_invocations_have_independent_budgets(
+    tmp_path: Path,
+) -> None:
+    async def run_agent(index: int) -> str:
+        call = _agent_call(f"agent-{index}")
+        backend = FakeBackend(
+            [
+                ScriptedTurn(tool_calls=[call]),
+                ScriptedTurn([TextContent(f"agent {index} complete")]),
+            ]
+        )
+        store = ConversationStore(tmp_path / str(index))
+        loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1)
+        await _collect(loop.run_turn("start"))
+        result = next(
+            message.tool_result
+            for message in store.messages()
+            if message.tool_result
+        )
+        return result.content
+
+    assert await asyncio.gather(run_agent(1), run_agent(2)) == [
+        "agent 1 complete",
+        "agent 2 complete",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_adopted_background_child_keeps_origin_tree_budget(
+    tmp_path: Path,
+) -> None:
+    backend = ForegroundNestedBackgroundBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1)
+
+    await _collect(loop.run_turn("start"))
+    notification = await _wait_for_notification(store, "error")
+
+    assert (
+        "shared agent turn budget exhausted for this agent tree"
+        in notification.data["text"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) -> None:
     nested = _agent_call("grandchild")
     nested.arguments["background"] = True
