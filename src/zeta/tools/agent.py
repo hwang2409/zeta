@@ -36,6 +36,7 @@ from .registry import (
 
 MAX_AGENT_STATUS_STEP = 160
 MAX_AGENT_STATUS_RESULT = 4_000
+MAX_AGENT_STATUS_DESCRIPTION = 160
 _TRUNCATION_NOTE = "\n[truncated]"
 
 
@@ -272,7 +273,9 @@ def _read_agent_status(
             ),
             "depth": lifecycle.get("depth", 0),
             "agent_type": lifecycle.get("agent_type", "general"),
-            "description": lifecycle.get("description", ""),
+            "description": _bounded_status_text(
+                lifecycle.get("description", ""), MAX_AGENT_STATUS_DESCRIPTION
+            ),
         }
         if finished_at is not None and requested_handle is not None:
             item["final_result"] = _bounded_status_text(
@@ -317,12 +320,81 @@ async def _agent_status(
                 "structuredContent": None,
             }
         children = matching
+    offset = arguments.get("offset", 0)
+    limit = arguments.get("limit")
+    if type(offset) is not int or offset < 0:
+        return {
+            "content": [text_block("agent error: offset must be a nonnegative integer")],
+            "isError": True,
+            "structuredContent": None,
+        }
+    if limit is not None and (type(limit) is not int or limit < 1):
+        return {
+            "content": [text_block("agent error: limit must be a positive integer")],
+            "isError": True,
+            "structuredContent": None,
+        }
+    page = children[offset : offset + limit if limit is not None else None]
+    max_bytes = registry.max_output_chars
+    while page:
+        next_offset = offset + len(page)
+        truncated = next_offset < len(children)
+        notice = (
+            f"\nmore children available: call agent_status with offset={next_offset}"
+            if truncated
+            else ""
+        )
+        details = "\n".join(
+            "child {handle}: state: {state}; started_at: {started_at}; "
+            "finished_at: {finished_at}; elapsed: {elapsed:.2f}s; "
+            "turns_used: {turns_used}/{tree_budget}; step: {current_step}; "
+            "result: {final_result}".format(
+                **{**child, "final_result": child.get("final_result", "")}
+            )
+            for child in page
+        )
+        content_text = f"agent status: {len(children)} children\n{details}{notice}"
+        structured = {
+            "children": page,
+            "offset": offset,
+            "truncated": truncated,
+            "total": len(children),
+        }
+        if truncated:
+            structured["next_offset"] = next_offset
+        result = {
+            "content": [text_block(content_text)],
+            "isError": False,
+            "structuredContent": structured,
+        }
+        if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= max_bytes:
+            return result
+        page.pop()
+    if offset < len(children):
+        return {
+            "content": [
+                text_block("agent error: status item exceeds response limit")
+            ],
+            "isError": True,
+            "structuredContent": None,
+        }
     count = len(children)
     label = "child" if count == 1 else "children"
+    if count == 0 and offset == 0 and limit is None:
+        return {
+            "content": [text_block(f"agent status: {count} {label}")],
+            "isError": False,
+            "structuredContent": {"children": []},
+        }
     return {
         "content": [text_block(f"agent status: {count} {label}")],
         "isError": False,
-        "structuredContent": {"children": children},
+        "structuredContent": {
+            "children": [],
+            "offset": offset,
+            "truncated": False,
+            "total": count,
+        },
     }
 
 
@@ -446,7 +518,17 @@ def register(registry: ToolRegistry) -> None:
                 "handle": {
                     "type": "string",
                     "description": "Stable child handle returned by the agent tool.",
-                }
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Child index for a status page continuation.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of children in this status page.",
+                },
             },
             "additionalProperties": False,
         },
