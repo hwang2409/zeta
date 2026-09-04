@@ -108,6 +108,76 @@ def test_teardown_guard_rejects_two_appends_for_one_declaration(
         live_home_write_guard.reset()
 
 
+def test_teardown_guard_allows_declared_append_creating_file(
+    tmp_path: Path, live_home_write_guard
+) -> None:
+    live_home = tmp_path / "live-home"
+    history = live_home / "history"
+    live_home.mkdir()
+    live_home_write_guard.watch(live_home)
+
+    try:
+        live_home_write_guard.declare_external_mutation(
+            history, kind="append", expected=b"external\n"
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "Path(__import__('sys').argv[1]).open('a').write('external\\n')"
+                ),
+                str(history),
+            ],
+            env={},
+            start_new_session=True,
+            check=True,
+        )
+
+        live_home_write_guard.assert_clean()
+    finally:
+        live_home_write_guard.reset()
+
+
+def test_teardown_guard_allows_two_sequential_declared_appends(
+    tmp_path: Path, live_home_write_guard
+) -> None:
+    live_home = tmp_path / "live-home"
+    history = live_home / "history"
+    history.parent.mkdir()
+    history.write_text("before\n", encoding="utf-8")
+    live_home_write_guard.watch(live_home)
+
+    try:
+        append_command = (
+            "from pathlib import Path; "
+            "Path(__import__('sys').argv[1]).open('a').write(__import__('sys').argv[2])"
+        )
+        live_home_write_guard.declare_external_mutation(
+            history, kind="append", expected=b"first\n"
+        )
+        subprocess.run(
+            [sys.executable, "-c", append_command, str(history), "first\n"],
+            env={},
+            start_new_session=True,
+            check=True,
+        )
+        live_home_write_guard.declare_external_mutation(
+            history, kind="append", expected=b"second\n"
+        )
+        subprocess.run(
+            [sys.executable, "-c", append_command, str(history), "second\n"],
+            env={},
+            start_new_session=True,
+            check=True,
+        )
+
+        live_home_write_guard.assert_clean()
+    finally:
+        live_home_write_guard.reset()
+
+
 def test_teardown_guard_rejects_wrong_declared_append_content(
     tmp_path: Path, live_home_write_guard
 ) -> None:

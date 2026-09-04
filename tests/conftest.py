@@ -142,18 +142,61 @@ class LiveHomeWriteGuard:
                 owned_paths.add(relative)
 
         violations: set[Path] = set()
+        tolerated_parents: set[Path] = set()
+        deferred: list[Path] = []
         for path in changed:
             if any(
                 recorded_path == path or recorded_path.is_relative_to(path)
                 for recorded_path in owned_paths
-            ) or not self._declared_delta_is_tolerated(path, current):
+            ):
                 violations.add(self.live_home / path)
+                continue
+            if self._declared_delta_is_tolerated(path, current, tolerated_parents):
+                continue
+            deferred.append(path)
+        for path in deferred:
+            if path in tolerated_parents and self._only_directory_metadata_changed(
+                path, current
+            ):
+                continue
+            violations.add(self.live_home / path)
         return violations
 
-    def _declared_delta_is_tolerated(
+    def _only_directory_metadata_changed(
         self, relative: Path, current: dict[Path, tuple[object, ...]]
     ) -> bool:
+        """Tolerate only the timestamp/size churn a declared child creation implies."""
+
+        before = self._snapshot.get(relative)
+        after = current.get(relative)
+        return (
+            before is not None
+            and after is not None
+            and stat.S_ISDIR(after[0])
+            and after[0] == before[0]
+            and after[1] == before[1]
+            and after[5] == before[5]
+            and after[6] == before[6]
+        )
+
+    def _declared_delta_is_tolerated(
+        self,
+        relative: Path,
+        current: dict[Path, tuple[object, ...]],
+        tolerated_parents: set[Path],
+    ) -> bool:
         path = (self.live_home / relative).resolve()
+        appends = [
+            declaration
+            for declaration in self._external_declarations
+            if not declaration.used
+            and declaration.path == path
+            and declaration.kind == "append"
+        ]
+        if appends:
+            return self._declared_append_chain_matches(
+                relative, path, current, appends, tolerated_parents
+            )
         for declaration in self._external_declarations:
             if declaration.used or declaration.path != path:
                 continue
@@ -161,31 +204,7 @@ class LiveHomeWriteGuard:
                 continue
             after = current.get(relative)
             before = declaration.snapshot
-            if declaration.kind == "append":
-                if after is None or not stat.S_ISREG(after[0]):
-                    continue
-                after_content = _path_content(path)
-                if (
-                    after_content is None
-                    or declaration.expected is None
-                    or after[2] != len(after_content)
-                ):
-                    continue
-                if before is None:
-                    if after_content == declaration.expected:
-                        declaration.used = True
-                        return True
-                    continue
-                if declaration.content is None:
-                    continue
-                if (
-                    after[0] == before[0]
-                    and after[1] == before[1]
-                    and after_content == declaration.content + declaration.expected
-                ):
-                    declaration.used = True
-                    return True
-            elif declaration.kind == "write":
+            if declaration.kind == "write":
                 if (
                     after is not None
                     and stat.S_ISREG(after[0])
@@ -205,6 +224,47 @@ class LiveHomeWriteGuard:
                 declaration.used = True
                 return True
         return False
+
+    def _declared_append_chain_matches(
+        self,
+        relative: Path,
+        path: Path,
+        current: dict[Path, tuple[object, ...]],
+        appends: list[_ExternalDeclaration],
+        tolerated_parents: set[Path],
+    ) -> bool:
+        """Match the final content against every declared append, in order."""
+
+        base = appends[0]
+        after = current.get(relative)
+        if (
+            after is None
+            or not stat.S_ISREG(after[0])
+            or self._snapshot.get(relative) != base.snapshot
+            or any(declaration.expected is None for declaration in appends)
+        ):
+            return False
+        after_content = _path_content(path)
+        if after_content is None or after[2] != len(after_content):
+            return False
+        if base.snapshot is None:
+            before_content = b""
+        else:
+            if base.content is None:
+                return False
+            if after[0] != base.snapshot[0] or after[1] != base.snapshot[1]:
+                return False
+            before_content = base.content
+        expected_final = before_content + b"".join(
+            declaration.expected or b"" for declaration in appends
+        )
+        if after_content != expected_final:
+            return False
+        for declaration in appends:
+            declaration.used = True
+        if base.snapshot is None:
+            tolerated_parents.add(relative.parent)
+        return True
 
     def assert_clean(self) -> None:
         violations = self._violations()
