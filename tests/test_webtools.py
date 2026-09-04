@@ -416,6 +416,57 @@ async def test_fetch_validates_each_redirect_and_uses_final_url_notice(
 
 
 @pytest.mark.asyncio
+async def test_get_response_preserves_post_body_on_307_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(307, headers={"location": "/final"}, request=request)
+        return httpx.Response(200, text="done", request=request)
+
+    _mock_client(monkeypatch, handler)
+    response = await fetch_tool.get_response(
+        "https://example.com/start",
+        user_agent="test",
+        method="POST",
+        data={"q": "zeta"},
+    )
+
+    assert response.text == "done"
+    assert [request.method for request in requests] == ["POST", "POST"]
+    assert [request.content for request in requests] == [b"q=zeta", b"q=zeta"]
+
+
+@pytest.mark.asyncio
+async def test_get_response_switches_to_get_without_body_on_303(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(303, headers={"location": "/final"}, request=request)
+        return httpx.Response(200, text="done", request=request)
+
+    _mock_client(monkeypatch, handler)
+    response = await fetch_tool.get_response(
+        "https://example.com/start",
+        user_agent="test",
+        method="POST",
+        data={"q": "zeta"},
+    )
+
+    assert response.text == "done"
+    assert [request.method for request in requests] == ["POST", "GET"]
+    assert requests[0].content == b"q=zeta"
+    assert requests[1].content == b""
+
+
+@pytest.mark.asyncio
 async def test_fetch_refuses_non_http_redirect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -945,6 +996,22 @@ def test_websearch_parses_lite_fixture() -> None:
                 "The No.1 AI chat! Over 13 hours of weekly use — and it's free. "
                 "Not using zeta yet? Everyone else is!"
             ),
+        }
+    ]
+
+
+def test_websearch_decodes_wrapped_lite_result_url() -> None:
+    body = (
+        '<a class="result-link" href="/l/?uddg=https%3A%2F%2Fexample.com%2Fresult">'
+        "Wrapped result"
+        "</a>"
+    )
+
+    assert websearch.parse_lite_search_results(body, max_results=1) == [
+        {
+            "title": "Wrapped result",
+            "url": "https://example.com/result",
+            "snippet": "",
         }
     ]
 

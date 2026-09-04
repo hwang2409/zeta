@@ -171,7 +171,7 @@ class _DuckDuckGoLiteParser(HTMLParser):
         attributes = dict(attrs)
         classes = set((attributes.get("class") or "").split())
         if tag == "a" and "result-link" in classes:
-            self._title = (attributes.get("href", ""), [])
+            self._title = (_decode_result_url(attributes.get("href", "")), [])
             self._title_depth = 1
         elif self._title is not None:
             self._title_depth += 1

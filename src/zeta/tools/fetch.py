@@ -143,6 +143,7 @@ async def get_response(
         ) as client:
             current_url = url
             current_method = method
+            current_data = data
             redirects_followed = 0
             while True:
                 _validate_url(current_url)
@@ -153,7 +154,7 @@ async def get_response(
                     current_method,
                     _pinned_url(current_url, address),
                     params=params if redirects_followed == 0 else None,
-                    data=data if redirects_followed == 0 else None,
+                    data=current_data,
                     headers={"Host": _host_header(current_url)},
                     extensions={"sni_hostname": urlsplit(current_url).hostname},
                 ) as response:
@@ -169,6 +170,7 @@ async def get_response(
                             )
                         if response.status_code in {301, 302, 303}:
                             current_method = "GET"
+                            current_data = None
                         current_url = urljoin(current_url, location)
                         redirects_followed += 1
                         continue
