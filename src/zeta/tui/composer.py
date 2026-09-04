@@ -781,6 +781,14 @@ class ComposerAttachmentMixin:
 class SubmissionMixin:
     """Translate composer callbacks into pipeline messages."""
 
+    async def slash_mcp(self, args: str) -> str:
+        return await self.loop.slash_mcp(args)
+
+    async def slash_mcp_prompt(
+        self, name: str, arguments: dict[str, str]
+    ) -> str:
+        return await self.loop.slash_mcp_prompt(name, arguments)
+
     def _submit_input(self, value: str) -> None:
         if (
             self._submissions._approval_action_for(value) is not None

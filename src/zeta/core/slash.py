@@ -8,7 +8,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
-<<<<<<< HEAD
 import yaml
 
 from ..mcp.client import MCPPrompt
@@ -18,8 +17,7 @@ from ..mcp.prompt_commands import (
     SlashModelInput,
     SlashPromptError,
     dispatch_prompt,
-=======
-from ..types import Message, MessageRole, StreamEventType, TextContent
+)
 from .commands.custom_commands import (
     COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
     CustomCommand,
@@ -28,7 +26,6 @@ from .commands.custom_commands import (
     needs_inline_shell_resolution,
     render_custom_input,
     resolve_custom_input,
->>>>>>> ddf61fc (ZETA-55: Harden command ergonomics)
 )
 from .store import ConversationEntry
 

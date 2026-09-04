@@ -15,7 +15,11 @@ from uuid import uuid4
 from .core.abort import AbortSignal
 from .core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from .core.commands.custom_commands import CustomCommand, InlineShellResult
-from .core.slash import SlashCommandRegistry
+from .core.slash import (
+    SlashCommandRegistry,
+    SlashModelInput,
+    SlashPromptError,
+)
 from .submission import Submission
 from .tools.exec import (
     forget_macro_display,
@@ -55,6 +59,7 @@ class SubmissionHost(Protocol):
         *,
         pending_attachments: list[Path],
         pending_attachment_tokens: dict[str, Path],
+        attachment_value: str | None = None,
     ) -> Any | None: ...
     def _record_prompt(self, value: str, draft_revision: int) -> None: ...
     def _release_attachment_paths(self, paths: tuple[Path, ...]) -> None: ...
@@ -157,7 +162,8 @@ class _Entry:
     submission: Submission
     state: SubmissionState = SubmissionState.QUEUED
     parsed: str = ""
-    model_input: str = ""
+    model_input: str | None = None
+    attachment_value: str | None = None
     message: Any | None = None
     candidate: UndoCandidate | None = None
     signal: AbortSignal | None = None
@@ -499,7 +505,15 @@ class SubmissionPipeline:
                         )
                     finally:
                         self._control_entry = None
-                    if slash_output is not None:
+                    if isinstance(slash_output, SlashPromptError):
+                        self._host._restore_pending_submission(entry.submission)
+                        self._host._print_system(slash_output.message)
+                        self._finish_entry(entry, SubmissionState.CANCELED)
+                    elif isinstance(slash_output, SlashModelInput):
+                        entry.model_input = slash_output.text
+                        entry.attachment_value = entry.submission.text
+                        self._prepare_submission(entry, parsed)
+                    elif slash_output is not None:
                         self._host._release_attachment_paths(
                             entry.submission.attachment_paths
                         )
@@ -663,7 +677,11 @@ class SubmissionPipeline:
         self._send(result)
 
     def _prepare_submission(self, entry: _Entry, parsed: str) -> None:
-        model_input = entry.model_input or self._host._slash_commands.input_for_model(parsed)
+        model_input = (
+            entry.model_input
+            if entry.model_input is not None
+            else self._host._slash_commands.input_for_model(parsed)
+        )
         if model_input is None:
             self._cancel_or_restore(entry)
             return
@@ -674,6 +692,7 @@ class SubmissionPipeline:
             model_input,
             pending_attachments=pending_attachments,
             pending_attachment_tokens=pending_tokens,
+            attachment_value=entry.attachment_value,
         )
         if message is None:
             self._host._restore_pending_submission(entry.submission)
