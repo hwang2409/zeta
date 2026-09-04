@@ -21,11 +21,19 @@ class MCPError(RuntimeError):
     """Base error for MCP transport and protocol failures."""
 
 
+class MCPTransportError(MCPError):
+    """Raised when the MCP transport is unavailable."""
+
+
 class MCPProtocolError(MCPError):
     """Raised for a malformed or error JSON-RPC response."""
 
 
-class MCPHTTPError(MCPError):
+class MCPRequestError(MCPError):
+    """Raised when an MCP request returns a JSON-RPC error response."""
+
+
+class MCPHTTPError(MCPTransportError):
     """Raised for an unsuccessful streamable-http response."""
 
     def __init__(self, status_code: int, detail: str) -> None:
@@ -265,8 +273,8 @@ def prompt_text_from_result(value: Mapping[str, object]) -> str:
         if type(content) is list and content and type(content[0]) is dict:
             message = content[0].get("text")
             if type(message) is str:
-                raise MCPProtocolError(message)
-        raise MCPProtocolError("MCP prompts/get failed")
+                raise MCPRequestError(message)
+        raise MCPRequestError("MCP prompts/get failed")
     if type(messages) is not list:
         raise MCPProtocolError("MCP prompts/get result must contain messages")
     text: list[str] = []
@@ -295,7 +303,9 @@ __all__ = [
     "MCPPrompt",
     "MCPPromptArgument",
     "MCPProtocolError",
+    "MCPRequestError",
     "MCPTool",
+    "MCPTransportError",
     "canceled_result",
     "initialize_params",
     "make_error_result",

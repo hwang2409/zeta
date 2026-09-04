@@ -17,6 +17,7 @@ from .client import (
     MCPHTTPError,
     MCPPrompt,
     MCPProtocolError,
+    MCPTransportError,
     MCPTool,
     canceled_result,
     initialize_params,
@@ -98,7 +99,7 @@ class StreamableHTTPMCPClient(MCPClient):
                 "prompts/get", {"name": name, "arguments": dict(arguments)}
             )
             return prompt_text_from_result(result)
-        except Exception as exc:
+        except MCPTransportError as exc:
             if self._failure_sink is not None:
                 self._failure_sink(str(exc))
             raise

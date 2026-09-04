@@ -38,7 +38,6 @@ async def _connect_and_list(client: MCPClient) -> list[MCPTool]:
     capabilities = getattr(client, "capabilities", None)
     if (
         type(capabilities) is dict
-        and capabilities
         and "tools" not in capabilities
     ):
         return []

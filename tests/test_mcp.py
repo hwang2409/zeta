@@ -34,7 +34,9 @@ from zeta.mcp import (
     write_mcp_config,
 )
 from zeta.mcp.client import (
+    MCPRequestError,
     MCPProtocolError,
+    MCPTransportError,
     parse_rpc_response,
     translate_call_result,
 )
@@ -113,7 +115,7 @@ for line in sys.stdin:
     if method == "notifications/initialized" or method == "notifications/cancelled":
         continue
     if method == "initialize":
-        result = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "fake", "version": "1"}}
+        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}
     elif method == "tools/list":
         result = {"tools": [{"name": "echo", "description": "echo text", "inputSchema": {"type": "object", "title": "EchoInput", "$defs": {"value": {"type": "string"}}, "properties": {"value": {"type": "string", "default": "hello"}}, "required": ["value"]}}]}
     elif method == "tools/call":
@@ -149,6 +151,7 @@ class _FakeClient:
     def __init__(self, config: MCPServerConfig, *, fail_connect: bool = False, fail_close: bool = False) -> None:
         self.config = config
         self.protocol_version = "2025-06-18"
+        self.capabilities = {"tools": {}}
         self.fail_connect = fail_connect
         self.fail_close = fail_close
 
@@ -238,6 +241,18 @@ class _PromptClient(_ListedClient):
     async def get_prompt(self, name: str, arguments: dict[str, str]) -> str:
         self.prompt_calls.append((name, arguments))
         return f"resolved {arguments['topic']}"
+
+
+class _PromptRequestErrorClient(_PromptClient):
+    async def get_prompt(self, name: str, arguments: dict[str, str]) -> str:
+        del name, arguments
+        raise MCPRequestError("prompt rejected")
+
+
+class _PromptTransportErrorClient(_PromptClient):
+    async def get_prompt(self, name: str, arguments: dict[str, str]) -> str:
+        del name, arguments
+        raise MCPTransportError("transport dropped")
 
 
 class _BlockingPromptClient(_PromptClient):
@@ -613,6 +628,31 @@ async def test_http_generic_request_failure_notifies_sink() -> None:
 
 
 @pytest.mark.asyncio
+async def test_json_rpc_prompt_error_does_not_notify_transport_sink() -> None:
+    client = StdioMCPClient(MCPServerConfig("stdio", "stdio", "unused"))
+    failures: list[str] = []
+    client.set_failure_sink(failures.append)
+
+    async def request_error(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        return parse_rpc_response(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32602, "message": "invalid prompt arguments"},
+            },
+            1,
+        )
+
+    client._request = request_error  # type: ignore[method-assign]
+    with pytest.raises(MCPRequestError, match="invalid prompt arguments"):
+        await client.get_prompt("review", {})
+
+    assert failures == []
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_mount_registers_prefixed_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     registry = ToolRegistry(tmp_path, register_builtin=False)
@@ -715,6 +755,64 @@ async def test_prompt_get_timeout_degrades_without_blocking_actor(
 
 
 @pytest.mark.asyncio
+async def test_prompt_request_error_keeps_server_mounted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("rejected", "stdio", "unused")
+    client = _PromptRequestErrorClient(config, [MCPPrompt("review")])
+    monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"rejected": config})
+    )
+
+    with pytest.raises(MCPRequestError, match="prompt rejected"):
+        await mount.get_prompt("rejected:review", {})
+
+    assert mount.statuses["rejected"].state == "mounted"
+    assert mount.prompt_entries[0][0] == "rejected:review"
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_prompt_transport_error_degrades_and_removes_prompts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("dropped", "stdio", "unused")
+    client = _PromptTransportErrorClient(config, [MCPPrompt("review")])
+    monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"dropped": config})
+    )
+
+    with pytest.raises(MCPTransportError, match="transport dropped"):
+        await mount.get_prompt("dropped:review", {})
+
+    assert mount.statuses["dropped"].state == "degraded"
+    assert mount.prompt_entries == ()
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_capabilities_skip_tool_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("empty", "stdio", "unused")
+    client = _ListedClient(config, [])
+    client.capabilities = {}
+    monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"empty": config})
+    )
+
+    assert client.tools_list_calls == 0
+    assert mount.statuses["empty"].state == "mounted"
+    await mount.close()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_prompt_get_cleans_up_actor_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -780,7 +878,7 @@ async def test_mount_reports_states_and_notices(
     assert [line.split(":", 1)[0] for line in mount.render().splitlines()[1:]] == list(
         mount.configs
     )
-    assert len(notices) == 4
+    assert len(notices) == 5
     await mount.close()
 
 

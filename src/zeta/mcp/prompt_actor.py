@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from ..core.abort import AbortSignal
 from ..types import StructuredToolResult
-from .client import MCPClient, MCPPrompt
+from .client import MCPClient, MCPPrompt, MCPTransportError
 
 if TYPE_CHECKING:
     from .server_actor import MCPServerActor
@@ -162,7 +162,7 @@ def handle_prompt_finished(
         and actor._status.state == "mounted"
     )
     if message.error is not None:
-        if current:
+        if current and isinstance(message.error, (MCPTransportError, TimeoutError)):
             actor._degrade_current(_error_text(message.error))
         set_exception(request.result, message.error)
         return

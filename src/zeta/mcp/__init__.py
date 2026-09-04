@@ -1,6 +1,13 @@
 """MCP client adapters for zeta."""
 
-from .client import MCPClient, MCPPrompt, MCPPromptArgument, MCPTool
+from .client import (
+    MCPClient,
+    MCPPrompt,
+    MCPPromptArgument,
+    MCPRequestError,
+    MCPTool,
+    MCPTransportError,
+)
 from .config import (
     MCPConfig,
     MCPConfigError,
@@ -27,10 +34,12 @@ __all__ = [
     "MCPMount",
     "MCPPrompt",
     "MCPPromptArgument",
+    "MCPRequestError",
     "MCPServerConfig",
     "MCPServerState",
     "MCPServerStatus",
     "MCPTool",
+    "MCPTransportError",
     "StdioMCPClient",
     "StreamableHTTPMCPClient",
     "default_config_path",

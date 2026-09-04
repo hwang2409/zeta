@@ -859,8 +859,8 @@ class TUIApp(
         if isinstance(session, FullScreenPromptSession):
             self._install_full_screen_layout(session)
         self.loop.session_start()
-        await self.loop.ensure_mcp_servers()
         self._rebuild_transcript()
+        await self.loop.ensure_mcp_servers()
         for notice in self._slash_commands.notices:
             style = COMMAND if notice in self._slash_commands.warning_notices else DIM
             self._print_unit(Text(f"command · {notice}", style=style))

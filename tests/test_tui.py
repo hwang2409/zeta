@@ -4810,6 +4810,45 @@ async def test_run_replays_resumed_transcript_before_prompt(
     assert "README.md" in rendered
 
 
+@pytest.mark.asyncio
+async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skip_mcp_mount=True,
+        ),
+        provider="fake",
+        model="offline",
+    )
+
+    async def ensure_mcp_servers() -> None:
+        assert app.loop._mcp_notice_sink is not None
+        app.loop._mcp_notice_sink("mcp · prompts unavailable")
+
+    monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp_servers)
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        run_task = asyncio.create_task(app.run(session))
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x04")
+        await run_task
+
+    assert "prompts unavailable" in Text.from_ansi(
+        app._transcript.render(120)
+    ).plain
+
+
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(Message(MessageRole.USER, [TextContent("old user")]))
