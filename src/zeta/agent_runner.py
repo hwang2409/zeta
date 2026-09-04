@@ -8,7 +8,10 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from .agent_background import finish_background_child
-from .agent_budget import MAX_AGENT_DEPTH, SharedTurnBudget
+from .agent_budget import (
+    MAX_AGENT_DEPTH,
+    AgentTree,
+)
 from .agent_budget import child_depth as next_agent_depth
 from .core.abort import AbortSignal as ToolAbortSignal
 from .core.store import ConversationStore
@@ -250,9 +253,12 @@ async def run_agent_tool(
             f"{agent_type!r}; expected one of: {', '.join(agent_type_names())}",
             error=True,
         )
-    if loop._shared_agent_budget is None:
-        loop._shared_agent_budget = SharedTurnBudget(preset.turn_cap)
-    shared_agent_budget = loop._shared_agent_budget
+    agent_tree = loop._agent_tree or AgentTree()
+    agent_tree.ensure_budget(
+        loop._agent_turn_budget
+        if loop._agent_turn_budget is not None
+        else preset.turn_cap
+    )
     await loop._ensure_mcp_servers()
     stored_agent_type = None if preset.name == GENERAL_PRESET.name else preset.name
     child_number = loop.store.allocate_agent_index()
@@ -321,7 +327,7 @@ async def run_agent_tool(
         skip_mcp_mount=True,
         agent_depth=child_depth,
         agent_instance_id=child_instance_id,
-        shared_agent_budget=shared_agent_budget,
+        agent_tree=agent_tree,
         background_owner=loop._background_owner,
     )
     child_loop.set_background_event_sink(loop._publish_background_event)

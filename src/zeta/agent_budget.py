@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 from .types import ErrorInfo
 
-
 MAX_AGENT_DEPTH = 2
 
 
@@ -30,12 +29,16 @@ class SharedTurnBudget:
         return True
 
 
-def configure_budget(
-    explicit: int | None, inherited: SharedTurnBudget | None
-) -> SharedTurnBudget | None:
-    if explicit is not None and inherited is not None:
-        raise ValueError("pass only one agent turn budget")
-    return inherited or (SharedTurnBudget(explicit) if explicit is not None else None)
+@dataclass(slots=True)
+class AgentTree:
+    """Own the shared turn budget for one complete agent tree."""
+
+    budget: SharedTurnBudget | None = None
+
+    def ensure_budget(self, limit: int) -> SharedTurnBudget:
+        if self.budget is None:
+            self.budget = SharedTurnBudget(limit)
+        return self.budget
 
 
 def child_depth(parent_depth: int, _background: bool) -> tuple[int, str | None]:
@@ -50,5 +53,6 @@ def consume_turn(budget: SharedTurnBudget | None) -> ErrorInfo | None:
         return None
     return ErrorInfo(
         "agent_turn_budget",
-        f"shared agent turn budget exhausted: {budget.limit} turns allocated",
+        "shared agent turn budget exhausted for this agent tree: "
+        f"{budget.limit} turns allocated",
     )
