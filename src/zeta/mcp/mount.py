@@ -15,11 +15,11 @@ from .http import StreamableHTTPMCPClient
 from .server_actor import (
     AUTO_RECONNECT_BASE_DELAY_SECONDS,
     AUTO_RECONNECT_MAX_DELAY_SECONDS,
+    SERVER_SETUP_TIMEOUT_SECONDS,
     MCPServerActor,
     MCPServerState,
     MCPServerStatus,
     NoticeSink,
-    SERVER_SETUP_TIMEOUT_SECONDS,
     _retry_text,
 )
 from .stdio import StdioMCPClient
@@ -35,6 +35,13 @@ def _build_client(config: MCPServerConfig) -> MCPClient:
 
 async def _connect_and_list(client: MCPClient) -> list[MCPTool]:
     await client.connect()
+    capabilities = getattr(client, "capabilities", None)
+    if (
+        type(capabilities) is dict
+        and capabilities
+        and "tools" not in capabilities
+    ):
+        return []
     return await client.list_tools()
 
 

@@ -10,6 +10,7 @@ from itertools import count
 from pathlib import Path
 
 from .core.slash import SlashModelInput
+from .mcp.prompt_commands import SlashPromptError
 from .tui.composer import UndoCandidate, parse_input
 
 
@@ -182,6 +183,9 @@ class SubmissionMixin:
         if self._submissions.is_cancelled(submission):
             self._submissions.complete(submission)
             return
+        if isinstance(slash_output, SlashPromptError):
+            self._restore_failed_submission(submission, slash_output.message)
+            return
         if isinstance(slash_output, SlashModelInput):
             model_input = slash_output.text
         elif slash_output is not None:
@@ -203,6 +207,9 @@ class SubmissionMixin:
             model_input,
             pending_attachments=pending_attachments,
             pending_attachment_tokens=pending_attachment_tokens,
+            attachment_value=submission.text
+            if isinstance(slash_output, SlashModelInput)
+            else None,
         )
         if user_message is None:
             session = self._active_session or self._session
@@ -252,3 +259,28 @@ class SubmissionMixin:
             self._undo_candidate = candidate
             self._submissions.complete(submission)
             self._start_turn(model_input, user_message=user_message)
+
+    def _restore_failed_submission(
+        self, submission: Submission, message: str
+    ) -> None:
+        """Show a slash error and return its captured composer state."""
+
+        self._print_system(message)
+        session = self._active_session or self._session
+        buffer = session.app.current_buffer if session is not None else None
+        if buffer is None or not buffer.text:
+            self._restore_composer(submission.text)
+            self._restore_pending_attachment_state(
+                submission.attachment_paths,
+                submission.attachment_tokens,
+                submission.next_image_token,
+            )
+            self._draft.schedule(
+                submission.text,
+                attachment_tokens=dict(submission.attachment_tokens),
+                next_image_token=submission.next_image_token,
+            )
+        else:
+            self._release_attachment_paths(submission.attachment_paths)
+            self._draft.schedule(buffer.text)
+        self._submissions.complete(submission)

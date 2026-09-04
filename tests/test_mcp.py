@@ -209,8 +209,10 @@ class _ListedClient(_LifecycleClient):
     def __init__(self, config: MCPServerConfig, tools: list[MCPTool]) -> None:
         super().__init__(config)
         self.tools = tools
+        self.tools_list_calls = 0
 
     async def list_tools(self) -> list[MCPTool]:
+        self.tools_list_calls += 1
         return self.tools
 
 
@@ -236,6 +238,26 @@ class _PromptClient(_ListedClient):
     async def get_prompt(self, name: str, arguments: dict[str, str]) -> str:
         self.prompt_calls.append((name, arguments))
         return f"resolved {arguments['topic']}"
+
+
+class _BlockingPromptClient(_PromptClient):
+    def __init__(self, config: MCPServerConfig) -> None:
+        super().__init__(
+            config,
+            [MCPPrompt("review", "review code")],
+        )
+        self.prompt_started = asyncio.Event()
+        self.prompt_cancelled = asyncio.Event()
+
+    async def get_prompt(self, name: str, arguments: dict[str, str]) -> str:
+        del name, arguments
+        self.prompt_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.prompt_cancelled.set()
+            raise
+        return "unreachable"
 
 
 class _CallTrackingClient(_ListedClient):
@@ -648,6 +670,72 @@ async def test_prompt_list_failure_keeps_tools_and_notifies(
     assert mount.statuses["fake"].state == "mounted"
     assert mount.prompt_entries == ()
     assert any("prompts unavailable" in notice for notice in notices)
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_prompt_only_mount_skips_tool_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("prompt-only", "stdio", "unused")
+    client = _PromptClient(config, [MCPPrompt("review")])
+    monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"prompt-only": config})
+    )
+
+    assert mount.statuses["prompt-only"].state == "mounted"
+    assert mount.prompt_entries[0][0] == "prompt-only:review"
+    assert registry.schemas == []
+    assert client.tools_list_calls == 0
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_prompt_get_timeout_degrades_without_blocking_actor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("hung", "stdio", "unused")
+    client = _BlockingPromptClient(config)
+    monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
+    monkeypatch.setattr(mount_module, "SERVER_SETUP_TIMEOUT_SECONDS", 0.01)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"hung": config})
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await mount.get_prompt("hung:review", {})
+
+    assert client.prompt_started.is_set()
+    assert mount.statuses["hung"].state == "degraded"
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_prompt_get_cleans_up_actor_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("cancel", "stdio", "unused")
+    client = _BlockingPromptClient(config)
+    monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"cancel": config})
+    )
+
+    request = asyncio.create_task(mount.get_prompt("cancel:review", {}))
+    await client.prompt_started.wait()
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    await client.prompt_cancelled.wait()
+    await asyncio.sleep(0)
+
+    actor = mount._actors["cancel"]
+    assert actor._requests == {}
     await mount.close()
 
 

@@ -5,8 +5,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
+from ..core.abort import AbortSignal
+from ..types import StructuredToolResult
 from .client import MCPClient, MCPPrompt
+
+if TYPE_CHECKING:
+    from .server_actor import MCPServerActor
 
 
 @dataclass(slots=True)
@@ -20,6 +26,20 @@ class PromptRequest:
     client: MCPClient | None = None
 
 
+@dataclass(slots=True)
+class CallRequest:
+    """One tool request sharing the actor request lifecycle."""
+
+    identifier: int
+    tool_name: str
+    arguments: dict[str, object]
+    abort_signal: AbortSignal
+    generation: int
+    result: asyncio.Future[StructuredToolResult]
+    task: asyncio.Task[StructuredToolResult] | None = None
+    client: MCPClient | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class PromptFinished:
     request: PromptRequest
@@ -28,93 +48,132 @@ class PromptFinished:
     error: BaseException | None
 
 
-class MCPPromptActorMixin:
-    """Add serialized prompt calls to an MCP server actor."""
+@dataclass(frozen=True, slots=True)
+class CallFinished:
+    request: CallRequest
+    task: asyncio.Task[StructuredToolResult]
+    result: StructuredToolResult | None
+    error: BaseException | None
 
-    async def get_prompt(
-        self,
-        prompt_name: str,
-        arguments: dict[str, str],
-        *,
-        generation: int,
-    ) -> str:
-        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        self._next_identifier += 1
-        request = PromptRequest(
-            self._next_identifier,
-            prompt_name,
-            dict(arguments),
-            generation,
-            future,
-        )
-        if self.is_terminal:
-            raise RuntimeError(prompt_unavailable(self.name))
-        self._queue.put_nowait(request)
+
+@dataclass(frozen=True, slots=True)
+class CancelRequest:
+    """A cancellation message shared by all actor request types."""
+
+    identifier: int
+    acknowledged: asyncio.Future[None] | None = None
+
+
+async def cancel_request(actor: "MCPServerActor", identifier: int) -> None:
+    """Cancel one queued actor request and wait for ownership cleanup."""
+
+    acknowledged = asyncio.get_running_loop().create_future()
+    if actor._task is not None and not actor._task.done():
+        actor._queue.put_nowait(CancelRequest(identifier, acknowledged))
+        await asyncio.shield(acknowledged)
+
+
+async def get_prompt(
+    actor: "MCPServerActor",
+    prompt_name: str,
+    arguments: dict[str, str],
+    *,
+    generation: int,
+) -> str:
+    """Queue one prompt request with actor-owned cancellation."""
+
+    future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    actor._next_identifier += 1
+    request = PromptRequest(
+        actor._next_identifier,
+        prompt_name,
+        dict(arguments),
+        generation,
+        future,
+    )
+    if actor.is_terminal:
+        raise RuntimeError(prompt_unavailable(actor.name))
+    actor._queue.put_nowait(request)
+    try:
         return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        await cancel_request(actor, request.identifier)
+        raise
 
-    def _handle_prompt(self, request: PromptRequest) -> None:
-        if self._closed or request.generation != self._generation:
-            set_exception(request.result, RuntimeError(prompt_unavailable(self.name)))
-            return
-        if self._status.state != "mounted" or self._client is None:
-            set_exception(request.result, RuntimeError(prompt_unavailable(self.name)))
-            return
-        self._dispatch_prompt(request, self._client)
 
-    def _dispatch_prompt(
-        self,
-        request: PromptRequest,
-        client: MCPClient,
-    ) -> None:
-        request.client = client
-        request.task = asyncio.create_task(
-            client.get_prompt(request.prompt_name, request.arguments)
+def handle_prompt(actor: "MCPServerActor", request: PromptRequest) -> None:
+    if actor._closed or request.generation != actor._generation:
+        set_exception(request.result, RuntimeError(prompt_unavailable(actor.name)))
+        return
+    if actor._status.state != "mounted" or actor._client is None:
+        set_exception(request.result, RuntimeError(prompt_unavailable(actor.name)))
+        return
+    request.client = actor._client
+    request.task = asyncio.create_task(
+        invoke_prompt(actor, request, actor._client)
+    )
+    actor._requests[request.identifier] = request
+    actor._children.add(request.task)
+    request.task.add_done_callback(
+        lambda done, prompt=request: queue_prompt_result(actor, done, prompt)
+    )
+
+
+async def invoke_prompt(
+    actor: "MCPServerActor",
+    request: PromptRequest,
+    client: MCPClient,
+) -> str:
+    return await asyncio.wait_for(
+        client.get_prompt(request.prompt_name, request.arguments),
+        timeout=actor._setup_timeout,
+    )
+
+
+def queue_prompt_result(
+    actor: "MCPServerActor",
+    task: asyncio.Task[str],
+    request: PromptRequest,
+) -> None:
+    if task.cancelled():
+        actor._queue.put_nowait(
+            PromptFinished(request, task, None, asyncio.CancelledError())
         )
-        self._prompt_calls[request.identifier] = request
-        self._children.add(request.task)
-        request.task.add_done_callback(
-            lambda done, prompt=request: self._queue_prompt_result(done, prompt)
-        )
+        return
+    try:
+        result = task.result()
+    except BaseException as exc:  # noqa: BLE001 - preserve task failure
+        actor._queue.put_nowait(PromptFinished(request, task, None, exc))
+    else:
+        actor._queue.put_nowait(PromptFinished(request, task, result, None))
 
-    def _queue_prompt_result(
-        self,
-        task: asyncio.Task[str],
-        request: PromptRequest,
-    ) -> None:
-        if task.cancelled():
-            self._queue.put_nowait(
-                PromptFinished(request, task, None, asyncio.CancelledError())
-            )
-            return
-        try:
-            result = task.result()
-        except BaseException as exc:  # noqa: BLE001 - preserve task failure
-            self._queue.put_nowait(PromptFinished(request, task, None, exc))
-        else:
-            self._queue.put_nowait(PromptFinished(request, task, result, None))
 
-    def _handle_prompt_finished(self, message: PromptFinished) -> None:
-        self._children.discard(message.task)
-        self._prompt_calls.pop(message.request.identifier, None)
-        current = (
-            not self._closed
-            and self._client is message.request.client
-            and message.request.generation == self._generation
-            and self._status.state == "mounted"
+def handle_prompt_finished(
+    actor: "MCPServerActor", message: PromptFinished
+) -> None:
+    actor._children.discard(message.task)
+    request = actor._requests.pop(message.request.identifier, message.request)
+    if isinstance(message.error, asyncio.CancelledError):
+        return
+    current = (
+        not actor._closed
+        and actor._client is request.client
+        and request.generation == actor._generation
+        and actor._status.state == "mounted"
+    )
+    if message.error is not None:
+        if current:
+            actor._degrade_current(_error_text(message.error))
+        set_exception(request.result, message.error)
+        return
+    if not current:
+        set_exception(
+            request.result,
+            RuntimeError(prompt_unavailable(actor.name)),
         )
-        if message.error is not None:
-            if current:
-                self._degrade_current(_error_text(message.error))
-            set_exception(message.request.result, message.error)
-            return
-        if not current:
-            set_exception(
-                message.request.result,
-                RuntimeError(prompt_unavailable(self.name)),
-            )
-            return
-        if message.result is not None:
-            set_result(message.request.result, message.result)
+        return
+    if message.result is not None:
+        set_result(request.result, message.result)
 
 
 async def discover_prompts(
@@ -143,8 +202,8 @@ def prompt_unavailable(name: str) -> str:
     return f"MCP prompt server '{name}' is unavailable. Use /mcp reconnect {name}."
 
 
-def set_result(future: asyncio.Future[object], value: object) -> None:
-    if not future.done():
+def set_result(future: asyncio.Future[object] | None, value: object) -> None:
+    if future is not None and not future.done():
         future.set_result(value)
 
 
@@ -153,15 +212,9 @@ def set_exception(future: asyncio.Future[object], error: BaseException) -> None:
         future.set_exception(error)
 
 
-def cancel_prompt_calls(calls: dict[int, PromptRequest], server_name: str) -> None:
-    for request in calls.values():
-        if request.task is not None:
-            request.task.cancel()
-        set_exception(request.result, RuntimeError(prompt_unavailable(server_name)))
-    calls.clear()
-
-
 def resolve_prompt_message(message: object, server_name: str) -> bool:
+    """Resolve a queued prompt message after actor termination."""
+
     if isinstance(message, PromptRequest):
         set_exception(message.result, RuntimeError(prompt_unavailable(server_name)))
     elif isinstance(message, PromptFinished):
@@ -174,6 +227,14 @@ def resolve_prompt_message(message: object, server_name: str) -> bool:
     return True
 
 
+def cancel_prompt_request(request: PromptRequest, server_name: str) -> None:
+    """Cancel one prompt task while closing the actor."""
+
+    if request.task is not None:
+        request.task.cancel()
+    set_exception(request.result, RuntimeError(prompt_unavailable(server_name)))
+
+
 def _error_text(error: BaseException) -> str:
     try:
         return str(error).strip() or type(error).__name__
@@ -182,10 +243,13 @@ def _error_text(error: BaseException) -> str:
 
 
 __all__ = [
-    "MCPPromptActorMixin",
+    "CancelRequest",
+    "CallFinished",
+    "CallRequest",
+    "cancel_request",
+    "cancel_prompt_request",
     "PromptFinished",
     "PromptRequest",
-    "cancel_prompt_calls",
     "discover_prompts",
     "prompt_unavailable",
     "resolve_prompt_message",
