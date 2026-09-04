@@ -457,7 +457,7 @@ async def test_background_agent_returns_handle_and_parent_continues(
 
     backend.release_child.set()
     notification = await _wait_for_notification(store, "completed")
-    assert notification.data["text"] == "child complete"
+    assert notification.data["text"].startswith("child complete")
     assert not store.agent_children()
     await loop.close()
 
@@ -476,7 +476,7 @@ async def test_background_completion_notification_waits_for_next_turn_boundary(
 
     events = await _collect(loop.run_turn("follow up"))
     assert events[0].type is StreamEventType.AGENT_NOTIFICATION
-    assert events[0].data["text"] == "child complete"
+    assert events[0].data["text"].startswith("child complete")
     assert loop.store.agent_notifications() == []
     await loop.close()
 
@@ -603,7 +603,7 @@ async def test_foreground_child_does_not_wait_for_background_grandchild(
 
     backend.release_grandchild.set()
     notification = await _wait_for_notification(store, "completed")
-    assert notification.data["text"] == "grandchild complete"
+    assert notification.data["text"].startswith("grandchild complete")
     await loop.close()
     assert not store.agent_children()
 
@@ -716,7 +716,7 @@ def test_resume_keeps_completed_unnotified_background_notification(
 
     notification = resumed.agent_notifications()[0]
     assert notification.data["status"] == "completed"
-    assert notification.data["text"] == "child complete"
+    assert notification.data["text"].startswith("child complete")
     assert not resumed.agent_children()
     assert ConversationStore(
         store.session_dir / "agents", session_id="1"
@@ -836,10 +836,10 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
     await asyncio.wait_for(task, timeout=1)
 
     results = [message.tool_result for message in store.messages() if message.tool_result]
-    assert [result.content for result in results if result is not None] == [
-        "child-1",
-        "child-2",
-    ]
+    assert all(
+        result is not None and result.content.startswith(expected)
+        for result, expected in zip(results, ("child-1", "child-2"), strict=True)
+    )
     assert sorted(path.name for path in (store.session_dir / "agents").iterdir()) == [
         "1",
         "2",
@@ -916,7 +916,11 @@ async def test_parent_abort_cancels_all_parallel_children(tmp_path: Path) -> Non
 
     results = [message.tool_result for message in store.messages() if message.tool_result]
     assert len(results) == 2
-    assert all(result is not None and result.content == "tool execution canceled" for result in results)
+    assert all(
+        result is not None
+        and result.content.startswith("tool execution canceled")
+        for result in results
+    )
     for index, call in enumerate(calls, start=1):
         child_store = ConversationStore(
             store.session_dir / "agents", session_id=str(index)
@@ -965,7 +969,7 @@ async def test_agent_returns_child_text_and_persists_child_session(tmp_path: Pat
     await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.content == "done"
+    assert result.content.startswith("done")
     child_dir = store.session_dir / "agents" / "1"
     assert (child_dir / "conversation.jsonl").exists()
     assert [message.role for message in ConversationStore(
@@ -1435,7 +1439,7 @@ async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
     await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.content == "child complete"
+    assert result.content.startswith("child complete")
     child_result = next(
         message.tool_result
         for message in ConversationStore(
@@ -1443,7 +1447,7 @@ async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
         ).messages()
         if message.tool_result
     )
-    assert child_result.content == "grandchild complete"
+    assert child_result.content.startswith("grandchild complete")
     grandchild_schemas = {
         schema["name"] for schema in backend.calls[2][1]
     }
@@ -1593,10 +1597,12 @@ async def test_top_level_agent_calls_get_fresh_shared_turn_budgets(
     results = [
         message.tool_result for message in store.messages() if message.tool_result
     ]
-    assert [result.content for result in results if result is not None] == [
-        "first complete",
-        "second complete",
-    ]
+    assert all(
+        result is not None and result.content.startswith(expected)
+        for result, expected in zip(
+            results, ("first complete", "second complete"), strict=True
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -1621,10 +1627,9 @@ async def test_parallel_top_level_agent_invocations_have_independent_budgets(
         )
         return result.content
 
-    assert await asyncio.gather(run_agent(1), run_agent(2)) == [
-        "agent 1 complete",
-        "agent 2 complete",
-    ]
+    results = await asyncio.gather(run_agent(1), run_agent(2))
+    assert results[0].startswith("agent 1 complete")
+    assert results[1].startswith("agent 2 complete")
 
 
 @pytest.mark.asyncio
@@ -1982,7 +1987,7 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
 
     await task
     result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.content == "tool execution canceled"
+    assert result.content.startswith("tool execution canceled")
     assert result.structured_content == {
         "turns_used": 0,
         "child_session_path": str(store.session_dir / "agents" / "1"),
@@ -2071,7 +2076,7 @@ async def test_parent_result_append_precedes_marker_cleanup(tmp_path: Path, monk
     AgentLoop(FakeBackend([]), replayed, max_turns=1)
     results = [message.tool_result for message in replayed.messages() if message.tool_result]
     assert len(results) == 1
-    assert results[0].content == "done"
+    assert results[0].content.startswith("done")
     assert not replayed.agent_children()
 
 
@@ -2093,7 +2098,7 @@ def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
     AgentLoop(FakeBackend([]), store, max_turns=1)
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.content == "tool execution canceled"
+    assert result.content.startswith("tool execution canceled")
     assert result.structured_content == {
         "turns_used": 2,
         "child_session_path": str(child.session_dir),
@@ -2233,7 +2238,7 @@ async def test_agent_without_a_model_still_inherits_the_parent_backend(
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
     )
-    assert result.content == "done"
+    assert result.content.startswith("done")
     # Parent and child both ran on the one backend, so it saw both turns.
     assert len(backend.calls) == 2
 
@@ -2255,7 +2260,7 @@ async def test_agent_with_a_model_runs_the_child_on_that_provider(
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
     )
-    assert result.content == "codex done"
+    assert result.content.startswith("codex done")
     # The child talked to the substitute, never to the parent's backend.
     assert len(child_backend.calls) == 1
     assert len(parent_backend.calls) == 1

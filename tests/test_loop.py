@@ -1393,7 +1393,7 @@ async def test_failed_child_returns_error_and_sibling_survives(tmp_path: Path) -
     ]
     assert results[0].is_error
     assert "child connection dropped" in results[0].content
-    assert results[1].content == "sibling complete"
+    assert results[1].content.startswith("sibling complete")
     assert store.messages()[-1].content[0].text == "parent survived"
     child_path = Path(results[0].structured_content["child_session_path"])
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
@@ -1429,7 +1429,7 @@ async def test_child_setup_failure_does_not_cancel_parallel_sibling(
     ]
     assert results[0] is not None and results[0].is_error
     assert "child setup disconnected" in results[0].content
-    assert results[1] is not None and results[1].content == "sibling complete"
+    assert results[1] is not None and results[1].content.startswith("sibling complete")
     child_path = Path(results[0].structured_content["child_session_path"])
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     assert child_store.turn_in_flight() is False

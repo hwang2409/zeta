@@ -765,7 +765,10 @@ class AgentLoop:
         except Exception as exc:
             result = ToolResult(tool_call.id, str(exc), is_error=True)
         result = _validated_tool_result(result, tool_call.id)
-        if result.content == "tool execution canceled" and result.is_error:
+        if (
+            result.is_error
+            and result.content.startswith("tool execution canceled")
+        ):
             result = self.finalize_canceled(request_id)
         else:
             result = self._finalize_tool_results([tool_call], [result])[0]
@@ -1046,7 +1049,8 @@ class AgentLoop:
             child_store = self._agent_child_stores.get(call.id)
             candidate = result if result is not None else slot
             if child_store is not None and (
-                candidate is None or candidate.content == "tool execution canceled"
+                candidate is None
+                or candidate.content.startswith("tool execution canceled")
             ):
                 result = self._canceled_agent_result(
                     call.id,
@@ -1085,7 +1089,7 @@ class AgentLoop:
                     continue
                 child_store = self._agent_child_stores.pop(call.id, None)
                 if child_store is not None:
-                    if result.content == "tool execution canceled":
+                    if result.content.startswith("tool execution canceled"):
                         child_store.mark_agent_canceled(call.id)
                     else:
                         adopt_agent_children(

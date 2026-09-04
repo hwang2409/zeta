@@ -17,7 +17,6 @@ from ..tools.agent_presets import GENERAL_PRESET, get_agent_preset
 from ..types import StreamEvent, StreamEventType, ToolCall
 from .theme import BODY, CARD_BG, CARD_BORDER, COMMAND, DIM, ERROR, RECEIPT
 
-
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
 MAX_TAIL_LINES = 20
@@ -58,28 +57,6 @@ def _read_lifecycle(path: str) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError, RecursionError):
         return {}
     return value if type(value) is dict else {}
-
-
-def format_agent_stats(stats: object) -> str:
-    if type(stats) is not dict:
-        return ""
-    turns = stats.get("turns_used")
-    elapsed = stats.get("elapsed")
-    tool_calls = stats.get("tool_calls")
-    error = stats.get("error")
-    canceled = stats.get("canceled")
-    if (
-        type(turns) is not int
-        or type(elapsed) not in {int, float}
-        or type(tool_calls) is not int
-        or type(error) is not bool
-        or type(canceled) is not bool
-    ):
-        return ""
-    return (
-        f" · {turns} turns · {elapsed:.1f}s · {tool_calls} tool calls"
-        f" · error={str(error).lower()} · canceled={str(canceled).lower()}"
-    )
 
 
 class AgentCard:
@@ -342,7 +319,7 @@ class AgentCard:
         if structured_status in {"running", "completed", "error", "canceled"}:
             status = structured_status
         else:
-            status = "canceled" if result.content == "tool execution canceled" else (
+            status = "canceled" if result.content.startswith("tool execution canceled") else (
                 "fail" if result.is_error else "ok"
             )
         agent_type = cls._agent_type(call)

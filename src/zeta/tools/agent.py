@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
-from ..core.checkpoints import ConversationIntegrityError
+from ..core.checkpoints import ConversationEntry, ConversationIntegrityError
 from ..core.store import ConversationStore
 from ..model_catalog import known_model_names
 from ..types import (
@@ -40,6 +40,72 @@ MAX_AGENT_STATUS_STEP = 160
 MAX_AGENT_STATUS_RESULT = 4_000
 MAX_AGENT_STATUS_DESCRIPTION = 160
 _TRUNCATION_NOTE = "\n[truncated]"
+
+
+def format_agent_stats(stats: object) -> str:
+    if type(stats) is not dict:
+        return ""
+    turns = stats.get("turns_used")
+    elapsed = stats.get("elapsed")
+    tool_calls = stats.get("tool_calls")
+    state = stats.get("state")
+    error = stats.get("error")
+    canceled = stats.get("canceled")
+    if (
+        type(turns) is not int
+        or turns < 0
+        or type(elapsed) not in {int, float}
+        or elapsed < 0
+        or type(tool_calls) is not int
+        or tool_calls < 0
+    ):
+        return ""
+    if type(state) is str:
+        if state not in {"running", "completed", "failed", "canceled", "error"}:
+            return ""
+        error = state in {"failed", "error"}
+        canceled = state == "canceled"
+    elif type(error) is not bool or type(canceled) is not bool:
+        return ""
+    return (
+        f" · {turns} turns · {elapsed:.1f}s · {tool_calls} tool calls"
+        f" · error={str(error).lower()} · canceled={str(canceled).lower()}"
+    )
+
+
+def _read_agent_lifecycle(path: str) -> dict[str, object]:
+    if not path:
+        return {}
+    try:
+        value = json.loads(
+            (Path(path) / "agent_lifecycle.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError, RecursionError):
+        return {}
+    return value if type(value) is dict else {}
+
+
+def _agent_error(message: str, max_bytes: int) -> dict[str, object]:
+    result = {
+        "content": [text_block(f"agent error: {message}")],
+        "isError": True,
+        "structuredContent": None,
+    }
+    if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= max_bytes:
+        return result
+    return {
+        "content": [text_block("agent error: response exceeds response limit")],
+        "isError": True,
+        "structuredContent": None,
+    }
+
+
+def _bounded_agent_result(
+    result: dict[str, object], max_bytes: int
+) -> dict[str, object]:
+    if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= max_bytes:
+        return result
+    return _agent_error("response exceeds response limit", max_bytes)
 
 
 class ChildApprovalPolicy:
@@ -306,14 +372,53 @@ def _read_agent_output(
     receipts = _active_agent_receipts(store)
     child_path = receipts.get(requested_handle)
     if child_path is None:
-        raise ValueError(f"unknown child handle: {requested_handle}")
+        raise ValueError("unknown child handle")
     try:
         if not child_path.is_dir() or not (child_path / "conversation.jsonl").is_file():
             raise OSError("child transcript is missing")
-        child_store = ConversationStore(child_path.parent, session_id=child_path.name)
-        output = _serialize_agent_transcript(child_store.messages())
+        raw = (child_path / "conversation.jsonl").read_bytes()
+        rows = raw.splitlines(keepends=True)
+        entries: list[ConversationEntry] = []
+        for index, line in enumerate(rows):
+            try:
+                row = json.loads(line)
+            except (ValueError, RecursionError) as exc:
+                if index == len(rows) - 1 and not line.endswith(b"\n"):
+                    break
+                raise ConversationIntegrityError(
+                    f"invalid conversation row {index + 1}: {child_path}"
+                ) from exc
+            if index == 0:
+                if not isinstance(row, dict) or row.get("type") != "header":
+                    raise ConversationIntegrityError(
+                        f"unsupported conversation schema: {child_path}"
+                    )
+                continue
+            if not isinstance(row, dict):
+                raise ConversationIntegrityError(
+                    f"conversation row {index + 1} is not an object: {child_path}"
+                )
+            entries.append(ConversationEntry.from_dict(row))
+        by_id = {entry.id: entry for entry in entries}
+        current = entries[-1] if entries else None
+        branch: list[ConversationEntry] = []
+        seen: set[str] = set()
+        while current is not None:
+            if current.id in seen:
+                raise ConversationIntegrityError(
+                    f"conversation parent cycle at {current.id}"
+                )
+            seen.add(current.id)
+            branch.append(current)
+            current = by_id.get(current.parent_id) if current.parent_id else None
+        messages = [
+            Message.from_dict(entry.data["message"])
+            for entry in reversed(branch)
+            if entry.type == "message"
+        ]
+        output = _serialize_agent_transcript(messages)
     except (OSError, ValueError, ConversationIntegrityError) as exc:
-        raise ValueError(f"could not read child transcript: {child_path}") from exc
+        raise ValueError("could not read child transcript") from exc
     result = _agent_output_page(
         output,
         handle=requested_handle,
@@ -336,7 +441,7 @@ def _read_agent_status(
         raise TypeError("agent status is unavailable outside an agent session")
     active_receipts = _active_agent_receipts(store)
     if requested_handle is not None and requested_handle not in active_receipts:
-        raise ValueError(f"unknown child handle: {requested_handle}")
+        raise ValueError("unknown child handle")
     children: list[dict[str, StructuredContentValue]] = []
     for handle, child_path in active_receipts.items():
         if requested_handle is not None and handle != requested_handle:
@@ -397,49 +502,29 @@ async def _agent_status(
     execution_context: ToolExecutionContext | None = None,
 ) -> dict[str, object]:
     del abort_signal, stream_publisher, execution_context
+    max_bytes = registry.max_output_chars
     requested = arguments.get("handle")
     if requested is not None and (type(requested) is not str or not requested):
-        return {
-            "content": [text_block("agent error: handle must be a nonempty string")],
-            "isError": True,
-            "structuredContent": None,
-        }
+        return _agent_error("handle must be a nonempty string", max_bytes)
     try:
         children = _read_agent_status(
             registry.session_store,
             requested_handle=requested,
         )
     except (TypeError, ValueError) as exc:
-        return {
-            "content": [text_block(f"agent error: {exc}")],
-            "isError": True,
-            "structuredContent": None,
-        }
+        return _agent_error(str(exc), max_bytes)
     if requested is not None:
         matching = [child for child in children if child["handle"] == requested]
         if not matching:
-            return {
-                "content": [text_block(f"agent error: unknown child handle: {requested}")],
-                "isError": True,
-                "structuredContent": None,
-            }
+            return _agent_error("unknown child handle", max_bytes)
         children = matching
     offset = arguments.get("offset", 0)
     limit = arguments.get("limit")
     if type(offset) is not int or offset < 0:
-        return {
-            "content": [text_block("agent error: offset must be a nonnegative integer")],
-            "isError": True,
-            "structuredContent": None,
-        }
+        return _agent_error("offset must be a nonnegative integer", max_bytes)
     if limit is not None and (type(limit) is not int or limit < 1):
-        return {
-            "content": [text_block("agent error: limit must be a positive integer")],
-            "isError": True,
-            "structuredContent": None,
-        }
+        return _agent_error("limit must be a positive integer", max_bytes)
     page = children[offset : offset + limit if limit is not None else None]
-    max_bytes = registry.max_output_chars
     while page:
         next_offset = offset + len(page)
         truncated = next_offset < len(children)
@@ -449,12 +534,13 @@ async def _agent_status(
             else ""
         )
         details = "\n".join(
-            "child {handle}: state: {state}; started_at: {started_at}; "
-            "finished_at: {finished_at}; elapsed: {elapsed:.2f}s; "
-            "turns_used: {turns_used}/{tree_budget}; step: {current_step}; "
-            "result: {final_result}".format(
-                **{**child, "final_result": child.get("final_result", "")}
-            )
+            (
+                "child {handle}: state: {state}; started_at: {started_at}; "
+                "finished_at: {finished_at}; elapsed: {elapsed:.2f}s; "
+                "turns_used: {turns_used}/{tree_budget}; step: {current_step}; "
+                "result: {final_result}"
+            ).format(**{**child, "final_result": child.get("final_result", "")})
+            + format_agent_stats(child)
             for child in page
         )
         content_text = f"agent status: {len(children)} children\n{details}{notice}"
@@ -475,31 +561,31 @@ async def _agent_status(
             return result
         page.pop()
     if offset < len(children):
-        return {
-            "content": [
-                text_block("agent error: status item exceeds response limit")
-            ],
-            "isError": True,
-            "structuredContent": None,
-        }
+        return _agent_error("status item exceeds response limit", max_bytes)
     count = len(children)
     label = "child" if count == 1 else "children"
     if count == 0 and offset == 0 and limit is None:
-        return {
+        return _bounded_agent_result(
+            {
+                "content": [text_block(f"agent status: {count} {label}")],
+                "isError": False,
+                "structuredContent": {"children": []},
+            },
+            max_bytes,
+        )
+    return _bounded_agent_result(
+        {
             "content": [text_block(f"agent status: {count} {label}")],
             "isError": False,
-            "structuredContent": {"children": []},
-        }
-    return {
-        "content": [text_block(f"agent status: {count} {label}")],
-        "isError": False,
-        "structuredContent": {
-            "children": [],
-            "offset": offset,
-            "truncated": False,
-            "total": count,
+            "structuredContent": {
+                "children": [],
+                "offset": offset,
+                "truncated": False,
+                "total": count,
+            },
         },
-    }
+        max_bytes,
+    )
 
 
 async def _agent_output(
@@ -510,41 +596,29 @@ async def _agent_output(
     execution_context: ToolExecutionContext | None = None,
 ) -> dict[str, object]:
     del abort_signal, stream_publisher, execution_context
+    max_bytes = registry.max_output_chars
     handle = arguments.get("handle")
     if type(handle) is not str or not handle:
-        return {
-            "content": [text_block("agent error: handle must be a nonempty string")],
-            "isError": True,
-            "structuredContent": None,
-        }
+        return _agent_error("handle must be a nonempty string", max_bytes)
     offset = arguments.get("offset", 0)
     limit = arguments.get("limit")
     if type(offset) is not int or offset < 0:
-        return {
-            "content": [text_block("agent error: offset must be a nonnegative integer")],
-            "isError": True,
-            "structuredContent": None,
-        }
+        return _agent_error("offset must be a nonnegative integer", max_bytes)
     if limit is not None and (type(limit) is not int or limit < 1):
-        return {
-            "content": [text_block("agent error: limit must be a positive integer")],
-            "isError": True,
-            "structuredContent": None,
-        }
+        return _agent_error("limit must be a positive integer", max_bytes)
     try:
-        return _read_agent_output(
-            registry.session_store,
-            requested_handle=handle,
-            offset=offset,
-            limit=limit,
-            max_bytes=registry.max_output_chars,
+        return _bounded_agent_result(
+            _read_agent_output(
+                registry.session_store,
+                requested_handle=handle,
+                offset=offset,
+                limit=limit,
+                max_bytes=max_bytes,
+            ),
+            max_bytes,
         )
     except (TypeError, ValueError) as exc:
-        return {
-            "content": [text_block(f"agent error: {exc}")],
-            "isError": True,
-            "structuredContent": None,
-        }
+        return _agent_error(str(exc), max_bytes)
 
 
 def agent_result(
@@ -577,8 +651,17 @@ def agent_result(
         structured_content["depth"] = depth
     if budget_exhausted:
         structured_content["error_code"] = "agent_turn_budget"
+    lifecycle = _read_agent_lifecycle(child_session_path)
+    stats = {
+        "turns_used": lifecycle.get("turns_used", turns_used),
+        "elapsed": lifecycle.get("elapsed", 0.0),
+        "tool_calls": lifecycle.get("tool_calls", 0),
+        "state": lifecycle.get(
+            "state", status or ("failed" if error else "completed")
+        ),
+    }
     return {
-        "content": [text_block(text)],
+        "content": [text_block(text + format_agent_stats(stats))],
         "isError": error,
         "structuredContent": structured_content,
     }

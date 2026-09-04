@@ -19,6 +19,7 @@ from rich.table import Table
 from rich import box
 from mdit_py_plugins.tasklists import tasklists_plugin
 
+from ..tools.agent import format_agent_stats
 from ..tools.exec import MacroDisplay
 from ..types import (
     ErrorInfo,
@@ -48,7 +49,7 @@ from .theme import (
     THOUGHT,
     VIM_STATE,
 )
-from .agent_card import AgentCard, format_agent_stats
+from .agent_card import AgentCard
 
 
 MAX_ARGUMENTS = 140
