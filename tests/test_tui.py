@@ -2500,7 +2500,12 @@ def test_agent_receipts_show_success_and_canceled_status() -> None:
     canceled = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,
         tool_call=call,
-        tool_result=ToolResult(call.id, "tool execution canceled", is_error=True),
+        tool_result=ToolResult(
+            call.id,
+            "tool execution canceled",
+            is_error=True,
+            is_canceled=True,
+        ),
         data={"elapsed_seconds": 0.4, "depth": 2},
     )
 
@@ -2511,6 +2516,24 @@ def test_agent_receipts_show_success_and_canceled_status() -> None:
     assert "canceled=true" in canceled_plain
     assert "error=true" not in canceled_plain
     assert "depth 2" in canceled_plain
+
+
+def test_unstructured_agent_error_renders_as_error() -> None:
+    call = ToolCall(
+        "agent-error",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "setup exploded", is_error=True),
+    )
+
+    rendered = render_agent_receipt(event)
+
+    assert "error=true" in rendered.plain
+    assert "canceled=false" in rendered.plain
 
 
 def test_background_start_event_reaches_presenter_with_depth(tmp_path: Path) -> None:

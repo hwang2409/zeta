@@ -218,6 +218,7 @@ def _parallel_agent_calls() -> list[ToolCall]:
 class BackgroundBackend(CompletionBackend):
     def __init__(self, calls: Sequence[ToolCall]) -> None:
         self.calls = list(calls)
+        self.child_text = "child complete"
         self.child_started = asyncio.Event()
         self.release_child = asyncio.Event()
 
@@ -242,7 +243,7 @@ class BackgroundBackend(CompletionBackend):
         elif last_user == "inspect the task":
             self.child_started.set()
             await self.release_child.wait()
-            blocks = [TextContent("child complete")]
+            blocks = [TextContent(self.child_text)]
         else:
             blocks = [TextContent("parent continued")]
         yield StreamEvent(StreamEventType.MESSAGE_START)
@@ -492,6 +493,36 @@ async def test_background_completion_notification_waits_for_next_turn_boundary(
     assert terminal.tool_result is not None
     assert terminal.tool_result.content.count("error=false") == 1
     assert loop.store.agent_notifications() == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_background_multibyte_receipt_fits_persisted_limit(
+    tmp_path: Path,
+) -> None:
+    backend = BackgroundBackend([_background_agent_call()])
+    backend.child_text = "😀" * 1_800
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+    background_events: list[StreamEvent] = []
+    loop.set_background_event_sink(background_events.append)
+
+    await _collect(loop.run_turn("start"))
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+
+    terminal = next(
+        event
+        for event in background_events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+    assert terminal.tool_result is not None
+    persisted = Message(
+        MessageRole.TOOL_RESULT,
+        [TextContent(terminal.tool_result.content)],
+        tool_result=terminal.tool_result,
+    )
+    assert len(json.dumps(persisted.to_dict(), ensure_ascii=False).encode("utf-8")) <= 10_000
     await loop.close()
 
 
@@ -2042,11 +2073,10 @@ async def test_multibyte_agent_receipt_stays_within_response_limit(
 
     await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
+    persisted = next(message for message in store.messages() if message.tool_result)
+    result = persisted.tool_result
     assert result is not None
-    assert len(json.dumps(result.to_dict(), ensure_ascii=False).encode("utf-8")) <= 10_000
+    assert len(json.dumps(persisted.to_dict(), ensure_ascii=False).encode("utf-8")) <= 10_000
 
 
 @pytest.mark.asyncio
@@ -2066,6 +2096,8 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     await task
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.content.startswith("tool execution canceled")
+    assert "error=false" in result.content
+    assert "canceled=true" in result.content
     assert result.structured_content == {
         "turns_used": 0,
         "child_session_path": str(store.session_dir / "agents" / "1"),

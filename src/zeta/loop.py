@@ -46,7 +46,7 @@ from .mcp.commands import (
 )
 from .prompts import load_identity
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
-from .tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
+from .tools.agent import MAX_AGENT_RESULT_BYTES, agent_result, bound_result
 from .tools.agent_presets import (
     compose_system_prompt,
     get_agent_preset,
@@ -157,14 +157,14 @@ def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
         structured_result = validate_tool_result(result)
     except ValueError as exc:
         return ToolResult(expected_id, f"invalid tool result: {exc}", True)
-    return ToolResult(
-        expected_id,
-        flatten_tool_content(structured_result["content"]),
-        structured_result["isError"],
-        content_blocks=structured_result["content"],
-        structured_content=structured_result["structuredContent"],
-        is_canceled=structured_result.get("isCanceled", False),
-    )
+    return bound_result(ToolResult(
+            expected_id,
+            flatten_tool_content(structured_result["content"]),
+            structured_result["isError"],
+            content_blocks=structured_result["content"],
+            structured_content=structured_result["structuredContent"],
+            is_canceled=structured_result.get("isCanceled", False),
+    ))
 
 
 class AgentLoop:

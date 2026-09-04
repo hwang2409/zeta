@@ -317,9 +317,7 @@ class AgentCard:
                 display_depth = value
         turns = turns or 0
         structured_status = structured.get("status")
-        is_canceled = result.is_canceled or (
-            result.is_error and result.structured_content is None
-        )
+        is_canceled = result.is_canceled
         if is_canceled:
             status = "canceled"
         elif structured_status in {"running", "completed", "error", "canceled"}:

@@ -20,7 +20,9 @@ from ..types import (
     StructuredContentValue,
     TextContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
+    flatten_tool_content,
 )
 from .agent_presets import (
     GENERAL_PRESET,
@@ -136,6 +138,66 @@ def _bounded_agent_result(
     if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= max_bytes:
         return result
     return _agent_error("response exceeds response limit", max_bytes)
+
+
+def bound_result(result: ToolResult) -> ToolResult:
+    structured = result.structured_content
+    blocks = result.content_blocks
+    if (
+        structured is None
+        or "child_session_path" not in structured
+        or blocks is None
+        or len(blocks) != 1
+        or blocks[0]["type"] != "text"
+    ):
+        return result
+
+    def envelope_size(candidate: ToolResult) -> int:
+        message = Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent(candidate.content)],
+            tool_result=candidate,
+        )
+        return len(json.dumps(message.to_dict(), ensure_ascii=False).encode("utf-8"))
+
+    if envelope_size(result) <= MAX_AGENT_RESULT_BYTES:
+        return result
+
+    block = blocks[0]
+
+    def candidate(length: int) -> ToolResult:
+        shown = block["text"][:length]
+        bounded_block = {
+            **block,
+            "text": shown,
+            "truncated": block["truncated"] or shown != block["text"],
+        }
+        bounded_blocks = [bounded_block]
+        return ToolResult(
+            result.tool_call_id,
+            flatten_tool_content(bounded_blocks),
+            result.is_error,
+            content_blocks=bounded_blocks,
+            structured_content=structured,
+            is_canceled=result.is_canceled,
+        )
+
+    low = 0
+    high = len(block["text"])
+    while low < high:
+        middle = (low + high + 1) // 2
+        if envelope_size(candidate(middle)) <= MAX_AGENT_RESULT_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    bounded = candidate(low)
+    if envelope_size(bounded) <= MAX_AGENT_RESULT_BYTES:
+        return bounded
+    return ToolResult(
+        result.tool_call_id,
+        "agent result exceeds response limit",
+        is_error=True,
+    )
 
 
 class ChildApprovalPolicy:
@@ -689,7 +751,8 @@ def agent_result(
         lifecycle = _read_agent_lifecycle(child_session_path)
         stats = agent_stats(
             lifecycle,
-            status=status or ("failed" if error else "completed"),
+            status=status
+            or ("canceled" if canceled else "failed" if error else "completed"),
             turns_used=turns_used,
         )
     content = text + (format_agent_stats(stats) if include_stats else "")
