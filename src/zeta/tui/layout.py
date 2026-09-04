@@ -129,7 +129,7 @@ def full_screen_content(
 ) -> VSplit:
     todo_panel = ConditionalContainer(
         Window(content=todo_widget, height=Dimension(min=0, max=7)),
-        Condition(lambda: bool(store.todo_items())),
+        Condition(lambda: todo_widget.visible),
     )
     bottom = WheelRouter(
         HSplit([todo_panel, *composer_rows, footer], height=Dimension(min=4, max=11)),

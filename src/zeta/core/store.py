@@ -60,6 +60,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self.bash_cwd = str(bash_cwd or self.cwd)
         self._entries: list[ConversationEntry] = []
         self._todo_items: list[TodoItem] = []
+        self._todo_revision = 0
+        self._todo_dismissed = False
         self._agent_counter = 0
         self._agent_children: dict[str, dict[str, Any]] = {}
         self._agent_parent: dict[str, Any] | None = None
@@ -186,14 +188,36 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
 
         return [dict(item) for item in self._todo_items]
 
+    @property
+    def todo_revision(self) -> int:
+        """Return the in-process revision of the todo list."""
+
+        return self._todo_revision
+
+    @property
+    def todo_dismissed(self) -> bool:
+        """Return whether the terminal todo receipt was dismissed."""
+
+        return self._todo_dismissed
+
+    def dismiss_todo(self) -> None:
+        """Persist dismissal of the terminal todo receipt."""
+
+        with self._append_lock():
+            self._load()
+            self._todo_dismissed = True
+            self._write_session_state(self.bash_cwd, self._todo_items)
+
     def set_todo_items(self, items: object) -> None:
         """Replace the session todo list in one atomic state-file update."""
 
         normalized = parse_todo_items(items)
         with self._append_lock():
             self._load()
-            self._write_session_state(self.bash_cwd, normalized)
             self._todo_items = [dict(item) for item in normalized]
+            self._todo_revision += 1
+            self._todo_dismissed = False
+            self._write_session_state(self.bash_cwd, normalized)
 
     def _load_session_state(self) -> None:
         if not self.state_path.exists():
@@ -219,6 +243,12 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         agent_state = _parse_agent_state(value, self.state_path)
         self.bash_cwd = bash_cwd
         self._todo_items = todo_items
+        todo_dismissed = value.get("todo_dismissed", False)
+        if type(todo_dismissed) is not bool:
+            raise ConversationIntegrityError(
+                f"session state todo dismissal is invalid: {self.state_path}"
+            )
+        self._todo_dismissed = todo_dismissed
         self._agent_counter = agent_state["agent_counter"]
         self._agent_children = agent_state["agent_children"]
         self._agent_parent = agent_state["agent_parent"]
@@ -231,6 +261,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         normalized_items = [dict(item) for item in todo_items]
         if normalized_items:
             state["todo_items"] = normalized_items
+        if self._todo_dismissed:
+            state["todo_dismissed"] = True
         _apply_agent_state(
             state,
             agent_counter=self._agent_counter,

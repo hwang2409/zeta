@@ -95,6 +95,9 @@ class CheckpointForkMixin:
             self._validate_checkpoint_label(label.strip())
             if type(created_at) is not str or not created_at:
                 raise ValueError("checkpoint created_at must be a string")
+            todo_dismissed = entry.data.get("todo_dismissed", False)
+            if type(todo_dismissed) is not bool:
+                raise ValueError("checkpoint todo dismissal must be a boolean")
         elif entry.type == "fork":
             from_entry_id = entry.data.get("from_entry_id")
             from_seq = entry.data.get("from_seq")
@@ -138,7 +141,11 @@ class CheckpointForkMixin:
             self._validate_checkpoint_label(resolved_label)
             entry = self._append_row_unlocked(
                 "checkpoint",
-                {"label": resolved_label, "created_at": _now()},
+                {
+                    "label": resolved_label,
+                    "created_at": _now(),
+                    "todo_dismissed": self._todo_dismissed,
+                },
             )
             return self._snapshot_entry(entry)
 
@@ -164,6 +171,8 @@ class CheckpointForkMixin:
                 },
                 parent_id=checkpoint.id,
             )
+            self._todo_dismissed = checkpoint.data.get("todo_dismissed", False)
+            self._write_session_state(self.bash_cwd, self._todo_items)
             return self._snapshot_entry(entry)
 
     @staticmethod

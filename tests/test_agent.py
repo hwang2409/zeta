@@ -24,6 +24,7 @@ from zeta.tools.agent_presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
 )
+from zeta.tui.todo import TodoWidget
 from zeta.types import (
     CompletionBackend,
     Message,
@@ -1265,33 +1266,38 @@ async def test_child_registry_preserves_parent_pre_execution_hook(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_child_registry_isolates_session_bound_builtin_tools(tmp_path: Path) -> None:
+async def test_child_registry_shares_todo_store_but_isolates_other_session_tools(
+    tmp_path: Path,
+) -> None:
     sessions = tmp_path / "sessions"
     parent_store = ConversationStore(sessions, session_id="parent", cwd=tmp_path)
     child_store = ConversationStore(sessions, session_id="child", cwd=tmp_path)
     (tmp_path / "nested").mkdir()
     registry = ToolRegistry(parent_store.cwd, session_store=parent_store)
     child_registry = registry.clone_for_session(child_store)
+    child_loop = AgentLoop(FakeBackend([]), child_store, registry=child_registry)
+    widget = TodoWidget(parent_store)
 
-    await child_registry.execute(
+    await child_loop.tool_registry.execute(
         ToolCall(
             "child-todo",
             "todo",
             {"items": [{"content": "child work", "status": "pending"}]},
         )
     )
-    await child_registry.execute(
+    await child_loop.tool_registry.execute(
         ToolCall("child-bash", "bash", {"cmd": "cd nested && pwd"})
     )
 
-    assert parent_store.todo_items() == []
-    assert child_store.todo_items() == [
+    assert parent_store.todo_items() == [
         {"content": "child work", "status": "pending"}
     ]
+    assert child_store.todo_items() == []
+    assert widget.visible
     assert parent_store.bash_cwd == str(tmp_path)
     assert child_store.bash_cwd == str(tmp_path / "nested")
 
-    await child_registry.close()
+    await child_loop.close()
     await registry.close()
 
 

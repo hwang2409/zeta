@@ -117,6 +117,7 @@ class TurnConsumerMixin:
                     self._invalidate_prompt()
                     continue
                 if event.type is StreamEventType.TURN_START:
+                    self._todo_widget.turn_boundary()
                     self._spinner_frame = 0
                     self._spinner_reset.set()
                     self._streaming = True
