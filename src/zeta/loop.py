@@ -182,6 +182,7 @@ class AgentLoop:
         token_budget: int = 200_000,
         retained_tail: int = 8,
         on_completion_success: Callable[[], None] | None = None,
+        on_plan_mode_change: Callable[[bool], None] | None = None,
         hooks: HookManager | None = None,
         skip_mcp_mount: bool = False,
         agent_depth: int = 0,
@@ -287,6 +288,7 @@ class AgentLoop:
             on_completion_success=on_completion_success,
         )
         self.on_completion_success = on_completion_success
+        self._on_plan_mode_change = on_plan_mode_change
         self.hooks = hooks
         if self.hooks is not None:
             self.hooks.bind_session(store.session_id)
@@ -294,7 +296,6 @@ class AgentLoop:
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
         self._plan_mode = False
         self._plan_mode_prior_prompt: Message | None = None
-        self._plan_mode_prior_deny: frozenset[str] | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
 
@@ -324,30 +325,18 @@ class AgentLoop:
         elif self._plan_mode_prior_prompt is not None:
             assembler.system_prompt = self._plan_mode_prior_prompt
             self._plan_mode_prior_prompt = None
-        self._apply_plan_mode_denials(enabled)
         self._plan_mode = enabled
+        if self._on_plan_mode_change is not None:
+            self._on_plan_mode_change(enabled)
 
-    def _apply_plan_mode_denials(self, enabled: bool) -> None:
-        """Deny the mutating tools outright, not just hide their schemas.
+    def plan_mode_allows(self, tool_name: str) -> bool:
+        """Check the current plan-mode allowlist at dispatch time."""
 
-        Withholding a schema stops a well-behaved model, not a determined one
-        replaying an older tool name, so plan mode also refuses the calls.
-        """
+        return not self._plan_mode or tool_name in PLAN_MODE_TOOLS | {"agent"}
 
-        policy = self.tool_registry.approval_policy
-        if policy is None:
-            return
-        if enabled:
-            self._plan_mode_prior_deny = policy.always_deny
-            allowed = PLAN_MODE_TOOLS | {"agent"}
-            policy.always_deny = policy.always_deny | {
-                name
-                for name in self.tool_registry.definitions_by_name
-                if name not in allowed
-            }
-        elif self._plan_mode_prior_deny is not None:
-            policy.always_deny = self._plan_mode_prior_deny
-            self._plan_mode_prior_deny = None
+    @property
+    def background_work_descriptions(self) -> tuple[str, ...]:
+        return self._background_owner.active_descriptions
 
     def _active_tool_schemas(self) -> list[ToolSchema]:
         """Return the schemas this turn advertises, honoring plan mode."""
@@ -724,6 +713,13 @@ class AgentLoop:
         existing = self._existing_tool_result(tool_call.id)
         if existing is not None:
             return existing
+        if not self.plan_mode_allows(tool_call.name):
+            result = ToolResult(
+                tool_call.id,
+                f"tool execution denied in plan mode: {tool_call.name} is not allowed",
+                is_error=True,
+            )
+            return self._finalize_tool_results([tool_call], [result])[0]
         if not prepared:
             self.tool_registry.start_batch()
         abort_signal = self.tool_registry.abort_signal
@@ -987,6 +983,8 @@ class AgentLoop:
             _validate_unique_tool_call_ids(calls)
             approval_requests: list[tuple[str, ToolCall]] = []
             for tool_call in calls:
+                if not self.plan_mode_allows(tool_call.name):
+                    continue
                 request = self.tool_registry.prepare_approval(tool_call)
                 if request is not None:
                     approval_requests.append((request.request_id, request.tool_call))

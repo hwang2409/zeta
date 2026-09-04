@@ -120,6 +120,10 @@ class SlashHandlerMixin:
                 "approval is active"
             )
         if not self.loop.plan_mode:
+            blocked = self._plan_mode_background_blocker()
+            if blocked is not None:
+                return blocked
+        if not self.loop.plan_mode:
             self.loop.set_plan_mode(True)
             self._invalidate_prompt()
         return SlashModelInput(requested)
@@ -148,11 +152,24 @@ class SlashHandlerMixin:
                 "plan mode unchanged: cannot change plan mode while a turn or "
                 "approval is active"
             )
+        if enabled:
+            blocked = self._plan_mode_background_blocker()
+            if blocked is not None:
+                return blocked
         self.loop.set_plan_mode(enabled)
         self._invalidate_prompt()
         if enabled:
             return "plan mode: on (read-only tools; deliver the plan as your answer)"
         return "plan mode: off"
+
+    def _plan_mode_background_blocker(self) -> str | None:
+        work = tuple(getattr(self.loop, "background_work_descriptions", ()))
+        if not work:
+            return None
+        return (
+            "plan mode unchanged: background work is active: "
+            f"{', '.join(work)}; stop it or wait"
+        )
 
     def toggle_plan_mode(self) -> None:
         """Toggle plan mode from the keyboard, reporting the same notice."""

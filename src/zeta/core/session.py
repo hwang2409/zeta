@@ -101,6 +101,7 @@ class SessionMetadata:
     context_files: list[str] = field(default_factory=list)
     vim_mode: bool = True
     budget_pinned: bool = False
+    plan_mode: bool = False
 
     @classmethod
     def new(
@@ -116,6 +117,7 @@ class SessionMetadata:
         context_files: list[str] | tuple[str, ...] = (),
         vim_mode: bool = True,
         budget_pinned: bool = False,
+        plan_mode: bool = False,
     ) -> SessionMetadata:
         timestamp = _now()
         return cls(
@@ -132,6 +134,7 @@ class SessionMetadata:
             context_files=list(context_files),
             vim_mode=vim_mode,
             budget_pinned=budget_pinned,
+            plan_mode=plan_mode,
         )
 
     @classmethod
@@ -170,12 +173,14 @@ class SessionMetadata:
         context_files = value.get("context_files", []) if has_context_snapshot else []
         vim_mode = value.get("vim_mode", True)
         budget_pinned = value.get("budget_pinned", False)
+        plan_mode = value.get("plan_mode", False)
         if (
             type(system_prompt) is not str
             or type(context_files) is not list
             or any(type(item) is not str for item in context_files)
             or type(vim_mode) is not bool
             or type(budget_pinned) is not bool
+            or type(plan_mode) is not bool
         ):
             raise SessionError(f"session metadata context is invalid: {path}")
         return cls(
@@ -193,6 +198,7 @@ class SessionMetadata:
             context_files=list(context_files),
             vim_mode=vim_mode,
             budget_pinned=budget_pinned,
+            plan_mode=plan_mode,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -211,6 +217,7 @@ class SessionMetadata:
             "context_files": self.context_files,
             "vim_mode": self.vim_mode,
             "budget_pinned": self.budget_pinned,
+            "plan_mode": self.plan_mode,
         }
 
 
@@ -425,6 +432,23 @@ class SessionManager:
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
+    def record_plan_mode(self, metadata: SessionMetadata, *, enabled: bool) -> None:
+        """Persist plan mode with optimistic concurrency."""
+
+        expected = metadata.plan_mode
+
+        def update(item: SessionMetadata) -> SessionMetadata:
+            if item.plan_mode != expected:
+                raise SessionError(
+                    "session plan mode changed before commit; winner: "
+                    f"plan_mode={item.plan_mode!r}"
+                )
+            item.plan_mode = enabled
+            return self._touch(item)
+
+        current = self._mutate(metadata.session_id, update)
+        self._copy_metadata(metadata, current)
+
     def record_budget(
         self,
         metadata: SessionMetadata,
@@ -481,6 +505,7 @@ class SessionManager:
         target.context_files = list(source.context_files)
         target.vim_mode = source.vim_mode
         target.budget_pinned = source.budget_pinned
+        target.plan_mode = source.plan_mode
 
     def _read(self, session_id: str) -> SessionMetadata:
         path = self.sessions_dir / session_id / "meta.json"

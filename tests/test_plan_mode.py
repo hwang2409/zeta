@@ -126,7 +126,9 @@ def test_plan_mode_wraps_and_restores_the_system_prompt(tmp_path: Path) -> None:
 # --- execution gate --------------------------------------------------------
 
 
-def test_plan_mode_denies_the_mutating_tools(tmp_path: Path) -> None:
+def test_plan_mode_checks_the_allowlist_without_mutating_approval_policy(
+    tmp_path: Path,
+) -> None:
     loop = build_loop(tmp_path, [])
     policy = loop.tool_registry.approval_policy
     assert policy is not None
@@ -135,11 +137,12 @@ def test_plan_mode_denies_the_mutating_tools(tmp_path: Path) -> None:
     loop.set_plan_mode(True)
     for name in ("bash", "edit", "write", "exec", "agent"):
         if name == "agent":
-            assert policy.decide(name, {}) is not ApprovalDecision.DENY, name
+            assert loop.plan_mode_allows(name), name
         else:
-            assert policy.decide(name, {}) is ApprovalDecision.DENY, name
+            assert not loop.plan_mode_allows(name), name
     for name in sorted(PLAN_MODE_TOOLS):
-        assert policy.decide(name, {}) is not ApprovalDecision.DENY, name
+        assert loop.plan_mode_allows(name), name
+    assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
 
     loop.set_plan_mode(False)
     assert policy.decide("bash", {}) is ApprovalDecision.ALLOW
@@ -252,6 +255,91 @@ async def test_general_sub_agents_are_rejected_in_plan_mode(tmp_path: Path) -> N
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_type", ["explore", "plan"])
+async def test_allowed_sub_agents_complete_a_turn_in_plan_mode(
+    tmp_path: Path, agent_type: str
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall(
+                "agent-call",
+                "agent",
+                {
+                    "prompt": "inspect this",
+                    "description": "task research",
+                    "agent_type": agent_type,
+                },
+            )]),
+            ScriptedTurn([TextContent("child complete")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        approval_policy=ApprovalPolicy(
+            store=store, default=ApprovalDecision.ALLOW
+        ),
+    )
+    loop.set_plan_mode(True)
+
+    await collect(loop.run_turn("start"))
+
+    child_result = next(
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    )
+    assert child_result.is_error is False
+    assert child_result.content == "child complete"
+    assert len(backend.calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approval_default", [ApprovalDecision.ALLOW, ApprovalDecision.ASK])
+async def test_late_mounted_tool_is_rejected_in_plan_mode(
+    tmp_path: Path, approval_default: ApprovalDecision
+) -> None:
+    executed = False
+
+    async def late_tool(arguments: dict[str, object]) -> str:
+        del arguments
+        nonlocal executed
+        executed = True
+        return "must not run"
+
+    call = ToolCall("late-call", "remote:write", {})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        approval_policy=ApprovalPolicy(store=store, default=approval_default),
+    )
+    loop.set_plan_mode(True)
+    loop.tool_registry.register(
+        "remote:write",
+        late_tool,
+        parameters={"type": "object"},
+    )
+
+    await collect(loop.run_turn("start"))
+
+    result = next(
+        message.tool_result
+        for message in store.messages()
+        if message.tool_result is not None
+    )
+    assert result.is_error is True
+    assert "remote:write is not allowed" in result.content
+    assert executed is False
+    assert store.pending_approvals() == []
+
+
 # --- the /plan command -----------------------------------------------------
 
 
@@ -320,6 +408,36 @@ def test_plan_command_refuses_while_a_turn_is_active() -> None:
     assert session.plan_mode is False
 
 
+@pytest.mark.asyncio
+async def test_plan_command_refuses_live_background_work_then_allows_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
+    app = build_app(tmp_path, [])
+    watcher = asyncio.create_task(asyncio.sleep(0))
+    app.loop._background_owner.register(
+        "macro:test",
+        lambda: None,
+        watcher,
+        description="/build",
+    )
+
+    blocked = dispatch(app, "/plan on")
+    assert blocked == (
+        "plan mode unchanged: background work is active: /build; stop it or wait"
+    )
+    assert app.loop.plan_mode is False
+
+    await watcher
+    app.loop._background_owner.unregister("macro:test")
+    assert dispatch(app, "/plan on") == (
+        "plan mode: on (read-only tools; deliver the plan as your answer)"
+    )
+    assert app.loop.plan_mode is True
+
+
 def test_plan_command_is_listed_in_help() -> None:
     assert "/plan" in create_slash_registry().help_text()
     assert "/implement" in create_slash_registry().help_text()
@@ -377,7 +495,7 @@ def test_status_command_reports_plan_mode(
     assert "plan_mode: on" in dispatch(app, "/status")
 
 
-def test_plan_mode_does_not_touch_session_metadata(
+def test_plan_mode_persists_and_restores_session_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home = tmp_path / "zeta-home"
@@ -386,7 +504,12 @@ def test_plan_mode_does_not_touch_session_metadata(
     app.loop.set_plan_mode(True)
     session_id = app.loop.store.session_id
     metadata = json.loads((home / "sessions" / session_id / "meta.json").read_text())
-    assert "plan_mode" not in metadata
+    assert metadata["plan_mode"] is True
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+    )
+    assert resumed.loop.plan_mode is True
 
 
 # --- the shift+tab binding -------------------------------------------------

@@ -494,6 +494,7 @@ async def run_agent_tool(
             request_background_cancel,
             watcher,
             parent_store=loop.store,
+            description=description,
         )
         # The tree owner now keeps this task pair alive after this loop closes.
         loop._tracked_tasks.discard(child_task)
