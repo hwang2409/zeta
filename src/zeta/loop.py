@@ -336,7 +336,12 @@ class AgentLoop:
 
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
-        return self._background_owner.active_descriptions
+        process_work = tuple(
+            record.command
+            for record in self.tool_registry.background_tasks.records
+            if record.running
+        )
+        return self._background_owner.active_descriptions + process_work
 
     def _active_tool_schemas(self) -> list[ToolSchema]:
         """Return the schemas this turn advertises, honoring plan mode."""
