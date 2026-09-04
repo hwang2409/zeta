@@ -690,7 +690,10 @@ class SlashCommandRegistry:
         first_line = value.split("\n", 1)[0]
         if not first_line.startswith("/") or first_line.startswith("//"):
             return None
-        name = first_line[1:].split(maxsplit=1)[0]
+        parts = first_line[1:].split(maxsplit=1)
+        if not parts:
+            return None
+        name = parts[0]
         command = self._custom_commands.get(name)
         return command if command is not None and command.kind == "exec" else None
 

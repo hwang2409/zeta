@@ -666,6 +666,7 @@ def test_empty_message_does_nothing() -> None:
 
     assert registry.dispatch(session(), "") is None
     assert registry.input_for_model("") == ""
+    assert registry.exec_command_for("/") is None
 
 
 def test_model_command_shows_and_changes_the_model() -> None:

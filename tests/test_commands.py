@@ -42,7 +42,7 @@ from zeta.tui.composer import (
     build_key_bindings,
 )
 from zeta.tui.render import render_approval_card
-from zeta.types import MessageRole, TextContent, ToolCall
+from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
 
 
 def _write_command(directory: Path, name: str, content: str) -> None:
@@ -560,6 +560,90 @@ async def test_handler_failure_acknowledges_entry_and_advances_pipeline(
     await app.loop.close()
 
 
+@pytest.mark.asyncio
+async def test_provider_start_failure_rolls_back_and_advances_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    app = TUIApp(
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        zeta_home=tmp_path / "home",
+        history_path=tmp_path / "history",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    original_start_turn = app._start_turn
+    attempts = 0
+
+    def start_turn(*args: object, **kwargs: object) -> asyncio.Task[None]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("forced provider failure")
+        return original_start_turn(*args, **kwargs)
+
+    monkeypatch.setattr(app, "_start_turn", start_turn)
+    app._input_loop_active = True
+    await app._handle_prompt_value("first")
+    for _ in range(100):
+        if "submission failed: forced provider failure" in app.console.file.getvalue():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("provider failure was not handled")
+    await app._handle_prompt_value("later")
+
+    for _ in range(100):
+        if len(backend.calls) == 1:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("pipeline did not advance after provider failure")
+    assert attempts == 2
+    user_message = next(
+        message
+        for message in backend.calls[0][0]
+        if message.role is MessageRole.USER
+    )
+    assert user_message.content[0].text == "later"
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_approval_action_acknowledges_waiter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    call = ToolCall("approval-write-failure", "danger", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    policy = ApprovalPolicy(store=store)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        provider="fake",
+        model="offline",
+        zeta_home=tmp_path / "home",
+        history_path=tmp_path / "history",
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    def fail_approval(request_id: str | tuple[str, str]) -> bool:
+        del request_id
+        raise OSError("forced approval write failure")
+
+    monkeypatch.setattr(policy, "approve", fail_approval)
+    await asyncio.wait_for(
+        app._submissions.approval_action_wait(ApprovalDecision.ALLOW, call.id),
+        timeout=1,
+    )
+    assert "submission failed: forced approval write failure" in app.console.file.getvalue()
+    await app.loop.close()
+
+
 async def test_prompt_macro_resolves_inline_shell_and_template_attachments(
     tmp_path: Path,
 ) -> None:
@@ -741,8 +825,9 @@ async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
 
 
 @pytest.mark.asyncio
-async def test_unmapped_durable_approval_does_not_deny_inline_submission(
-    tmp_path: Path,
+@pytest.mark.parametrize("decision", [ApprovalDecision.ALLOW, ApprovalDecision.DENY])
+async def test_unmapped_durable_approval_is_finalized(
+    tmp_path: Path, decision: ApprovalDecision
 ) -> None:
     home = tmp_path / "home"
     _write_command(home / "commands", "inspect", "value !`printf ready`")
@@ -751,11 +836,13 @@ async def test_unmapped_durable_approval_does_not_deny_inline_submission(
     store.append_approval_request(old_call.id, old_call)
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+
     app = TUIApp(
         AgentLoop(backend, store, approval_policy=policy),
         provider="fake",
         model="offline",
         zeta_home=home,
+        history_path=home / "history",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
     )
@@ -774,7 +861,24 @@ async def test_unmapped_durable_approval_does_not_deny_inline_submission(
         for request in app.pending_approvals
         if request.key != old_call.id
     )
-    await app._handle_prompt_value(f"deny {old_call.id}")
+    verb = "approve" if decision is ApprovalDecision.ALLOW else "deny"
+    await app._handle_prompt_value(f"{verb} {old_call.id}")
+    for _ in range(100):
+        old_result = next(
+            (
+                message.tool_result
+                for message in store.messages()
+                if message.tool_result is not None
+                and message.tool_result.tool_call_id == old_call.id
+            ),
+            None,
+        )
+        if old_result is not None:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("unmapped durable approval was not finalized")
+    assert old_result is not None
     assert {request.key for request in app.pending_approvals} == {inline_key}
 
     await app._handle_prompt_value(f"approve {inline_key}")

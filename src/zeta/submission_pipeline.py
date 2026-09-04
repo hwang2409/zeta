@@ -439,7 +439,7 @@ class SubmissionPipeline:
                 elif isinstance(message, _ApprovalLifecycle):
                     self._on_approval_lifecycle(message)
                 elif isinstance(message, _ApprovalAction):
-                    self._on_approval_action(message)
+                    await self._on_approval_action(message)
                 elif isinstance(message, _AbortAction):
                     self._on_abort(message.submission_id)
                 elif isinstance(message, _UndoAction):
@@ -450,7 +450,11 @@ class SubmissionPipeline:
             self._resolve_preprocessing_completions()
             self._prune_finished()
             if self._messages.empty():
-                self._dispatch_oldest_ready()
+                try:
+                    self._dispatch_oldest_ready()
+                except Exception as exc:  # noqa: BLE001
+                    self._host._print_system(f"submission failed: {exc}")
+                    self._rollback_provider_dispatch()
 
     async def _on_submit(self, message: _Submit) -> None:
         entry = _Entry(message.submission)
@@ -463,7 +467,7 @@ class SubmissionPipeline:
             action = self._approval_action_for(parsed)
             if action is not None:
                 decision, requested_key = action
-                self._on_approval_action(_ApprovalAction(decision, requested_key))
+                await self._on_approval_action(_ApprovalAction(decision, requested_key))
                 self._host._record_prompt(parsed, entry.submission.draft_revision)
                 self._cancel_entry(entry)
             else:
@@ -784,6 +788,17 @@ class SubmissionPipeline:
             )
         )
 
+    def _rollback_provider_dispatch(self) -> None:
+        entry = self._provider_entry
+        if entry is None:
+            return
+        if self._provider_task is not None and not self._provider_task.done():
+            self._provider_task.cancel()
+        self._provider_entry = None
+        self._provider_task = None
+        self._host._release_attachment_paths(entry.submission.attachment_paths)
+        self._finish_entry(entry, SubmissionState.CANCELED)
+
     def _on_provider_done(self, message: _ProviderDone) -> None:
         if (
             self._provider_entry is None
@@ -852,7 +867,7 @@ class SubmissionPipeline:
         if entry.state is SubmissionState.AWAITING_APPROVAL:
             entry.state = SubmissionState.PREPROCESSING
 
-    def _on_approval_action(self, message: _ApprovalAction) -> None:
+    async def _on_approval_action(self, message: _ApprovalAction) -> None:
         policy = self._host._approval_policy
         if policy is None:
             self._ack_action(message)
@@ -863,6 +878,12 @@ class SubmissionPipeline:
             self._ack_action(message)
             return
         owner = self._approval_owners.get(request.key)
+        durable = (
+            owner is None
+            and isinstance(request.key, str)
+            and self._host.loop.store.approval_states().get(request.request_id)
+            == (request.tool_call, None)
+        )
         if message.decision is ApprovalDecision.ALLOW:
             policy.approve(request.key)
             verb = "approved"
@@ -876,6 +897,11 @@ class SubmissionPipeline:
         self._host._print_system(f"approval · {verb} {request.key}")
         self._host._present_pending_approvals()
         self._host._invalidate_prompt()
+        if durable:
+            await self._host.loop.resume_pending_tool(
+                request.request_id,
+                event_sink=self._host._handle_tool_event,
+            )
         self._ack_action(message)
 
     def _find_request(self, requested_key: str | None) -> ApprovalRequest | None:
@@ -1016,10 +1042,10 @@ class SubmissionPipeline:
     def _fail_message(self, message: _Message) -> None:
         submission = self._submission_for_message(message)
         entry = self._entry_for(submission)
-        if entry is None or entry.state not in self._NONTERMINAL:
-            return
-        self._host._release_attachment_paths(entry.submission.attachment_paths)
-        self._finish_entry(entry, SubmissionState.CANCELED)
+        if entry is not None and entry.state in self._NONTERMINAL:
+            self._host._release_attachment_paths(entry.submission.attachment_paths)
+            self._finish_entry(entry, SubmissionState.CANCELED)
+        self._ack_message(message)
 
     @staticmethod
     def _submission_for_message(message: _Message) -> Submission | None:
