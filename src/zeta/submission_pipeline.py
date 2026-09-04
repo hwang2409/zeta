@@ -740,6 +740,8 @@ class SubmissionPipeline:
                 self._host._record_macro_receipt(receipt)
 
     def _dispatch_oldest_ready(self) -> None:
+        if self._durable_tasks:
+            return
         if any(
             entry.child_task is not None
             and entry.state

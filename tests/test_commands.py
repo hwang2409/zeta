@@ -1009,6 +1009,69 @@ async def test_resumed_durable_tool_abort_is_processed_by_submission_consumer(
 
 
 @pytest.mark.asyncio
+async def test_submission_waits_for_resumed_durable_tool_result(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    old_call = ToolCall("slow-request", "block", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(old_call)]),
+        [(old_call.id, old_call)],
+    )
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def block(arguments: dict[str, object], abort_signal: object) -> str:
+        del arguments, abort_signal
+        started.set()
+        await release.wait()
+        return "done"
+
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("later reply")])])
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            store,
+            tools={"block": block},
+            approval_policy=policy,
+        ),
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    await app._submissions.approval_action_wait(
+        ApprovalDecision.ALLOW, old_call.id
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await app._submissions.submit_text("later")
+    await asyncio.sleep(0)
+    assert backend.calls == []
+    assert [message.role for message in store.messages()] == [MessageRole.ASSISTANT]
+
+    release.set()
+    for _ in range(100):
+        if len(backend.calls) == 1:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("submission was not dispatched after durable result")
+
+    messages = store.messages()
+    assert [message.role for message in messages] == [
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL_RESULT,
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+    ]
+    assert messages[1].tool_result is not None
+    await app._submissions.close()
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
 async def test_close_resolves_pending_submission_ack_and_rejects_new_sends(
     tmp_path: Path,
 ) -> None:
