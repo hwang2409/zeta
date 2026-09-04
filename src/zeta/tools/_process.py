@@ -32,6 +32,7 @@ class _BackgroundRecord:
     exit_code: int | None = None
     note: str | None = None
     monitor: asyncio.Task[None] | None = None
+    log_path: Path | None = None
 
 
 class BackgroundTaskRegistry:
@@ -90,7 +91,13 @@ class BackgroundTaskRegistry:
         self._state_path = self._session_dir / "background_tasks.json"
         self._load_previous()
 
-    async def start(self, command: str, cwd: str | Path) -> tuple[str, int]:
+    async def start(
+        self,
+        command: str,
+        cwd: str | Path,
+        *,
+        log_path: str | Path | None = None,
+    ) -> tuple[str, int]:
         if self._closed:
             raise RuntimeError("background task registry is closed")
         if self.running_count >= self.max_tasks:
@@ -112,12 +119,21 @@ class BackgroundTaskRegistry:
             pid=process.pid,
             process=process,
             output=bytearray(),
+            log_path=Path(log_path) if log_path is not None else None,
         )
         self._records[task_id] = record
         record.monitor = asyncio.create_task(self._monitor(record))
         self._notice(f"background task {task_id} started: {_command_headline(command)}")
         self._persist()
         return task_id, process.pid
+
+    async def wait(self, task_id: str) -> dict[str, Any]:
+        """Wait for one background process and return its terminal status."""
+
+        record = self._record(task_id)
+        if record.monitor is not None:
+            await record.monitor
+        return self._status(record)
 
     async def output(
         self,
@@ -184,7 +200,13 @@ class BackgroundTaskRegistry:
         process = record.process
         if process is None or process.stdout is None:
             return
-        reader = asyncio.create_task(self._read_output(record, process.stdout))
+        log_handle = None
+        if record.log_path is not None:
+            record.log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_handle = await asyncio.to_thread(record.log_path.open, "wb")
+        reader = asyncio.create_task(
+            self._read_output(record, process.stdout, log_handle)
+        )
         try:
             await process.wait()
             await reader
@@ -195,6 +217,8 @@ class BackgroundTaskRegistry:
             await asyncio.gather(reader, return_exceptions=True)
             raise
         finally:
+            if log_handle is not None:
+                log_handle.close()
             if not record.running:
                 return
             record.running = False
@@ -210,9 +234,13 @@ class BackgroundTaskRegistry:
         self,
         record: _BackgroundRecord,
         stream: asyncio.StreamReader,
+        log_handle: Any | None = None,
     ) -> None:
         while chunk := await stream.read(65_536):
             self._append(record, chunk)
+            if log_handle is not None:
+                log_handle.write(chunk)
+                log_handle.flush()
 
     async def _terminate(self, record: _BackgroundRecord, *, reason: str) -> None:
         process = record.process

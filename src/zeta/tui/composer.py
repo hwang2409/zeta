@@ -24,8 +24,9 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding.vi_state import InputMode
 from rich.text import Text
 
-from ..core.slash import CustomCommand, SlashCommandRegistry
-from ..tools.exec import forget_macro_display, register_macro_display, run_exec_macro
+from ..core.abort import AbortSignal
+from ..core.approval import ApprovalRequest
+from ..core.slash import SlashCommandRegistry
 from ..types import (
     ErrorInfo,
     ImageContent,
@@ -34,8 +35,6 @@ from ..types import (
     StreamEvent,
     StreamEventType,
     TextContent,
-    ToolCall,
-    ToolResult,
     image_signature_matches,
 )
 from .key_bindings import (
@@ -67,7 +66,7 @@ class TurnConsumerMixin:
                 await asyncio.wait_for(
                     self._spinner_reset.wait(), timeout=SPINNER_INTERVAL
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 if self._spinner_active:
                     self._spinner_frame += 1
                     if self._presenter.has_active_agent:
@@ -82,6 +81,7 @@ class TurnConsumerMixin:
         *,
         user_message: Message | None = None,
         persist_user_message: bool = True,
+        abort_signal: Any | None = None,
     ) -> None:
         user_text, user_message = self._consume_macro_receipts(
             user_text, user_message
@@ -91,6 +91,8 @@ class TurnConsumerMixin:
         self._loop_state = "streaming"
         self._streaming = True
         self._spinner_active = True
+        turn_abort_signal = abort_signal or self.loop.tool_registry.abort_signal.registry.new_generation()
+        self._standalone_abort_signal = turn_abort_signal
         spinner_task = asyncio.create_task(self._pulse_spinner())
         retry_message = user_message or Message(
             role=MessageRole.USER,
@@ -102,6 +104,7 @@ class TurnConsumerMixin:
                 user_text,
                 user_message=user_message,
                 persist_user_message=persist_user_message,
+                abort_signal=turn_abort_signal,
             ):
                 self._update_usage(event)
                 self._usage_tracker.record(event.type, self.model)
@@ -195,6 +198,8 @@ class TurnConsumerMixin:
             self._abort_requested = False
             self._streaming = False
             self._spinner_active = False
+            if self._standalone_abort_signal is turn_abort_signal:
+                self._standalone_abort_signal = None
             spinner_task.cancel()
             await asyncio.gather(spinner_task, return_exceptions=True)
             self._invalidate_prompt()
@@ -242,6 +247,7 @@ class UndoCandidate:
     attachment_paths: tuple[Path, ...] = ()
     attachment_tokens: tuple[tuple[str, Path], ...] = ()
     next_image_token: int = 1
+    submission_id: int | None = None
 
     @classmethod
     def from_message(
@@ -250,6 +256,8 @@ class UndoCandidate:
         message: Message,
         attachment_tokens: Mapping[str, Path],
         next_image_token: int,
+        *,
+        submission_id: int | None = None,
     ) -> UndoCandidate:
         paths = tuple(
             dict.fromkeys(
@@ -265,7 +273,7 @@ class UndoCandidate:
             for token, path in attachment_tokens.items()
             if path.resolve() in path_set
         )
-        return cls(text, paths, tokens, next_image_token)
+        return cls(text, paths, tokens, next_image_token, submission_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,27 +433,26 @@ end run
 class ComposerAttachmentMixin:
     """Attachment behavior shared by the TUI composition root."""
 
-    def abort_active(self) -> None:
-        if self._active_task is not None and not self._active_task.done():
-            macro_running = self._macro_abort_signal is not None
-            if macro_running:
-                self._abort_macro()
-            else:
-                self.loop.abort()
-                for request in self.pending_approvals:
-                    self._abort_approval(request.key)
-                    self.loop.finalize_canceled(request.request_id)
-            if macro_running or (
-                self._loop_state == "tool-running" and not self._resuming_tool
-            ):
+    def abort_active(self, submission_id: int | None = None) -> None:
+        if submission_id is None and not self._submissions.active:
+            task = self._active_task
+            if task is None or task.done():
+                return
+            signal = getattr(self, "_standalone_abort_signal", None)
+            if signal is not None:
+                signal.abort()
+            for request in self.pending_approvals:
+                if self._approval_policy is not None:
+                    self._approval_policy.abort(request.key)
+                self.loop.finalize_canceled(request.request_id)
+            if self._loop_state == "tool-running" and not self._resuming_tool:
                 self._abort_requested = True
             else:
-                self._active_task.cancel()
+                task.cancel()
             self._loop_state = "interrupted"
             self._invalidate_prompt()
-        elif self.loop.background_children_running:
-            self.loop.abort()
-            self._invalidate_prompt()
+            return
+        self._submissions.abort(submission_id)
 
     def _restore_draft_state(self, draft: Any) -> None:
         self._pending_attachment_tokens = {
@@ -649,59 +656,63 @@ class ComposerAttachmentMixin:
             return
         session.app.current_buffer.set_document(Document(value, len(value)))
 
-    def undo_sent_turn(self) -> None:
-        """Abort the current turn and restore its submitted text once."""
-
-        pending_submission = self._submissions.cancel_current()
-        if pending_submission is not None:
-            session = self._active_session or self._session
-            buffer = session.app.current_buffer if session is not None else None
-            self._draft.clear_submitted(pending_submission.draft_revision)
-            if buffer is not None and buffer.text:
-                self._release_attachment_paths(pending_submission.attachment_paths)
-                self._print_system(
-                    f"undo kept the current draft; sent text: {pending_submission.text}"
-                )
-                self._draft.schedule(buffer.text)
-                return
-            self._restore_composer(pending_submission.text)
-            self._restore_pending_attachment_state(
-                pending_submission.attachment_paths,
-                pending_submission.attachment_tokens,
-                pending_submission.next_image_token,
-            )
-            self._draft.schedule(
-                pending_submission.text,
-                attachment_tokens=dict(pending_submission.attachment_tokens),
-                next_image_token=pending_submission.next_image_token,
-            )
-            return
-
-        candidate = self._undo_candidate
-        if (
-            candidate is None
-            or not self.active
-            or self._loop_state
-            not in {"streaming", "compacting", "tool-running", "approval"}
-        ):
-            self._print_unit(Text("undo unavailable: turn already completed", style=DIM))
-            return
-        self._undo_candidate = None
-        self.abort_active()
+    def _restore_pending_submission(self, submission: Any) -> None:
         session = self._active_session or self._session
         buffer = session.app.current_buffer if session is not None else None
+        self._draft.clear_submitted(submission.draft_revision)
         if buffer is not None and buffer.text:
+            self._release_attachment_paths(submission.attachment_paths)
             self._print_system(
-                f"undo kept the current draft; sent text: {candidate.text}"
+                f"undo kept the current draft; sent text: {submission.text}"
             )
             self._draft.schedule(buffer.text)
             return
-        self._restore_composer(candidate.text)
-        self._pending_attachments[:] = list(candidate.attachment_paths)
-        self._pending_attachment_tokens.clear()
-        self._pending_attachment_tokens.update(candidate.attachment_tokens)
-        self._next_image_token = candidate.next_image_token
-        self._draft.schedule(candidate.text)
+        self._restore_composer(submission.text)
+        self._restore_pending_attachment_state(
+            submission.attachment_paths,
+            submission.attachment_tokens,
+            submission.next_image_token,
+        )
+        self._draft.schedule(
+            submission.text,
+            attachment_tokens=dict(submission.attachment_tokens),
+            next_image_token=submission.next_image_token,
+        )
+
+    def undo_sent_turn(self) -> None:
+        """Abort the current turn and restore its submitted text once."""
+
+        if not self._submissions.has_pending:
+            candidate = self._undo_candidate
+            if (
+                candidate is None
+                or self._active_task is None
+                or self._active_task.done()
+                or self._loop_state
+                not in {"streaming", "compacting", "tool-running", "approval"}
+            ):
+                self._print_unit(
+                    Text("undo unavailable: turn already completed", style=DIM)
+                )
+                return
+            self._undo_candidate = None
+            self.abort_active(candidate.submission_id)
+            session = self._active_session or self._session
+            buffer = session.app.current_buffer if session is not None else None
+            if buffer is not None and buffer.text:
+                self._print_system(
+                    f"undo kept the current draft; sent text: {candidate.text}"
+                )
+                self._draft.schedule(buffer.text)
+                return
+            self._restore_composer(candidate.text)
+            self._pending_attachments[:] = list(candidate.attachment_paths)
+            self._pending_attachment_tokens.clear()
+            self._pending_attachment_tokens.update(candidate.attachment_tokens)
+            self._next_image_token = candidate.next_image_token
+            self._draft.schedule(candidate.text)
+            return
+        self._submissions.undo()
 
     def _print_user(self, user: str | Message) -> None:
         self._presenter.reset_assistant_unit()
@@ -725,20 +736,6 @@ class ComposerAttachmentMixin:
                     style="dim",
                 )
         self._presenter.print_user(rendered)
-
-    def _start_queued_turn(self) -> None:
-        if not self._queued:
-            return
-        user_message, candidate = self._queued.popleft()
-        user_text = next(
-            block.text
-            for block in user_message.content
-            if isinstance(block, TextContent) and block.path is None
-        )
-        self._print_user(user_message)
-        self._print(Text("[queued]", style="dim"))
-        self._undo_candidate = candidate
-        self._start_turn(user_text, user_message=user_message)
 
     def _consume_macro_receipts(
         self, user_text: str, user_message: Message | None
@@ -764,131 +761,157 @@ class ComposerAttachmentMixin:
         *,
         user_message: Message | None = None,
         persist_user_message: bool = True,
-    ) -> None:
+        submission_id: int | None = None,
+        abort_signal: Any | None = None,
+    ) -> asyncio.Task[None]:
         self._loop_state = "streaming"
-        self._active_task = asyncio.create_task(
+        self._active_turn_submission_id = submission_id
+        task = asyncio.create_task(
             self._consume_turn(
                 user_text,
                 user_message=user_message,
                 persist_user_message=persist_user_message,
+                abort_signal=abort_signal,
             )
         )
-
-    async def slash_exec_macro(self, command: CustomCommand, args: str) -> str:
-        """Run one custom shell macro through the normal exec safety path."""
-
-        if self.active:
-            return "macro unavailable while a turn is running"
-        call = ToolCall(
-            f"macro-{uuid4().hex}",
-            "exec",
-            {
-                "command": command.render_exec(args),
-                "timeout": command.timeout,
-            },
-        )
-        register_macro_display(
-            call.id,
-            command=command.render(args),
-            argv=tuple(args.split()),
-        )
-        abort_signal = self.loop.tool_registry.abort_signal.registry.new_generation()
-        self._macro_abort_signal = abort_signal
-        self._macro_call_id = call.id
-        task = asyncio.create_task(self._run_exec_macro(command, call))
         self._active_task = task
-        self._loop_state = "tool-running"
-        if not self._input_loop_active:
-            try:
-                await asyncio.shield(task)
-            finally:
-                if self._active_task is task:
-                    self._active_task = None
-        return ""
+        return task
 
-    def _abort_macro(self) -> None:
-        signal = self._macro_abort_signal
-        if signal is None:
+
+class SubmissionMixin:
+    """Translate composer callbacks into pipeline messages."""
+
+    async def slash_mcp(self, args: str) -> str:
+        return await self.loop.slash_mcp(args)
+
+    async def slash_mcp_prompt(
+        self, name: str, arguments: dict[str, str]
+    ) -> str:
+        return await self.loop.slash_mcp_prompt(name, arguments)
+
+    def _submit_input(self, value: str) -> None:
+        if (
+            self._submissions._approval_action_for(value) is not None
+            and not self._submissions.active
+        ):
+            task = asyncio.create_task(self._handle_approval_input(value))
+            self._active_task = task
+            task.add_done_callback(self._clear_approval_task)
             return
-        signal.abort()
-        for request in self.pending_approvals:
-            if request.tool_call.id == self._macro_call_id:
-                self._abort_approval(request.key)
-
-    async def _run_exec_macro(self, command: CustomCommand, call: ToolCall) -> None:
-        log_path = self.loop.store.session_dir / f"macro-{call.id[6:]}.log"
-
-        def lifecycle_sink(kind: str) -> None:
-            event_type = {
-                "approval_start": StreamEventType.TOOL_APPROVAL_START,
-                "approval_end": StreamEventType.TOOL_APPROVAL_END,
-                "execution_start": StreamEventType.TOOL_EXECUTION_START,
-            }.get(kind)
-            if event_type is None:
-                return
-            self._handle_tool_event(
-                StreamEvent(
-                    event_type,
-                    tool_call=call,
-                    data={"macro": command.name},
-                )
-            )
-            if kind == "approval_start":
-                asyncio.get_running_loop().call_soon(self._present_pending_approvals)
-            self._invalidate_prompt()
-
-        def stream_sink(event: StreamEvent) -> None:
-            event.data["macro"] = command.name
-            self._handle_tool_event(event)
-            self._invalidate_prompt()
-
-        canceled = False
-        try:
-            result = await run_exec_macro(
-                self.loop.tool_registry,
-                call,
-                log_path,
-                stream_sink=stream_sink,
-                lifecycle_sink=lifecycle_sink,
-                abort_signal=self._macro_abort_signal,
-            )
-        except asyncio.CancelledError:
-            result = ToolResult(call.id, "tool execution canceled", True)
-            canceled = True
-        finally:
-            if self._approval_policy is not None:
-                self._approval_policy.forget_ephemeral(call.id)
-            forget_macro_display(call.id)
-        self._handle_tool_event(
-            StreamEvent(
-                StreamEventType.TOOL_EXECUTION_END,
-                tool_call=call,
-                tool_result=result,
-                data={"macro": command.name},
-            )
+        draft_revision = self._draft.mark_submitted()
+        paths, tokens, next_image_token = self._capture_pending_attachment_state()
+        self._submissions.submit(
+            value,
+            draft_revision=draft_revision,
+            attachment_paths=paths,
+            attachment_tokens=dict(tokens),
+            next_image_token=next_image_token,
         )
-        if result.content == "tool execution canceled":
-            status = "canceled"
-        elif result.content == "tool execution denied":
-            status = "denied"
-        elif (result.structured_content or {}).get("timed_out") is True:
-            status = "timeout"
-        else:
-            exit_code = (
-                result.structured_content.get("exit_code")
-                if result.structured_content is not None
-                else None
-            )
-            status = f"exit {exit_code}" if exit_code is not None else "failed"
-        self._macro_receipts.append(f"ran /{command.name}, {status}")
-        if self._macro_call_id == call.id:
-            self._macro_abort_signal = None
-            self._macro_call_id = None
-        self._loop_state = "idle"
-        self._streaming = False
-        if canceled:
-            raise asyncio.CancelledError
 
+    def _clear_approval_task(self, task: asyncio.Task[Any]) -> None:
+        if self._active_task is task:
+            self._active_task = None
+
+    async def _handle_prompt_value(self, value: str) -> None:
+        if self._input_loop_active:
+            self._submit_input(value)
+            await asyncio.sleep(0)
+            return
+        draft_revision = self._draft.mark_submitted()
+        paths, tokens, next_image_token = self._capture_pending_attachment_state()
+        await self._submissions.submit_text(
+            value,
+            draft_revision=draft_revision,
+            attachment_paths=paths,
+            attachment_tokens=dict(tokens),
+            next_image_token=next_image_token,
+        )
+
+    async def _handle_approval_input(self, value: str) -> bool:
+        action = self._submissions._approval_action_for(value)
+        if action is None:
+            return False
+        decision, requested_key = action
+        await self._submissions.approval_action_wait(decision, requested_key)
+        return True
+
+    def _pending_approvals_for_submission(
+        self, submission_id: int
+    ) -> tuple[ApprovalRequest, ...]:
+        owners = self._submissions.approval_owners
+        return tuple(
+            request
+            for request in self.pending_approvals
+            if owners.get(request.key) == submission_id
+        )
+
+    def _preprocessing_wait_set(self) -> set[asyncio.Task[Any]]:
+        return set(self._submissions.preprocessing_tasks.values())
+
+    def _drain_preprocessing(self, done: set[asyncio.Task[Any]]) -> None:
+        del done
+
+    def _set_pipeline_task(self, task: asyncio.Task[Any]) -> None:
+        self._active_task = task
+
+    def _record_macro_receipt(self, receipt: str) -> None:
+        self._macro_receipts.append(receipt)
+
+    def _handle_slash_output(self, output: str) -> None:
+        if self._fork_rebuilt:
+            self._fork_rebuilt = False
+        elif output.startswith("[Image #"):
+            self._insert_paste_token(output)
+        elif output:
+            self._print_system(output)
+
+    @property
+    def _preprocessing_tasks(self) -> dict[int, asyncio.Task[Any]]:
+        return self._submissions.preprocessing_tasks
+
+    @property
+    def _preprocessing_task(self) -> asyncio.Task[Any] | None:
+        return self._submissions.preprocessing_task
+
+    @_preprocessing_task.setter
+    def _preprocessing_task(self, value: asyncio.Task[Any] | None) -> None:
+        del value
+
+    @property
+    def _inline_abort_signals(self) -> dict[int, AbortSignal]:
+        return self._submissions.inline_abort_signals
+
+    @property
+    def _approval_owners(self) -> dict[str | tuple[str, str], int]:
+        return self._submissions.approval_owners
+
+    @property
+    def _approval_queue(self) -> tuple[tuple[Any, UndoCandidate], ...]:
+        return self._submissions.approval_queue
+
+    @property
+    def _queued(self) -> tuple[tuple[Any, UndoCandidate], ...]:
+        return self._submissions.queued
+
+    def _set_undo_candidate(self, candidate: UndoCandidate) -> None:
+        self._undo_candidate = candidate
+
+    def _restore_undo_candidate(self, candidate: UndoCandidate) -> None:
+        session = self._active_session or self._session
+        buffer = session.app.current_buffer if session is not None else None
+        if buffer is not None and buffer.text:
+            self._release_attachment_paths(candidate.attachment_paths)
+            self._print_system(
+                f"undo kept the current draft; sent text: {candidate.text}"
+            )
+            self._draft.schedule(buffer.text)
+            return
+        self._restore_composer(candidate.text)
+        self._pending_attachments[:] = list(candidate.attachment_paths)
+        self._pending_attachment_tokens.clear()
+        self._pending_attachment_tokens.update(candidate.attachment_tokens)
+        self._next_image_token = candidate.next_image_token
+        self._draft.schedule(candidate.text)
 
 def vim_state_label(vim_mode: bool) -> str | None:
     """Return the native prompt-toolkit vi state for the footer."""
