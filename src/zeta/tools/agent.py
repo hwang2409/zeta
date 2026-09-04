@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..model_catalog import known_model_names
-from ..types import Message, MessageRole, ToolCall, ToolUseContent
+from ..types import (
+    Message,
+    MessageRole,
+    StructuredContentValue,
+    ToolCall,
+    ToolUseContent,
+)
 from .agent_presets import (
-    AgentType,
     GENERAL_PRESET,
+    AgentType,
     agent_type_description,
     agent_type_names,
 )
@@ -151,6 +160,105 @@ def _approval_decision(value: str | None) -> ApprovalDecision | None:
     return None
 
 
+def _agent_status_elapsed(started_at: str, finished_at: str | None) -> float:
+    try:
+        started = datetime.fromisoformat(started_at)
+        ended = (
+            datetime.fromisoformat(finished_at)
+            if finished_at is not None
+            else datetime.now(UTC)
+        )
+        return max(0.0, (ended - started).total_seconds())
+    except ValueError:
+        return 0.0
+
+
+def _read_agent_status(
+    store: object,
+) -> list[dict[str, StructuredContentValue]]:
+    session_dir = getattr(store, "session_dir", None)
+    if not isinstance(session_dir, Path):
+        raise TypeError("agent status is unavailable outside an agent session")
+    agents_root = session_dir / "agents"
+    if not agents_root.exists():
+        return []
+    children: list[dict[str, StructuredContentValue]] = []
+    for lifecycle_path in sorted(agents_root.rglob("agent_lifecycle.json")):
+        try:
+            lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError(f"could not read child state: {lifecycle_path}") from exc
+        if type(lifecycle) is not dict:
+            continue
+        handle = lifecycle.get("handle")
+        if type(handle) is not str or not handle:
+            continue
+        started_at = lifecycle.get("started_at")
+        finished_at = lifecycle.get("finished_at")
+        if type(started_at) is not str or (
+            finished_at is not None and type(finished_at) is not str
+        ):
+            raise ValueError(f"invalid child timestamps: {lifecycle_path}")
+        item: dict[str, StructuredContentValue] = {
+            "handle": handle,
+            "state": lifecycle.get("state", "failed"),
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "elapsed": _agent_status_elapsed(started_at, finished_at),
+            "turns_used": lifecycle.get("turns_used", 0),
+            "tree_budget": lifecycle.get("tree_budget", 0),
+            "current_step": lifecycle.get("current_step", "unknown"),
+            "depth": lifecycle.get("depth", 0),
+            "agent_type": lifecycle.get("agent_type", "general"),
+            "description": lifecycle.get("description", ""),
+        }
+        if finished_at is not None:
+            item["final_result"] = lifecycle.get("final_result", "")
+        children.append(item)
+    return sorted(children, key=lambda child: str(child["started_at"]))
+
+
+async def _agent_status(
+    registry: ToolRegistry,
+    arguments: dict[str, Any],
+    abort_signal: AbortSignal,
+    stream_publisher: object = None,
+    execution_context: ToolExecutionContext | None = None,
+) -> dict[str, object]:
+    del abort_signal, stream_publisher, execution_context
+    requested = arguments.get("handle")
+    if requested is not None and (type(requested) is not str or not requested):
+        return {
+            "content": [text_block("agent error: handle must be a nonempty string")],
+            "isError": True,
+            "structuredContent": None,
+        }
+    try:
+        children = _read_agent_status(registry.session_store)
+    except (TypeError, ValueError) as exc:
+        return {
+            "content": [text_block(f"agent error: {exc}")],
+            "isError": True,
+            "structuredContent": None,
+        }
+    if requested is not None:
+        matching = [child for child in children if child["handle"] == requested]
+        if not matching:
+            return {
+                "content": [text_block(f"agent error: unknown child handle: {requested}")],
+                "isError": True,
+                "structuredContent": None,
+            }
+        children = matching
+    count = len(children)
+    label = "child" if count == 1 else "children"
+    return {
+        "content": [text_block(f"agent status: {count} {label}")],
+        "isError": False,
+        "structuredContent": {"children": children},
+    }
+
+
 def agent_result(
     text: str,
     *,
@@ -223,7 +331,8 @@ def register(registry: ToolRegistry) -> None:
             "main context. The child has its own bounded context and may spawn "
             "one level of grandchildren, but grandchildren cannot spawn agents. "
             "Pass model to run the child on another provider's model and "
-            "orchestrate it from here. Built-in types: "
+            "orchestrate it from here. The returned child_instance_id is the "
+            "stable handle for agent_status. Built-in types: "
             f"{agent_type_description()}"
         ),
         parameters={
@@ -256,4 +365,24 @@ def register(registry: ToolRegistry) -> None:
         },
         requires_approval=False,
         parallel_safe=True,
+    )
+    registry.register_session_tool(
+        "agent_status",
+        _agent_status,
+        description=(
+            "Inspect child agents from this session. Pass a child handle for "
+            "one child, or omit it to list every child. This is read-only."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "handle": {
+                    "type": "string",
+                    "description": "Stable child handle returned by the agent tool.",
+                }
+            },
+            "additionalProperties": False,
+        },
+        parallel_safe=True,
+        requires_approval=False,
     )

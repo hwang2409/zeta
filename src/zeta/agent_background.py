@@ -153,6 +153,9 @@ def _nested_canceled_result(marker: dict[str, object]) -> ToolResult:
     }
     if type(marker.get("agent_type")) is str:
         structured_content["agent_type"] = marker["agent_type"]
+    child_instance_id = marker.get("child_instance_id")
+    if type(child_instance_id) is str:
+        structured_content["child_instance_id"] = child_instance_id
     return ToolResult(
         ToolCall.from_dict(marker["tool_call"]).id,
         "tool execution canceled",
@@ -197,6 +200,7 @@ def _recover_nested_children(
             _recover_nested_children(child_store, notification_store)
         existing_result = _existing_tool_result(store, tool_call.id)
         notification_status: str | None = None
+        notification_text: str | None = None
         if marker.get("background"):
             child_instance_id = marker.get(
                 "child_instance_id", f"{store.session_id}:{child_path.name}"
@@ -213,8 +217,12 @@ def _recover_nested_children(
                     text="background child canceled when the parent session exited",
                 )
                 notification_status = "canceled"
+                notification_text = (
+                    "background child canceled when the parent session exited"
+                )
             else:
                 notification_status = existing.data["status"]
+                notification_text = existing.data["text"]
             if (
                 notification_store is not store
                 and _agent_notification(store, child_instance_id) is None
@@ -242,6 +250,13 @@ def _recover_nested_children(
             if marker.get("background") and notification_status == "canceled":
                 child_store.mark_agent_canceled(tool_call.id)
             elif existing_result or notification_status is not None:
+                if child_store.agent_lifecycle() is not None:
+                    child_store.finish_agent_lifecycle(
+                        "completed" if notification_status != "error" else "failed",
+                        final_result=(
+                            notification_text or "background child completed"
+                        ),
+                    )
                 child_store.finish_agent_parent()
             else:
                 child_store.mark_agent_canceled(tool_call.id)
@@ -296,6 +311,13 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                 if notification.data["status"] == "canceled":
                     child_store.mark_agent_canceled(tool_call.id)
                 else:
+                    if child_store.agent_lifecycle() is not None:
+                        child_store.finish_agent_lifecycle(
+                            "completed"
+                            if notification.data["status"] == "completed"
+                            else "failed",
+                            final_result=str(notification.data["text"]),
+                        )
                     child_store.finish_agent_parent()
             loop.store.finish_agent_child(marker_key)
             continue
@@ -310,6 +332,10 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                         child_session_path=marker["child_session_path"],
                         turns_used=marker.get("turns_used", 0),
                         agent_type=marker.get("agent_type"),
+                        child_instance_id=marker.get(
+                            "child_instance_id",
+                            f"{loop.store.session_id}:{child_path.name}",
+                        ),
                     ),
                 )
             )
@@ -370,14 +396,25 @@ async def finish_background_child(
         except Exception as exc:
             status = "error"
             notification_text = f"agent error: {error_message(exc)}"
+        lifecycle_state = {
+            "completed": "completed",
+            "canceled": "canceled",
+            "error": "failed",
+        }[status]
+        if lifecycle_state == "canceled":
+            child_store.mark_agent_canceled(tool_call.id)
+        else:
+            child_store.finish_agent_lifecycle(
+                lifecycle_state,
+                final_result=notification_text or "background child completed",
+                turns_used=child_turns(),
+            )
         effective_parent_store = (
             background_owner.parent_store(child_instance_id, parent_store)
             if background_owner is not None
             else parent_store
         )
-        if status == "canceled":
-            child_store.mark_agent_canceled(tool_call.id)
-        else:
+        if status != "canceled":
             adopt_agent_children(
                 child_store,
                 effective_parent_store,

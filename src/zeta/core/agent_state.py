@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from ..types import ToolCall
-from .checkpoints import ConversationIntegrityError
+from .checkpoints import ConversationIntegrityError, _now
+
+_AGENT_STATES = {"running", "completed", "canceled", "failed"}
 
 
 def _agent_type_metadata(agent_type: str | None) -> dict[str, str]:
@@ -264,7 +269,13 @@ class AgentStateMixin:
                 "content": "tool execution canceled",
             }
             self._agent_canceled.update(_agent_type_metadata(agent_type))
+            if self._agent_lifecycle is not None:
+                self._agent_lifecycle["state"] = "canceled"
+                self._agent_lifecycle["finished_at"] = _now()
+                self._agent_lifecycle["final_result"] = "tool execution canceled"
             self._write_session_state(self.bash_cwd, self._todo_items)
+            if self._agent_lifecycle is not None:
+                self._write_agent_lifecycle()
 
     def agent_type(self) -> str | None:
         """Return the child type from its agent marker."""
@@ -279,3 +290,125 @@ class AgentStateMixin:
         """Return the durable cancellation marker, if one exists."""
 
         return copy.deepcopy(self._agent_canceled)
+
+    def agent_lifecycle(self) -> dict[str, Any] | None:
+        """Return a detached snapshot of this child lifecycle."""
+
+        return copy.deepcopy(self._agent_lifecycle)
+
+    def agent_handle(self) -> str | None:
+        """Return this child's stable handle, if it has one."""
+
+        lifecycle = self._agent_lifecycle
+        handle = lifecycle.get("handle") if lifecycle is not None else None
+        return handle if type(handle) is str else None
+
+    def start_agent_lifecycle(
+        self,
+        *,
+        handle: str,
+        started_at: str,
+        tree_budget: int,
+        depth: int,
+        agent_type: str,
+        description: str,
+    ) -> None:
+        """Persist the metadata used by the agent status tool."""
+
+        if (
+            not handle
+            or not started_at
+            or type(tree_budget) is not int
+            or tree_budget < 1
+            or type(depth) is not int
+            or depth < 1
+            or not agent_type
+            or not description
+        ):
+            raise ValueError("invalid agent lifecycle metadata")
+        with self._append_lock():
+            self._load()
+            self._load_session_state()
+            self._agent_lifecycle = {
+                "handle": handle,
+                "state": "running",
+                "started_at": started_at,
+                "finished_at": None,
+                "turns_used": 0,
+                "tree_budget": tree_budget,
+                "current_step": "starting",
+                "depth": depth,
+                "agent_type": agent_type,
+                "description": description,
+            }
+            self._write_agent_lifecycle()
+
+    def update_agent_lifecycle(
+        self,
+        *,
+        current_step: str | None = None,
+        turns_used: int | None = None,
+    ) -> None:
+        """Persist a live child's latest step and turn count."""
+
+        if current_step is not None and not current_step:
+            raise ValueError("agent lifecycle step must be nonempty")
+        if turns_used is not None and (type(turns_used) is not int or turns_used < 0):
+            raise ValueError("agent lifecycle turns must be nonnegative")
+        with self._append_lock():
+            self._load()
+            self._load_session_state()
+            if self._agent_lifecycle is None:
+                return
+            if current_step is not None:
+                self._agent_lifecycle["current_step"] = current_step
+            if turns_used is not None:
+                self._agent_lifecycle["turns_used"] = turns_used
+            self._write_agent_lifecycle()
+
+    def finish_agent_lifecycle(
+        self,
+        state: str,
+        *,
+        final_result: str,
+        turns_used: int | None = None,
+        finished_at: str | None = None,
+    ) -> None:
+        """Persist a terminal child state and its final result text."""
+
+        if state not in _AGENT_STATES - {"running"} or not final_result:
+            raise ValueError("invalid terminal agent lifecycle")
+        if turns_used is not None and (type(turns_used) is not int or turns_used < 0):
+            raise ValueError("agent lifecycle turns must be nonnegative")
+        with self._append_lock():
+            self._load()
+            self._load_session_state()
+            if self._agent_lifecycle is None:
+                return
+            self._agent_lifecycle["state"] = state
+            self._agent_lifecycle["finished_at"] = finished_at or _now()
+            self._agent_lifecycle["final_result"] = final_result
+            if turns_used is not None:
+                self._agent_lifecycle["turns_used"] = turns_used
+            self._write_agent_lifecycle()
+
+    def _write_agent_lifecycle(self) -> None:
+        """Atomically write lifecycle data without changing session state bytes."""
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=self.session_dir,
+            prefix=".agent_lifecycle.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            try:
+                json.dump(self._agent_lifecycle, temporary, separators=(",", ":"))
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                os.replace(temporary_path, self.agent_lifecycle_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)

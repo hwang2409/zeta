@@ -1180,6 +1180,7 @@ async def test_typed_child_turn_cap_is_enforced(
         "turns_used": turn_cap,
         "child_session_path": str(store.session_dir / "agents" / "1"),
         "agent_type": agent_type,
+        "child_instance_id": f"{store.session_id}:1",
     }
 
 
@@ -1954,6 +1955,7 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     assert result.structured_content == {
         "turns_used": 0,
         "child_session_path": str(store.session_dir / "agents" / "1"),
+        "child_instance_id": f"{store.session_id}:1",
     }
     child_state = (store.session_dir / "agents" / "1" / "session_state.json").read_text()
     assert '"agent_parent"' not in child_state
@@ -1992,6 +1994,7 @@ async def test_parent_abort_after_child_turn_reports_completed_turns(tmp_path: P
     assert result.structured_content == {
         "turns_used": 1,
         "child_session_path": str(store.session_dir / "agents" / "1"),
+        "child_instance_id": f"{store.session_id}:1",
     }
 
 
@@ -2063,6 +2066,7 @@ def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
     assert result.structured_content == {
         "turns_used": 2,
         "child_session_path": str(child.session_dir),
+        "child_instance_id": "parent:1",
     }
     assert not store.agent_children()
     assert '"agent_parent"' not in (child.state_path).read_text()

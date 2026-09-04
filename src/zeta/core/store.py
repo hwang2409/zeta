@@ -14,15 +14,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from ..types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
-from .agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
-from .todo import TodoItem, parse_todo_items
+from ..types import Message, MessageRole, ToolCall, ToolUseContent
 from .checkpoints import (
     CheckpointForkMixin,
     ConversationEntry,
     ConversationIntegrityError,
     _now,
 )
+from .agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
+from .todo import TodoItem, parse_todo_items
 
 SCHEMA = "zeta.conversation.v1"
 MAX_AGENT_NOTIFICATION_TEXT = 4_000
@@ -55,6 +55,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.session_dir / "conversation.jsonl"
         self.state_path = self.session_dir / "session_state.json"
+        self.agent_lifecycle_path = self.session_dir / "agent_lifecycle.json"
         self.lock_path = self.session_dir / ".lock"
         self.cwd = str(cwd or Path.cwd())
         self.bash_cwd = str(bash_cwd or self.cwd)
@@ -64,6 +65,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._agent_children: dict[str, dict[str, Any]] = {}
         self._agent_parent: dict[str, Any] | None = None
         self._agent_canceled: dict[str, Any] | None = None
+        self._agent_lifecycle: dict[str, Any] | None = None
         with self._append_lock():
             self._load()
             self._load_session_state()
@@ -223,6 +225,21 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._agent_children = agent_state["agent_children"]
         self._agent_parent = agent_state["agent_parent"]
         self._agent_canceled = agent_state["agent_canceled"]
+        self._agent_lifecycle = None
+        if self.agent_lifecycle_path.exists():
+            try:
+                lifecycle = json.loads(
+                    self.agent_lifecycle_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ConversationIntegrityError(
+                    f"agent lifecycle could not be read: {self.agent_lifecycle_path}"
+                ) from exc
+            if type(lifecycle) is not dict:
+                raise ConversationIntegrityError(
+                    f"agent lifecycle is invalid: {self.agent_lifecycle_path}"
+                )
+            self._agent_lifecycle = lifecycle
 
     def _write_session_state(
         self, bash_cwd: str, todo_items: Iterable[TodoItem]
