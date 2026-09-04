@@ -81,10 +81,23 @@ def test_teardown_guard_rejects_two_appends_for_one_declaration(
 
     try:
         live_home_write_guard.declare_external_mutation(history, kind="append")
-        with history.open("a", encoding="utf-8") as stream:
-            stream.write("first\n")
-        with history.open("a", encoding="utf-8") as stream:
-            stream.write("second\n")
+        append_command = (
+            "from pathlib import Path; "
+            "Path(__import__('sys').argv[1]).open('a').write(__import__('sys').argv[2])"
+        )
+        subprocess.run(
+            [sys.executable, "-c", append_command, str(history), "first\n"],
+            env={},
+            start_new_session=True,
+            check=True,
+        )
+        live_home_write_guard.assert_clean()
+        subprocess.run(
+            [sys.executable, "-c", append_command, str(history), "second\n"],
+            env={},
+            start_new_session=True,
+            check=True,
+        )
 
         with pytest.raises(AssertionError, match="tests wrote to live zeta home"):
             live_home_write_guard.assert_clean()
