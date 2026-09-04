@@ -401,9 +401,10 @@ async def finish_background_child(
             "canceled": "canceled",
             "error": "failed",
         }[status]
+        lifecycle = child_store.agent_lifecycle()
         if lifecycle_state == "canceled":
             child_store.mark_agent_canceled(tool_call.id)
-        else:
+        elif lifecycle is None or lifecycle.get("finished_at") is None:
             child_store.finish_agent_lifecycle(
                 lifecycle_state,
                 final_result=notification_text or "background child completed",

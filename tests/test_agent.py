@@ -1052,7 +1052,14 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
     await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
     child_schemas = {schema["name"] for schema in backend.calls[1][1]}
-    assert child_schemas == {"agent", "fetch", "read", "skill", "websearch"}
+    assert child_schemas == {
+        "agent",
+        "agent_status",
+        "fetch",
+        "read",
+        "skill",
+        "websearch",
+    }
     child_messages = ConversationStore(
         store.session_dir / "agents", session_id="1"
     ).messages()
@@ -1140,6 +1147,7 @@ async def test_plan_child_includes_todo_and_only_read_only_tools(tmp_path: Path)
 
     assert {schema["name"] for schema in backend.calls[1][1]} == {
         "agent",
+        "agent_status",
         "fetch",
         "read",
         "skill",
@@ -1452,8 +1460,21 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
 
     child_tools = {schema["name"] for schema in backend.calls[1][1]}
     grandchild_tools = {schema["name"] for schema in backend.calls[2][1]}
-    assert child_tools == {"agent", "fetch", "read", "skill", "websearch"}
-    assert grandchild_tools == {"fetch", "read", "skill", "websearch"}
+    assert child_tools == {
+        "agent",
+        "agent_status",
+        "fetch",
+        "read",
+        "skill",
+        "websearch",
+    }
+    assert grandchild_tools == {
+        "agent_status",
+        "fetch",
+        "read",
+        "skill",
+        "websearch",
+    }
 
 
 @pytest.mark.asyncio

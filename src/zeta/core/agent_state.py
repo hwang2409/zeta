@@ -6,6 +6,8 @@ import copy
 import json
 import os
 import tempfile
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,34 @@ from ..types import ToolCall
 from .checkpoints import ConversationIntegrityError, _now
 
 _AGENT_STATES = {"running", "completed", "canceled", "failed"}
+
+
+def _lifecycle_elapsed(
+    lifecycle: dict[str, Any], *, finished_at: str | None = None
+) -> float:
+    started_monotonic = lifecycle.get("started_monotonic")
+    if (
+        type(started_monotonic) in {int, float}
+        and lifecycle.get("monotonic_pid") == os.getpid()
+    ):
+        return max(0.0, time.monotonic() - started_monotonic)
+    stored_elapsed = lifecycle.get("elapsed")
+    if type(stored_elapsed) in {int, float}:
+        return max(0.0, float(stored_elapsed))
+    started_at = lifecycle.get("started_at")
+    ended_at = finished_at or lifecycle.get("finished_at") or _now()
+    if type(started_at) is not str or type(ended_at) is not str:
+        return 0.0
+    try:
+        return max(
+            0.0,
+            (
+                datetime.fromisoformat(ended_at)
+                - datetime.fromisoformat(started_at)
+            ).total_seconds(),
+        )
+    except ValueError:
+        return 0.0
 
 
 def _agent_type_metadata(agent_type: str | None) -> dict[str, str]:
@@ -269,12 +299,19 @@ class AgentStateMixin:
                 "content": "tool execution canceled",
             }
             self._agent_canceled.update(_agent_type_metadata(agent_type))
-            if self._agent_lifecycle is not None:
+            lifecycle_was_running = (
+                self._agent_lifecycle is not None
+                and self._agent_lifecycle.get("finished_at") is None
+            )
+            if lifecycle_was_running:
                 self._agent_lifecycle["state"] = "canceled"
                 self._agent_lifecycle["finished_at"] = _now()
                 self._agent_lifecycle["final_result"] = "tool execution canceled"
+                self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(
+                    self._agent_lifecycle
+                )
             self._write_session_state(self.bash_cwd, self._todo_items)
-            if self._agent_lifecycle is not None:
+            if lifecycle_was_running:
                 self._write_agent_lifecycle()
 
     def agent_type(self) -> str | None:
@@ -334,6 +371,9 @@ class AgentStateMixin:
                 "state": "running",
                 "started_at": started_at,
                 "finished_at": None,
+                "elapsed": 0.0,
+                "started_monotonic": time.monotonic(),
+                "monotonic_pid": os.getpid(),
                 "turns_used": 0,
                 "tree_budget": tree_budget,
                 "current_step": "starting",
@@ -364,6 +404,9 @@ class AgentStateMixin:
                 self._agent_lifecycle["current_step"] = current_step
             if turns_used is not None:
                 self._agent_lifecycle["turns_used"] = turns_used
+            self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(
+                self._agent_lifecycle
+            )
             self._write_agent_lifecycle()
 
     def finish_agent_lifecycle(
@@ -385,11 +428,18 @@ class AgentStateMixin:
             self._load_session_state()
             if self._agent_lifecycle is None:
                 return
+            if self._agent_lifecycle.get("finished_at") is not None:
+                return
+            resolved_finished_at = finished_at or _now()
             self._agent_lifecycle["state"] = state
-            self._agent_lifecycle["finished_at"] = finished_at or _now()
+            self._agent_lifecycle["finished_at"] = resolved_finished_at
             self._agent_lifecycle["final_result"] = final_result
             if turns_used is not None:
                 self._agent_lifecycle["turns_used"] = turns_used
+            self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(
+                self._agent_lifecycle,
+                finished_at=resolved_finished_at,
+            )
             self._write_agent_lifecycle()
 
     def _write_agent_lifecycle(self) -> None:

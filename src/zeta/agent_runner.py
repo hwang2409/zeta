@@ -301,6 +301,14 @@ async def run_agent_tool(
         if loop.agent_instance_id is not None
         else f"{loop.store.session_id}:{child_number}"
     )
+    loop.store.register_agent_child(
+        tool_call,
+        child_session_path=child_path,
+        description=description,
+        agent_type=stored_agent_type,
+        background=background,
+        child_instance_id=(child_instance_id if child_depth > 1 else None),
+    )
     child_store.start_agent_lifecycle(
         handle=child_instance_id,
         started_at=_now(),
@@ -315,14 +323,6 @@ async def run_agent_tool(
     child_marker_key = child_instance_id if child_depth > 1 else tool_call.id
     if publisher is not None:
         publisher.set_metadata({"child_session_path": child_path, "depth": child_depth})
-    loop.store.register_agent_child(
-        tool_call,
-        child_session_path=child_path,
-        description=description,
-        agent_type=stored_agent_type,
-        background=background,
-        child_instance_id=(child_instance_id if child_depth > 1 else None),
-    )
     excluded_names = {"agent"} if child_depth == MAX_AGENT_DEPTH else set()
     if preset.tool_names is not None:
         allowed_names = set(preset.tool_names)
