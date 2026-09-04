@@ -829,7 +829,11 @@ async def test_websearch_parses_saved_duckduckgo_fixture(
     body = fixture.read_text(encoding="utf-8")
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.params["q"] == "zeta"
+        assert request.method == "POST"
+        assert request.url.path == "/html/"
+        assert request.content == b"q=zeta"
+        assert request.headers["accept-language"] == "en-US,en;q=0.9"
+        assert request.headers["user-agent"].startswith("Mozilla/5.0")
         return httpx.Response(200, headers={"content-type": "text/html"}, text=body)
 
     _mock_client(monkeypatch, handler)
@@ -847,6 +851,102 @@ async def test_websearch_parses_saved_duckduckgo_fixture(
             }
         ]
     }
+
+
+@pytest.mark.asyncio
+async def test_websearch_falls_back_to_lite_for_provider_challenge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    challenge = (
+        Path(__file__).parent / "fixtures" / "duckduckgo_challenge.html"
+    ).read_text(encoding="utf-8")
+    lite = (Path(__file__).parent / "fixtures" / "duckduckgo_lite.html").read_text(
+        encoding="utf-8"
+    )
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            assert request.headers["host"] == "html.duckduckgo.com"
+            return httpx.Response(
+                200, headers={"content-type": "text/html"}, text=challenge
+            )
+        assert request.headers["host"] == "lite.duckduckgo.com"
+        assert request.method == "POST"
+        assert request.content == b"q=zeta"
+        return httpx.Response(200, headers={"content-type": "text/html"}, text=lite)
+
+    _mock_client(monkeypatch, handler)
+    result = await ToolRegistry(tmp_path).execute(
+        ToolCall("search-1", "websearch", {"query": "zeta", "max_results": 1})
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["results"][0]["title"] == (
+        "Login / Sign up - zeta"
+    )
+    assert len(requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_websearch_falls_back_to_lite_for_parser_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lite = (Path(__file__).parent / "fixtures" / "duckduckgo_lite.html").read_text(
+        encoding="utf-8"
+    )
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text="<html><body>unexpected response</body></html>",
+            )
+        return httpx.Response(200, headers={"content-type": "text/html"}, text=lite)
+
+    _mock_client(monkeypatch, handler)
+    result = await ToolRegistry(tmp_path).execute(
+        ToolCall("search-1", "websearch", {"query": "zeta", "max_results": 1})
+    )
+
+    assert result["isError"] is False
+    assert calls == 2
+
+
+def test_websearch_detects_captured_provider_challenge() -> None:
+    body = (Path(__file__).parent / "fixtures" / "duckduckgo_challenge.html").read_text(
+        encoding="utf-8"
+    )
+
+    with pytest.raises(
+        websearch.SearchProviderChallengeError,
+        match="search provider served a no-results/challenge page",
+    ):
+        websearch.parse_search_results(body, max_results=8)
+
+
+def test_websearch_parses_lite_fixture() -> None:
+    body = (Path(__file__).parent / "fixtures" / "duckduckgo_lite.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert websearch.parse_lite_search_results(body, max_results=1) == [
+        {
+            "title": "Login / Sign up - zeta",
+            "url": "https://zeta-ai.io/en/login",
+            "snippet": (
+                "The No.1 AI chat! Over 13 hours of weekly use — and it's free. "
+                "Not using zeta yet? Everyone else is!"
+            ),
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -873,12 +973,10 @@ async def test_websearch_output_keeps_registry_truncation_marker(
 
 @pytest.mark.asyncio
 async def test_websearch_empty_results_and_parse_failure() -> None:
-    assert websearch.parse_search_results(
-        '<div class="no-results__container result__title"><span class="no-results">'
-        '<div class="no-results__message"><h1>No results found for <strong>query</strong>'
-        '</h1></div></span></div>',
-        max_results=8,
-    ) == []
+    empty = (Path(__file__).parent / "fixtures" / "duckduckgo_empty.html").read_text(
+        encoding="utf-8"
+    )
+    assert websearch.parse_search_results(empty, max_results=8) == []
     with pytest.raises(ValueError, match="search backend failed"):
         websearch.parse_search_results(
             "<html><body>No results found</body></html>", max_results=8
