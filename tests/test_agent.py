@@ -24,6 +24,7 @@ from zeta.tools.agent_presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
 )
+from zeta.tui.render import render_event
 from zeta.tui.todo import TodoWidget
 from zeta.types import (
     CompletionBackend,
@@ -469,6 +470,8 @@ async def test_background_completion_notification_waits_for_next_turn_boundary(
     backend = BackgroundBackend([_background_agent_call()])
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1)
+    background_events: list[StreamEvent] = []
+    loop.set_background_event_sink(background_events.append)
 
     await _collect(loop.run_turn("start"))
     backend.release_child.set()
@@ -477,6 +480,17 @@ async def test_background_completion_notification_waits_for_next_turn_boundary(
     events = await _collect(loop.run_turn("follow up"))
     assert events[0].type is StreamEventType.AGENT_NOTIFICATION
     assert events[0].data["text"].startswith("child complete")
+    assert "error=" not in events[0].data["text"]
+    rendered = render_event(events[0])
+    assert rendered is not None
+    assert rendered.plain.count("error=false") == 1
+    terminal = next(
+        event
+        for event in background_events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+    assert terminal.tool_result is not None
+    assert terminal.tool_result.content.count("error=false") == 1
     assert loop.store.agent_notifications() == []
     await loop.close()
 
@@ -1969,6 +1983,70 @@ async def test_empty_child_final_message_returns_error(tmp_path: Path) -> None:
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.is_error
     assert "empty final assistant message" in result.content
+
+
+@pytest.mark.asyncio
+async def test_child_answer_with_cancellation_prefix_is_success(
+    tmp_path: Path,
+) -> None:
+    answer = "tool execution canceled, but this is the answer"
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call()]),
+            ScriptedTurn([TextContent(answer)]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result is not None
+    assert result.is_error is False
+    assert result.content.startswith(answer)
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    assert child.agent_canceled() is None
+
+
+@pytest.mark.asyncio
+async def test_failed_agent_receipt_stats_match_is_error(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[_agent_call()]), ScriptedTurn()]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result is not None
+    assert result.is_error is True
+    assert "error=true" in result.content
+    assert "canceled=false" in result.content
+
+
+@pytest.mark.asyncio
+async def test_multibyte_agent_receipt_stays_within_response_limit(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call()]),
+            ScriptedTurn([TextContent("😀" * 5_000)]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result is not None
+    assert len(json.dumps(result.to_dict(), ensure_ascii=False).encode("utf-8")) <= 10_000
 
 
 @pytest.mark.asyncio

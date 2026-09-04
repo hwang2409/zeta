@@ -375,7 +375,7 @@ AdvanceGeneration = Callable[[AbortSignal], AbortSignal]
 
 
 def canceled_result(tool_call_id: str) -> ToolResult:
-    return ToolResult(tool_call_id, "tool execution canceled", True)
+    return ToolResult(tool_call_id, "tool execution canceled", True, is_canceled=True)
 
 
 @dataclass(slots=True)

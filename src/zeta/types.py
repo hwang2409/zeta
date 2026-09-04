@@ -597,6 +597,7 @@ class StructuredToolResult(TypedDict):
     content: list[ToolContentBlock]
     isError: bool
     structuredContent: dict[str, StructuredContentValue] | None
+    isCanceled: NotRequired[bool]
 
 
 def content_from_dict(value: Mapping[str, Any]) -> ContentBlock:
@@ -667,6 +668,7 @@ class ToolResult:
     structured_content: dict[str, StructuredContentValue] | None = field(
         default=None, compare=False
     )
+    is_canceled: bool = field(default=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -674,6 +676,8 @@ class ToolResult:
             "content": self.content,
             "is_error": self.is_error,
         }
+        if self.is_canceled:
+            result["is_canceled"] = True
         if self.content_blocks is not None:
             result["content_blocks"] = self.content_blocks
         if self.structured_content is not None:
@@ -687,12 +691,15 @@ class ToolResult:
         is_error = value.get("is_error")
         content_blocks = value.get("content_blocks")
         structured_content = value.get("structured_content")
+        is_canceled = value.get("is_canceled", False)
         if type(tool_call_id) is not str or not tool_call_id:
             raise ValueError("tool result call id must be a nonempty string")
         if type(content) is not str:
             raise ValueError("tool result content must be a string")
         if type(is_error) is not bool:
             raise ValueError("tool result is_error must be a boolean")
+        if type(is_canceled) is not bool:
+            raise ValueError("tool result is_canceled must be a boolean")
         if content_blocks is not None:
             if type(content_blocks) is not list:
                 raise ValueError("tool result content_blocks must be an array")
@@ -717,6 +724,7 @@ class ToolResult:
             structured_content=(
                 dict(structured_content) if structured_content is not None else None
             ),
+            is_canceled=is_canceled,
         )
 
 

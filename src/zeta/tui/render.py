@@ -334,7 +334,7 @@ def _tool_receipt(event: StreamEvent) -> Text:
     macro = event.data.get("macro")
     if isinstance(macro, str) and macro:
         structured = result.structured_content or {}
-        if result.content == "tool execution canceled":
+        if result.is_canceled:
             status = "canceled"
         elif result.content == "tool execution denied":
             status = "denied"

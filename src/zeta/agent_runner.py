@@ -19,7 +19,7 @@ from .core.store import ConversationStore
 from .model_catalog import provider_for_model
 from .providers.factory import build_backend, credential_store
 from .tools import ToolStreamPublisher
-from .tools.agent import ChildApprovalPolicy
+from .tools.agent import ChildApprovalPolicy, agent_stats
 from .tools.agent_presets import (
     GENERAL_PRESET,
     agent_type_names,
@@ -54,7 +54,7 @@ async def consume_child(
     update_turns: Callable[[int], None],
     update_step: Callable[[str], None],
     update_tool_calls: Callable[[int], None],
-    finish_lifecycle: Callable[[str, str], None],
+    finish_lifecycle: Callable[[str, str], dict[str, object]],
     publish_lifecycle: Callable[..., None],
     child_result: Callable[..., dict[str, object]],
     error_message: Callable[[BaseException], str],
@@ -69,10 +69,15 @@ async def consume_child(
     tool_calls = 0
 
     def terminal_result(
-        result: dict[str, object], *, state: str, text: str
+        *, state: str, text: str, error: bool, **result_options: object
     ) -> dict[str, object]:
-        finish_lifecycle(state, text)
-        return result
+        stats = finish_lifecycle(state, text)
+        return child_result(
+            text,
+            error=error,
+            stats=stats,
+            **result_options,
+        )
 
     def lifecycle_depth(call: ToolCall | None) -> int:
         if call is not None and call.name.casefold() == "agent":
@@ -154,9 +159,10 @@ async def consume_child(
     if budget_exhausted:
         text = f"agent error: {failure_message or 'shared agent turn budget exhausted'}"
         return terminal_result(
-            child_result(text, error=True, budget_exhausted=True),
             state="failed",
             text=text,
+            error=True,
+            budget_exhausted=True,
         )
     if cap_hit:
         text = (
@@ -166,28 +172,28 @@ async def consume_child(
             f"turns used: {child_turns()}"
         )
         return terminal_result(
-            child_result(text, error=True),
             state="failed",
             text=text,
+            error=True,
         )
     if failure_message is not None:
         text = f"agent error: {failure_message}"
         return terminal_result(
-            child_result(text, error=True), state="failed", text=text
+            state="failed", text=text, error=True
         )
     if final_message is None:
         text = "agent error: child ended without a final response"
         return terminal_result(
-            child_result(text, error=True), state="failed", text=text
+            state="failed", text=text, error=True
         )
     final_text = assistant_text(final_message)
     if not final_text.strip():
         text = "agent error: child returned an empty final assistant message"
         return terminal_result(
-            child_result(text, error=True), state="failed", text=text
+            state="failed", text=text, error=True
         )
     return terminal_result(
-        child_result(final_text, error=False), state="completed", text=final_text
+        state="completed", text=final_text, error=False
     )
 
 
@@ -404,10 +410,14 @@ async def run_agent_tool(
     def update_step(step: str) -> None:
         child_store.update_agent_lifecycle(current_step=step)
 
-    def finish_lifecycle(state: str, text: str) -> None:
+    def finish_lifecycle(state: str, text: str) -> dict[str, object]:
         child_store.finish_agent_lifecycle(
             state,
             final_result=text,
+            turns_used=child_turns(),
+        )
+        return agent_stats(
+            child_store.agent_lifecycle(),
             turns_used=child_turns(),
         )
 
@@ -417,6 +427,8 @@ async def run_agent_tool(
         error: bool,
         status: str | None = None,
         budget_exhausted: bool = False,
+        stats: dict[str, object] | None = None,
+        include_stats: bool = not background,
     ) -> dict[str, object]:
         return loop._child_result_payload(
             tool_call.id,
@@ -429,6 +441,8 @@ async def run_agent_tool(
             description=description if background else None,
             depth=child_depth,
             budget_exhausted=budget_exhausted,
+            stats=stats,
+            include_stats=include_stats,
         )
 
     def publish_lifecycle(
@@ -528,8 +542,8 @@ async def run_agent_tool(
                 child_path=child_path,
                 description=description,
                 child_turns=child_turns,
-                build_result=lambda text, error, status: child_result(
-                    text, error=error, status=status
+                build_result=lambda text, error, status, stats: child_result(
+                    text, error=error, status=status, stats=stats, include_stats=True
                 ),
                 validate_result=validate_result,
                 publish_event=loop._publish_background_event,

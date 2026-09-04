@@ -39,10 +39,39 @@ from .registry import (
 MAX_AGENT_STATUS_STEP = 160
 MAX_AGENT_STATUS_RESULT = 4_000
 MAX_AGENT_STATUS_DESCRIPTION = 160
+MAX_AGENT_RESULT_BYTES = 10_000
 _TRUNCATION_NOTE = "\n[truncated]"
 
 
-def format_agent_stats(stats: object) -> str:
+def agent_stats(
+    lifecycle: dict[str, object] | None,
+    *,
+    status: str | None = None,
+    turns_used: int = 0,
+) -> dict[str, object]:
+    lifecycle = lifecycle or {}
+    elapsed = lifecycle.get("elapsed", 0.0)
+    if type(elapsed) not in {int, float} or elapsed < 0:
+        elapsed = 0.0
+    turns = lifecycle.get("turns_used", turns_used)
+    if type(turns) is not int or turns < 0:
+        turns = turns_used
+    tool_calls = lifecycle.get("tool_calls", 0)
+    if type(tool_calls) is not int or tool_calls < 0:
+        tool_calls = 0
+    state = status or lifecycle.get("state")
+    if state == "error":
+        state = "failed"
+    return {
+        "turns_used": turns,
+        "elapsed": elapsed,
+        "tool_calls": tool_calls,
+        "error": state in {"failed", "error"},
+        "canceled": state == "canceled",
+    }
+
+
+def format_agent_stats(stats: object, *, include_duration: bool = True) -> str:
     if type(stats) is not dict:
         return ""
     turns = stats.get("turns_used")
@@ -67,8 +96,9 @@ def format_agent_stats(stats: object) -> str:
         canceled = state == "canceled"
     elif type(error) is not bool or type(canceled) is not bool:
         return ""
+    duration = f" · {turns} turns · {elapsed:.1f}s" if include_duration else ""
     return (
-        f" · {turns} turns · {elapsed:.1f}s · {tool_calls} tool calls"
+        f"{duration} · {tool_calls} tool calls"
         f" · error={str(error).lower()} · canceled={str(canceled).lower()}"
     )
 
@@ -633,6 +663,10 @@ def agent_result(
     description: str | None = None,
     depth: int | None = None,
     budget_exhausted: bool = False,
+    stats: dict[str, object] | None = None,
+    include_stats: bool = True,
+    canceled: bool = False,
+    max_bytes: int = MAX_AGENT_RESULT_BYTES,
 ) -> dict[str, object]:
     structured_content: dict[str, object] = {
         "turns_used": turns_used,
@@ -651,20 +685,22 @@ def agent_result(
         structured_content["depth"] = depth
     if budget_exhausted:
         structured_content["error_code"] = "agent_turn_budget"
-    lifecycle = _read_agent_lifecycle(child_session_path)
-    stats = {
-        "turns_used": lifecycle.get("turns_used", turns_used),
-        "elapsed": lifecycle.get("elapsed", 0.0),
-        "tool_calls": lifecycle.get("tool_calls", 0),
-        "state": lifecycle.get(
-            "state", status or ("failed" if error else "completed")
-        ),
-    }
-    return {
-        "content": [text_block(text + format_agent_stats(stats))],
+    if include_stats and stats is None:
+        lifecycle = _read_agent_lifecycle(child_session_path)
+        stats = agent_stats(
+            lifecycle,
+            status=status or ("failed" if error else "completed"),
+            turns_used=turns_used,
+        )
+    content = text + (format_agent_stats(stats) if include_stats else "")
+    result: dict[str, object] = {
+        "content": [text_block(content)],
         "isError": error,
         "structuredContent": structured_content,
     }
+    if canceled:
+        result["isCanceled"] = True
+    return _bounded_agent_result(result, max_bytes)
 
 
 async def _agent(

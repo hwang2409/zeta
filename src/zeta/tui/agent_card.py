@@ -13,6 +13,7 @@ from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
 
+from ..tools.agent import agent_stats, format_agent_stats
 from ..tools.agent_presets import GENERAL_PRESET, get_agent_preset
 from ..types import StreamEvent, StreamEventType, ToolCall
 from .theme import BODY, CARD_BG, CARD_BORDER, COMMAND, DIM, ERROR, RECEIPT
@@ -316,24 +317,31 @@ class AgentCard:
                 display_depth = value
         turns = turns or 0
         structured_status = structured.get("status")
-        if structured_status in {"running", "completed", "error", "canceled"}:
+        is_canceled = result.is_canceled or (
+            result.is_error and result.structured_content is None
+        )
+        if is_canceled:
+            status = "canceled"
+        elif structured_status in {"running", "completed", "error", "canceled"}:
             status = structured_status
         else:
-            status = "canceled" if result.content.startswith("tool execution canceled") else (
-                "fail" if result.is_error else "ok"
-            )
+            status = "fail" if result.is_error else "ok"
         agent_type = cls._agent_type(call)
         prefix = f"{agent_type} · " if agent_type else ""
-        stats_suffix = ""
-        tool_call_count = lifecycle.get("tool_calls")
-        if type(tool_call_count) is int and tool_call_count >= 0:
-            state = lifecycle.get("state")
-            error = state in {"failed"} or result.is_error
-            canceled = state == "canceled" or status == "canceled"
-            stats_suffix = (
-                f" · {tool_call_count} tool calls · error={str(error).lower()}"
-                f" · canceled={str(canceled).lower()}"
-            )
+        stats_status = {
+            "running": "running",
+            "completed": "completed",
+            "error": "error",
+            "canceled": "canceled",
+            "fail": "error",
+            "ok": "completed",
+        }[status]
+        stats = agent_stats(
+            lifecycle,
+            status=stats_status,
+            turns_used=turns,
+        )
+        stats_suffix = format_agent_stats(stats, include_duration=False)
         return Text(
             f"{prefix}{cls._description(call)} · {turns} turns · "
             f"{max(0.0, elapsed or 0.0):.1f}s · {status} · "

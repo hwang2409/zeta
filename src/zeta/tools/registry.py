@@ -226,13 +226,14 @@ def _legacy_result(result: ToolResult) -> StructuredToolResult:
         else [text_block(result.content)]
     )
     try:
-        return validate_tool_result(
-            {
-                "content": blocks,
-                "isError": result.is_error,
-                "structuredContent": None,
-            }
-        )
+        structured_result: dict[str, object] = {
+            "content": blocks,
+            "isError": result.is_error,
+            "structuredContent": None,
+        }
+        if result.is_canceled:
+            structured_result["isCanceled"] = True
+        return validate_tool_result(structured_result)
     except ValueError as exc:
         return _error_result(f"invalid tool result: {exc}")
 
@@ -766,7 +767,7 @@ def validate_tool_result(result: object) -> StructuredToolResult:
     if missing_keys:
         missing = ", ".join(sorted(missing_keys))
         raise ValueError(f"missing top-level keys: {missing}")
-    extra_keys = result_keys - expected_keys
+    extra_keys = result_keys - expected_keys - {"isCanceled"}
     if extra_keys:
         extra = ", ".join(sorted(extra_keys))
         raise ValueError(f"unexpected top-level keys: {extra}")
@@ -777,6 +778,9 @@ def validate_tool_result(result: object) -> StructuredToolResult:
     is_error = result["isError"]
     if type(is_error) is not bool:
         raise ValueError("isError must be a boolean")
+    is_canceled = result.get("isCanceled", False)
+    if type(is_canceled) is not bool:
+        raise ValueError("isCanceled must be a boolean")
     structured_content = result["structuredContent"]
     if structured_content is not None:
         if type(structured_content) is not dict:

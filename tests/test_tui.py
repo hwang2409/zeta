@@ -2507,6 +2507,9 @@ def test_agent_receipts_show_success_and_canceled_status() -> None:
     assert "2 turns · 1.5s · ok" in render_agent_receipt(success).plain
     canceled_plain = render_agent_receipt(canceled).plain
     assert "0 turns · 0.4s · canceled" in canceled_plain
+    assert "error=false" in canceled_plain
+    assert "canceled=true" in canceled_plain
+    assert "error=true" not in canceled_plain
     assert "depth 2" in canceled_plain
 
 

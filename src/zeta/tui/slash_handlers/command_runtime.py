@@ -120,7 +120,9 @@ class CommandRuntimeMixin:
                 background=command.background,
             )
         except asyncio.CancelledError:
-            result = ToolResult(call.id, "tool execution canceled", True)
+            result = ToolResult(
+                call.id, "tool execution canceled", True, is_canceled=True
+            )
         finally:
             if self._approval_policy is not None:
                 self._approval_policy.forget_ephemeral(call.id)
@@ -137,7 +139,7 @@ class CommandRuntimeMixin:
             )
         )
         structured = result.structured_content or {}
-        if result.content == "tool execution canceled":
+        if result.is_canceled:
             status = "canceled"
         elif result.content == "tool execution denied":
             status = "denied"

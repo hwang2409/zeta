@@ -46,7 +46,7 @@ from .mcp.commands import (
 )
 from .prompts import load_identity
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
-from .tools.agent import agent_result
+from .tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from .tools.agent_presets import (
     compose_system_prompt,
     get_agent_preset,
@@ -163,6 +163,7 @@ def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
         structured_result["isError"],
         content_blocks=structured_result["content"],
         structured_content=structured_result["structuredContent"],
+        is_canceled=structured_result.get("isCanceled", False),
     )
 
 
@@ -496,6 +497,9 @@ class AgentLoop:
         description: str | None = None,
         depth: int | None = None,
         budget_exhausted: bool = False,
+        stats: dict[str, object] | None = None,
+        include_stats: bool = True,
+        canceled: bool = False,
     ) -> dict[str, object]:
         child_store = self._agent_child_stores.get(tool_call_id)
         path = (
@@ -527,6 +531,14 @@ class AgentLoop:
             description=description,
             depth=depth,
             budget_exhausted=budget_exhausted,
+            stats=stats,
+            include_stats=include_stats,
+            canceled=canceled,
+            max_bytes=getattr(
+                getattr(self, "tool_registry", None),
+                "max_output_chars",
+                MAX_AGENT_RESULT_BYTES,
+            ),
         )
 
     def _canceled_agent_result(
@@ -547,6 +559,7 @@ class AgentLoop:
                 turns_used=turns_used,
                 agent_type=agent_type,
                 child_instance_id=child_instance_id,
+                canceled=True,
             ),
             tool_call_id,
         )
@@ -765,10 +778,7 @@ class AgentLoop:
         except Exception as exc:
             result = ToolResult(tool_call.id, str(exc), is_error=True)
         result = _validated_tool_result(result, tool_call.id)
-        if (
-            result.is_error
-            and result.content.startswith("tool execution canceled")
-        ):
+        if result.is_canceled:
             result = self.finalize_canceled(request_id)
         else:
             result = self._finalize_tool_results([tool_call], [result])[0]
@@ -1050,7 +1060,7 @@ class AgentLoop:
             candidate = result if result is not None else slot
             if child_store is not None and (
                 candidate is None
-                or candidate.content.startswith("tool execution canceled")
+                or candidate.is_canceled
             ):
                 result = self._canceled_agent_result(
                     call.id,
@@ -1066,6 +1076,7 @@ class AgentLoop:
                         call.id,
                         "tool execution canceled",
                         is_error=True,
+                        is_canceled=True,
                     )
             if stored_result is None:
                 new_results.append((call, result))
@@ -1089,7 +1100,7 @@ class AgentLoop:
                     continue
                 child_store = self._agent_child_stores.pop(call.id, None)
                 if child_store is not None:
-                    if result.content.startswith("tool execution canceled"):
+                    if result.is_canceled:
                         child_store.mark_agent_canceled(call.id)
                     else:
                         adopt_agent_children(

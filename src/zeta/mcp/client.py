@@ -119,7 +119,9 @@ def make_error_result(message: str) -> StructuredToolResult:
 
 
 def canceled_result() -> StructuredToolResult:
-    return make_error_result("tool execution canceled")
+    result = make_error_result("tool execution canceled")
+    result["isCanceled"] = True
+    return result
 
 
 def translate_call_result(value: object) -> StructuredToolResult:
