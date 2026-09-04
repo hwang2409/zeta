@@ -99,6 +99,23 @@ async def test_todo_writes_and_reads_the_full_list(tmp_path: Path) -> None:
     assert store.todo_items() == items
 
 
+@pytest.mark.asyncio
+async def test_todo_text_result_includes_canceled_count(tmp_path: Path) -> None:
+    _, registry = _registry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall(
+            "canceled",
+            "todo",
+            {"items": [{"content": "stopped", "status": "canceled"}]},
+        )
+    )
+
+    assert result["content"][0]["text"] == (
+        "todo list: 0 pending, 0 in progress, 0 completed, 1 canceled"
+    )
+
+
 def test_todo_schema_matches_handler_contract(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path)
     schema = next(schema for schema in registry.schemas if schema["name"] == "todo")
@@ -295,15 +312,15 @@ def test_todo_canceled_items_validate_count_and_render(tmp_path: Path) -> None:
 def test_todo_dismissal_persists_across_resume_and_fork(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     store.set_todo_items([{"content": "done", "status": "canceled"}])
+    store.append_checkpoint("before dismissal")
     widget = TodoWidget(store)
     widget.turn_boundary()
 
     resumed = ConversationStore(tmp_path / "sessions", session_id=store.session_id)
     assert not TodoWidget(resumed).visible
 
-    store.append_checkpoint("before fork")
-    store.append_fork("before fork")
-    assert not TodoWidget(store).visible
+    store.append_fork("before dismissal")
+    assert TodoWidget(store).visible
 
 
 def test_todo_widget_hides_empty_lists_and_bounds_visible_rows(tmp_path: Path) -> None:

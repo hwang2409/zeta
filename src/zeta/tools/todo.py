@@ -19,7 +19,8 @@ def _todo_result(items: list[TodoItem]) -> StructuredToolResult:
         "todo list: "
         f"{counts['pending']} pending, "
         f"{counts['in_progress']} in progress, "
-        f"{counts['completed']} completed"
+        f"{counts['completed']} completed, "
+        f"{counts['canceled']} canceled"
     )
     structured: dict[str, StructuredContentValue] = {
         "items": items,
