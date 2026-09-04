@@ -11,6 +11,7 @@ from zeta.agent_background import (
     adopt_agent_children,
     finish_background_child,
 )
+from zeta.agent_budget import AgentTree
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -1491,11 +1492,12 @@ async def test_shared_turn_budget_covers_generations(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_shared_turn_budget_covers_parallel_siblings(tmp_path: Path) -> None:
-    calls = [_agent_call("child-1"), _agent_call("child-2")]
+async def test_shared_turn_budget_covers_parallel_grandchildren(tmp_path: Path) -> None:
+    grandchildren = [_agent_call("grandchild-1"), _agent_call("grandchild-2")]
     backend = FakeBackend(
         [
-            ScriptedTurn(tool_calls=calls),
+            ScriptedTurn(tool_calls=[_agent_call("child")]),
+            ScriptedTurn(tool_calls=grandchildren),
             ScriptedTurn([TextContent("one")]),
         ]
     )
@@ -1506,21 +1508,34 @@ async def test_shared_turn_budget_covers_parallel_siblings(tmp_path: Path) -> No
             backend,
             store,
             max_turns=1,
-            agent_turn_budget=1,
+            agent_turn_budget=2,
         ).run_turn("start")
     )
 
     results = [message.tool_result for message in store.messages() if message.tool_result]
-    assert sorted(result.is_error for result in results if result is not None) == [
-        False,
-        True,
+    assert [result.is_error for result in results if result is not None] == [True]
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    child_results = [
+        message.tool_result
+        for message in child_store.messages()
+        if message.tool_result is not None
     ]
+    assert sorted(result.is_error for result in child_results) == [False, True]
     assert any(
-        result is not None
-        and result.structured_content is not None
+        result.structured_content is not None
         and result.structured_content.get("error_code") == "agent_turn_budget"
-        for result in results
+        for result in child_results
     )
+
+
+def test_agent_loop_rejects_conflicting_turn_budget_inputs(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="pass only one agent turn budget"):
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path),
+            agent_turn_budget=1,
+            agent_tree=AgentTree(),
+        )
 
 
 @pytest.mark.asyncio

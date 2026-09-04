@@ -20,7 +20,6 @@ from .agent_background import (
 from .agent_budget import (
     MAX_AGENT_DEPTH,
     AgentTree,
-    agent_tree_context,
     consume_turn,
 )
 from .agent_runner import run_agent_tool
@@ -198,6 +197,8 @@ class AgentLoop:
         self.store = store
         self.agent_depth = agent_depth
         self.agent_instance_id = agent_instance_id
+        if agent_turn_budget is not None and agent_tree is not None:
+            raise ValueError("pass only one agent turn budget")
         if agent_turn_budget is not None and (
             type(agent_turn_budget) is not int or agent_turn_budget < 1
         ):
@@ -826,7 +827,6 @@ class AgentLoop:
             self.store.append_message(user_message)
         elif user_message not in self.store.messages():
             raise ValueError("cannot reuse a user message that is not persisted")
-        agent_tree = AgentTree() if self.agent_depth == 0 else None
         setup_error: ErrorInfo | None = None
         try:
             await self._ensure_mcp_servers()
@@ -1025,12 +1025,11 @@ class AgentLoop:
                 _validated_tool_result,
                 abort_signal=turn_abort_signal,
             )
-            with agent_tree_context(agent_tree):
-                try:
-                    async for event in dispatch:
-                        yield event
-                finally:
-                    await dispatch.aclose()
+            try:
+                async for event in dispatch:
+                    yield event
+            finally:
+                await dispatch.aclose()
             if self._plan_mode and self._approved_plan_exit(calls):
                 self.set_plan_mode(False)
             yield StreamEvent(

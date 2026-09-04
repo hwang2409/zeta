@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 
 from .types import ErrorInfo
@@ -42,24 +39,6 @@ class AgentTree:
         if self.budget is None:
             self.budget = SharedTurnBudget(limit)
         return self.budget
-
-
-_current_agent_tree: ContextVar[AgentTree | None] = ContextVar(
-    "current_agent_tree", default=None
-)
-
-
-@contextmanager
-def agent_tree_context(tree: AgentTree | None) -> Iterator[None]:
-    token = _current_agent_tree.set(tree)
-    try:
-        yield
-    finally:
-        _current_agent_tree.reset(token)
-
-
-def current_agent_tree() -> AgentTree | None:
-    return _current_agent_tree.get()
 
 
 def child_depth(parent_depth: int, _background: bool) -> tuple[int, str | None]:

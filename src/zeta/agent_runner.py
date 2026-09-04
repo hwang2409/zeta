@@ -11,7 +11,6 @@ from .agent_background import finish_background_child
 from .agent_budget import (
     MAX_AGENT_DEPTH,
     AgentTree,
-    current_agent_tree,
 )
 from .agent_budget import child_depth as next_agent_depth
 from .core.abort import AbortSignal as ToolAbortSignal
@@ -254,7 +253,7 @@ async def run_agent_tool(
             f"{agent_type!r}; expected one of: {', '.join(agent_type_names())}",
             error=True,
         )
-    agent_tree = loop._agent_tree or current_agent_tree() or AgentTree()
+    agent_tree = loop._agent_tree or AgentTree()
     agent_tree.ensure_budget(
         loop._agent_turn_budget
         if loop._agent_turn_budget is not None
