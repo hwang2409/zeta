@@ -506,7 +506,9 @@ class SlashSession(Protocol):
 
     def slash_vim(self, args: str) -> str: ...
 
-    def slash_plan(self, args: str) -> str: ...
+    def slash_plan(self, args: str) -> str | SlashModelInput: ...
+
+    def slash_implement(self, args: str) -> str | SlashModelInput: ...
 
     def slash_paste(self, args: str) -> str: ...
 
@@ -659,7 +661,7 @@ class SlashCommandRegistry:
         result = self._dispatch(session, value)
         if result is None:
             return None
-        if isinstance(result, (str, SlashPromptError)):
+        if isinstance(result, (str, SlashModelInput, SlashPromptError)):
             return result
         return await result
 
@@ -848,8 +850,12 @@ def _run_vim(session: SlashSession, args: str) -> str:
     return session.slash_vim(args.strip())
 
 
-def _run_plan(session: SlashSession, args: str) -> str:
+def _run_plan(session: SlashSession, args: str) -> str | SlashModelInput:
     return session.slash_plan(args.strip())
+
+
+def _run_implement(session: SlashSession, args: str) -> str | SlashModelInput:
+    return session.slash_implement(args.strip())
 
 
 async def _run_compact(session: SlashSession, args: str) -> str:
@@ -883,6 +889,9 @@ def create_slash_registry(
     registry.register(SlashCommand("vim", _run_vim, "show or change vim mode"))
     registry.register(
         SlashCommand("plan", _run_plan, "show or change plan mode")
+    )
+    registry.register(
+        SlashCommand("implement", _run_implement, "implement the proposed plan")
     )
     registry.register(SlashCommand("paste", _run_paste, "paste an image"))
     registry.register(SlashCommand("compact", _run_compact, "compact the context"))

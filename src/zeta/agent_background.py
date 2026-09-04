@@ -43,6 +43,7 @@ class BackgroundAgentOwner:
         self._cancellers: dict[str, Callable[[], None]] = {}
         self._watchers: dict[str, asyncio.Task[Any]] = {}
         self._parent_stores: dict[str, ConversationStore] = {}
+        self._descriptions: dict[str, str] = {}
         self._canceling = False
 
     def register(
@@ -51,16 +52,20 @@ class BackgroundAgentOwner:
         cancel: Callable[[], None],
         watcher: asyncio.Task[Any],
         parent_store: ConversationStore | None = None,
+        description: str | None = None,
     ) -> None:
         self._cancellers[instance_id] = cancel
         self._watchers[instance_id] = watcher
         if parent_store is not None:
             self._parent_stores[instance_id] = parent_store
+        if description is not None:
+            self._descriptions[instance_id] = description
 
     def unregister(self, instance_id: str) -> None:
         self._cancellers.pop(instance_id, None)
         self._watchers.pop(instance_id, None)
         self._parent_stores.pop(instance_id, None)
+        self._descriptions.pop(instance_id, None)
 
     def adopt(self, instance_id: str, parent_store: ConversationStore) -> None:
         if instance_id in self._watchers:
@@ -84,6 +89,10 @@ class BackgroundAgentOwner:
     @property
     def running(self) -> bool:
         return bool(self._cancellers)
+
+    @property
+    def active_descriptions(self) -> tuple[str, ...]:
+        return tuple(self._descriptions.values())
 
     async def wait(self) -> None:
         current = asyncio.current_task()

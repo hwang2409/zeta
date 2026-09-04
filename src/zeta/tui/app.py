@@ -40,7 +40,6 @@ from ..persistence import DraftPersistence, history_for
 from ..providers.factory import build_backend as build_network_backend
 from ..submission_pipeline import SubmissionPipeline
 from ..tools.exec import trusted_macro_display
-from ..tools.plan_mode import EXIT_PLAN_MODE
 from ..types import (
     CompletionBackend,
     Message,
@@ -984,9 +983,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
     approval_default = (
         ApprovalDecision.ALLOW if getattr(args, "yolo", False) else ApprovalDecision.ASK
     )
-    approval_policy = ApprovalPolicy(
-        store=store, default=approval_default, always_ask={EXIT_PLAN_MODE}
-    )
+    approval_policy = ApprovalPolicy(store=store, default=approval_default)
     pending_override = None
     if resuming and mismatches:
         pending_override = (
@@ -1013,6 +1010,9 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             return
         manager.record_override(metadata, provider=None, model=model_name)
 
+    def plan_mode_changed(enabled: bool) -> None:
+        manager.record_plan_mode(metadata, enabled=enabled)
+
     effective_token_budget, budget_pinned = resolve_session_budget(
         metadata.compaction_budget,
         metadata.budget_pinned,
@@ -1034,11 +1034,14 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         "token_budget": effective_token_budget,
         "retained_tail": metadata.retained_tail,
         "on_completion_success": completion_success,
+        "on_plan_mode_change": plan_mode_changed,
         "system_prompt": project_context.system_prompt,
     }
     if max_turns_override is not None and max_turns_override > 0:
         loop_kwargs["max_turns"] = max_turns_override
     loop = AgentLoop(backend, store, **loop_kwargs)
+    if metadata.plan_mode:
+        loop.set_plan_mode(True)
     loop.set_mcp_scope(home=home, project_dir=discover_repo_root(Path(store.cwd)))
     return TUIApp(
         loop,

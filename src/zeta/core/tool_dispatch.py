@@ -39,6 +39,8 @@ class _ToolRegistry(Protocol):
 class _AgentLoop(Protocol):
     tool_registry: _ToolRegistry | None
 
+    def plan_mode_allows(self, tool_name: str) -> bool: ...
+
     def _create_task(
         self,
         coroutine: Coroutine[Any, Any, TaskResult],
@@ -110,6 +112,22 @@ async def dispatch_tool_calls(
     try:
         call_index = 0
         while call_index < len(calls):
+            tool_call = calls[call_index]
+            if not loop.plan_mode_allows(tool_call.name):
+                result = ToolResult(
+                    tool_call.id,
+                    f"tool execution denied in plan mode: {tool_call.name} is not allowed",
+                    is_error=True,
+                )
+                result = loop._finalize_tool_results([tool_call], [result])[0]
+                completed_tool_indexes.add(call_index)
+                yield StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END,
+                    tool_call=tool_call,
+                    tool_result=result,
+                )
+                call_index += 1
+                continue
             parallel_calls: list[ToolCall] = []
             if loop.tool_registry is not None:
                 definition = loop.tool_registry.definitions_by_name.get(
@@ -119,6 +137,8 @@ async def dispatch_tool_calls(
                     parallel_calls.append(calls[call_index])
                     while call_index + len(parallel_calls) < len(calls):
                         next_call = calls[call_index + len(parallel_calls)]
+                        if not loop.plan_mode_allows(next_call.name):
+                            break
                         next_definition = loop.tool_registry.definitions_by_name.get(
                             next_call.name
                         )

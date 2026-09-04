@@ -199,4 +199,5 @@ class CommandRuntimeMixin:
                 self.loop.tool_registry.background_tasks.kill(task_id)
             ),
             watcher,
+            description=f"/{command.name}",
         )
