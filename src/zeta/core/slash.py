@@ -13,7 +13,14 @@ from typing import Protocol
 
 import yaml
 
+from ..mcp.client import MCPPrompt
 from ..types import Message, MessageRole, StreamEventType, TextContent
+from ..mcp.prompt_commands import (
+    MCPPromptCommands,
+    SlashModelInput,
+    SlashPromptError,
+    dispatch_prompt,
+)
 from .store import ConversationEntry
 
 COMMAND_FILE_SIZE_LIMIT = 64 * 1024
@@ -638,6 +645,10 @@ class SlashSession(Protocol):
 
     async def slash_mcp(self, args: str) -> str: ...
 
+    async def slash_mcp_prompt(
+        self, name: str, arguments: dict[str, str]
+    ) -> str: ...
+
     def slash_model(self, args: str) -> str: ...
 
     def slash_vim(self, args: str) -> str: ...
@@ -655,7 +666,12 @@ class SlashSession(Protocol):
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str: ...
 
 
-SlashResult = str | Awaitable[str]
+SlashResult = (
+    str
+    | SlashModelInput
+    | SlashPromptError
+    | Awaitable[str | SlashModelInput | SlashPromptError]
+)
 SlashHandler = Callable[[SlashSession, str], SlashResult]
 
 
@@ -679,6 +695,9 @@ class SlashCommandRegistry:
         self._custom_commands: dict[str, CustomCommand] = {}
         self._notices: list[str] = []
         self._warning_notices: set[str] = set()
+        self._mcp_prompts = MCPPromptCommands(
+            self._notices, self._warning_notices
+        )
 
     def register(self, command: SlashCommand) -> None:
         if not command.name or any(character.isspace() for character in command.name):
@@ -717,7 +736,14 @@ class SlashCommandRegistry:
             (command.name, command.description, command.source)
             for command in self.custom_commands
         )
-        return builtins + custom
+        prompts = self._mcp_prompts.completion_entries()
+        return builtins + custom + prompts
+
+    def set_mcp_prompts(
+        self, entries: Sequence[tuple[str, str, MCPPrompt]]
+    ) -> None:
+        """Replace live MCP prompt commands from one mount snapshot."""
+        self._mcp_prompts.replace(tuple(entries))
 
     def register_custom(self, command: CustomCommand) -> None:
         """Register a custom command unless a built-in owns its name."""
@@ -726,6 +752,14 @@ class SlashCommandRegistry:
             notice = (
                 f"ignored custom command {command.path}: "
                 f"shadows built-in /{command.name}"
+            )
+            self._notices.append(notice)
+            self._warning_notices.add(notice)
+            return
+        if ":" in command.name:
+            notice = (
+                f"ignored custom command {command.path}: "
+                "colon names are reserved for MCP prompts"
             )
             self._notices.append(notice)
             self._warning_notices.add(notice)
@@ -747,6 +781,14 @@ class SlashCommandRegistry:
         if command is not None:
             return command.run(session, parts[1] if len(parts) == 2 else "")
         custom = self._custom_commands.get(parts[0])
+        prompt = self._mcp_prompts.get(parts[0])
+        if prompt is not None:
+            return dispatch_prompt(
+                session,
+                parts[0],
+                prompt[1],
+                parts[1] if len(parts) == 2 else "",
+            )
         if custom is None or custom.kind != "exec":
             return None
         return session.slash_exec_macro(custom, parts[1] if len(parts) == 2 else "")
@@ -756,13 +798,15 @@ class SlashCommandRegistry:
 
         return self._dispatch(session, value)
 
-    async def dispatch_async(self, session: SlashSession, value: str) -> str | None:
+    async def dispatch_async(
+        self, session: SlashSession, value: str
+    ) -> str | SlashModelInput | SlashPromptError | None:
         """Run a known command, awaiting it when the command is asynchronous."""
 
         result = self._dispatch(session, value)
         if result is None:
             return None
-        if isinstance(result, str):
+        if isinstance(result, (str, SlashPromptError)):
             return result
         return await result
 

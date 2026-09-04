@@ -210,6 +210,7 @@ class AgentLoop:
         self._background_child_watchers: dict[str, asyncio.Task[Any]] = {}
         self._background_event_sink: Callable[[StreamEvent], None] | None = None
         self._mcp_notice_sink: Callable[[str], None] | None = None
+        self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         recover_agent_children(self)
         if registry is not None and tools is not None:
             raise ValueError("pass only one tool registry")
@@ -398,6 +399,15 @@ class AgentLoop:
 
         self._mcp_notice_sink = sink
 
+    def set_mcp_prompt_refresh(
+        self, callback: Callable[[MCPMount], None] | None
+    ) -> None:
+        """Set the owner callback for live MCP prompt commands."""
+
+        self._mcp_prompt_refresh = callback
+        if callback is not None and self._mcp_mount is not None:
+            callback(self._mcp_mount)
+
     @property
     def mcp_summary(self) -> str:
         if self._mcp_mount is None:
@@ -450,6 +460,16 @@ class AgentLoop:
         except (MCPCommandError, ValueError) as exc:
             return f"mcp error: {exc}"
         return MCP_USAGE
+
+    async def slash_mcp_prompt(
+        self, name: str, arguments: dict[str, str]
+    ) -> str:
+        """Resolve one mounted MCP prompt for the next model turn."""
+
+        await self._ensure_mcp_servers()
+        if self._mcp_mount is None:
+            raise RuntimeError("MCP mount is unavailable")
+        return await self._mcp_mount.get_prompt(name, arguments)
 
     def _mcp_add_target(self) -> Path:
         project_dir = self._mcp_project_dir_value
@@ -644,6 +664,8 @@ class AgentLoop:
             self._mcp_config_error = str(exc)
             self._mcp_mount = MCPMount(self.tool_registry, {}, {})
         self._mcp_mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
+        if self._mcp_prompt_refresh is not None:
+            self._mcp_mount.set_prompt_refresh(self._mcp_prompt_refresh)
         self._mcp_mount_attempted = True
 
     def set_mcp_scope(

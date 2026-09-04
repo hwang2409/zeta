@@ -362,11 +362,14 @@ def build_user_message(
     value: str,
     base_dir: str | Path,
     pending_paths: tuple[Path, ...] = (),
+    *,
+    attachment_value: str | None = None,
 ) -> Message:
     """Resolve references into one message, deduplicating resolved paths."""
 
     paths: list[Path] = []
-    for ref in attachment_refs(value, base_dir):
+    source = value if attachment_value is None else attachment_value
+    for ref in attachment_refs(source, base_dir):
         if ref.path not in paths:
             paths.append(ref.path)
     for path in pending_paths:
@@ -576,21 +579,32 @@ class ComposerAttachmentMixin:
         *,
         pending_attachments: list[Path] | None = None,
         pending_attachment_tokens: dict[str, Path] | None = None,
+        attachment_value: str | None = None,
     ) -> Message | None:
+        source = value if attachment_value is None else attachment_value
         try:
-            message = build_user_message(value, self.loop.store.cwd)
+            message = build_user_message(
+                value,
+                self.loop.store.cwd,
+                attachment_value=source,
+            )
         except AttachmentError as exc:
             self._print_system(f"attachment rejected: {exc}")
             return None
 
         valid_pending: list[Path] = []
         for path in self._pending_paths_for(
-            value,
+            source,
             pending_attachments=pending_attachments,
             pending_attachment_tokens=pending_attachment_tokens,
         ):
             try:
-                build_user_message(value, self.loop.store.cwd, (path,))
+                build_user_message(
+                    value,
+                    self.loop.store.cwd,
+                    (path,),
+                    attachment_value=source,
+                )
             except AttachmentError as exc:
                 self._print_system(f"pending attachment dropped: {exc}")
             else:
@@ -603,7 +617,12 @@ class ComposerAttachmentMixin:
         attachments[:] = valid_pending
         if not valid_pending:
             return message
-        return build_user_message(value, self.loop.store.cwd, tuple(valid_pending))
+        return build_user_message(
+            value,
+            self.loop.store.cwd,
+            tuple(valid_pending),
+            attachment_value=source,
+        )
 
     def _clear_pending_attachments(self) -> None:
         mapped_paths = set(self._pending_attachment_tokens.values())

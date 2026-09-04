@@ -15,12 +15,16 @@ from .client import (
     MCPCanceled,
     MCPClient,
     MCPError,
+    MCPPrompt,
     MCPProtocolError,
+    MCPTransportError,
     MCPTool,
     canceled_result,
     initialize_params,
     make_error_result,
     parse_rpc_response,
+    prompt_text_from_result,
+    prompts_from_result,
     tools_from_result,
     translate_call_result,
 )
@@ -33,6 +37,7 @@ class StdioMCPClient(MCPClient):
     def __init__(self, config: MCPServerConfig) -> None:
         self.config = config
         self.protocol_version: str | None = None
+        self.capabilities: dict[str, object] = {}
         self._process: asyncio.subprocess.Process | None = None
         self._stderr: BinaryIO | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -78,6 +83,8 @@ class StdioMCPClient(MCPClient):
             if type(protocol_version) is not str or not protocol_version:
                 raise MCPProtocolError("MCP initialize response omitted protocolVersion")
             self.protocol_version = protocol_version
+            capabilities = result.get("capabilities", {})
+            self.capabilities = dict(capabilities) if type(capabilities) is dict else {}
             await self._notify("notifications/initialized", {})
         except BaseException:
             await self.close()
@@ -98,6 +105,32 @@ class StdioMCPClient(MCPClient):
             if next_cursor == cursor:
                 raise MCPProtocolError("MCP tools/list cursor did not advance")
             cursor = next_cursor
+
+    async def list_prompts(self) -> list[MCPPrompt]:
+        prompts: list[MCPPrompt] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, object] = {}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await self._request("prompts/list", params)
+            prompts.extend(prompts_from_result(result))
+            next_cursor = result.get("nextCursor")
+            if type(next_cursor) is not str or not next_cursor:
+                return prompts
+            if next_cursor == cursor:
+                raise MCPProtocolError("MCP prompts/list cursor did not advance")
+            cursor = next_cursor
+
+    async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:
+        try:
+            result = await self._request(
+                "prompts/get", {"name": name, "arguments": dict(arguments)}
+            )
+            return prompt_text_from_result(result)
+        except MCPTransportError as exc:
+            self._report_failure(exc)
+            raise
 
     async def call_tool(self, name: str, arguments: Mapping[str, object], abort_signal: AbortSignal):
         try:
@@ -126,7 +159,7 @@ class StdioMCPClient(MCPClient):
             await process.wait()
         for future in self._pending.values():
             if not future.done():
-                future.set_exception(MCPError("MCP stdio server closed"))
+                future.set_exception(MCPTransportError("MCP stdio server closed"))
         self._pending.clear()
         stderr = self._stderr
         self._stderr = None
@@ -136,9 +169,9 @@ class StdioMCPClient(MCPClient):
     async def _request(self, method: str, params: Mapping[str, object], abort_signal: AbortSignal | None = None) -> dict[str, object]:
         process = self._process
         if process is None or process.stdin is None:
-            raise MCPError("MCP stdio server is not connected")
+            raise MCPTransportError("MCP stdio server is not connected")
         if self._closed:
-            raise MCPError("MCP stdio server is closed")
+            raise MCPTransportError("MCP stdio server is closed")
         self._next_id += 1
         request_id = self._next_id
         response = asyncio.get_running_loop().create_future()
@@ -211,7 +244,7 @@ class StdioMCPClient(MCPClient):
         await process.wait()
         if reader_task is not None and not reader_task.done():
             await asyncio.gather(reader_task, return_exceptions=True)
-        error = MCPError("MCP stdio server terminated after cancellation")
+        error = MCPTransportError("MCP stdio server terminated after cancellation")
         self._fail_pending(error)
         self._process = None
         self._reader_task = None
@@ -247,7 +280,7 @@ class StdioMCPClient(MCPClient):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - reader failure is transport failure
-            self._fail_pending(MCPError(f"MCP stdio reader failed: {exc}"))
+            self._fail_pending(MCPTransportError(f"MCP stdio reader failed: {exc}"))
         finally:
             if process.returncode is None:
                 try:
@@ -255,7 +288,9 @@ class StdioMCPClient(MCPClient):
                 except asyncio.CancelledError:
                     return
             if self._process is process:
-                error = MCPError(f"MCP stdio server exited with code {process.returncode}")
+                error = MCPTransportError(
+                    f"MCP stdio server exited with code {process.returncode}"
+                )
                 self._fail_pending(error)
                 if not self._suppress_failure and self._failure_sink is not None:
                     self._failure_sink(str(error))

@@ -45,6 +45,7 @@ from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
+from zeta.mcp import MCPPrompt, MCPPromptArgument
 from zeta.providers.anthropic import AnthropicBackend, AnthropicCredentialStore, OAuthTokens
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
 from zeta.tools import ToolStreamPublisher
@@ -4809,6 +4810,45 @@ async def test_run_replays_resumed_transcript_before_prompt(
     assert "README.md" in rendered
 
 
+@pytest.mark.asyncio
+async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skip_mcp_mount=True,
+        ),
+        provider="fake",
+        model="offline",
+    )
+
+    async def ensure_mcp_servers() -> None:
+        assert app.loop._mcp_notice_sink is not None
+        app.loop._mcp_notice_sink("mcp · prompts unavailable")
+
+    monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp_servers)
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            key_bindings=build_key_bindings(
+                on_interrupt=app.abort_active,
+                on_exit=app.request_exit,
+            ),
+            multiline=True,
+        )
+        run_task = asyncio.create_task(app.run(session))
+        await asyncio.sleep(0.05)
+        pipe.send_text("\x04")
+        await run_task
+
+    assert "prompts unavailable" in Text.from_ansi(
+        app._transcript.render(120)
+    ).plain
+
+
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(Message(MessageRole.USER, [TextContent("old user")]))
@@ -7097,6 +7137,96 @@ async def test_history_and_draft_store_attachment_refs_without_payloads(
         assert b"private attachment text" not in contents
     assert isinstance(store.messages()[0].content[1], ImageContent)
     assert isinstance(store.messages()[0].content[2], TextContent)
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_prompt_result_does_not_activate_attachment_syntax(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text("must not be sent", encoding="utf-8")
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        provider="fake",
+        model="offline",
+    )
+    app._slash_commands.set_mcp_prompts(
+        [("fake:review", "fake", MCPPrompt("review"))]
+    )
+
+    async def resolve(_name: str, _arguments: dict[str, str]) -> str:
+        return f"@./{secret.name} $ARGUMENTS !`echo unsafe`"
+
+    async def ensure_mcp_servers() -> None:
+        return None
+
+    monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp_servers)
+    monkeypatch.setattr(app.loop, "slash_mcp_prompt", resolve)
+    await app._handle_prompt_value("/fake:review")
+    assert app._active_task is not None
+    await app._active_task
+
+    message = store.messages()[0]
+    assert message.content == [
+        TextContent(f"@./{secret.name} $ARGUMENTS !`echo unsafe`")
+    ]
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_prompt_error_restores_draft_and_attachments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staged = tmp_path / "clipboard-prompt.png"
+    staged.write_bytes(PNG)
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+    )
+    session = app._make_session()
+    app._active_session = session
+    app._slash_commands.set_mcp_prompts(
+        [
+            (
+                "fake:review",
+                "fake",
+                MCPPrompt(
+                    "review",
+                    arguments=(MCPPromptArgument("topic", required=True),),
+                ),
+            )
+        ]
+    )
+    rendered: list[Text] = []
+    app._print_unit = rendered.append
+
+    async def fail(_name: str, _arguments: dict[str, str]) -> str:
+        raise RuntimeError("prompt unavailable")
+
+    async def ensure_mcp_servers() -> None:
+        return None
+
+    monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp_servers)
+    monkeypatch.setattr(app.loop, "slash_mcp_prompt", fail)
+    raw = "/fake:review topic"
+    session.default_buffer.insert_text(raw)
+    app._pending_attachments.append(staged)
+    app._pending_attachment_tokens["[Image #1]"] = staged
+    app._next_image_token = 2
+    app._submit_input(raw)
+    session.default_buffer.reset()
+
+    await app._handle_prompt_value(raw)
+
+    assert session.default_buffer.text == raw
+    assert app._pending_attachments == [staged]
+    assert app._pending_attachment_tokens == {"[Image #1]": staged}
+    assert rendered and rendered[-1].style == ERROR
+    assert "prompt unavailable" in rendered[-1].plain
     await app.loop.close()
 
 

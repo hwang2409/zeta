@@ -14,8 +14,24 @@ from typing import Literal
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..types import StructuredToolResult
-from .client import MCPClient, MCPTool, make_error_result
+from .client import MCPClient, MCPPrompt, MCPTool, make_error_result
 from .config import MCPServerConfig, mcp_log_path
+from .prompt_actor import (
+    CallFinished as _CallFinished,
+    CallRequest as _CallRequest,
+    cancel_request as _cancel_request,
+    cancel_prompt_request,
+    CancelRequest as _CancelRequest,
+    PromptFinished as _PromptFinished,
+    PromptRequest as _PromptRequest,
+    discover_prompts,
+    get_prompt as _get_prompt,
+    handle_prompt as _handle_prompt,
+    handle_prompt_finished as _handle_prompt_finished,
+    prompt_unavailable,
+    resolve_prompt_message,
+    set_result as _set_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +68,7 @@ class _SetupOutcome:
     status: MCPServerStatus
     client: MCPClient | None = None
     tools: tuple[MCPTool, ...] = ()
+    prompts: tuple[MCPPrompt, ...] = ()
     failure_reason: str | None = None
 
 
@@ -64,21 +81,9 @@ class _Operation:
     generation: int
     preserve_degraded: bool
     request: asyncio.Future[MCPServerStatus] | None = None
-    waiter: "_CallRequest | None" = None
+    waiter: _CallRequest | None = None
     task: asyncio.Task[_SetupOutcome] | None = None
     failure_reason: str | None = None
-
-
-@dataclass(slots=True)
-class _CallRequest:
-    identifier: int
-    tool_name: str
-    arguments: dict[str, object]
-    abort_signal: AbortSignal
-    generation: int
-    result: asyncio.Future[StructuredToolResult]
-    task: asyncio.Task[StructuredToolResult] | None = None
-    client: MCPClient | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,14 +112,6 @@ class _TransportFailure:
 
 
 @dataclass(frozen=True, slots=True)
-class _CallFinished:
-    request: _CallRequest
-    task: asyncio.Task[StructuredToolResult]
-    result: StructuredToolResult | None
-    error: BaseException | None
-
-
-@dataclass(frozen=True, slots=True)
 class _ChildFinished:
     task: asyncio.Task[object]
 
@@ -123,11 +120,6 @@ class _ChildFinished:
 class _CancelOperation:
     identifier: int
     acknowledged: asyncio.Future[None]
-
-
-@dataclass(frozen=True, slots=True)
-class _CancelCall:
-    identifier: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,13 +173,14 @@ class MCPServerActor:
         self._operation: _Operation | None = None
         self._pending_starts: list[_StartOperation] = []
         self._pending_removes: list[asyncio.Future[None]] = []
-        self._calls: dict[int, _CallRequest] = {}
+        self._requests: dict[int, _CallRequest | _PromptRequest] = {}
         self._scheduled_closes: dict[
             int, tuple[MCPClient, asyncio.Task[object]]
         ] = {}
         self._next_identifier = 0
         self._client: MCPClient | None = None
         self._tools: tuple[MCPTool, ...] = ()
+        self._prompts: tuple[MCPPrompt, ...] = ()
         self._generation = 0
         self._failure_count = 0
         self._status = MCPServerStatus(
@@ -205,7 +198,12 @@ class MCPServerActor:
     @property
     def status(self) -> MCPServerStatus:
         return self._status
-
+    @property
+    def prompts(self) -> tuple[MCPPrompt, ...]:
+        return self._prompts
+    @property
+    def generation(self) -> int:
+        return self._generation
     @property
     def is_terminal(self) -> bool:
         return self._closed or (self._task is not None and self._task.done())
@@ -305,9 +303,17 @@ class MCPServerActor:
         try:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
-            self._queue.put_nowait(_CancelCall(request.identifier))
+            await _cancel_request(self, request.identifier)
             raise
 
+    async def get_prompt(
+        self,
+        prompt_name: str,
+        arguments: dict[str, str],
+        *,
+        generation: int,
+    ) -> str:
+        return await _get_prompt(self, prompt_name, arguments, generation=generation)
     async def _request_operation(
         self,
         kind: Literal["manual", "auto"],
@@ -358,10 +364,14 @@ class MCPServerActor:
                     self._handle_call(message)
                 elif isinstance(message, _CallFinished):
                     self._handle_call_finished(message)
+                elif isinstance(message, _PromptRequest):
+                    _handle_prompt(self, message)
+                elif isinstance(message, _PromptFinished):
+                    _handle_prompt_finished(self, message)
                 elif isinstance(message, _CancelOperation):
                     self._handle_cancel_operation(message)
-                elif isinstance(message, _CancelCall):
-                    self._handle_cancel_call(message)
+                elif isinstance(message, _CancelRequest):
+                    self._handle_cancel_request(message)
                 elif isinstance(message, _ChildFinished):
                     self._children.discard(message.task)
                 elif isinstance(message, _Remove):
@@ -407,6 +417,7 @@ class MCPServerActor:
             old_client = self._client
             self._client = None
             self._tools = ()
+            self._prompts = ()
             self._unregister_tools()
             self._set_status(
                 MCPServerStatus(
@@ -512,6 +523,12 @@ class MCPServerActor:
             tools = await asyncio.wait_for(
                 self._connect_and_list(client), timeout=self._setup_timeout
             )
+            prompts = await discover_prompts(
+                client,
+                self.name,
+                self._setup_timeout,
+                lambda message: _notice(notice_sink, message),
+            )
             await asyncio.sleep(0)
         except asyncio.CancelledError:
             if client is not None:
@@ -552,7 +569,7 @@ class MCPServerActor:
         )
         _notice(notice_sink, f"mcp · {self.name} mounted ({len(tools)} tools)")
         failure_reason = failure_future.result() if failure_future.done() else None
-        return _SetupOutcome(status, client, tuple(tools), failure_reason)
+        return _SetupOutcome(status, client, tuple(tools), prompts, failure_reason)
 
     def _handle_setup_finished(self, message: _SetupFinished) -> None:
         self._children.discard(message.task)
@@ -583,6 +600,7 @@ class MCPServerActor:
             self.source = operation.source
             self._client = outcome.client
             self._tools = outcome.tools
+            self._prompts = outcome.prompts
             self._generation = operation.generation
             self._failure_count = 0
             self._set_status(
@@ -610,6 +628,7 @@ class MCPServerActor:
             self._schedule_close(outcome.client)
         if reason is not None and operation.kind != "auto":
             self._client = None
+            self._prompts = ()
             if not operation.preserve_degraded:
                 self._tools = ()
             self._set_status(
@@ -667,6 +686,7 @@ class MCPServerActor:
         else:
             self._client = None
             self._tools = ()
+            self._prompts = ()
             self._set_status(outcome.status)
         self._complete_operation(operation, self._status)
         if operation.waiter is not None:
@@ -690,6 +710,7 @@ class MCPServerActor:
         else:
             self._unregister_tools()
             self._tools = ()
+            self._prompts = ()
             self._set_status(
                 MCPServerStatus(
                     self.name,
@@ -716,6 +737,7 @@ class MCPServerActor:
         if client is None:
             return
         self._client = None
+        self._prompts = ()
         self._detach_failure_sink(client)
         self._schedule_close(client)
         self._set_status(
@@ -771,7 +793,7 @@ class MCPServerActor:
         request.task = asyncio.create_task(
             self._invoke_call(request, client)
         )
-        self._calls[request.identifier] = request
+        self._requests[request.identifier] = request
         self._children.add(request.task)
         request.task.add_done_callback(
             lambda done, call=request: self._queue_call_result(done, call)
@@ -807,7 +829,7 @@ class MCPServerActor:
 
     def _handle_call_finished(self, message: _CallFinished) -> None:
         self._children.discard(message.task)
-        request = self._calls.pop(message.request.identifier, message.request)
+        request = self._requests.pop(message.request.identifier, message.request)
         if isinstance(message.error, asyncio.CancelledError):
             _set_result(request.result, _unavailable_result(self.name))
             return
@@ -841,10 +863,16 @@ class MCPServerActor:
             self._finish_cancelled(operation)
         _set_result(message.acknowledged, None)
 
-    def _handle_cancel_call(self, message: _CancelCall) -> None:
-        request = self._calls.get(message.identifier)
-        if request is not None and request.task is not None:
+    def _handle_cancel_request(self, message: _CancelRequest) -> None:
+        request = self._requests.get(message.identifier)
+        if request is None:
+            _set_result(message.acknowledged, None)
+            return
+        request.result.cancel()
+        if request.task is not None:
             request.task.cancel()
+        self._requests.pop(message.identifier, None)
+        _set_result(message.acknowledged, None)
 
     async def _handle_remove(self, result: asyncio.Future[None]) -> None:
         await self._terminate(result)
@@ -854,9 +882,8 @@ class MCPServerActor:
 
     def _cancel_current_operation(self) -> None:
         operation = self._operation
-        if operation is not None:
-            if operation.task is not None:
-                operation.task.cancel()
+        if operation is not None and operation.task is not None:
+            operation.task.cancel()
 
     def _resolve_pending_removes(self) -> None:
         while self._pending_removes:
@@ -898,11 +925,15 @@ class MCPServerActor:
         while self._pending_starts:
             self._resolve_message(self._pending_starts.pop(0))
         self._resolve_pending_removes()
-        for request in self._calls.values():
+        for request in self._requests.values():
             if request.task is not None:
                 request.task.cancel()
-            _set_result(request.result, _unavailable_result(self.name))
-        self._calls.clear()
+            if isinstance(request, _CallRequest):
+                _set_result(request.result, _unavailable_result(self.name))
+            else:
+                cancel_prompt_request(request, self.name)
+        self._requests.clear()
+        self._prompts = ()
         self._unregister_tools()
         if self._client is not None:
             self._schedule_close(self._client, detach=False)
@@ -950,12 +981,14 @@ class MCPServerActor:
     def _resolve_message(self, message: object | None) -> None:
         if isinstance(message, (_Remove, _RemoveWhenIdle, _Close)):
             _set_result(message.result, None)
-        elif isinstance(message, _CancelOperation):
+        elif isinstance(message, (_CancelOperation, _CancelRequest)):
             _set_result(message.acknowledged, None)
         elif isinstance(message, _CallRequest):
             _set_result(message.result, _unavailable_result(self.name))
         elif isinstance(message, _CallFinished):
             _set_result(message.request.result, _unavailable_result(self.name))
+        elif resolve_prompt_message(message, self.name):
+            return
         elif isinstance(message, _StartOperation):
             if message.request is not None:
                 _set_result(
@@ -1031,7 +1064,7 @@ class MCPServerActor:
                 self._children.discard(message.task)
                 if message.outcome is not None and message.outcome.client is not None:
                     self._schedule_close(message.outcome.client)
-            elif isinstance(message, _CallFinished):
+            elif isinstance(message, (_CallFinished, _PromptFinished)):
                 self._children.discard(message.task)
                 self._resolve_message(message)
             elif isinstance(message, _ChildFinished):
@@ -1150,18 +1183,13 @@ def _unavailable_status(name: str, config: MCPServerConfig) -> MCPServerStatus:
     )
 
 
-def _set_result(future: asyncio.Future[object], value: object) -> None:
-    if not future.done():
-        future.set_result(value)
-
-
 __all__ = [
     "AUTO_RECONNECT_BASE_DELAY_SECONDS",
     "AUTO_RECONNECT_MAX_DELAY_SECONDS",
+    "SERVER_SETUP_TIMEOUT_SECONDS",
     "MCPServerActor",
     "MCPServerState",
     "MCPServerStatus",
-    "SERVER_SETUP_TIMEOUT_SECONDS",
     "_degraded_result",
     "_retry_text",
 ]
