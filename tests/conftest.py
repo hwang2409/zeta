@@ -8,6 +8,7 @@ from collections.abc import Generator
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from runpy import run_path
 
 import httpx
 import pytest
@@ -15,6 +16,8 @@ from rich.console import Console
 
 LIVE_ZETA_HOME = Path.home() / ".zeta"
 _TEST_SITE_PACKAGES = Path(__file__).parent
+
+run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 
 
 def _path_snapshot(path: Path) -> tuple[object, ...] | None:
@@ -92,6 +95,7 @@ class _ExternalDeclaration:
     kind: str
     snapshot: tuple[object, ...] | None
     content: bytes | None
+    used: bool = False
 
 
 class LiveHomeWriteGuard:
@@ -150,7 +154,7 @@ class LiveHomeWriteGuard:
     ) -> bool:
         path = (self.live_home / relative).resolve()
         for declaration in self._external_declarations:
-            if declaration.path != path:
+            if declaration.used or declaration.path != path:
                 continue
             if self._snapshot.get(relative) != declaration.snapshot:
                 continue
@@ -171,6 +175,7 @@ class LiveHomeWriteGuard:
                     and len(after_content) > len(declaration.content)
                     and after[2] == len(after_content)
                 ):
+                    declaration.used = True
                     return True
             elif declaration.kind == "write":
                 if (
@@ -178,14 +183,18 @@ class LiveHomeWriteGuard:
                     and stat.S_ISREG(after[0])
                     and (before is None or after[5] != before[5])
                 ):
+                    declaration.used = True
                     return True
             elif declaration.kind == "mkdir":
                 if before is None and after is not None and stat.S_ISDIR(after[0]):
+                    declaration.used = True
                     return True
             elif declaration.kind in {"remove", "rmdir"}:
                 if before is not None and after is None:
+                    declaration.used = True
                     return True
             elif declaration.kind in {"rename", "replace"} and before != after:
+                declaration.used = True
                 return True
         return False
 

@@ -70,6 +70,48 @@ def test_teardown_guard_allows_external_live_history_writer(
         live_home_write_guard.reset()
 
 
+def test_teardown_guard_rejects_two_appends_for_one_declaration(
+    tmp_path: Path, live_home_write_guard
+) -> None:
+    live_home = tmp_path / "live-home"
+    history = live_home / "history"
+    history.parent.mkdir()
+    history.write_text("before\n", encoding="utf-8")
+    live_home_write_guard.watch(live_home)
+
+    try:
+        live_home_write_guard.declare_external_mutation(history, kind="append")
+        with history.open("a", encoding="utf-8") as stream:
+            stream.write("first\n")
+        with history.open("a", encoding="utf-8") as stream:
+            stream.write("second\n")
+
+        with pytest.raises(AssertionError, match="tests wrote to live zeta home"):
+            live_home_write_guard.assert_clean()
+    finally:
+        live_home_write_guard.reset()
+
+
+def test_teardown_guard_rejects_declared_test_process_write(
+    tmp_path: Path, live_home_write_guard
+) -> None:
+    live_home = tmp_path / "live-home"
+    history = live_home / "history"
+    history.parent.mkdir()
+    history.write_text("before\n", encoding="utf-8")
+    live_home_write_guard.watch(live_home)
+
+    try:
+        live_home_write_guard.declare_external_mutation(history, kind="append")
+        with history.open("a", encoding="utf-8") as stream:
+            stream.write("test-owned\n")
+
+        with pytest.raises(AssertionError, match="tests wrote to live zeta home"):
+            live_home_write_guard.assert_clean()
+    finally:
+        live_home_write_guard.reset()
+
+
 def test_teardown_guard_rejects_undeclared_external_live_history_writer(
     tmp_path: Path, live_home_write_guard
 ) -> None:
