@@ -123,6 +123,12 @@ class _ProviderDone:
 
 
 @dataclass(frozen=True, slots=True)
+class _DurableToolDone:
+    request_id: str
+    task: asyncio.Task[Any]
+
+
+@dataclass(frozen=True, slots=True)
 class _ApprovalLifecycle:
     submission: Submission
     kind: str
@@ -189,6 +195,7 @@ class SubmissionPipeline:
         self._command_results: dict[int, str | None] = {}
         self._provider_entry: _Entry | None = None
         self._provider_task: asyncio.Task[None] | None = None
+        self._durable_tasks: dict[str, asyncio.Task[Any]] = {}
         self._control_entry: _Entry | None = None
         self._closed = False
         self._shutting_down = False
@@ -219,7 +226,7 @@ class SubmissionPipeline:
                 isinstance(message, (_Submit, _Retry))
                 for message in self._messages._queue
             )
-        )
+        ) or bool(self._durable_tasks)
 
     @property
     def has_pending(self) -> bool:
@@ -364,6 +371,9 @@ class SubmissionPipeline:
                 entry.signal.abort()
             if entry.child_task is not None and not entry.child_task.done():
                 entry.child_task.cancel()
+        for task in self._durable_tasks.values():
+            if not task.done():
+                task.cancel()
         if self._provider_task is not None and not self._provider_task.done():
             self._provider_task.cancel()
         tasks = [
@@ -371,6 +381,7 @@ class SubmissionPipeline:
             for task in (
                 *self._preprocessing_waiters.values(),
                 self._provider_task,
+                *self._durable_tasks.values(),
             )
             if task is not None
         ]
@@ -436,6 +447,8 @@ class SubmissionPipeline:
                     self._on_command_done(message)
                 elif isinstance(message, _ProviderDone):
                     self._on_provider_done(message)
+                elif isinstance(message, _DurableToolDone):
+                    self._on_durable_tool_done(message)
                 elif isinstance(message, _ApprovalLifecycle):
                     self._on_approval_lifecycle(message)
                 elif isinstance(message, _ApprovalAction):
@@ -455,6 +468,7 @@ class SubmissionPipeline:
                 except Exception as exc:  # noqa: BLE001
                     self._host._print_system(f"submission failed: {exc}")
                     self._rollback_provider_dispatch()
+                    self._retry_oldest_ready()
 
     async def _on_submit(self, message: _Submit) -> None:
         entry = _Entry(message.submission)
@@ -788,6 +802,16 @@ class SubmissionPipeline:
             )
         )
 
+    def _retry_oldest_ready(self) -> None:
+        while self._messages.empty():
+            try:
+                self._dispatch_oldest_ready()
+            except Exception as exc:  # noqa: BLE001
+                self._host._print_system(f"submission failed: {exc}")
+                self._rollback_provider_dispatch()
+            else:
+                return
+
     def _rollback_provider_dispatch(self) -> None:
         entry = self._provider_entry
         if entry is None:
@@ -897,10 +921,21 @@ class SubmissionPipeline:
         self._host._print_system(f"approval · {verb} {request.key}")
         self._host._present_pending_approvals()
         self._host._invalidate_prompt()
-        if durable:
-            await self._host.loop.resume_pending_tool(
-                request.request_id,
-                event_sink=self._host._handle_tool_event,
+        if durable and self._host.loop.prepare_resume_pending_tool(
+            request.request_id
+        ):
+            task = asyncio.create_task(
+                self._host.loop.resume_pending_tool(
+                    request.request_id,
+                    prepared=True,
+                    event_sink=self._host._handle_tool_event,
+                )
+            )
+            self._durable_tasks[request.request_id] = task
+            task.add_done_callback(
+                lambda completed, request_id=request.request_id: self._send(
+                    _DurableToolDone(request_id, completed)
+                )
             )
         self._ack_action(message)
 
@@ -914,6 +949,20 @@ class SubmissionPipeline:
         )
 
     def _on_abort(self, submission_id: int | None) -> None:
+        if (
+            submission_id is None
+            and self._provider_entry is None
+            and self._durable_tasks
+        ):
+            request_id, task = next(reversed(self._durable_tasks.items()))
+            self._host.loop.abort()
+            if self._host._approval_policy is not None:
+                self._host._approval_policy.abort(request_id)
+            self._host.loop.finalize_canceled(request_id)
+            if not task.done():
+                task.cancel()
+            self._host._invalidate_prompt()
+            return
         entry = (
             self._target(submission_id)
             if submission_id is not None
@@ -924,6 +973,18 @@ class SubmissionPipeline:
             self._abort_entry(entry)
             if not had_child and entry is not self._provider_entry:
                 self._cancel_or_restore(entry)
+            return
+
+    def _on_durable_tool_done(self, message: _DurableToolDone) -> None:
+        if self._durable_tasks.get(message.request_id) is not message.task:
+            return
+        self._durable_tasks.pop(message.request_id)
+        if message.task.cancelled():
+            return
+        try:
+            message.task.result()
+        except Exception as exc:  # noqa: BLE001
+            self._host._print_system(f"submission failed: {exc}")
 
     def _abort_target(self) -> _Entry | None:
         if self._provider_entry is not None:
@@ -1051,7 +1112,13 @@ class SubmissionPipeline:
     def _submission_for_message(message: _Message) -> Submission | None:
         if isinstance(
             message,
-            (_Submit, _Retry, _PreprocessingDone, _CommandDone, _ProviderDone),
+            (
+                _Submit,
+                _Retry,
+                _PreprocessingDone,
+                _CommandDone,
+                _ProviderDone,
+            ),
         ):
             return message.submission
         if isinstance(message, _ApprovalLifecycle):

@@ -611,6 +611,55 @@ async def test_provider_start_failure_rolls_back_and_advances_pipeline(
 
 
 @pytest.mark.asyncio
+async def test_same_tick_provider_failure_dispatches_the_next_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(content=[TextContent("done")]),
+            ScriptedTurn(content=[TextContent("done again")]),
+        ]
+    )
+    app = TUIApp(
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        provider="fake",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    original_start_turn = app._start_turn
+    attempts = 0
+
+    def start_turn(*args: object, **kwargs: object) -> asyncio.Task[None]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("forced provider failure")
+        return original_start_turn(*args, **kwargs)
+
+    monkeypatch.setattr(app, "_start_turn", start_turn)
+    app._input_loop_active = True
+    await asyncio.gather(
+        app._handle_prompt_value("first"),
+        app._handle_prompt_value("second"),
+    )
+
+    for _ in range(100):
+        if len(backend.calls) == 1:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("second submission was not dispatched")
+    assert attempts == 2
+    user_message = next(
+        message
+        for message in backend.calls[0][0]
+        if message.role is MessageRole.USER
+    )
+    assert user_message.content[0].text == "second"
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_approval_action_acknowledges_waiter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -894,6 +943,68 @@ async def test_unmapped_durable_approval_is_finalized(
     )
     assert isinstance(user_message.content[0], TextContent)
     assert user_message.content[0].text == "value ready"
+    await app.loop.close()
+
+
+@pytest.mark.asyncio
+async def test_resumed_durable_tool_abort_is_processed_by_submission_consumer(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_command(home / "commands", "inspect", "value !`printf ready`")
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    old_call = ToolCall("slow-request", "block", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(old_call)]),
+        [(old_call.id, old_call)],
+    )
+    policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
+    started = asyncio.Event()
+
+    async def block(arguments: dict[str, object], abort_signal: object) -> str:
+        del arguments
+        started.set()
+        await abort_signal.wait()  # type: ignore[attr-defined]
+        return "unreachable"
+
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            store,
+            tools={"block": block},
+            approval_policy=policy,
+        ),
+        provider="fake",
+        model="offline",
+        approval_policy=policy,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    await app._submissions.approval_action_wait(
+        ApprovalDecision.ALLOW, old_call.id
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert app._submissions.active
+    app.abort_active()
+
+    for _ in range(100):
+        result = next(
+            (
+                message.tool_result
+                for message in store.messages()
+                if message.tool_result is not None
+                and message.tool_result.tool_call_id == old_call.id
+            ),
+            None,
+        )
+        if result is not None:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("durable tool abort was not processed")
+    assert result is not None
+    assert result.content == "tool execution canceled"
+
+    await app._submissions.close()
     await app.loop.close()
 
 
