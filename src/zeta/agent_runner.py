@@ -14,6 +14,7 @@ from .agent_budget import (
 )
 from .agent_budget import child_depth as next_agent_depth
 from .core.abort import AbortSignal as ToolAbortSignal
+from .core.checkpoints import _now
 from .core.store import ConversationStore
 from .model_catalog import provider_for_model
 from .providers.factory import build_backend, credential_store
@@ -51,6 +52,8 @@ async def consume_child(
     publish: Callable[[str], None],
     child_turns: Callable[[], int],
     update_turns: Callable[[int], None],
+    update_step: Callable[[str], None],
+    finish_lifecycle: Callable[[str, str], None],
     publish_lifecycle: Callable[..., None],
     child_result: Callable[..., dict[str, object]],
     error_message: Callable[[BaseException], str],
@@ -63,6 +66,12 @@ async def consume_child(
     failure_message: str | None = None
     budget_exhausted = False
 
+    def terminal_result(
+        result: dict[str, object], *, state: str, text: str
+    ) -> dict[str, object]:
+        finish_lifecycle(state, text)
+        return result
+
     def lifecycle_depth(call: ToolCall | None) -> int:
         if call is not None and call.name.casefold() == "agent":
             return child_loop.agent_depth + 1
@@ -71,10 +80,14 @@ async def consume_child(
     try:
         async for event in child_loop.run_turn(prompt):
             if event.type is StreamEventType.TURN_START:
-                publish(f"turn {child_turns() + 1}: thinking")
+                status = f"turn {child_turns() + 1}: thinking"
+                update_step(status)
+                publish(status)
             elif event.type is StreamEventType.TOOL_APPROVAL_START:
                 name = event.tool_call.name if event.tool_call is not None else "tool"
-                publish(f"turn {child_turns() + 1}: approval pending: {name}")
+                status = f"turn {child_turns() + 1}: approval pending: {name}"
+                update_step(status)
+                publish(status)
                 publish_lifecycle(
                     "approval_start",
                     event.tool_call,
@@ -92,7 +105,9 @@ async def consume_child(
                     event.tool_call.arguments if event.tool_call is not None else {}
                 )
                 summary = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
-                publish(f"turn {child_turns() + 1}: tool: {name} {summary}")
+                status = f"turn {child_turns() + 1}: tool: {name} {summary}"
+                update_step(status)
+                publish(status)
                 publish_lifecycle(
                     "execution_start",
                     event.tool_call,
@@ -133,32 +148,43 @@ async def consume_child(
     except Exception as exc:
         failure_message = error_message(exc)
     if budget_exhausted:
-        return child_result(
-            f"agent error: {failure_message or 'shared agent turn budget exhausted'}",
-            error=True,
-            budget_exhausted=True,
+        text = f"agent error: {failure_message or 'shared agent turn budget exhausted'}"
+        return terminal_result(
+            child_result(text, error=True, budget_exhausted=True),
+            state="failed",
+            text=text,
         )
     if cap_hit:
-        return child_result(
+        text = (
             f"agent error: child reached the {turn_cap}-turn cap; "
             f"partial state is saved at {child_path}; "
             f"last assistant text: {last_assistant_text or '[none]'}; "
-            f"turns used: {child_turns()}",
-            error=True,
+            f"turns used: {child_turns()}"
+        )
+        return terminal_result(
+            child_result(text, error=True),
+            state="failed",
+            text=text,
         )
     if failure_message is not None:
-        return child_result(f"agent error: {failure_message}", error=True)
+        text = f"agent error: {failure_message}"
+        return terminal_result(
+            child_result(text, error=True), state="failed", text=text
+        )
     if final_message is None:
-        return child_result(
-            "agent error: child ended without a final response", error=True
+        text = "agent error: child ended without a final response"
+        return terminal_result(
+            child_result(text, error=True), state="failed", text=text
         )
     final_text = assistant_text(final_message)
     if not final_text.strip():
-        return child_result(
-            "agent error: child returned an empty final assistant message",
-            error=True,
+        text = "agent error: child returned an empty final assistant message"
+        return terminal_result(
+            child_result(text, error=True), state="failed", text=text
         )
-    return child_result(final_text, error=False)
+    return terminal_result(
+        child_result(final_text, error=False), state="completed", text=final_text
+    )
 
 
 def resolve_child_backend(
@@ -282,12 +308,6 @@ async def run_agent_tool(
         if loop.agent_instance_id is not None
         else f"{loop.store.session_id}:{child_number}"
     )
-    loop._agent_child_stores[tool_call.id] = child_store
-    loop._agent_child_turns[tool_call.id] = 0
-    loop._agent_child_types[tool_call.id] = preset.name
-    child_marker_key = child_instance_id if child_depth > 1 else tool_call.id
-    if publisher is not None:
-        publisher.set_metadata({"child_session_path": child_path, "depth": child_depth})
     loop.store.register_agent_child(
         tool_call,
         child_session_path=child_path,
@@ -296,6 +316,20 @@ async def run_agent_tool(
         background=background,
         child_instance_id=(child_instance_id if child_depth > 1 else None),
     )
+    child_store.start_agent_lifecycle(
+        handle=child_instance_id,
+        started_at=_now(),
+        tree_budget=agent_tree.budget.limit,
+        depth=child_depth,
+        agent_type=preset.name,
+        description=description,
+    )
+    loop._agent_child_stores[tool_call.id] = child_store
+    loop._agent_child_turns[tool_call.id] = 0
+    loop._agent_child_types[tool_call.id] = preset.name
+    child_marker_key = child_instance_id if child_depth > 1 else tool_call.id
+    if publisher is not None:
+        publisher.set_metadata({"child_session_path": child_path, "depth": child_depth})
     excluded_names = {"agent"} if child_depth == MAX_AGENT_DEPTH else set()
     if preset.tool_names is not None:
         allowed_names = set(preset.tool_names)
@@ -363,6 +397,16 @@ async def run_agent_tool(
     def child_turns() -> int:
         return loop._agent_child_turns.get(tool_call.id, 0)
 
+    def update_step(step: str) -> None:
+        child_store.update_agent_lifecycle(current_step=step)
+
+    def finish_lifecycle(state: str, text: str) -> None:
+        child_store.finish_agent_lifecycle(
+            state,
+            final_result=text,
+            turns_used=child_turns(),
+        )
+
     def child_result(
         text: str,
         *,
@@ -377,7 +421,7 @@ async def run_agent_tool(
             child_session_path=child_path,
             agent_type=preset.name,
             status=status,
-            child_instance_id=child_instance_id if background else None,
+            child_instance_id=child_instance_id,
             description=description if background else None,
             depth=child_depth,
             budget_exhausted=budget_exhausted,
@@ -416,6 +460,7 @@ async def run_agent_tool(
 
     def update_turns(turns: int) -> None:
         loop._agent_child_turns[tool_call.id] = turns
+        child_store.update_agent_lifecycle(turns_used=turns)
         loop.store.update_agent_child_turns(child_marker_key, turns)
 
     child_task = loop._create_task(
@@ -427,6 +472,8 @@ async def run_agent_tool(
             publish=publish,
             child_turns=child_turns,
             update_turns=update_turns,
+            update_step=update_step,
+            finish_lifecycle=finish_lifecycle,
             publish_lifecycle=publish_lifecycle,
             child_result=child_result,
             error_message=error_message,

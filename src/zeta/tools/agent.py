@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import time
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.store import ConversationStore
 from ..model_catalog import known_model_names
-from ..types import Message, MessageRole, ToolCall, ToolUseContent
+from ..types import (
+    Message,
+    MessageRole,
+    StructuredContentValue,
+    ToolCall,
+    ToolUseContent,
+)
 from .agent_presets import (
-    AgentType,
     GENERAL_PRESET,
+    AgentType,
     agent_type_description,
     agent_type_names,
 )
@@ -22,6 +33,12 @@ from .registry import (
     ToolStreamPublisher,
     text_block,
 )
+
+MAX_AGENT_STATUS_STEP = 160
+MAX_AGENT_STATUS_RESULT = 4_000
+MAX_AGENT_STATUS_DESCRIPTION = 160
+_TRUNCATION_NOTE = "\n[truncated]"
+
 
 class ChildApprovalPolicy:
     """Keep child approval state in both the child and parent stores."""
@@ -151,6 +168,236 @@ def _approval_decision(value: str | None) -> ApprovalDecision | None:
     return None
 
 
+def _agent_status_elapsed(
+    started_at: str,
+    finished_at: str | None,
+    *,
+    started_monotonic: float | None = None,
+    monotonic_pid: int | None = None,
+    stored_elapsed: float | None = None,
+) -> float:
+    if finished_at is not None and type(stored_elapsed) in {int, float}:
+        return max(0.0, float(stored_elapsed))
+    if (
+        type(started_monotonic) in {int, float}
+        and monotonic_pid == os.getpid()
+    ):
+        return max(0.0, time.monotonic() - started_monotonic)
+    try:
+        started = datetime.fromisoformat(started_at)
+        ended = (
+            datetime.fromisoformat(finished_at)
+            if finished_at is not None
+            else datetime.now(UTC)
+        )
+        return max(0.0, (ended - started).total_seconds())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _bounded_status_text(value: object, limit: int) -> str:
+    if type(value) is not str:
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[: limit - len(_TRUNCATION_NOTE)] + _TRUNCATION_NOTE
+
+
+def _active_agent_receipts(store: object) -> dict[str, Path]:
+    replay = getattr(store, "replay", None)
+    if not callable(replay):
+        raise TypeError("agent status is unavailable outside an agent session")
+    receipts: dict[str, Path] = {}
+    for entry in replay():
+        if entry.type != "message":
+            continue
+        message = Message.from_dict(entry.data["message"])
+        result = message.tool_result
+        structured = result.structured_content if result is not None else None
+        if structured is None:
+            continue
+        handle = structured.get("child_instance_id")
+        child_path = structured.get("child_session_path")
+        if type(handle) is str and handle and type(child_path) is str and child_path:
+            receipts[handle] = Path(child_path)
+    return receipts
+
+
+def _read_agent_status(
+    store: object,
+    *,
+    requested_handle: str | None = None,
+) -> list[dict[str, StructuredContentValue]]:
+    session_dir = getattr(store, "session_dir", None)
+    if not isinstance(session_dir, Path):
+        raise TypeError("agent status is unavailable outside an agent session")
+    active_receipts = _active_agent_receipts(store)
+    if requested_handle is not None and requested_handle not in active_receipts:
+        raise ValueError(f"unknown child handle: {requested_handle}")
+    children: list[dict[str, StructuredContentValue]] = []
+    for handle, child_path in active_receipts.items():
+        if requested_handle is not None and handle != requested_handle:
+            continue
+        lifecycle_path = child_path / "agent_lifecycle.json"
+        try:
+            lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError(f"could not read child state: {lifecycle_path}") from exc
+        if type(lifecycle) is not dict:
+            continue
+        lifecycle_handle = lifecycle.get("handle")
+        if lifecycle_handle != handle:
+            raise ValueError(f"child handle mismatch: {lifecycle_path}")
+        started_at = lifecycle.get("started_at")
+        finished_at = lifecycle.get("finished_at")
+        if type(started_at) is not str or (
+            finished_at is not None and type(finished_at) is not str
+        ):
+            raise ValueError(f"invalid child timestamps: {lifecycle_path}")
+        item: dict[str, StructuredContentValue] = {
+            "handle": handle,
+            "state": lifecycle.get("state", "failed"),
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "elapsed": _agent_status_elapsed(
+                started_at,
+                finished_at,
+                started_monotonic=lifecycle.get("started_monotonic"),
+                monotonic_pid=lifecycle.get("monotonic_pid"),
+                stored_elapsed=lifecycle.get("elapsed"),
+            ),
+            "turns_used": lifecycle.get("turns_used", 0),
+            "tree_budget": lifecycle.get("tree_budget", 0),
+            "current_step": _bounded_status_text(
+                lifecycle.get("current_step", "unknown"), MAX_AGENT_STATUS_STEP
+            ),
+            "depth": lifecycle.get("depth", 0),
+            "agent_type": lifecycle.get("agent_type", "general"),
+            "description": _bounded_status_text(
+                lifecycle.get("description", ""), MAX_AGENT_STATUS_DESCRIPTION
+            ),
+        }
+        if finished_at is not None and requested_handle is not None:
+            item["final_result"] = _bounded_status_text(
+                lifecycle.get("final_result", ""), MAX_AGENT_STATUS_RESULT
+            )
+        children.append(item)
+    return sorted(children, key=lambda child: str(child["started_at"]))
+
+
+async def _agent_status(
+    registry: ToolRegistry,
+    arguments: dict[str, Any],
+    abort_signal: AbortSignal,
+    stream_publisher: object = None,
+    execution_context: ToolExecutionContext | None = None,
+) -> dict[str, object]:
+    del abort_signal, stream_publisher, execution_context
+    requested = arguments.get("handle")
+    if requested is not None and (type(requested) is not str or not requested):
+        return {
+            "content": [text_block("agent error: handle must be a nonempty string")],
+            "isError": True,
+            "structuredContent": None,
+        }
+    try:
+        children = _read_agent_status(
+            registry.session_store,
+            requested_handle=requested,
+        )
+    except (TypeError, ValueError) as exc:
+        return {
+            "content": [text_block(f"agent error: {exc}")],
+            "isError": True,
+            "structuredContent": None,
+        }
+    if requested is not None:
+        matching = [child for child in children if child["handle"] == requested]
+        if not matching:
+            return {
+                "content": [text_block(f"agent error: unknown child handle: {requested}")],
+                "isError": True,
+                "structuredContent": None,
+            }
+        children = matching
+    offset = arguments.get("offset", 0)
+    limit = arguments.get("limit")
+    if type(offset) is not int or offset < 0:
+        return {
+            "content": [text_block("agent error: offset must be a nonnegative integer")],
+            "isError": True,
+            "structuredContent": None,
+        }
+    if limit is not None and (type(limit) is not int or limit < 1):
+        return {
+            "content": [text_block("agent error: limit must be a positive integer")],
+            "isError": True,
+            "structuredContent": None,
+        }
+    page = children[offset : offset + limit if limit is not None else None]
+    max_bytes = registry.max_output_chars
+    while page:
+        next_offset = offset + len(page)
+        truncated = next_offset < len(children)
+        notice = (
+            f"\nmore children available: call agent_status with offset={next_offset}"
+            if truncated
+            else ""
+        )
+        details = "\n".join(
+            "child {handle}: state: {state}; started_at: {started_at}; "
+            "finished_at: {finished_at}; elapsed: {elapsed:.2f}s; "
+            "turns_used: {turns_used}/{tree_budget}; step: {current_step}; "
+            "result: {final_result}".format(
+                **{**child, "final_result": child.get("final_result", "")}
+            )
+            for child in page
+        )
+        content_text = f"agent status: {len(children)} children\n{details}{notice}"
+        structured = {
+            "children": page,
+            "offset": offset,
+            "truncated": truncated,
+            "total": len(children),
+        }
+        if truncated:
+            structured["next_offset"] = next_offset
+        result = {
+            "content": [text_block(content_text)],
+            "isError": False,
+            "structuredContent": structured,
+        }
+        if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= max_bytes:
+            return result
+        page.pop()
+    if offset < len(children):
+        return {
+            "content": [
+                text_block("agent error: status item exceeds response limit")
+            ],
+            "isError": True,
+            "structuredContent": None,
+        }
+    count = len(children)
+    label = "child" if count == 1 else "children"
+    if count == 0 and offset == 0 and limit is None:
+        return {
+            "content": [text_block(f"agent status: {count} {label}")],
+            "isError": False,
+            "structuredContent": {"children": []},
+        }
+    return {
+        "content": [text_block(f"agent status: {count} {label}")],
+        "isError": False,
+        "structuredContent": {
+            "children": [],
+            "offset": offset,
+            "truncated": False,
+            "total": count,
+        },
+    }
+
+
 def agent_result(
     text: str,
     *,
@@ -223,7 +470,8 @@ def register(registry: ToolRegistry) -> None:
             "main context. The child has its own bounded context and may spawn "
             "one level of grandchildren, but grandchildren cannot spawn agents. "
             "Pass model to run the child on another provider's model and "
-            "orchestrate it from here. Built-in types: "
+            "orchestrate it from here. The returned child_instance_id is the "
+            "stable handle for agent_status. Built-in types: "
             f"{agent_type_description()}"
         ),
         parameters={
@@ -256,4 +504,34 @@ def register(registry: ToolRegistry) -> None:
         },
         requires_approval=False,
         parallel_safe=True,
+    )
+    registry.register_session_tool(
+        "agent_status",
+        _agent_status,
+        description=(
+            "Inspect child agents from this session. Pass a child handle for "
+            "one child, or omit it to list every child. This is read-only."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "handle": {
+                    "type": "string",
+                    "description": "Stable child handle returned by the agent tool.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Child index for a status page continuation.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of children in this status page.",
+                },
+            },
+            "additionalProperties": False,
+        },
+        parallel_safe=True,
+        requires_approval=False,
     )

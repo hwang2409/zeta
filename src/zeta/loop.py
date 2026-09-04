@@ -491,8 +491,8 @@ class AgentLoop:
         child_session_path: str | None = None,
         turns_used: int | None = None,
         agent_type: str | None = None,
-        status: str | None = None,
         child_instance_id: str | None = None,
+        status: str | None = None,
         description: str | None = None,
         depth: int | None = None,
         budget_exhausted: bool = False,
@@ -510,6 +510,8 @@ class AgentLoop:
             if turns_used is not None
             else self._agent_child_turns.get(tool_call_id, 0)
         )
+        if child_instance_id is None and child_store is not None:
+            child_instance_id = child_store.agent_handle()
         return agent_result(
             content,
             error=error,
@@ -534,6 +536,7 @@ class AgentLoop:
         child_session_path: str | None = None,
         turns_used: int | None = None,
         agent_type: str | None = None,
+        child_instance_id: str | None = None,
     ) -> ToolResult:
         return _validated_tool_result(
             self._child_result_payload(
@@ -543,6 +546,7 @@ class AgentLoop:
                 child_session_path=child_session_path,
                 turns_used=turns_used,
                 agent_type=agent_type,
+                child_instance_id=child_instance_id,
             ),
             tool_call_id,
         )

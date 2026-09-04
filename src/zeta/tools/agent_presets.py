@@ -31,23 +31,29 @@ GENERAL_PRESET = AgentPreset(
 EXPLORE_PRESET = AgentPreset(
     name="explore",
     turn_cap=15,
-    tool_names=frozenset({"fetch", "read", "skill", "websearch"}),
+    tool_names=frozenset({"agent_status", "fetch", "read", "skill", "websearch"}),
     preamble=(
         "You are an explore sub-agent. Use read-only tools to search and inspect. "
         "Summarize the useful findings and return them to the parent."
     ),
-    selection_guidance="read-only fetch, read, skill, and websearch tools, up to 15 turns",
+    selection_guidance=(
+        "read-only agent_status, fetch, read, skill, and websearch tools, "
+        "up to 15 turns"
+    ),
 )
 PLAN_PRESET = AgentPreset(
     name="plan",
     turn_cap=20,
-    tool_names=frozenset({"fetch", "read", "skill", "todo", "websearch"}),
+    tool_names=frozenset(
+        {"agent_status", "fetch", "read", "skill", "todo", "websearch"}
+    ),
     preamble=(
         "You are a plan sub-agent. Inspect the task with read-only tools, then "
         "create or update a concise todo plan. Return the plan to the parent."
     ),
     selection_guidance=(
-        "read-only fetch, read, skill, todo, and websearch tools, up to 20 turns"
+        "read-only agent_status, fetch, read, skill, todo, and websearch tools, "
+        "up to 20 turns"
     ),
 )
 
