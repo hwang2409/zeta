@@ -485,7 +485,7 @@ class SlashStatus:
     vim_mode: bool = True
     plan_mode: bool = False
     hooks: tuple[str, ...] = ()
-    todo_counts: tuple[int, int, int] | None = None
+    todo_counts: tuple[int, int, int, int] | None = None
     usage_history: tuple[UsageSnapshot, ...] = ()
     usage_cost_by_model: tuple[UsageSnapshot, ...] = ()
     compaction_history: tuple[CompactionSummary, ...] = ()
@@ -793,10 +793,11 @@ def _format_status(status: SlashStatus) -> str:
         ]
     )
     if status.todo_counts is not None:
-        pending, in_progress, completed = status.todo_counts
+        pending, in_progress, completed, canceled = status.todo_counts
         lines.append(
             "todo: "
-            f"pending={pending}, in_progress={in_progress}, completed={completed}"
+            f"pending={pending}, in_progress={in_progress}, completed={completed}, "
+            f"canceled={canceled}"
         )
     return "\n".join(lines)
 

@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from typing import Literal, TypedDict
 
 
-TodoStatus = Literal["pending", "in_progress", "completed"]
+TodoStatus = Literal["pending", "in_progress", "completed", "canceled"]
 
 
 class TodoItem(TypedDict):
@@ -14,7 +14,12 @@ class TodoItem(TypedDict):
     status: TodoStatus
 
 
-TODO_STATUSES: tuple[TodoStatus, ...] = ("pending", "in_progress", "completed")
+TODO_STATUSES: tuple[TodoStatus, ...] = (
+    "pending",
+    "in_progress",
+    "completed",
+    "canceled",
+)
 MAX_TODO_ITEMS = 50
 MAX_TODO_CONTENT_LENGTH = 500
 
@@ -61,12 +66,13 @@ def todo_counts(items: Sequence[TodoItem]) -> dict[TodoStatus, int]:
         "pending": 0,
         "in_progress": 0,
         "completed": 0,
+        "canceled": 0,
     }
     for item in items:
         counts[item["status"]] += 1
     return counts
 
 
-def todo_count_tuple(items: Sequence[TodoItem]) -> tuple[int, int, int]:
+def todo_count_tuple(items: Sequence[TodoItem]) -> tuple[int, int, int, int]:
     counts = todo_counts(items)
     return tuple(counts[status] for status in TODO_STATUSES)

@@ -85,7 +85,12 @@ async def test_todo_writes_and_reads_the_full_list(tmp_path: Path) -> None:
 
     expected = {
         "items": items,
-        "counts": {"pending": 1, "in_progress": 1, "completed": 0},
+        "counts": {
+            "pending": 1,
+            "in_progress": 1,
+            "completed": 0,
+            "canceled": 0,
+        },
     }
     assert written["isError"] is False
     assert written["structuredContent"] == expected
@@ -248,7 +253,12 @@ async def test_todo_empty_list_clears_state_and_does_not_pollute_transcript(
     assert result["isError"] is False
     assert result["structuredContent"] == {
         "items": [],
-        "counts": {"pending": 0, "in_progress": 0, "completed": 0},
+        "counts": {
+            "pending": 0,
+            "in_progress": 0,
+            "completed": 0,
+            "canceled": 0,
+        },
     }
     assert reopened.todo_items() == []
     assert "todo_items" not in json.loads(reopened.state_path.read_text())
@@ -263,6 +273,37 @@ def test_todo_items_persist_across_store_resume(tmp_path: Path) -> None:
 
     assert resumed.todo_items() == [{"content": "resume me", "status": "pending"}]
     assert json.loads(resumed.state_path.read_text())["todo_items"] == resumed.todo_items()
+
+
+def test_todo_canceled_items_validate_count_and_render(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    store.set_todo_items(
+        [
+            {"content": "stopped", "status": "canceled"},
+            {"content": "next", "status": "pending"},
+        ]
+    )
+    widget = TodoWidget(store)
+
+    assert widget.create_content(80, 20).line_count == 2
+    rendered = "".join(
+        fragment[1] for fragment in widget.create_content(80, 20).get_line(0)
+    )
+    assert "[-] stopped" in rendered
+
+
+def test_todo_dismissal_persists_across_resume_and_fork(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    store.set_todo_items([{"content": "done", "status": "canceled"}])
+    widget = TodoWidget(store)
+    widget.turn_boundary()
+
+    resumed = ConversationStore(tmp_path / "sessions", session_id=store.session_id)
+    assert not TodoWidget(resumed).visible
+
+    store.append_checkpoint("before fork")
+    store.append_fork("before fork")
+    assert not TodoWidget(store).visible
 
 
 def test_todo_widget_hides_empty_lists_and_bounds_visible_rows(tmp_path: Path) -> None:
@@ -404,7 +445,7 @@ def test_status_includes_todo_counts_only_when_nonempty(tmp_path: Path) -> None:
 
     output = registry.dispatch(app, "/status")
     assert output is not None
-    assert "todo: pending=0, in_progress=0, completed=1" in output
+    assert "todo: pending=0, in_progress=0, completed=1, canceled=0" in output
 
 
 def test_full_screen_layout_places_todo_between_transcript_and_composer(

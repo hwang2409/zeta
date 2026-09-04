@@ -340,6 +340,7 @@ class ToolRegistry:
             self.approval_policy.bind_store(approval_store)
         self.max_output_chars = max_output_chars
         self._session_store = session_store
+        self._todo_store = session_store
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
         self.background_tasks = BackgroundTaskRegistry(
             session_dir=session_store.session_dir if session_store is not None else None,
@@ -446,6 +447,7 @@ class ToolRegistry:
             if name not in exclude_names
         }
         clone._session_store = store
+        clone._todo_store = self._todo_store or store
         clone.background_tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
         )
@@ -470,6 +472,8 @@ class ToolRegistry:
 
     def bind_session_store(self, store: ConversationStore) -> None:
         self._session_store = store
+        if self._todo_store is None:
+            self._todo_store = store
         self.background_tasks.bind_session_dir(store.session_dir)
         self.bash_cwd = store.bash_cwd
 
@@ -478,6 +482,12 @@ class ToolRegistry:
         if self._session_store is None:
             raise ValueError("tool requires a bound session store")
         return self._session_store
+
+    @property
+    def todo_store(self) -> ConversationStore:
+        if self._todo_store is None:
+            raise ValueError("todo tool requires a bound session store")
+        return self._todo_store
 
     async def close(self) -> None:
         """Stop session-owned background processes."""

@@ -40,7 +40,7 @@ async def _todo(
     registry: ToolRegistry,
     arguments: TodoArguments,
 ) -> StructuredToolResult:
-    store = registry.session_store
+    store = registry.todo_store
     unexpected = sorted(set(arguments) - {"items"})
     if unexpected:
         return _todo_error(
