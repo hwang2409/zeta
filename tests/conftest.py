@@ -95,6 +95,7 @@ class _ExternalDeclaration:
     kind: str
     snapshot: tuple[object, ...] | None
     content: bytes | None
+    expected: bytes | None = None
     used: bool = False
 
 
@@ -164,16 +165,23 @@ class LiveHomeWriteGuard:
                 if after is None or not stat.S_ISREG(after[0]):
                     continue
                 after_content = _path_content(path)
+                if (
+                    after_content is None
+                    or declaration.expected is None
+                    or after[2] != len(after_content)
+                ):
+                    continue
                 if before is None:
-                    return after_content is not None and after[2] == len(after_content)
-                if declaration.content is None or after_content is None:
+                    if after_content == declaration.expected:
+                        declaration.used = True
+                        return True
+                    continue
+                if declaration.content is None:
                     continue
                 if (
                     after[0] == before[0]
                     and after[1] == before[1]
-                    and after_content.startswith(declaration.content)
-                    and len(after_content) > len(declaration.content)
-                    and after[2] == len(after_content)
+                    and after_content == declaration.content + declaration.expected
                 ):
                     declaration.used = True
                     return True
@@ -209,18 +217,23 @@ class LiveHomeWriteGuard:
         self._ledger_offset = _audit_ledger_size(self._ledger)
         self._external_declarations.clear()
 
-    def declare_external_mutation(self, path: Path, *, kind: str) -> None:
+    def declare_external_mutation(
+        self, path: Path, *, kind: str, expected: bytes | None = None
+    ) -> None:
         normalized_path = path.expanduser().resolve()
         try:
             normalized_path.relative_to(self.live_home)
         except ValueError as exc:
             raise ValueError("external mutation must be inside the watched home") from exc
+        if kind == "append" and expected is None:
+            raise ValueError("append declarations must state the expected suffix")
         self._external_declarations.append(
             _ExternalDeclaration(
                 path=normalized_path,
                 kind=kind,
                 snapshot=_path_snapshot(normalized_path),
                 content=_path_content(normalized_path) if kind == "append" else None,
+                expected=expected,
             )
         )
 
