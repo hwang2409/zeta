@@ -77,6 +77,16 @@ class MCPPrompt:
     arguments: tuple[MCPPromptArgument, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class MCPResource:
+    """One resource declared by an MCP server."""
+
+    uri: str
+    name: str = ""
+    description: str = ""
+    mime_type: str = ""
+
+
 class MCPClient(Protocol):
     config: MCPServerConfig
     protocol_version: str | None
@@ -90,6 +100,12 @@ class MCPClient(Protocol):
 
     async def list_prompts(self) -> list[MCPPrompt]:
         """Discover prompts exposed by the server."""
+
+    async def list_resources(self) -> list[MCPResource]:
+        """Discover resources exposed by the server."""
+
+    async def read_resource(self, uri: str) -> str:
+        """Read one resource's text payload."""
 
     async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:
         """Resolve one prompt into user-facing text."""
@@ -268,6 +284,57 @@ def prompts_from_result(value: Mapping[str, object]) -> list[MCPPrompt]:
     return prompts
 
 
+def resources_from_result(value: Mapping[str, object]) -> list[MCPResource]:
+    raw_resources = value.get("resources")
+    if type(raw_resources) is not list:
+        raise MCPProtocolError("MCP resources/list result must contain resources")
+    resources: list[MCPResource] = []
+    for item in raw_resources:
+        if type(item) is not dict:
+            raise MCPProtocolError("MCP resource declaration must be an object")
+        uri = item.get("uri")
+        if type(uri) is not str or not uri:
+            raise MCPProtocolError("MCP resource uri must be a nonempty string")
+        name = item.get("name", "")
+        description = item.get("description", "")
+        mime_type = item.get("mimeType", "")
+        resources.append(
+            MCPResource(
+                uri=uri,
+                name=name if type(name) is str else "",
+                description=description if type(description) is str else "",
+                mime_type=mime_type if type(mime_type) is str else "",
+            )
+        )
+    return resources
+
+
+def resource_text_from_result(value: Mapping[str, object]) -> str:
+    contents = value.get("contents")
+    if type(contents) is not list or not contents:
+        raise MCPProtocolError(
+            "MCP resources/read result must contain a non-empty contents array"
+        )
+    pieces: list[str] = []
+    for index, item in enumerate(contents):
+        if type(item) is not dict:
+            raise MCPProtocolError(
+                f"MCP resource content[{index}] must be an object"
+            )
+        text = item.get("text")
+        if type(text) is str:
+            pieces.append(text)
+            continue
+        if item.get("blob") is not None:
+            raise MCPProtocolError(
+                f"MCP resource content[{index}] is binary; text-only supported"
+            )
+        raise MCPProtocolError(
+            f"MCP resource content[{index}] missing text payload"
+        )
+    return "\n".join(pieces)
+
+
 def prompt_text_from_result(value: Mapping[str, object]) -> str:
     messages = value.get("messages")
     if messages is None and value.get("isError") is True:
@@ -306,6 +373,7 @@ __all__ = [
     "MCPPromptArgument",
     "MCPProtocolError",
     "MCPRequestError",
+    "MCPResource",
     "MCPTool",
     "MCPTransportError",
     "canceled_result",
@@ -314,6 +382,8 @@ __all__ = [
     "parse_rpc_response",
     "prompt_text_from_result",
     "prompts_from_result",
+    "resource_text_from_result",
+    "resources_from_result",
     "tools_from_result",
     "translate_call_result",
 ]

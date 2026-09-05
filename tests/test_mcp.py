@@ -34,8 +34,8 @@ from zeta.mcp import (
     write_mcp_config,
 )
 from zeta.mcp.client import (
-    MCPRequestError,
     MCPProtocolError,
+    MCPRequestError,
     MCPTransportError,
     parse_rpc_response,
     translate_call_result,
@@ -377,10 +377,14 @@ async def test_agent_loop_bootstrap_checks_missing_mcp_config(
     calls = 0
     original_mount = mount_module.mount_mcp_servers
 
-    async def observe_mount(registry: ToolRegistry, config=None, *, notice_sink=None):
+    async def observe_mount(
+        registry: ToolRegistry, config=None, *, notice_sink=None, home=None
+    ):
         nonlocal calls
         calls += 1
-        return await original_mount(registry, config, notice_sink=notice_sink)
+        return await original_mount(
+            registry, config, notice_sink=notice_sink, home=home
+        )
 
     monkeypatch.setattr("zeta.loop.mount_mcp_servers", observe_mount)
     backend = FakeBackend([ScriptedTurn([TextContent("booted")])])
@@ -2129,10 +2133,10 @@ async def test_mcp_status_waits_for_one_shared_initial_mount(
     calls = 0
 
     async def delayed_mount(
-        registry: ToolRegistry, config=None, *, notice_sink=None
+        registry: ToolRegistry, config=None, *, notice_sink=None, home=None
     ) -> MCPMount:
         nonlocal calls
-        del notice_sink, config
+        del notice_sink, config, home
         calls += 1
         started.set()
         await release.wait()
@@ -2223,7 +2227,7 @@ def test_write_mcp_config_leaves_no_partial_on_failure(
     target.write_text('{"servers": {"keep": {"transport": "stdio", "command": "orig"}}}')
     original_replace = os.replace
 
-    def boom(src, dst):  # noqa: ANN001
+    def boom(src, dst):
         raise RuntimeError("simulated rename failure")
 
     monkeypatch.setattr("zeta.mcp.config.os.replace", boom)

@@ -5,6 +5,7 @@ from .client import (
     MCPPrompt,
     MCPPromptArgument,
     MCPRequestError,
+    MCPResource,
     MCPTool,
     MCPTransportError,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "MCPPrompt",
     "MCPPromptArgument",
     "MCPRequestError",
+    "MCPResource",
     "MCPServerConfig",
     "MCPServerState",
     "MCPServerStatus",

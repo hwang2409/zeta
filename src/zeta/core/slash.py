@@ -8,16 +8,14 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
-import yaml
-
 from ..mcp.client import MCPPrompt
-from ..types import Message, MessageRole, StreamEventType, TextContent
 from ..mcp.prompt_commands import (
     MCPPromptCommands,
     SlashModelInput,
     SlashPromptError,
     dispatch_prompt,
 )
+from ..types import Message, MessageRole, StreamEventType, TextContent
 from .commands.custom_commands import (
     COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
     CustomCommand,
@@ -496,7 +494,7 @@ class SlashStatus:
 class SlashSession(Protocol):
     def slash_status(self) -> SlashStatus: ...
 
-    async def slash_mcp(self, args: str) -> str: ...
+    async def slash_mcp(self, args: str) -> str | SlashModelInput: ...
 
     async def slash_mcp_prompt(
         self, name: str, arguments: dict[str, str]
@@ -838,7 +836,7 @@ def _run_status(session: SlashSession, args: str) -> str:
     return _format_status(session.slash_status())
 
 
-async def _run_mcp(session: SlashSession, args: str) -> str:
+async def _run_mcp(session: SlashSession, args: str) -> str | SlashModelInput:
     return await session.slash_mcp(args.strip())
 
 

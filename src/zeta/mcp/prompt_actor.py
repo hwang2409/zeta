@@ -64,7 +64,7 @@ class CancelRequest:
     acknowledged: asyncio.Future[None] | None = None
 
 
-async def cancel_request(actor: "MCPServerActor", identifier: int) -> None:
+async def cancel_request(actor: MCPServerActor, identifier: int) -> None:
     """Cancel one queued actor request and wait for ownership cleanup."""
 
     acknowledged = asyncio.get_running_loop().create_future()
@@ -74,7 +74,7 @@ async def cancel_request(actor: "MCPServerActor", identifier: int) -> None:
 
 
 async def get_prompt(
-    actor: "MCPServerActor",
+    actor: MCPServerActor,
     prompt_name: str,
     arguments: dict[str, str],
     *,
@@ -101,7 +101,7 @@ async def get_prompt(
         raise
 
 
-def handle_prompt(actor: "MCPServerActor", request: PromptRequest) -> None:
+def handle_prompt(actor: MCPServerActor, request: PromptRequest) -> None:
     if actor._closed or request.generation != actor._generation:
         set_exception(request.result, RuntimeError(prompt_unavailable(actor.name)))
         return
@@ -120,7 +120,7 @@ def handle_prompt(actor: "MCPServerActor", request: PromptRequest) -> None:
 
 
 async def invoke_prompt(
-    actor: "MCPServerActor",
+    actor: MCPServerActor,
     request: PromptRequest,
     client: MCPClient,
 ) -> str:
@@ -131,7 +131,7 @@ async def invoke_prompt(
 
 
 def queue_prompt_result(
-    actor: "MCPServerActor",
+    actor: MCPServerActor,
     task: asyncio.Task[str],
     request: PromptRequest,
 ) -> None:
@@ -149,7 +149,7 @@ def queue_prompt_result(
 
 
 def handle_prompt_finished(
-    actor: "MCPServerActor", message: PromptFinished
+    actor: MCPServerActor, message: PromptFinished
 ) -> None:
     actor._children.discard(message.task)
     request = actor._requests.pop(message.request.identifier, message.request)
@@ -243,13 +243,13 @@ def _error_text(error: BaseException) -> str:
 
 
 __all__ = [
-    "CancelRequest",
     "CallFinished",
     "CallRequest",
-    "cancel_request",
-    "cancel_prompt_request",
+    "CancelRequest",
     "PromptFinished",
     "PromptRequest",
+    "cancel_prompt_request",
+    "cancel_request",
     "discover_prompts",
     "prompt_unavailable",
     "resolve_prompt_message",

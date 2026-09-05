@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
+import time  # noqa: F401 - kept as the monkey-patch seam for tests
 from collections.abc import Callable
 from pathlib import Path
 
@@ -30,7 +30,27 @@ logger = logging.getLogger(__name__)
 def _build_client(config: MCPServerConfig) -> MCPClient:
     if config.transport == "stdio":
         return StdioMCPClient(config)
-    return StreamableHTTPMCPClient(config)
+    return StreamableHTTPMCPClient(config, home=_current_home())
+
+
+_HOME_CONTEXT: list[str | None] = [None]
+
+
+def _current_home() -> str | None:
+    return _HOME_CONTEXT[-1]
+
+
+def _make_build_client(
+    home: str | None,
+) -> Callable[[MCPServerConfig], MCPClient]:
+    def build(config: MCPServerConfig) -> MCPClient:
+        _HOME_CONTEXT.append(home)
+        try:
+            return _build_client(config)
+        finally:
+            _HOME_CONTEXT.pop()
+
+    return build
 
 
 async def _connect_and_list(client: MCPClient) -> list[MCPTool]:
@@ -54,6 +74,7 @@ class MCPMount:
         statuses: dict[str, MCPServerStatus] | None = None,
         *,
         sources: dict[str, Path] | None = None,
+        home: str | None = None,
     ) -> None:
         if isinstance(registry, ToolRegistry):
             self.registry: ToolRegistry | None = registry
@@ -68,6 +89,7 @@ class MCPMount:
         self.configs = server_configs
         self.statuses = dict(statuses or {})
         self.sources = dict(sources or {})
+        self.home = home
         self._clients = clients
         self._actors: dict[str, MCPServerActor] = {}
         self._removed_actors: set[MCPServerActor] = set()
@@ -77,6 +99,11 @@ class MCPMount:
         self._prompt_refresh: Callable[[MCPMount], None] | None = None
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
+
+    def client_for(self, name: str) -> MCPClient | None:
+        """Return the live client for one server, or None if it is not mounted."""
+
+        return self._clients.get(name)
 
     @property
     def clients(self) -> tuple[MCPClient, ...]:
@@ -331,7 +358,7 @@ class MCPMount:
             source=source,
             registry=self.registry,
             publish=self._publish,
-            build_client=_build_client,
+            build_client=_make_build_client(self.home),
             connect_and_list=_connect_and_list,
             setup_timeout=SERVER_SETUP_TIMEOUT_SECONDS,
             auto_base_delay=AUTO_RECONNECT_BASE_DELAY_SECONDS,
@@ -366,6 +393,7 @@ async def mount_mcp_servers(
     config: MCPConfig | None = None,
     *,
     notice_sink: NoticeSink | None = None,
+    home: str | None = None,
 ) -> MCPMount:
     """Connect configured servers and register each discovered tool."""
 
@@ -374,13 +402,14 @@ async def mount_mcp_servers(
             config = load_mcp_config()
         except MCPConfigError as exc:
             logger.error("%s", exc)
-            return MCPMount(registry, {}, {})
+            return MCPMount(registry, {}, {}, home=home)
 
     mount = MCPMount(
         registry,
         config.configured_servers,
         {},
         sources=dict(config.sources),
+        home=home,
     )
     actors: list[MCPServerActor] = []
     for server_config in config.configured_servers.values():
