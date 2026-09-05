@@ -31,6 +31,12 @@ jobs:
       # a dead socket. That is a test-side timing assumption of the ZETA-67
       # family, not product behaviour. ZETA-85 covers making them CI-capable;
       # until then this is a known coverage gap, not a pass.
+      # ubuntu-latest SHIPS tmux, so the skip assumption above does not hold
+      # on a stock runner — remove it explicitly or the racy tests run anyway
+      # (first hit: PR #111 run 33993051287).
+      - name: Remove tmux so tmux-gated tests skip
+        run: sudo apt-get remove -y tmux || sudo rm -f "$(command -v tmux)"
+
       - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
