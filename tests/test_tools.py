@@ -1509,7 +1509,7 @@ async def test_pre_execution_hook_can_allow_and_deny(tmp_path: Path) -> None:
     assert allowed["isError"] is False
     assert allowed["content"][0]["text"] == "allowed"
     assert denied["isError"] is True
-    assert denied["content"][0]["text"] == "tool execution denied"
+    assert denied["content"][0]["text"] == "tool execution denied by hook"
     assert seen == [("gated", {"allow": True}), ("gated", {"allow": False})]
 
 

@@ -522,7 +522,9 @@ def _inline_shell_was_canceled(result: StructuredToolResult) -> bool:
 def _inline_shell_was_denied(result: StructuredToolResult) -> bool:
     content = result.get("content")
     return result.get("isError") is True and isinstance(content, list) and any(
-        isinstance(block, dict) and block.get("text") == "tool execution denied"
+        isinstance(block, dict)
+        and isinstance(block.get("text"), str)
+        and block["text"].startswith("tool execution denied")
         for block in content
     )
 
@@ -542,7 +544,12 @@ def _inline_shell_failure(result: StructuredToolResult) -> str:
             and isinstance(content[0], dict)
             else None
         )
-        reason = "denied" if content_text == "tool execution denied" else "canceled"
+        reason = (
+            "denied"
+            if isinstance(content_text, str)
+            and content_text.startswith("tool execution denied")
+            else "canceled"
+        )
     return f"[inline shell failed: {reason}]"
 
 

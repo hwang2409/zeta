@@ -141,7 +141,7 @@ class CommandRuntimeMixin:
         structured = result.structured_content or {}
         if result.is_canceled:
             status = "canceled"
-        elif result.content == "tool execution denied":
+        elif result.content.startswith("tool execution denied"):
             status = "denied"
         elif structured.get("status") == "running":
             status = "running"

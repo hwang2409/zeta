@@ -272,6 +272,10 @@ class TUIApp(
     def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
         return self._submissions.pending_approvals
 
+    @property
+    def approval_policy(self) -> ApprovalPolicy | None:
+        return self._approval_policy
+
     def _start_model_catalog_load(self) -> None:
         if self._model_catalog_task is not None:
             return

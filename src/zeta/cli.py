@@ -70,6 +70,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="cap the assistant's tool-use loop turns per user message",
     )
+    parser.add_argument(
+        "-p",
+        "--print",
+        dest="prompt",
+        metavar="PROMPT",
+        default=None,
+        help=(
+            "run one turn without the TUI: print the final assistant text "
+            "and exit; combine with --format json to emit a JSONL event stream"
+        ),
+    )
+    parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="headless output format (text or json); requires --print",
+    )
     commands = parser.add_subparsers(dest="command")
     login_parser = commands.add_parser("login", help="log in to an OAuth provider")
     login_parser.add_argument(
@@ -132,6 +149,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.force_provider and args.model is None:
         parser.error("--force-provider requires --model")
+    if args.prompt is not None:
+        from .headless import run_headless
+
+        return run_headless(args, args.prompt)
+    if args.format != "text":
+        parser.error("--format requires --print")
     try:
         app = create_app(args)
     except SessionError as exc:
