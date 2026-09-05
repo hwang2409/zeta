@@ -57,6 +57,7 @@ from ..types import (
     validate_tool_content_block,
 )
 from ._process import BackgroundTaskRegistry
+from ._sandbox import SandboxPolicy
 
 AbortSignal = ToolAbortSignal
 MAX_STRUCTURED_CONTENT_DEPTH = 32
@@ -324,6 +325,7 @@ class ToolRegistry:
         self._cwd_fd = cwd_fd
         self._cwd_identity = (cwd_stat.st_dev, cwd_stat.st_ino)
         self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)
+        self.policy = SandboxPolicy(self.cwd)
         if type(max_output_chars) is not int or max_output_chars < 1:
             raise ValueError("max_output_chars must be a positive integer")
         if pre_execute_hook is not None and hook is not None:
@@ -728,10 +730,7 @@ class ToolRegistry:
         return [result for result in results if result is not None]
 
     def _path(self, raw_path: object) -> Path:
-        if type(raw_path) is not str or not raw_path:
-            raise ValueError("path must be a nonempty string")
-        candidate = Path(raw_path)
-        return candidate if candidate.is_absolute() else self.cwd / candidate
+        return self.policy.resolve(raw_path).absolute
 
     def _open_cwd(self) -> int:
         try:

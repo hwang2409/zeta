@@ -109,7 +109,8 @@ def register(registry: ToolRegistry) -> None:
         _edit,
         description=(
             "Replace one unique UTF-8 string in a file. "
-            "Relative paths use the session cwd."
+            "Relative paths use the session cwd; "
+            "~ and absolute paths outside the cwd are allowed."
         ),
         parameters={
             "type": "object",

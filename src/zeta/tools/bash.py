@@ -1,9 +1,9 @@
 """The built-in general shell tool.
 
-Sandboxing is truly best-effort and weaker than the file tools. An explicit
-``cwd`` is checked lexically against the session root, but shell commands can
-change directory to any path. The reported shell cwd is persisted as session
-state for the next call.
+Bash and the file tools share one sandbox policy: paths are expanded
+(``~`` per call) and used as-is. Shell commands can change directory to
+any path; the reported shell cwd is persisted as session state for the
+next call.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from typing import TypedDict
 from ..core.abort import AbortSignal
 from ..types import StructuredToolResult
 from ._process import _kill_and_reap
+from ._sandbox import expand_user_path
 from .registry import (
     ToolRegistry,
     ToolStream,
@@ -46,17 +47,10 @@ def _start_cwd(registry: ToolRegistry, arguments: BashArguments) -> str:
         return registry.bash_cwd
     if type(cwd) is not str or not cwd:
         raise ValueError("cwd must be a nonempty string or null")
-    candidate = Path(cwd)
-    normalized = Path(os.path.normpath(cwd))
-    if candidate.is_absolute():
-        inside = normalized == registry.cwd or registry.cwd in normalized.parents
-    else:
-        inside = not (normalized == Path("..") or Path("..") in normalized.parents)
-    if not inside:
-        raise ValueError("path escaped sandbox")
-    return os.path.abspath(
-        os.fspath(candidate if candidate.is_absolute() else registry.cwd / candidate)
-    )
+    candidate = Path(expand_user_path(cwd))
+    if not candidate.is_absolute():
+        candidate = registry.cwd / candidate
+    return os.path.abspath(candidate)
 
 
 async def _bash(
@@ -105,9 +99,12 @@ async def _bash(
         while chunk := await pipe.read(65_536):
             chunks.append(chunk)
             text = decoder.decode(chunk)
-            if stream_publisher is not None and not abort_signal.is_set():
-                if text:
-                    stream_publisher.publish(text, stream)
+            if (
+                stream_publisher is not None
+                and not abort_signal.is_set()
+                and text
+            ):
+                stream_publisher.publish(text, stream)
         text = decoder.decode(b"", final=True)
         if stream_publisher is not None and not abort_signal.is_set() and text:
             stream_publisher.publish(text, stream)
@@ -210,7 +207,7 @@ def register(registry: ToolRegistry) -> None:
         _bash,
         description=(
             "Run a shell command. Session cwd persists after cd. "
-            "Sandboxing is truly best-effort."
+            "Paths outside the session cwd are allowed."
         ),
         parameters={
             "type": "object",

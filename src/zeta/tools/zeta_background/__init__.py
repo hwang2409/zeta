@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 from ...types import StructuredToolResult
+from .._sandbox import expand_user_path
 from ..registry import ToolRegistry, _success_result, text_block
 
 
@@ -28,19 +29,10 @@ async def _run_background(
     if cwd is not None:
         if type(cwd) is not str or not cwd:
             raise ValueError("cwd must be a nonempty string or null")
-        candidate = Path(cwd)
-        normalized = Path(os.path.normpath(cwd))
-        if candidate.is_absolute():
-            inside = normalized == registry.cwd or registry.cwd in normalized.parents
-        else:
-            inside = not (normalized == Path("..") or Path("..") in normalized.parents)
-        if not inside:
-            raise ValueError("path escaped sandbox")
-        start_cwd = Path(
-            os.path.abspath(
-                os.fspath(candidate if candidate.is_absolute() else registry.cwd / candidate)
-            )
-        )
+        candidate = Path(expand_user_path(cwd))
+        if not candidate.is_absolute():
+            candidate = registry.cwd / candidate
+        start_cwd = Path(os.path.abspath(candidate))
     task_id, pid = await registry.background_tasks.start(arguments["command"], start_cwd)
     return _result(
         f"started background task {task_id} (pid {pid})",
