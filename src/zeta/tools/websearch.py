@@ -280,6 +280,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "websearch",
         _websearch,
+        approval_subject="query",
         description=(
             "Search the web with DuckDuckGo. Network access requires approval. "
             "The keyless HTML backend may change without notice."

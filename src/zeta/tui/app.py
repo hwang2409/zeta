@@ -892,6 +892,11 @@ class TUIApp(
         await self.loop.ensure_mcp_servers()
         for warning in self._startup_warnings:
             self._print_unit(Text(warning, style=ERROR))
+        # After the MCP mount so argument-scoped rules dropped for a
+        # just-mounted subject-less tool are reported too (ZETA-86).
+        if self._approval_policy is not None:
+            for notice in self._approval_policy.notices:
+                self._print_unit(Text(notice, style=ERROR))
         for alert in self._startup_alerts:
             self._print_unit(Text(alert, style=COMMAND))
         for notice in self._startup_notices:

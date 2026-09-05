@@ -1437,6 +1437,84 @@ async def test_child_approval_cleanup_removes_pending_requests(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_child_policy_inherits_scoped_rules_and_delegates_prompts(
+    tmp_path: Path,
+) -> None:
+    """ZETA-86: scoped rules apply to children; unmatched calls still surface."""
+
+    parent_store = ConversationStore(tmp_path / "sessions", session_id="parent")
+    policy = ApprovalPolicy(
+        store=parent_store,
+        always_allow={"bash(git status*)"},
+        always_deny={"bash(rm *)"},
+    )
+    policy.declare_subjects({"bash": "command"})
+    child_store = ConversationStore(tmp_path / "children", session_id="child")
+    child_policy = ChildApprovalPolicy(policy, child_store, "child", "child-1")
+
+    # A child registry declares its (subset of) tools through the child policy
+    # without erasing what the parent already knows.
+    assert child_policy.declare_subjects({"read": "path"}) == ()
+    assert child_policy.decide("bash", {"command": "git status"}) is ApprovalDecision.ALLOW
+    assert child_policy.decide("bash", {"command": "rm -rf /"}) is ApprovalDecision.DENY
+    assert child_policy.prepare(ToolCall("ok", "bash", {"command": "git status"})) is None
+    assert child_policy.notices == ()
+
+    signal = AbortGenerationRegistry().new_generation()
+    call = ToolCall("pending", "bash", {"command": "git push"})
+    task = asyncio.create_task(child_policy.authorize(call, signal))
+    while not policy.pending_requests():
+        await asyncio.sleep(0)
+
+    assert [request.key for request in policy.pending_requests()] == [
+        ("child-1", "pending")
+    ]
+    assert policy.approve(("child-1", "pending"))
+    assert await task is ApprovalDecision.ALLOW
+    signal.abort()
+
+
+@pytest.mark.asyncio
+async def test_child_loop_inherits_argument_scoped_approval_rules(
+    tmp_path: Path,
+) -> None:
+    """ZETA-86: the agent tool's child loop is gated by the parent's scoped rules."""
+
+    allowed_call = ToolCall("child-echo", "exec", {"command": "echo scoped-ok"})
+    denied_call = ToolCall("child-rm", "exec", {"command": "rm -rf nothing-here"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call()]),
+            ScriptedTurn(tool_calls=[allowed_call, denied_call]),
+            ScriptedTurn([TextContent("child done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(
+        store=store,
+        always_allow={"exec(echo *)"},
+        default=ApprovalDecision.DENY,
+    )
+
+    await _collect(
+        AgentLoop(backend, store, approval_policy=policy, max_turns=1).run_turn("start")
+    )
+
+    child_messages = ConversationStore(
+        store.session_dir / "agents", session_id="1"
+    ).messages()
+    results = {
+        message.tool_result.tool_call_id: message.tool_result
+        for message in child_messages
+        if message.tool_result
+    }
+    assert not results["child-echo"].is_error
+    assert "scoped-ok" in results["child-echo"].content
+    assert results["child-rm"].is_error
+    assert results["child-rm"].content == "tool execution denied"
+
+
+@pytest.mark.asyncio
 async def test_child_abort_closes_all_loop_tasks(tmp_path: Path) -> None:
     started = asyncio.Event()
 

@@ -569,6 +569,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "fetch",
         _fetch,
+        approval_subject="url",
         description=(
             "Fetch a URL and return readable text. Network access requires approval; "
             "HTTP URLs are allowed with a notice. Private, loopback, link-local, "

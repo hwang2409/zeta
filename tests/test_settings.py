@@ -478,3 +478,123 @@ def test_project_settings_read_from_dot_zeta(tmp_path: Path) -> None:
     # A non-dot-zeta project directory sees no settings.
     plain = load_settings(home=home, project_dir=project)
     assert plain.settings.model is None
+
+
+# --- ZETA-86: argument-scoped rules ---------------------------------------
+
+
+def test_scoped_approval_rules_round_trip_into_policy(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write(
+        home,
+        """
+        [approval]
+        allow = ["bash(git status*)", "read"]
+        deny = ["bash(rm *)"]
+        ask = ["write(/etc/*)"]
+        """,
+    )
+    loaded = load_settings(home=home, project_dir=None)
+    assert loaded.warnings == ()
+    assert loaded.notices == ()
+    assert loaded.settings.approval_allow == ("bash(git status*)", "read")
+    policy = ApprovalPolicy(
+        store=ConversationStore(tmp_path / "sessions"),
+        always_allow=loaded.settings.approval_allow,
+        always_deny=loaded.settings.approval_deny,
+        always_ask=loaded.settings.approval_ask,
+    )
+    policy.declare_subjects({"bash": "command", "read": "path", "write": "path"})
+    assert policy.decide("bash", {"command": "git status -s"}) is ApprovalDecision.ALLOW
+    assert policy.decide("bash", {"command": "rm -rf /"}) is ApprovalDecision.DENY
+    assert policy.decide("bash", {"command": "ls"}) is ApprovalDecision.ASK
+    assert policy.decide("write", {"path": "/etc/hosts"}) is ApprovalDecision.ASK
+    assert policy.decide("read", {"path": "/etc/hosts"}) is ApprovalDecision.ALLOW
+
+
+def test_malformed_approval_rule_is_dropped_with_loud_warning(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write(
+        home,
+        """
+        [approval]
+        allow = ["bash(git status", "read"]
+        deny = ["bash()"]
+        """,
+    )
+    loaded = load_settings(home=home, project_dir=None)
+    # Only the malformed entry is dropped; the rest of the list survives.
+    assert loaded.settings.approval_allow == ("read",)
+    assert loaded.settings.approval_deny == ()
+    assert loaded.notices == ()
+    assert len(loaded.warnings) == 2
+    assert "approval.allow" in loaded.warnings[0]
+    assert "'bash(git status'" in loaded.warnings[0]
+    assert "approval.deny" in loaded.warnings[1]
+    assert "'bash()'" in loaded.warnings[1]
+
+
+def test_hostile_project_cannot_grant_scoped_approvals(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write(
+        home,
+        """
+        [approval]
+        deny = ["bash(rm *)"]
+        """,
+    )
+    _write(
+        project,
+        """
+        [approval]
+        allow = ["bash(*)", "write(*)"]
+        deny = []
+        """,
+    )
+    loaded = load_settings(home=home, project_dir=project)
+    assert loaded.settings.approval_allow == ()
+    assert loaded.settings.approval_deny == ("bash(rm *)",)
+    assert len(loaded.warnings) == 1
+    assert "cannot grant approvals" in loaded.warnings[0]
+    policy = ApprovalPolicy(
+        always_allow=loaded.settings.approval_allow,
+        always_deny=loaded.settings.approval_deny,
+        always_ask=loaded.settings.approval_ask,
+    )
+    policy.declare_subjects({"bash": "command", "write": "path"})
+    assert policy.decide("bash", {"command": "git status"}) is ApprovalDecision.ASK
+    assert policy.decide("write", {"path": "x"}) is ApprovalDecision.ASK
+    assert policy.decide("bash", {"command": "rm -rf /"}) is ApprovalDecision.DENY
+
+
+def test_scoped_rules_reach_the_live_policy_through_create_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: settings -> policy -> registry subject declaration."""
+
+    from zeta.cli import build_parser
+    from zeta.tui.app import create_app
+
+    home = tmp_path / "home"
+    _write(
+        home,
+        """
+        [approval]
+        allow = ["bash(git status*)", "todo(*)"]
+        """,
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+
+    policy = app.approval_policy
+    assert policy is not None
+    assert policy.decide("bash", {"command": "git status --short"}) is ApprovalDecision.ALLOW
+    assert policy.decide("bash", {"command": "git push"}) is ApprovalDecision.ASK
+    assert policy.decide("bash", {"cmd": "git status"}) is ApprovalDecision.ASK
+    # todo declares no subject, so the scoped rule is dropped and reported.
+    assert policy.decide("todo", {}) is ApprovalDecision.ASK
+    assert len(policy.notices) == 1
+    assert "todo(*)" in policy.notices[0]

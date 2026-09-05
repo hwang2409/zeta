@@ -77,6 +77,20 @@ class _ToolCanceled(Exception):
     pass
 
 
+def _signal_is_set(signal_state: AbortSignal) -> bool:
+    return signal_state.is_set()
+
+
+async def _yield_for_abort(
+    abort_signal: AbortSignal,
+) -> None:
+    if _signal_is_set(abort_signal):
+        raise _ToolCanceled()
+    await asyncio.sleep(0)
+    if _signal_is_set(abort_signal):
+        raise _ToolCanceled()
+
+
 ToolHandler = Callable[..., ToolHandlerResult | Awaitable[ToolHandlerResult]]
 
 

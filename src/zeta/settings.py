@@ -27,7 +27,9 @@ The ``yolo`` flag is tri-state — an explicit ``--yolo`` or ``--no-yolo`` wins
 either way, while an omitted flag inherits the settings value.
 
 Malformed files fail open with a dim notice at session start; a missing file
-is silent.
+is silent. Approval entries are ``tool`` or ``tool(pattern)`` (ZETA-86); an
+entry that does not parse is dropped with a loud warning, since a rule the
+user wrote that silently never applies would change what gets approved.
 """
 
 from __future__ import annotations
@@ -38,6 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+
+from .core.approval import parse_approval_rule
 
 SETTINGS_FILENAME = "settings.toml"
 _PROVIDER_CHOICES = frozenset({"fake", "claude", "codex"})
@@ -135,7 +139,7 @@ def load_settings(
     )
     project_data = _strip_unsafe_project_keys(project_data, project_path, warnings)
     merged = _deep_merge(global_data, project_data)
-    settings = _validate(merged, notices)
+    settings = _validate(merged, notices, warnings)
     return LoadedSettings(settings, tuple(notices), tuple(warnings))
 
 
@@ -246,7 +250,9 @@ def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str
     return merged
 
 
-def _validate(data: Mapping[str, Any], notices: list[str]) -> Settings:
+def _validate(
+    data: Mapping[str, Any], notices: list[str], warnings: list[str]
+) -> Settings:
     for key in data.keys() - _TOP_KEYS:
         notices.append(f"settings · ignored unknown key '{key}'")
     provider = _validated_choice(data, "provider", _PROVIDER_CHOICES, notices)
@@ -263,7 +269,7 @@ def _validate(data: Mapping[str, Any], notices: list[str]) -> Settings:
     workspace_snapshot_cap = _validated_positive_int(
         data, "workspace_snapshot_cap", notices
     )
-    allow, deny, ask = _validated_approval(data, notices)
+    allow, deny, ask = _validated_approval(data, notices, warnings)
     keybindings = _validated_keybindings(data, notices)
     return Settings(
         provider=provider,
@@ -348,7 +354,7 @@ def _validated_nonnegative_int(
 
 
 def _validated_approval(
-    data: Mapping[str, Any], notices: list[str]
+    data: Mapping[str, Any], notices: list[str], warnings: list[str]
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     if "approval" not in data:
         return (), (), ()
@@ -358,11 +364,32 @@ def _validated_approval(
         return (), (), ()
     for key in table.keys() - _APPROVAL_KEYS:
         notices.append(f"settings · ignored unknown key 'approval.{key}'")
-    return (
-        _validated_str_list("approval.allow", table.get("allow"), notices),
-        _validated_str_list("approval.deny", table.get("deny"), notices),
-        _validated_str_list("approval.ask", table.get("ask"), notices),
+    return tuple(
+        _validated_rules(
+            f"approval.{key}",
+            _validated_str_list(f"approval.{key}", table.get(key), notices),
+            warnings,
+        )
+        for key in ("allow", "deny", "ask")
     )
+
+
+def _validated_rules(
+    label: str,
+    entries: tuple[str, ...],
+    warnings: list[str],
+) -> tuple[str, ...]:
+    """Keep only entries that parse as ``tool`` or ``tool(pattern)``."""
+
+    kept: list[str] = []
+    for entry in entries:
+        try:
+            parse_approval_rule(entry)
+        except ValueError as exc:
+            warnings.append(f"settings · dropped {label} entry: {exc}")
+            continue
+        kept.append(entry)
+    return tuple(kept)
 
 
 def _validated_str_list(

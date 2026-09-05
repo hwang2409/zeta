@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from zeta.cli import build_parser, main
-from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRule
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager, env_home
 from zeta.core.store import ConversationStore
@@ -339,6 +339,80 @@ def test_headless_no_yolo_flag_beats_settings_yolo(
     assert captured_policies, "wrapped create_app should have been called"
     policy = captured_policies[0]
     assert policy.default is ApprovalDecision.DENY
+
+
+def test_headless_hard_denies_argument_scoped_ask_rules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression (ZETA-86): a scoped ask rule from settings is neutralised too.
+
+    The override assigns an empty rule set; if the rule representation ever
+    stops flowing through that assignment, a ``bash(git push*)`` ask rule
+    would survive and headless would poll for a UI answer that never comes.
+    """
+
+    from zeta.headless import run_headless
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "settings.toml").write_text(
+        '[approval]\nask = ["bash(git push*)"]\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    args = build_parser().parse_args(["--provider", "fake", "-p", "hi"])
+
+    import zeta.tui.app as tui_app
+
+    original_create_app = tui_app.create_app
+    captured_policies: list[ApprovalPolicy] = []
+
+    def _wrapped_create_app(parsed: argparse.Namespace) -> tui_app.TUIApp:
+        app = original_create_app(parsed)
+        policy = app.approval_policy
+        assert policy is not None
+        assert policy.always_ask == {ApprovalRule("bash", "git push*")}
+        assert policy.decide("bash", {"command": "git push"}) is ApprovalDecision.ASK
+        captured_policies.append(policy)
+        return app
+
+    monkeypatch.setattr(tui_app, "create_app", _wrapped_create_app)
+
+    code = run_headless(args, args.prompt)
+    capsys.readouterr()
+
+    assert code == 0
+    policy = captured_policies[0]
+    assert policy.always_ask == frozenset()
+    assert policy.default is ApprovalDecision.DENY
+    assert policy.decide("bash", {"command": "git push origin main"}) is ApprovalDecision.DENY
+    assert policy.decide("bash", {"command": "git status"}) is ApprovalDecision.DENY
+
+
+def test_headless_reports_dropped_scoped_rules_on_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from zeta.headless import run_headless
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "settings.toml").write_text(
+        '[approval]\nallow = ["todo(*)"]\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    args = build_parser().parse_args(["--provider", "fake", "-p", "hi"])
+
+    code = run_headless(args, args.prompt)
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "dropped rule 'todo(*)'" in captured.err
+    assert "dropped rule" not in captured.out
 
 
 async def test_headless_denies_ask_tool_and_writes_stderr_note(tmp_path: Path) -> None:
