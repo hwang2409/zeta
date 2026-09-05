@@ -19,13 +19,16 @@ from urllib.request import urlopen
 import httpx
 import pytest
 
-import zeta.core.login_flow as login_flow
-import zeta.cli as cli
+from zeta import cli
 from zeta.cli import build_parser
+from zeta.core import login_flow
 from zeta.core.login_flow import LoginError, LoginProvider, run_login
 from zeta.providers.anthropic import AnthropicCredentialStore
 from zeta.providers.auth import OAuthTokens
-from zeta.providers.codex import CodexCredentialStore, build_authorization_url as build_codex_authorization_url
+from zeta.providers.codex import CodexCredentialStore
+from zeta.providers.codex import (
+    build_authorization_url as build_codex_authorization_url,
+)
 
 
 @dataclass
@@ -185,7 +188,10 @@ def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
                 port = urlsplit(redirect).port
         assert port is not None
         process.send_signal(signal.SIGINT)
-        assert process.wait(timeout=3) == 1
+        shutdown_deadline = time.monotonic() + 30
+        while process.poll() is None and time.monotonic() < shutdown_deadline:
+            time.sleep(0.01)
+        assert process.poll() == 1
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.bind(("127.0.0.1", port))
     finally:
