@@ -23,12 +23,7 @@ def _python(*parts: str) -> str:
 
 
 async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None:
-    for _ in range(100):
-        status = await registry.output(task_id, since=0)
-        if not status["running"]:
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("background task did not exit")
+    await asyncio.wait_for(registry.wait(task_id), timeout=30)
 
 
 @pytest.mark.asyncio

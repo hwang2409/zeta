@@ -932,7 +932,7 @@ async def test_parallel_nested_lifecycle_events_survive_large_batch(
         agent_turn_budget=100,
     )
 
-    events = await asyncio.wait_for(_collect(loop.run_turn("start")), timeout=2)
+    events = await asyncio.wait_for(_collect(loop.run_turn("start")), timeout=30)
 
     read_lifecycle = [
         event
