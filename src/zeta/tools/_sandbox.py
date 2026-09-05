@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _MAX_ANCESTRY_DEPTH = 256
+_DELETED_MARKER = " (deleted)"
 _Identity = tuple[int, int]
 
 
@@ -105,6 +106,22 @@ def _path_open_error(
     return ValueError(f"could not open path: {path}: {error}")
 
 
+def _without_deleted_marker(link_target: str, *, unlinked: bool) -> str:
+    """Drop procfs's " (deleted)" marker so both platforms report bare paths.
+
+    Linux appends the marker to a /proc/self/fd entry once the inode has no
+    remaining links; macOS F_GETPATH reports the path with no marker. Strip it
+    only when the descriptor is genuinely unlinked, so a file actually named
+    "... (deleted)" keeps its name. An unlink racing between the readlink and
+    the fstat is safe either way: an inode cannot regain links, and the
+    endswith guard makes a missing marker a no-op.
+    """
+
+    if unlinked and link_target.endswith(_DELETED_MARKER):
+        return link_target[: -len(_DELETED_MARKER)]
+    return link_target
+
+
 if sys.platform == "darwin" and hasattr(fcntl, "F_GETPATH"):
 
     def _path_from_fd(file_descriptor: int) -> str:
@@ -119,7 +136,10 @@ elif sys.platform.startswith("linux") and os.path.isdir("/proc/self/fd"):
     def _path_from_fd(file_descriptor: int) -> str:
         """Return the kernel path with Linux procfs."""
 
-        return os.readlink(f"/proc/self/fd/{file_descriptor}")
+        link_target = os.readlink(f"/proc/self/fd/{file_descriptor}")
+        return _without_deleted_marker(
+            link_target, unlinked=os.fstat(file_descriptor).st_nlink == 0
+        )
 
 else:
 

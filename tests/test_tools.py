@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import zeta.tools._sandbox as sandbox_module
 import zeta.tools.exec as exec_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
@@ -771,6 +772,47 @@ async def test_write_overwrite_symlink_race_stays_in_sandbox(tmp_path: Path) -> 
             target.unlink()
         if not target.exists():
             target.write_bytes(b"inside")
+
+
+def test_deleted_marker_stripped_only_for_unlinked_descriptors() -> None:
+    """procfs marks unlinked fds; a real file may still be named that way."""
+
+    assert (
+        sandbox_module._without_deleted_marker("/s/target (deleted)", unlinked=True)
+        == "/s/target"
+    )
+    assert (
+        sandbox_module._without_deleted_marker("/s/target", unlinked=True)
+        == "/s/target"
+    )
+    # A file genuinely named "report (deleted)" keeps its name while linked.
+    assert (
+        sandbox_module._without_deleted_marker("/s/report (deleted)", unlinked=False)
+        == "/s/report (deleted)"
+    )
+    assert (
+        sandbox_module._without_deleted_marker("/s/report", unlinked=False)
+        == "/s/report"
+    )
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the procfs (deleted) marker is Linux-only",
+)
+def test_path_from_fd_reports_bare_path_for_unlinked_file(tmp_path: Path) -> None:
+    """Linux procfs must report the same bare path macOS F_GETPATH reports."""
+
+    target = tmp_path / "target"
+    target.write_bytes(b"inside")
+    file_descriptor = os.open(target, os.O_RDONLY)
+    try:
+        assert sandbox_module._path_from_fd(file_descriptor) == str(target)
+        target.unlink()
+        assert os.fstat(file_descriptor).st_nlink == 0
+        assert sandbox_module._path_from_fd(file_descriptor) == str(target)
+    finally:
+        os.close(file_descriptor)
 
 
 @pytest.mark.asyncio
