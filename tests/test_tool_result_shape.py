@@ -289,7 +289,11 @@ async def test_failure_result_uses_mcp_error_shape(tmp_path: Path) -> None:
     result = await registry.execute(ToolCall("call-1", "missing", {}))
 
     assert result["isError"] is True
-    assert result["structuredContent"] is None
+    error = result["structuredContent"]["error"]
+    assert error["tool"] == "missing"
+    assert error["kind"] == "unknown_tool"
+    assert error["hint"]
+    assert error["message"] == "unknown tool: missing"
     block = _text_block(result)
     assert block["type"] == "text"
     assert block["text"] == "unknown tool: missing"

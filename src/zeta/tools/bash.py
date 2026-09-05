@@ -30,8 +30,19 @@ from .registry import (
 
 
 class BashArguments(TypedDict, total=False):
+    command: str
     cmd: str
     cwd: str | None
+
+
+def _extract_command(arguments: BashArguments) -> str:
+    command = arguments.get("command")
+    if isinstance(command, str) and command:
+        return command
+    legacy = arguments.get("cmd")
+    if isinstance(legacy, str) and legacy:
+        return legacy
+    raise ValueError("command is required (accepts legacy alias cmd)")
 
 
 class BashStructuredContent(TypedDict):
@@ -78,7 +89,7 @@ async def _bash(
             script,
             "zeta-bash",
             start_cwd,
-            arguments["cmd"],
+            _extract_command(arguments),
         ]
     )
     process: asyncio.subprocess.Process | None = None
@@ -207,15 +218,20 @@ def register(registry: ToolRegistry) -> None:
         _bash,
         description=(
             "Run a shell command. Session cwd persists after cd. "
-            "Paths outside the session cwd are allowed."
+            "Paths outside the session cwd are allowed. "
+            "For a long-running command, use run_background instead."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "cmd": {"type": "string", "minLength": 1},
+                "command": {"type": "string", "minLength": 1},
+                "cmd": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Deprecated alias for command.",
+                },
                 "cwd": {},
             },
-            "required": ["cmd"],
             "additionalProperties": False,
         },
     )

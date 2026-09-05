@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -163,18 +163,35 @@ def _format_exec_result(
     return output.render()
 
 
+def _format_timeout(seconds: float) -> str:
+    if seconds == int(seconds):
+        return f"{int(seconds)}s"
+    return f"{seconds:g}s"
+
+
+def _extract_exec_command(arguments: Mapping[str, Any]) -> str:
+    command = arguments.get("command")
+    if isinstance(command, str) and command:
+        return command
+    legacy = arguments.get("cmd")
+    if isinstance(legacy, str) and legacy:
+        return legacy
+    raise ValueError("command is required (accepts legacy alias cmd)")
+
+
 async def _exec(
     registry: ToolRegistry,
     arguments: dict[str, Any],
     abort_signal: AbortSignal,
     stream_publisher: ToolStreamPublisher | None = None,
 ) -> StructuredToolResult:
+    command_text = _extract_exec_command(arguments)
     timeout = arguments.get("timeout", 30.0)
     output_limit = arguments.get("max_output", registry.max_output_chars)
     log_path = arguments.get("_log_path")
     if arguments.get("_background") is True:
         task_id, pid = await registry.background_tasks.start(
-            arguments["command"],
+            command_text,
             registry.cwd,
             log_path=log_path,
         )
@@ -206,7 +223,7 @@ async def _exec(
     )
     try:
         process = await asyncio.create_subprocess_shell(
-            arguments["command"],
+            command_text,
             cwd=registry.cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -291,8 +308,10 @@ async def _exec(
                 break
 
         await _kill_and_reap(process, process_tasks)
+        timeout_message = f"timed out after {_format_timeout(timeout)}"
         structured_content = {
             "timed_out": True,
+            "timeout_seconds": float(timeout),
             "exit_code": process.returncode,
             "cwd": str(registry.cwd),
             **({"log_path": str(log_path)} if log_path is not None else {}),
@@ -311,7 +330,7 @@ async def _exec(
                     stdout_capture.data,
                     stderr_capture.data,
                     output_limit,
-                    suffix="command timed out",
+                    suffix=timeout_message,
                     stdout_full_size=stdout_capture.full_size,
                     stderr_full_size=stderr_capture.full_size,
                 )
@@ -533,16 +552,21 @@ def register(registry: ToolRegistry) -> None:
         _exec,
         description=(
             "Run a shell command from the session cwd. "
-            "This tool is not a sandbox."
+            "This tool is not a sandbox. "
+            "For a long-running command, use run_background instead."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "command": {"type": "string", "minLength": 1},
+                "cmd": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Deprecated alias for command.",
+                },
                 "timeout": {"type": "number", "exclusiveMinimum": 0},
                 "max_output": {"type": "integer", "minimum": 1},
             },
-            "required": ["command"],
             "additionalProperties": False,
         },
     )

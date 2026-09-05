@@ -161,12 +161,14 @@ async def test_bash_captures_stdout_stderr_and_exit_code(tmp_path: Path) -> None
     )
 
     assert result["isError"] is True
-    assert result["structuredContent"] == {
-        "stdout": "out",
-        "stderr": "err",
-        "exit_code": 7,
-        "cwd_after": str(tmp_path),
-    }
+    structured = result["structuredContent"]
+    assert structured["stdout"] == "out"
+    assert structured["stderr"] == "err"
+    assert structured["exit_code"] == 7
+    assert structured["cwd_after"] == str(tmp_path)
+    assert structured["error"]["tool"] == "bash"
+    assert structured["error"]["kind"] == "exit_nonzero"
+    assert structured["error"]["hint"]
     assert "stdout:\nout\nstderr:\nerr" in result["content"][0]["text"]
 
 
@@ -231,7 +233,7 @@ async def test_bash_failed_persistence_keeps_registry_state_on_replace_error(
     )
 
     assert result["isError"] is True
-    assert result["structuredContent"] is None
+    assert result["structuredContent"]["error"]["tool"] == "bash"
     assert registry.bash_cwd == str(tmp_path)
     assert store.bash_cwd == str(tmp_path)
     assert store.state_path.read_bytes() == before_state
@@ -274,12 +276,13 @@ async def test_bash_persists_cwd_after_failed_command(tmp_path: Path) -> None:
     current = await registry.execute(ToolCall("bash-failed-pwd", "bash", {"cmd": "pwd"}))
 
     assert failed["isError"] is True
-    assert failed["structuredContent"] == {
-        "stdout": "",
-        "stderr": "",
-        "exit_code": 3,
-        "cwd_after": "/tmp",
-    }
+    failed_structured = failed["structuredContent"]
+    assert failed_structured["stdout"] == ""
+    assert failed_structured["stderr"] == ""
+    assert failed_structured["exit_code"] == 3
+    assert failed_structured["cwd_after"] == "/tmp"
+    assert failed_structured["error"]["tool"] == "bash"
+    assert failed_structured["error"]["kind"] == "exit_nonzero"
     assert current["structuredContent"]["stdout"].strip() == "/tmp"
 
 
@@ -391,7 +394,11 @@ async def test_bash_rejects_malformed_arguments(
     )
 
     assert result["isError"] is True
-    assert result["structuredContent"] is None
+    assert result["structuredContent"]["error"]["tool"] == "bash"
+    assert result["structuredContent"]["error"]["kind"] in {
+        "invalid_arguments",
+        "error",
+    }
 
 
 def test_list_is_not_registered(tmp_path: Path) -> None:
@@ -501,7 +508,7 @@ async def test_edit_requires_one_match(
 
     assert result["isError"] is True
     assert result["content"][0]["text"] == message
-    assert result["structuredContent"] is None
+    assert result["structuredContent"]["error"]["tool"] == "edit"
     assert file_path.read_text(encoding="utf-8") == content
 
 
@@ -1064,7 +1071,10 @@ async def test_exec_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
     await asyncio.sleep(0.4)
 
     assert result["isError"] is True
-    assert "command timed out" in result["content"][0]["text"]
+    assert "timed out after" in result["content"][0]["text"]
+    assert result["structuredContent"]["timed_out"] is True
+    assert result["structuredContent"]["error"]["tool"] == "exec"
+    assert result["structuredContent"]["error"]["kind"] == "timeout"
     assert not marker.exists()
 
 
