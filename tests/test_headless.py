@@ -266,9 +266,10 @@ def test_headless_respects_settings_yolo_without_cli_flag(
 
     from zeta.headless import run_headless
 
-    home = Path(env_home())
-    settings_file = home / "settings.toml"
-    settings_file.write_text("yolo = true\n")
+    home = tmp_path / "zeta-home"
+    home.mkdir()
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    (home / "settings.toml").write_text("yolo = true\n")
 
     monkeypatch.chdir(tmp_path)
     args = build_parser().parse_args(["--provider", "fake", "-p", "hi"])
@@ -307,7 +308,9 @@ def test_headless_no_yolo_flag_beats_settings_yolo(
 
     from zeta.headless import run_headless
 
-    home = Path(env_home())
+    home = tmp_path / "zeta-home"
+    home.mkdir()
+    monkeypatch.setenv("ZETA_HOME", str(home))
     (home / "settings.toml").write_text("yolo = true\n")
 
     monkeypatch.chdir(tmp_path)
