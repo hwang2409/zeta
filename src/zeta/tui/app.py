@@ -38,6 +38,8 @@ from ..core.slash import (
 from ..loop import AgentLoop
 from ..persistence import DraftPersistence, history_for
 from ..providers.factory import build_backend as build_network_backend
+from ..settings import ResolvedConfig, load_settings
+from ..settings import resolve as resolve_settings
 from ..submission_pipeline import SubmissionPipeline
 from ..tools.exec import trusted_macro_display
 from ..types import (
@@ -147,6 +149,7 @@ class TUIApp(
         on_vim_mode_change: Callable[[bool], None] | None = None,
         on_budget_change: Callable[[int], None] | None = None,
         model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
+        startup_notices: Sequence[str] = (),
     ) -> None:
         self.loop = loop
         self.loop.tool_registry.background_tasks.set_notice_sink(
@@ -227,6 +230,7 @@ class TUIApp(
         self.loop.set_background_event_sink(self._handle_background_event)
         self.loop.set_mcp_notice_sink(lambda message: background_notice(self, message))
         self._fork_rebuilt = False
+        self._startup_notices: tuple[str, ...] = tuple(startup_notices)
 
     @property
     def _transcript_lines(self) -> list[str]:
@@ -844,6 +848,8 @@ class TUIApp(
         self.loop.session_start()
         self._rebuild_transcript()
         await self.loop.ensure_mcp_servers()
+        for notice in self._startup_notices:
+            self._print_unit(Text(notice, style=DIM))
         for notice in self._slash_commands.notices:
             style = COMMAND if notice in self._slash_commands.warning_notices else DIM
             self._print_unit(Text(f"command · {notice}", style=style))
@@ -883,13 +889,22 @@ class TUIApp(
 def create_app(args: argparse.Namespace) -> TUIApp:
     home = env_home()
     manager = SessionManager(home)
+    project_dir = discover_repo_root(Path.cwd())
+    loaded_settings = load_settings(home=home, project_dir=project_dir)
+    config: ResolvedConfig = resolve_settings(
+        loaded_settings.settings,
+        cli_provider=getattr(args, "provider", None),
+        cli_model=getattr(args, "model", None),
+        cli_yolo=bool(getattr(args, "yolo", False)),
+        cli_token_budget=getattr(args, "token_budget", None),
+    )
     continue_session = getattr(args, "continue_session", False)
     resume_id = getattr(args, "resume", None)
     force_provider = getattr(args, "force_provider", False)
     resuming = continue_session or resume_id is not None
     if force_provider and not resuming:
         raise SessionError("--force-provider requires --continue or --resume")
-    if force_provider and args.model is None:
+    if force_provider and config.model is None:
         raise SessionError("--force-provider requires --model")
 
     if resuming:
@@ -922,8 +937,8 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             recent = manager.find_most_recent(cwd=Path.cwd())
             opened = manager.open(recent.session_id)
         metadata = opened.metadata
-        provider_override = args.provider
-        model_override = args.model
+        provider_override = getattr(args, "provider", None)
+        model_override = getattr(args, "model", None)
         mismatches = []
         if provider_override is not None and provider_override != metadata.provider:
             mismatches.append(
@@ -961,14 +976,14 @@ def create_app(args: argparse.Namespace) -> TUIApp:
                 tuple(Path(path) for path in persisted.context_files),
             )
     else:
-        provider = args.provider or "fake"
-        backend, selected_model = build_backend(provider, args.model, home=home)
+        provider = config.provider
+        backend, selected_model = build_backend(provider, config.model, home=home)
         project_context = load_project_context(
             repo_root=discover_repo_root(Path.cwd()),
             zeta_home=home,
         )
         created_budget, created_pin = resolve_session_budget(
-            0, False, provider, selected_model, getattr(args, "token_budget", None)
+            0, False, provider, selected_model, config.token_budget
         )
         opened = manager.create(
             provider=provider,
@@ -985,9 +1000,15 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         backend, selected_model = build_backend(provider, model, home=home)
     hooks = load_hooks_for_provider(home, provider)
     approval_default = (
-        ApprovalDecision.ALLOW if getattr(args, "yolo", False) else ApprovalDecision.ASK
+        ApprovalDecision.ALLOW if config.yolo else ApprovalDecision.ASK
     )
-    approval_policy = ApprovalPolicy(store=store, default=approval_default)
+    approval_policy = ApprovalPolicy(
+        store=store,
+        default=approval_default,
+        always_allow=config.approval_allow,
+        always_deny=config.approval_deny,
+        always_ask=config.approval_ask,
+    )
     pending_override = None
     if resuming and mismatches:
         pending_override = (
@@ -1022,7 +1043,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         metadata.budget_pinned,
         provider,
         selected_model,
-        getattr(args, "token_budget", None),
+        config.token_budget,
     )
     if (
         effective_token_budget != metadata.compaction_budget
@@ -1068,6 +1089,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         on_vim_mode_change=lambda enabled: manager.record_vim_mode(
             metadata, enabled=enabled
         ),
+        startup_notices=loaded_settings.notices,
     )
 
 

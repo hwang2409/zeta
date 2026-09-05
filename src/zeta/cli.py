@@ -147,8 +147,6 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"logged in as {handle}" if handle else "ok")
         return 0
-    if args.force_provider and args.model is None:
-        parser.error("--force-provider requires --model")
     if args.prompt is not None:
         from .headless import run_headless
 
