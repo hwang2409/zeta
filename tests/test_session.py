@@ -832,6 +832,27 @@ def test_resume_provider_override_requires_force_and_records_audit(
             )
         )
 
+
+def test_resume_honors_provider_from_settings_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+
+    project = tmp_path / "project"
+    dot_zeta = project / ".zeta"
+    dot_zeta.mkdir(parents=True)
+    (dot_zeta / "settings.toml").write_text(
+        'provider = "claude"\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(project)
+    # No CLI --provider; settings.provider alone must trigger the mismatch banner.
+    with pytest.raises(SessionError, match="override rejected"):
+        create_app(build_parser().parse_args(["--resume", session_id]))
+
     create_app(
         build_parser().parse_args(
             [

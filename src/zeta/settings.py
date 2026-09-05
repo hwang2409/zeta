@@ -5,12 +5,27 @@ Two files, layered project-over-global:
     ~/.zeta/settings.toml           (global defaults)
     <project>/.zeta/settings.toml   (project override)
 
+Callers pass the directory that directly contains ``settings.toml`` for
+each layer — for the global layer that is ``env_home()`` (already
+``~/.zeta``); for the project layer that is
+``discover_repo_root(cwd) / ".zeta"``.
+
 Merge rule: tables merge recursively; every other value (scalars and lists)
 from the project file replaces the global file's value. So a project may set
-one table entry (`[approval]\\nallow = [...]`) without restating unrelated
+one table entry (``[approval]\\nallow = [...]``) without restating unrelated
 tables, but replacing a list is one atomic swap.
 
+Trust boundary: the project layer may only contribute safe keys — provider,
+model, theme, token_budget, keybindings. ``yolo`` and ``[approval]`` from the
+project file are IGNORED with a loud startup warning ("project settings
+cannot grant approvals; see docs"). Global settings retain full key access.
+A future ``/trust`` mechanism may relax this per-repo, but until then a
+hostile checkout cannot silently grant itself tool approvals.
+
 Precedence: CLI flags override settings; settings override built-in defaults.
+The ``yolo`` flag is tri-state — an explicit ``--yolo`` or ``--no-yolo`` wins
+either way, while an omitted flag inherits the settings value.
+
 Malformed files fail open with a dim notice at session start; a missing file
 is silent.
 """
@@ -28,6 +43,9 @@ SETTINGS_FILENAME = "settings.toml"
 _PROVIDER_CHOICES = frozenset({"fake", "claude", "codex"})
 _TOP_KEYS = frozenset(
     {"provider", "model", "yolo", "token_budget", "theme", "approval", "keybindings"}
+)
+_PROJECT_SAFE_KEYS = frozenset(
+    {"provider", "model", "theme", "token_budget", "keybindings"}
 )
 _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
 _EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
@@ -65,10 +83,11 @@ class ResolvedConfig:
 
 @dataclass(frozen=True, slots=True)
 class LoadedSettings:
-    """The resolved settings and any dim notices to surface at start."""
+    """The resolved settings, dim notices, and loud warnings for session start."""
 
     settings: Settings
-    notices: tuple[str, ...]
+    notices: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 def load_settings(
@@ -76,18 +95,24 @@ def load_settings(
     home: str | Path | None = None,
     project_dir: str | Path | None = None,
 ) -> LoadedSettings:
-    """Read, deep-merge, and validate the layered settings files."""
+    """Read, deep-merge, and validate the layered settings files.
+
+    ``home`` and ``project_dir`` are the directories that directly contain
+    ``settings.toml`` (``~/.zeta`` and ``<repo>/.zeta`` in production).
+    """
 
     notices: list[str] = []
+    warnings: list[str] = []
     global_path = _settings_path(home)
     project_path = _settings_path(project_dir)
     global_data = _parse(global_path, notices)
     project_data = (
         _parse(project_path, notices) if project_path != global_path else {}
     )
+    project_data = _strip_unsafe_project_keys(project_data, project_path, warnings)
     merged = _deep_merge(global_data, project_data)
     settings = _validate(merged, notices)
-    return LoadedSettings(settings, tuple(notices))
+    return LoadedSettings(settings, tuple(notices), tuple(warnings))
 
 
 def resolve(
@@ -95,14 +120,19 @@ def resolve(
     *,
     cli_provider: str | None,
     cli_model: str | None,
-    cli_yolo: bool,
+    cli_yolo: bool | None,
     cli_token_budget: int | None,
     default_provider: str = "fake",
 ) -> ResolvedConfig:
-    """Layer CLI flags over the loaded settings; CLI wins where set."""
+    """Layer CLI flags over the loaded settings; CLI wins where set.
+
+    ``cli_yolo`` is tri-state: ``True`` for an explicit ``--yolo``, ``False``
+    for an explicit ``--no-yolo`` (both override settings), and ``None`` when
+    the flag was omitted (settings value inherited).
+    """
 
     provider = cli_provider or settings.provider or default_provider
-    yolo = bool(cli_yolo) or bool(settings.yolo)
+    yolo = bool(settings.yolo) if cli_yolo is None else cli_yolo
     token_budget = (
         cli_token_budget if cli_token_budget is not None else settings.token_budget
     )
@@ -125,6 +155,20 @@ def _settings_path(base: str | Path | None) -> Path | None:
     return Path(base).expanduser() / SETTINGS_FILENAME
 
 
+def _display_path(path: Path) -> str:
+    """Collapse ``$HOME`` prefixes to ``~/`` so notices do not leak layouts."""
+
+    try:
+        home = Path.home()
+    except (RuntimeError, OSError):
+        return str(path)
+    try:
+        relative = path.relative_to(home)
+    except ValueError:
+        return str(path)
+    return f"~/{relative}"
+
+
 def _parse(path: Path | None, notices: list[str]) -> dict[str, Any]:
     if path is None:
         return {}
@@ -133,17 +177,35 @@ def _parse(path: Path | None, notices: list[str]) -> dict[str, Any]:
     except FileNotFoundError:
         return {}
     except OSError as exc:
-        notices.append(f"settings · could not read {path}: {exc}")
+        notices.append(f"settings · could not read {_display_path(path)}: {exc}")
         return {}
     try:
         parsed = tomllib.loads(raw.decode("utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-        notices.append(f"settings · ignored {path}: {exc}")
+        notices.append(f"settings · ignored {_display_path(path)}: {exc}")
         return {}
     if not isinstance(parsed, dict):
-        notices.append(f"settings · ignored {path}: top-level is not a table")
+        notices.append(
+            f"settings · ignored {_display_path(path)}: top-level is not a table"
+        )
         return {}
     return parsed
+
+
+def _strip_unsafe_project_keys(
+    data: dict[str, Any],
+    path: Path | None,
+    warnings: list[str],
+) -> dict[str, Any]:
+    unsafe = sorted(data.keys() - _PROJECT_SAFE_KEYS)
+    if not unsafe:
+        return data
+    where = _display_path(path) if path is not None else "project settings"
+    warnings.append(
+        "settings · project settings cannot grant approvals; "
+        f"ignoring {', '.join(unsafe)} in {where} (see docs)"
+    )
+    return {key: value for key, value in data.items() if key not in unsafe}
 
 
 def _deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
@@ -282,7 +344,17 @@ def _validated_keybindings(
     if not isinstance(value, Mapping):
         notices.append("settings · ignored key 'keybindings': expected table")
         return _EMPTY_MAPPING
-    return MappingProxyType(dict(value))
+    entries: dict[str, str] = {}
+    for name, binding in value.items():
+        if type(binding) is not str:
+            notices.append(
+                f"settings · ignored key 'keybindings.{name}': expected string"
+            )
+            continue
+        entries[name] = binding
+    if not entries:
+        return _EMPTY_MAPPING
+    return MappingProxyType(entries)
 
 
 __all__ = [

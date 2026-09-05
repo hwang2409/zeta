@@ -150,6 +150,7 @@ class TUIApp(
         on_budget_change: Callable[[int], None] | None = None,
         model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
         startup_notices: Sequence[str] = (),
+        startup_warnings: Sequence[str] = (),
     ) -> None:
         self.loop = loop
         self.loop.tool_registry.background_tasks.set_notice_sink(
@@ -231,6 +232,7 @@ class TUIApp(
         self.loop.set_mcp_notice_sink(lambda message: background_notice(self, message))
         self._fork_rebuilt = False
         self._startup_notices: tuple[str, ...] = tuple(startup_notices)
+        self._startup_warnings: tuple[str, ...] = tuple(startup_warnings)
 
     @property
     def _transcript_lines(self) -> list[str]:
@@ -848,6 +850,8 @@ class TUIApp(
         self.loop.session_start()
         self._rebuild_transcript()
         await self.loop.ensure_mcp_servers()
+        for warning in self._startup_warnings:
+            self._print_unit(Text(warning, style=ERROR))
         for notice in self._startup_notices:
             self._print_unit(Text(notice, style=DIM))
         for notice in self._slash_commands.notices:
@@ -889,13 +893,13 @@ class TUIApp(
 def create_app(args: argparse.Namespace) -> TUIApp:
     home = env_home()
     manager = SessionManager(home)
-    project_dir = discover_repo_root(Path.cwd())
+    project_dir = discover_repo_root(Path.cwd()) / ".zeta"
     loaded_settings = load_settings(home=home, project_dir=project_dir)
     config: ResolvedConfig = resolve_settings(
         loaded_settings.settings,
         cli_provider=getattr(args, "provider", None),
         cli_model=getattr(args, "model", None),
-        cli_yolo=bool(getattr(args, "yolo", False)),
+        cli_yolo=getattr(args, "yolo", None),
         cli_token_budget=getattr(args, "token_budget", None),
     )
     continue_session = getattr(args, "continue_session", False)
@@ -937,8 +941,10 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             recent = manager.find_most_recent(cwd=Path.cwd())
             opened = manager.open(recent.session_id)
         metadata = opened.metadata
-        provider_override = getattr(args, "provider", None)
-        model_override = getattr(args, "model", None)
+        cli_provider = getattr(args, "provider", None)
+        cli_model = getattr(args, "model", None)
+        provider_override = cli_provider or loaded_settings.settings.provider
+        model_override = cli_model or loaded_settings.settings.model
         mismatches = []
         if provider_override is not None and provider_override != metadata.provider:
             mismatches.append(
@@ -1090,6 +1096,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             metadata, enabled=enabled
         ),
         startup_notices=loaded_settings.notices,
+        startup_warnings=loaded_settings.warnings,
     )
 
 

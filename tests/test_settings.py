@@ -53,9 +53,6 @@ def test_global_and_project_merge_with_project_wins(tmp_path: Path) -> None:
         project,
         """
         model = "sonnet-4.7"
-
-        [approval]
-        allow = ["read", "write"]
         """,
     )
     loaded = load_settings(home=home, project_dir=project)
@@ -64,7 +61,8 @@ def test_global_and_project_merge_with_project_wins(tmp_path: Path) -> None:
     assert settings.provider == "claude"
     assert settings.model == "sonnet-4.7"
     assert settings.token_budget == 100000
-    assert settings.approval_allow == ("read", "write")
+    # Approval lists come from the global layer only.
+    assert settings.approval_allow == ("read",)
     assert settings.approval_deny == ("bash",)
     assert settings.approval_ask == ()
 
@@ -75,23 +73,25 @@ def test_deep_merge_preserves_unrelated_table_keys(tmp_path: Path) -> None:
     _write(
         home,
         """
-        [approval]
-        allow = ["read"]
-        deny = ["bash"]
-        ask = ["edit"]
+        [keybindings]
+        ctrl_p = "previous"
+        ctrl_n = "next"
+        ctrl_r = "refresh"
         """,
     )
     _write(
         project,
         """
-        [approval]
-        allow = ["fetch"]
+        [keybindings]
+        ctrl_p = "back"
         """,
     )
     loaded = load_settings(home=home, project_dir=project)
-    assert loaded.settings.approval_allow == ("fetch",)
-    assert loaded.settings.approval_deny == ("bash",)
-    assert loaded.settings.approval_ask == ("edit",)
+    assert dict(loaded.settings.keybindings) == {
+        "ctrl_p": "back",
+        "ctrl_n": "next",
+        "ctrl_r": "refresh",
+    }
 
 
 def test_cli_flags_override_settings(tmp_path: Path) -> None:
@@ -106,17 +106,37 @@ def test_cli_flags_override_settings(tmp_path: Path) -> None:
         """,
     )
     loaded = load_settings(home=home, project_dir=None)
-    config = resolve(
+    # Omitted --yolo (None) inherits settings.yolo=true.
+    inherited = resolve(
         loaded.settings,
         cli_provider="codex",
         cli_model="gpt-5",
-        cli_yolo=False,
+        cli_yolo=None,
         cli_token_budget=42,
     )
-    assert config.provider == "codex"
-    assert config.model == "gpt-5"
-    assert config.token_budget == 42
-    assert config.yolo is True  # settings.yolo still wins because CLI has no --no-yolo
+    assert inherited.provider == "codex"
+    assert inherited.model == "gpt-5"
+    assert inherited.token_budget == 42
+    assert inherited.yolo is True
+    # Explicit --no-yolo (False) beats settings.yolo=true.
+    overridden = resolve(
+        loaded.settings,
+        cli_provider=None,
+        cli_model=None,
+        cli_yolo=False,
+        cli_token_budget=None,
+    )
+    assert overridden.yolo is False
+    # Explicit --yolo (True) beats settings.yolo=false too.
+    settings_off_loaded = load_settings(home=tmp_path / "empty", project_dir=None)
+    forced_on = resolve(
+        settings_off_loaded.settings,
+        cli_provider=None,
+        cli_model=None,
+        cli_yolo=True,
+        cli_token_budget=None,
+    )
+    assert forced_on.yolo is True
 
 
 def test_resolve_falls_back_to_defaults_when_nothing_configured(tmp_path: Path) -> None:
@@ -125,7 +145,7 @@ def test_resolve_falls_back_to_defaults_when_nothing_configured(tmp_path: Path) 
         loaded.settings,
         cli_provider=None,
         cli_model=None,
-        cli_yolo=False,
+        cli_yolo=None,
         cli_token_budget=None,
     )
     assert config.provider == "fake"
@@ -299,7 +319,7 @@ def test_yolo_from_settings_flows_into_approval_default(tmp_path: Path) -> None:
         loaded.settings,
         cli_provider=None,
         cli_model=None,
-        cli_yolo=False,
+        cli_yolo=None,
         cli_token_budget=None,
     )
     assert config.yolo is True
@@ -319,7 +339,7 @@ def test_resolve_returns_resolved_config(tmp_path: Path) -> None:
         loaded.settings,
         cli_provider="fake",
         cli_model=None,
-        cli_yolo=False,
+        cli_yolo=None,
         cli_token_budget=None,
     )
     assert isinstance(config, ResolvedConfig)
@@ -346,3 +366,115 @@ def test_empty_settings_file_is_silent(tmp_path: Path, value: str) -> None:
     loaded = load_settings(home=home, project_dir=None)
     assert loaded.settings == Settings()
     assert loaded.notices == ()
+
+
+def test_hostile_project_cannot_grant_yolo_or_approvals(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write(
+        home,
+        """
+        provider = "claude"
+        """,
+    )
+    _write(
+        project,
+        """
+        yolo = true
+        model = "sonnet-4.7"
+
+        [approval]
+        allow = ["bash", "write"]
+        deny = ["read"]
+        """,
+    )
+    loaded = load_settings(home=home, project_dir=project)
+    # yolo and approval from the project layer are dropped completely.
+    assert loaded.settings.yolo is None
+    assert loaded.settings.approval_allow == ()
+    assert loaded.settings.approval_deny == ()
+    assert loaded.settings.approval_ask == ()
+    # Safe keys from the project layer still apply.
+    assert loaded.settings.model == "sonnet-4.7"
+    assert loaded.settings.provider == "claude"
+    # A loud warning names the file and the ignored keys.
+    assert len(loaded.warnings) == 1
+    warning = loaded.warnings[0]
+    assert "cannot grant approvals" in warning
+    assert "approval" in warning
+    assert "yolo" in warning
+    assert str(project / SETTINGS_FILENAME) in warning or "~/" in warning
+    assert loaded.notices == ()
+
+
+def test_global_layer_may_still_set_yolo_and_approvals(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write(
+        home,
+        """
+        yolo = true
+
+        [approval]
+        allow = ["read"]
+        deny = ["bash"]
+        """,
+    )
+    _write(
+        project,
+        """
+        model = "sonnet-4.7"
+        """,
+    )
+    loaded = load_settings(home=home, project_dir=project)
+    assert loaded.warnings == ()
+    assert loaded.settings.yolo is True
+    assert loaded.settings.approval_allow == ("read",)
+    assert loaded.settings.approval_deny == ("bash",)
+    assert loaded.settings.model == "sonnet-4.7"
+
+
+def test_keybindings_reject_non_string_values(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write(
+        home,
+        """
+        [keybindings]
+        ctrl_p = "previous"
+        ctrl_n = 42
+        ctrl_r = true
+        """,
+    )
+    loaded = load_settings(home=home, project_dir=None)
+    assert dict(loaded.settings.keybindings) == {"ctrl_p": "previous"}
+    joined = " ".join(loaded.notices)
+    assert "keybindings.ctrl_n" in joined
+    assert "keybindings.ctrl_r" in joined
+
+
+def test_notices_collapse_home_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_home = tmp_path / "fakehome"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    home_dir = fake_home / ".zeta"
+    (home_dir).mkdir()
+    (home_dir / SETTINGS_FILENAME).write_text("not = valid = toml", encoding="utf-8")
+    loaded = load_settings(home=home_dir, project_dir=None)
+    assert loaded.notices
+    combined = " ".join(loaded.notices)
+    assert str(fake_home) not in combined
+    assert "~/" in combined
+
+
+def test_project_settings_read_from_dot_zeta(tmp_path: Path) -> None:
+    """End-to-end: <project>/.zeta/settings.toml is what the project layer reads."""
+
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    dot_zeta = project / ".zeta"
+    _write(dot_zeta, 'model = "sonnet-4.7"\n')
+    loaded = load_settings(home=home, project_dir=dot_zeta)
+    assert loaded.settings.model == "sonnet-4.7"
+    # A non-dot-zeta project directory sees no settings.
+    plain = load_settings(home=home, project_dir=project)
+    assert plain.settings.model is None
