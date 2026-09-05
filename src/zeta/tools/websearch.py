@@ -7,6 +7,8 @@ from html.parser import HTMLParser
 from typing import Any, TypedDict
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import httpx
+
 from ..core.abort import AbortSignal
 from ..types import StructuredToolResult
 from .fetch import (
@@ -20,6 +22,7 @@ from .registry import ToolRegistry, _success_result
 
 DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
 DDG_LITE_ENDPOINT = "https://lite.duckduckgo.com/lite/"
+DIAGNOSTIC_BODY_PREFIX_BYTES = 200
 DDG_BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -244,7 +247,17 @@ async def _ddg_search(query: str, max_results: int) -> list[SearchResult]:
                 response_text(lite_response), max_results=max_results
             )
         except (SearchProviderChallengeError, SearchParserError):
-            raise primary_error
+            raise _with_response_diagnostics(primary_error, response) from primary_error
+
+
+def _with_response_diagnostics(
+    error: WebsearchError, response: httpx.Response
+) -> WebsearchError:
+    body_preview = response_text(response)[:DIAGNOSTIC_BODY_PREFIX_BYTES]
+    body_preview = " ".join(body_preview.split())
+    return type(error)(
+        f"{error} (HTTP {response.status_code}, body: {body_preview!r})"
+    )
 
 
 async def _websearch(
