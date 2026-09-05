@@ -246,14 +246,13 @@ def _validated_approval(
     for key in table.keys() - _APPROVAL_KEYS:
         notices.append(f"settings · ignored unknown key 'approval.{key}'")
     return (
-        _validated_str_list(table, "approval.allow", table.get("allow"), notices),
-        _validated_str_list(table, "approval.deny", table.get("deny"), notices),
-        _validated_str_list(table, "approval.ask", table.get("ask"), notices),
+        _validated_str_list("approval.allow", table.get("allow"), notices),
+        _validated_str_list("approval.deny", table.get("deny"), notices),
+        _validated_str_list("approval.ask", table.get("ask"), notices),
     )
 
 
 def _validated_str_list(
-    _table: Mapping[str, Any],
     label: str,
     value: Any,
     notices: list[str],
