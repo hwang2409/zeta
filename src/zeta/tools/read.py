@@ -114,37 +114,17 @@ async def _read_handle(
     )
 
 
-def _is_external_path(path: Path, cwd: Path) -> bool:
-    try:
-        path.relative_to(cwd)
-    except ValueError:
-        return True
-    return False
-
-
 async def _read(
     registry: ToolRegistry,
     arguments: dict[str, Any],
     abort_signal: AbortSignal,
 ) -> StructuredToolResult:
     raw_path = arguments["path"]
-    path = registry._path(raw_path)
     offset = arguments.get("offset", 0)
     limit = arguments.get("limit")
     output = _BoundedText(registry.max_output_chars)
     digest = hashlib.sha256()
     try:
-        if _is_external_path(path, registry.cwd):
-            if not path.is_file():
-                if path.is_dir():
-                    raise ValueError(
-                        f"{raw_path} is a directory; use bash (e.g. `ls`) to list its contents"
-                    )
-                raise ValueError(f"not a file: {raw_path}")
-            with path.open("rb") as handle:
-                return await _read_handle(
-                    handle, path, offset, limit, output, digest, abort_signal
-                )
         with open_target(
             registry,
             raw_path,
@@ -173,7 +153,10 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "read",
         _read,
-        description="Read a UTF-8 file. Relative paths use the session cwd.",
+        description=(
+            "Read a UTF-8 file. Relative paths use the session cwd; "
+            "~ and absolute paths outside the cwd are allowed."
+        ),
         parallel_safe=True,
         parameters={
             "type": "object",

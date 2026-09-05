@@ -84,18 +84,13 @@ async def _write(
         )
         was_created = True
     except FileExistsError:
-        try:
-            path = _write_target(
-                registry,
-                arguments["path"],
-                encoded_content,
-                create_parents=arguments.get("create_parents", False),
-                was_created=False,
-            )
-        except ValueError as exc:
-            if str(exc).startswith("parent directory does not exist:"):
-                raise ValueError("path escaped sandbox") from exc
-            raise
+        path = _write_target(
+            registry,
+            arguments["path"],
+            encoded_content,
+            create_parents=arguments.get("create_parents", False),
+            was_created=False,
+        )
         was_created = False
 
     structured_content: WriteStructuredContent = {
@@ -116,7 +111,10 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "write",
         _write,
-        description="Write UTF-8 text to a file. Relative paths use the session cwd.",
+        description=(
+            "Write UTF-8 text to a file. Relative paths use the session cwd; "
+            "~ and absolute paths outside the cwd are allowed."
+        ),
         parameters={
             "type": "object",
             "properties": {

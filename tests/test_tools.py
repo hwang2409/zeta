@@ -242,21 +242,26 @@ async def test_bash_failed_persistence_keeps_registry_state_on_replace_error(
 
 
 @pytest.mark.asyncio
-async def test_bash_rejects_per_call_cwd_outside_sandbox(tmp_path: Path) -> None:
-    marker = tmp_path / "should-not-run"
+async def test_bash_accepts_per_call_cwd_outside_sandbox(tmp_path: Path) -> None:
+    outside = tmp_path.parent
+    marker = outside / f"zeta-bash-outside-{tmp_path.name}"
     registry = ToolRegistry(tmp_path)
 
-    result = await registry.execute(
-        ToolCall(
-            "bash-outside-cwd",
-            "bash",
-            {"cmd": f"touch {shlex.quote(str(marker))}", "cwd": str(tmp_path.parent)},
+    try:
+        result = await registry.execute(
+            ToolCall(
+                "bash-outside-cwd",
+                "bash",
+                {"cmd": f"touch {shlex.quote(str(marker))}", "cwd": str(outside)},
+            )
         )
-    )
 
-    assert result["isError"] is True
-    assert result["structuredContent"] is None
-    assert not marker.exists()
+        assert result["isError"] is False
+        assert result["structuredContent"]["cwd_after"] == str(outside)
+        assert marker.exists()
+    finally:
+        if marker.exists():
+            marker.unlink()
 
 
 @pytest.mark.asyncio
@@ -547,7 +552,7 @@ async def test_edit_preserves_utf8_and_reports_byte_lengths(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_edit_rejects_path_outside_session_cwd(tmp_path: Path) -> None:
+async def test_edit_allows_path_outside_session_cwd(tmp_path: Path) -> None:
     session_cwd = tmp_path / "session"
     session_cwd.mkdir()
     outside = tmp_path / "outside.txt"
@@ -562,9 +567,8 @@ async def test_edit_rejects_path_outside_session_cwd(tmp_path: Path) -> None:
         )
     )
 
-    assert result["isError"] is True
-    assert "escaped sandbox" in result["content"][0]["text"]
-    assert outside.read_text(encoding="utf-8") == "old"
+    assert result["isError"] is False
+    assert outside.read_text(encoding="utf-8") == "new"
 
 
 @pytest.mark.asyncio
@@ -818,7 +822,7 @@ async def test_write_create_parents_symlink_race_stays_in_sandbox(
 
 
 @pytest.mark.asyncio
-async def test_write_rejects_path_outside_session_cwd(tmp_path: Path) -> None:
+async def test_write_allows_path_outside_session_cwd(tmp_path: Path) -> None:
     session_cwd = tmp_path / "session"
     session_cwd.mkdir()
     outside = tmp_path / "outside.txt"
@@ -828,9 +832,8 @@ async def test_write_rejects_path_outside_session_cwd(tmp_path: Path) -> None:
         ToolCall("write-outside", "write", {"path": str(outside), "content": "x"})
     )
 
-    assert result["isError"] is True
-    assert "escaped sandbox" in result["content"][0]["text"]
-    assert not outside.exists()
+    assert result["isError"] is False
+    assert outside.read_text(encoding="utf-8") == "x"
 
 
 @pytest.mark.asyncio
