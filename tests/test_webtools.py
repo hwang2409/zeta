@@ -1087,3 +1087,212 @@ async def test_discovery_and_approval_gate_network_tools(
     assert fetch_result["content"][0]["text"] == "tool execution denied"
     assert search_result["content"][0]["text"] == "tool execution denied"
     assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_get_response_retries_with_identity_on_decode_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={
+                    "content-type": "text/plain",
+                    "content-encoding": "gzip",
+                },
+                stream=_ChunkedByteStream(b"this is not really gzip"),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            stream=_ChunkedByteStream(b"recovered body"),
+            request=request,
+        )
+
+    _mock_client(monkeypatch, handler)
+    response = await fetch_tool.get_response(
+        "https://example.com/data", user_agent="test"
+    )
+
+    assert response.text == "recovered body"
+    assert len(requests) == 2
+    assert requests[0].headers.get("accept-encoding", "").lower() != "identity"
+    assert requests[1].headers.get("accept-encoding", "").lower() == "identity"
+
+
+@pytest.mark.asyncio
+async def test_get_response_surfaces_error_when_identity_retry_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/plain",
+                "content-encoding": "gzip",
+            },
+            stream=_ChunkedByteStream(b"still not gzip"),
+            request=request,
+        )
+
+    _mock_client(monkeypatch, handler)
+    with pytest.raises(ValueError, match="request failed:.*incorrect header check"):
+        await fetch_tool.get_response(
+            "https://example.com/data", user_agent="test"
+        )
+
+    assert len(requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_tool_recovers_from_bad_encoding_via_identity_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                headers={
+                    "content-type": "text/plain",
+                    "content-encoding": "gzip",
+                },
+                stream=_ChunkedByteStream(b"raw plain body"),
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            stream=_ChunkedByteStream(b"raw plain body"),
+            request=request,
+        )
+
+    _mock_client(monkeypatch, handler)
+    result = await ToolRegistry(tmp_path).execute(
+        ToolCall("fetch-1", "fetch", {"url": "https://example.com/data"})
+    )
+
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "raw plain body"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_tool_surfaces_decompression_error_after_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/plain",
+                "content-encoding": "gzip",
+            },
+            stream=_ChunkedByteStream(b"not gzip at all"),
+            request=request,
+        )
+
+    _mock_client(monkeypatch, handler)
+    result = await ToolRegistry(tmp_path).execute(
+        ToolCall("fetch-1", "fetch", {"url": "https://example.com/data"})
+    )
+
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "request failed:" in text
+    assert "incorrect header check" in text
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_get_response_skips_identity_retry_when_caller_pins_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/plain",
+                "content-encoding": "gzip",
+            },
+            stream=_ChunkedByteStream(b"not gzip"),
+            request=request,
+        )
+
+    _mock_client(monkeypatch, handler)
+    with pytest.raises(ValueError, match="request failed"):
+        await fetch_tool.get_response(
+            "https://example.com/data",
+            user_agent="test",
+            headers={"Accept-Encoding": "identity"},
+        )
+
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_websearch_parser_failure_error_carries_status_and_body_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = "<html><body>the backend was temporarily blocked, please try later</body></html>"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text=body,
+            request=request,
+        )
+
+    _mock_client(monkeypatch, handler)
+    with pytest.raises(websearch.SearchParserError) as excinfo:
+        await websearch._ddg_search("zeta", max_results=1)
+
+    message = str(excinfo.value)
+    assert "search backend failed" in message
+    assert "HTTP 200" in message
+    assert "temporarily blocked" in message
+
+
+@pytest.mark.asyncio
+async def test_websearch_tool_surface_includes_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = "<html><body>captcha challenge please solve</body></html>"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text=body,
+            request=request,
+        )
+
+    _mock_client(monkeypatch, handler)
+    result = await ToolRegistry(tmp_path).execute(
+        ToolCall("search-1", "websearch", {"query": "zeta"})
+    )
+
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "search backend failed" in text
+    assert "HTTP 200" in text
+    assert "captcha challenge" in text

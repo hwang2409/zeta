@@ -48,6 +48,14 @@ class _CompressedResponseTruncated(ValueError):
         super().__init__("response truncated: compressed stream ended early")
 
 
+class _DecompressionFailed(Exception):
+    """Raised when a compressed response body cannot be decoded."""
+
+    def __init__(self, original: str) -> None:
+        super().__init__(original)
+        self.original = original
+
+
 async def _raw_response_chunks(response: httpx.Response) -> AsyncIterator[bytes]:
     if response.is_stream_consumed:
         yield response.content
@@ -129,12 +137,50 @@ async def get_response(
     The cloud metadata address 169.254.169.254 is always refused.
     Environment proxies are disabled because they would bypass validated-address
     connection pinning.
+
+    A decode failure on the first attempt retries once with
+    ``Accept-Encoding: identity`` so a mislabeled or corrupt compressed body
+    does not kill the tool call; a second failure surfaces the original error.
     """
 
+    request_headers = {"User-Agent": user_agent}
+    if headers is not None:
+        request_headers.update(headers)
+    for attempt in range(2):
+        try:
+            return await _request_and_decode(
+                url,
+                request_headers=request_headers,
+                max_bytes=max_bytes,
+                params=params,
+                method=method,
+                data=data,
+            )
+        except _DecompressionFailed as exc:
+            if attempt == 0 and not _has_identity_encoding(request_headers):
+                request_headers = {**request_headers, "Accept-Encoding": "identity"}
+                continue
+            raise ValueError(f"request failed: {exc.original}") from exc
+    raise AssertionError("unreachable response loop")
+
+
+def _has_identity_encoding(request_headers: Mapping[str, str]) -> bool:
+    for key, value in request_headers.items():
+        if key.lower() == "accept-encoding":
+            return "identity" in value.lower()
+    return False
+
+
+async def _request_and_decode(
+    url: str,
+    *,
+    request_headers: Mapping[str, str],
+    max_bytes: int,
+    params: Mapping[str, str] | None,
+    method: str,
+    data: Mapping[str, str] | None,
+) -> httpx.Response:
     try:
-        request_headers = {"User-Agent": user_agent}
-        if headers is not None:
-            request_headers.update(headers)
         async with httpx.AsyncClient(
             timeout=HTTP_TIMEOUT_SECONDS,
             follow_redirects=False,
@@ -179,70 +225,7 @@ async def get_response(
                         raise ValueError(
                             f"request failed: HTTP {response.status_code} {reason}"
                         )
-                    content_encoding = response.headers.get("content-encoding", "")
-                    encodings = tuple(
-                        encoding.strip().lower()
-                        for encoding in content_encoding.split(",")
-                        if encoding.strip()
-                    )
-                    if len(encodings) > 1:
-                        raise ValueError(
-                            "request failed: multiple content encodings are not supported"
-                        )
-                    encoding = encodings[0] if encodings else "identity"
-                    decoder = (
-                        zlib.decompressobj(wbits=47)
-                        if encoding in {"gzip", "deflate"}
-                        else None
-                    )
-                    compressed_prefix = bytearray() if encoding == "deflate" else None
-                    chunks: list[bytes] = []
-                    received = 0
-                    decompressed = 0
-                    async for chunk in _raw_response_chunks(response):
-                        received += len(chunk)
-                        if received > max_bytes:
-                            raise ValueError(
-                                f"response too large: more than {max_bytes} bytes received"
-                            )
-                        if decoder is None:
-                            chunks.append(chunk)
-                            continue
-                        if compressed_prefix is not None:
-                            compressed_prefix.extend(chunk)
-                        pending = chunk
-                        while pending:
-                            remaining = max_bytes - decompressed
-                            try:
-                                decoded = decoder.decompress(
-                                    pending,
-                                    max_length=remaining + 1,
-                                )
-                            except zlib.error:
-                                if compressed_prefix is None:
-                                    raise
-                                decoder = zlib.decompressobj(wbits=-15)
-                                chunks.clear()
-                                decompressed = 0
-                                pending = bytes(compressed_prefix)
-                                compressed_prefix = None
-                                continue
-                            decompressed += len(decoded)
-                            if decompressed > max_bytes:
-                                raise _DecompressedResponseTooLarge(max_bytes)
-                            if decoded:
-                                chunks.append(decoded)
-                            pending = decoder.unconsumed_tail
-                    if decoder is not None:
-                        remaining = max_bytes - decompressed
-                        decoded = decoder.flush(remaining + 1)
-                        decompressed += len(decoded)
-                        if decompressed > max_bytes:
-                            raise _DecompressedResponseTooLarge(max_bytes)
-                        if decoded:
-                            chunks.append(decoded)
-                        if not decoder.eof:
-                            raise _CompressedResponseTruncated()
+                    chunks = await _decode_body(response, max_bytes=max_bytes)
                     headers = response.headers.copy()
                     headers.pop("content-encoding", None)
                     headers.pop("content-length", None)
@@ -264,7 +247,77 @@ async def get_response(
         raise ValueError("request failed: request timed out") from exc
     except httpx.RequestError as exc:
         raise ValueError(f"request failed: {exc}") from exc
-    raise AssertionError("unreachable response loop")
+
+
+async def _decode_body(response: httpx.Response, *, max_bytes: int) -> list[bytes]:
+    content_encoding = response.headers.get("content-encoding", "")
+    encodings = tuple(
+        encoding.strip().lower()
+        for encoding in content_encoding.split(",")
+        if encoding.strip()
+    )
+    if len(encodings) > 1:
+        raise ValueError(
+            "request failed: multiple content encodings are not supported"
+        )
+    encoding = encodings[0] if encodings else "identity"
+    decoder = (
+        zlib.decompressobj(wbits=47)
+        if encoding in {"gzip", "deflate"}
+        else None
+    )
+    compressed_prefix = bytearray() if encoding == "deflate" else None
+    chunks: list[bytes] = []
+    received = 0
+    decompressed = 0
+    async for chunk in _raw_response_chunks(response):
+        received += len(chunk)
+        if received > max_bytes:
+            raise ValueError(
+                f"response too large: more than {max_bytes} bytes received"
+            )
+        if decoder is None:
+            chunks.append(chunk)
+            continue
+        if compressed_prefix is not None:
+            compressed_prefix.extend(chunk)
+        pending = chunk
+        while pending:
+            remaining = max_bytes - decompressed
+            try:
+                decoded = decoder.decompress(
+                    pending,
+                    max_length=remaining + 1,
+                )
+            except zlib.error as exc:
+                if compressed_prefix is None:
+                    raise _DecompressionFailed(str(exc)) from exc
+                decoder = zlib.decompressobj(wbits=-15)
+                chunks.clear()
+                decompressed = 0
+                pending = bytes(compressed_prefix)
+                compressed_prefix = None
+                continue
+            decompressed += len(decoded)
+            if decompressed > max_bytes:
+                raise _DecompressedResponseTooLarge(max_bytes)
+            if decoded:
+                chunks.append(decoded)
+            pending = decoder.unconsumed_tail
+    if decoder is not None:
+        remaining = max_bytes - decompressed
+        try:
+            decoded = decoder.flush(remaining + 1)
+        except zlib.error as exc:
+            raise _DecompressionFailed(str(exc)) from exc
+        decompressed += len(decoded)
+        if decompressed > max_bytes:
+            raise _DecompressedResponseTooLarge(max_bytes)
+        if decoded:
+            chunks.append(decoded)
+        if not decoder.eof:
+            raise _CompressedResponseTruncated()
+    return chunks
 
 
 def response_text(response: httpx.Response) -> str:
