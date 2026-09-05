@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from zeta.agent_background import adopt_agent_children
+from zeta.agent_receipt import encode_json
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
@@ -17,6 +19,7 @@ from zeta.types import (
     TextContent,
     ToolCall,
     ToolResult,
+    ToolUseContent,
 )
 
 
@@ -62,12 +65,48 @@ async def test_agent_setup_exception_uses_failed_receipt(tmp_path: Path) -> None
     assert "agent error: setup exploded" in result.content
     assert "error=true · canceled=false" in result.content
     terminal = next(
-        event
-        for event in events
-        if event.type is StreamEventType.TOOL_EXECUTION_END
+        event for event in events if event.type is StreamEventType.TOOL_EXECUTION_END
     )
     assert terminal.tool_result is not None
     assert terminal.tool_result.content == result.content
+
+
+@pytest.mark.asyncio
+async def test_agent_setup_failure_finishes_child_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call = ToolCall(
+        "late-setup-failure",
+        "agent",
+        {"prompt": "inspect", "description": "late setup"},
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=[call])]),
+        store,
+        max_turns=1,
+    )
+
+    def fail_clone(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("registry clone exploded")
+
+    monkeypatch.setattr(loop.tool_registry, "clone_for_session", fail_clone)
+    await _collect(loop.run_turn("start"))
+
+    result = _result(store, call.id)
+    assert result.is_error is True
+    assert result.structured_content is not None
+    handle = result.structured_content["child_instance_id"]
+    assert type(handle) is str
+
+    status = await loop.tool_registry.execute(
+        ToolCall("status-after-setup-failure", "agent_status", {"handle": handle})
+    )
+    child = status["structuredContent"]["children"][0]
+    assert child["state"] == "failed"
+    assert child["final_result"].startswith("agent error: registry clone exploded")
+    assert child["elapsed"] >= 0
 
 
 @pytest.mark.asyncio
@@ -126,10 +165,70 @@ async def test_agent_output_rejects_handle_not_on_active_branch(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_agent_output_rejects_forged_and_out_of_tree_receipts(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="parent")
+    other = ConversationStore(tmp_path, session_id="other")
+    victim = ConversationStore(other.session_dir / "agents", session_id="1")
+    victim.append_message(Message(MessageRole.ASSISTANT, [TextContent("secret")]))
+    real_call = ToolCall("real-agent", "agent", {})
+    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(real_call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent("forged")],
+            tool_result=ToolResult(
+                "not-agent",
+                "forged",
+                structured_content={
+                    "child_instance_id": "other:1",
+                    "child_session_path": str(victim.session_dir),
+                },
+            ),
+        )
+    )
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent("out of tree")],
+            tool_result=ToolResult(
+                real_call.id,
+                "out of tree",
+                structured_content={
+                    "child_instance_id": "parent:1",
+                    "child_session_path": str(victim.session_dir),
+                },
+            ),
+        )
+    )
+    loop = AgentLoop(FakeBackend([]), store, max_turns=1)
+
+    forged = await loop.tool_registry.execute(
+        ToolCall("output-forged", "agent_output", {"handle": "other:1"})
+    )
+    out_of_tree = await loop.tool_registry.execute(
+        ToolCall("output-outside", "agent_output", {"handle": "parent:1"})
+    )
+
+    assert forged["isError"] is True
+    assert out_of_tree["isError"] is True
+    assert "unknown child handle" in forged["content"][0]["text"]
+    assert "unknown child handle" in out_of_tree["content"][0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_agent_output_reads_new_live_tail_on_each_call(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("agent-call", "agent", {}))],
+        )
+    )
     store.append_message(
         Message(
             MessageRole.TOOL_RESULT,
@@ -184,6 +283,12 @@ async def test_agent_stats_are_in_provider_visible_receipt_and_status_text(
     parent.append_message(Message(MessageRole.USER, [TextContent("start")]))
     parent.append_message(
         Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("agent-call", "agent", {}))],
+        )
+    )
+    parent.append_message(
+        Message(
             MessageRole.TOOL_RESULT,
             [TextContent("done")],
             tool_result=ToolResult(
@@ -210,9 +315,9 @@ async def test_agent_stats_are_in_provider_visible_receipt_and_status_text(
     assert "error=false" in receipt_text
     assert "canceled=false" in receipt_text
 
-    status = await AgentLoop(FakeBackend([]), parent, max_turns=1).tool_registry.execute(
-        ToolCall("status-call", "agent_status", {"handle": handle})
-    )
+    status = await AgentLoop(
+        FakeBackend([]), parent, max_turns=1
+    ).tool_registry.execute(ToolCall("status-call", "agent_status", {"handle": handle}))
     status_text = status["content"][0]["text"]
     assert "2 turns" in status_text
     assert "1 tool calls" in status_text
@@ -301,6 +406,12 @@ async def test_agent_output_response_has_one_total_byte_bound(tmp_path: Path) ->
     store.append_message(Message(MessageRole.USER, [TextContent("start")]))
     store.append_message(
         Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("agent-call", "agent", {}))],
+        )
+    )
+    store.append_message(
+        Message(
             MessageRole.TOOL_RESULT,
             [TextContent("done")],
             tool_result=ToolResult(
@@ -318,7 +429,101 @@ async def test_agent_output_response_has_one_total_byte_bound(tmp_path: Path) ->
     result = await loop.tool_registry.execute(
         ToolCall("output-large", "agent_output", {"handle": "parent:1"})
     )
-    assert len(json.dumps(result, ensure_ascii=False).encode()) <= 10_000
+    assert len(encode_json(result)) <= 10_000
+
+
+@pytest.mark.asyncio
+async def test_agent_output_pages_unicode_with_persistence_size(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path, session_id="parent")
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    child.append_message(Message(MessageRole.USER, [TextContent("😀" * 1_800)]))
+    call = ToolCall("emoji-agent", "agent", {})
+    store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent("running")],
+            tool_result=ToolResult(
+                call.id,
+                "running",
+                structured_content={
+                    "child_instance_id": "parent:1",
+                    "child_session_path": str(child.session_dir),
+                },
+            ),
+        )
+    )
+    loop = AgentLoop(FakeBackend([]), store, max_turns=1)
+
+    offset = 0
+    pages: list[dict[str, object]] = []
+    while True:
+        page = await loop.tool_registry.execute(
+            ToolCall(
+                f"output-emoji-{offset}",
+                "agent_output",
+                {"handle": "parent:1", "offset": offset},
+            )
+        )
+        assert page["isError"] is False
+        assert len(encode_json(page)) <= 10_000
+        pages.append(page)
+        structured = page["structuredContent"]
+        if not structured["truncated"]:
+            break
+        offset = structured["next_offset"]
+
+    text = "".join(page["content"][0]["text"] for page in pages)
+    assert len(pages) > 1
+    assert text.count("😀") == 1_800
+
+
+@pytest.mark.asyncio
+async def test_agent_output_reads_adopted_background_descendant_notification(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path, session_id="parent")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1")
+    grandchild.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("grandchild output")])
+    )
+    grandchild_call = ToolCall(
+        "grandchild-call",
+        "agent",
+        {"prompt": "inspect", "description": "grandchild"},
+    )
+    grandchild.mark_agent_parent(grandchild_call.id)
+    child.register_agent_child(
+        grandchild_call,
+        child_session_path=str(grandchild.session_dir),
+        description="grandchild",
+        background=True,
+        child_instance_id="parent:1:1",
+    )
+    adopt_agent_children(child, root)
+    root.append_agent_notification(
+        "parent:1:1",
+        child_session_path=str(grandchild.session_dir),
+        description="grandchild",
+        status="completed",
+        text="grandchild complete",
+    )
+    loop = AgentLoop(FakeBackend([]), root, max_turns=1)
+
+    result = await loop.tool_registry.execute(
+        ToolCall(
+            "output-adopted-grandchild",
+            "agent_output",
+            {"handle": "parent:1:1"},
+        )
+    )
+
+    assert result["isError"] is False
+    assert "assistant: grandchild output" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio
@@ -329,6 +534,12 @@ async def test_agent_output_reads_snapshot_without_lock_or_mutation(
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("saved")]))
     store.append_message(Message(MessageRole.USER, [TextContent("start")]))
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("agent-call", "agent", {}))],
+        )
+    )
     store.append_message(
         Message(
             MessageRole.TOOL_RESULT,

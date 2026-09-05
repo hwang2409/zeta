@@ -224,10 +224,7 @@ def _agent_status_elapsed(
 ) -> float:
     if finished_at is not None and type(stored_elapsed) in {int, float}:
         return max(0.0, float(stored_elapsed))
-    if (
-        type(started_monotonic) in {int, float}
-        and monotonic_pid == os.getpid()
-    ):
+    if type(started_monotonic) in {int, float} and monotonic_pid == os.getpid():
         return max(0.0, time.monotonic() - started_monotonic)
     try:
         started = datetime.fromisoformat(started_at)
@@ -249,23 +246,92 @@ def _bounded_status_text(value: object, limit: int) -> str:
     return value[: limit - len(_TRUNCATION_NOTE)] + _TRUNCATION_NOTE
 
 
+def _canonical_child_path(session_dir: Path, value: object) -> Path | None:
+    if type(value) is not str or not value:
+        return None
+    try:
+        session_root = session_dir.resolve()
+        child_path = Path(value).resolve()
+        relative = child_path.relative_to(session_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    parts = relative.parts
+    if (
+        len(parts) < 2
+        or len(parts) % 2
+        or any(parts[index] != "agents" for index in range(0, len(parts), 2))
+        or any(not parts[index].isdigit() for index in range(1, len(parts), 2))
+    ):
+        return None
+    return child_path
+
+
 def _active_agent_receipts(store: object) -> dict[str, Path]:
     replay = getattr(store, "replay", None)
     if not callable(replay):
         raise TypeError("agent status is unavailable outside an agent session")
-    receipts: dict[str, Path] = {}
-    for entry in replay():
+    session_dir = getattr(store, "session_dir", None)
+    if not isinstance(session_dir, Path):
+        raise TypeError("agent status is unavailable outside an agent session")
+    entries = replay()
+    agent_call_ids: set[str] = set()
+    for entry in entries:
         if entry.type != "message":
             continue
         message = Message.from_dict(entry.data["message"])
-        result = message.tool_result
-        structured = result.structured_content if result is not None else None
-        if structured is None:
-            continue
-        handle = structured.get("child_instance_id")
-        child_path = structured.get("child_session_path")
-        if type(handle) is str and handle and type(child_path) is str and child_path:
-            receipts[handle] = Path(child_path)
+        agent_call_ids.update(
+            block.tool_call.id
+            for block in message.content
+            if isinstance(block, ToolUseContent)
+            and block.tool_call.name.casefold() == "agent"
+        )
+
+    receipts: dict[str, Path] = {}
+
+    def add_receipt(handle: object, child_path: object) -> None:
+        if type(handle) is not str or not handle:
+            return
+        canonical_path = _canonical_child_path(session_dir, child_path)
+        if canonical_path is not None:
+            receipts.setdefault(handle, canonical_path)
+
+    for entry in entries:
+        if entry.type == "message":
+            message = Message.from_dict(entry.data["message"])
+            result = message.tool_result
+            if result is None or result.tool_call_id not in agent_call_ids:
+                continue
+            structured = result.structured_content
+            if structured is not None:
+                add_receipt(
+                    structured.get("child_instance_id"),
+                    structured.get("child_session_path"),
+                )
+        elif entry.type == "notification":
+            data = entry.data
+            add_receipt(
+                data.get("child_instance_id"),
+                data.get("child_session_path"),
+            )
+
+    agent_children = getattr(store, "agent_children", None)
+    if callable(agent_children):
+        for marker in agent_children().values():
+            if type(marker) is not dict:
+                continue
+            raw_tool_call = marker.get("tool_call")
+            if type(raw_tool_call) is not dict:
+                continue
+            try:
+                tool_call = ToolCall.from_dict(raw_tool_call)
+            except ValueError:
+                continue
+            if tool_call.name.casefold() != "agent":
+                continue
+            add_receipt(
+                marker.get("child_instance_id"),
+                marker.get("child_session_path"),
+            )
     return receipts
 
 
@@ -327,16 +393,12 @@ def _agent_output_page(
     while low < high:
         middle = (low + high + 1) // 2
         result = build(output[offset:middle], middle)
-        if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= max_bytes:
+        if len(encode_json(result)) <= max_bytes:
             low = middle
         else:
             high = middle - 1
     result = build(output[offset:low], low)
-    return (
-        result
-        if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= max_bytes
-        else None
-    )
+    return result if len(encode_json(result)) <= max_bytes else None
 
 
 def _read_agent_output(

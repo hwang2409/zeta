@@ -334,56 +334,77 @@ async def run_agent_tool(
         agent_type=preset.name,
         description=description,
     )
-    loop._agent_child_stores[tool_call.id] = child_store
-    loop._agent_child_turns[tool_call.id] = 0
-    loop._agent_child_types[tool_call.id] = preset.name
-    child_marker_key = child_instance_id if child_depth > 1 else tool_call.id
-    if publisher is not None:
-        publisher.set_metadata({"child_session_path": child_path, "depth": child_depth})
-    excluded_names = {"agent"} if child_depth == MAX_AGENT_DEPTH else set()
-    if preset.tool_names is not None:
-        allowed_names = set(preset.tool_names)
-        if child_depth < MAX_AGENT_DEPTH:
-            allowed_names.add("agent")
-        excluded_names.update(
-            set(loop.tool_registry.definitions_by_name) - allowed_names
-        )
-    child_registry = loop.tool_registry.clone_for_session(
-        child_store,
-        exclude_names=excluded_names,
-    )
-    parent_policy = loop.tool_registry.approval_policy
-    child_policy: ChildApprovalPolicy | None = None
-    if parent_policy is not None:
-        child_policy = ChildApprovalPolicy(
-            parent_policy,
+    try:
+        loop._agent_child_stores[tool_call.id] = child_store
+        loop._agent_child_turns[tool_call.id] = 0
+        loop._agent_child_types[tool_call.id] = preset.name
+        child_marker_key = child_instance_id if child_depth > 1 else tool_call.id
+        if publisher is not None:
+            publisher.set_metadata(
+                {"child_session_path": child_path, "depth": child_depth}
+            )
+        excluded_names = {"agent"} if child_depth == MAX_AGENT_DEPTH else set()
+        if preset.tool_names is not None:
+            allowed_names = set(preset.tool_names)
+            if child_depth < MAX_AGENT_DEPTH:
+                allowed_names.add("agent")
+            excluded_names.update(
+                set(loop.tool_registry.definitions_by_name) - allowed_names
+            )
+        child_registry = loop.tool_registry.clone_for_session(
             child_store,
-            description,
-            child_instance_id,
+            exclude_names=excluded_names,
         )
-        child_registry.set_approval_policy(child_policy)
-    from .loop import AgentLoop
+        parent_policy = loop.tool_registry.approval_policy
+        child_policy: ChildApprovalPolicy | None = None
+        if parent_policy is not None:
+            child_policy = ChildApprovalPolicy(
+                parent_policy,
+                child_store,
+                description,
+                child_instance_id,
+            )
+            child_registry.set_approval_policy(child_policy)
+        from .loop import AgentLoop
 
-    child_loop = AgentLoop(
-        child_backend,
-        child_store,
-        registry=child_registry,
-        max_turns=preset.turn_cap,
-        token_budget=loop.context_assembler.token_budget,
-        retained_tail=loop.context_assembler.retained_tail,
-        system_prompt=compose_system_prompt(
-            loop.context_assembler.system_prompt,
-            preset.preamble,
-        ),
-        skip_mcp_mount=True,
-        agent_depth=child_depth,
-        agent_instance_id=child_instance_id,
-        agent_tree=agent_tree,
-        background_owner=loop._background_owner,
-    )
-    if loop.plan_mode:
-        child_loop.set_plan_mode(True)
-    child_loop.set_background_event_sink(loop._publish_background_event)
+        child_loop = AgentLoop(
+            child_backend,
+            child_store,
+            registry=child_registry,
+            max_turns=preset.turn_cap,
+            token_budget=loop.context_assembler.token_budget,
+            retained_tail=loop.context_assembler.retained_tail,
+            system_prompt=compose_system_prompt(
+                loop.context_assembler.system_prompt,
+                preset.preamble,
+            ),
+            skip_mcp_mount=True,
+            agent_depth=child_depth,
+            agent_instance_id=child_instance_id,
+            agent_tree=agent_tree,
+            background_owner=loop._background_owner,
+        )
+        if loop.plan_mode:
+            child_loop.set_plan_mode(True)
+        child_loop.set_background_event_sink(loop._publish_background_event)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - setup failures become receipts
+        failure_text = f"agent error: {error_message(exc)}"
+        child_store.finish_agent_lifecycle(
+            "failed",
+            final_result=failure_text,
+            turns_used=0,
+        )
+        return loop._child_result_payload(
+            tool_call.id,
+            failure_text,
+            state="failed",
+            child_session_path=child_path,
+            agent_type=preset.name,
+            child_instance_id=child_instance_id,
+            depth=child_depth,
+        )
     lifecycle_sink = (
         execution_context.lifecycle_sink if execution_context is not None else None
     )
