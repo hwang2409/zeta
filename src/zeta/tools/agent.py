@@ -787,6 +787,15 @@ def register(registry: ToolRegistry) -> None:
                     "type": "boolean",
                     "description": "Keep the child running across parent turns and return a handle.",
                 },
+                "max_turns": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "Raise the shared turn budget for this agent tree "
+                        "(root + descendants). Only accepted on the top-level "
+                        "agent call; children inherit the tree budget."
+                    ),
+                },
             },
             "required": ["prompt", "description"],
             "additionalProperties": False,

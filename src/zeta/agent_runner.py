@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from .agent_background import finish_background_child
 from .agent_budget import (
     MAX_AGENT_DEPTH,
+    MAX_AGENT_TURN_CAP,
     AgentTree,
 )
 from .agent_budget import child_depth as next_agent_depth
@@ -158,7 +159,11 @@ async def consume_child(
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if budget_exhausted:
-        text = f"agent error: {failure_message or 'shared agent turn budget exhausted'}"
+        text = (
+            f"agent error: {failure_message or 'shared agent turn budget exhausted'}; "
+            f"child transcript is saved at {child_path} — "
+            "read it with agent_output to recover the work"
+        )
         return terminal_result(
             state="failed",
             text=text,
@@ -258,6 +263,28 @@ async def run_agent_tool(
             "agent error: background must be a boolean",
             state="failed",
         )
+    max_turns_arg = arguments.get("max_turns")
+    if max_turns_arg is not None:
+        if type(max_turns_arg) is not int or max_turns_arg < 1:
+            return loop._child_result_payload(
+                tool_call.id,
+                "agent error: max_turns must be a positive integer",
+                state="failed",
+            )
+        if max_turns_arg > MAX_AGENT_TURN_CAP:
+            return loop._child_result_payload(
+                tool_call.id,
+                f"agent error: max_turns exceeds the hard cap "
+                f"of {MAX_AGENT_TURN_CAP}",
+                state="failed",
+            )
+        if loop.agent_depth > 0:
+            return loop._child_result_payload(
+                tool_call.id,
+                "agent error: max_turns is only accepted at the top-level "
+                "agent call; children inherit the tree turn budget",
+                state="failed",
+            )
     preset = get_agent_preset(agent_type)
     if preset is None:
         return loop._child_result_payload(
@@ -288,11 +315,14 @@ async def run_agent_tool(
             state="failed",
         )
     agent_tree = loop._agent_tree or AgentTree()
-    agent_tree.ensure_budget(
-        loop._agent_turn_budget
-        if loop._agent_turn_budget is not None
-        else preset.turn_cap
-    )
+    if max_turns_arg is not None:
+        tree_budget_limit = max_turns_arg
+    elif loop._agent_turn_budget is not None:
+        tree_budget_limit = loop._agent_turn_budget
+    else:
+        tree_budget_limit = preset.turn_cap
+    agent_tree.ensure_budget(tree_budget_limit)
+    child_turn_cap = max(preset.turn_cap, agent_tree.budget.limit)
     try:
         await loop._ensure_mcp_servers()
     except asyncio.CancelledError:
@@ -371,7 +401,7 @@ async def run_agent_tool(
             child_backend,
             child_store,
             registry=child_registry,
-            max_turns=preset.turn_cap,
+            max_turns=child_turn_cap,
             token_budget=loop.context_assembler.token_budget,
             retained_tail=loop.context_assembler.retained_tail,
             system_prompt=compose_system_prompt(
@@ -511,7 +541,7 @@ async def run_agent_tool(
         consume_child(
             child_loop,
             prompt,
-            turn_cap=preset.turn_cap,
+            turn_cap=child_turn_cap,
             child_path=child_path,
             publish=publish,
             child_turns=child_turns,
@@ -592,7 +622,12 @@ async def run_agent_tool(
         loop._tracked_tasks.discard(child_task)
         loop._tracked_tasks.discard(watcher)
         running_result = child_result(
-            f"background agent started: {description}",
+            (
+                f"background agent started: handle={child_instance_id} "
+                f"({description}) — poll with "
+                f"agent_status handle={child_instance_id} or "
+                f"agent_output handle={child_instance_id}"
+            ),
             error=False,
             status="running",
         )
