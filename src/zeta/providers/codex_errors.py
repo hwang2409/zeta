@@ -47,10 +47,12 @@ class CodexStreamError(CodexBackendError):
         *,
         retryable: bool = False,
         retry_reason: str | None = None,
+        is_stall: bool = False,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.retry_reason = retry_reason
+        self.is_stall = is_stall
 
 
 __all__ = [

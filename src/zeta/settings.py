@@ -42,7 +42,17 @@ from typing import Any
 SETTINGS_FILENAME = "settings.toml"
 _PROVIDER_CHOICES = frozenset({"fake", "claude", "codex"})
 _TOP_KEYS = frozenset(
-    {"provider", "model", "yolo", "token_budget", "theme", "approval", "keybindings"}
+    {
+        "provider",
+        "model",
+        "yolo",
+        "token_budget",
+        "theme",
+        "approval",
+        "keybindings",
+        "stream_stall_seconds",
+        "stream_stall_retries",
+    }
 )
 _PROJECT_SAFE_KEYS = frozenset(
     {"provider", "model", "theme", "token_budget", "keybindings"}
@@ -64,6 +74,8 @@ class Settings:
     approval_deny: tuple[str, ...] = ()
     approval_ask: tuple[str, ...] = ()
     keybindings: Mapping[str, Any] = field(default_factory=lambda: _EMPTY_MAPPING)
+    stream_stall_seconds: int | None = None
+    stream_stall_retries: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +91,8 @@ class ResolvedConfig:
     approval_deny: tuple[str, ...]
     approval_ask: tuple[str, ...]
     keybindings: Mapping[str, Any]
+    stream_stall_seconds: int | None = None
+    stream_stall_retries: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +160,8 @@ def resolve(
         approval_deny=settings.approval_deny,
         approval_ask=settings.approval_ask,
         keybindings=settings.keybindings,
+        stream_stall_seconds=settings.stream_stall_seconds,
+        stream_stall_retries=settings.stream_stall_retries,
     )
 
 
@@ -227,6 +243,12 @@ def _validate(data: Mapping[str, Any], notices: list[str]) -> Settings:
     theme = _validated_string(data, "theme", notices)
     yolo = _validated_bool(data, "yolo", notices)
     token_budget = _validated_positive_int(data, "token_budget", notices)
+    stream_stall_seconds = _validated_positive_int(
+        data, "stream_stall_seconds", notices
+    )
+    stream_stall_retries = _validated_nonnegative_int(
+        data, "stream_stall_retries", notices
+    )
     allow, deny, ask = _validated_approval(data, notices)
     keybindings = _validated_keybindings(data, notices)
     return Settings(
@@ -239,6 +261,8 @@ def _validate(data: Mapping[str, Any], notices: list[str]) -> Settings:
         approval_deny=deny,
         approval_ask=ask,
         keybindings=keybindings,
+        stream_stall_seconds=stream_stall_seconds,
+        stream_stall_retries=stream_stall_retries,
     )
 
 
@@ -292,6 +316,18 @@ def _validated_positive_int(
     value = data[key]
     if type(value) is not int or value <= 0:
         notices.append(f"settings · ignored key '{key}': expected positive integer")
+        return None
+    return value
+
+
+def _validated_nonnegative_int(
+    data: Mapping[str, Any], key: str, notices: list[str]
+) -> int | None:
+    if key not in data:
+        return None
+    value = data[key]
+    if type(value) is not int or value < 0:
+        notices.append(f"settings · ignored key '{key}': expected nonnegative integer")
         return None
     return value
 

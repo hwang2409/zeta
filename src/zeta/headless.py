@@ -15,6 +15,10 @@ JSONL event schema (``--format json``), one JSON object per line:
      "content": <str>}`` — ``content`` is trimmed the same way once it exceeds
   ``TOOL_RESULT_MAX_BYTES``.
 - ``{"type": "usage", "usage": <object>}``
+- ``{"type": "retry", "text": <str>, "retry": <int>, "delay": <float>,
+     "is_stall": <bool>}`` — emitted for provider retries (pre-stream and
+  stall). ``is_stall`` is present when the retry follows a mid-stream stall.
+  In text mode the same text is written to stderr instead.
 - ``{"type": "turn_end", "tool_calls": <int>}``
 - ``{"type": "error", "code": <str>, "message": <str>}`` — terminates the turn;
   no ``message`` event follows.
@@ -143,6 +147,19 @@ async def drive_turn(
                 final_message = event.message
             if format == "json":
                 _emit_jsonl(stdout, {"type": "turn_end", "tool_calls": tool_calls})
+        elif event.type is StreamEventType.RETRY:
+            data = event.data if isinstance(event.data, dict) else {}
+            text = data.get("text")
+            display = text if isinstance(text, str) and text else "retrying"
+            if format == "json":
+                payload: dict[str, Any] = {"type": "retry", "text": display}
+                for key in ("retry", "delay", "is_stall"):
+                    if key in data:
+                        payload[key] = data[key]
+                _emit_jsonl(stdout, payload)
+            else:
+                stderr.write(f"zeta: {display}\n")
+                stderr.flush()
         elif event.type is StreamEventType.ERROR and event.error is not None:
             error_code = event.error.code
             error_message = event.error.message

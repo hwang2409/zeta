@@ -26,6 +26,8 @@ from .codex_errors import (
 from .codex_payload import build_responses_payload
 from .stream_diagnostics import StreamDiagnostics
 from .transport import (
+    DEFAULT_STREAM_STALL_RETRIES,
+    DEFAULT_STREAM_STALL_SECONDS,
     cleanup_transport,
     format_retry_delay,
     is_control_exception,
@@ -34,6 +36,8 @@ from .transport import (
     retry_error_label,
     retry_provider_completion,
     retryable_provider_error,
+    sse_lines,
+    stall_retry_kwargs,
     task_is_cancelling,
 )
 from .usage import normalize_usage
@@ -335,6 +339,8 @@ class CodexBackend(CompletionBackend):
         token_store: CodexCredentialStore | None = None,
         client: httpx.AsyncClient | None = None,
         diagnostics_path: str | Path | None = None,
+        stall_seconds: float = DEFAULT_STREAM_STALL_SECONDS,
+        stall_retries: int = DEFAULT_STREAM_STALL_RETRIES,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -345,6 +351,7 @@ class CodexBackend(CompletionBackend):
             if diagnostics_path is not None
             else self.token_store.path.parent / "logs" / "stream-diagnostics.jsonl"
         )
+        self.stall_seconds, self.stall_retries = stall_seconds, stall_retries
 
     def complete(
         self,
@@ -371,6 +378,7 @@ class CodexBackend(CompletionBackend):
             retryable_provider_error,
             self._retry_notice,
             self._record_retry_exhausted,
+            **stall_retry_kwargs(self.stall_retries),
         )
         try:
             async for event in attempts:
@@ -425,7 +433,7 @@ class CodexBackend(CompletionBackend):
                 if response.status_code >= 400:
                     body = await _read_error_body(response)
                     raise _http_error(response.status_code, body, response.headers)
-                async for event in _decode_response(response):
+                async for event in _decode_response(response, self.stall_seconds):
                     yield event
             except CodexBackendError as exc:
                 primary_exception = exc
@@ -508,14 +516,16 @@ def _http_error(
     )
 
 
-async def _decode_response(response: httpx.Response) -> AsyncIterator[StreamEvent]:
+async def _decode_response(
+    response: httpx.Response, stall_seconds: float = 0.0
+) -> AsyncIterator[StreamEvent]:
     decoder = _SSEDecoder()
     response_state = "not-started"
     items: dict[int, _ItemState] = {}
     blocks: dict[BlockKey, _BlockState] = {}
     usage: dict[str, Any] = {}
     response_data: dict[str, Any] = {}
-    async for line in response.aiter_lines():
+    async for line in sse_lines(response, stall_seconds, "Codex", CodexStreamError):
         record = decoder.feed(line)
         if record is None:
             continue
