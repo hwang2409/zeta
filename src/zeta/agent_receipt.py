@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, Protocol
 
 from .core.checkpoints import ConversationEntry
@@ -155,16 +155,21 @@ def _candidate(
     return result
 
 
-def _serialized_sizes(result: StructuredToolResult, tool_call_id: str) -> tuple[int, int]:
-    payload_size = json_size(result)
-    text = result["content"][0]["text"]
+def _serialized_sizes(
+    result: StructuredToolResult,
+    tool_call_id: str,
+    envelope: Callable[[StructuredToolResult], StructuredToolResult] | None = None,
+) -> tuple[int, int]:
+    measured = envelope(result) if envelope is not None else result
+    payload_size = json_size(measured)
+    text = measured["content"][0]["text"]
     tool_result = ToolResult(
         tool_call_id,
         text,
-        result["isError"],
-        content_blocks=result["content"],
-        structured_content=result["structuredContent"],
-        is_canceled=result.get("isCanceled", False),
+        measured["isError"],
+        content_blocks=measured["content"],
+        structured_content=measured["structuredContent"],
+        is_canceled=measured.get("isCanceled", False),
     )
     message = Message(
         MessageRole.TOOL_RESULT,
@@ -191,9 +196,10 @@ def _with_answer_limit(
     structured_content: dict[str, Any] | None,
     tool_call_id: str,
     max_bytes: int,
+    envelope: Callable[[StructuredToolResult], StructuredToolResult] | None = None,
 ) -> StructuredToolResult:
     full = _candidate(state, answer, suffix, structured_content, tool_call_id)
-    if max(_serialized_sizes(full, tool_call_id)) <= max_bytes:
+    if max(_serialized_sizes(full, tool_call_id, envelope)) <= max_bytes:
         return full
 
     def candidate(length: int) -> StructuredToolResult:
@@ -206,22 +212,30 @@ def _with_answer_limit(
     high = len(answer)
     while low < high:
         middle = (low + high + 1) // 2
-        if max(_serialized_sizes(candidate(middle), tool_call_id)) <= max_bytes:
+        if max(_serialized_sizes(candidate(middle), tool_call_id, envelope)) <= max_bytes:
             low = middle
         else:
             high = middle - 1
     bounded = candidate(low)
-    if max(_serialized_sizes(bounded, tool_call_id)) <= max_bytes:
+    if max(_serialized_sizes(bounded, tool_call_id, envelope)) <= max_bytes:
         return bounded
 
     minimal = _candidate(state, "", suffix, structured_content, tool_call_id)
-    if max(_serialized_sizes(minimal, tool_call_id)) <= max_bytes:
+    if max(_serialized_sizes(minimal, tool_call_id, envelope)) <= max_bytes:
         return minimal
 
     reduced = _candidate(state, "", suffix, None, tool_call_id)
-    if max(_serialized_sizes(reduced, tool_call_id)) <= max_bytes:
+    if max(_serialized_sizes(reduced, tool_call_id, envelope)) <= max_bytes:
         return reduced
     return _candidate(state, "", "", None, tool_call_id)
+
+
+def _governance_envelope(
+    tool_name: str,
+) -> Callable[[StructuredToolResult], StructuredToolResult]:
+    from .tools.registry import _apply_error_governance
+
+    return lambda result: _apply_error_governance(result, tool_name)
 
 
 def build_agent_receipt(
@@ -245,6 +259,7 @@ def build_agent_receipt(
     suffix = format_agent_stats(
         dict(stats) if stats is not None else {}, state=state
     )
+    envelope = _governance_envelope("agent") if state == "failed" else None
     return _with_answer_limit(
         state,
         answer,
@@ -252,6 +267,7 @@ def build_agent_receipt(
         dict(structured_content) if structured_content is not None else None,
         tool_call_id,
         max_bytes,
+        envelope=envelope,
     )
 
 

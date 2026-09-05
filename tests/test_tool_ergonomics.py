@@ -4,12 +4,15 @@ structured error payload governance.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
+from zeta.agent_receipt import build_agent_receipt, encode_json
 from zeta.core.store import ConversationStore
 from zeta.tools import ToolRegistry
+from zeta.tools.registry import _apply_error_governance
 from zeta.types import ToolCall
 
 
@@ -182,7 +185,9 @@ async def test_todo_error_carries_governance(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_read_sandbox_violation_carries_governance(tmp_path: Path) -> None:
+async def test_read_unknown_tilde_expansion_maps_to_error_kind(
+    tmp_path: Path,
+) -> None:
     registry = _registry(tmp_path)
 
     result = await registry.execute(
@@ -192,8 +197,28 @@ async def test_read_sandbox_violation_carries_governance(tmp_path: Path) -> None
     assert result["isError"] is True
     error = result["structuredContent"]["error"]
     assert error["tool"] == "read"
-    assert error["kind"] in {"error", "sandbox_violation"}
-    assert error["hint"] or error["kind"] == "error"
+    assert error["kind"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_write_hardlinked_target_reports_sandbox_violation(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    target = tmp_path / "target"
+    target.write_text("seed")
+    link = tmp_path / "link"
+    os.link(target, link)
+
+    result = await registry.execute(
+        ToolCall("write-link", "write", {"path": "link", "content": "next"})
+    )
+
+    assert result["isError"] is True
+    error = result["structuredContent"]["error"]
+    assert error["tool"] == "write"
+    assert error["kind"] == "sandbox_violation"
+    assert error["hint"]
 
 
 @pytest.mark.asyncio
@@ -225,3 +250,86 @@ async def test_every_registered_tool_error_carries_governance(
     assert error["tool"] == "broken"
     assert error["kind"] == "error"
     assert error["message"] == "boom"
+
+
+@pytest.mark.asyncio
+async def test_governance_normalizes_unknown_kind_taxonomy(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+
+    def rogue(_arguments: object) -> dict:
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "rate limited",
+                    "truncated": False,
+                    "full_size": 12,
+                }
+            ],
+            "isError": True,
+            "structuredContent": {"error": {"kind": "rate_limited"}},
+        }
+
+    registry.register("rogue", rogue)
+    with caplog.at_level("WARNING", logger="zeta.tools.registry"):
+        result = await registry.execute(ToolCall("call", "rogue", {}))
+
+    error = result["structuredContent"]["error"]
+    assert error["kind"] == "error"
+    assert any(
+        "rate_limited" in record.getMessage() for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_governance_preserves_caller_provided_tool_label(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+
+    def labeled(_arguments: object) -> dict:
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "downstream failure",
+                    "truncated": False,
+                    "full_size": 18,
+                }
+            ],
+            "isError": True,
+            "structuredContent": {"error": {"tool": "upstream-service"}},
+        }
+
+    registry.register("labeled", labeled)
+    result = await registry.execute(ToolCall("call", "labeled", {}))
+
+    error = result["structuredContent"]["error"]
+    assert error["tool"] == "upstream-service"
+
+
+def test_failed_agent_receipt_stays_under_cap_after_governance() -> None:
+    max_bytes = 10_000
+    long_answer = "x" * 20_000
+    stats = {
+        "turns_used": 3,
+        "elapsed": 1.5,
+        "tool_calls": 4,
+        "error": True,
+        "canceled": False,
+    }
+    structured_content = {"child_session_path": "/agents/1"}
+
+    receipt = build_agent_receipt(
+        "failed",
+        long_answer,
+        stats,
+        structured_content=structured_content,
+        tool_call_id="agent-1",
+        max_bytes=max_bytes,
+    )
+    governed = _apply_error_governance(receipt, "agent")
+
+    assert len(encode_json(governed)) <= max_bytes

@@ -12,6 +12,7 @@ import copy
 import importlib
 import inspect
 import json
+import logging
 import math
 import os
 import pkgutil
@@ -61,6 +62,7 @@ from ._sandbox import SandboxPolicy
 
 AbortSignal = ToolAbortSignal
 MAX_STRUCTURED_CONTENT_DEPTH = 32
+_logger = logging.getLogger(__name__)
 ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
 
@@ -236,6 +238,7 @@ _ERROR_HINTS: dict[str, str] = {
     "invalid_result": "the tool handler returned a malformed result",
     "error": "",
 }
+_ERROR_KINDS: frozenset[str] = frozenset(_ERROR_HINTS)
 
 
 def _extract_error_message(result: StructuredToolResult) -> str:
@@ -279,7 +282,14 @@ def _infer_error_kind(
 def _apply_error_governance(
     result: StructuredToolResult, tool_name: str
 ) -> StructuredToolResult:
-    """Ensure every tool error carries structuredContent.error = {tool, kind, hint}."""
+    """Ensure every tool error carries structuredContent.error = {tool, kind, hint}.
+
+    ``kind`` is normalized against the closed :data:`_ERROR_KINDS` taxonomy;
+    unknown values are logged and remapped through :func:`_infer_error_kind`.
+    ``tool`` and ``hint`` follow the same fallback pattern: caller-provided
+    strings win, and the seam only fills in defaults when the caller left
+    the field empty.
+    """
 
     if not result.get("isError"):
         return result
@@ -292,10 +302,19 @@ def _apply_error_governance(
     kind = error.get("kind")
     if not isinstance(kind, str) or not kind:
         kind = _infer_error_kind(result, structured)
+    elif kind not in _ERROR_KINDS:
+        _logger.warning(
+            "unknown error kind %r from tool %r; normalizing to inferred kind",
+            kind,
+            tool_name,
+        )
+        kind = _infer_error_kind(result, structured)
     hint = error.get("hint")
     if not isinstance(hint, str) or not hint:
         hint = _ERROR_HINTS.get(kind, "")
-    error["tool"] = tool_name
+    existing_tool = error.get("tool")
+    if not isinstance(existing_tool, str) or not existing_tool:
+        error["tool"] = tool_name
     error["kind"] = kind
     error["hint"] = hint
     if "message" not in error:
