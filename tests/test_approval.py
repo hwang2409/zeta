@@ -262,7 +262,7 @@ async def test_approval_and_pre_execution_hook_compose(tmp_path: Path) -> None:
     result = await registry.execute(ToolCall("call-1", "echo", {}))
 
     assert result["isError"] is True
-    assert result["content"][0]["text"] == "tool execution denied"
+    assert result["content"][0]["text"] == "tool execution denied by hook"
     assert seen == ["echo"]
 
 

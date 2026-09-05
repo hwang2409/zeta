@@ -336,7 +336,7 @@ def _tool_receipt(event: StreamEvent) -> Text:
         structured = result.structured_content or {}
         if result.is_canceled:
             status = "canceled"
-        elif result.content == "tool execution denied":
+        elif result.content.startswith("tool execution denied"):
             status = "denied"
         elif structured.get("timed_out") is True:
             status = "timeout"

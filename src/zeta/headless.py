@@ -7,16 +7,22 @@ writes results to stdout as plain text or as a JSONL event stream.
 JSONL event schema (``--format json``), one JSON object per line:
 
 - ``{"type": "turn_start", "prompt": <str>}``
-- ``{"type": "tool_call", "id": <str>, "name": <str>, "arguments": <object>}``
+- ``{"type": "tool_call", "id": <str>, "name": <str>,
+     "arguments": <object|str>}`` — ``arguments`` is the original object when it
+  serializes within ``TOOL_RESULT_MAX_BYTES``; otherwise a truncated JSON string
+  with a ``... [truncated: N bytes]`` suffix.
 - ``{"type": "tool_result", "id": <str>, "name": <str>, "is_error": <bool>,
-     "content": <str>}``
+     "content": <str>}`` — ``content`` is trimmed the same way once it exceeds
+  ``TOOL_RESULT_MAX_BYTES``.
 - ``{"type": "usage", "usage": <object>}``
 - ``{"type": "turn_end", "tool_calls": <int>}``
-- ``{"type": "error", "code": <str>, "message": <str>}``
-- ``{"type": "message", "role": "assistant", "text": <str>}``
+- ``{"type": "error", "code": <str>, "message": <str>}`` — terminates the turn;
+  no ``message`` event follows.
+- ``{"type": "message", "role": "assistant", "text": <str>}`` — emitted once on
+  success as the final line; absent when an ``error`` fires.
 
-``tool_result.content`` is bounded to keep frames small; overflow is trimmed
-with a ``... [truncated: N bytes]`` suffix.
+Both truncation limits are enforced against UTF-8 byte length, not character
+count.
 """
 
 from __future__ import annotations
@@ -43,9 +49,22 @@ DENIAL_MARKER = "tool execution denied"
 
 
 def _bounded(value: str, limit: int = TOOL_RESULT_MAX_BYTES) -> str:
-    if len(value) <= limit:
+    data = value.encode("utf-8")
+    if len(data) <= limit:
         return value
-    return value[:limit] + f"... [truncated: {len(value) - limit} bytes]"
+    kept = data[:limit].decode("utf-8", errors="ignore")
+    dropped = len(data) - limit
+    return kept + f"... [truncated: {dropped} bytes]"
+
+
+def _bounded_arguments(
+    arguments: dict[str, object],
+    limit: int = TOOL_RESULT_MAX_BYTES,
+) -> dict[str, object] | str:
+    serialized = json.dumps(arguments, separators=(",", ":"), ensure_ascii=False)
+    if len(serialized.encode("utf-8")) <= limit:
+        return arguments
+    return _bounded(serialized, limit)
 
 
 def _emit_jsonl(stream: IO[str], event: dict[str, Any]) -> None:
@@ -88,7 +107,7 @@ async def drive_turn(
                         "type": "tool_call",
                         "id": event.tool_call.id,
                         "name": event.tool_call.name,
-                        "arguments": event.tool_call.arguments,
+                        "arguments": _bounded_arguments(event.tool_call.arguments),
                     },
                 )
         elif event.type is StreamEventType.TOOL_EXECUTION_END:
@@ -176,9 +195,12 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
         return 1
 
     loop = app.loop
-    policy = app._approval_policy
+    policy = app.approval_policy
     if policy is not None and not args.yolo:
+        # Headless has no UI to answer ASK prompts, so both the policy default
+        # AND any always_ask entries must fall through to a hard DENY.
         policy.default = ApprovalDecision.DENY
+        policy.always_ask = frozenset()
 
     # Detach the TUI sinks the create_app path wired up; without a running
     # prompt_toolkit app they call into ``get_app()`` and raise.
@@ -189,7 +211,6 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
     async def _run() -> int:
         loop.session_start()
         try:
-            await loop.ensure_mcp_servers()
             return await drive_turn(
                 loop,
                 prompt,

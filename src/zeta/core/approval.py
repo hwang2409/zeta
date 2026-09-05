@@ -443,7 +443,7 @@ class ApprovalGate:
         if isinstance(allowed, str):
             return ToolResult(tool_call.id, allowed, True), execution_signal
         if allowed is False:
-            return ToolResult(tool_call.id, "tool execution denied", True), execution_signal
+            return ToolResult(tool_call.id, "tool execution denied by hook", True), execution_signal
         if signal.is_set() and execution_signal is signal:
             return canceled_result(tool_call.id), execution_signal
         return None, execution_signal

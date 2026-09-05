@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import io
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -125,6 +127,131 @@ async def test_json_mode_bounds_large_tool_result(tmp_path: Path) -> None:
     result_event = next(event for event in events if event["type"] == "tool_result")
     assert "[truncated:" in result_event["content"]
     assert len(result_event["content"]) < len(big)
+
+
+async def test_json_mode_tool_result_bound_is_byte_based(tmp_path: Path) -> None:
+    from zeta.headless import TOOL_RESULT_MAX_BYTES
+
+    call = ToolCall("call-1", "wide", {})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn(content=[TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    # Four-byte UTF-8 emoji: char count is well under the limit, byte count is
+    # well over it. Char-based bounds would silently ship the whole payload.
+    big = "\U0001f600" * (TOOL_RESULT_MAX_BYTES // 2)
+    registry.register("wide", lambda arguments: big)
+    loop = AgentLoop(backend, store, registry=registry)
+
+    code, out, _err = await _drive(loop, "go", "json")
+
+    assert code == 0
+    events = [json.loads(line) for line in out.splitlines() if line]
+    result_event = next(event for event in events if event["type"] == "tool_result")
+    assert "[truncated:" in result_event["content"]
+    assert len(result_event["content"].encode("utf-8")) <= (
+        TOOL_RESULT_MAX_BYTES + 64
+    )
+
+
+async def test_json_mode_bounds_large_tool_call_arguments(tmp_path: Path) -> None:
+    from zeta.headless import TOOL_RESULT_MAX_BYTES
+
+    big_arg = "z" * (TOOL_RESULT_MAX_BYTES * 2)
+    call = ToolCall("call-1", "sink", {"payload": big_arg})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn(content=[TextContent("done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register("sink", lambda arguments: "ok")
+    loop = AgentLoop(backend, store, registry=registry)
+
+    code, out, _err = await _drive(loop, "go", "json")
+
+    assert code == 0
+    events = [json.loads(line) for line in out.splitlines() if line]
+    call_event = next(event for event in events if event["type"] == "tool_call")
+    arguments = call_event["arguments"]
+    assert isinstance(arguments, str)
+    assert "[truncated:" in arguments
+    assert len(arguments.encode("utf-8")) <= (TOOL_RESULT_MAX_BYTES + 64)
+
+
+async def test_headless_hook_rejection_does_not_show_yolo_hint(tmp_path: Path) -> None:
+    call = ToolCall("call-1", "vetoed", {})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[call]),
+            ScriptedTurn(content=[TextContent("recovered")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry.register("vetoed", lambda arguments: "must not run")
+    registry.set_pre_execute_hook(lambda name, arguments: False)
+    loop = AgentLoop(backend, store, registry=registry)
+
+    code, out, err = await _drive(loop, "start", "text")
+
+    assert code == 0
+    assert "recovered" in out
+    # Hook denial is distinct from approval-required denial. Headless must not
+    # falsely suggest --yolo unlocks it — that only unlocks the approval path.
+    assert "--yolo" not in err
+    tool_results = [
+        message.tool_result for message in store.messages() if message.tool_result
+    ]
+    assert tool_results[0].content == "tool execution denied by hook"
+
+
+def test_headless_run_headless_hard_denies_always_ask_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Governance: headless must never block on ASK prompts.
+
+    Even if a caller populates always_ask, the headless driver must strip it
+    so the run terminates instead of polling for a UI answer that will never
+    come.
+    """
+
+    from zeta.headless import run_headless
+
+    monkeypatch.chdir(tmp_path)
+    args = build_parser().parse_args(["--provider", "fake", "-p", "hi"])
+
+    import zeta.tui.app as tui_app
+
+    original_create_app = tui_app.create_app
+    captured: list[Any] = []
+
+    def _wrapped_create_app(parsed: argparse.Namespace) -> tui_app.TUIApp:
+        app = original_create_app(parsed)
+        policy = app.approval_policy
+        assert policy is not None
+        policy.always_ask = frozenset({"anything"})
+        captured.append(policy)
+        return app
+
+    monkeypatch.setattr(tui_app, "create_app", _wrapped_create_app)
+
+    code = run_headless(args, args.prompt)
+    capsys.readouterr()
+
+    assert code == 0
+    assert captured, "wrapped create_app should have been called"
+    policy = captured[0]
+    assert policy.always_ask == frozenset()
+    assert policy.default is ApprovalDecision.DENY
 
 
 async def test_headless_denies_ask_tool_and_writes_stderr_note(tmp_path: Path) -> None:
