@@ -1,0 +1,49 @@
+name: CI
+
+# Runs on pull requests AND on every push to main. The post-merge run on main
+# is the important half: ZETA-51 and ZETA-52 were both red-main incidents where
+# two pull requests were green independently and only collided once merged, so
+# a pull-request check alone would not have caught either one.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Superseded pull-request runs are disposable; main runs are the record.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # tmux is deliberately NOT installed, so the three tmux-gated tests in
+      # tests/test_tui.py and tests/test_test_environment.py take their
+      # existing skipif path. Installing it makes them run, and
+      # test_teardown_guard_rejects_tmux_pane_without_home then races: the
+      # pane's `sh -c` finishes, the session ends, the server exits because
+      # nothing is left attached, and the parent's `wait-for` exits 1 against
+      # a dead socket. That is a test-side timing assumption of the ZETA-67
+      # family, not product behaviour. ZETA-85 covers making them CI-capable;
+      # until then this is a known coverage gap, not a pass.
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache uv downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: uv-${{ runner.os }}-
+
+      # --frozen pins the resolution to uv.lock so a transitive bump cannot
+      # turn main red without a lockfile change in the diff.
+      - name: Run the suite
+        run: uv run --frozen pytest -q
