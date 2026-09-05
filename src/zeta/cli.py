@@ -55,8 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true", help="show raw stream events")
     parser.add_argument(
         "--yolo",
-        action="store_true",
-        help="auto-approve every tool call (skip approval prompts)",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "auto-approve every tool call; --no-yolo forces prompts even "
+            "when settings.toml enables yolo"
+        ),
     )
     parser.add_argument(
         "--token-budget",
@@ -147,8 +151,6 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"logged in as {handle}" if handle else "ok")
         return 0
-    if args.force_provider and args.model is None:
-        parser.error("--force-provider requires --model")
     if args.prompt is not None:
         from .headless import run_headless
 

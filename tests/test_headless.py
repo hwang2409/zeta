@@ -254,6 +254,93 @@ def test_headless_run_headless_hard_denies_always_ask_tools(
     assert policy.default is ApprovalDecision.DENY
 
 
+def test_headless_respects_settings_yolo_without_cli_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """settings.toml yolo=true must reach the headless policy the same way
+    it reaches the TUI: no --yolo on the command line, no --no-yolo, but the
+    resolved default is ALLOW so headless does not clobber it to DENY.
+    """
+
+    from zeta.headless import run_headless
+
+    home = tmp_path / "zeta-home"
+    home.mkdir()
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    (home / "settings.toml").write_text("yolo = true\n")
+
+    monkeypatch.chdir(tmp_path)
+    args = build_parser().parse_args(["--provider", "fake", "-p", "hi"])
+    assert args.yolo is None
+
+    import zeta.tui.app as tui_app
+
+    original_create_app = tui_app.create_app
+    captured_policies: list[ApprovalPolicy] = []
+
+    def _wrapped_create_app(parsed: argparse.Namespace) -> tui_app.TUIApp:
+        app = original_create_app(parsed)
+        assert app.approval_policy is not None
+        captured_policies.append(app.approval_policy)
+        return app
+
+    monkeypatch.setattr(tui_app, "create_app", _wrapped_create_app)
+
+    code = run_headless(args, args.prompt)
+    capsys.readouterr()
+
+    assert code == 0
+    assert captured_policies, "wrapped create_app should have been called"
+    policy = captured_policies[0]
+    assert policy.default is ApprovalDecision.ALLOW
+
+
+def test_headless_no_yolo_flag_beats_settings_yolo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--no-yolo on the CLI must override settings.toml yolo=true and force
+    the headless policy back to DENY.
+    """
+
+    from zeta.headless import run_headless
+
+    home = tmp_path / "zeta-home"
+    home.mkdir()
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    (home / "settings.toml").write_text("yolo = true\n")
+
+    monkeypatch.chdir(tmp_path)
+    args = build_parser().parse_args(
+        ["--provider", "fake", "--no-yolo", "-p", "hi"]
+    )
+    assert args.yolo is False
+
+    import zeta.tui.app as tui_app
+
+    original_create_app = tui_app.create_app
+    captured_policies: list[ApprovalPolicy] = []
+
+    def _wrapped_create_app(parsed: argparse.Namespace) -> tui_app.TUIApp:
+        app = original_create_app(parsed)
+        assert app.approval_policy is not None
+        captured_policies.append(app.approval_policy)
+        return app
+
+    monkeypatch.setattr(tui_app, "create_app", _wrapped_create_app)
+
+    code = run_headless(args, args.prompt)
+    capsys.readouterr()
+
+    assert code == 0
+    assert captured_policies, "wrapped create_app should have been called"
+    policy = captured_policies[0]
+    assert policy.default is ApprovalDecision.DENY
+
+
 async def test_headless_denies_ask_tool_and_writes_stderr_note(tmp_path: Path) -> None:
     call = ToolCall("call-1", "danger", {})
     backend = FakeBackend(

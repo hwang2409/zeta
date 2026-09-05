@@ -196,9 +196,11 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
 
     loop = app.loop
     policy = app.approval_policy
-    if policy is not None and not args.yolo:
+    if policy is not None and policy.default is not ApprovalDecision.ALLOW:
         # Headless has no UI to answer ASK prompts, so both the policy default
-        # AND any always_ask entries must fall through to a hard DENY.
+        # AND any always_ask entries must fall through to a hard DENY. When
+        # yolo was resolved to True (via --yolo or settings.toml), create_app
+        # already set the default to ALLOW; leave it alone in that case.
         policy.default = ApprovalDecision.DENY
         policy.always_ask = frozenset()
 
