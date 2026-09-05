@@ -24,6 +24,7 @@ from zeta.tools.agent_presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
 )
+from zeta.tui.render import render_event
 from zeta.tui.todo import TodoWidget
 from zeta.types import (
     CompletionBackend,
@@ -217,6 +218,7 @@ def _parallel_agent_calls() -> list[ToolCall]:
 class BackgroundBackend(CompletionBackend):
     def __init__(self, calls: Sequence[ToolCall]) -> None:
         self.calls = list(calls)
+        self.child_text = "child complete"
         self.child_started = asyncio.Event()
         self.release_child = asyncio.Event()
 
@@ -241,7 +243,7 @@ class BackgroundBackend(CompletionBackend):
         elif last_user == "inspect the task":
             self.child_started.set()
             await self.release_child.wait()
-            blocks = [TextContent("child complete")]
+            blocks = [TextContent(self.child_text)]
         else:
             blocks = [TextContent("parent continued")]
         yield StreamEvent(StreamEventType.MESSAGE_START)
@@ -457,7 +459,7 @@ async def test_background_agent_returns_handle_and_parent_continues(
 
     backend.release_child.set()
     notification = await _wait_for_notification(store, "completed")
-    assert notification.data["text"] == "child complete"
+    assert notification.data["text"].startswith("child complete")
     assert not store.agent_children()
     await loop.close()
 
@@ -469,6 +471,8 @@ async def test_background_completion_notification_waits_for_next_turn_boundary(
     backend = BackgroundBackend([_background_agent_call()])
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1)
+    background_events: list[StreamEvent] = []
+    loop.set_background_event_sink(background_events.append)
 
     await _collect(loop.run_turn("start"))
     backend.release_child.set()
@@ -476,8 +480,61 @@ async def test_background_completion_notification_waits_for_next_turn_boundary(
 
     events = await _collect(loop.run_turn("follow up"))
     assert events[0].type is StreamEventType.AGENT_NOTIFICATION
-    assert events[0].data["text"] == "child complete"
+    assert events[0].data["text"].startswith("child complete")
+    assert events[0].data["text"].count("error=false") == 1
+    assert events[0].data["text"].count("canceled=false") == 1
+    rendered = render_event(events[0])
+    assert rendered is not None
+    assert rendered.plain.count("error=false") == 1
+    terminal = next(
+        event
+        for event in background_events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+    assert terminal.tool_result is not None
+    assert terminal.tool_result.content.count("error=false") == 1
     assert loop.store.agent_notifications() == []
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_background_multibyte_receipt_fits_persisted_limit(
+    tmp_path: Path,
+) -> None:
+    backend = BackgroundBackend([_background_agent_call()])
+    backend.child_text = "😀" * 1_800
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+    background_events: list[StreamEvent] = []
+    loop.set_background_event_sink(background_events.append)
+
+    await _collect(loop.run_turn("start"))
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+
+    terminal = next(
+        event
+        for event in background_events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+    assert terminal.tool_result is not None
+    assert terminal.tool_result.content.count("error=false") == 1
+    assert terminal.tool_result.content.count("canceled=false") == 1
+    notification = store.agent_notifications(pending_only=False)[0]
+    notification_row = next(
+        row
+        for row in store.path.read_bytes().splitlines()
+        if b'"type":"notification"' in row
+    )
+    assert len(notification_row) <= 10_000
+    assert notification.data["text"].count("error=false") == 1
+    assert notification.data["text"].count("canceled=false") == 1
+    persisted = Message(
+        MessageRole.TOOL_RESULT,
+        [TextContent(terminal.tool_result.content)],
+        tool_result=terminal.tool_result,
+    )
+    assert len(json.dumps(persisted.to_dict(), ensure_ascii=False).encode("utf-8")) <= 10_000
     await loop.close()
 
 
@@ -540,11 +597,27 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
     backend = BackgroundBackend([call])
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1)
+    background_events: list[StreamEvent] = []
+    loop.set_background_event_sink(background_events.append)
 
     await _collect(loop.run_turn("start"))
     loop.abort()
     notification = await _wait_for_notification(store, "canceled")
     assert "parent session exited" not in notification.data["text"]
+    assert notification.data["text"].count("error=false") == 1
+    assert notification.data["text"].count("canceled=true") == 1
+    terminal = next(
+        event
+        for event in background_events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+    assert terminal.tool_result is not None
+    assert terminal.tool_result.is_error is False
+    assert terminal.tool_result.is_canceled is True
+    rendered = render_event(terminal)
+    assert rendered is not None
+    assert rendered.plain.count("error=false") == 1
+    assert rendered.plain.count("canceled=true") == 1
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     assert child_store.agent_canceled() == {
         "tool_call_id": call.id,
@@ -603,7 +676,7 @@ async def test_foreground_child_does_not_wait_for_background_grandchild(
 
     backend.release_grandchild.set()
     notification = await _wait_for_notification(store, "completed")
-    assert notification.data["text"] == "grandchild complete"
+    assert notification.data["text"].startswith("grandchild complete")
     await loop.close()
     assert not store.agent_children()
 
@@ -716,7 +789,7 @@ def test_resume_keeps_completed_unnotified_background_notification(
 
     notification = resumed.agent_notifications()[0]
     assert notification.data["status"] == "completed"
-    assert notification.data["text"] == "child complete"
+    assert notification.data["text"].startswith("child complete")
     assert not resumed.agent_children()
     assert ConversationStore(
         store.session_dir / "agents", session_id="1"
@@ -836,10 +909,10 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
     await asyncio.wait_for(task, timeout=1)
 
     results = [message.tool_result for message in store.messages() if message.tool_result]
-    assert [result.content for result in results if result is not None] == [
-        "child-1",
-        "child-2",
-    ]
+    assert all(
+        result is not None and result.content.startswith(expected)
+        for result, expected in zip(results, ("child-1", "child-2"), strict=True)
+    )
     assert sorted(path.name for path in (store.session_dir / "agents").iterdir()) == [
         "1",
         "2",
@@ -916,7 +989,11 @@ async def test_parent_abort_cancels_all_parallel_children(tmp_path: Path) -> Non
 
     results = [message.tool_result for message in store.messages() if message.tool_result]
     assert len(results) == 2
-    assert all(result is not None and result.content == "tool execution canceled" for result in results)
+    assert all(
+        result is not None
+        and result.content.startswith("tool execution canceled")
+        for result in results
+    )
     for index, call in enumerate(calls, start=1):
         child_store = ConversationStore(
             store.session_dir / "agents", session_id=str(index)
@@ -965,7 +1042,7 @@ async def test_agent_returns_child_text_and_persists_child_session(tmp_path: Pat
     await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.content == "done"
+    assert result.content.startswith("done")
     child_dir = store.session_dir / "agents" / "1"
     assert (child_dir / "conversation.jsonl").exists()
     assert [message.role for message in ConversationStore(
@@ -1055,6 +1132,7 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
     child_schemas = {schema["name"] for schema in backend.calls[1][1]}
     assert child_schemas == {
         "agent",
+        "agent_output",
         "agent_status",
         "fetch",
         "read",
@@ -1148,6 +1226,7 @@ async def test_plan_child_includes_todo_and_only_read_only_tools(tmp_path: Path)
 
     assert {schema["name"] for schema in backend.calls[1][1]} == {
         "agent",
+        "agent_output",
         "agent_status",
         "fetch",
         "read",
@@ -1433,7 +1512,7 @@ async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
     await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.content == "child complete"
+    assert result.content.startswith("child complete")
     child_result = next(
         message.tool_result
         for message in ConversationStore(
@@ -1441,7 +1520,7 @@ async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
         ).messages()
         if message.tool_result
     )
-    assert child_result.content == "grandchild complete"
+    assert child_result.content.startswith("grandchild complete")
     grandchild_schemas = {
         schema["name"] for schema in backend.calls[2][1]
     }
@@ -1468,6 +1547,7 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
     grandchild_tools = {schema["name"] for schema in backend.calls[2][1]}
     assert child_tools == {
         "agent",
+        "agent_output",
         "agent_status",
         "fetch",
         "read",
@@ -1476,6 +1556,7 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
     }
     assert grandchild_tools == {
         "agent_status",
+        "agent_output",
         "fetch",
         "read",
         "skill",
@@ -1589,10 +1670,12 @@ async def test_top_level_agent_calls_get_fresh_shared_turn_budgets(
     results = [
         message.tool_result for message in store.messages() if message.tool_result
     ]
-    assert [result.content for result in results if result is not None] == [
-        "first complete",
-        "second complete",
-    ]
+    assert all(
+        result is not None and result.content.startswith(expected)
+        for result, expected in zip(
+            results, ("first complete", "second complete"), strict=True
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -1617,10 +1700,9 @@ async def test_parallel_top_level_agent_invocations_have_independent_budgets(
         )
         return result.content
 
-    assert await asyncio.gather(run_agent(1), run_agent(2)) == [
-        "agent 1 complete",
-        "agent 2 complete",
-    ]
+    results = await asyncio.gather(run_agent(1), run_agent(2))
+    assert results[0].startswith("agent 1 complete")
+    assert results[1].startswith("agent 2 complete")
 
 
 @pytest.mark.asyncio
@@ -1963,6 +2045,123 @@ async def test_empty_child_final_message_returns_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_child_answer_with_cancellation_prefix_is_success(
+    tmp_path: Path,
+) -> None:
+    answer = "tool execution canceled, but this is the answer"
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call()]),
+            ScriptedTurn([TextContent(answer)]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result is not None
+    assert result.is_error is False
+    assert result.content.startswith(answer)
+    child = ConversationStore(store.session_dir / "agents", session_id="1")
+    assert child.agent_canceled() is None
+
+
+@pytest.mark.asyncio
+async def test_failed_agent_receipt_stats_match_is_error(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[_agent_call()]), ScriptedTurn()]
+    )
+    store = ConversationStore(tmp_path)
+
+    events = await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result is not None
+    assert result.is_error is True
+    assert "error=true" in result.content
+    assert "canceled=false" in result.content
+    rendered = render_event(
+        next(
+            event
+            for event in events
+            if event.type is StreamEventType.TOOL_EXECUTION_END
+        )
+    )
+    assert rendered is not None
+    assert rendered.plain.count("error=true") == 1
+    assert rendered.plain.count("canceled=false") == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_background_receipt_matches_error_flag(
+    tmp_path: Path,
+) -> None:
+    call = _background_agent_call()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=[call]), ScriptedTurn()]),
+        store,
+        max_turns=1,
+    )
+    background_events: list[StreamEvent] = []
+    loop.set_background_event_sink(background_events.append)
+
+    await _collect(loop.run_turn("start"))
+    await loop._background_owner.wait()
+    notification = store.agent_notifications(pending_only=False)[0]
+    terminal = next(
+        event
+        for event in background_events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+
+    assert notification.data["status"] == "error"
+    assert notification.data["text"].count("error=true") == 1
+    assert notification.data["text"].count("canceled=false") == 1
+    assert terminal.tool_result is not None
+    assert terminal.tool_result.is_error is True
+    assert terminal.tool_result.is_canceled is False
+    rendered = render_event(terminal)
+    assert rendered is not None
+    assert rendered.plain.count("error=true") == 1
+    assert rendered.plain.count("canceled=false") == 1
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_multibyte_agent_receipt_stays_within_response_limit(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call()]),
+            ScriptedTurn([TextContent("😀" * 1_800)]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    persisted = next(message for message in store.messages() if message.tool_result)
+    result = persisted.tool_result
+    assert result is not None
+    assert len(json.dumps(persisted.to_dict(), ensure_ascii=False).encode("utf-8")) <= 10_000
+    receipt_row = next(
+        row
+        for row in store.path.read_bytes().splitlines()
+        if b'"tool_result"' in row
+    )
+    assert len(receipt_row) <= 10_000
+    assert result.content.count("error=false") == 1
+    assert result.content.count("canceled=false") == 1
+
+
+@pytest.mark.asyncio
 async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     backend = FakeBackend(
         [
@@ -1976,14 +2175,26 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     await asyncio.sleep(0.05)
     loop.abort()
 
-    await task
+    events = await task
     result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.content == "tool execution canceled"
+    assert result.content.startswith("tool execution canceled")
+    assert "error=false" in result.content
+    assert "canceled=true" in result.content
     assert result.structured_content == {
         "turns_used": 0,
         "child_session_path": str(store.session_dir / "agents" / "1"),
         "child_instance_id": f"{store.session_id}:1",
     }
+    rendered = render_event(
+        next(
+            event
+            for event in events
+            if event.type is StreamEventType.TOOL_EXECUTION_END
+        )
+    )
+    assert rendered is not None
+    assert rendered.plain.count("error=false") == 1
+    assert rendered.plain.count("canceled=true") == 1
     child_state = (store.session_dir / "agents" / "1" / "session_state.json").read_text()
     assert '"agent_parent"' not in child_state
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
@@ -2067,7 +2278,7 @@ async def test_parent_result_append_precedes_marker_cleanup(tmp_path: Path, monk
     AgentLoop(FakeBackend([]), replayed, max_turns=1)
     results = [message.tool_result for message in replayed.messages() if message.tool_result]
     assert len(results) == 1
-    assert results[0].content == "done"
+    assert results[0].content.startswith("done")
     assert not replayed.agent_children()
 
 
@@ -2089,7 +2300,7 @@ def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
     AgentLoop(FakeBackend([]), store, max_turns=1)
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
-    assert result.content == "tool execution canceled"
+    assert result.content.startswith("tool execution canceled")
     assert result.structured_content == {
         "turns_used": 2,
         "child_session_path": str(child.session_dir),
@@ -2229,7 +2440,7 @@ async def test_agent_without_a_model_still_inherits_the_parent_backend(
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
     )
-    assert result.content == "done"
+    assert result.content.startswith("done")
     # Parent and child both ran on the one backend, so it saw both turns.
     assert len(backend.calls) == 2
 
@@ -2251,7 +2462,7 @@ async def test_agent_with_a_model_runs_the_child_on_that_provider(
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
     )
-    assert result.content == "codex done"
+    assert result.content.startswith("codex done")
     # The child talked to the substitute, never to the parent's backend.
     assert len(child_backend.calls) == 1
     assert len(parent_backend.calls) == 1

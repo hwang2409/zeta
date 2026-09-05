@@ -14,13 +14,17 @@ import httpx
 
 from .agent_background import (
     BackgroundAgentOwner,
-    adopt_agent_children,
     recover_agent_children,
 )
 from .agent_budget import (
     MAX_AGENT_DEPTH,
     AgentTree,
     consume_turn,
+)
+from .agent_receipt import (
+    TerminalState,
+    finalize_agent_results,
+    terminal_state,
 )
 from .agent_runner import run_agent_tool
 from .core.abort import AbortSignal as ToolAbortSignal
@@ -46,7 +50,7 @@ from .mcp.commands import (
 )
 from .prompts import load_identity
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
-from .tools.agent import agent_result
+from .tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from .tools.agent_presets import (
     compose_system_prompt,
     get_agent_preset,
@@ -93,7 +97,7 @@ async def _close_completion(
         return None
     try:
         await close()
-    except BaseException as exc:
+    except BaseException as exc:  # noqa: BLE001 - preserve close errors
         return exc
     return None
 
@@ -123,7 +127,7 @@ def _error_info(error: BaseException) -> ErrorInfo:
                 code = "backend_error"
     try:
         message = str(error).strip()
-    except Exception:
+    except Exception:  # noqa: BLE001 - malformed exception text is recoverable
         message = ""
     if not message:
         message = type(error).__name__
@@ -158,11 +162,12 @@ def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
     except ValueError as exc:
         return ToolResult(expected_id, f"invalid tool result: {exc}", True)
     return ToolResult(
-        expected_id,
-        flatten_tool_content(structured_result["content"]),
-        structured_result["isError"],
-        content_blocks=structured_result["content"],
-        structured_content=structured_result["structuredContent"],
+            expected_id,
+            flatten_tool_content(structured_result["content"]),
+            structured_result["isError"],
+            content_blocks=structured_result["content"],
+            structured_content=structured_result["structuredContent"],
+            is_canceled=structured_result.get("isCanceled", False),
     )
 
 
@@ -487,7 +492,8 @@ class AgentLoop:
         tool_call_id: str,
         content: str,
         *,
-        error: bool,
+        state: TerminalState | None = None,
+        error: bool | None = None,
         child_session_path: str | None = None,
         turns_used: int | None = None,
         agent_type: str | None = None,
@@ -496,6 +502,9 @@ class AgentLoop:
         description: str | None = None,
         depth: int | None = None,
         budget_exhausted: bool = False,
+        stats: dict[str, object] | None = None,
+        include_stats: bool = True,
+        canceled: bool = False,
     ) -> dict[str, object]:
         child_store = self._agent_child_stores.get(tool_call_id)
         path = (
@@ -512,9 +521,20 @@ class AgentLoop:
         )
         if child_instance_id is None and child_store is not None:
             child_instance_id = child_store.agent_handle()
+        result_status = (
+            "running"
+            if status == "running"
+            else state
+            or terminal_state(
+                error=error is True,
+                canceled=canceled,
+                status=status,
+            )
+        )
         return agent_result(
             content,
-            error=error,
+            tool_call_id=tool_call_id,
+            error=result_status == "failed",
             turns_used=turns,
             child_session_path=path,
             agent_type=(
@@ -522,11 +542,19 @@ class AgentLoop:
                 if (preset := get_agent_preset(agent_type)) is not None
                 else None
             ),
-            status=status,
+            status=status if status == "running" else None,
             child_instance_id=child_instance_id,
             description=description,
             depth=depth,
             budget_exhausted=budget_exhausted,
+            stats=stats,
+            include_stats=include_stats,
+            canceled=result_status == "canceled",
+            max_bytes=getattr(
+                getattr(self, "tool_registry", None),
+                "max_output_chars",
+                MAX_AGENT_RESULT_BYTES,
+            ),
         )
 
     def _canceled_agent_result(
@@ -542,7 +570,7 @@ class AgentLoop:
             self._child_result_payload(
                 tool_call_id,
                 "tool execution canceled",
-                error=True,
+                state="canceled",
                 child_session_path=child_session_path,
                 turns_used=turns_used,
                 agent_type=agent_type,
@@ -762,10 +790,10 @@ class AgentLoop:
                     )
                 )
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - report execution failures
             result = ToolResult(tool_call.id, str(exc), is_error=True)
         result = _validated_tool_result(result, tool_call.id)
-        if result.content == "tool execution canceled" and result.is_error:
+        if result.is_canceled:
             result = self.finalize_canceled(request_id)
         else:
             result = self._finalize_tool_results([tool_call], [result])[0]
@@ -821,7 +849,7 @@ class AgentLoop:
             await self._ensure_mcp_servers()
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - report setup failures
             setup_error = _error_info(exc)
 
         for notification in self.store.agent_notifications():
@@ -913,9 +941,11 @@ class AgentLoop:
                         and event.type is StreamEventType.MESSAGE_END
                     ):
                         assistant_message = event.message
-                    if event.type is StreamEventType.MESSAGE_END:
-                        if not event.data.get("truncated"):
-                            completion_succeeded = True
+                    if (
+                        event.type is StreamEventType.MESSAGE_END
+                        and not event.data.get("truncated")
+                    ):
+                        completion_succeeded = True
                     yield event
                     if provider_error is not None:
                         yield StreamEvent(
@@ -1038,70 +1068,7 @@ class AgentLoop:
         calls: Sequence[ToolCall],
         slots: Sequence[ToolResult | None],
     ) -> list[ToolResult]:
-        results: list[ToolResult] = []
-        new_results: list[tuple[ToolCall, ToolResult]] = []
-        for call, slot in zip(calls, slots, strict=True):
-            result = self._existing_tool_result(call.id)
-            stored_result = result
-            child_store = self._agent_child_stores.get(call.id)
-            candidate = result if result is not None else slot
-            if child_store is not None and (
-                candidate is None or candidate.content == "tool execution canceled"
-            ):
-                result = self._canceled_agent_result(
-                    call.id,
-                    child_session_path=str(child_store.session_dir),
-                    agent_type=self._agent_child_types.get(call.id),
-                )
-            if result is None:
-                result = slot
-                if result is None and call.name == "agent":
-                    result = self._canceled_agent_result(call.id)
-                if result is None:
-                    result = ToolResult(
-                        call.id,
-                        "tool execution canceled",
-                        is_error=True,
-                    )
-            if stored_result is None:
-                new_results.append((call, result))
-            results.append(result)
-        for call, result in new_results:
-            self.store.append_message(
-                Message(
-                    MessageRole.TOOL_RESULT,
-                    [TextContent(result.content)],
-                    tool_result=result,
-                )
-            )
-            if self.hooks is not None:
-                self.hooks.post_tool(call.name, result.content)
-            if call.name == "agent":
-                is_background = (
-                    result.structured_content is not None
-                    and result.structured_content.get("status") == "running"
-                )
-                if is_background:
-                    continue
-                child_store = self._agent_child_stores.pop(call.id, None)
-                if child_store is not None:
-                    if result.content == "tool execution canceled":
-                        child_store.mark_agent_canceled(call.id)
-                    else:
-                        adopt_agent_children(
-                            child_store,
-                            self.store,
-                            background_owner=self._background_owner,
-                        )
-                        child_store.finish_agent_parent()
-                self.store.finish_agent_child(
-                    f"{self.agent_instance_id}:{child_store.session_id}"
-                    if child_store is not None and self.agent_instance_id is not None
-                    else call.id
-                )
-                self._agent_child_turns.pop(call.id, None)
-                self._agent_child_types.pop(call.id, None)
-        return results
+        return finalize_agent_results(self, calls, slots)
 
     def _persist_partial(
         self,
@@ -1140,14 +1107,14 @@ class AgentLoop:
             self._persist_partial_with_cancelled_tools(
                 partial_blocks, assistant_message
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - warn when persistence fails
             try:
                 warnings.warn(
                     f"failed to persist partial state: {exc}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-            except:
+            except BaseException:  # noqa: BLE001, S110 - warning failure is ignored
                 pass
 
     def _persist_partial_with_cancelled_tools(

@@ -13,13 +13,14 @@ from .agent_budget import (
     AgentTree,
 )
 from .agent_budget import child_depth as next_agent_depth
+from .agent_receipt import TerminalState
 from .core.abort import AbortSignal as ToolAbortSignal
 from .core.checkpoints import _now
 from .core.store import ConversationStore
 from .model_catalog import provider_for_model
 from .providers.factory import build_backend, credential_store
 from .tools import ToolStreamPublisher
-from .tools.agent import ChildApprovalPolicy
+from .tools.agent import ChildApprovalPolicy, agent_stats
 from .tools.agent_presets import (
     GENERAL_PRESET,
     agent_type_names,
@@ -53,7 +54,8 @@ async def consume_child(
     child_turns: Callable[[], int],
     update_turns: Callable[[int], None],
     update_step: Callable[[str], None],
-    finish_lifecycle: Callable[[str, str], None],
+    update_tool_calls: Callable[[int], None],
+    finish_lifecycle: Callable[[str, str], dict[str, object]],
     publish_lifecycle: Callable[..., None],
     child_result: Callable[..., dict[str, object]],
     error_message: Callable[[BaseException], str],
@@ -65,12 +67,18 @@ async def consume_child(
     cap_hit = False
     failure_message: str | None = None
     budget_exhausted = False
+    tool_calls = 0
 
     def terminal_result(
-        result: dict[str, object], *, state: str, text: str
+        *, state: TerminalState, text: str, **result_options: object
     ) -> dict[str, object]:
-        finish_lifecycle(state, text)
-        return result
+        stats = finish_lifecycle(state, text)
+        return child_result(
+            text,
+            state=state,
+            stats=stats,
+            **result_options,
+        )
 
     def lifecycle_depth(call: ToolCall | None) -> int:
         if call is not None and call.name.casefold() == "agent":
@@ -100,6 +108,8 @@ async def consume_child(
                     depth=lifecycle_depth(event.tool_call),
                 )
             elif event.type is StreamEventType.TOOL_EXECUTION_START:
+                tool_calls += 1
+                update_tool_calls(tool_calls)
                 name = event.tool_call.name if event.tool_call is not None else "tool"
                 arguments = (
                     event.tool_call.arguments if event.tool_call is not None else {}
@@ -145,14 +155,14 @@ async def consume_child(
                     failure_message = event.error.message
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if budget_exhausted:
         text = f"agent error: {failure_message or 'shared agent turn budget exhausted'}"
         return terminal_result(
-            child_result(text, error=True, budget_exhausted=True),
             state="failed",
             text=text,
+            budget_exhausted=True,
         )
     if cap_hit:
         text = (
@@ -162,29 +172,20 @@ async def consume_child(
             f"turns used: {child_turns()}"
         )
         return terminal_result(
-            child_result(text, error=True),
             state="failed",
             text=text,
         )
     if failure_message is not None:
         text = f"agent error: {failure_message}"
-        return terminal_result(
-            child_result(text, error=True), state="failed", text=text
-        )
+        return terminal_result(state="failed", text=text)
     if final_message is None:
         text = "agent error: child ended without a final response"
-        return terminal_result(
-            child_result(text, error=True), state="failed", text=text
-        )
+        return terminal_result(state="failed", text=text)
     final_text = assistant_text(final_message)
     if not final_text.strip():
         text = "agent error: child returned an empty final assistant message"
-        return terminal_result(
-            child_result(text, error=True), state="failed", text=text
-        )
-    return terminal_result(
-        child_result(final_text, error=False), state="completed", text=final_text
-    )
+        return terminal_result(state="failed", text=text)
+    return terminal_result(state="completed", text=final_text)
 
 
 def resolve_child_backend(
@@ -243,19 +244,19 @@ async def run_agent_tool(
         return loop._child_result_payload(
             tool_call.id,
             "agent error: prompt must be a nonempty string",
-            error=True,
+            state="failed",
         )
     if type(description) is not str or not description.strip():
         return loop._child_result_payload(
             tool_call.id,
             "agent error: description must be a nonempty string",
-            error=True,
+            state="failed",
         )
     if type(background) is not bool:
         return loop._child_result_payload(
             tool_call.id,
             "agent error: background must be a boolean",
-            error=True,
+            state="failed",
         )
     preset = get_agent_preset(agent_type)
     if preset is None:
@@ -263,28 +264,28 @@ async def run_agent_tool(
             tool_call.id,
             "agent error: unknown agent_type "
             f"{agent_type!r}; expected one of: {', '.join(agent_type_names())}",
-            error=True,
+            state="failed",
         )
     if loop.plan_mode and preset.name == GENERAL_PRESET.name:
         return loop._child_result_payload(
             tool_call.id,
             "agent error: general agents are unavailable in plan mode; "
             "use agent_type 'explore' or 'plan'",
-            error=True,
+            state="failed",
         )
     child_backend, backend_error = resolve_child_backend(loop, model)
     if backend_error is not None:
         return loop._child_result_payload(
             tool_call.id,
             backend_error,
-            error=True,
+            state="failed",
         )
     child_depth, nesting_error = next_agent_depth(loop.agent_depth, background)
     if nesting_error is not None:
         return loop._child_result_payload(
             tool_call.id,
             nesting_error,
-            error=True,
+            state="failed",
         )
     agent_tree = loop._agent_tree or AgentTree()
     agent_tree.ensure_budget(
@@ -292,7 +293,16 @@ async def run_agent_tool(
         if loop._agent_turn_budget is not None
         else preset.turn_cap
     )
-    await loop._ensure_mcp_servers()
+    try:
+        await loop._ensure_mcp_servers()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - setup failures become receipts
+        return loop._child_result_payload(
+            tool_call.id,
+            f"agent error: {error_message(exc)}",
+            state="failed",
+        )
     stored_agent_type = None if preset.name == GENERAL_PRESET.name else preset.name
     child_number = loop.store.allocate_agent_index()
     agents_root = loop.store.session_dir / "agents"
@@ -324,56 +334,77 @@ async def run_agent_tool(
         agent_type=preset.name,
         description=description,
     )
-    loop._agent_child_stores[tool_call.id] = child_store
-    loop._agent_child_turns[tool_call.id] = 0
-    loop._agent_child_types[tool_call.id] = preset.name
-    child_marker_key = child_instance_id if child_depth > 1 else tool_call.id
-    if publisher is not None:
-        publisher.set_metadata({"child_session_path": child_path, "depth": child_depth})
-    excluded_names = {"agent"} if child_depth == MAX_AGENT_DEPTH else set()
-    if preset.tool_names is not None:
-        allowed_names = set(preset.tool_names)
-        if child_depth < MAX_AGENT_DEPTH:
-            allowed_names.add("agent")
-        excluded_names.update(
-            set(loop.tool_registry.definitions_by_name) - allowed_names
-        )
-    child_registry = loop.tool_registry.clone_for_session(
-        child_store,
-        exclude_names=excluded_names,
-    )
-    parent_policy = loop.tool_registry.approval_policy
-    child_policy: ChildApprovalPolicy | None = None
-    if parent_policy is not None:
-        child_policy = ChildApprovalPolicy(
-            parent_policy,
+    try:
+        loop._agent_child_stores[tool_call.id] = child_store
+        loop._agent_child_turns[tool_call.id] = 0
+        loop._agent_child_types[tool_call.id] = preset.name
+        child_marker_key = child_instance_id if child_depth > 1 else tool_call.id
+        if publisher is not None:
+            publisher.set_metadata(
+                {"child_session_path": child_path, "depth": child_depth}
+            )
+        excluded_names = {"agent"} if child_depth == MAX_AGENT_DEPTH else set()
+        if preset.tool_names is not None:
+            allowed_names = set(preset.tool_names)
+            if child_depth < MAX_AGENT_DEPTH:
+                allowed_names.add("agent")
+            excluded_names.update(
+                set(loop.tool_registry.definitions_by_name) - allowed_names
+            )
+        child_registry = loop.tool_registry.clone_for_session(
             child_store,
-            description,
-            child_instance_id,
+            exclude_names=excluded_names,
         )
-        child_registry.set_approval_policy(child_policy)
-    from .loop import AgentLoop
+        parent_policy = loop.tool_registry.approval_policy
+        child_policy: ChildApprovalPolicy | None = None
+        if parent_policy is not None:
+            child_policy = ChildApprovalPolicy(
+                parent_policy,
+                child_store,
+                description,
+                child_instance_id,
+            )
+            child_registry.set_approval_policy(child_policy)
+        from .loop import AgentLoop
 
-    child_loop = AgentLoop(
-        child_backend,
-        child_store,
-        registry=child_registry,
-        max_turns=preset.turn_cap,
-        token_budget=loop.context_assembler.token_budget,
-        retained_tail=loop.context_assembler.retained_tail,
-        system_prompt=compose_system_prompt(
-            loop.context_assembler.system_prompt,
-            preset.preamble,
-        ),
-        skip_mcp_mount=True,
-        agent_depth=child_depth,
-        agent_instance_id=child_instance_id,
-        agent_tree=agent_tree,
-        background_owner=loop._background_owner,
-    )
-    if loop.plan_mode:
-        child_loop.set_plan_mode(True)
-    child_loop.set_background_event_sink(loop._publish_background_event)
+        child_loop = AgentLoop(
+            child_backend,
+            child_store,
+            registry=child_registry,
+            max_turns=preset.turn_cap,
+            token_budget=loop.context_assembler.token_budget,
+            retained_tail=loop.context_assembler.retained_tail,
+            system_prompt=compose_system_prompt(
+                loop.context_assembler.system_prompt,
+                preset.preamble,
+            ),
+            skip_mcp_mount=True,
+            agent_depth=child_depth,
+            agent_instance_id=child_instance_id,
+            agent_tree=agent_tree,
+            background_owner=loop._background_owner,
+        )
+        if loop.plan_mode:
+            child_loop.set_plan_mode(True)
+        child_loop.set_background_event_sink(loop._publish_background_event)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - setup failures become receipts
+        failure_text = f"agent error: {error_message(exc)}"
+        child_store.finish_agent_lifecycle(
+            "failed",
+            final_result=failure_text,
+            turns_used=0,
+        )
+        return loop._child_result_payload(
+            tool_call.id,
+            failure_text,
+            state="failed",
+            child_session_path=child_path,
+            agent_type=preset.name,
+            child_instance_id=child_instance_id,
+            depth=child_depth,
+        )
     lifecycle_sink = (
         execution_context.lifecycle_sink if execution_context is not None else None
     )
@@ -400,23 +431,31 @@ async def run_agent_tool(
     def update_step(step: str) -> None:
         child_store.update_agent_lifecycle(current_step=step)
 
-    def finish_lifecycle(state: str, text: str) -> None:
+    def finish_lifecycle(state: str, text: str) -> dict[str, object]:
         child_store.finish_agent_lifecycle(
             state,
             final_result=text,
+            turns_used=child_turns(),
+        )
+        return agent_stats(
+            child_store.agent_lifecycle(),
             turns_used=child_turns(),
         )
 
     def child_result(
         text: str,
         *,
-        error: bool,
+        state: TerminalState | None = None,
+        error: bool | None = None,
         status: str | None = None,
         budget_exhausted: bool = False,
+        stats: dict[str, object] | None = None,
+        include_stats: bool = not background,
     ) -> dict[str, object]:
         return loop._child_result_payload(
             tool_call.id,
             text,
+            state=state,
             error=error,
             child_session_path=child_path,
             agent_type=preset.name,
@@ -425,6 +464,8 @@ async def run_agent_tool(
             description=description if background else None,
             depth=child_depth,
             budget_exhausted=budget_exhausted,
+            stats=stats,
+            include_stats=include_stats,
         )
 
     def publish_lifecycle(
@@ -463,6 +504,9 @@ async def run_agent_tool(
         child_store.update_agent_lifecycle(turns_used=turns)
         loop.store.update_agent_child_turns(child_marker_key, turns)
 
+    def update_tool_calls(tool_calls: int) -> None:
+        child_store.update_agent_lifecycle(tool_calls=tool_calls)
+
     child_task = loop._create_task(
         consume_child(
             child_loop,
@@ -472,6 +516,7 @@ async def run_agent_tool(
             publish=publish,
             child_turns=child_turns,
             update_turns=update_turns,
+            update_tool_calls=update_tool_calls,
             update_step=update_step,
             finish_lifecycle=finish_lifecycle,
             publish_lifecycle=publish_lifecycle,
@@ -520,8 +565,8 @@ async def run_agent_tool(
                 child_path=child_path,
                 description=description,
                 child_turns=child_turns,
-                build_result=lambda text, error, status: child_result(
-                    text, error=error, status=status
+                build_result=lambda text, error, status, stats: child_result(
+                    text, error=error, status=status, stats=stats, include_stats=True
                 ),
                 validate_result=validate_result,
                 publish_event=loop._publish_background_event,

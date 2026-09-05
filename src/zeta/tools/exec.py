@@ -368,6 +368,7 @@ async def run_exec_macro(
             result["isError"],
             content_blocks=result["content"],
             structured_content=structured,
+            is_canceled=result.get("isCanceled", False),
         )
     except asyncio.CancelledError:
         scope_signal.abort()
@@ -375,6 +376,7 @@ async def run_exec_macro(
             call.id,
             "tool execution canceled",
             True,
+            is_canceled=True,
             structured_content={"log_path": str(log_path)},
         )
 
@@ -495,11 +497,7 @@ async def run_inline_shell_batch(
 
 
 def _inline_shell_was_canceled(result: StructuredToolResult) -> bool:
-    content = result.get("content")
-    return result.get("isError") is True and isinstance(content, list) and any(
-        isinstance(block, dict) and block.get("text") == "tool execution canceled"
-        for block in content
-    )
+    return result.get("isCanceled") is True
 
 
 def _inline_shell_was_denied(result: StructuredToolResult) -> bool:

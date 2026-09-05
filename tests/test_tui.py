@@ -20,20 +20,20 @@ from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
 
-import pytest
 import httpx
+import pytest
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import set_app
+from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
-from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.output import DummyOutput
-from prompt_toolkit.output.vt100 import Vt100_Output
-from prompt_toolkit.data_structures import Point, Size
+from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.cells import cell_len
 from rich.console import Console
 from rich.panel import Panel
@@ -46,17 +46,21 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.mcp import MCPPrompt, MCPPromptArgument
-from zeta.providers.anthropic import AnthropicBackend, AnthropicCredentialStore, OAuthTokens
+from zeta.persistence import DraftPersistence, history_for
+from zeta.providers.anthropic import (
+    AnthropicBackend,
+    AnthropicCredentialStore,
+    OAuthTokens,
+)
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
 from zeta.tools import ToolStreamPublisher
-from zeta.tui.app import FullScreenPromptSession, TUIApp, background_notice
 from zeta.tui.agent_card import AgentCard
+from zeta.tui.app import FullScreenPromptSession, TUIApp, background_notice
 from zeta.tui.composer import (
     UndoCandidate,
     build_key_bindings,
     parse_input,
 )
-from zeta.persistence import DraftPersistence, history_for
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
@@ -64,20 +68,20 @@ PNG = bytes.fromhex(
 )
 from zeta.tui.layout import content_width
 from zeta.tui.render import (
+    _render_tool_output,
     format_status,
     format_thought,
-    render_code,
-    render_event,
+    is_retryable_error,
     render_agent_progress,
     render_agent_receipt,
+    render_code,
+    render_event,
     render_line,
     render_markdown,
     render_thought,
     render_thought_live,
     render_tool_progress,
-    is_retryable_error,
     tool_render_mode,
-    _render_tool_output,
 )
 from zeta.tui.theme import ACCENT, BODY, DIM, ERROR, RICH_THEME
 from zeta.tui.transcript import TranscriptPresenter, TranscriptWidget
@@ -91,11 +95,11 @@ from zeta.types import (
     StreamEvent,
     StreamEventType,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolSchema,
     ToolUseContent,
-    ThinkingContent,
 )
 
 
@@ -2500,14 +2504,40 @@ def test_agent_receipts_show_success_and_canceled_status() -> None:
     canceled = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,
         tool_call=call,
-        tool_result=ToolResult(call.id, "tool execution canceled", is_error=True),
+        tool_result=ToolResult(
+            call.id,
+            "tool execution canceled",
+            is_error=True,
+            is_canceled=True,
+        ),
         data={"elapsed_seconds": 0.4, "depth": 2},
     )
 
     assert "2 turns · 1.5s · ok" in render_agent_receipt(success).plain
     canceled_plain = render_agent_receipt(canceled).plain
     assert "0 turns · 0.4s · canceled" in canceled_plain
+    assert "error=false" in canceled_plain
+    assert "canceled=true" in canceled_plain
+    assert "error=true" not in canceled_plain
     assert "depth 2" in canceled_plain
+
+
+def test_unstructured_agent_error_renders_as_error() -> None:
+    call = ToolCall(
+        "agent-error",
+        "agent",
+        {"prompt": "inspect", "description": "task research"},
+    )
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(call.id, "setup exploded", is_error=True),
+    )
+
+    rendered = render_agent_receipt(event)
+
+    assert "error=true" in rendered.plain
+    assert "canceled=false" in rendered.plain
 
 
 def test_background_start_event_reaches_presenter_with_depth(tmp_path: Path) -> None:
@@ -3169,7 +3199,7 @@ def test_recovered_canceled_agent_card_expands_with_child_tail(tmp_path: Path) -
 def test_finished_agent_card_keeps_elapsed_time_after_clock_moves(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import zeta.tui.agent_card as agent_card
+    from zeta.tui import agent_card
 
     clock = iter((100.0, 105.0, 205.0))
     monkeypatch.setattr(agent_card.time, "monotonic", lambda: next(clock))
@@ -3463,7 +3493,7 @@ def test_redacted_thought_renders_as_collapsed_line_with_duration() -> None:
 
 @pytest.mark.asyncio
 async def test_anthropic_redacted_thinking_reaches_tui_stream(tmp_path: Path) -> None:
-    stream = "\n".join(
+    stream = "\n".join(  # noqa: FLY002 - construct the SSE fixture clearly
         [
             'data: {"type":"message_start","message":{}}',
             "",
@@ -4115,7 +4145,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     try:
         output = bytearray()
         deadline = time.monotonic() + 5
-        while " > ".encode() not in output and time.monotonic() < deadline:
+        while b" > " not in output and time.monotonic() < deadline:
             ready, _, _ = select.select(
                 [master_fd],
                 [],
@@ -4124,7 +4154,7 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
             )
             if ready:
                 output.extend(os.read(master_fd, 4096))
-        assert " > ".encode() in output
+        assert b" > " in output
 
         os.write(master_fd, b"\x04")
         deadline = time.monotonic() + 5
@@ -4297,6 +4327,7 @@ def test_tui_import_does_not_load_cli() -> None:
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
 
     assert result.returncode == 0, result.stderr

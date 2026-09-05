@@ -293,7 +293,7 @@ async def test_allowed_sub_agents_complete_a_turn_in_plan_mode(
         if message.tool_result is not None
     )
     assert child_result.is_error is False
-    assert child_result.content == "child complete"
+    assert child_result.content.startswith("child complete")
     assert len(backend.calls) == 2
 
 

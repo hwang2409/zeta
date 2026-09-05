@@ -375,6 +375,7 @@ class AgentStateMixin:
                 "started_monotonic": time.monotonic(),
                 "monotonic_pid": os.getpid(),
                 "turns_used": 0,
+                "tool_calls": 0,
                 "tree_budget": tree_budget,
                 "current_step": "starting",
                 "depth": depth,
@@ -388,6 +389,7 @@ class AgentStateMixin:
         *,
         current_step: str | None = None,
         turns_used: int | None = None,
+        tool_calls: int | None = None,
     ) -> None:
         """Persist a live child's latest step and turn count."""
 
@@ -395,6 +397,8 @@ class AgentStateMixin:
             raise ValueError("agent lifecycle step must be nonempty")
         if turns_used is not None and (type(turns_used) is not int or turns_used < 0):
             raise ValueError("agent lifecycle turns must be nonnegative")
+        if tool_calls is not None and (type(tool_calls) is not int or tool_calls < 0):
+            raise ValueError("agent lifecycle tool calls must be nonnegative")
         with self._append_lock():
             self._load()
             self._load_session_state()
@@ -404,6 +408,8 @@ class AgentStateMixin:
                 self._agent_lifecycle["current_step"] = current_step
             if turns_used is not None:
                 self._agent_lifecycle["turns_used"] = turns_used
+            if tool_calls is not None:
+                self._agent_lifecycle["tool_calls"] = tool_calls
             self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(
                 self._agent_lifecycle
             )
