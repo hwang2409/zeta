@@ -650,11 +650,12 @@ class SlowSecondCompletionBackend(CompletionBackend):
 
 
 async def wait_until(check: Callable[[], bool]) -> None:
-    for _ in range(100):
-        if check():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition did not become true")
+    try:
+        async with asyncio.timeout(30):
+            while not check():
+                await asyncio.sleep(0.01)
+    except TimeoutError as exc:
+        raise AssertionError("condition did not become true") from exc
 
 
 def app_session(app: TUIApp, pipe: PipeInput) -> PromptSession[str]:
@@ -5937,11 +5938,13 @@ async def test_spinner_pulses_on_timer(tmp_path: Path) -> None:
     app._streaming = True
     app._spinner_active = True
     task = asyncio.create_task(app._pulse_spinner())
-    await asyncio.sleep(0.45)
-    app._streaming = False
-    app._spinner_active = False
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    try:
+        await wait_until(lambda: app._spinner_frame >= 2)
+    finally:
+        app._streaming = False
+        app._spinner_active = False
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     assert app._spinner_frame >= 2
 
