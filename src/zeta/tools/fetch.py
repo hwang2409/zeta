@@ -506,10 +506,8 @@ def _readable_content(url: str, content_type: str, body: str) -> str:
     if (
         not media_type
         or media_type.startswith("text/")
-        or media_type == "application/json"
-        or media_type.endswith("+json")
-        or media_type == "application/xml"
-        or media_type.endswith("+xml")
+        or media_type in {"application/json", "application/xml"}
+        or media_type.endswith(("+json", "+xml"))
     ):
         return body
     if media_type.startswith(("audio/", "video/", "image/")) or media_type in {

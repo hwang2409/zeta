@@ -12,9 +12,9 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
 from zeta.core.fake import FakeBackend
-from zeta.core.todo import TODO_STATUSES
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
+from zeta.core.todo import TODO_STATUSES
 from zeta.loop import AgentLoop
 from zeta.tools import ToolRegistry
 from zeta.tools import todo as todo_tool
@@ -160,7 +160,10 @@ async def test_todo_rejects_removed_action_argument(tmp_path: Path) -> None:
     result = await registry.execute(ToolCall("action", "todo", {"action": "read"}))
 
     assert result["isError"] is True
-    assert "unexpected properties: action" in result["structuredContent"]["error"]
+    assert (
+        "unexpected properties: action"
+        in result["structuredContent"]["error"]["message"]
+    )
 
 
 @pytest.mark.asyncio
@@ -169,13 +172,6 @@ async def test_todo_rejects_removed_action_argument(tmp_path: Path) -> None:
     [
         ([{"content": " ", "status": "pending"}], "content must be nonempty"),
         ([{"content": "bad status", "status": "paused"}], "status must be one of"),
-        (
-            [
-                {"content": "first", "status": "in_progress"},
-                {"content": "second", "status": "in_progress"},
-            ],
-            "at most one in_progress",
-        ),
     ],
 )
 async def test_todo_rejects_invalid_lists_without_mutating_state(
@@ -194,9 +190,27 @@ async def test_todo_rejects_invalid_lists_without_mutating_state(
     result = await registry.execute(ToolCall("invalid", "todo", {"items": items}))
 
     assert result["isError"] is True
-    assert reason in result["structuredContent"]["error"]
+    assert reason in result["structuredContent"]["error"]["message"]
     assert store.todo_items() == [{"content": "keep", "status": "pending"}]
     assert store.state_path.read_bytes() == state_before
+
+
+@pytest.mark.asyncio
+async def test_todo_accepts_multiple_in_progress_items(tmp_path: Path) -> None:
+    """ZETA-70: multiple in_progress items are allowed (was a live error path)."""
+
+    store, registry = _registry(tmp_path)
+    items = [
+        {"content": "first", "status": "in_progress"},
+        {"content": "second", "status": "in_progress"},
+        {"content": "third", "status": "pending"},
+    ]
+
+    result = await registry.execute(ToolCall("multi", "todo", {"items": items}))
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["counts"]["in_progress"] == 2
+    assert store.todo_items() == items
 
 
 @pytest.mark.asyncio
@@ -223,7 +237,10 @@ async def test_todo_rejects_more_than_fifty_items_without_mutating_state(
     result = await registry.execute(ToolCall("fifty-one", "todo", {"items": items}))
 
     assert result["isError"] is True
-    assert "more than 50 items" in result["structuredContent"]["error"]
+    assert (
+        "more than 50 items"
+        in result["structuredContent"]["error"]["message"]
+    )
     assert store.todo_items() == initial
     assert store.state_path.read_bytes() == state_before
 
@@ -246,7 +263,10 @@ async def test_todo_rejects_overlong_content_without_mutating_state(
     )
 
     assert result["isError"] is True
-    assert "cannot exceed 500 characters" in result["structuredContent"]["error"]
+    assert (
+        "cannot exceed 500 characters"
+        in result["structuredContent"]["error"]["message"]
+    )
     assert store.todo_items() == initial
     assert store.state_path.read_bytes() == state_before
 

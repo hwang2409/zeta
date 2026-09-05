@@ -1716,7 +1716,7 @@ def test_tool_card_preserves_timeout_preamble_before_stdout() -> None:
             tool_call=ToolCall("tool-5", "exec", {"command": "sleep 1"}),
             tool_result=ToolResult(
                 "tool-5",
-                "command timed out\nstdout:\npartial output",
+                "timed out after 30s\nstdout:\npartial output",
                 is_error=True,
             ),
         )
@@ -1724,9 +1724,9 @@ def test_tool_card_preserves_timeout_preamble_before_stdout() -> None:
 
     assert rendered is not None
     plain = renderable_plain(rendered)
-    assert "command timed out" in plain
+    assert "timed out after 30s" in plain
     assert "stdout:\npartial output" in plain
-    assert plain.index("command timed out") < plain.index("stdout:")
+    assert plain.index("timed out after 30s") < plain.index("stdout:")
 
 
 def test_tool_card_preserves_preamble_without_sections() -> None:
@@ -1734,12 +1734,14 @@ def test_tool_card_preserves_preamble_without_sections() -> None:
         StreamEvent(
             StreamEventType.TOOL_EXECUTION_END,
             tool_call=ToolCall("tool-6", "exec", {"command": "sleep 1"}),
-            tool_result=ToolResult("tool-6", "command timed out", is_error=True),
+            tool_result=ToolResult(
+                "tool-6", "timed out after 30s", is_error=True
+            ),
         )
     )
 
     assert rendered is not None
-    assert "command timed out" in renderable_plain(rendered)
+    assert "timed out after 30s" in renderable_plain(rendered)
 
 
 def test_tool_card_preserves_preamble_before_multiple_sections() -> None:

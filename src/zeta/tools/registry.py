@@ -210,17 +210,107 @@ def _success_result(
     }
 
 
-def _error_result(message: str) -> StructuredToolResult:
+def _error_result(
+    message: str,
+    *,
+    kind: str = "error",
+    hint: str = "",
+) -> StructuredToolResult:
     return {
         "content": [text_block(message)],
         "isError": True,
-        "structuredContent": None,
+        "structuredContent": {
+            "error": {"kind": kind, "hint": hint, "message": message},
+        },
     }
+
+
+_ERROR_HINTS: dict[str, str] = {
+    "timeout": "increase the timeout or use run_background for long-running work",
+    "exit_nonzero": "check stderr; the process ran but exited nonzero",
+    "unknown_tool": "call one of the registered tools listed in the schemas",
+    "invalid_arguments": "reread the tool schema and retry with correct arguments",
+    "denied": "the user denied approval; do not retry without new context",
+    "canceled": "the tool call was canceled; retry only if still useful",
+    "sandbox_violation": "retarget to a path inside the session cwd",
+    "invalid_result": "the tool handler returned a malformed result",
+    "error": "",
+}
+
+
+def _extract_error_message(result: StructuredToolResult) -> str:
+    content = result.get("content")
+    if not isinstance(content, list):
+        return ""
+    for block in content:
+        if isinstance(block, Mapping) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                return text
+    return ""
+
+
+def _infer_error_kind(
+    result: StructuredToolResult, structured: Mapping[str, Any]
+) -> str:
+    if structured.get("timed_out") is True:
+        return "timeout"
+    exit_code = structured.get("exit_code")
+    if isinstance(exit_code, int) and exit_code != 0:
+        return "exit_nonzero"
+    message = _extract_error_message(result).lower()
+    if not message:
+        return "error"
+    if message.startswith("tool execution canceled"):
+        return "canceled"
+    if message.startswith("tool execution denied"):
+        return "denied"
+    if message.startswith("unknown tool"):
+        return "unknown_tool"
+    if message.startswith("invalid arguments"):
+        return "invalid_arguments"
+    if message.startswith("invalid tool "):
+        return "invalid_result"
+    if "path escaped" in message or "sandbox integrity" in message:
+        return "sandbox_violation"
+    return "error"
+
+
+def _apply_error_governance(
+    result: StructuredToolResult, tool_name: str
+) -> StructuredToolResult:
+    """Ensure every tool error carries structuredContent.error = {tool, kind, hint}."""
+
+    if not result.get("isError"):
+        return result
+    raw_structured = result.get("structuredContent")
+    structured: dict[str, Any] = (
+        dict(raw_structured) if isinstance(raw_structured, Mapping) else {}
+    )
+    existing = structured.get("error")
+    error: dict[str, Any] = dict(existing) if isinstance(existing, Mapping) else {}
+    kind = error.get("kind")
+    if not isinstance(kind, str) or not kind:
+        kind = _infer_error_kind(result, structured)
+    hint = error.get("hint")
+    if not isinstance(hint, str) or not hint:
+        hint = _ERROR_HINTS.get(kind, "")
+    error["tool"] = tool_name
+    error["kind"] = kind
+    error["hint"] = hint
+    if "message" not in error:
+        message = _extract_error_message(result)
+        if message:
+            error["message"] = message
+    structured["error"] = error
+    return {**result, "structuredContent": structured}
 
 
 def _legacy_result(result: ToolResult) -> StructuredToolResult:
     if type(result.content) is not str:
-        return _error_result("invalid tool result: content")
+        return _error_result(
+            "invalid tool result: content", kind="invalid_result"
+        )
     blocks = (
         result.content_blocks
         if result.content_blocks is not None
@@ -236,7 +326,9 @@ def _legacy_result(result: ToolResult) -> StructuredToolResult:
             structured_result["isCanceled"] = True
         return validate_tool_result(structured_result)
     except ValueError as exc:
-        return _error_result(f"invalid tool result: {exc}")
+        return _error_result(
+            f"invalid tool result: {exc}", kind="invalid_result"
+        )
 
 
 def _normalize_result(
@@ -543,24 +635,31 @@ class ToolRegistry:
         _skip_approval: bool = False,
     ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
+
+        def finalize(result: StructuredToolResult) -> StructuredToolResult:
+            normalized = _normalize_result(result, self.max_output_chars)
+            return _apply_error_governance(normalized, tool_call.name)
+
         if _boundary_signal is not None and _signal_is_set(_boundary_signal):
             signal_state, abort_result = self._arbitrate_abort(
                 tool_call, _boundary_signal, _scope_signal
             )
             if abort_result is not None:
-                return _normalize_result(abort_result, self.max_output_chars)
+                return finalize(abort_result)
         if _signal_is_set(signal_state):
             signal_state, abort_result = self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
             )
             if abort_result is not None:
-                return _normalize_result(abort_result, self.max_output_chars)
+                return finalize(abort_result)
         definition = self._tools.get(tool_call.name)
         if definition is None:
             self._abort_approval(tool_call)
-            return _normalize_result(
-                _error_result(f"unknown tool: {tool_call.name}"),
-                self.max_output_chars,
+            return finalize(
+                _error_result(
+                    f"unknown tool: {tool_call.name}",
+                    kind="unknown_tool",
+                )
             )
         try:
             arguments = (
@@ -570,16 +669,18 @@ class ToolRegistry:
             )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             self._abort_approval(tool_call)
-            return _normalize_result(
-                _error_result(f"invalid arguments: {exc}"),
-                self.max_output_chars,
+            return finalize(
+                _error_result(
+                    f"invalid arguments: {exc}",
+                    kind="invalid_arguments",
+                )
             )
         if _signal_is_set(signal_state):
             signal_state, abort_result = self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
             )
             if abort_result is not None:
-                return _normalize_result(abort_result, self.max_output_chars)
+                return finalize(abort_result)
         gate_result, execution_signal = await self._approval_gate.run(
             tool_call,
             arguments,
@@ -590,16 +691,11 @@ class ToolRegistry:
             persist_request=_persist_approval,
         )
         if gate_result is not None:
-            return _normalize_result(
-                _legacy_result(gate_result), self.max_output_chars
-            )
+            return finalize(_legacy_result(gate_result))
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():
-                return _normalize_result(
-                    _legacy_result(_canceled_result(tool_call.id)),
-                    self.max_output_chars,
-                )
+                return finalize(_legacy_result(_canceled_result(tool_call.id)))
         if _lifecycle_sink is not None:
             _lifecycle_sink("execution_start")
         stream_publisher = (
@@ -628,7 +724,8 @@ class ToolRegistry:
             if result.tool_call_id != tool_call.id:
                 normalized_result = _error_result(
                     f"tool result id mismatch: expected {tool_call.id}, "
-                    f"got {result.tool_call_id}"
+                    f"got {result.tool_call_id}",
+                    kind="invalid_result",
                 )
             else:
                 normalized_result = _legacy_result(result)
@@ -636,14 +733,18 @@ class ToolRegistry:
             try:
                 normalized_result = validate_tool_result(result)
             except ValueError as exc:
-                normalized_result = _error_result(f"invalid tool handler result: {exc}")
+                normalized_result = _error_result(
+                    f"invalid tool handler result: {exc}",
+                    kind="invalid_result",
+                )
         elif isinstance(result, str):
             normalized_result = _success_result(text_block(result))
         else:
             normalized_result = _error_result(
-                "invalid tool handler result: expected str or structured tool result"
+                "invalid tool handler result: expected str or structured tool result",
+                kind="invalid_result",
             )
-        return _normalize_result(normalized_result, self.max_output_chars)
+        return finalize(normalized_result)
 
     def _abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
         if self.approval_policy is None:
@@ -666,7 +767,9 @@ class ToolRegistry:
                 return signal_state, _legacy_result(_canceled_result(tool_call.id))
             return signal_state, None
         if winner is ApprovalDecision.DENY:
-            return signal_state, _error_result("tool execution denied")
+            return signal_state, _error_result(
+                "tool execution denied", kind="denied"
+            )
         return signal_state, _legacy_result(_canceled_result(tool_call.id))
 
     def _next_abort_generation(

@@ -33,7 +33,15 @@ def _todo_error(reason: str) -> StructuredToolResult:
     return {
         "content": [text_block(reason)],
         "isError": True,
-        "structuredContent": {"error": reason},
+        "structuredContent": {
+            "error": {
+                "kind": "invalid_arguments",
+                "message": reason,
+                "hint": (
+                    "reread the todo schema and retry with a valid items array"
+                ),
+            },
+        },
     }
 
 

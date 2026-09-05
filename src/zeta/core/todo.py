@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Literal, TypedDict
 
-
 TodoStatus = Literal["pending", "in_progress", "completed", "canceled"]
 
 
@@ -55,9 +54,6 @@ def parse_todo_items(value: object) -> list[TodoItem]:
             )
         normalized.append({"content": content, "status": status})
 
-    in_progress = sum(item["status"] == "in_progress" for item in normalized)
-    if in_progress > 1:
-        raise ValueError("todo list can have at most one in_progress item")
     return normalized
 
 

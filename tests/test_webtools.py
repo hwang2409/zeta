@@ -8,11 +8,10 @@ from pathlib import Path
 import httpx
 import pytest
 
-import zeta.tools.fetch as fetch_tool
-import zeta.tools.websearch as websearch
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.store import ConversationStore
-from zeta.tools import ToolRegistry
+from zeta.tools import ToolRegistry, websearch
+from zeta.tools import fetch as fetch_tool
 from zeta.types import ToolCall, flatten_tool_content
 
 _ASYNC_CLIENT = httpx.AsyncClient
