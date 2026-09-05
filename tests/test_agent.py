@@ -11,7 +11,7 @@ from zeta.agent_background import (
     adopt_agent_children,
     finish_background_child,
 )
-from zeta.agent_budget import AgentTree
+from zeta.agent_budget import MAX_AGENT_TURN_CAP, AgentTree
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
@@ -2563,3 +2563,201 @@ def test_agent_loop_turn_cap_allows_long_runs(tmp_path: Path) -> None:
     default = inspect.signature(AgentLoop.__init__).parameters["max_turns"].default
     assert default == 150
     assert AgentLoop(FakeBackend([]), ConversationStore(tmp_path)).max_turns == 150
+
+
+@pytest.mark.asyncio
+async def test_background_start_text_names_handle_and_polling_tools(
+    tmp_path: Path,
+) -> None:
+    backend = BackgroundBackend([_background_agent_call()])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.structured_content is not None
+    handle = result.structured_content["child_instance_id"]
+    assert type(handle) is str and handle
+    assert result.structured_content["status"] == "running"
+    assert f"handle={handle}" in result.content
+    assert "agent_status" in result.content
+    assert "agent_output" in result.content
+    assert "task_output" not in result.content
+    assert result.content.startswith("background agent started:")
+
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_max_turns_raises_shared_tree_budget(tmp_path: Path) -> None:
+    """max_turns lifts the shared tree budget without changing the outer loop cap."""
+
+    call = _agent_call()
+    call.arguments["max_turns"] = 60
+    child_read = ToolCall("child-read", "read", {"path": "missing"})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call])]
+        + [
+            ScriptedTurn([TextContent(f"step-{turn}")], tool_calls=[child_read])
+            for turn in range(1, 41)
+        ]
+        + [ScriptedTurn([TextContent("child done")])]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    lifecycle = child_store.agent_lifecycle()
+    assert lifecycle["tree_budget"] == 60
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.is_error is False
+    assert result.content.startswith("child done")
+
+
+@pytest.mark.asyncio
+async def test_max_turns_hard_cap_rejects_oversized_request(tmp_path: Path) -> None:
+    call = _agent_call()
+    call.arguments["max_turns"] = MAX_AGENT_TURN_CAP + 1
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.is_error is True
+    assert f"hard cap of {MAX_AGENT_TURN_CAP}" in result.content
+    assert not (store.session_dir / "agents").exists()
+
+
+@pytest.mark.asyncio
+async def test_max_turns_rejected_by_schema_for_non_positive_input(
+    tmp_path: Path,
+) -> None:
+    """Schema-level minimum:1 catches zero/negative before the runner sees them."""
+
+    call = _agent_call()
+    call.arguments["max_turns"] = 0
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    store = ConversationStore(tmp_path)
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.is_error is True
+    assert "invalid arguments" in result.content
+    assert "max_turns" in result.content
+
+
+@pytest.mark.asyncio
+async def test_max_turns_rejected_from_nested_agent_calls(tmp_path: Path) -> None:
+    """Children inherit the tree budget; they can't override it mid-tree."""
+
+    child = _agent_call("child")
+    grandchild = _agent_call("grandchild")
+    grandchild.arguments["max_turns"] = 5
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[child]),
+            ScriptedTurn(tool_calls=[grandchild]),
+            ScriptedTurn([TextContent("recover")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    nested = next(
+        message.tool_result
+        for message in child_store.messages()
+        if message.tool_result and message.tool_result.tool_call_id == grandchild.id
+    )
+    assert nested.is_error is True
+    assert "max_turns is only accepted at the top-level" in nested.content
+
+
+@pytest.mark.asyncio
+async def test_budget_exhaustion_error_reports_used_and_allocated(
+    tmp_path: Path,
+) -> None:
+    call = _agent_call()
+    call.arguments["max_turns"] = 2
+    child_read = ToolCall("child-read", "read", {"path": "missing"})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call])]
+        + [
+            ScriptedTurn([TextContent(f"step-{turn}")], tool_calls=[child_read])
+            for turn in range(1, 4)
+        ]
+    )
+    store = ConversationStore(tmp_path)
+
+    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.is_error is True
+    assert result.structured_content is not None
+    assert result.structured_content["error_code"] == "agent_turn_budget"
+    assert "shared agent turn budget exhausted" in result.content
+    assert "2 of 2 turns used" in result.content
+    assert "agent_output" in result.content
+    assert str(store.session_dir / "agents" / "1") in result.content
+
+
+@pytest.mark.asyncio
+async def test_child_transcript_survives_budget_exhaustion(tmp_path: Path) -> None:
+    """After budget death the child work must still be readable via agent_output."""
+
+    call = _agent_call()
+    call.arguments["max_turns"] = 2
+    child_read = ToolCall("child-read", "read", {"path": "missing"})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call])]
+        + [
+            ScriptedTurn(
+                [TextContent(f"work step {turn}")], tool_calls=[child_read]
+            )
+            for turn in range(1, 4)
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+    await _collect(loop.run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    handle = result.structured_content["child_instance_id"]
+
+    output = await loop.tool_registry.execute(
+        ToolCall("output-after-death", "agent_output", {"handle": handle})
+    )
+
+    assert output["isError"] is False
+    text = output["content"][0]["text"]
+    assert "assistant: work step 1" in text
+    assert "assistant: work step 2" in text
+
+
+@pytest.mark.asyncio
+async def test_max_turns_bounded_by_hard_cap_constant() -> None:
+    """The hard cap constant must be documented, positive, and above defaults."""
+
+    assert type(MAX_AGENT_TURN_CAP) is int
+    assert MAX_AGENT_TURN_CAP >= 100
+    from zeta.tools.agent_presets import AGENT_PRESETS
+
+    assert MAX_AGENT_TURN_CAP >= max(
+        preset.turn_cap for preset in AGENT_PRESETS.values()
+    )

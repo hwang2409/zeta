@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from .types import ErrorInfo
 
 MAX_AGENT_DEPTH = 2
+# Hard cap on caller-supplied `max_turns` for one agent tree. Preset defaults
+# are 15-25, so 200 leaves ~8-13x headroom for deep multi-child research
+# without letting a runaway prompt burn arbitrary turns.
+MAX_AGENT_TURN_CAP = 200
 
 
 @dataclass(slots=True)
@@ -54,5 +58,5 @@ def consume_turn(budget: SharedTurnBudget | None) -> ErrorInfo | None:
     return ErrorInfo(
         "agent_turn_budget",
         "shared agent turn budget exhausted for this agent tree: "
-        f"{budget.limit} turns allocated",
+        f"{budget.limit} of {budget.limit} turns used",
     )
