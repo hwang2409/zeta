@@ -5,25 +5,25 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable, Literal
+from typing import Any, Literal
 
 from markdown_it import MarkdownIt
+from mdit_py_plugins.tasklists import tasklists_plugin
+from rich import box
 from rich.cells import cell_len
 from rich.columns import Columns
 from rich.console import Console, Group, RenderableType
 from rich.panel import Panel
 from rich.syntax import Syntax
-from rich.text import Text
 from rich.table import Table
-from rich import box
-from mdit_py_plugins.tasklists import tasklists_plugin
+from rich.text import Text
 
-from ..tools.agent import format_agent_stats
+from ..agent_receipt import ensure_agent_receipt_text, terminal_state
 from ..tools.exec import MacroDisplay
 from ..types import (
     ErrorInfo,
-    flatten_tool_content,
     RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
@@ -31,7 +31,9 @@ from ..types import (
     ThinkingContent,
     ToolCall,
     ToolUseContent,
+    flatten_tool_content,
 )
+from .agent_card import AgentCard
 from .theme import (
     ACCENT,
     AFFORDANCE,
@@ -49,8 +51,6 @@ from .theme import (
     THOUGHT,
     VIM_STATE,
 )
-from .agent_card import AgentCard
-
 
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
@@ -933,11 +933,10 @@ class MarkdownDocument:
                 width,
                 started + _MAX_MARKDOWN_SECONDS,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - fall back to plain text
             yield Text(_strip_terminal_controls(self.source), style=BODY)
             return
-        for rendered in _with_blank_lines(blocks):
-            yield rendered
+        yield from _with_blank_lines(blocks)
 
 
 def render_markdown(value: str) -> MarkdownDocument:
@@ -949,7 +948,7 @@ def render_markdown(value: str) -> MarkdownDocument:
         if time.monotonic() - started > _MAX_MARKDOWN_SECONDS:
             raise TimeoutError("markdown rendering exceeded its time budget")
         return MarkdownDocument(value, _token_tree(tokens))
-    except Exception:
+    except Exception:  # noqa: BLE001 - return an unparsed document
         return MarkdownDocument(value, None)
 
 
@@ -979,9 +978,13 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         if not all(type(value) is str for value in (description, status, text, path)):
             return Text("background agent notification unavailable", style=ERROR)
         style = ERROR if status in {"error", "canceled"} else RECEIPT
-        stats_suffix = format_agent_stats(event.data.get("stats"))
+        receipt_state = terminal_state(status=status)
+        stats = event.data.get("stats")
+        receipt_text = ensure_agent_receipt_text(
+            text, receipt_state, stats if type(stats) is dict else None
+        )
         return Text(
-            f"background · {description} · {status} · {text}{stats_suffix} · {path}",
+            f"background · {description} · {status} · {receipt_text} · {path}",
             style=style,
             overflow="ellipsis",
         )

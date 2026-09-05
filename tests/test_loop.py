@@ -5,13 +5,13 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 import httpx
+import pytest
 
 import zeta.providers.anthropic as anthropic_module
-from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.context import ContextAssembler
+from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.loop import _validated_tool_result
@@ -25,10 +25,10 @@ from zeta.types import (
     StreamEvent,
     StreamEventType,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResult,
     ToolSchema,
-    ThinkingContent,
     ToolUseContent,
 )
 
@@ -1222,12 +1222,11 @@ async def test_cancellation_keeps_control_error_when_partial_persist_fails(
         store,
         "append_message",
         side_effect=OSError("disk full"),
-    ):
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+    ), warnings.catch_warnings():
+        warnings.simplefilter("error")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 @pytest.mark.asyncio
@@ -1246,10 +1245,9 @@ async def test_aclose_keeps_control_error_when_partial_persist_fails(
                 store,
                 "append_message",
                 side_effect=OSError("disk full"),
-            ):
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error")
-                    await stream.aclose()
+            ), warnings.catch_warnings():
+                warnings.simplefilter("error")
+                await stream.aclose()
             break
 
 

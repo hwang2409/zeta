@@ -13,6 +13,7 @@ from .agent_budget import (
     AgentTree,
 )
 from .agent_budget import child_depth as next_agent_depth
+from .agent_receipt import TerminalState
 from .core.abort import AbortSignal as ToolAbortSignal
 from .core.checkpoints import _now
 from .core.store import ConversationStore
@@ -69,12 +70,12 @@ async def consume_child(
     tool_calls = 0
 
     def terminal_result(
-        *, state: str, text: str, error: bool, **result_options: object
+        *, state: TerminalState, text: str, **result_options: object
     ) -> dict[str, object]:
         stats = finish_lifecycle(state, text)
         return child_result(
             text,
-            error=error,
+            state=state,
             stats=stats,
             **result_options,
         )
@@ -154,14 +155,13 @@ async def consume_child(
                     failure_message = event.error.message
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if budget_exhausted:
         text = f"agent error: {failure_message or 'shared agent turn budget exhausted'}"
         return terminal_result(
             state="failed",
             text=text,
-            error=True,
             budget_exhausted=True,
         )
     if cap_hit:
@@ -174,27 +174,18 @@ async def consume_child(
         return terminal_result(
             state="failed",
             text=text,
-            error=True,
         )
     if failure_message is not None:
         text = f"agent error: {failure_message}"
-        return terminal_result(
-            state="failed", text=text, error=True
-        )
+        return terminal_result(state="failed", text=text)
     if final_message is None:
         text = "agent error: child ended without a final response"
-        return terminal_result(
-            state="failed", text=text, error=True
-        )
+        return terminal_result(state="failed", text=text)
     final_text = assistant_text(final_message)
     if not final_text.strip():
         text = "agent error: child returned an empty final assistant message"
-        return terminal_result(
-            state="failed", text=text, error=True
-        )
-    return terminal_result(
-        state="completed", text=final_text, error=False
-    )
+        return terminal_result(state="failed", text=text)
+    return terminal_result(state="completed", text=final_text)
 
 
 def resolve_child_backend(
@@ -253,19 +244,19 @@ async def run_agent_tool(
         return loop._child_result_payload(
             tool_call.id,
             "agent error: prompt must be a nonempty string",
-            error=True,
+            state="failed",
         )
     if type(description) is not str or not description.strip():
         return loop._child_result_payload(
             tool_call.id,
             "agent error: description must be a nonempty string",
-            error=True,
+            state="failed",
         )
     if type(background) is not bool:
         return loop._child_result_payload(
             tool_call.id,
             "agent error: background must be a boolean",
-            error=True,
+            state="failed",
         )
     preset = get_agent_preset(agent_type)
     if preset is None:
@@ -273,28 +264,28 @@ async def run_agent_tool(
             tool_call.id,
             "agent error: unknown agent_type "
             f"{agent_type!r}; expected one of: {', '.join(agent_type_names())}",
-            error=True,
+            state="failed",
         )
     if loop.plan_mode and preset.name == GENERAL_PRESET.name:
         return loop._child_result_payload(
             tool_call.id,
             "agent error: general agents are unavailable in plan mode; "
             "use agent_type 'explore' or 'plan'",
-            error=True,
+            state="failed",
         )
     child_backend, backend_error = resolve_child_backend(loop, model)
     if backend_error is not None:
         return loop._child_result_payload(
             tool_call.id,
             backend_error,
-            error=True,
+            state="failed",
         )
     child_depth, nesting_error = next_agent_depth(loop.agent_depth, background)
     if nesting_error is not None:
         return loop._child_result_payload(
             tool_call.id,
             nesting_error,
-            error=True,
+            state="failed",
         )
     agent_tree = loop._agent_tree or AgentTree()
     agent_tree.ensure_budget(
@@ -302,7 +293,16 @@ async def run_agent_tool(
         if loop._agent_turn_budget is not None
         else preset.turn_cap
     )
-    await loop._ensure_mcp_servers()
+    try:
+        await loop._ensure_mcp_servers()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - setup failures become receipts
+        return loop._child_result_payload(
+            tool_call.id,
+            f"agent error: {error_message(exc)}",
+            state="failed",
+        )
     stored_agent_type = None if preset.name == GENERAL_PRESET.name else preset.name
     child_number = loop.store.allocate_agent_index()
     agents_root = loop.store.session_dir / "agents"
@@ -424,7 +424,8 @@ async def run_agent_tool(
     def child_result(
         text: str,
         *,
-        error: bool,
+        state: TerminalState | None = None,
+        error: bool | None = None,
         status: str | None = None,
         budget_exhausted: bool = False,
         stats: dict[str, object] | None = None,
@@ -433,6 +434,7 @@ async def run_agent_tool(
         return loop._child_result_payload(
             tool_call.id,
             text,
+            state=state,
             error=error,
             child_session_path=child_path,
             agent_type=preset.name,

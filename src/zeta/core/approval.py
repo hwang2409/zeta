@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Iterable, Protocol
+from typing import Protocol
 
+from ..types import Message, MessageRole, ToolCall, ToolResult, ToolUseContent
 from .abort import AbortSignal
 from .store import ConversationStore
-from ..types import Message, MessageRole, ToolCall, ToolResult, ToolUseContent
 
 
 class ApprovalDecision(StrEnum):
@@ -412,7 +412,7 @@ class ApprovalGate:
                     decision = await self.policy.authorize(
                         tool_call, signal, persist_request=False
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - report approval failures
                 return ToolResult(tool_call.id, f"approval failed: {exc}", True), execution_signal
             finally:
                 if approval_started and lifecycle is not None:
@@ -438,7 +438,7 @@ class ApprovalGate:
             allowed = self.hook(tool_call.name, arguments)
             if inspect.isawaitable(allowed):
                 allowed = await allowed
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - report hook failures
             return ToolResult(tool_call.id, f"pre-execution hook failed: {exc}", True), execution_signal
         if isinstance(allowed, str):
             return ToolResult(tool_call.id, allowed, True), execution_signal

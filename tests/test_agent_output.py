@@ -34,6 +34,43 @@ def _result(store: ConversationStore, call_id: str) -> ToolResult:
 
 
 @pytest.mark.asyncio
+async def test_agent_setup_exception_uses_failed_receipt(tmp_path: Path) -> None:
+    call = ToolCall(
+        "setup-failure",
+        "agent",
+        {"prompt": "inspect", "description": "setup"},
+    )
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=[call])]),
+        ConversationStore(tmp_path),
+        max_turns=1,
+    )
+    setup_calls = 0
+
+    async def fail_child_setup() -> None:
+        nonlocal setup_calls
+        setup_calls += 1
+        if setup_calls == 2:
+            raise RuntimeError("setup exploded")
+
+    loop._ensure_mcp_servers = fail_child_setup
+    events = await _collect(loop.run_turn("start"))
+    result = _result(loop.store, call.id)
+
+    assert result.is_error is True
+    assert result.is_canceled is False
+    assert "agent error: setup exploded" in result.content
+    assert "error=true · canceled=false" in result.content
+    terminal = next(
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+    assert terminal.tool_result is not None
+    assert terminal.tool_result.content == result.content
+
+
+@pytest.mark.asyncio
 async def test_agent_output_reads_finished_child_with_roles_and_pages(
     tmp_path: Path,
 ) -> None:

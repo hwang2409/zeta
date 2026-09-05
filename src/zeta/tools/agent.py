@@ -10,6 +10,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ..agent_receipt import (
+    MAX_AGENT_RESULT_BYTES,
+    agent_stats,
+    build_agent_progress,
+    build_agent_receipt,
+    encode_json,
+    format_agent_stats,
+    terminal_state,
+)
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.checkpoints import ConversationEntry, ConversationIntegrityError
 from ..core.store import ConversationStore
@@ -20,9 +29,7 @@ from ..types import (
     StructuredContentValue,
     TextContent,
     ToolCall,
-    ToolResult,
     ToolUseContent,
-    flatten_tool_content,
 )
 from .agent_presets import (
     GENERAL_PRESET,
@@ -41,68 +48,7 @@ from .registry import (
 MAX_AGENT_STATUS_STEP = 160
 MAX_AGENT_STATUS_RESULT = 4_000
 MAX_AGENT_STATUS_DESCRIPTION = 160
-MAX_AGENT_RESULT_BYTES = 10_000
 _TRUNCATION_NOTE = "\n[truncated]"
-
-
-def agent_stats(
-    lifecycle: dict[str, object] | None,
-    *,
-    status: str | None = None,
-    turns_used: int = 0,
-) -> dict[str, object]:
-    lifecycle = lifecycle or {}
-    elapsed = lifecycle.get("elapsed", 0.0)
-    if type(elapsed) not in {int, float} or elapsed < 0:
-        elapsed = 0.0
-    turns = lifecycle.get("turns_used", turns_used)
-    if type(turns) is not int or turns < 0:
-        turns = turns_used
-    tool_calls = lifecycle.get("tool_calls", 0)
-    if type(tool_calls) is not int or tool_calls < 0:
-        tool_calls = 0
-    state = status or lifecycle.get("state")
-    if state == "error":
-        state = "failed"
-    return {
-        "turns_used": turns,
-        "elapsed": elapsed,
-        "tool_calls": tool_calls,
-        "error": state in {"failed", "error"},
-        "canceled": state == "canceled",
-    }
-
-
-def format_agent_stats(stats: object, *, include_duration: bool = True) -> str:
-    if type(stats) is not dict:
-        return ""
-    turns = stats.get("turns_used")
-    elapsed = stats.get("elapsed")
-    tool_calls = stats.get("tool_calls")
-    state = stats.get("state")
-    error = stats.get("error")
-    canceled = stats.get("canceled")
-    if (
-        type(turns) is not int
-        or turns < 0
-        or type(elapsed) not in {int, float}
-        or elapsed < 0
-        or type(tool_calls) is not int
-        or tool_calls < 0
-    ):
-        return ""
-    if type(state) is str:
-        if state not in {"running", "completed", "failed", "canceled", "error"}:
-            return ""
-        error = state in {"failed", "error"}
-        canceled = state == "canceled"
-    elif type(error) is not bool or type(canceled) is not bool:
-        return ""
-    duration = f" · {turns} turns · {elapsed:.1f}s" if include_duration else ""
-    return (
-        f"{duration} · {tool_calls} tool calls"
-        f" · error={str(error).lower()} · canceled={str(canceled).lower()}"
-    )
 
 
 def _read_agent_lifecycle(path: str) -> dict[str, object]:
@@ -123,7 +69,7 @@ def _agent_error(message: str, max_bytes: int) -> dict[str, object]:
         "isError": True,
         "structuredContent": None,
     }
-    if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= max_bytes:
+    if len(encode_json(result)) <= max_bytes:
         return result
     return {
         "content": [text_block("agent error: response exceeds response limit")],
@@ -135,69 +81,9 @@ def _agent_error(message: str, max_bytes: int) -> dict[str, object]:
 def _bounded_agent_result(
     result: dict[str, object], max_bytes: int
 ) -> dict[str, object]:
-    if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= max_bytes:
+    if len(encode_json(result)) <= max_bytes:
         return result
     return _agent_error("response exceeds response limit", max_bytes)
-
-
-def bound_result(result: ToolResult) -> ToolResult:
-    structured = result.structured_content
-    blocks = result.content_blocks
-    if (
-        structured is None
-        or "child_session_path" not in structured
-        or blocks is None
-        or len(blocks) != 1
-        or blocks[0]["type"] != "text"
-    ):
-        return result
-
-    def envelope_size(candidate: ToolResult) -> int:
-        message = Message(
-            MessageRole.TOOL_RESULT,
-            [TextContent(candidate.content)],
-            tool_result=candidate,
-        )
-        return len(json.dumps(message.to_dict(), ensure_ascii=False).encode("utf-8"))
-
-    if envelope_size(result) <= MAX_AGENT_RESULT_BYTES:
-        return result
-
-    block = blocks[0]
-
-    def candidate(length: int) -> ToolResult:
-        shown = block["text"][:length]
-        bounded_block = {
-            **block,
-            "text": shown,
-            "truncated": block["truncated"] or shown != block["text"],
-        }
-        bounded_blocks = [bounded_block]
-        return ToolResult(
-            result.tool_call_id,
-            flatten_tool_content(bounded_blocks),
-            result.is_error,
-            content_blocks=bounded_blocks,
-            structured_content=structured,
-            is_canceled=result.is_canceled,
-        )
-
-    low = 0
-    high = len(block["text"])
-    while low < high:
-        middle = (low + high + 1) // 2
-        if envelope_size(candidate(middle)) <= MAX_AGENT_RESULT_BYTES:
-            low = middle
-        else:
-            high = middle - 1
-    bounded = candidate(low)
-    if envelope_size(bounded) <= MAX_AGENT_RESULT_BYTES:
-        return bounded
-    return ToolResult(
-        result.tool_call_id,
-        "agent result exceeds response limit",
-        is_error=True,
-    )
 
 
 class ChildApprovalPolicy:
@@ -649,7 +535,7 @@ async def _agent_status(
             "isError": False,
             "structuredContent": structured,
         }
-        if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= max_bytes:
+        if len(encode_json(result)) <= max_bytes:
             return result
         page.pop()
     if offset < len(children):
@@ -716,6 +602,7 @@ async def _agent_output(
 def agent_result(
     text: str,
     *,
+    tool_call_id: str = "",
     error: bool,
     turns_used: int,
     child_session_path: str,
@@ -747,7 +634,7 @@ def agent_result(
         structured_content["depth"] = depth
     if budget_exhausted:
         structured_content["error_code"] = "agent_turn_budget"
-    if include_stats and stats is None:
+    if stats is None:
         lifecycle = _read_agent_lifecycle(child_session_path)
         stats = agent_stats(
             lifecycle,
@@ -755,15 +642,24 @@ def agent_result(
             or ("canceled" if canceled else "failed" if error else "completed"),
             turns_used=turns_used,
         )
-    content = text + (format_agent_stats(stats) if include_stats else "")
-    result: dict[str, object] = {
-        "content": [text_block(content)],
-        "isError": error,
-        "structuredContent": structured_content,
-    }
-    if canceled:
-        result["isCanceled"] = True
-    return _bounded_agent_result(result, max_bytes)
+    if status == "running":
+        return build_agent_progress(
+            text,
+            stats,
+            structured_content=structured_content,
+            tool_call_id=tool_call_id,
+            max_bytes=max_bytes,
+            include_stats=include_stats,
+        )
+    state = terminal_state(error=error, canceled=canceled, status=status)
+    return build_agent_receipt(
+        state,
+        text,
+        stats,
+        structured_content=structured_content,
+        tool_call_id=tool_call_id,
+        max_bytes=max_bytes,
+    )
 
 
 async def _agent(

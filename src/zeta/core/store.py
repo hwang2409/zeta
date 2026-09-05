@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from ..agent_receipt import encode_json
 from ..types import Message, MessageRole, ToolCall, ToolUseContent
 from .agent_state import AgentStateMixin, _apply_agent_state, _parse_agent_state
 from .checkpoints import (
@@ -26,7 +27,7 @@ from .checkpoints import (
 from .todo import TodoItem, parse_todo_items
 
 SCHEMA = "zeta.conversation.v1"
-MAX_AGENT_NOTIFICATION_TEXT = 4_000
+MAX_AGENT_NOTIFICATION_TEXT = 10_000
 
 
 def _valid_agent_stats(value: object) -> bool:
@@ -304,24 +305,25 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             agent_parent=self._agent_parent,
             agent_canceled=self._agent_canceled,
         )
-        temporary = tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=self.session_dir,
-            prefix=".session_state.",
-            suffix=".tmp",
-            delete=False,
-        )
-        temporary_path = Path(temporary.name)
+        temporary_path: Path | None = None
         try:
-            with temporary:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.session_dir,
+                prefix=".session_state.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
                 json.dump(state, temporary, separators=(",", ":"))
                 temporary.write("\n")
                 temporary.flush()
                 os.fsync(temporary.fileno())
             os.replace(temporary_path, self.state_path)
         finally:
-            temporary_path.unlink(missing_ok=True)
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def _validate_entries(self) -> None:
         ids: set[str] = set()
@@ -526,7 +528,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
 
     def _write_line(self, row: dict[str, Any]) -> None:
         with self.path.open("ab") as handle:
-            handle.write(json.dumps(row, separators=(",", ":"), sort_keys=True).encode() + b"\n")
+            handle.write(encode_json(row) + b"\n")
             handle.flush()
             os.fsync(handle.fileno())
 
@@ -604,7 +606,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             "child_session_path": child_session_path,
             "description": description,
             "status": status,
-            "text": text[:MAX_AGENT_NOTIFICATION_TEXT],
+            "text": text,
         }
         if stats is not None:
             data["stats"] = dict(stats)

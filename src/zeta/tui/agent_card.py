@@ -13,7 +13,12 @@ from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
 
-from ..tools.agent import agent_stats, format_agent_stats
+from ..agent_receipt import (
+    agent_stats,
+    ensure_agent_receipt_text,
+    has_agent_receipt_suffix,
+    terminal_state,
+)
 from ..tools.agent_presets import GENERAL_PRESET, get_agent_preset
 from ..types import StreamEvent, StreamEventType, ToolCall
 from .theme import BODY, CARD_BG, CARD_BORDER, COMMAND, DIM, ERROR, RECEIPT
@@ -317,34 +322,48 @@ class AgentCard:
                 display_depth = value
         turns = turns or 0
         structured_status = structured.get("status")
-        is_canceled = result.is_canceled
-        if is_canceled:
-            status = "canceled"
-        elif structured_status in {"running", "completed", "error", "canceled"}:
-            status = structured_status
-        else:
-            status = "fail" if result.is_error else "ok"
-        agent_type = cls._agent_type(call)
-        prefix = f"{agent_type} · " if agent_type else ""
-        stats_status = {
-            "running": "running",
-            "completed": "completed",
-            "error": "error",
-            "canceled": "canceled",
-            "fail": "error",
-            "ok": "completed",
-        }[status]
+        receipt_status = terminal_state(
+            error=result.is_error,
+            canceled=result.is_canceled,
+            status=(
+                structured_status
+                if structured_status in {"completed", "error", "canceled"}
+                else None
+            ),
+        )
+        status = (
+            structured_status
+            if structured_status in {"completed", "error", "canceled"}
+            else "canceled"
+            if receipt_status == "canceled"
+            else "fail"
+            if receipt_status == "failed"
+            else "ok"
+        )
         stats = agent_stats(
             lifecycle,
-            status=stats_status,
+            status=receipt_status,
             turns_used=turns,
         )
-        stats_suffix = format_agent_stats(stats, include_duration=False)
+        receipt_text = ensure_agent_receipt_text(
+            result.content,
+            receipt_status,
+            stats,
+        )
+        if has_agent_receipt_suffix(result.content):
+            return Text(
+                receipt_text,
+                style=ERROR if receipt_status in {"failed", "canceled"} else RECEIPT,
+                no_wrap=True,
+                overflow="ellipsis",
+            )
+        agent_type = cls._agent_type(call)
+        prefix = f"{agent_type} · " if agent_type else ""
         return Text(
             f"{prefix}{cls._description(call)} · {turns} turns · "
             f"{max(0.0, elapsed or 0.0):.1f}s · {status} · "
-            f"depth {display_depth}{stats_suffix} · expand: ctrl+x ctrl+o",
-            style=ERROR if status in {"fail", "error", "canceled"} else RECEIPT,
+            f"depth {display_depth} · {receipt_text} · expand: ctrl+x ctrl+o",
+            style=ERROR if receipt_status in {"failed", "canceled"} else RECEIPT,
             no_wrap=True,
             overflow="ellipsis",
         )

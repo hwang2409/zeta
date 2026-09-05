@@ -481,7 +481,8 @@ async def test_background_completion_notification_waits_for_next_turn_boundary(
     events = await _collect(loop.run_turn("follow up"))
     assert events[0].type is StreamEventType.AGENT_NOTIFICATION
     assert events[0].data["text"].startswith("child complete")
-    assert "error=" not in events[0].data["text"]
+    assert events[0].data["text"].count("error=false") == 1
+    assert events[0].data["text"].count("canceled=false") == 1
     rendered = render_event(events[0])
     assert rendered is not None
     assert rendered.plain.count("error=false") == 1
@@ -517,6 +518,17 @@ async def test_background_multibyte_receipt_fits_persisted_limit(
         if event.type is StreamEventType.TOOL_EXECUTION_END
     )
     assert terminal.tool_result is not None
+    assert terminal.tool_result.content.count("error=false") == 1
+    assert terminal.tool_result.content.count("canceled=false") == 1
+    notification = store.agent_notifications(pending_only=False)[0]
+    notification_row = next(
+        row
+        for row in store.path.read_bytes().splitlines()
+        if b'"type":"notification"' in row
+    )
+    assert len(notification_row) <= 10_000
+    assert notification.data["text"].count("error=false") == 1
+    assert notification.data["text"].count("canceled=false") == 1
     persisted = Message(
         MessageRole.TOOL_RESULT,
         [TextContent(terminal.tool_result.content)],
@@ -585,11 +597,27 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
     backend = BackgroundBackend([call])
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1)
+    background_events: list[StreamEvent] = []
+    loop.set_background_event_sink(background_events.append)
 
     await _collect(loop.run_turn("start"))
     loop.abort()
     notification = await _wait_for_notification(store, "canceled")
     assert "parent session exited" not in notification.data["text"]
+    assert notification.data["text"].count("error=false") == 1
+    assert notification.data["text"].count("canceled=true") == 1
+    terminal = next(
+        event
+        for event in background_events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+    assert terminal.tool_result is not None
+    assert terminal.tool_result.is_error is False
+    assert terminal.tool_result.is_canceled is True
+    rendered = render_event(terminal)
+    assert rendered is not None
+    assert rendered.plain.count("error=false") == 1
+    assert rendered.plain.count("canceled=true") == 1
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     assert child_store.agent_canceled() == {
         "tool_call_id": call.id,
@@ -2048,7 +2076,7 @@ async def test_failed_agent_receipt_stats_match_is_error(tmp_path: Path) -> None
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    events = await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -2057,6 +2085,52 @@ async def test_failed_agent_receipt_stats_match_is_error(tmp_path: Path) -> None
     assert result.is_error is True
     assert "error=true" in result.content
     assert "canceled=false" in result.content
+    rendered = render_event(
+        next(
+            event
+            for event in events
+            if event.type is StreamEventType.TOOL_EXECUTION_END
+        )
+    )
+    assert rendered is not None
+    assert rendered.plain.count("error=true") == 1
+    assert rendered.plain.count("canceled=false") == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_background_receipt_matches_error_flag(
+    tmp_path: Path,
+) -> None:
+    call = _background_agent_call()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=[call]), ScriptedTurn()]),
+        store,
+        max_turns=1,
+    )
+    background_events: list[StreamEvent] = []
+    loop.set_background_event_sink(background_events.append)
+
+    await _collect(loop.run_turn("start"))
+    await loop._background_owner.wait()
+    notification = store.agent_notifications(pending_only=False)[0]
+    terminal = next(
+        event
+        for event in background_events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+    )
+
+    assert notification.data["status"] == "error"
+    assert notification.data["text"].count("error=true") == 1
+    assert notification.data["text"].count("canceled=false") == 1
+    assert terminal.tool_result is not None
+    assert terminal.tool_result.is_error is True
+    assert terminal.tool_result.is_canceled is False
+    rendered = render_event(terminal)
+    assert rendered is not None
+    assert rendered.plain.count("error=true") == 1
+    assert rendered.plain.count("canceled=false") == 1
+    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -2066,7 +2140,7 @@ async def test_multibyte_agent_receipt_stays_within_response_limit(
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call()]),
-            ScriptedTurn([TextContent("😀" * 5_000)]),
+            ScriptedTurn([TextContent("😀" * 1_800)]),
         ]
     )
     store = ConversationStore(tmp_path)
@@ -2077,6 +2151,14 @@ async def test_multibyte_agent_receipt_stays_within_response_limit(
     result = persisted.tool_result
     assert result is not None
     assert len(json.dumps(persisted.to_dict(), ensure_ascii=False).encode("utf-8")) <= 10_000
+    receipt_row = next(
+        row
+        for row in store.path.read_bytes().splitlines()
+        if b'"tool_result"' in row
+    )
+    assert len(receipt_row) <= 10_000
+    assert result.content.count("error=false") == 1
+    assert result.content.count("canceled=false") == 1
 
 
 @pytest.mark.asyncio
@@ -2093,7 +2175,7 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
     await asyncio.sleep(0.05)
     loop.abort()
 
-    await task
+    events = await task
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.content.startswith("tool execution canceled")
     assert "error=false" in result.content
@@ -2103,6 +2185,16 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
         "child_session_path": str(store.session_dir / "agents" / "1"),
         "child_instance_id": f"{store.session_id}:1",
     }
+    rendered = render_event(
+        next(
+            event
+            for event in events
+            if event.type is StreamEventType.TOOL_EXECUTION_END
+        )
+    )
+    assert rendered is not None
+    assert rendered.plain.count("error=false") == 1
+    assert rendered.plain.count("canceled=true") == 1
     child_state = (store.session_dir / "agents" / "1" / "session_state.json").read_text()
     assert '"agent_parent"' not in child_state
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")

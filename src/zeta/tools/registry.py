@@ -37,8 +37,8 @@ from ..execution import (
     ToolHandler,
     ToolHandlerResult,
     ToolLifecycleSink,
-    ToolStream,
-    ToolStreamPublisher,
+    ToolStream,  # noqa: F401 - preserve the public registry import
+    ToolStreamPublisher,  # noqa: F401 - preserve the public registry import
     ToolStreamSink,
     _ToolCallStreamPublisher,
     _ToolCanceled,
@@ -47,10 +47,10 @@ from ..execution import (
     run_handler_with_abort,
 )
 from ..types import (
-    ToolContentBlock,
     StructuredContentValue,
     StructuredToolResult,
     ToolCall,
+    ToolContentBlock,
     ToolResult,
     ToolSchema,
     ToolTextBlock,
@@ -83,7 +83,7 @@ def _register_discovered_tools(registry: ToolRegistry) -> None:
     for module_name in _discover_tool_modules():
         try:
             module = importlib.import_module(module_name)
-        except Exception as exc:  # noqa: BLE001 - identify broken modules clearly
+        except Exception as exc:
             raise RuntimeError(
                 f"failed to load tool module {module_name}: {exc}"
             ) from exc
@@ -100,7 +100,7 @@ def _register_discovered_tools(registry: ToolRegistry) -> None:
                 if inspect.iscoroutine(result):
                     result.close()
                 raise TypeError("register must be synchronous")
-        except Exception as exc:  # noqa: BLE001 - name malformed modules clearly
+        except Exception as exc:
             raise RuntimeError(
                 f"failed to register tool module {module_name}: {exc}"
             ) from exc
