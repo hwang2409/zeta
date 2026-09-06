@@ -146,7 +146,7 @@ def _run_login(provider: str) -> str | None:
     return asyncio.run(run_login(_build_login_provider(provider), _pkce_values))
 
 
-def _cleanup_ephemeral(app: "object") -> None:
+def _cleanup_ephemeral(app: object) -> None:
     import shutil
 
     root = app.ephemeral_root
@@ -155,7 +155,7 @@ def _cleanup_ephemeral(app: "object") -> None:
     shutil.rmtree(root, ignore_errors=True)
 
 
-def _print_exit_hint(app: "object") -> None:
+def _print_exit_hint(app: object) -> None:
     if app.ephemeral_root is not None:
         return
     print(f"resume with: zeta --resume {app.loop.store.session_id}", file=sys.stderr)

@@ -361,3 +361,143 @@ def test_session_metadata_rejects_bad_name_type(
 
     with pytest.raises(SessionError, match="context is invalid"):
         SessionManager(home).open(opened.store.session_id)
+
+
+def test_ephemeral_history_does_not_touch_shared_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    home.mkdir()
+    history = home / "history"
+    history.write_text("persisted-line\n", encoding="utf-8")
+    baseline_bytes = history.read_bytes()
+    baseline_mtime_ns = history.stat().st_mtime_ns
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(build_parser().parse_args(["--provider", "fake", "--no-session"]))
+    root = app.ephemeral_root
+    assert root is not None
+    assert app._history_path is not None
+    assert Path(app._history_path).parent == root
+
+    from zeta.cli import _cleanup_ephemeral
+
+    _cleanup_ephemeral(app)
+
+    assert history.read_bytes() == baseline_bytes
+    assert history.stat().st_mtime_ns == baseline_mtime_ns
+
+
+def test_session_delete_refuses_when_locked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import fcntl
+
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(_args())
+    session_id = app.loop.store.session_id
+    lock_path = home / "sessions" / session_id / ".lock"
+    assert lock_path.exists()
+
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        exit_code = main(["session", "delete", session_id, "--force"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "currently open" in captured.err
+    assert (home / "sessions" / session_id).exists()
+
+
+def test_session_delete_removes_corrupt_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(_args())
+    session_id = app.loop.store.session_id
+    session_dir = home / "sessions" / session_id
+    (session_dir / "conversation.jsonl").unlink()
+
+    exit_code = main(["session", "delete", session_id, "--force"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0, captured.err
+    assert not session_dir.exists()
+
+
+def test_session_delete_resolves_unique_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    app = create_app(_args())
+    session_id = app.loop.store.session_id
+
+    exit_code = main(["session", "delete", session_id[:8], "--force"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0, captured.err
+    assert not (home / "sessions" / session_id).exists()
+
+
+def test_session_delete_rejects_ambiguous_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "zeta-home"
+    sessions_dir = home / "sessions"
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "abc111").mkdir()
+    (sessions_dir / "abc222").mkdir()
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(["session", "delete", "abc", "--force"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "ambiguous" in captured.err
+    assert (sessions_dir / "abc111").exists()
+    assert (sessions_dir / "abc222").exists()
+
+
+def test_ephemeral_cleanup_when_create_app_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import glob
+    import tempfile
+
+    home = tmp_path / "zeta-home"
+    fake_tmp = tmp_path / "tmp"
+    fake_tmp.mkdir()
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.setenv("TMPDIR", str(fake_tmp))
+    monkeypatch.chdir(tmp_path)
+    tempfile.tempdir = None
+
+    def _boom(*args_, **kwargs_):
+        raise RuntimeError("simulated create_app failure")
+
+    monkeypatch.setattr("zeta.tui.app.load_settings", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated create_app failure"):
+        create_app(build_parser().parse_args(["--provider", "fake", "--no-session"]))
+
+    leaks = glob.glob(str(fake_tmp / "zeta-ephemeral-*"))
+    assert leaks == [], f"leaked ephemeral roots: {leaks}"

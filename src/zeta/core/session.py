@@ -530,25 +530,56 @@ class SessionManager:
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
+    def resolve_id(self, session_id: str) -> str:
+        """Return the full id for an exact match or unambiguous prefix."""
+
+        self._validate_id(session_id)
+        if (self.sessions_dir / session_id).is_dir():
+            return session_id
+        if not self.sessions_dir.exists():
+            raise SessionError(f"session {session_id} was not found")
+        matches = sorted(
+            entry.name
+            for entry in self.sessions_dir.iterdir()
+            if entry.is_dir() and entry.name.startswith(session_id)
+        )
+        if not matches:
+            raise SessionError(f"session {session_id} was not found")
+        if len(matches) > 1:
+            raise SessionError(
+                f"session id {session_id!r} is ambiguous "
+                f"({len(matches)} matches)"
+            )
+        return matches[0]
+
     def delete(self, session_id: str) -> None:
         """Remove a session directory and its contents."""
 
-        self._validate_id(session_id)
-        session_dir = self.sessions_dir / session_id
-        if not session_dir.exists():
-            raise SessionError(f"session {session_id} was not found")
+        full_id = self.resolve_id(session_id)
+        session_dir = self.sessions_dir / full_id
         import shutil
 
-        shutil.rmtree(session_dir)
+        lock_path = session_dir / ".lock"
+        if lock_path.exists():
+            with lock_path.open("a+") as handle:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise SessionError(
+                        "session is currently open in another process"
+                    ) from exc
+                shutil.rmtree(session_dir)
+        else:
+            shutil.rmtree(session_dir)
 
     def export(self, session_id: str) -> str:
         """Return the session as portable JSONL (metadata header + entries)."""
 
-        self._validate_id(session_id)
-        metadata = self._read(session_id)
-        conversation_path = self.sessions_dir / session_id / "conversation.jsonl"
+        full_id = self.resolve_id(session_id)
+        metadata = self._read(full_id)
+        conversation_path = self.sessions_dir / full_id / "conversation.jsonl"
         if not conversation_path.exists():
-            raise SessionError(f"session {session_id} has no conversation.jsonl")
+            raise SessionError(f"session {full_id} has no conversation.jsonl")
         header = {"type": "session_export", "metadata": metadata.to_dict()}
         lines = [json.dumps(header, separators=(",", ":"), sort_keys=True)]
         with conversation_path.open() as handle:

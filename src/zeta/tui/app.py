@@ -952,9 +952,23 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         import tempfile
 
         ephemeral_root = Path(tempfile.mkdtemp(prefix="zeta-ephemeral-"))
-        manager = SessionManager(ephemeral_root)
-    else:
-        manager = SessionManager(home)
+    try:
+        return _create_app_with_root(args, home, ephemeral_root)
+    except BaseException:
+        if ephemeral_root is not None:
+            import shutil
+
+            shutil.rmtree(ephemeral_root, ignore_errors=True)
+        raise
+
+
+def _create_app_with_root(
+    args: argparse.Namespace,
+    home: Path,
+    ephemeral_root: Path | None,
+) -> TUIApp:
+    ephemeral = ephemeral_root is not None
+    manager = SessionManager(ephemeral_root if ephemeral else home)
     project_dir = discover_repo_root(Path.cwd()) / ".zeta"
     loaded_settings = load_settings(home=home, project_dir=project_dir)
     config: ResolvedConfig = resolve_settings(
@@ -1163,7 +1177,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         model=selected_model,
         zeta_home=home,
         verbose=args.verbose,
-        history_path=home / "history",
+        history_path=(ephemeral_root if ephemeral else home) / "history",
         approval_policy=approval_policy,
         context_files=[str(path) for path in project_context.files],
         on_model_change=model_changed,

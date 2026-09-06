@@ -85,17 +85,20 @@ def _run_delete(
     err: IO[str],
     input_reader,
 ) -> int:
-    session_id = args.session_id
     try:
-        metadata = manager.open(session_id).metadata
+        full_id = manager.resolve_id(args.session_id)
     except SessionError as exc:
         print(f"zeta: {exc}", file=err)
         return 1
+    label = ""
+    try:
+        metadata = manager._read(full_id)
+    except SessionError:
+        metadata = None
+    if metadata is not None and metadata.name:
+        label = f" [{metadata.name}]"
     if not args.force:
-        label = f" [{metadata.name}]" if metadata.name else ""
-        prompt = (
-            f"delete session {session_id[:8]}{label}? [y/N] "
-        )
+        prompt = f"delete session {full_id[:8]}{label}? [y/N] "
         try:
             answer = input_reader(prompt)
         except EOFError:
@@ -104,11 +107,11 @@ def _run_delete(
             print("aborted", file=out)
             return 1
     try:
-        manager.delete(session_id)
+        manager.delete(full_id)
     except SessionError as exc:
         print(f"zeta: {exc}", file=err)
         return 1
-    print(f"deleted {session_id}", file=out)
+    print(f"deleted {full_id}", file=out)
     return 0
 
 
