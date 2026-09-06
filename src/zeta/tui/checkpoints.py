@@ -424,19 +424,21 @@ def _render_branch_tree(branches: list[BranchInfo]) -> str:
     # /tree usage footer off the visible transcript. Keep the first and last
     # halves so the current branch marker stays visible.
     head_count = TREE_SOFT_CAP // 2
-    hidden_start, hidden_end = None, None
+    hidden_start: int | None = None
+    hidden_end: int | None = None
     if len(branches) > TREE_SOFT_CAP:
         hidden_start = head_count
         hidden_end = len(branches) - head_count
-    for index, branch in enumerate(branches, start=1):
+    for pos, branch in enumerate(branches):
         if (
             hidden_start is not None
             and hidden_end is not None
-            and hidden_start < index - 1 < hidden_end
+            and hidden_start <= pos < hidden_end
         ):
-            if index - 1 == hidden_start + 1:
+            if pos == hidden_start:
                 lines.append(f"  ... {hidden_end - hidden_start} more branches ...")
             continue
+        index = pos + 1
         marker = "*" if branch.is_current else " "
         divergence = (
             f" · from seq {branch.divergence.seq}"

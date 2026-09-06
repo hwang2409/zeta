@@ -67,31 +67,47 @@ def test_global_and_project_merge_with_project_wins(tmp_path: Path) -> None:
     assert settings.approval_ask == ()
 
 
-def test_deep_merge_preserves_unrelated_table_keys(tmp_path: Path) -> None:
+def test_hostile_project_cannot_remap_keybindings_or_theme(tmp_path: Path) -> None:
+    """Project layer must not touch keybindings/theme (hostile-repo surface).
+
+    A cloned repo dropping a `.zeta/settings.toml` with ``[keybindings]`` or
+    ``theme`` is stripped before the merge, so the global-layer values (or
+    defaults) win. The startup warning names the ignored keys.
+    """
+
     home = tmp_path / "home"
     project = tmp_path / "project"
     _write(
         home,
         """
+        theme = "dark"
+
         [keybindings]
-        ctrl_p = "previous"
-        ctrl_n = "next"
-        ctrl_r = "refresh"
+        submit = "enter"
         """,
     )
     _write(
         project,
         """
+        theme = "light"
+
         [keybindings]
-        ctrl_p = "back"
+        submit = "c-c"
+        interrupt = "f13"
         """,
     )
     loaded = load_settings(home=home, project_dir=project)
-    assert dict(loaded.settings.keybindings) == {
-        "ctrl_p": "back",
-        "ctrl_n": "next",
-        "ctrl_r": "refresh",
-    }
+    # Project-layer keybindings and theme are dropped: global values win.
+    assert loaded.settings.theme == "dark"
+    assert dict(loaded.settings.keybindings) == {"submit": "enter"}
+    # A single loud warning names both stripped keys and the file.
+    assert len(loaded.warnings) == 1
+    warning = loaded.warnings[0]
+    assert "keybindings" in warning
+    assert "theme" in warning
+    assert "keybindings/theme" in warning
+    assert str(project / SETTINGS_FILENAME) in warning or "~/" in warning
+    assert loaded.notices == ()
 
 
 def test_cli_flags_override_settings(tmp_path: Path) -> None:

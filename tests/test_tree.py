@@ -478,18 +478,33 @@ def test_slash_fork_picker_falls_through_to_checkpoints_without_user_messages(
 
 
 def test_slash_tree_soft_caps_long_branch_lists(tmp_path: Path) -> None:
-    """Sweep (d): /tree elides overflow with an ellipsis marker."""
+    """Sweep (d): /tree elides overflow with an ellipsis marker.
+
+    The ellipsis count must match the number of rows hidden exactly — an
+    off-by-one under-shows or over-reports how many branches were dropped.
+    With N total branches and head_count = TREE_SOFT_CAP // 2 rows kept on
+    each side, exactly ``N - 2 * head_count`` rows are hidden.
+    """
 
     from zeta.tui.checkpoints import TREE_SOFT_CAP
 
     store = ConversationStore(tmp_path)
     root = store.append_message(_msg(MessageRole.USER, "root"))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
-    # Spin up TREE_SOFT_CAP + 5 fork branches off the root.
-    for _ in range(TREE_SOFT_CAP + 5):
+    extra_forks = 5
+    for _ in range(TREE_SOFT_CAP + extra_forks):
         store.append_message_fork(root.id)
     app = _make_tui(store)
     result = app.slash_tree("")
-    assert "... " in result and "more branches" in result
+    # 1 root branch + (TREE_SOFT_CAP + extra_forks) forks total.
+    total_branches = 1 + TREE_SOFT_CAP + extra_forks
+    head_count = TREE_SOFT_CAP // 2
+    expected_hidden = total_branches - 2 * head_count
+    assert f"... {expected_hidden} more branches ..." in result
+    # And there is exactly one ellipsis line, not several.
+    assert result.count("more branches") == 1
     # Current branch marker still visible in the output.
     assert "* " in result
+    # Exactly 2 * head_count branch rows survive the cap.
+    branch_rows = [line for line in result.splitlines() if "head seq" in line]
+    assert len(branch_rows) == 2 * head_count

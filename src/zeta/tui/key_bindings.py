@@ -120,20 +120,35 @@ def resolve_keybindings(
     """
 
     resolved: dict[str, tuple[str, ...]] = dict(DEFAULTS)
-    if not user_map:
-        return resolved
-    for action, spec in user_map.items():
-        if action not in ACTIONS:
-            valid = ", ".join(sorted(ACTIONS))
+    if user_map:
+        for action, spec in user_map.items():
+            if action not in ACTIONS:
+                valid = ", ".join(sorted(ACTIONS))
+                raise KeybindingError(
+                    f"keybindings: unknown action {action!r}; valid: {valid}"
+                )
+            try:
+                resolved[action] = parse_key_spec(spec)
+            except KeybindingError as exc:
+                raise KeybindingError(
+                    f"keybindings: {action!r} = {spec!r}: {exc}"
+                ) from exc
+    # Collision detection: a remap that lands on a key already owned by
+    # another action means prompt-toolkit registers two handlers on the same
+    # key and fires both — silent shadowing the user has no way to spot.
+    # Fail loudly so a one-line typo does not turn `ctrl-y` into a coin flip
+    # between submit and retry.
+    reverse: dict[tuple[str, ...], list[str]] = {}
+    for action, key_tuple in resolved.items():
+        reverse.setdefault(key_tuple, []).append(action)
+    for key_tuple, actions in reverse.items():
+        if len(actions) > 1:
+            a, b = sorted(actions)[:2]
+            key_display = " ".join(key_tuple)
             raise KeybindingError(
-                f"keybindings: unknown action {action!r}; valid: {valid}"
+                f"keybindings: {key_display!r} is bound to both "
+                f"{a!r} and {b!r}; each key may only bind one action"
             )
-        try:
-            resolved[action] = parse_key_spec(spec)
-        except KeybindingError as exc:
-            raise KeybindingError(
-                f"keybindings: {action!r} = {spec!r}: {exc}"
-            ) from exc
     return resolved
 
 

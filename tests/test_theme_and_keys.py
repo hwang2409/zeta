@@ -80,6 +80,30 @@ def test_resolve_keybindings_reports_bad_key_with_action() -> None:
         resolve_keybindings({"retry": "nope"})
 
 
+def test_resolve_keybindings_rejects_user_vs_default_collision() -> None:
+    """Remapping ``submit`` onto ``c-y`` collides with retry's default."""
+
+    with pytest.raises(KeybindingError, match="'c-y' is bound to both"):
+        resolve_keybindings({"submit": "c-y"})
+
+
+def test_resolve_keybindings_rejects_user_vs_user_collision() -> None:
+    """Two remaps landing on the same key both fail loudly at load."""
+
+    with pytest.raises(KeybindingError, match="'c-t' is bound to both"):
+        resolve_keybindings({"submit": "c-t", "retry": "c-t"})
+
+
+def test_resolve_keybindings_collision_error_names_both_actions() -> None:
+    """The error message names both colliding actions, sorted for stability."""
+
+    with pytest.raises(KeybindingError) as exc_info:
+        resolve_keybindings({"submit": "c-y"})
+    message = str(exc_info.value)
+    assert "'retry'" in message
+    assert "'submit'" in message
+
+
 def _binding_keys(bindings: KeyBindings, callback_name: str) -> set[tuple[str, ...]]:
     return {
         tuple(str(k.value) if hasattr(k, "value") else str(k) for k in binding.keys)
