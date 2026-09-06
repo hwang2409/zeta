@@ -6,6 +6,7 @@ import asyncio
 import os
 import shlex
 import warnings
+from collections import deque
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
@@ -306,6 +307,7 @@ class AgentLoop:
                 self.tool_registry.set_pre_execute_hook(self.hooks.pre_tool)
         self._plan_mode = False
         self._plan_mode_prior_prompt: Message | None = None
+        self._steering_queue: deque[Message] = deque()
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
 
@@ -378,6 +380,26 @@ class AgentLoop:
 
         self.tool_registry.abort()
         self._background_owner.cancel_all()
+        self._steering_queue.clear()
+
+    def steer(self, message: Message) -> None:
+        """Queue a user message for injection at the next tool boundary.
+
+        The running ``_run_turn`` drains this queue before the next provider
+        call, so the message never lands between a tool_call and its
+        tool_result. Callers must pass a durable USER-role message.
+        """
+
+        if message.role is not MessageRole.USER:
+            raise ValueError("steering message must have the user role")
+        self._steering_queue.append(message)
+
+    @property
+    def has_pending_steering(self) -> bool:
+        return bool(self._steering_queue)
+
+    def clear_pending_steering(self) -> None:
+        self._steering_queue.clear()
 
     def set_background_event_sink(
         self, sink: Callable[[StreamEvent], None] | None
@@ -895,6 +917,14 @@ class AgentLoop:
         yield StreamEvent(StreamEventType.AGENT_START)
 
         for turn_number in range(1, self.max_turns + 1):
+            # Mid-turn steering drains here — after the previous iteration's
+            # dispatch_tool_calls persisted every tool_result, and before the
+            # next provider call. The invariant "never split a tool_call from
+            # its tool_result" holds because this point is strictly between
+            # complete tool batches.
+            while self._steering_queue:
+                steering = self._steering_queue.popleft()
+                self.store.append_message(steering)
             if (
                 self.agent_depth
                 and (

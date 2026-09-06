@@ -16,6 +16,9 @@ from ...tools.exec import (
 )
 from ...types import StreamEvent, StreamEventType, ToolCall, ToolResult
 
+# Default timeout for ad-hoc ``!cmd`` passthrough commands from the composer.
+PASSTHROUGH_TIMEOUT = 30.0
+
 
 class CommandRuntimeMixin:
     """Run inline spans and custom exec commands for the TUI."""
@@ -160,6 +163,104 @@ class CommandRuntimeMixin:
         self._loop_state = "idle"
         self._streaming = False
         return receipt
+
+    async def _run_shell_passthrough(self, command: str) -> None:
+        """Run one ad-hoc ``!cmd`` passthrough via the exec-macro machinery.
+
+        The empty command routes to the last passthrough so ``!!`` repeats
+        the previous run (per pi's ``!!`` semantics documented in the vault
+        note ``tools/harness-pi-coding-agent.md``). No model turn happens
+        either way — the receipt lands in the transcript and is stitched
+        into the next real user turn like any exec macro.
+        """
+
+        # A running model turn or preprocessing pipeline blocks the shell
+        # passthrough: the composer's own dispatch task is not "active" for
+        # this purpose, only in-flight submissions are.
+        if self._submissions.active:
+            self._print_system("passthrough unavailable while a turn is running")
+            return
+        target = command.strip()
+        if not target:
+            target = getattr(self, "_last_passthrough", "")
+            if not target:
+                self._print_system(
+                    "passthrough repeat unavailable: no previous ! command"
+                )
+                return
+        else:
+            self._last_passthrough = target
+        call = ToolCall(
+            f"passthrough-{uuid4().hex}",
+            "exec",
+            {"command": target, "timeout": PASSTHROUGH_TIMEOUT},
+        )
+        register_macro_display(call.id, command=target, argv=())
+        abort_signal = self.loop.tool_registry.abort_signal.registry.new_generation()
+        log_path = self.loop.store.session_dir / f"passthrough-{call.id[12:]}.log"
+
+        def lifecycle_sink(kind: str) -> None:
+            event_type = {
+                "approval_start": StreamEventType.TOOL_APPROVAL_START,
+                "approval_end": StreamEventType.TOOL_APPROVAL_END,
+                "execution_start": StreamEventType.TOOL_EXECUTION_START,
+            }.get(kind)
+            if event_type is None:
+                return
+            self._handle_tool_event(
+                StreamEvent(
+                    event_type,
+                    tool_call=call,
+                    data={"passthrough": True},
+                )
+            )
+            if kind == "approval_start":
+                asyncio.get_running_loop().call_soon(self._present_pending_approvals)
+            self._invalidate_prompt()
+
+        def stream_sink(event: StreamEvent) -> None:
+            event.data["passthrough"] = True
+            self._handle_tool_event(event)
+            self._invalidate_prompt()
+
+        try:
+            result = await run_exec_macro(
+                self.loop.tool_registry,
+                call,
+                log_path,
+                stream_sink=stream_sink,
+                lifecycle_sink=lifecycle_sink,
+                abort_signal=abort_signal,
+            )
+        except asyncio.CancelledError:
+            result = ToolResult(
+                call.id, "tool execution canceled", True, is_canceled=True
+            )
+        finally:
+            if self._approval_policy is not None:
+                self._approval_policy.forget_ephemeral(call.id)
+            forget_macro_display(call.id)
+        self._handle_tool_event(
+            StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END,
+                tool_call=call,
+                tool_result=result,
+                data={"passthrough": True},
+            )
+        )
+        structured = result.structured_content or {}
+        if result.is_canceled:
+            status = "canceled"
+        elif result.content.startswith("tool execution denied"):
+            status = "denied"
+        elif structured.get("timed_out") is True:
+            status = "timeout"
+        else:
+            exit_code = structured.get("exit_code")
+            status = f"exit {exit_code}" if exit_code is not None else "failed"
+        self._record_macro_receipt(f"ran !{target}, {status}")
+        self._loop_state = "idle"
+        self._streaming = False
 
     def _watch_background_macro(
         self,

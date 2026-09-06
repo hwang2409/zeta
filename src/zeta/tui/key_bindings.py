@@ -55,6 +55,11 @@ DEFAULTS: Final[Mapping[str, tuple[str, ...]]] = {
     "transcript-next-user": ("c-down",),
     "toggle-agent": ("c-x", "c-o"),
     "plan-mode-toggle": ("s-tab",),
+    # Bash-style external-editor chord: opens $EDITOR (fallback vi) on the
+    # composer buffer via prompt-toolkit's ``Buffer.open_in_editor``, which
+    # handles terminal state around the round-trip. Works in both vi and
+    # emacs editing modes; the vi ``v``-in-normal shortcut still applies.
+    "open-editor": ("c-x", "c-e"),
 }
 
 ACTIONS: Final[frozenset[str]] = frozenset(DEFAULTS)
@@ -589,6 +594,10 @@ def build_key_bindings(
         def deny(event: KeyPressEvent) -> None:
             del event
             on_deny()
+
+    @bindings.add(*resolved_keys["open-editor"], eager=True)
+    def open_external_editor(event: KeyPressEvent) -> None:
+        event.current_buffer.open_in_editor()
 
     if on_plan_toggle is not None:
         # Shift+Tab cycles modes in the harnesses people arrive from, so it
