@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import inspect
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -18,6 +19,73 @@ class ApprovalDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     ASK = "ask"
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalRule:
+    """One allow/deny/ask entry: a tool name with an optional subject glob.
+
+    ``read`` matches every ``read`` call. ``bash(git status*)`` matches a
+    ``bash`` call whose declared subject argument (``command`` for ``bash``)
+    satisfies ``fnmatch.fnmatchcase`` against the pattern. That is the only
+    matching mode: a misread pattern is an unintended auto-approval, so
+    predictability beats expressiveness here.
+    """
+
+    tool: str
+    pattern: str | None = None
+
+    def __str__(self) -> str:
+        if self.pattern is None:
+            return self.tool
+        return f"{self.tool}({self.pattern})"
+
+
+def parse_approval_rule(text: str) -> ApprovalRule:
+    """Parse ``tool`` or ``tool(pattern)``; anything else is a ``ValueError``.
+
+    The tool name may not be empty or contain whitespace or parentheses, and
+    the pattern may not be empty. The pattern is taken verbatim.
+    """
+
+    if type(text) is not str:
+        raise ValueError(
+            f"invalid approval rule {text!r}: expected a string, "
+            f"got {type(text).__name__}"
+        )
+    if "(" not in text:
+        tool, pattern = text, None
+    elif text.endswith(")"):
+        tool, pattern = text[:-1].split("(", 1)
+        if not pattern:
+            raise ValueError(
+                f"invalid approval rule {text!r}: empty argument pattern"
+            )
+    else:
+        raise ValueError(
+            f"invalid approval rule {text!r}: missing closing parenthesis; "
+            "expected 'tool' or 'tool(pattern)'"
+        )
+    if not tool or "(" in tool or ")" in tool or any(ch.isspace() for ch in tool):
+        raise ValueError(
+            f"invalid approval rule {text!r}: tool name must be nonempty "
+            "with no whitespace or parentheses"
+        )
+    return ApprovalRule(tool, pattern)
+
+
+def _rule_set(rules: Iterable[str | ApprovalRule]) -> frozenset[ApprovalRule]:
+    return frozenset(
+        rule if isinstance(rule, ApprovalRule) else parse_approval_rule(rule)
+        for rule in rules
+    )
+
+
+def _without_scoped(
+    rules: frozenset[ApprovalRule], tool: str
+) -> tuple[frozenset[ApprovalRule], list[ApprovalRule]]:
+    dropped = [rule for rule in rules if rule.tool == tool and rule.pattern is not None]
+    return rules - frozenset(dropped), dropped
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,16 +114,18 @@ class ApprovalPolicy:
     def __init__(
         self,
         *,
-        always_allow: Iterable[str] = (),
-        always_deny: Iterable[str] = (),
-        always_ask: Iterable[str] = (),
+        always_allow: Iterable[str | ApprovalRule] = (),
+        always_deny: Iterable[str | ApprovalRule] = (),
+        always_ask: Iterable[str | ApprovalRule] = (),
         default: ApprovalDecision | str = ApprovalDecision.ASK,
         store: ConversationStore | None = None,
     ) -> None:
-        self.always_allow = frozenset(always_allow)
-        self.always_deny = frozenset(always_deny)
-        self.always_ask = frozenset(always_ask)
+        self.always_allow = always_allow
+        self.always_deny = always_deny
+        self.always_ask = always_ask
         self.default = _decision(default)
+        self._subjects: dict[str, str] = {}
+        self._notices: list[str] = []
         self._store = store
         self._delegated: dict[
             tuple[str, str], tuple[ApprovalRequest, ConversationStore]
@@ -65,19 +135,119 @@ class ApprovalPolicy:
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
 
+    # The three rule sets accept rule text or parsed rules and always hold
+    # parsed rules, so ``policy.always_ask = frozenset()`` keeps neutralising
+    # every ask rule, bare or argument-scoped (headless relies on this).
+
+    @property
+    def always_allow(self) -> frozenset[ApprovalRule]:
+        return self._always_allow
+
+    @always_allow.setter
+    def always_allow(self, rules: Iterable[str | ApprovalRule]) -> None:
+        self._always_allow = _rule_set(rules)
+
+    @property
+    def always_deny(self) -> frozenset[ApprovalRule]:
+        return self._always_deny
+
+    @always_deny.setter
+    def always_deny(self, rules: Iterable[str | ApprovalRule]) -> None:
+        self._always_deny = _rule_set(rules)
+
+    @property
+    def always_ask(self) -> frozenset[ApprovalRule]:
+        return self._always_ask
+
+    @always_ask.setter
+    def always_ask(self, rules: Iterable[str | ApprovalRule]) -> None:
+        self._always_ask = _rule_set(rules)
+
+    @property
+    def notices(self) -> tuple[str, ...]:
+        """Loud configuration notices: rules dropped because they cannot apply."""
+
+        return tuple(self._notices)
+
+    def declare_subjects(
+        self, subjects: Mapping[str, str | None]
+    ) -> tuple[str, ...]:
+        """Record which argument scopes each tool; returns new notices.
+
+        The registry calls this for every tool it holds. A tool that declares
+        no subject cannot be scoped by arguments, so an argument-scoped rule
+        naming it is a configuration error: the rule is dropped from every
+        tier and reported, never silently widened to a bare-name match.
+        Declarations merge, so a child registry pushing a subset of its
+        parent's tools cannot erase what the parent declared.
+        """
+
+        dropped: list[ApprovalRule] = []
+        for tool, subject in subjects.items():
+            if subject is not None:
+                self._subjects[tool] = subject
+                continue
+            self._subjects.pop(tool, None)
+            self._always_deny, removed = _without_scoped(self._always_deny, tool)
+            dropped.extend(removed)
+            self._always_ask, removed = _without_scoped(self._always_ask, tool)
+            dropped.extend(removed)
+            self._always_allow, removed = _without_scoped(self._always_allow, tool)
+            dropped.extend(removed)
+        notices = tuple(
+            f"approval · dropped rule '{rule}': tool '{rule.tool}' "
+            "declares no approval subject, so it cannot be scoped by arguments"
+            for rule in sorted(dropped, key=str)
+        )
+        self._notices.extend(notices)
+        return notices
+
     def decide(
         self,
         tool_name: str,
         arguments: dict[str, object],
     ) -> ApprovalDecision:
-        del arguments
-        if tool_name in self.always_deny:
+        if self._matches(self._always_deny, tool_name, arguments, unreadable=True):
             return ApprovalDecision.DENY
-        if tool_name in self.always_ask:
+        if self._matches(self._always_ask, tool_name, arguments, unreadable=True):
             return ApprovalDecision.ASK
-        if tool_name in self.always_allow:
+        if self._matches(self._always_allow, tool_name, arguments, unreadable=False):
             return ApprovalDecision.ALLOW
         return self.default
+
+    def _matches(
+        self,
+        rules: frozenset[ApprovalRule],
+        tool_name: str,
+        arguments: object,
+        *,
+        unreadable: bool,
+    ) -> bool:
+        """Report whether any rule in one tier fires for this call.
+
+        A bare rule fires on the name alone. A scoped rule needs the tool's
+        declared subject: with none declared it is inert. When the subject
+        argument is missing or not a string the rule resolves to its safe
+        side, given by ``unreadable``: an allow rule does not fire, while a
+        deny or ask rule does (fail closed).
+        """
+
+        for rule in rules:
+            if rule.tool != tool_name:
+                continue
+            if rule.pattern is None:
+                return True
+            subject = self._subjects.get(tool_name)
+            if subject is None:
+                continue
+            value = arguments.get(subject) if isinstance(arguments, Mapping) else None
+            if not isinstance(value, str):
+                if unreadable:
+                    return True
+                continue
+            if fnmatch.fnmatchcase(value, rule.pattern):
+                return True
+        return False
 
     def pending_requests(self) -> list[ApprovalRequest]:
         store = self._require_store()

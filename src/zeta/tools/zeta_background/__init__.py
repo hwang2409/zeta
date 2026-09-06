@@ -88,6 +88,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "run_background",
         _run_background,
+        approval_subject="command",
         description=(
             "Start a shell command as a session-scoped background task. "
             "Use task_output to monitor it."

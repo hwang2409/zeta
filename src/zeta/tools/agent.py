@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -119,6 +120,17 @@ class ChildApprovalPolicy:
 
     def cleanup_delegated(self, child_instance_id: str) -> None:
         self.parent.cleanup_delegated(child_instance_id)
+
+    def declare_subjects(
+        self, subjects: Mapping[str, str | None]
+    ) -> tuple[str, ...]:
+        # Child tools are clones of the parent's, so the parent already holds
+        # every subject; declarations merge, so pushing the subset is safe.
+        return self.parent.declare_subjects(subjects)
+
+    @property
+    def notices(self) -> tuple[str, ...]:
+        return self.parent.notices
 
     def decide(self, tool_name: str, arguments: dict[str, Any]) -> ApprovalDecision:
         return self.parent.decide(tool_name, arguments)

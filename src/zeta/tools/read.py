@@ -153,6 +153,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "read",
         _read,
+        approval_subject="path",
         description=(
             "Read a UTF-8 file. Relative paths use the session cwd; "
             "~ and absolute paths outside the cwd are allowed."

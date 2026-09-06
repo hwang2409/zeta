@@ -557,6 +557,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "exec",
         _exec,
+        approval_subject="command",
         description=(
             "Run a shell command from the session cwd. "
             "This tool is not a sandbox. "

@@ -107,6 +107,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "edit",
         _edit,
+        approval_subject="path",
         description=(
             "Replace one unique UTF-8 string in a file. "
             "Relative paths use the session cwd; "

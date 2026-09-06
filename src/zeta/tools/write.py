@@ -111,6 +111,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "write",
         _write,
+        approval_subject="path",
         description=(
             "Write UTF-8 text to a file. Relative paths use the session cwd; "
             "~ and absolute paths outside the cwd are allowed."

@@ -41,8 +41,10 @@ from ..execution import (
     ToolStream,  # noqa: F401 - preserve the public registry import
     ToolStreamPublisher,  # noqa: F401 - preserve the public registry import
     ToolStreamSink,
+    _signal_is_set,
     _ToolCallStreamPublisher,
-    _ToolCanceled,
+    _ToolCanceled,  # noqa: F401 - preserve the exec tool's import
+    _yield_for_abort,  # noqa: F401 - preserve the read tool's import
     bind_execution_context,
     build_execution_arguments,
     run_handler_with_abort,
@@ -113,16 +115,6 @@ def _validate_unique_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
     call_ids = [tool_call.id for tool_call in tool_calls]
     if len(call_ids) != len(set(call_ids)):
         raise ValueError("duplicate tool call id in one execution batch")
-
-
-async def _yield_for_abort(
-    abort_signal: ToolAbortSignal,
-) -> None:
-    if _signal_is_set(abort_signal):
-        raise _ToolCanceled()
-    await asyncio.sleep(0)
-    if _signal_is_set(abort_signal):
-        raise _ToolCanceled()
 
 
 class _BoundedText:
@@ -385,6 +377,8 @@ class ToolDefinition:
     parallel_safe: bool = False
     validate_arguments: bool = True
     requires_approval: bool = True
+    # Argument that ``tool(pattern)`` approval rules match against (ZETA-86).
+    approval_subject: str | None = None
 
     def schema(self) -> ToolSchema:
         return {
@@ -505,6 +499,7 @@ class ToolRegistry:
         validate_arguments: bool = True,
         requires_approval: bool = True,
         handler_factory: ToolHandlerFactory | None = None,
+        approval_subject: str | None = None,
     ) -> ToolDefinition:
         if type(name) is not str or not name:
             raise ValueError("tool name must be a nonempty string")
@@ -521,6 +516,15 @@ class ToolRegistry:
             supplied_schemas[0] if supplied_schemas else None,
             validate_definition=validate_arguments,
         )
+        properties = normalized.get("properties")
+        if approval_subject is not None and (
+            type(approval_subject) is not str
+            or not approval_subject
+            or (isinstance(properties, Mapping) and properties and approval_subject not in properties)
+        ):
+            raise ValueError(
+                f"approval_subject {approval_subject!r} must name a parameter of tool {name!r}"
+            )
         definition = ToolDefinition(
             name=name,
             description=description,
@@ -530,8 +534,11 @@ class ToolRegistry:
             parallel_safe=parallel_safe,
             validate_arguments=validate_arguments,
             requires_approval=requires_approval,
+            approval_subject=approval_subject,
         )
         self._tools[name] = definition
+        if self.approval_policy is not None:
+            self.approval_policy.declare_subjects({name: approval_subject})
         return _copy_definition(definition)
 
     register_tool = register
@@ -626,6 +633,10 @@ class ToolRegistry:
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
         self.approval_policy = policy
         self._approval_gate.policy = policy
+        if policy is not None:  # tell the policy which argument scopes each tool
+            policy.declare_subjects(
+                {name: tool.approval_subject for name, tool in self._tools.items()}
+            )
 
     def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
@@ -1182,7 +1193,3 @@ def _validate_schema_definition(schema: Mapping[str, Any], path: str) -> None:
         raise ValueError(f"schema properties is only valid for an object at {path}")
     if expected_type != "array" and schema.get("items") is not None:
         raise ValueError(f"schema items is only valid for an array at {path}")
-
-
-def _signal_is_set(signal_state: ToolAbortSignal) -> bool:
-    return signal_state.is_set()

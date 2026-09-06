@@ -216,6 +216,7 @@ def register(registry: ToolRegistry) -> None:
     registry.register_session_tool(
         "bash",
         _bash,
+        approval_subject="command",
         description=(
             "Run a shell command. Session cwd persists after cd. "
             "Paths outside the session cwd are allowed. "
