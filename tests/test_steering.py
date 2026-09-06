@@ -35,7 +35,6 @@ from zeta.types import (
     ToolUseContent,
 )
 
-
 # --- fakes ------------------------------------------------------------------
 
 
@@ -173,11 +172,9 @@ async def test_steer_delivers_between_tool_pair_and_next_provider_call(
     store = ConversationStore(tmp_path / "sessions")
     loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3)
 
-    events: list[StreamEvent] = []
-
     async def run() -> None:
-        async for event in loop.run_turn("prompt"):
-            events.append(event)
+        async for _event in loop.run_turn("prompt"):
+            pass
 
     task = asyncio.create_task(run())
     await backend.turn1_streaming.wait()
@@ -207,13 +204,6 @@ async def test_steer_delivers_between_tool_pair_and_next_provider_call(
     # The second provider call MUST have seen the steer message in context.
     assert backend.calls[1][-1].role is MessageRole.USER
     assert backend.calls[1][-1].content[0].text == "steer-1"
-    # The loop yielded a USER_STEERING event so UI layers see the injection.
-    steering_events = [
-        event for event in events if event.type is StreamEventType.USER_STEERING
-    ]
-    assert len(steering_events) == 1
-    assert steering_events[0].message is not None
-    assert steering_events[0].message.content[0].text == "steer-1"
 
 
 @pytest.mark.asyncio
@@ -380,6 +370,94 @@ async def test_abort_drops_pending_steering(tmp_path: Path) -> None:
     app.abort_active()
     await _drive(app._active_task or asyncio.sleep(0))
     assert app.loop.has_pending_steering is False
+    await app.loop.close()
+
+
+class TextOnlyBackend(CompletionBackend):
+    """Streams one text-only assistant turn per call — no tool_use, so the
+    loop exits without a follow-up drain point. Turn 1 blocks on
+    ``release_turn1`` so callers can enqueue a steer AFTER the drain point
+    but BEFORE MESSAGE_END fires.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+        self.turn1_streaming = asyncio.Event()
+        self.release_turn1 = asyncio.Event()
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        index = len(self.calls)
+        self.calls.append(list(messages))
+        text = TextContent(f"reply-{index}")
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=text)
+        if index == 0:
+            self.turn1_streaming.set()
+            await self.release_turn1.wait()
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [text]),
+            data={"usage": {"input_tokens": 1, "output_tokens": 1}},
+        )
+
+
+@pytest.mark.asyncio
+async def test_toolless_turn_drops_orphan_steer_and_notifies(
+    tmp_path: Path,
+) -> None:
+    """A steer enqueued during a tool-less turn has no next provider call to
+    drain into. The pipeline must clear it on turn end AND print a system
+    notice, so it can never resurface at the top of the next fresh turn.
+    """
+
+    backend = TextOnlyBackend()
+    store = ConversationStore(tmp_path / "sessions")
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(backend, store, max_turns=3),
+        provider="fake",
+        model="offline",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    app._submit_input("prompt")
+    await backend.turn1_streaming.wait()
+    app._submit_input("orphan")
+    await _wait(lambda: app.loop.has_pending_steering)
+    backend.release_turn1.set()
+    await _wait(lambda: not app.loop.has_pending_steering)
+    if app._active_task is not None:
+        await _drive(app._active_task)
+
+    # The queue was cleared on turn end, so no orphan lingers.
+    assert app.loop.has_pending_steering is False
+    # The user was told their echoed steer was not delivered.
+    assert "steer arrived after the turn ended" in output.getvalue()
+
+    # A follow-up fresh prompt reaches the provider WITHOUT the orphan tail —
+    # the fresh user message is the last message the provider saw.
+    app._submit_input("fresh")
+    await _wait(lambda: len(backend.calls) >= 2)
+    if app._active_task is not None:
+        await _drive(app._active_task)
+
+    second_call = backend.calls[1]
+    last_user_texts = [
+        block.text
+        for block in second_call[-1].content
+        if isinstance(block, TextContent)
+    ]
+    assert second_call[-1].role is MessageRole.USER
+    assert last_user_texts == ["fresh"]
+    # And "orphan" never made it into any provider call's context.
+    for call_messages in backend.calls:
+        for message in call_messages:
+            for block in message.content:
+                if isinstance(block, TextContent):
+                    assert block.text != "orphan"
     await app.loop.close()
 
 

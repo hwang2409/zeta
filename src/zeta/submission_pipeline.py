@@ -885,6 +885,16 @@ class SubmissionPipeline:
             or self._provider_task is not message.task
         ):
             return
+        # A steer enqueued after the last drain point of a tool-less final
+        # turn has no next provider call to land into. Drop it here (matching
+        # the abort path) so it can't resurface at the top of the next fresh
+        # turn, and tell the user their echoed steer was not delivered.
+        if self._host.loop.has_pending_steering:
+            self._host.loop.clear_pending_steering()
+            self._host._print_system(
+                "steer arrived after the turn ended; not delivered "
+                "(resend if still wanted)"
+            )
         self._ack_entry(self._provider_entry)
         self._provider_entry = None
         self._provider_task = None

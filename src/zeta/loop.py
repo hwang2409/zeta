@@ -925,10 +925,6 @@ class AgentLoop:
             while self._steering_queue:
                 steering = self._steering_queue.popleft()
                 self.store.append_message(steering)
-                yield StreamEvent(
-                    StreamEventType.USER_STEERING,
-                    message=steering,
-                )
             if (
                 self.agent_depth
                 and (
