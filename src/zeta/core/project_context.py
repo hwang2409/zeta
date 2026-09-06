@@ -233,22 +233,27 @@ def load_project_context(
             deduped.append(resolved)
 
         # The cap governs walked instruction bytes so a long packaged
-        # identity does not push every file over. Track only the running
-        # total of appended <zeta-project-instructions> sections.
+        # identity does not push every file over. Iterate nearest-first so
+        # the cap drops OUTER (more general) files and preserves the
+        # nearest (most-specific) instructions per the documented
+        # precedence.
         instructions_bytes = 0
         skipped: list[Path] = []
-        for path in deduped:
+        kept: list[tuple[Path, str]] = []
+        for path in reversed(deduped):
             content = path.read_text(encoding="utf-8")
             section = _format_section(path, content)
             section_bytes = len(section.encode("utf-8"))
             if instructions_bytes + section_bytes > byte_cap:
                 skipped.append(path)
                 continue
+            kept.append((path, section))
+            instructions_bytes += section_bytes
+        for path, section in reversed(kept):
             sections.append(section)
             loaded.append(path)
-            instructions_bytes += section_bytes
         if skipped:
-            joined = ", ".join(str(path) for path in skipped)
+            joined = ", ".join(str(path) for path in reversed(skipped))
             notices.append(
                 f"context · walked instructions exceeded {byte_cap} byte cap; "
                 f"skipped {joined}"

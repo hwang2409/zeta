@@ -195,6 +195,139 @@ def test_partial_context_metadata_is_replaced_with_fallback_snapshot(
     assert saved["context_files"] == [str(context_file.resolve())]
 
 
+def test_resume_system_prompt_flag_wins_over_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    (tmp_path / "AGENTS.md").write_text("original rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    metadata_path = home / "sessions" / session_id / "meta.json"
+    original_snapshot = json.loads(metadata_path.read_text(encoding="utf-8"))["system_prompt"]
+    assert "original rules" in original_snapshot
+
+    resumed = create_app(
+        build_parser().parse_args(
+            [
+                "--resume",
+                session_id,
+                "--provider",
+                "fake",
+                "--system-prompt",
+                "operator override",
+            ]
+        )
+    )
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+    saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    assert prompt == "operator override"
+    assert saved["system_prompt"] == "operator override"
+    assert saved["context_files"] == []
+    assert any(
+        "system prompt overridden" in alert for alert in resumed._startup_alerts
+    )
+
+
+def test_resume_append_flag_composes_over_snapshot_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    (tmp_path / "AGENTS.md").write_text("repo rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+
+    resumed = create_app(
+        build_parser().parse_args(
+            [
+                "--resume",
+                session_id,
+                "--provider",
+                "fake",
+                "--append-system-prompt",
+                "TAIL EXTENSION",
+            ]
+        )
+    )
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+
+    # Append composes over the freshly rebuilt base — identity + walked
+    # instructions come back, and the tail lands last.
+    assert "You are zeta" in prompt
+    assert "repo rules" in prompt
+    assert prompt.endswith("TAIL EXTENSION")
+    assert any(
+        "system prompt overridden" in alert for alert in resumed._startup_alerts
+    )
+
+
+def test_resume_without_flags_leaves_snapshot_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    (tmp_path / "AGENTS.md").write_text("original rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    metadata_path = home / "sessions" / session_id / "meta.json"
+    original = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    # Mutate the AGENTS.md on disk; snapshot resume must ignore the edit.
+    (tmp_path / "AGENTS.md").write_text("mutated rules", encoding="utf-8")
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+    )
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+    saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    assert prompt == original["system_prompt"]
+    assert saved["system_prompt"] == original["system_prompt"]
+    assert saved["context_files"] == original["context_files"]
+    assert resumed._startup_alerts == ()
+
+
+def test_second_resume_after_override_sees_overridden_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    (tmp_path / "AGENTS.md").write_text("original rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+
+    create_app(
+        build_parser().parse_args(
+            [
+                "--resume",
+                session_id,
+                "--provider",
+                "fake",
+                "--system-prompt",
+                "explicit override",
+            ]
+        )
+    )
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+    )
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+
+    assert prompt == "explicit override"
+    assert resumed._startup_alerts == ()
+
+
 def test_concurrent_legacy_resumes_adopt_the_persisted_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

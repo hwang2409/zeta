@@ -176,6 +176,7 @@ class TUIApp(
         model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
         startup_notices: Sequence[str] = (),
         startup_warnings: Sequence[str] = (),
+        startup_alerts: Sequence[str] = (),
         external_tools: ExternalToolDiscovery | None = None,
         workspace_snapshot_cap: int | None = None,
         ephemeral_root: Path | None = None,
@@ -264,6 +265,7 @@ class TUIApp(
         self._fork_rebuilt = False
         self._startup_notices: tuple[str, ...] = tuple(startup_notices)
         self._startup_warnings: tuple[str, ...] = tuple(startup_warnings)
+        self._startup_alerts: tuple[str, ...] = tuple(startup_alerts)
         self._external_tools = external_tools
         self._ephemeral_root = ephemeral_root
         self._new_session_requested = False
@@ -908,6 +910,8 @@ class TUIApp(
         await self.loop.ensure_mcp_servers()
         for warning in self._startup_warnings:
             self._print_unit(Text(warning, style=ERROR))
+        for alert in self._startup_alerts:
+            self._print_unit(Text(alert, style=COMMAND))
         for notice in self._startup_notices:
             self._print_unit(Text(notice, style=DIM))
         for notice in self._slash_commands.notices:
@@ -998,6 +1002,7 @@ def _create_app_with_root(
     if force_provider and config.model is None:
         raise SessionError("--force-provider requires --model")
 
+    override_on_resume = False
     if resuming:
         if resume_id == "":
             previews = manager.list_session_previews(limit=RECENT_SESSION_LIMIT)
@@ -1044,7 +1049,15 @@ def _create_app_with_root(
         provider = provider_override or metadata.provider
         model = model_override or metadata.model
         store = opened.store
-        if metadata.system_prompt:
+        # Explicit --system-prompt / --append-system-prompt on resume WINS
+        # over the snapshot: rebuild the context from the flags, overwrite
+        # the snapshot, and warn that the prompt cache will rebuild. The
+        # ~/.zeta/SYSTEM.md file path stays snapshot-first — only the
+        # CLI-flag path (values non-None here) triggers overwrite.
+        override_on_resume = bool(metadata.system_prompt) and (
+            system_prompt_override is not None or system_prompt_append is not None
+        )
+        if metadata.system_prompt and not override_on_resume:
             project_context = ProjectContext(
                 metadata.system_prompt,
                 tuple(Path(path) for path in metadata.context_files),
@@ -1061,6 +1074,7 @@ def _create_app_with_root(
                 metadata,
                 system_prompt=project_context.system_prompt,
                 context_files=[str(path) for path in project_context.files],
+                overwrite=override_on_resume,
             )
             project_context = ProjectContext(
                 persisted.system_prompt,
@@ -1193,6 +1207,11 @@ def _create_app_with_root(
             "ephemeral session: nothing will be persisted",
             *startup_warnings,
         )
+    startup_alerts: tuple[str, ...] = ()
+    if resuming and override_on_resume:
+        startup_alerts = (
+            "system prompt overridden for this session; prompt cache will rebuild",
+        )
     return TUIApp(
         loop,
         provider=provider,
@@ -1216,6 +1235,7 @@ def _create_app_with_root(
         ),
         startup_notices=startup_notices,
         startup_warnings=startup_warnings,
+        startup_alerts=startup_alerts,
         external_tools=external_tools,
         workspace_snapshot_cap=config.workspace_snapshot_cap,
         ephemeral_root=ephemeral_root,

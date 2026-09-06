@@ -232,9 +232,9 @@ def test_project_context_bounds_total_size_with_loud_notice(tmp_path: Path) -> N
     repo = tmp_path / "repo"
     inner = repo / "leaf"
     inner.mkdir(parents=True)
-    (repo / "AGENTS.md").write_text("x" * 500, encoding="utf-8")
-    huge = "y" * 2000
-    (inner / "AGENTS.md").write_text(huge, encoding="utf-8")
+    huge = "x" * 2000
+    (repo / "AGENTS.md").write_text(huge, encoding="utf-8")
+    (inner / "AGENTS.md").write_text("y" * 500, encoding="utf-8")
 
     context = load_project_context(
         cwd=inner,
@@ -243,9 +243,13 @@ def test_project_context_bounds_total_size_with_loud_notice(tmp_path: Path) -> N
         byte_cap=1200,
     )
 
-    assert (repo / "AGENTS.md").resolve() in context.files
-    assert (inner / "AGENTS.md").resolve() not in context.files
+    # Nearest (leaf) survives; outer (more general) is dropped and named.
+    assert (inner / "AGENTS.md").resolve() in context.files
+    assert (repo / "AGENTS.md").resolve() not in context.files
     assert any("exceeded 1200 byte cap" in notice for notice in context.notices)
+    assert any(
+        str((repo / "AGENTS.md").resolve()) in notice for notice in context.notices
+    )
     assert huge not in context.system_prompt
 
 
