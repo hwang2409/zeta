@@ -161,8 +161,10 @@ class TUIApp(
         startup_notices: Sequence[str] = (),
         startup_warnings: Sequence[str] = (),
         external_tools: ExternalToolDiscovery | None = None,
+        workspace_snapshot_cap: int | None = None,
     ) -> None:
         self.loop = loop
+        self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: background_notice(self, message)
         )
@@ -1138,6 +1140,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         startup_notices=startup_notices,
         startup_warnings=startup_warnings,
         external_tools=external_tools,
+        workspace_snapshot_cap=config.workspace_snapshot_cap,
     )
 
 

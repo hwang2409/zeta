@@ -52,10 +52,18 @@ _TOP_KEYS = frozenset(
         "keybindings",
         "stream_stall_seconds",
         "stream_stall_retries",
+        "workspace_snapshot_cap",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
-    {"provider", "model", "theme", "token_budget", "keybindings"}
+    {
+        "provider",
+        "model",
+        "theme",
+        "token_budget",
+        "keybindings",
+        "workspace_snapshot_cap",
+    }
 )
 _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
 _EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
@@ -76,6 +84,7 @@ class Settings:
     keybindings: Mapping[str, Any] = field(default_factory=lambda: _EMPTY_MAPPING)
     stream_stall_seconds: int | None = None
     stream_stall_retries: int | None = None
+    workspace_snapshot_cap: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +102,7 @@ class ResolvedConfig:
     keybindings: Mapping[str, Any]
     stream_stall_seconds: int | None = None
     stream_stall_retries: int | None = None
+    workspace_snapshot_cap: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +172,7 @@ def resolve(
         keybindings=settings.keybindings,
         stream_stall_seconds=settings.stream_stall_seconds,
         stream_stall_retries=settings.stream_stall_retries,
+        workspace_snapshot_cap=settings.workspace_snapshot_cap,
     )
 
 
@@ -249,6 +260,9 @@ def _validate(data: Mapping[str, Any], notices: list[str]) -> Settings:
     stream_stall_retries = _validated_nonnegative_int(
         data, "stream_stall_retries", notices
     )
+    workspace_snapshot_cap = _validated_positive_int(
+        data, "workspace_snapshot_cap", notices
+    )
     allow, deny, ask = _validated_approval(data, notices)
     keybindings = _validated_keybindings(data, notices)
     return Settings(
@@ -263,6 +277,7 @@ def _validate(data: Mapping[str, Any], notices: list[str]) -> Settings:
         keybindings=keybindings,
         stream_stall_seconds=stream_stall_seconds,
         stream_stall_retries=stream_stall_retries,
+        workspace_snapshot_cap=workspace_snapshot_cap,
     )
 
 
