@@ -111,13 +111,21 @@ def build_backend(
     model: str | None,
     *,
     home: str | Path | None = None,
+    stall_seconds: float | None = None,
+    stall_retries: int | None = None,
 ) -> tuple[CompletionBackend, str]:
     """Build the selected provider without loading network credentials for fake."""
 
     if provider == "fake":
         selected_model = model or "offline"
         return FakeInteractiveBackend(model=selected_model), selected_model
-    return build_network_backend(provider, model, home=home)
+    return build_network_backend(
+        provider,
+        model,
+        home=home,
+        stall_seconds=stall_seconds,
+        stall_retries=stall_retries,
+    )
 
 
 class TUIApp(
@@ -780,6 +788,14 @@ class TUIApp(
             self._flush_stream_kind(preserve_inline=True)
             self._presenter.reset_assistant_unit()
             return
+        if (
+            event.type is StreamEventType.RETRY
+            and event.data.get("is_stall")
+        ):
+            self._presenter.reset_assistant_unit()
+            self._reset_stream_state()
+            self._reset_stream_buffers()
+            return
         if event.type is not StreamEventType.MESSAGE_UPDATE:
             self._flush_pending_stream()
             return
@@ -983,7 +999,13 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             )
     else:
         provider = config.provider
-        backend, selected_model = build_backend(provider, config.model, home=home)
+        backend, selected_model = build_backend(
+            provider,
+            config.model,
+            home=home,
+            stall_seconds=config.stream_stall_seconds,
+            stall_retries=config.stream_stall_retries,
+        )
         project_context = load_project_context(
             repo_root=discover_repo_root(Path.cwd()),
             zeta_home=home,
@@ -1003,7 +1025,13 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         metadata = opened.metadata
         store = opened.store
     if resuming:
-        backend, selected_model = build_backend(provider, model, home=home)
+        backend, selected_model = build_backend(
+            provider,
+            model,
+            home=home,
+            stall_seconds=config.stream_stall_seconds,
+            stall_retries=config.stream_stall_retries,
+        )
     hooks = load_hooks_for_provider(home, provider)
     approval_default = (
         ApprovalDecision.ALLOW if config.yolo else ApprovalDecision.ASK

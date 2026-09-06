@@ -18,6 +18,7 @@ from ..types import CompletionBackend
 from .anthropic import AnthropicBackend, AnthropicCredentialStore
 from .auth import OAuthCredentialStore
 from .codex import CodexBackend, CodexCredentialStore
+from .transport import DEFAULT_STREAM_STALL_RETRIES, DEFAULT_STREAM_STALL_SECONDS
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
@@ -43,21 +44,33 @@ def build_backend(
     model: str | None,
     *,
     home: str | Path | None = None,
+    stall_seconds: float | None = None,
+    stall_retries: int | None = None,
 ) -> tuple[CompletionBackend, str]:
     """Build a network provider backend and report the model it settled on."""
 
     auth_home = Path(home) if home is not None else env_home()
+    stall_kwargs = {
+        "stall_seconds": (
+            DEFAULT_STREAM_STALL_SECONDS if stall_seconds is None else stall_seconds
+        ),
+        "stall_retries": (
+            DEFAULT_STREAM_STALL_RETRIES if stall_retries is None else stall_retries
+        ),
+    }
     if provider == "claude":
         selected_model = model or DEFAULT_CLAUDE_MODEL
         return AnthropicBackend(
             model=selected_model,
             token_store=AnthropicCredentialStore(auth_home / "anthropic-oauth.json"),
+            **stall_kwargs,
         ), selected_model
     if provider == "codex":
         selected_model = model or DEFAULT_CODEX_MODEL
         return CodexBackend(
             model=selected_model,
             token_store=CodexCredentialStore(auth_home / "codex-oauth.json"),
+            **stall_kwargs,
         ), selected_model
     raise ValueError(f"unsupported provider: {provider}")
 

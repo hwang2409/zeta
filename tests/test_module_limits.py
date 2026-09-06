@@ -1,9 +1,9 @@
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1] / "src" / "zeta"
-# the codex stream parser is a legitimate provider module at this size.
-MAX_FILE_LINES = 1200
+# the codex stream parser is a legitimate provider module at this size; bumped
+# to 1250 for the ZETA-74 stall-watchdog wiring on top of the existing parser.
+MAX_FILE_LINES = 1250
 # Built-in todo state and tool modules keep their layer-specific boundaries.
 # Bumped on 2026-08-27 for the dedicated TUI agent-card seam.
 MAX_FILES_PER_DIRECTORY = 15
