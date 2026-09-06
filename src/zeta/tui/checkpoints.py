@@ -76,12 +76,14 @@ class CheckpointTranscriptMixin:
     """Add checkpoint commands and active-branch transcript rebuilding."""
 
     _workspace_snapshot_store: WorkspaceSnapshotStore | None = None
+    _workspace_snapshot_cap: int | None = None
 
     def _snapshots(self) -> WorkspaceSnapshotStore:
         if self._workspace_snapshot_store is None:
             self._workspace_snapshot_store = WorkspaceSnapshotStore(
                 self.loop.store.session_dir,
                 self.loop.store.session_id,
+                cap=self._workspace_snapshot_cap,
             )
         return self._workspace_snapshot_store
 
@@ -337,7 +339,9 @@ def _dirty_guard(
         return None
     if git_repo_root(cwd) is None:
         return None
-    if snapshots.current() is None:
+    # Gate on "any restorable snapshot exists" so a corrupt or missing
+    # current_id in the state file cannot silently bypass the confirm.
+    if not snapshots.has_restorable_snapshot():
         return None
     if not snapshots.is_dirty(cwd):
         return None
