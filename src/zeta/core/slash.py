@@ -516,6 +516,8 @@ class SlashSession(Protocol):
 
     def slash_fork(self, args: str) -> str: ...
 
+    def slash_tree(self, args: str) -> str: ...
+
     def slash_tools(self, args: str) -> str: ...
 
     def slash_undo(self, args: str) -> str: ...
@@ -883,6 +885,10 @@ def _run_fork(session: SlashSession, args: str) -> str:
     return session.slash_fork(args)
 
 
+def _run_tree(session: SlashSession, args: str) -> str:
+    return session.slash_tree(args)
+
+
 def _run_tools(session: SlashSession, args: str) -> str:
     return session.slash_tools(args)
 
@@ -924,7 +930,16 @@ def create_slash_registry(
     registry.register(SlashCommand("paste", _run_paste, "paste an image"))
     registry.register(SlashCommand("compact", _run_compact, "compact the context"))
     registry.register(SlashCommand("checkpoint", _run_checkpoint, "save a checkpoint"))
-    registry.register(SlashCommand("fork", _run_fork, "fork from a checkpoint"))
+    registry.register(
+        SlashCommand(
+            "fork",
+            _run_fork,
+            "fork from a prior user message or checkpoint",
+        )
+    )
+    registry.register(
+        SlashCommand("tree", _run_tree, "list branches or switch to one")
+    )
     registry.register(
         SlashCommand("tools", _run_tools, "list tools or trust project tools")
     )

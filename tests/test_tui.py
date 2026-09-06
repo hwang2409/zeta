@@ -6372,7 +6372,7 @@ async def test_run_delivers_queued_follow_up_after_current_turn(tmp_path: Path) 
     [
         ("/checkpoint", "checkpoint_count"),
         ("/compact", "compact: nothing to compact"),
-        ("/fork", "no checkpoints on the active branch"),
+        ("/fork", "no user messages to fork from"),
         ("/model offline", "model: offline"),
         ("/plan on", "plan mode: on"),
     ],
