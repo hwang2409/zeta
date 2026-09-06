@@ -518,6 +518,10 @@ class SlashSession(Protocol):
 
     def slash_tools(self, args: str) -> str: ...
 
+    def slash_undo(self, args: str) -> str: ...
+
+    def slash_redo(self, args: str) -> str: ...
+
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str: ...
 
 
@@ -879,6 +883,14 @@ def _run_tools(session: SlashSession, args: str) -> str:
     return session.slash_tools(args)
 
 
+def _run_undo(session: SlashSession, args: str) -> str:
+    return session.slash_undo(args)
+
+
+def _run_redo(session: SlashSession, args: str) -> str:
+    return session.slash_redo(args)
+
+
 def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
@@ -903,6 +915,12 @@ def create_slash_registry(
     registry.register(SlashCommand("fork", _run_fork, "fork from a checkpoint"))
     registry.register(
         SlashCommand("tools", _run_tools, "list tools or trust project tools")
+    )
+    registry.register(
+        SlashCommand("undo", _run_undo, "restore the previous workspace snapshot")
+    )
+    registry.register(
+        SlashCommand("redo", _run_redo, "restore the next workspace snapshot")
     )
     registry.register(
         SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")
