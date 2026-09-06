@@ -522,6 +522,10 @@ class SlashSession(Protocol):
 
     def slash_redo(self, args: str) -> str: ...
 
+    def slash_new(self, args: str) -> str: ...
+
+    def slash_name(self, args: str) -> str: ...
+
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str: ...
 
 
@@ -891,6 +895,14 @@ def _run_redo(session: SlashSession, args: str) -> str:
     return session.slash_redo(args)
 
 
+def _run_new(session: SlashSession, args: str) -> str:
+    return session.slash_new(args)
+
+
+def _run_name(session: SlashSession, args: str) -> str:
+    return session.slash_name(args)
+
+
 def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
@@ -921,6 +933,12 @@ def create_slash_registry(
     )
     registry.register(
         SlashCommand("redo", _run_redo, "restore the next workspace snapshot")
+    )
+    registry.register(
+        SlashCommand("new", _run_new, "start a fresh session in this window")
+    )
+    registry.register(
+        SlashCommand("name", _run_name, "name the current session for the picker")
     )
     registry.register(
         SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")

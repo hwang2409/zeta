@@ -35,6 +35,30 @@ class SessionPreview:
     session_id: str
     updated_at: str
     preview: str
+    name: str = ""
+
+
+SESSION_NAME_MAX_LENGTH = 60
+
+
+def normalize_session_name(value: str) -> str:
+    """Return a validated session label or raise ``SessionError``."""
+
+    cleaned = _ANSI_SEQUENCE.sub("", value)
+    cleaned = "".join(
+        character
+        for character in cleaned
+        if character not in _PREVIEW_STRIPPED_CHARACTERS
+        and unicodedata.category(character) != "Cc"
+    )
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        raise SessionError("session name must be a nonempty label")
+    if cell_len(cleaned) > SESSION_NAME_MAX_LENGTH:
+        raise SessionError(
+            f"session name is too long (max {SESSION_NAME_MAX_LENGTH} cells)"
+        )
+    return cleaned
 
 
 _ANSI_SEQUENCE = re.compile(
@@ -85,6 +109,36 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def format_relative_age(updated_at: str, *, now: datetime | None = None) -> str:
+    """Return a compact human-readable age string like ``2h ago``."""
+
+    try:
+        parsed = datetime.fromisoformat(updated_at)
+    except ValueError:
+        return "unknown"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    reference = now or datetime.now(UTC)
+    delta_seconds = int((reference - parsed).total_seconds())
+    if delta_seconds < 5:
+        return "just now"
+    if delta_seconds < 60:
+        return f"{delta_seconds}s ago"
+    minutes = delta_seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    if days < 30:
+        return f"{days}d ago"
+    months = days // 30
+    if months < 12:
+        return f"{months}mo ago"
+    return f"{days // 365}y ago"
+
+
 @dataclass(slots=True)
 class SessionMetadata:
     version: int
@@ -102,6 +156,7 @@ class SessionMetadata:
     vim_mode: bool = True
     budget_pinned: bool = False
     plan_mode: bool = False
+    name: str = ""
 
     @classmethod
     def new(
@@ -118,6 +173,7 @@ class SessionMetadata:
         vim_mode: bool = True,
         budget_pinned: bool = False,
         plan_mode: bool = False,
+        name: str = "",
     ) -> SessionMetadata:
         timestamp = _now()
         return cls(
@@ -135,6 +191,7 @@ class SessionMetadata:
             vim_mode=vim_mode,
             budget_pinned=budget_pinned,
             plan_mode=plan_mode,
+            name=name,
         )
 
     @classmethod
@@ -174,6 +231,7 @@ class SessionMetadata:
         vim_mode = value.get("vim_mode", True)
         budget_pinned = value.get("budget_pinned", False)
         plan_mode = value.get("plan_mode", False)
+        name = value.get("name", "")
         if (
             type(system_prompt) is not str
             or type(context_files) is not list
@@ -181,6 +239,7 @@ class SessionMetadata:
             or type(vim_mode) is not bool
             or type(budget_pinned) is not bool
             or type(plan_mode) is not bool
+            or type(name) is not str
         ):
             raise SessionError(f"session metadata context is invalid: {path}")
         return cls(
@@ -199,6 +258,7 @@ class SessionMetadata:
             vim_mode=vim_mode,
             budget_pinned=budget_pinned,
             plan_mode=plan_mode,
+            name=name,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -218,6 +278,7 @@ class SessionMetadata:
             "vim_mode": self.vim_mode,
             "budget_pinned": self.budget_pinned,
             "plan_mode": self.plan_mode,
+            "name": self.name,
         }
 
 
@@ -246,6 +307,7 @@ class SessionManager:
         context_files: list[str] | tuple[str, ...] = (),
         vim_mode: bool = True,
         budget_pinned: bool = False,
+        name: str = "",
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -267,6 +329,7 @@ class SessionManager:
                 context_files=context_files,
                 vim_mode=vim_mode,
                 budget_pinned=budget_pinned,
+                name=name,
             )
             store = ConversationStore(
                 self.sessions_dir,
@@ -340,6 +403,7 @@ class SessionManager:
                     session_id=metadata.session_id,
                     updated_at=metadata.updated_at,
                     preview=_preview_text(first_message) or "(no user message)",
+                    name=metadata.name,
                 )
             )
         return previews
@@ -449,6 +513,82 @@ class SessionManager:
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
+    def record_name(self, metadata: SessionMetadata, *, name: str) -> None:
+        """Persist a session label with optimistic concurrency."""
+
+        expected = metadata.name
+
+        def update(item: SessionMetadata) -> SessionMetadata:
+            if item.name != expected:
+                raise SessionError(
+                    "session name changed before commit; winner: "
+                    f"name={item.name!r}"
+                )
+            item.name = name
+            return self._touch(item)
+
+        current = self._mutate(metadata.session_id, update)
+        self._copy_metadata(metadata, current)
+
+    def resolve_id(self, session_id: str) -> str:
+        """Return the full id for an exact match or unambiguous prefix."""
+
+        self._validate_id(session_id)
+        if (self.sessions_dir / session_id).is_dir():
+            return session_id
+        if not self.sessions_dir.exists():
+            raise SessionError(f"session {session_id} was not found")
+        matches = sorted(
+            entry.name
+            for entry in self.sessions_dir.iterdir()
+            if entry.is_dir() and entry.name.startswith(session_id)
+        )
+        if not matches:
+            raise SessionError(f"session {session_id} was not found")
+        if len(matches) > 1:
+            raise SessionError(
+                f"session id {session_id!r} is ambiguous "
+                f"({len(matches)} matches)"
+            )
+        return matches[0]
+
+    def delete(self, session_id: str) -> None:
+        """Remove a session directory and its contents."""
+
+        full_id = self.resolve_id(session_id)
+        session_dir = self.sessions_dir / full_id
+        import shutil
+
+        lock_path = session_dir / ".lock"
+        if lock_path.exists():
+            with lock_path.open("a+") as handle:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise SessionError(
+                        "session is currently open in another process"
+                    ) from exc
+                shutil.rmtree(session_dir)
+        else:
+            shutil.rmtree(session_dir)
+
+    def export(self, session_id: str) -> str:
+        """Return the session as portable JSONL (metadata header + entries)."""
+
+        full_id = self.resolve_id(session_id)
+        metadata = self._read(full_id)
+        conversation_path = self.sessions_dir / full_id / "conversation.jsonl"
+        if not conversation_path.exists():
+            raise SessionError(f"session {full_id} has no conversation.jsonl")
+        header = {"type": "session_export", "metadata": metadata.to_dict()}
+        lines = [json.dumps(header, separators=(",", ":"), sort_keys=True)]
+        with conversation_path.open() as handle:
+            for line in handle:
+                stripped = line.rstrip("\n")
+                if stripped:
+                    lines.append(stripped)
+        return "\n".join(lines) + "\n"
+
     def record_budget(
         self,
         metadata: SessionMetadata,
@@ -506,6 +646,7 @@ class SessionManager:
         target.vim_mode = source.vim_mode
         target.budget_pinned = source.budget_pinned
         target.plan_mode = source.plan_mode
+        target.name = source.name
 
     def _read(self, session_id: str) -> SessionMetadata:
         path = self.sessions_dir / session_id / "meta.json"
@@ -564,6 +705,7 @@ class SessionManager:
 
 __all__ = [
     "META_VERSION",
+    "SESSION_NAME_MAX_LENGTH",
     "OpenedSession",
     "SessionError",
     "SessionManager",
@@ -571,7 +713,9 @@ __all__ = [
     "SessionPreview",
     "env_home",
     "find_most_recent",
+    "format_relative_age",
     "list_sessions",
+    "normalize_session_name",
 ]
 
 
