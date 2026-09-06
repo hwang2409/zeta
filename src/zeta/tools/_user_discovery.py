@@ -22,10 +22,20 @@ Two scopes stacked over the built-in registry (registered by
   privileges. Session-scoped trust only; a durable ``/trust`` mechanism is a
   future ticket.
 
+Precedence: project tools may replace USER tools on trust (loud "shadows
+user tool" notice) but may NEVER replace BUILT-IN names -- an attempt is
+rejected at the discovery seam with a loud REJECTED notice naming the
+module and tool name, and the built-in stays intact. The rest of the
+project module's tools still register. This closes the "trusted project
+tool hijacks an always_allow built-in name" gap.
+
 Failure modes fail OPEN: a malformed module (bad Python, missing/invalid
 ``register``, exception during registration, or import error) is reported
 via a dim notice naming the file. Import errors are isolated per file so
-one broken tool does not stop the rest.
+one broken tool does not stop the rest. When a module's ``register()``
+raises AFTER re-registering names that already existed, the prior
+``ToolDefinition`` for each affected name is restored so a partial-failed
+project module cannot silently unregister a pre-existing user tool.
 """
 
 from __future__ import annotations
@@ -37,7 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .registry import ToolRegistry
+    from .registry import ToolDefinition, ToolRegistry
 
 TOOLS_DIRNAME = "tools"
 USER_SCOPE = "user"
@@ -63,10 +73,14 @@ class ExternalToolDiscovery:
         notices: tuple[str, ...],
         warnings: tuple[str, ...],
         pending_project_tools: tuple[PendingProjectTool, ...],
+        builtin_names: frozenset[str] = frozenset(),
+        user_names: frozenset[str] = frozenset(),
     ) -> None:
         self._notices: list[str] = list(notices)
         self._warnings: list[str] = list(warnings)
         self._pending: list[PendingProjectTool] = list(pending_project_tools)
+        self._builtin_names: frozenset[str] = builtin_names
+        self._user_names: frozenset[str] = user_names
 
     @property
     def notices(self) -> tuple[str, ...]:
@@ -101,13 +115,19 @@ def apply_external_tools(
     user_dir = _resolve_tools_dir(home)
     project_tools_dir = _resolve_tools_dir(project_dir)
     if user_dir is not None:
-        _load_scope_modules(
-            registry,
-            user_dir,
-            USER_SCOPE,
-            builtin_names,
-            notices,
-        )
+        user_added: set[str] = set()
+        for path in _module_files(user_dir):
+            added = _load_module_file(
+                registry,
+                path,
+                USER_SCOPE,
+                builtin_names=builtin_names,
+                user_names=frozenset(user_added),
+                other_names=frozenset(),
+                other_label="",
+                notices=notices,
+            )
+            user_added.update(added)
     pending: list[PendingProjectTool] = []
     if project_tools_dir is not None and project_tools_dir != user_dir:
         pending = _collect_pending_project_tools(project_tools_dir)
@@ -117,10 +137,13 @@ def apply_external_tools(
             f"tools · untrusted project tools present: {names}; "
             "run /tools trust to enable them for this session"
         )
+    user_names = frozenset(registry.registered_names - builtin_names)
     return ExternalToolDiscovery(
         notices=tuple(notices),
         warnings=tuple(warnings),
         pending_project_tools=tuple(pending),
+        builtin_names=builtin_names,
+        user_names=user_names,
     )
 
 
@@ -134,20 +157,30 @@ def trust_project_tools(
     the caller must now consider active. The discovery's pending list is
     cleared regardless of per-module success -- a malformed module is
     reported once and stays dropped.
+
+    Project modules may NEVER register a name owned by a built-in tool: any
+    such attempt is rejected with a loud notice and the rest of the module's
+    tools register normally.
     """
 
     if not discovery._pending:
         return (), ()
-    guard_names = registry.registered_names
+    builtin_names = discovery._builtin_names
+    user_names = discovery._user_names
+    project_added: set[str] = set()
     notices: list[str] = []
     for pending in list(discovery._pending):
-        _load_module_file(
+        added = _load_module_file(
             registry,
             pending.path,
             PROJECT_SCOPE,
-            guard_names,
-            notices,
+            builtin_names=builtin_names,
+            user_names=user_names,
+            other_names=frozenset(project_added),
+            other_label="project tool",
+            notices=notices,
         )
+        project_added.update(added)
     trusted = tuple(discovery._pending)
     discovery._pending.clear()
     return tuple(notices), trusted
@@ -189,24 +222,17 @@ def _module_files(tools_dir: Path) -> list[Path]:
     return files
 
 
-def _load_scope_modules(
-    registry: ToolRegistry,
-    tools_dir: Path,
-    scope: str,
-    guard_names: frozenset[str],
-    notices: list[str],
-) -> None:
-    for path in _module_files(tools_dir):
-        _load_module_file(registry, path, scope, guard_names, notices)
-
-
 def _load_module_file(
     registry: ToolRegistry,
     path: Path,
     scope: str,
-    guard_names: frozenset[str],
+    *,
+    builtin_names: frozenset[str],
+    user_names: frozenset[str],
+    other_names: frozenset[str],
+    other_label: str,
     notices: list[str],
-) -> None:
+) -> tuple[str, ...]:
     display = _display_path(path)
     try:
         module = _import_module_from_file(path)
@@ -214,32 +240,40 @@ def _load_module_file(
         notices.append(
             f"tools · ignored {scope} tool {display}: import failed: {_short(exc)}"
         )
-        return
+        return ()
     register = getattr(module, "register", None)
     if not callable(register):
         notices.append(
             f"tools · ignored {scope} tool {display}: no callable register(registry)"
         )
-        return
+        return ()
     added: list[str] = []
+    snapshots: dict[str, ToolDefinition | None] = {}
+    rejected_builtins: list[str] = []
+    reject_builtins = scope == PROJECT_SCOPE
     original_register = registry.register
 
     def spy(name: str, *args: object, **kwargs: object) -> object:
+        if reject_builtins and name in builtin_names:
+            if name not in rejected_builtins:
+                rejected_builtins.append(name)
+            return None
+        snapshots.setdefault(name, registry._tools.get(name))
         added.append(name)
         return original_register(name, *args, **kwargs)
 
     registry.register = spy  # type: ignore[method-assign]
     registry.register_tool = spy  # type: ignore[method-assign]
+    register_error: BaseException | None = None
     try:
         register(registry)
     except Exception as exc:  # noqa: BLE001 - discovery must fail open
-        for name in added:
-            registry.unregister(name)
-        notices.append(
-            f"tools · ignored {scope} tool {display}: "
-            f"register() raised: {_short(exc)}"
-        )
-        return
+        register_error = exc
+        for name, prior in snapshots.items():
+            if prior is None:
+                registry._tools.pop(name, None)
+            else:
+                registry._tools[name] = prior
     finally:
         try:
             del registry.register
@@ -249,16 +283,53 @@ def _load_module_file(
             del registry.register_tool
         except AttributeError:
             pass
-    if not added:
+    for name in rejected_builtins:
+        notices.append(
+            f"tools · REJECTED {scope} tool '{name}' from {display}: "
+            "cannot replace built-in tool"
+        )
+    if register_error is not None:
+        notices.append(
+            f"tools · ignored {scope} tool {display}: "
+            f"register() raised: {_short(register_error)}"
+        )
+        return ()
+    if not added and not rejected_builtins:
         notices.append(
             f"tools · {scope} tool {display} registered no tools"
         )
-        return
+        return ()
     for name in added:
-        if name in guard_names:
-            notices.append(
-                f"tools · {scope} tool '{name}' from {display} shadows built-in"
-            )
+        phrase = _shadow_phrase(
+            name,
+            builtin_names=builtin_names,
+            user_names=user_names,
+            other_names=other_names,
+            other_label=other_label,
+        )
+        if phrase is None:
+            continue
+        notices.append(
+            f"tools · {scope} tool '{name}' from {display} shadows {phrase}"
+        )
+    return tuple(added)
+
+
+def _shadow_phrase(
+    name: str,
+    *,
+    builtin_names: frozenset[str],
+    user_names: frozenset[str],
+    other_names: frozenset[str],
+    other_label: str,
+) -> str | None:
+    if name in builtin_names:
+        return "built-in"
+    if name in user_names:
+        return "user tool"
+    if other_label and name in other_names:
+        return other_label
+    return None
 
 
 def _import_module_from_file(path: Path) -> object:

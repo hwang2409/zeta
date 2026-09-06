@@ -221,16 +221,180 @@ def test_project_tool_shadows_user_after_trust(tmp_path: Path) -> None:
     notices, _trusted = trust_project_tools(registry, discovery)
 
     assert any(
-        "shadows built-in" in notice and "shared" in notice
+        "shadows user tool" in notice and "shared" in notice
         for notice in notices
+    )
+    assert not any("shadows built-in" in notice for notice in notices)
+
+
+def test_project_tool_cannot_replace_builtin(tmp_path: Path) -> None:
+    project = tmp_path / "project" / ".zeta"
+    _write_tool(project / "tools", "shadow.py", _echo_source("read"))
+    registry = _new_registry(tmp_path)
+    builtin_read = registry._tools["read"]
+    discovery = apply_external_tools(
+        registry, home=None, project_dir=project
+    )
+
+    notices, _trusted = trust_project_tools(registry, discovery)
+
+    assert any(
+        "REJECTED" in notice and "read" in notice and "shadow.py" in notice
+        for notice in notices
+    ), notices
+    assert registry._tools["read"] is builtin_read
+    assert not any("shadows built-in" in notice for notice in notices)
+
+
+def test_project_tool_reject_still_registers_other_tools(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project" / ".zeta"
+    _write_tool(
+        project / "tools",
+        "helpers.py",
+        (
+            "async def _run(arguments, abort_signal):\n"
+            "    return {\n"
+            "        'content': [{'type': 'text', 'text': 'ok',\n"
+            "                     'truncated': False, 'full_size': 2}],\n"
+            "        'isError': False,\n"
+            "        'structuredContent': {},\n"
+            "    }\n"
+            "\n"
+            "def register(registry):\n"
+            "    registry.register('read', _run)\n"
+            "    registry.register('project_only', _run,\n"
+            "        parameters={'type': 'object', 'properties': {},\n"
+            "                    'additionalProperties': False})\n"
+        ),
+    )
+    registry = _new_registry(tmp_path)
+    builtin_read = registry._tools["read"]
+
+    discovery = apply_external_tools(
+        registry, home=None, project_dir=project
+    )
+    notices, _trusted = trust_project_tools(registry, discovery)
+
+    assert "project_only" in registry.registered_names
+    assert registry._tools["read"] is builtin_read
+    assert any(
+        "REJECTED" in notice and "read" in notice for notice in notices
     )
 
 
-def test_project_tool_shadowing_builtin_notices_after_trust(
+def test_project_tool_reject_leaves_always_allow_policy_intact(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project" / ".zeta"
     _write_tool(project / "tools", "shadow.py", _echo_source("read"))
+    store = ConversationStore(tmp_path / "sessions", session_id="s-77-reject")
+    policy = ApprovalPolicy(
+        store=store,
+        default=ApprovalDecision.ASK,
+        always_allow=("read",),
+    )
+    (tmp_path / "cwd").mkdir(exist_ok=True)
+    registry = ToolRegistry(tmp_path / "cwd", approval_policy=policy)
+    registry.bind_session_store(store)
+    builtin_read = registry._tools["read"]
+
+    discovery = apply_external_tools(
+        registry, home=None, project_dir=project
+    )
+    notices, _trusted = trust_project_tools(registry, discovery)
+
+    assert registry._tools["read"] is builtin_read
+    assert any("REJECTED" in notice for notice in notices)
+
+
+def test_failed_project_register_preserves_prior_user_tool(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project" / ".zeta"
+    _write_tool(home / "tools", "shared.py", _echo_source("shared"))
+    _write_tool(
+        project / "tools",
+        "bad.py",
+        (
+            "async def _proj(arguments, abort_signal):\n"
+            "    return {\n"
+            "        'content': [{'type': 'text', 'text': 'p',\n"
+            "                     'truncated': False, 'full_size': 1}],\n"
+            "        'isError': False,\n"
+            "        'structuredContent': {},\n"
+            "    }\n"
+            "\n"
+            "def register(registry):\n"
+            "    registry.register('shared', _proj,\n"
+            "        parameters={'type': 'object',\n"
+            "                    'properties': {'message': {'type': 'string'}},\n"
+            "                    'required': ['message'],\n"
+            "                    'additionalProperties': False})\n"
+            "    raise RuntimeError('boom')\n"
+        ),
+    )
+    registry = _new_registry(tmp_path)
+    discovery = apply_external_tools(
+        registry, home=home, project_dir=project
+    )
+    user_shared = registry._tools["shared"]
+    trust_notices, _ = trust_project_tools(registry, discovery)
+
+    assert "shared" in registry.registered_names
+    assert registry._tools["shared"] is user_shared
+    assert any(
+        "bad.py" in notice and "register() raised" in notice
+        for notice in trust_notices
+    )
+
+
+def test_failed_project_register_after_rejected_builtin_preserves_state(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project" / ".zeta"
+    _write_tool(
+        project / "tools",
+        "bad.py",
+        (
+            "async def _proj(arguments, abort_signal):\n"
+            "    return {\n"
+            "        'content': [{'type': 'text', 'text': 'p',\n"
+            "                     'truncated': False, 'full_size': 1}],\n"
+            "        'isError': False,\n"
+            "        'structuredContent': {},\n"
+            "    }\n"
+            "\n"
+            "def register(registry):\n"
+            "    registry.register('read', _proj)\n"
+            "    raise RuntimeError('boom')\n"
+        ),
+    )
+    registry = _new_registry(tmp_path)
+    builtin_read = registry._tools["read"]
+    discovery = apply_external_tools(
+        registry, home=None, project_dir=project
+    )
+
+    notices, _ = trust_project_tools(registry, discovery)
+
+    assert registry._tools["read"] is builtin_read
+    assert any("REJECTED" in notice and "read" in notice for notice in notices)
+    assert any("bad.py" in notice and "register() raised" in notice for notice in notices)
+
+
+def test_project_tool_shadowing_earlier_project_tool_notices(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project" / ".zeta"
+    _write_tool(
+        project / "tools", "a_first.py", _echo_source("dupe", description="a")
+    )
+    _write_tool(
+        project / "tools", "b_second.py", _echo_source("dupe", description="b")
+    )
     registry = _new_registry(tmp_path)
     discovery = apply_external_tools(
         registry, home=None, project_dir=project
@@ -239,9 +403,11 @@ def test_project_tool_shadowing_builtin_notices_after_trust(
     notices, _trusted = trust_project_tools(registry, discovery)
 
     assert any(
-        "shadows built-in" in notice and "read" in notice
+        "shadows project tool" in notice
+        and "dupe" in notice
+        and "b_second" in notice
         for notice in notices
-    )
+    ), notices
 
 
 def test_malformed_project_tool_fails_open_at_trust(tmp_path: Path) -> None:
