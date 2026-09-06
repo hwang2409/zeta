@@ -425,9 +425,20 @@ class SessionManager:
         *,
         system_prompt: str,
         context_files: list[str] | tuple[str, ...],
+        overwrite: bool = False,
     ) -> SessionMetadata:
+        """Snapshot the composed system prompt for future resumes.
+
+        By default this is first-write-wins: once a session has a stored
+        system_prompt, subsequent calls no-op so plain resume replays the
+        same cached prefix. Pass ``overwrite=True`` on the explicit
+        resume-with-``--system-prompt``/``--append-system-prompt`` path
+        so the new prompt replaces the snapshot; the caller is
+        responsible for warning the user that the prompt cache rebuilds.
+        """
+
         def update(item: SessionMetadata) -> SessionMetadata:
-            if item.system_prompt:
+            if item.system_prompt and not overwrite:
                 return item
             item.system_prompt = system_prompt
             item.context_files = list(context_files)
