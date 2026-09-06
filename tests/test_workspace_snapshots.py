@@ -339,6 +339,73 @@ def test_slash_undo_refuses_when_no_earlier_snapshot(
     assert "no earlier" in result
 
 
+def test_slash_checkpoint_soft_fails_on_git_error(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.types import Message, MessageRole, TextContent
+
+    store = _make_store(tmp_path / "session", git_repo)
+    store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("hey")]))
+    app = _make_tui(store)
+
+    real_run = subprocess.run
+
+    def failing_run(cmd, *args, **kwargs):
+        if (
+            len(cmd) >= 2
+            and cmd[0] == "git"
+            and cmd[1] == "add"
+            and kwargs.get("check")
+        ):
+            raise subprocess.CalledProcessError(
+                returncode=128, cmd=cmd, stderr="fatal: forced failure\n"
+            )
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(workspace_module.subprocess, "run", failing_run)
+    result = app.slash_checkpoint("break")
+    assert "workspace snapshot skipped" in result
+    assert "forced failure" in result
+    assert "Traceback" not in result
+
+
+def test_slash_undo_soft_fails_on_git_error(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.types import Message, MessageRole, TextContent
+
+    store = _make_store(tmp_path / "session", git_repo)
+    store.append_message(Message(MessageRole.USER, [TextContent("hi")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("hey")]))
+    app = _make_tui(store)
+    app.slash_checkpoint("first")
+    (git_repo / "tracked.txt").write_text("edit-1\n")
+    store.append_message(Message(MessageRole.USER, [TextContent("u2")]))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("a2")]))
+    app.slash_checkpoint("second")
+
+    real_run = subprocess.run
+
+    def failing_run(cmd, *args, **kwargs):
+        if (
+            len(cmd) >= 2
+            and cmd[0] == "git"
+            and cmd[1] == "read-tree"
+            and kwargs.get("check")
+        ):
+            raise subprocess.CalledProcessError(
+                returncode=128, cmd=cmd, stderr="fatal: read-tree boom\n"
+            )
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(workspace_module.subprocess, "run", failing_run)
+    result = app.slash_undo("--force")
+    assert "workspace unchanged" in result
+    assert "read-tree boom" in result
+    assert "Traceback" not in result
+
+
 def test_slash_checkpoint_in_non_git_directory(tmp_path: Path) -> None:
     from zeta.types import Message, MessageRole, TextContent
 

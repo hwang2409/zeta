@@ -105,11 +105,20 @@ def _ensure_shadow_repo(session_dir: Path) -> Path:
     if not (shadow / "HEAD").exists():
         session_dir.mkdir(parents=True, exist_ok=True)
         shadow.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "init", "--bare", "--quiet", str(shadow)],
-            check=True,
-            capture_output=True,
-        )
+        try:
+            subprocess.run(
+                ["git", "init", "--bare", "--quiet", str(shadow)],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise WorkspaceSnapshotError(
+                f"git init failed for shadow repo: {_git_error_detail(exc)}"
+            ) from exc
+        except (FileNotFoundError, OSError) as exc:
+            raise WorkspaceSnapshotError(
+                f"git init failed for shadow repo: {exc}"
+            ) from exc
     return shadow
 
 
@@ -147,6 +156,12 @@ def _reserve_shadow_index_path(session_dir: Path) -> Path:
     return path
 
 
+def _git_error_detail(exc: subprocess.CalledProcessError) -> str:
+    stderr = (exc.stderr or "").strip() if isinstance(exc.stderr, str) else ""
+    reason = stderr or f"exit {exc.returncode}"
+    return reason.splitlines()[0] if reason else f"exit {exc.returncode}"
+
+
 def _run_git(
     args: list[str],
     *,
@@ -164,15 +179,24 @@ def _run_git(
     )
     if env is not None:
         merged_env.update(env)
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        env=merged_env,
-        input=input_text,
-        capture_output=True,
-        text=True,
-        check=check,
-    )
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            env=merged_env,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise WorkspaceSnapshotError(
+            f"git {args[0] if args else ''} failed: {_git_error_detail(exc)}"
+        ) from exc
+    except (FileNotFoundError, OSError) as exc:
+        if not check:
+            raise
+        raise WorkspaceSnapshotError(f"git invocation failed: {exc}") from exc
 
 
 def git_repo_root(cwd: str | Path) -> str | None:
@@ -565,7 +589,7 @@ class WorkspaceSnapshotStore:
             return False
         try:
             current_tree = _current_tree_sha(self.session_dir, repo_root)
-        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        except WorkspaceSnapshotError:
             return False
         return current_tree != reference.tree_sha
 
