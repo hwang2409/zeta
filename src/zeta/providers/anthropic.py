@@ -11,7 +11,7 @@ import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlencode
 
 import httpx
@@ -131,6 +131,23 @@ def _extract_claude_tokens(value: Any) -> OAuthTokens:
     return OAuthTokens.from_mapping(value, error_type=AnthropicAuthError)
 
 
+class AnthropicCredential(Protocol):
+    """What AnthropicBackend needs from a Claude credential source.
+
+    Subscription OAuth (AnthropicCredentialStore) and opt-in API-key auth
+    (AnthropicApiKeyCredential) both implement this so the request path stays
+    ignorant of which one it was handed.
+    """
+
+    async def access_token(self, client: httpx.AsyncClient) -> str: ...
+
+    async def refresh_token(self, client: httpx.AsyncClient) -> str: ...
+
+    def auth_headers(self, token: str) -> dict[str, str]: ...
+
+    def beta_header(self) -> str: ...
+
+
 class AnthropicCredentialStore(OAuthCredentialStore):
     """Owns zeta's OAuth file and reads Claude credentials only for bootstrap."""
 
@@ -199,6 +216,41 @@ class AnthropicCredentialStore(OAuthCredentialStore):
             raise self.auth_error_type(
                 f"{self.provider_label} OAuth token response is invalid"
             ) from exc
+
+    def auth_headers(self, token: str) -> dict[str, str]:
+        return {"authorization": f"Bearer {token}"}
+
+    def beta_header(self) -> str:
+        return f"{CLAUDE_CODE_BETA},{OAUTH_BETA},{INTERLEAVED_THINKING_BETA}"
+
+
+@dataclass(slots=True)
+class AnthropicApiKeyCredential:
+    """Static `ANTHROPIC_API_KEY` credential, opt-in only (see docs/design.md).
+
+    Evaluation/automation only: no refresh is possible for a static key, so a
+    401 must surface a clear "check your key" error instead of attempting the
+    OAuth refresh-on-401 dance from ZETA-11.
+    """
+
+    api_key: str
+
+    async def access_token(self, client: httpx.AsyncClient) -> str:
+        del client
+        return self.api_key
+
+    async def refresh_token(self, client: httpx.AsyncClient) -> str:
+        del client
+        raise AnthropicAuthError(
+            "Anthropic API key was rejected (HTTP 401); check ANTHROPIC_API_KEY",
+            status_code=401,
+        )
+
+    def auth_headers(self, token: str) -> dict[str, str]:
+        return {"x-api-key": token}
+
+    def beta_header(self) -> str:
+        return f"{CLAUDE_CODE_BETA},{INTERLEAVED_THINKING_BETA}"
 
 
 def build_authorization_url(
@@ -318,6 +370,14 @@ class _SSEDecoder:
         return event, payload
 
 
+def _default_diagnostics_path(token_store: AnthropicCredential) -> Path:
+    """Reuse the OAuth store's home directory; a static key has no home of its own."""
+
+    home = getattr(token_store, "path", None)
+    base = home.parent if isinstance(home, Path) else Path.home() / ".zeta"
+    return base / "logs" / "stream-diagnostics.jsonl"
+
+
 class AnthropicBackend(CompletionBackend):
     """One-completion Anthropic Messages streaming backend."""
 
@@ -328,7 +388,7 @@ class AnthropicBackend(CompletionBackend):
         max_tokens: int = DEFAULT_MAX_TOKENS,
         thinking_budget: int = DEFAULT_THINKING_BUDGET,
         base_url: str = API_URL,
-        token_store: AnthropicCredentialStore | None = None,
+        token_store: AnthropicCredential | None = None,
         client: httpx.AsyncClient | None = None,
         diagnostics_path: str | Path | None = None,
         stall_seconds: float = DEFAULT_STREAM_STALL_SECONDS,
@@ -344,7 +404,7 @@ class AnthropicBackend(CompletionBackend):
         self.diagnostics_path = (
             Path(diagnostics_path)
             if diagnostics_path is not None
-            else self.token_store.path.parent / "logs" / "stream-diagnostics.jsonl"
+            else _default_diagnostics_path(self.token_store)
         )
         self.stall_seconds, self.stall_retries = stall_seconds, stall_retries
 
@@ -411,13 +471,11 @@ class AnthropicBackend(CompletionBackend):
             )
             headers = {
                 "accept": "text/event-stream",
-                "anthropic-beta": (
-                    f"{CLAUDE_CODE_BETA},{OAUTH_BETA},{INTERLEAVED_THINKING_BETA}"
-                ),
+                "anthropic-beta": self.token_store.beta_header(),
                 "anthropic-version": "2023-06-01",
-                "authorization": f"Bearer {token}",
                 "content-type": "application/json",
                 "user-agent": "zeta/0.1",
+                **self.token_store.auth_headers(token),
             }
             stream_started_at = time.monotonic()
             stream_context = client.stream(
