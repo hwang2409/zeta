@@ -5,8 +5,9 @@ ROOT = Path(__file__).parents[1] / "src" / "zeta"
 # to 1250 for the ZETA-74 stall-watchdog wiring on top of the existing parser.
 MAX_FILE_LINES = 1250
 # Built-in todo state and tool modules keep their layer-specific boundaries.
-# Bumped on 2026-08-27 for the dedicated TUI agent-card seam.
-MAX_FILES_PER_DIRECTORY = 15
+# Bumped on 2026-08-27 for the dedicated TUI agent-card seam and again on
+# 2026-09-06 for the ZETA-77 external tool discovery seam.
+MAX_FILES_PER_DIRECTORY = 16
 
 
 def test_module_limits() -> None:

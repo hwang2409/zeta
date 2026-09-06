@@ -16,6 +16,7 @@ from ...core.slash import (
 )
 from ...core.todo import todo_count_tuple
 from ...mcp.prompt_commands import SlashModelInput
+from ...tools._user_discovery import trust_project_tools
 from ..models import validate_model_name
 
 
@@ -192,6 +193,44 @@ class SlashHandlerMixin:
             return f"context budget unchanged: {exc}"
         assembler.token_budget = budget
         return f"context budget {previous:,} -> {budget:,}"
+
+    def slash_tools(self, args: str) -> str:
+        """List registered tools or trust pending project tools."""
+
+        requested = args.strip().lower()
+        discovery = self._external_tools
+        pending = discovery.pending_project_tools if discovery is not None else ()
+        if requested in {"", "list"}:
+            names = sorted(self.loop.tool_registry.registered_names)
+            summary = f"tools: {len(names)} registered"
+            if names:
+                summary = f"{summary} ({', '.join(names)})"
+            if pending:
+                waiting = ", ".join(
+                    sorted({tool.module_stem for tool in pending})
+                )
+                summary = (
+                    f"{summary}; untrusted project tools waiting: {waiting}; "
+                    "run /tools trust to enable"
+                )
+            return summary
+        if requested != "trust":
+            return "tools: use /tools or /tools trust"
+        if self.active or self.pending_approvals:
+            return (
+                "tools unchanged: cannot trust project tools while a turn or "
+                "approval is active"
+            )
+        if discovery is None or not pending:
+            return "tools: no project tools waiting for trust"
+        notices, trusted = trust_project_tools(
+            self.loop.tool_registry, discovery
+        )
+        self.loop.tool_schemas = list(self.loop.tool_registry.schemas)
+        for notice in notices:
+            self._print_system(notice)
+        names = sorted({tool.module_stem for tool in trusted})
+        return f"tools: trusted {len(names)} project tool(s): {', '.join(names)}"
 
     def slash_vim(self, args: str) -> str:
         requested = args.strip().lower()
