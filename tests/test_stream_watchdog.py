@@ -423,6 +423,42 @@ async def _no_op_sleep(_delay: float) -> None:
     return None
 
 
+async def test_anthropic_backend_ignores_stall_after_message_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Post-completion silence must NOT trigger a stall retry: the caller
+    already has a finished message, so the socket hanging open is a clean EOF
+    from our perspective, not a stall that costs another billed attempt."""
+
+    monkeypatch.setattr(anthropic_module.asyncio, "sleep", _no_op_sleep)
+    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_HangingByteStream(ANTHROPIC_SSE.encode()),
+            request=request,
+        )
+
+    client = _mock_client(handler)
+    backend = AnthropicBackend(
+        client=client,
+        token_store=_anthropic_store(tmp_path / "zeta.json"),
+        stall_seconds=0.05,
+        stall_retries=2,
+    )
+    events = [event async for event in backend.complete([], [])]
+    retries = [event for event in events if event.type is StreamEventType.RETRY]
+
+    assert len(requests) == 1
+    assert retries == []
+    assert events[-1].type is StreamEventType.MESSAGE_END
+    await client.aclose()
+
+
 # ------------------------ Codex backend integration ----------------------- #
 
 
@@ -535,6 +571,41 @@ async def test_codex_backend_stall_budget_exhausts_raises(
     await client.aclose()
 
 
+async def test_codex_backend_ignores_stall_after_message_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex mirror of the Anthropic post-completion guard."""
+
+    monkeypatch.setattr(codex_module.asyncio, "sleep", _no_op_sleep)
+    monkeypatch.setattr(transport_module.asyncio, "sleep", _no_op_sleep)
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_HangingByteStream(CODEX_COMPLETE_SSE.encode()),
+            request=request,
+        )
+
+    client = _mock_client(handler)
+    backend = CodexBackend(
+        client=client,
+        token_store=_codex_store(tmp_path / "codex.json"),
+        base_url="https://test.invalid/codex/responses",
+        stall_seconds=0.05,
+        stall_retries=2,
+    )
+    events = [event async for event in backend.complete([], [])]
+    retries = [event for event in events if event.type is StreamEventType.RETRY]
+
+    assert len(requests) == 1
+    assert retries == []
+    assert events[-1].type is StreamEventType.MESSAGE_END
+    await client.aclose()
+
+
 # ---------------------------- AgentLoop integration ------------------------ #
 
 
@@ -584,6 +655,57 @@ async def test_agent_loop_reset_on_stall_retry_drops_pre_stall_partial(
     assert any(isinstance(block, TextContent) and block.text == "fresh text" for block in persisted[0].content)
     assert not any(
         isinstance(block, TextContent) and "pre-stall" in block.text
+        for block in persisted[0].content
+    )
+
+
+class _StallAfterCompletionBackend:
+    """Misbehaving provider: emits a full message, THEN a stall RETRY notice.
+
+    Simulates a broken transport where the post-completion silence somehow
+    still produces an ``is_stall`` event; the loop must ignore it rather than
+    wipe the already-completed message and bill a fresh attempt."""
+
+    def complete(self, messages, tool_schemas):
+        return self._complete(messages, tool_schemas)
+
+    async def _complete(self, _messages, _tool_schemas):
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="only text")
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("only text")]),
+        )
+        yield stall_retry_notice(1, 0.0, 2)
+
+
+async def test_agent_loop_stall_after_message_end_keeps_completed_message(
+    tmp_path: Path,
+) -> None:
+    """Layer B guard: an ``is_stall`` RETRY after MESSAGE_END must not wipe
+    the completed message; the store keeps the first message, unmarked."""
+
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(_StallAfterCompletionBackend(), store)
+    events = [event async for event in loop.run_turn("hi")]
+
+    turn_end = next(
+        event for event in events if event.type is StreamEventType.TURN_END
+    )
+    assert turn_end.message is not None
+    assert [
+        block for block in turn_end.message.content if isinstance(block, TextContent)
+    ] == [TextContent("only text")]
+
+    persisted = [
+        message
+        for message in store.messages()
+        if message.role is MessageRole.ASSISTANT
+    ]
+    assert len(persisted) == 1
+    assert not persisted[0].metadata.get(FAILED_TURN_MARKER)
+    assert any(
+        isinstance(block, TextContent) and block.text == "only text"
         for block in persisted[0].content
     )
 

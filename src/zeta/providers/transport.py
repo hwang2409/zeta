@@ -97,21 +97,41 @@ def stall_retry_kwargs(stall_retries: int) -> dict[str, object]:
     }
 
 
+class StreamFinished:
+    """Mutable flag the provider decoder sets when the completion sentinel
+    arrives, so ``sse_lines``' stall watchdog treats any post-completion
+    silence as a clean EOF instead of a spurious stall retry."""
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = False
+
+
 def sse_lines[E: RuntimeError](
     response: httpx.Response,
     seconds: float,
     provider: str,
     error_class: type[E],
+    finished: StreamFinished | None = None,
 ) -> AsyncIterator[str]:
-    """Yield SSE lines from ``response`` and raise ``error_class`` on stall."""
+    """Yield SSE lines from ``response`` and raise ``error_class`` on stall.
+
+    A ``finished`` flag lets the caller signal that the provider has already
+    emitted its completion sentinel; post-completion silence is then treated
+    as a clean EOF instead of a stall retry."""
 
     def on_stall(elapsed: float) -> E:
         return error_class(
             f"{provider} stream stalled for {elapsed:.0f}s", is_stall=True
         )
 
+    is_finished = (lambda: finished.value) if finished is not None else None
     return stall_watchdog(
-        response.aiter_lines(), seconds=seconds, on_stall=on_stall
+        response.aiter_lines(),
+        seconds=seconds,
+        on_stall=on_stall,
+        is_finished=is_finished,
     )
 
 
@@ -207,10 +227,15 @@ async def stall_watchdog[T](
     *,
     seconds: float,
     on_stall: Callable[[float], BaseException],
+    is_finished: Callable[[], bool] | None = None,
 ) -> AsyncIterator[T]:
     """Yield from ``source`` and raise ``on_stall(elapsed)`` when no item
     arrives within ``seconds``. A non-positive ``seconds`` disables the
-    watchdog. Every item resets the timer, so keepalives count as activity."""
+    watchdog. Every item resets the timer, so keepalives count as activity.
+
+    ``is_finished`` lets the caller mark the stream complete; when set, a
+    timeout returns cleanly (EOF) instead of raising a stall — protecting
+    already-completed responses from a spurious post-sentinel retry."""
 
     if seconds <= 0:
         async for item in source:
@@ -224,6 +249,8 @@ async def stall_watchdog[T](
             except StopAsyncIteration:
                 return
             except TimeoutError as exc:
+                if is_finished is not None and is_finished():
+                    return
                 raise on_stall(seconds) from exc
             yield item
     finally:

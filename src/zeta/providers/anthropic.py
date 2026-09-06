@@ -34,6 +34,7 @@ from .stream_diagnostics import Cause, StreamDiagnostics
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
+    StreamFinished,
     cleanup_transport,
     format_retry_delay,
     is_control_exception,
@@ -511,7 +512,7 @@ async def _decode_response(
     stopped_blocks: set[int] = set()
     usage: dict[str, Any] = {}
     stop_reason: str | None = None
-    finished = False
+    finished = StreamFinished()
     message_state = "not-started"
     started_at = time.monotonic() if stream_started_at is None else stream_started_at
     last_event_at = started_at
@@ -614,7 +615,11 @@ async def _decode_response(
 
     try:
         async for line in sse_lines(
-            response, stall_seconds, "Anthropic", AnthropicStreamError
+            response,
+            stall_seconds,
+            "Anthropic",
+            AnthropicStreamError,
+            finished=finished,
         ):
             bytes_received += len(line.encode()) + 1
             record = decoder.feed(line)
@@ -635,12 +640,12 @@ async def _decode_response(
                         "stop_reason": stop_reason,
                     },
                 )
-                finished = True
+                finished.value = True
             yield translated
             if provider_error is not None:
                 raise provider_error
     except httpx.HTTPError as exc:
-        if finished or message_state == "not-started":
+        if finished.value or message_state == "not-started":
             raise
         salvage(type(exc))
         raise AnthropicStreamError(
@@ -670,7 +675,7 @@ async def _decode_response(
             yield translated
             if provider_error is not None:
                 raise provider_error
-    if not finished:
+    if not finished.value:
         if message_state == "not-started":
             raise AnthropicStreamError("Anthropic stream ended before message_start")
         salvage("clean-eof")

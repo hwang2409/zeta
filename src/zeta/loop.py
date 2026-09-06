@@ -931,7 +931,11 @@ class AgentLoop:
                             data=dict(event.data),
                         )
                         break
-                    if event.type is StreamEventType.RETRY and event.data.get("is_stall"):
+                    if (
+                        event.type is StreamEventType.RETRY
+                        and event.data.get("is_stall")
+                        and not completion_succeeded
+                    ):
                         partial_blocks = []
                         assistant_message = None
                     if event.type is StreamEventType.MESSAGE_UPDATE:

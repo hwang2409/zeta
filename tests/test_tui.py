@@ -3739,6 +3739,66 @@ def test_retry_notice_is_dim() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stall_retry_drops_pre_stall_partial_from_scrollback(
+    tmp_path: Path,
+) -> None:
+    """The pre-stall assistant partial must not leak into scrollback: the
+    store already discards it on RETRY, so the visible transcript must match
+    the persisted history — the stall banner, then the retry's message."""
+
+    class StallRetryBackend(CompletionBackend):
+        async def complete(
+            self,
+            messages: Sequence[Message],
+            tool_schemas: Sequence[ToolSchema],
+        ) -> AsyncIterator[StreamEvent]:
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=TextContent("pre-stall partial"),
+            )
+            yield StreamEvent(
+                StreamEventType.RETRY,
+                data={
+                    "text": "provider stalled, retrying (1/2) in 0s",
+                    "retry": 1,
+                    "delay": 0.0,
+                    "is_stall": True,
+                },
+            )
+            yield StreamEvent(StreamEventType.MESSAGE_START)
+            yield StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=TextContent("post-retry reply"),
+            )
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(
+                    MessageRole.ASSISTANT, [TextContent("post-retry reply")]
+                ),
+            )
+
+    output = StringIO()
+    app = TUIApp(
+        AgentLoop(
+            StallRetryBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            tool_schemas=[],
+        ),
+        provider="fake",
+        model="offline",
+        console=_test_console(output),
+    )
+
+    await app._consume_turn("hi")
+
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "provider stalled" in plain
+    assert "post-retry reply" in plain
+    assert "pre-stall partial" not in plain
+
+
+@pytest.mark.asyncio
 async def test_truncated_response_notice_is_printed_once(tmp_path: Path) -> None:
     class TruncatedBackend(CompletionBackend):
         async def complete(

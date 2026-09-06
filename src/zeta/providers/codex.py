@@ -28,6 +28,7 @@ from .stream_diagnostics import StreamDiagnostics
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
+    StreamFinished,
     cleanup_transport,
     format_retry_delay,
     is_control_exception,
@@ -525,7 +526,14 @@ async def _decode_response(
     blocks: dict[BlockKey, _BlockState] = {}
     usage: dict[str, Any] = {}
     response_data: dict[str, Any] = {}
-    async for line in sse_lines(response, stall_seconds, "Codex", CodexStreamError):
+    finished = StreamFinished()
+    async for line in sse_lines(
+        response,
+        stall_seconds,
+        "Codex",
+        CodexStreamError,
+        finished=finished,
+    ):
         record = decoder.feed(line)
         if record is None:
             continue
@@ -534,6 +542,8 @@ async def _decode_response(
             event, payload, response_state, items, blocks, usage, response_data
         )
         if translated is not None:
+            if translated.type is StreamEventType.MESSAGE_END:
+                finished.value = True
             yield translated
     record = decoder.finish()
     if record is not None:
@@ -541,6 +551,8 @@ async def _decode_response(
             record[0], record[1], response_state, items, blocks, usage, response_data
         )
         if translated is not None:
+            if translated.type is StreamEventType.MESSAGE_END:
+                finished.value = True
             yield translated
     if response_state != "stopped":
         raise CodexStreamError("Codex stream ended before response completion")
