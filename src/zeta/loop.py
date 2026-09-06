@@ -47,7 +47,12 @@ from .mcp.commands import (
     add_and_mount,
     parse_add_command,
     remove_and_unshadow,
+    render_mcp_status,
+    run_mcp_auth,
+    run_mcp_resource_attach,
+    run_mcp_resources_list,
 )
+from .mcp.prompt_commands import SlashModelInput
 from .prompts import load_identity
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from .tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
@@ -401,8 +406,8 @@ class AgentLoop:
             return "mcp: 0 mounted, 0 failed"
         return self._mcp_mount.summary
 
-    async def slash_mcp(self, args: str) -> str:
-        """Show MCP state, reconnect, add, or remove one configured server."""
+    async def slash_mcp(self, args: str) -> str | SlashModelInput:
+        """Show MCP state, reconnect, add, remove, authorize, or attach."""
 
         await self._ensure_mcp_servers()
         mount = self._mcp_mount
@@ -415,14 +420,14 @@ class AgentLoop:
         if mount is None:
             return "mcp: no configured servers"
         if not parts:
-            return mount.render()
+            return render_mcp_status(mount, home=self._mcp_home_hint)
         verb = parts[0]
         try:
             if verb == "reconnect":
                 if len(parts) != 2:
                     return MCP_USAGE
                 await mount.reconnect(parts[1], notice_sink=self._mcp_notice_sink)
-                return mount.render()
+                return render_mcp_status(mount, home=self._mcp_home_hint)
             if verb == "add":
                 await add_and_mount(
                     mount,
@@ -430,7 +435,7 @@ class AgentLoop:
                     target=self._mcp_add_target(),
                     notice_sink=self._mcp_notice_sink,
                 )
-                return mount.render()
+                return render_mcp_status(mount, home=self._mcp_home_hint)
             if verb == "remove":
                 if len(parts) != 2:
                     return MCP_USAGE
@@ -443,7 +448,24 @@ class AgentLoop:
                     ).configured_servers,
                     notice_sink=self._mcp_notice_sink,
                 )
-                return mount.render()
+                return render_mcp_status(mount, home=self._mcp_home_hint)
+            if verb == "auth":
+                if len(parts) != 2:
+                    return MCP_USAGE
+                return await run_mcp_auth(
+                    mount,
+                    parts[1],
+                    home=self._mcp_home_hint,
+                    notice_sink=self._mcp_notice_sink,
+                )
+            if verb == "resources":
+                if len(parts) == 2:
+                    return await run_mcp_resources_list(mount, parts[1])
+                if len(parts) == 3:
+                    return await run_mcp_resource_attach(
+                        mount, parts[1], parts[2]
+                    )
+                return MCP_USAGE
         except (MCPCommandError, ValueError) as exc:
             return f"mcp error: {exc}"
         return MCP_USAGE
@@ -674,11 +696,16 @@ class AgentLoop:
                 project_dir=self._mcp_project_dir_value,
             )
             self._mcp_mount = await mount_mcp_servers(
-                self.tool_registry, config, notice_sink=self._mcp_notice_sink
+                self.tool_registry,
+                config,
+                notice_sink=self._mcp_notice_sink,
+                home=self._mcp_home_hint,
             )
         except MCPConfigError as exc:
             self._mcp_config_error = str(exc)
-            self._mcp_mount = MCPMount(self.tool_registry, {}, {})
+            self._mcp_mount = MCPMount(
+                self.tool_registry, {}, {}, home=self._mcp_home_hint
+            )
         self._mcp_mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
         if self._mcp_prompt_refresh is not None:
             self._mcp_mount.set_prompt_refresh(self._mcp_prompt_refresh)

@@ -17,14 +17,17 @@ from .client import (
     MCPError,
     MCPPrompt,
     MCPProtocolError,
-    MCPTransportError,
+    MCPResource,
     MCPTool,
+    MCPTransportError,
     canceled_result,
     initialize_params,
     make_error_result,
     parse_rpc_response,
     prompt_text_from_result,
     prompts_from_result,
+    resource_text_from_result,
+    resources_from_result,
     tools_from_result,
     translate_call_result,
 )
@@ -121,6 +124,26 @@ class StdioMCPClient(MCPClient):
             if next_cursor == cursor:
                 raise MCPProtocolError("MCP prompts/list cursor did not advance")
             cursor = next_cursor
+
+    async def list_resources(self) -> list[MCPResource]:
+        resources: list[MCPResource] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, object] = {}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await self._request("resources/list", params)
+            resources.extend(resources_from_result(result))
+            next_cursor = result.get("nextCursor")
+            if type(next_cursor) is not str or not next_cursor:
+                return resources
+            if next_cursor == cursor:
+                raise MCPProtocolError("MCP resources/list cursor did not advance")
+            cursor = next_cursor
+
+    async def read_resource(self, uri: str) -> str:
+        result = await self._request("resources/read", {"uri": uri})
+        return resource_text_from_result(result)
 
     async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:
         try:

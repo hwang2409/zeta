@@ -30,7 +30,7 @@ class MCPServerConfig:
     args: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
     url: str | None = None
-    auth_type: Literal["none", "bearer"] = "none"
+    auth_type: Literal["none", "bearer", "oauth"] = "none"
     auth_token: str | None = None
     missing_env: tuple[str, ...] = ()
     malformed_reason: str | None = None
@@ -275,11 +275,15 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
     if type(raw_auth) is not dict:
         raise ValueError("auth must be an object")
     auth_type = raw_auth.get("type", "none")
-    if auth_type not in {"none", "bearer"}:
-        raise ValueError("auth.type must be 'none' or 'bearer'")
+    if auth_type not in {"none", "bearer", "oauth"}:
+        raise ValueError("auth.type must be 'none', 'bearer', or 'oauth'")
     token = raw_auth.get("token")
     if auth_type == "bearer" and (type(token) is not str or not token):
         raise ValueError("bearer auth requires a token")
+    if auth_type == "oauth" and transport != "streamable-http":
+        raise ValueError("oauth auth requires streamable-http transport")
+    if auth_type == "oauth" and token is not None:
+        raise ValueError("oauth auth must not carry an inline token")
     if transport == "stdio":
         command = value.get("command")
         if type(command) is not str or not command:
@@ -351,6 +355,8 @@ def server_to_json(config: MCPServerConfig) -> dict[str, object]:
         payload["env"] = dict(config.env)
     if config.auth_type == "bearer" and config.auth_token is not None:
         payload["auth"] = {"type": "bearer", "token": config.auth_token}
+    elif config.auth_type == "oauth":
+        payload["auth"] = {"type": "oauth"}
     return payload
 
 

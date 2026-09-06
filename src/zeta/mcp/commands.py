@@ -1,8 +1,9 @@
-"""Slash-command helpers for /mcp add and /mcp remove."""
+"""Slash-command helpers for /mcp add, remove, auth, and resources."""
 
 from __future__ import annotations
 
 import fcntl
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,10 +17,21 @@ from .config import (
     write_mcp_config,
 )
 from .mount import MCPMount, NoticeSink
+from .oauth import MCPOAuthError, authorize
+from .oauth_store import load_token, token_state
+from .prompt_commands import SlashModelInput
+from .resources import (
+    MCPResourceError,
+    fetch_resource,
+    format_resource_list,
+    list_resources,
+)
 
 MCP_USAGE = (
     "mcp usage: /mcp | /mcp reconnect <server> | /mcp add <name> --stdio <cmd...> "
-    "| /mcp add <name> --http <url> | /mcp remove <name>"
+    "| /mcp add <name> --http <url> [--oauth] "
+    "| /mcp remove <name> | /mcp auth <server> "
+    "| /mcp resources <server> [<uri>]"
 )
 
 
@@ -47,9 +59,19 @@ def parse_add_command(tokens: list[str]) -> MCPServerConfig:
             args=tuple(rest[1:]),
         )
     if flag == "--http":
-        if len(rest) != 1:
+        auth_type = "none"
+        url_tokens = list(rest)
+        if url_tokens and url_tokens[-1] == "--oauth":
+            auth_type = "oauth"
+            url_tokens.pop()
+        if len(url_tokens) != 1:
             raise MCPCommandError("--http takes exactly one url argument")
-        return MCPServerConfig(name=name, transport="streamable-http", url=rest[0])
+        return MCPServerConfig(
+            name=name,
+            transport="streamable-http",
+            url=url_tokens[0],
+            auth_type=auth_type,
+        )
     raise MCPCommandError(f"unknown add flag: {flag}")
 
 
@@ -157,11 +179,112 @@ async def remove_and_unshadow(
     )
 
 
+def render_mcp_status(mount: MCPMount, *, home: str | None) -> str:
+    """Render `/mcp` output including per-server auth state."""
+
+    base = mount.render()
+    output: list[str] = []
+    for line in base.split("\n"):
+        output.append(line)
+        for name, config in mount.configs.items():
+            prefix = f"{name}: "
+            if not line.startswith(prefix):
+                continue
+            output.append(_render_auth_suffix(name, config, home=home))
+            break
+    return "\n".join(output)
+
+
+def _render_auth_suffix(
+    name: str, config: MCPServerConfig, *, home: str | None
+) -> str:
+    if config.auth_type == "oauth":
+        token = load_token(name, home=home)
+        state = token_state(token)
+        suffix = f"  auth: oauth ({state})"
+        if token is not None and token.expires_at is not None:
+            remaining = int(token.expires_at - time.time())
+            suffix += f" | expires_in: {remaining}s"
+        if token is not None and token.refresh_error:
+            suffix += f" | refresh_error: {token.refresh_error}"
+        return suffix
+    if config.auth_type == "bearer":
+        return "  auth: bearer"
+    return "  auth: not-required"
+
+
+async def run_mcp_auth(
+    mount: MCPMount,
+    name: str,
+    *,
+    home: str | None,
+    notice_sink: NoticeSink | None,
+) -> str:
+    """Run the browser OAuth flow for one server, then reconnect it."""
+
+    config = mount.configs.get(name)
+    if config is None:
+        return f"mcp error: unknown MCP server: {name}"
+    if config.transport != "streamable-http" or config.url is None:
+        return (
+            f"mcp error: /mcp auth requires an HTTP MCP server "
+            f"(got transport {config.transport})"
+        )
+    try:
+        await authorize(
+            server_name=name,
+            server_url=config.url,
+            home=home,
+        )
+    except MCPOAuthError as exc:
+        return f"mcp error: {exc}"
+    await mount.reconnect(name, notice_sink=notice_sink)
+    return render_mcp_status(mount, home=home)
+
+
+async def run_mcp_resources_list(mount: MCPMount, server: str) -> str:
+    """List one connected server's resources."""
+
+    client = mount.client_for(server)
+    if client is None:
+        return (
+            f"mcp error: {server} is not connected; "
+            f"run /mcp reconnect {server} first"
+        )
+    try:
+        resources = await list_resources(client, server=server)
+    except MCPResourceError as exc:
+        return f"mcp error: {exc}"
+    return format_resource_list(server, resources)
+
+
+async def run_mcp_resource_attach(
+    mount: MCPMount, server: str, uri: str
+) -> str | SlashModelInput:
+    """Fetch one resource and hand it back for the next user turn."""
+
+    client = mount.client_for(server)
+    if client is None:
+        return (
+            f"mcp error: {server} is not connected; "
+            f"run /mcp reconnect {server} first"
+        )
+    try:
+        attachment = await fetch_resource(client, server=server, uri=uri)
+    except MCPResourceError as exc:
+        return f"mcp error: {exc}"
+    return SlashModelInput(attachment.labeled_text)
+
+
 __all__ = [
     "MCP_USAGE",
     "MCPCommandError",
     "add_and_mount",
     "parse_add_command",
     "remove_and_unshadow",
+    "render_mcp_status",
     "rewrite_mcp_file",
+    "run_mcp_auth",
+    "run_mcp_resource_attach",
+    "run_mcp_resources_list",
 ]
