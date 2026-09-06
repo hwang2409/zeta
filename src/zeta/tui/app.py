@@ -25,8 +25,10 @@ from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.hooks import load_hooks_for_provider
 from ..core.project_context import (
     ProjectContext,
+    PromptArgumentError,
     discover_repo_root,
     load_project_context,
+    resolve_prompt_argument,
 )
 from ..core.session import (
     SessionError,
@@ -969,6 +971,15 @@ def _create_app_with_root(
 ) -> TUIApp:
     ephemeral = ephemeral_root is not None
     manager = SessionManager(ephemeral_root if ephemeral else home)
+    try:
+        system_prompt_override = resolve_prompt_argument(
+            getattr(args, "system_prompt", None)
+        )
+        system_prompt_append = resolve_prompt_argument(
+            getattr(args, "append_system_prompt", None)
+        )
+    except PromptArgumentError as exc:
+        raise SessionError(str(exc)) from exc
     project_dir = discover_repo_root(Path.cwd()) / ".zeta"
     loaded_settings = load_settings(home=home, project_dir=project_dir)
     config: ResolvedConfig = resolve_settings(
@@ -1040,8 +1051,11 @@ def _create_app_with_root(
             )
         else:
             project_context = load_project_context(
+                cwd=Path(metadata.cwd),
                 repo_root=discover_repo_root(Path(metadata.cwd)),
                 zeta_home=home,
+                system_override=system_prompt_override,
+                system_append=system_prompt_append,
             )
             persisted = manager.persist_context_snapshot(
                 metadata,
@@ -1051,6 +1065,7 @@ def _create_app_with_root(
             project_context = ProjectContext(
                 persisted.system_prompt,
                 tuple(Path(path) for path in persisted.context_files),
+                project_context.notices,
             )
     else:
         provider = config.provider
@@ -1062,8 +1077,11 @@ def _create_app_with_root(
             stall_retries=config.stream_stall_retries,
         )
         project_context = load_project_context(
+            cwd=Path.cwd(),
             repo_root=discover_repo_root(Path.cwd()),
             zeta_home=home,
+            system_override=system_prompt_override,
+            system_append=system_prompt_append,
         )
         created_budget, created_pin = resolve_session_budget(
             0, False, provider, selected_model, config.token_budget
@@ -1164,7 +1182,11 @@ def _create_app_with_root(
         project_dir=repo_root / ".zeta",
     )
     loop.tool_schemas = list(loop.tool_registry.schemas)
-    startup_notices = tuple(loaded_settings.notices) + external_tools.notices
+    startup_notices = (
+        tuple(loaded_settings.notices)
+        + project_context.notices
+        + external_tools.notices
+    )
     startup_warnings = tuple(loaded_settings.warnings) + external_tools.warnings
     if ephemeral:
         startup_warnings = (

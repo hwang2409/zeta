@@ -15,6 +15,7 @@ import pytest
 from rich.cells import cell_len
 from rich.console import Console
 
+from zeta.cli import build_parser, main
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
@@ -24,9 +25,8 @@ from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
-from zeta.tui.app import TUIApp, create_app
 from zeta.tools.agent import ChildApprovalPolicy
-from zeta.cli import build_parser, main
+from zeta.tui.app import TUIApp, create_app
 from zeta.tui.layout import CONTENT_MARGIN, content_width
 from zeta.types import (
     Message,
@@ -213,8 +213,8 @@ def test_concurrent_legacy_resumes_adopt_the_persisted_snapshot(
     load_count = 0
     load_count_lock = threading.Lock()
 
-    def load_context(*, repo_root: Path, zeta_home: Path) -> ProjectContext:
-        del repo_root, zeta_home
+    def load_context(**kwargs: object) -> ProjectContext:
+        del kwargs
         nonlocal load_count
         with load_count_lock:
             index = load_count
@@ -1420,7 +1420,7 @@ async def test_strict_pre_start_parent_cancellation_persists_canceled_result(
     parent_task: asyncio.Task[bool]
 
     def cancel_create(coro: object) -> asyncio.Task[object]:
-        close = getattr(coro, "close")
+        close = coro.close
         close()
         current = asyncio.current_task()
         assert current is not None

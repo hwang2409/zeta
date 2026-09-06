@@ -8,21 +8,29 @@ import sys
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from .core.login_flow import LoginError, LoginProvider, run_login
+from .core.login_flow import LoginProvider, run_login
 from .core.session import SessionError, env_home
-from .tui.app import create_app
 from .providers.anthropic import (
     AnthropicCredentialStore,
+)
+from .providers.anthropic import (
     build_authorization_url as build_anthropic_authorization_url,
+)
+from .providers.anthropic import (
     exchange_authorization_code as exchange_anthropic_authorization_code,
 )
 from .providers.auth import OAuthTokens, build_pkce_parameters
 from .providers.codex import (
     CodexCredentialStore,
-    build_authorization_url as build_codex_authorization_url,
-    exchange_authorization_code as exchange_codex_authorization_code,
     extract_account_id,
 )
+from .providers.codex import (
+    build_authorization_url as build_codex_authorization_url,
+)
+from .providers.codex import (
+    exchange_authorization_code as exchange_codex_authorization_code,
+)
+from .tui.app import create_app
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -96,6 +104,28 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("text", "json"),
         default="text",
         help="headless output format (text or json); requires --print",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        dest="system_prompt",
+        metavar="TEXT-OR-@FILE",
+        default=None,
+        help=(
+            "replace the built-in system prompt (identity and walked AGENTS.md); "
+            "pass @path to load from a file. Overrides ~/.zeta/SYSTEM.md and "
+            "drops any --append-system-prompt for this session"
+        ),
+    )
+    parser.add_argument(
+        "--append-system-prompt",
+        dest="append_system_prompt",
+        metavar="TEXT-OR-@FILE",
+        default=None,
+        help=(
+            "append text after the default system prompt; pass @path to load "
+            "from a file. Overrides ~/.zeta/APPEND_SYSTEM.md. Ignored when "
+            "--system-prompt is set"
+        ),
     )
     commands = parser.add_subparsers(dest="command")
     login_parser = commands.add_parser("login", help="log in to an OAuth provider")
