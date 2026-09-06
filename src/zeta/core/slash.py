@@ -516,6 +516,8 @@ class SlashSession(Protocol):
 
     def slash_fork(self, args: str) -> str: ...
 
+    def slash_tools(self, args: str) -> str: ...
+
     async def slash_exec_macro(self, command: CustomCommand, args: str) -> str: ...
 
 
@@ -873,6 +875,10 @@ def _run_fork(session: SlashSession, args: str) -> str:
     return session.slash_fork(args)
 
 
+def _run_tools(session: SlashSession, args: str) -> str:
+    return session.slash_tools(args)
+
+
 def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
@@ -895,6 +901,9 @@ def create_slash_registry(
     registry.register(SlashCommand("compact", _run_compact, "compact the context"))
     registry.register(SlashCommand("checkpoint", _run_checkpoint, "save a checkpoint"))
     registry.register(SlashCommand("fork", _run_fork, "fork from a checkpoint"))
+    registry.register(
+        SlashCommand("tools", _run_tools, "list tools or trust project tools")
+    )
     registry.register(
         SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")
     )

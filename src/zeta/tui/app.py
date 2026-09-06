@@ -41,6 +41,7 @@ from ..providers.factory import build_backend as build_network_backend
 from ..settings import ResolvedConfig, load_settings
 from ..settings import resolve as resolve_settings
 from ..submission_pipeline import SubmissionPipeline
+from ..tools._user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.exec import trusted_macro_display
 from ..types import (
     CompletionBackend,
@@ -159,6 +160,7 @@ class TUIApp(
         model_catalog_loader: Callable[[str], frozenset[str] | None] | None = None,
         startup_notices: Sequence[str] = (),
         startup_warnings: Sequence[str] = (),
+        external_tools: ExternalToolDiscovery | None = None,
     ) -> None:
         self.loop = loop
         self.loop.tool_registry.background_tasks.set_notice_sink(
@@ -241,6 +243,7 @@ class TUIApp(
         self._fork_rebuilt = False
         self._startup_notices: tuple[str, ...] = tuple(startup_notices)
         self._startup_warnings: tuple[str, ...] = tuple(startup_warnings)
+        self._external_tools = external_tools
 
     @property
     def _transcript_lines(self) -> list[str]:
@@ -1101,7 +1104,16 @@ def create_app(args: argparse.Namespace) -> TUIApp:
     loop = AgentLoop(backend, store, **loop_kwargs)
     if metadata.plan_mode:
         loop.set_plan_mode(True)
-    loop.set_mcp_scope(home=home, project_dir=discover_repo_root(Path(store.cwd)))
+    repo_root = discover_repo_root(Path(store.cwd))
+    loop.set_mcp_scope(home=home, project_dir=repo_root)
+    external_tools = apply_external_tools(
+        loop.tool_registry,
+        home=home,
+        project_dir=repo_root / ".zeta",
+    )
+    loop.tool_schemas = list(loop.tool_registry.schemas)
+    startup_notices = tuple(loaded_settings.notices) + external_tools.notices
+    startup_warnings = tuple(loaded_settings.warnings) + external_tools.warnings
     return TUIApp(
         loop,
         provider=provider,
@@ -1123,8 +1135,9 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         on_vim_mode_change=lambda enabled: manager.record_vim_mode(
             metadata, enabled=enabled
         ),
-        startup_notices=loaded_settings.notices,
-        startup_warnings=loaded_settings.warnings,
+        startup_notices=startup_notices,
+        startup_warnings=startup_warnings,
+        external_tools=external_tools,
     )
 
 

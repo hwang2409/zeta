@@ -486,6 +486,12 @@ class ToolRegistry:
             for name, definition in self._tools.items()
         }
 
+    @property
+    def registered_names(self) -> frozenset[str]:
+        """Return the current tool names without copying definitions."""
+
+        return frozenset(self._tools)
+
     def register(
         self,
         name: str,
