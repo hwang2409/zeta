@@ -493,7 +493,7 @@ async def test_custom_command_becomes_the_model_user_message(
     [
         ("/checkpoint test", "checkpoint 'test'"),
         ("/compact", "compact: nothing to compact"),
-        ("/fork", "no checkpoints on the active branch"),
+        ("/fork", "no user messages to fork from"),
         ("/model offline", "model: offline"),
         ("/plan on", "plan mode: on"),
     ],

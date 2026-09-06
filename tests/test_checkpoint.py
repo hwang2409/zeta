@@ -33,9 +33,16 @@ def test_checkpoint_method_type_hints_resolve_conversation_entry() -> None:
         CheckpointForkMixin._validate_fork_entry,
         CheckpointForkMixin.append_checkpoint,
         CheckpointForkMixin.append_fork,
+        CheckpointForkMixin.append_message_fork,
+        CheckpointForkMixin.switch_to_branch,
+        CheckpointForkMixin.list_user_message_forkpoints,
+        CheckpointForkMixin.list_branches,
+        CheckpointForkMixin.has_outstanding_tool_calls,
         CheckpointForkMixin.is_turn_boundary,
         CheckpointForkMixin.list_checkpoints,
         CheckpointForkMixin._default_checkpoint_label,
+        CheckpointForkMixin._message_fork_label,
+        CheckpointForkMixin._branch_switch_label,
         CheckpointForkMixin._message_preview,
         CheckpointForkMixin._resolve_checkpoint,
     )
@@ -172,7 +179,9 @@ def test_naive_checkpoint_timestamp_is_normalized_at_jsonl_boundary(
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
     )
-    assert "ago" in app.slash_fork("")
+    picker = app.slash_fork("")
+    assert "prior user messages" in picker
+    assert "ago" in picker
 
 
 def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:

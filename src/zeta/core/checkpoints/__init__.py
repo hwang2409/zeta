@@ -85,6 +85,17 @@ class ConversationEntry:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class BranchInfo:
+    """One leaf of the parent-linked conversation tree."""
+
+    head: ConversationEntry
+    divergence: ConversationEntry | None
+    preview: str
+    message_count: int
+    is_current: bool
+
+
 class CheckpointForkMixin:
     def _validate_checkpoint_or_fork_payload(self, entry: ConversationEntry) -> None:
         if entry.type == "checkpoint":
@@ -117,12 +128,11 @@ class CheckpointForkMixin:
         )
         if (
             source is None
-            or source.type != "checkpoint"
             or entry.parent_id != source.id
             or entry.data["from_seq"] != source.seq
         ):
             raise ConversationIntegrityError(
-                f"fork source is not its checkpoint parent: {entry.id}"
+                f"fork source is not its parent: {entry.id}"
             )
 
     def append_checkpoint(self, label: str | None = None) -> ConversationEntry:
@@ -200,6 +210,24 @@ class CheckpointForkMixin:
     def turn_in_flight(self) -> bool:
         return not self.is_turn_boundary(self.replay())
 
+    @staticmethod
+    def has_outstanding_tool_calls(entries: Iterable[ConversationEntry]) -> bool:
+        """Return whether any tool_call lacks a matching tool_result."""
+
+        outstanding: set[str] = set()
+        for entry in entries:
+            if entry.type != "message":
+                continue
+            parsed = Message.from_dict(entry.data["message"])
+            outstanding.update(
+                block.tool_call.id
+                for block in parsed.content
+                if isinstance(block, ToolUseContent)
+            )
+            if parsed.tool_result is not None:
+                outstanding.discard(parsed.tool_result.tool_call_id)
+        return bool(outstanding)
+
     def list_checkpoints(self) -> list[tuple[ConversationEntry, str | None]]:
         """Return active checkpoints with the next message preview."""
 
@@ -219,6 +247,180 @@ class CheckpointForkMixin:
 
     def checkpoint_count(self) -> int:
         return len(self.list_checkpoints())
+
+    def list_user_message_forkpoints(
+        self,
+    ) -> list[tuple[int, ConversationEntry, str]]:
+        """Return ``(index, entry, preview)`` for USER messages on the branch."""
+
+        branch = self.replay()
+        result: list[tuple[int, ConversationEntry, str]] = []
+        for entry in branch:
+            if entry.type != "message":
+                continue
+            message = Message.from_dict(entry.data["message"])
+            if message.role is not MessageRole.USER:
+                continue
+            preview = self._message_preview(entry) or ""
+            result.append((len(result) + 1, entry, preview))
+        return result
+
+    def append_message_fork(self, entry_id: str) -> ConversationEntry:
+        """Fork from a prior USER message (implicit boundary checkpoint).
+
+        The target must be a USER message on the active branch; the fork
+        re-anchors the tail at that message and abandons everything after.
+        Because the fork itself is a pure append that never splits an
+        outstanding tool_call/tool_result pair, mid-turn tails are allowed
+        as long as the target is a user boundary.
+        """
+
+        if not entry_id or not entry_id.strip():
+            raise ValueError("fork requires a user message entry id")
+        with self._append_lock():
+            self._load()
+            branch = self.replay()
+            source = next(
+                (candidate for candidate in branch if candidate.id == entry_id),
+                None,
+            )
+            if source is None:
+                raise ValueError(
+                    f"user message is not on the active branch: {entry_id!r}"
+                )
+            if source.type != "message":
+                raise ValueError(
+                    f"fork source is not a message: {entry_id!r}"
+                )
+            message = Message.from_dict(source.data["message"])
+            if message.role is not MessageRole.USER:
+                raise ValueError(
+                    f"fork source is not a user message: {entry_id!r}"
+                )
+            label = self._message_fork_label(source)
+            entry = self._append_row_unlocked(
+                "fork",
+                {
+                    "from_entry_id": source.id,
+                    "from_seq": source.seq,
+                    "label": label,
+                },
+                parent_id=source.id,
+            )
+            return self._snapshot_entry(entry)
+
+    def list_branches(self) -> list[BranchInfo]:
+        """Enumerate every leaf in the parent-linked tree."""
+
+        by_id = {entry.id: entry for entry in self._entries}
+        child_count: dict[str, int] = {}
+        for entry in self._entries:
+            if entry.parent_id is not None:
+                child_count[entry.parent_id] = (
+                    child_count.get(entry.parent_id, 0) + 1
+                )
+        active_branch = self.replay()
+        active_head_id = active_branch[-1].id if active_branch else None
+        branches: list[BranchInfo] = []
+        for entry in self._entries:
+            if child_count.get(entry.id, 0) > 0:
+                continue
+            walker: ConversationEntry | None = entry
+            chain: list[ConversationEntry] = []
+            divergence: ConversationEntry | None = None
+            while walker is not None:
+                chain.append(walker)
+                if (
+                    divergence is None
+                    and walker.id != entry.id
+                    and child_count.get(walker.id, 0) > 1
+                ):
+                    divergence = walker
+                if walker.parent_id is None:
+                    break
+                walker = by_id.get(walker.parent_id)
+            chain.reverse()
+            preview = ""
+            for candidate in reversed(chain):
+                if candidate.type != "message":
+                    continue
+                candidate_message = Message.from_dict(candidate.data["message"])
+                if candidate_message.role is MessageRole.USER:
+                    preview = self._message_preview(candidate) or ""
+                    break
+            if not preview:
+                preview = f"seq {entry.seq}"
+            message_count = sum(
+                1
+                for candidate in chain
+                if candidate.type == "message"
+                and Message.from_dict(candidate.data["message"]).role
+                is MessageRole.USER
+            )
+            branches.append(
+                BranchInfo(
+                    head=self._snapshot_entry(entry),
+                    divergence=(
+                        self._snapshot_entry(divergence)
+                        if divergence is not None
+                        else None
+                    ),
+                    preview=preview,
+                    message_count=message_count,
+                    is_current=(entry.id == active_head_id),
+                )
+            )
+        branches.sort(key=lambda info: info.head.seq)
+        return branches
+
+    def switch_to_branch(self, head_entry_id: str) -> ConversationEntry:
+        """Re-anchor the active branch on a leaf via a fork entry.
+
+        Branch switching is a pure re-anchor and never splits an
+        outstanding tool_call/tool_result pair, so the current branch's
+        turn boundary is not required.
+        """
+
+        if not head_entry_id or not head_entry_id.strip():
+            raise ValueError("branch switch requires a head entry id")
+        with self._append_lock():
+            self._load()
+            current_branch = self.replay()
+            by_id = {entry.id: entry for entry in self._entries}
+            source = by_id.get(head_entry_id)
+            if source is None:
+                raise ValueError(
+                    f"branch head not found: {head_entry_id!r}"
+                )
+            for entry in self._entries:
+                if entry.parent_id == source.id:
+                    raise ValueError(
+                        f"entry has children; not a branch head: {head_entry_id!r}"
+                    )
+            if current_branch and current_branch[-1].id == source.id:
+                raise ValueError("already on that branch")
+            label = self._branch_switch_label(source, by_id)
+            entry = self._append_row_unlocked(
+                "fork",
+                {
+                    "from_entry_id": source.id,
+                    "from_seq": source.seq,
+                    "label": label,
+                },
+                parent_id=source.id,
+            )
+            walker: ConversationEntry | None = source
+            dismissed = False
+            while walker is not None:
+                if walker.type == "checkpoint":
+                    dismissed = bool(walker.data.get("todo_dismissed", False))
+                    break
+                if walker.parent_id is None:
+                    break
+                walker = by_id.get(walker.parent_id)
+            self._todo_dismissed = dismissed
+            self._write_session_state(self.bash_cwd, self._todo_items)
+            return self._snapshot_entry(entry)
 
     @staticmethod
     def _default_checkpoint_label(branch: list[ConversationEntry]) -> str:
@@ -252,6 +454,40 @@ class CheckpointForkMixin:
                 "checkpoint label cannot be numeric; numeric values are reserved "
                 "for sequence selectors"
             )
+
+    @staticmethod
+    def _message_fork_label(entry: ConversationEntry) -> str:
+        message = Message.from_dict(entry.data["message"])
+        text = " ".join(
+            block.text.strip()
+            for block in message.content
+            if isinstance(block, TextContent) and block.text.strip()
+        )
+        if text:
+            return " ".join(text.split())[:48]
+        return f"message seq {entry.seq}"
+
+    @staticmethod
+    def _branch_switch_label(
+        head: ConversationEntry,
+        by_id: Mapping[str, ConversationEntry],
+    ) -> str:
+        walker: ConversationEntry | None = head
+        while walker is not None:
+            if walker.type == "message":
+                message = Message.from_dict(walker.data["message"])
+                if message.role is MessageRole.USER:
+                    text = " ".join(
+                        block.text.strip()
+                        for block in message.content
+                        if isinstance(block, TextContent) and block.text.strip()
+                    )
+                    if text:
+                        return " ".join(text.split())[:48]
+            if walker.parent_id is None:
+                break
+            walker = by_id.get(walker.parent_id)
+        return f"branch seq {head.seq}"
 
     @staticmethod
     def _message_preview(entry: ConversationEntry) -> str | None:

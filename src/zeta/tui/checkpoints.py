@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from ..core.checkpoints import BranchInfo, ConversationIntegrityError
 from ..core.checkpoints.workspace import (
     SIZE_NOTICE_THRESHOLD_BYTES,
     SNAPSHOT_MODE_GIT,
@@ -139,27 +140,86 @@ class CheckpointTranscriptMixin:
         )
 
     def slash_fork(self, args: str) -> str:
-        if self.active or self.loop.store.turn_in_flight():
+        if self.active:
             return "fork unavailable while a turn is running"
+        if self.loop.store.has_outstanding_tool_calls(self.loop.store.replay()):
+            return "fork unavailable while a tool call is pending"
         if self.loop.background_children_running:
             return "fork unavailable while background agents are running"
         selector, forced = _parse_force(args)
         selector = selector.strip()
         if not selector:
-            checkpoints = self.loop.store.list_checkpoints()
-            if not checkpoints:
-                return "no checkpoints on the active branch; use /checkpoint [label]"
-            lines = ["checkpoints on the active branch:"]
-            snapshots = self._snapshots()
-            for entry, preview in checkpoints:
+            return self._render_fork_picker()
+        if selector.isdigit():
+            return self._fork_from_message_index(int(selector), forced)
+        return self._fork_from_checkpoint_label(selector, forced)
+
+    def _render_fork_picker(self) -> str:
+        forkpoints = self.loop.store.list_user_message_forkpoints()
+        if not forkpoints:
+            return "no user messages to fork from; run a turn first"
+        snapshots = self._snapshots()
+        checkpoint_by_id = {
+            entry.id: entry for entry, _ in self.loop.store.list_checkpoints()
+        }
+        lines = ["prior user messages on the active branch:"]
+        for index, entry, preview in forkpoints:
+            snap = snapshots.by_checkpoint(entry.id)
+            snap_note = _snapshot_note(snap)
+            lines.append(
+                f"{index} · seq {entry.seq} · {snap_note} · "
+                f"{preview or '(empty)'}"
+            )
+        if checkpoint_by_id:
+            lines.append("explicit checkpoint labels:")
+            for entry, preview in self.loop.store.list_checkpoints():
+                snap = snapshots.by_checkpoint(entry.id)
+                snap_note = _snapshot_note(snap)
                 next_message = preview or "(no message after checkpoint)"
-                workspace_snapshot = snapshots.by_checkpoint(entry.id)
-                snap_note = _snapshot_note(workspace_snapshot)
                 lines.append(
-                    f"seq {entry.seq} · {entry.data['label']} · "
-                    f"{_age(entry.data['created_at'])} · {snap_note} · {next_message}"
+                    f"{entry.data['label']} · seq {entry.seq} · "
+                    f"{_age(entry.data['created_at'])} · {snap_note} · "
+                    f"{next_message}"
                 )
-            return "\n".join(lines)
+        lines.append(
+            "use /fork <n> for a message index or /fork <label> for a checkpoint"
+        )
+        return "\n".join(lines)
+
+    def _fork_from_message_index(self, index: int, forced: bool) -> str:
+        forkpoints = self.loop.store.list_user_message_forkpoints()
+        if index < 1 or index > len(forkpoints):
+            return (
+                "fork failed: user message index out of range "
+                f"(1..{len(forkpoints)})"
+            )
+        _, source, _ = forkpoints[index - 1]
+        snapshots = self._snapshots()
+        target_snapshot = snapshots.by_checkpoint(source.id)
+        if target_snapshot is not None:
+            dirty_warning = _dirty_guard(
+                snapshots, self.loop.store.bash_cwd, forced
+            )
+            if dirty_warning is not None:
+                return dirty_warning
+        try:
+            entry = self.loop.store.append_message_fork(source.id)
+        except (ValueError, ConversationIntegrityError) as exc:
+            return f"fork failed: {exc}"
+        restore_note = _restore_workspace(
+            snapshots, target_snapshot, self.loop.store.bash_cwd
+        )
+        self._rebuild_transcript()
+        self._fork_rebuilt = True
+        header = (
+            f"forked to user message {index} at seq {source.seq} "
+            f"(label '{entry.data['label']}')"
+        )
+        if restore_note:
+            return f"{header} ({restore_note})"
+        return f"{header} · conversation-only, no workspace snapshot at this message"
+
+    def _fork_from_checkpoint_label(self, selector: str, forced: bool) -> str:
         snapshots = self._snapshots()
         dirty_warning = _dirty_guard(snapshots, self.loop.store.bash_cwd, forced)
         if dirty_warning is not None:
@@ -181,6 +241,33 @@ class CheckpointTranscriptMixin:
         if restore_note:
             return f"{message} ({restore_note})"
         return message
+
+    def slash_tree(self, args: str) -> str:
+        if self.active:
+            return "tree unavailable while a turn is running"
+        tokens = args.split()
+        branches = self.loop.store.list_branches()
+        if not tokens:
+            return _render_branch_tree(branches)
+        if len(tokens) != 1 or not tokens[0].isdigit():
+            return "tree: usage /tree [n]"
+        if self.loop.store.has_outstanding_tool_calls(self.loop.store.replay()):
+            return "tree unavailable while a tool call is pending"
+        if self.loop.background_children_running:
+            return "tree unavailable while background agents are running"
+        index = int(tokens[0])
+        if index < 1 or index > len(branches):
+            return f"tree: branch index out of range (1..{len(branches)})"
+        target = branches[index - 1]
+        if target.is_current:
+            return f"tree: already on branch {index}"
+        try:
+            self.loop.store.switch_to_branch(target.head.id)
+        except (ValueError, ConversationIntegrityError) as exc:
+            return f"tree: switch failed: {exc}"
+        self._rebuild_transcript()
+        self._fork_rebuilt = True
+        return f"switched to branch {index} (head seq {target.head.seq})"
 
     def slash_undo(self, args: str) -> str:
         return self._navigate_snapshot(args, verb="undo", past="undone")
@@ -315,6 +402,25 @@ def _format_checkpoint_result(
             "consider adding heavy paths to .gitignore"
         )
     return base
+
+
+def _render_branch_tree(branches: list[BranchInfo]) -> str:
+    if not branches:
+        return "no branches"
+    lines = ["branches on this session:"]
+    for index, branch in enumerate(branches, start=1):
+        marker = "*" if branch.is_current else " "
+        divergence = (
+            f" · from seq {branch.divergence.seq}"
+            if branch.divergence is not None
+            else ""
+        )
+        lines.append(
+            f"{marker} {index}. head seq {branch.head.seq}{divergence} · "
+            f"{branch.message_count} user messages · {branch.preview}"
+        )
+    lines.append("use /tree <n> to switch branches")
+    return "\n".join(lines)
 
 
 def _snapshot_note(snapshot: WorkspaceSnapshot | None) -> str:
