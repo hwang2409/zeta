@@ -178,6 +178,7 @@ class CheckpointForkMixin:
                     "from_entry_id": checkpoint.id,
                     "from_seq": checkpoint.seq,
                     "label": checkpoint.data["label"],
+                    "source_type": "checkpoint",
                 },
                 parent_id=checkpoint.id,
             )
@@ -304,6 +305,7 @@ class CheckpointForkMixin:
                     "from_entry_id": source.id,
                     "from_seq": source.seq,
                     "label": label,
+                    "source_type": "message",
                 },
                 parent_id=source.id,
             )
@@ -376,9 +378,14 @@ class CheckpointForkMixin:
     def switch_to_branch(self, head_entry_id: str) -> ConversationEntry:
         """Re-anchor the active branch on a leaf via a fork entry.
 
-        Branch switching is a pure re-anchor and never splits an
-        outstanding tool_call/tool_result pair, so the current branch's
-        turn boundary is not required.
+        The re-anchor itself is a pure append (a new ``fork`` row parented
+        at the target leaf), so the current branch's turn boundary is not
+        required — abandoning an in-flight turn is fine.
+
+        The target branch's own tail is whatever the historical tree
+        recorded — a leaf may sit mid-turn between a tool_call and its
+        tool_result. Callers that need a clean tail must land on a
+        boundary head themselves; this method does not repair one.
         """
 
         if not head_entry_id or not head_entry_id.strip():
@@ -406,6 +413,7 @@ class CheckpointForkMixin:
                     "from_entry_id": source.id,
                     "from_seq": source.seq,
                     "label": label,
+                    "source_type": "branch",
                 },
                 parent_id=source.id,
             )

@@ -16,11 +16,12 @@ one table entry (``[approval]\\nallow = [...]``) without restating unrelated
 tables, but replacing a list is one atomic swap.
 
 Trust boundary: the project layer may only contribute safe keys — provider,
-model, theme, token_budget, keybindings. ``yolo`` and ``[approval]`` from the
-project file are IGNORED with a loud startup warning ("project settings
-cannot grant approvals; see docs"). Global settings retain full key access.
-A future ``/trust`` mechanism may relax this per-repo, but until then a
-hostile checkout cannot silently grant itself tool approvals.
+model, token_budget, workspace_snapshot_cap. ``yolo``, ``[approval]``,
+``theme``, and ``[keybindings]`` from the project file are IGNORED with a
+loud startup warning. Global settings retain full key access. A future
+``/trust`` mechanism may relax this per-repo, but until then a hostile
+checkout cannot silently grant itself tool approvals, remap ``ctrl-c`` to
+exfiltrate the composer, or hide the abort key.
 
 Precedence: CLI flags override settings; settings override built-in defaults.
 The ``yolo`` flag is tri-state — an explicit ``--yolo`` or ``--no-yolo`` wins
@@ -63,9 +64,7 @@ _PROJECT_SAFE_KEYS = frozenset(
     {
         "provider",
         "model",
-        "theme",
         "token_budget",
-        "keybindings",
         "workspace_snapshot_cap",
     }
 )
@@ -233,7 +232,8 @@ def _strip_unsafe_project_keys(
         return data
     where = _display_path(path) if path is not None else "project settings"
     warnings.append(
-        "settings · project settings cannot grant approvals; "
+        "settings · project layer cannot grant approvals or remap "
+        "keybindings/theme; "
         f"ignoring {', '.join(unsafe)} in {where} (see docs)"
     )
     return {key: value for key, value in data.items() if key not in unsafe}

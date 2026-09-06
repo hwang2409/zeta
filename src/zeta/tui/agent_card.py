@@ -21,7 +21,7 @@ from ..agent_receipt import (
 )
 from ..tools.agent_presets import GENERAL_PRESET, get_agent_preset
 from ..types import StreamEvent, StreamEventType, ToolCall
-from .theme import BODY, CARD_BG, CARD_BORDER, COMMAND, DIM, ERROR, RECEIPT
+from . import theme
 
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
@@ -136,7 +136,7 @@ class AgentCard:
         return Text(
             f"{prefix}{cls._description(call)} · {elapsed_seconds:.1f}s · "
             f"{turns_used} turns · depth {depth} · {affordance}",
-            style=COMMAND,
+            style=theme.COMMAND,
             no_wrap=True,
             overflow="ellipsis",
         )
@@ -154,7 +154,7 @@ class AgentCard:
         if call.name.casefold() != "agent":
             return None
         turns = cls._turns_from_content(content) if turns_used is None else turns_used
-        body = Text(cls._step(content), style=BODY, no_wrap=True, overflow="ellipsis")
+        body = Text(cls._step(content), style=theme.BODY, no_wrap=True, overflow="ellipsis")
         return Panel(
             Group(
                 cls._header(
@@ -165,8 +165,8 @@ class AgentCard:
                 ),
                 body,
             ),
-            border_style=CARD_BORDER,
-            style=CARD_BG,
+            border_style=theme.CARD_BORDER,
+            style=theme.CARD_BG,
             padding=(0, 1),
             expand=True,
         )
@@ -252,7 +252,7 @@ class AgentCard:
         tail = cls._tail_lines(child_session_path, limit)
         body = Text(
             "\n".join(tail) if tail else "child transcript unavailable",
-            style=BODY if tail else DIM,
+            style=theme.BODY if tail else theme.DIM,
             overflow="ellipsis",
             no_wrap=True,
         )
@@ -267,8 +267,8 @@ class AgentCard:
                 ),
                 body,
             ),
-            border_style=CARD_BORDER,
-            style=CARD_BG,
+            border_style=theme.CARD_BORDER,
+            style=theme.CARD_BG,
             padding=(0, 1),
             expand=True,
         )
@@ -353,7 +353,7 @@ class AgentCard:
         if has_agent_receipt_suffix(result.content):
             return Text(
                 receipt_text,
-                style=ERROR if receipt_status in {"failed", "canceled"} else RECEIPT,
+                style=theme.ERROR if receipt_status in {"failed", "canceled"} else theme.RECEIPT,
                 no_wrap=True,
                 overflow="ellipsis",
             )
@@ -363,7 +363,7 @@ class AgentCard:
             f"{prefix}{cls._description(call)} · {turns} turns · "
             f"{max(0.0, elapsed or 0.0):.1f}s · {status} · "
             f"depth {display_depth} · {receipt_text} · expand: ctrl+x ctrl+o",
-            style=ERROR if receipt_status in {"failed", "canceled"} else RECEIPT,
+            style=theme.ERROR if receipt_status in {"failed", "canceled"} else theme.RECEIPT,
             no_wrap=True,
             overflow="ellipsis",
         )

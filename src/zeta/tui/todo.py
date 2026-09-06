@@ -11,8 +11,7 @@ from prompt_toolkit.layout.controls import (
 
 from ..core.store import ConversationStore
 from ..core.todo import TodoItem
-from .theme import ACCENT, BODY, DIM
-
+from . import theme
 
 VISIBLE_ROWS = 6
 
@@ -57,7 +56,7 @@ class TodoWidget(UIControl):
         if self.store.todo_dismissed:
             return []
         if self._is_terminal(items):
-            return [[(f"fg:{DIM}", f"todos done ({len(items)})")]]
+            return [[(f"fg:{theme.DIM}", f"todos done ({len(items)})")]]
         if max_height is not None and max_height <= 0:
             return []
         visible_rows = min(VISIBLE_ROWS, len(items))
@@ -66,7 +65,7 @@ class TodoWidget(UIControl):
         lines = [self._render_item(item, width) for item in items[:visible_rows]]
         remaining = len(items) - visible_rows
         if remaining > 0:
-            lines.append([(f"fg:{DIM}", f"+{remaining} more")])
+            lines.append([(f"fg:{theme.DIM}", f"+{remaining} more")])
         return lines
 
     @staticmethod
@@ -77,13 +76,13 @@ class TodoWidget(UIControl):
             "completed": "[x]",
             "canceled": "[-]",
         }
-        glyph_style = ACCENT if item["status"] == "in_progress" else DIM
+        glyph_style = theme.ACCENT if item["status"] == "in_progress" else theme.DIM
         prefix = f"{glyphs[item['status']]} "
         available = max(1, width - len(prefix))
         content = item["content"]
         if len(content) > available:
             content = content[: max(1, available - 1)] + "…"
-        return [(f"fg:{glyph_style}", prefix), (f"fg:{BODY}", content)]
+        return [(f"fg:{glyph_style}", prefix), (f"fg:{theme.BODY}", content)]
 
     def create_content(self, width: int, height: int) -> UIContent:
         lines = self._render_lines(max(1, width), max_height=height)

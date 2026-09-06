@@ -33,24 +33,8 @@ from ..types import (
     ToolUseContent,
     flatten_tool_content,
 )
+from . import theme
 from .agent_card import AgentCard
-from .theme import (
-    ACCENT,
-    AFFORDANCE,
-    BODY,
-    CARD_BG,
-    CARD_BORDER,
-    CHROME,
-    CODE_BG,
-    CODE_THEME,
-    COMMAND,
-    DIM,
-    ERROR,
-    PLAN_STATE,
-    RECEIPT,
-    THOUGHT,
-    VIM_STATE,
-)
 
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
@@ -146,7 +130,7 @@ def _shell_syntax(command: str) -> Syntax:
     return Syntax(
         command,
         "bash",
-        theme=CODE_THEME,
+        theme=theme.CODE_THEME,
         word_wrap=True,
         background_color="default",
     )
@@ -157,13 +141,13 @@ def _tool_header(call: ToolCall) -> RenderableType:
     if command is not None:
         return Columns(
             [
-                Text.assemble((call.name, COMMAND)),
+                Text.assemble((call.name, theme.COMMAND)),
                 _shell_syntax(command),
             ],
             padding=(0, 1),
             expand=False,
         )
-    return Text.assemble((call.name, COMMAND), (f" {_arguments(call.arguments)}", DIM))
+    return Text.assemble((call.name, theme.COMMAND), (f" {_arguments(call.arguments)}", theme.DIM))
 
 
 def _receipt_arguments(call: ToolCall, content: str) -> str:
@@ -227,28 +211,28 @@ def render_error_card(event: StreamEvent) -> Panel:
     reason = _truncate(reason, MAX_ERROR_REASON)
     retryable = is_retryable_error(error)
     title = "provider failure" if retryable else "error"
-    content: list[RenderableType] = [Text(f"{title} · {code}", style=ERROR)]
+    content: list[RenderableType] = [Text(f"{title} · {code}", style=theme.ERROR)]
     if not is_json_payload:
-        content.append(_safe_text(f"reason: {reason}", style=BODY))
+        content.append(_safe_text(f"reason: {reason}", style=theme.BODY))
     else:
         content.extend(
             (
-                Text("payload · json", style=DIM),
+                Text("payload · json", style=theme.DIM),
                 Syntax(
                     reason,
                     "json",
-                    theme=CODE_THEME,
+                    theme=theme.CODE_THEME,
                     word_wrap=True,
                     background_color="default",
                 ),
             )
         )
     if retryable:
-        content.append(Text("retry: ctrl+y", style=AFFORDANCE))
+        content.append(Text("retry: ctrl+y", style=theme.AFFORDANCE))
     return Panel(
         Group(*content),
-        border_style=ERROR,
-        style=CARD_BG,
+        border_style=theme.ERROR,
+        style=theme.CARD_BG,
         padding=(0, 1),
         expand=True,
     )
@@ -286,12 +270,12 @@ def render_approval_card(
     """
 
     header = Text.assemble(
-        ("allow ", DIM),
-        (label or tool_name, COMMAND),
-        ("?", DIM),
+        ("allow ", theme.DIM),
+        (label or tool_name, theme.COMMAND),
+        ("?", theme.DIM),
     )
     if key is not None:
-        header.append(f"  [{key}]", style=DIM)
+        header.append(f"  [{key}]", style=theme.DIM)
     body_parts: list[RenderableType] = [header]
     if trusted_display is not None:
         command = trusted_display.command
@@ -301,26 +285,26 @@ def render_approval_card(
         command = str(raw_command) if raw_command is not None else None
         argv = ()
     if command is not None:
-        body_parts.append(Text(f"command={command}", style=DIM, overflow="fold"))
+        body_parts.append(Text(f"command={command}", style=theme.DIM, overflow="fold"))
         if argv:
-            body_parts.append(Text("argv:", style=DIM))
+            body_parts.append(Text("argv:", style=theme.DIM))
             for index, value in enumerate(argv, 1):
                 body_parts.append(
-                    Text(f"  [{index}] {value}", style=DIM, overflow="fold")
+                    Text(f"  [{index}] {value}", style=theme.DIM, overflow="fold")
                 )
     else:
         arg_line = _arguments(arguments)
         if arg_line:
-            body_parts.append(Text(arg_line, style=DIM, overflow="ellipsis", no_wrap=True))
+            body_parts.append(Text(arg_line, style=theme.DIM, overflow="ellipsis", no_wrap=True))
     if shortcut:
         affordance = "y approve · n deny"
     else:
         affordance = f"approve {key} · deny {key}" if key is not None else "approve · deny"
-    body_parts.append(Text(affordance, style=AFFORDANCE))
+    body_parts.append(Text(affordance, style=theme.AFFORDANCE))
     return Panel(
         Group(*body_parts),
-        border_style=ACCENT,
-        style=CARD_BG,
+        border_style=theme.ACCENT,
+        style=theme.CARD_BG,
         padding=(0, 1),
         expand=True,
     )
@@ -351,7 +335,7 @@ def _tool_receipt(event: StreamEvent) -> Text:
             suffix += f" · log {log_path}"
         return Text(
             f"⏺ {suffix}",
-            style=ERROR if result.is_error else RECEIPT,
+            style=theme.ERROR if result.is_error else theme.RECEIPT,
             overflow="ellipsis",
             no_wrap=True,
         )
@@ -361,7 +345,7 @@ def _tool_receipt(event: StreamEvent) -> Text:
     suffix = _receipt_arguments(call, _tool_content(event))
     return Text(
         f"{prefix}{call.name}{f' {suffix}' if suffix else ''}",
-        style=RECEIPT,
+        style=theme.RECEIPT,
         overflow="ellipsis",
         no_wrap=True,
     )
@@ -373,14 +357,14 @@ def _render_tool_output(content: str, extra_lines: list[str] | None = None) -> T
     visible = lines[:MAX_TOOL_LINES]
     if extra_lines:
         visible.extend(extra_lines)
-    rendered = Text(style=BODY, overflow="ellipsis", no_wrap=True)
+    rendered = Text(style=theme.BODY, overflow="ellipsis", no_wrap=True)
     for index, line in enumerate(visible):
         if index:
             rendered.append("\n")
-        style = DIM if line.startswith("[image block]") else BODY
+        style = theme.DIM if line.startswith("[image block]") else theme.BODY
         rendered.append(_safe_text(line, style=style))
     if truncated:
-        rendered.append(f"\n… +{len(lines) - MAX_TOOL_LINES} lines", style=AFFORDANCE)
+        rendered.append(f"\n… +{len(lines) - MAX_TOOL_LINES} lines", style=theme.AFFORDANCE)
     return rendered
 
 
@@ -451,7 +435,7 @@ def _tool_body(event: StreamEvent) -> Text | None:
             )
         if byte_sizes:
             extra_lines.append(f"[truncated; full_size={max(byte_sizes)} bytes]")
-    rendered = Text(style=BODY, overflow="ellipsis", no_wrap=True)
+    rendered = Text(style=theme.BODY, overflow="ellipsis", no_wrap=True)
 
     visible_sections = [(label, value) for label, value in sections if value.strip()]
     if generic.strip():
@@ -461,7 +445,7 @@ def _tool_body(event: StreamEvent) -> Text | None:
         for label, value in visible_sections:
             if rendered:
                 rendered.append("\n\n")
-            rendered.append(f"{label}:\n", style=DIM)
+            rendered.append(f"{label}:\n", style=theme.DIM)
             rendered.append_text(_render_tool_output(value, extra_lines))
             extra_lines = []
 
@@ -474,7 +458,7 @@ def _tool_card(event: StreamEvent, *, running: bool = False) -> Panel:
         "tool",
         {},
     )
-    body = Text("running…", style=DIM) if running else _tool_body(event)
+    body = Text("running…", style=theme.DIM) if running else _tool_body(event)
     return _tool_panel(
         call,
         body,
@@ -499,8 +483,8 @@ def _tool_panel(
         content = Group(header, body)
     return Panel(
         content,
-        border_style=ERROR if error else CARD_BORDER,
-        style=CARD_BG,
+        border_style=theme.ERROR if error else theme.CARD_BORDER,
+        style=theme.CARD_BG,
         padding=(0, 1),
         expand=True,
     )
@@ -523,7 +507,7 @@ def render_tool_progress(
     )
     if agent_render is not None:
         return agent_render
-    body = Text("running…", style=DIM) if not content else _render_tool_output(content)
+    body = Text("running…", style=theme.DIM) if not content else _render_tool_output(content)
     return _tool_panel(call, body)
 
 
@@ -531,7 +515,7 @@ def format_thought(duration: float | None = None) -> Text:
     parts = ["✱ thought"]
     if duration is not None:
         parts.append(f"{duration:.1f}s")
-    return Text(" · ".join(parts), style=THOUGHT)
+    return Text(" · ".join(parts), style=theme.THOUGHT)
 
 
 def render_thought(value: str, duration: float | None = None) -> Text:
@@ -541,11 +525,11 @@ def render_thought(value: str, duration: float | None = None) -> Text:
         return Text(
             f"✱ thought · redacted"
             f"{f' · {duration:.1f}s' if duration is not None else ''}",
-            style=THOUGHT,
+            style=theme.THOUGHT,
         )
     trace = Text(
         _strip_terminal_controls(value),
-        style=THOUGHT,
+        style=theme.THOUGHT,
     )
     rendered = Text.assemble(format_thought(duration), "\n", trace)
     return rendered
@@ -558,7 +542,7 @@ def render_thought_live(value: str) -> Text:
         return render_thought(value)
     return Text(
         _strip_terminal_controls(value),
-        style=THOUGHT,
+        style=theme.THOUGHT,
     )
 
 
@@ -609,7 +593,7 @@ def _token_tree(tokens: Iterable[Any]) -> list[_MarkdownNode]:
 
 
 def _inline_style(active: set[str], *, link: bool = False) -> str:
-    styles: list[str] = [] if "strike" in active else [BODY]
+    styles: list[str] = [] if "strike" in active else [theme.BODY]
     if link:
         styles.append("underline")
     styles.extend(sorted(active))
@@ -634,7 +618,7 @@ def _render_inline_tokens(tokens: Iterable[Any]) -> Text:
         if token_type == "text":
             append(token.content)
         elif token_type == "code_inline":
-            append(token.content, style=BODY)
+            append(token.content, style=theme.BODY)
         elif token_type == "softbreak":
             append(" ")
         elif token_type == "hardbreak":
@@ -658,7 +642,7 @@ def _render_inline_tokens(tokens: Iterable[Any]) -> Text:
         elif token_type == "link_close":
             href = link_href.pop() if link_href else ""
             if href:
-                append(f" ({href})", style=CHROME)
+                append(f" ({href})", style=theme.CHROME)
         elif token_type == "image":
             src = token.attrGet("src") or ""
             append(f"![{token.content}]({src})")
@@ -670,7 +654,7 @@ def _render_inline_tokens(tokens: Iterable[Any]) -> Text:
         else:
             append(token.content)
     if not strike_seen:
-        rendered.style = BODY
+        rendered.style = theme.BODY
     return rendered
 
 
@@ -695,9 +679,9 @@ def render_code(value: str, language: str = "text") -> Syntax:
     return Syntax(
         value,
         language or "text",
-        theme=CODE_THEME,
+        theme=theme.CODE_THEME,
         word_wrap=True,
-        background_color=CODE_BG,
+        background_color=theme.CODE_BG,
     )
 
 
@@ -834,9 +818,9 @@ def _render_table(node: _MarkdownNode, deadline: float | None = None) -> Table:
         raise TimeoutError("markdown table exceeded its time budget")
     table = Table(
         box=box.SQUARE,
-        border_style=CHROME,
-        header_style=f"bold {BODY}",
-        style=CARD_BG,
+        border_style=theme.CHROME,
+        header_style=f"bold {theme.BODY}",
+        style=theme.CARD_BG,
         pad_edge=True,
         show_lines=False,
     )
@@ -875,13 +859,13 @@ def _render_blocks(
             level = int(node.token.tag.removeprefix("h") or 1)
             heading.stylize(
                 {
-                    1: f"bold underline {BODY}",
-                    2: f"bold {BODY}",
-                    3: f"bold {BODY}",
-                    4: f"underline {BODY}",
-                    5: BODY,
-                    6: f"italic {BODY}",
-                }.get(level, BODY)
+                    1: f"bold underline {theme.BODY}",
+                    2: f"bold {theme.BODY}",
+                    3: f"bold {theme.BODY}",
+                    4: f"underline {theme.BODY}",
+                    5: theme.BODY,
+                    6: f"italic {theme.BODY}",
+                }.get(level, theme.BODY)
             )
             rendered.append(heading)
         elif token_type in {"bullet_list_open", "ordered_list_open"}:
@@ -891,17 +875,17 @@ def _render_blocks(
                 _render_blocks(node.children, console, width, deadline)
             )
             rendered.append(
-                _Prefixed(Group(*inner), "│ " * 1, f"dim {DIM}")
+                _Prefixed(Group(*inner), "│ " * 1, f"dim {theme.DIM}")
             )
         elif token_type == "fence":
             language = (node.token.info.strip() or "text").split()[0]
             rendered.append(render_code(node.token.content, language))
         elif token_type in {"code_block", "html_block"}:
             rendered.append(
-                Text(_strip_terminal_controls(node.token.content), style=BODY)
+                Text(_strip_terminal_controls(node.token.content), style=theme.BODY)
             )
         elif token_type == "hr":
-            rendered.append(Text("─" * max(1, width), style=DIM, overflow="crop"))
+            rendered.append(Text("─" * max(1, width), style=theme.DIM, overflow="crop"))
         elif token_type == "table_open":
             rendered.append(_render_table(node, deadline))
         else:
@@ -922,7 +906,7 @@ class MarkdownDocument:
 
     def __rich_console__(self, console: Console, options: Any) -> Iterable[RenderableType]:
         if self.nodes is None:
-            yield Text(_strip_terminal_controls(self.source), style=BODY)
+            yield Text(_strip_terminal_controls(self.source), style=theme.BODY)
             return
         width = max(1, options.max_width)
         started = time.monotonic()
@@ -934,7 +918,7 @@ class MarkdownDocument:
                 started + _MAX_MARKDOWN_SECONDS,
             )
         except Exception:  # noqa: BLE001 - fall back to plain text
-            yield Text(_strip_terminal_controls(self.source), style=BODY)
+            yield Text(_strip_terminal_controls(self.source), style=theme.BODY)
             return
         yield from _with_blank_lines(blocks)
 
@@ -964,20 +948,20 @@ def render_event(event: StreamEvent) -> RenderableType | None:
             noun = "tool call" if dropped == 1 else "tool calls"
             return Text(
                 f"response truncated (stream ended early; dropped {dropped} incomplete {noun})",
-                style=DIM,
+                style=theme.DIM,
             )
-        return Text("response truncated (stream ended early)", style=DIM)
+        return Text("response truncated (stream ended early)", style=theme.DIM)
     if event.type is StreamEventType.RETRY:
         text = event.data.get("text")
-        return Text(text if type(text) is str else "retrying", style=DIM)
+        return Text(text if type(text) is str else "retrying", style=theme.DIM)
     if event.type is StreamEventType.AGENT_NOTIFICATION:
         description = event.data.get("description")
         status = event.data.get("status")
         text = event.data.get("text")
         path = event.data.get("child_session_path")
         if not all(type(value) is str for value in (description, status, text, path)):
-            return Text("background agent notification unavailable", style=ERROR)
-        style = ERROR if status in {"error", "canceled"} else RECEIPT
+            return Text("background agent notification unavailable", style=theme.ERROR)
+        style = theme.ERROR if status in {"error", "canceled"} else theme.RECEIPT
         receipt_state = terminal_state(status=status)
         stats = event.data.get("stats")
         receipt_text = ensure_agent_receipt_text(
@@ -996,19 +980,19 @@ def render_event(event: StreamEvent) -> RenderableType | None:
         if isinstance(macro, str) and macro:
             return Text(
                 f"⏺ /{macro} · running",
-                style=RECEIPT,
+                style=theme.RECEIPT,
             )
         if event.tool_call.name.lower() in RECEIPT_TOOLS:
             suffix = _receipt_arguments(event.tool_call, "")
             return Text(
                 f"⏺ {event.tool_call.name}{f' {suffix}' if suffix else ''} · running",
-                style=RECEIPT,
+                style=theme.RECEIPT,
             )
         return _tool_card(event, running=True)
     if event.type is StreamEventType.TOOL_EXECUTION_UPDATE and event.delta is not None:
         stream = event.data.get("stream")
         label = f"[{stream}] " if stream in {"stdout", "stderr"} else ""
-        return _safe_text(f"  ↳ {label}{event.delta}", style=DIM)
+        return _safe_text(f"  ↳ {label}{event.delta}", style=theme.DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:
         agent_render = AgentCard.render_receipt(event)
         if agent_render is not None:
@@ -1188,11 +1172,11 @@ def format_status(
             fitted = Text(value, no_wrap=True, overflow="ellipsis")
             fitted.truncate(width, overflow="ellipsis")
             value = fitted.plain.rstrip(" ·")
-    rendered = Text(value, style=CHROME)
+    rendered = Text(value, style=theme.CHROME)
     offset = 0
     if plan_state and value.startswith(plan_state):
-        rendered.stylize(PLAN_STATE, 0, len(plan_state))
+        rendered.stylize(theme.PLAN_STATE, 0, len(plan_state))
         offset = len(plan_state) + 2
     if vim_state and value[offset:].startswith(vim_state):
-        rendered.stylize(VIM_STATE, offset, offset + len(vim_state))
+        rendered.stylize(theme.VIM_STATE, offset, offset + len(vim_state))
     return rendered

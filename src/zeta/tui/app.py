@@ -53,6 +53,7 @@ from ..types import (
     ThinkingContent,
     assistant_text,
 )
+from . import theme
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ComposerAttachmentMixin,
@@ -82,17 +83,7 @@ from .render import (
 )
 from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.command_runtime import CommandRuntimeMixin
-from .theme import (
-    ACCENT,
-    BODY,
-    CHROME,
-    COMMAND,
-    COMPOSER_BORDER,
-    COMPOSER_FOCUS,
-    DIM,
-    ERROR,
-    RICH_THEME,
-)
+from .theme import RICH_THEME
 from .todo import TodoWidget
 from .transcript import TranscriptWidget, stream_key
 from .transcript_presenter import TranscriptPresenter
@@ -101,7 +92,7 @@ from .transcript_presenter import TranscriptPresenter
 def background_notice(app: Any, message: str) -> None:
     """Print one dim background task notice and refresh the prompt."""
 
-    app._print(Text(message, style=DIM))
+    app._print(Text(message, style=theme.DIM))
     app._invalidate_prompt()
 
 
@@ -164,6 +155,7 @@ class TUIApp(
         ephemeral_root: Path | None = None,
         session_name: str = "",
         on_name_change: Callable[[str], None] | None = None,
+        key_remap: Any | None = None,
     ) -> None:
         self.loop = loop
         self._workspace_snapshot_cap = workspace_snapshot_cap
@@ -224,7 +216,10 @@ class TUIApp(
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
         self._model_catalog_task: asyncio.Task[None] | None = None
-        self._slash_commands = create_slash_registry(zeta_home=Path(zeta_home).resolve() if zeta_home is not None else None, project_dir=discover_repo_root(Path(self.loop.store.cwd)))
+        self._zeta_home: Path | None = (
+            Path(zeta_home).resolve() if zeta_home is not None else None
+        )
+        self._slash_commands = create_slash_registry(zeta_home=self._zeta_home, project_dir=discover_repo_root(Path(self.loop.store.cwd)))
         self.loop.set_mcp_prompt_refresh(
             lambda mount: self._slash_commands.set_mcp_prompts(mount.prompt_entries)
         )
@@ -253,6 +248,7 @@ class TUIApp(
         self._new_session_requested = False
         self._session_name = session_name
         self._on_name_change = on_name_change
+        self._key_remap: dict[str, str] = dict(key_remap or {})
 
     @property
     def ephemeral_root(self) -> Path | None:
@@ -434,16 +430,16 @@ class TUIApp(
         if style is None:
             style = Style.from_dict(
                 {
-                    "": f"fg:{BODY}",
-                    "prompt": f"fg:{ACCENT} bold",
-                    "placeholder": f"italic fg:{DIM}",
-                    "status-bar": f"noreverse fg:{CHROME}",
+                    "": f"fg:{theme.BODY}",
+                    "prompt": f"fg:{theme.ACCENT} bold",
+                    "placeholder": f"italic fg:{theme.DIM}",
+                    "status-bar": f"noreverse fg:{theme.CHROME}",
                     "frame": "",
                     "frame.border": (
-                        f"fg:{COMPOSER_FOCUS}" if focused else f"fg:{COMPOSER_BORDER}"
+                        f"fg:{theme.COMPOSER_FOCUS}" if focused else f"fg:{theme.COMPOSER_BORDER}"
                     ),
-                    "text-area": f"fg:{BODY}",
-                    "text-area.prompt": f"fg:{ACCENT} bold",
+                    "text-area": f"fg:{theme.BODY}",
+                    "text-area.prompt": f"fg:{theme.ACCENT} bold",
                 }
             )
             self._prompt_styles[focused] = style
@@ -479,6 +475,7 @@ class TUIApp(
             on_plan_toggle=self.toggle_plan_mode,
             on_scroll_up=self._transcript.scroll_up,
             on_scroll_down=self._transcript.scroll_down,
+            key_remap=self._key_remap,
         )
         session = FullScreenPromptSession(
             message=[("class:prompt", " > ")],
@@ -696,7 +693,7 @@ class TUIApp(
             return
         if value:
             self._assistant_text += value
-            self._presenter.update_assistant(Text(self._assistant_text, style=BODY))
+            self._presenter.update_assistant(Text(self._assistant_text, style=theme.BODY))
             self._turn_had_visible_output |= bool(value.strip())
 
     def _update_usage(self, event: StreamEvent) -> None:
@@ -716,7 +713,7 @@ class TUIApp(
             self._print_committed([self._thinking_text], thinking=True)
         elif self._stream_kind == "assistant" and self._assistant_text:
             self._presenter.finish_assistant(
-                Text(self._assistant_text, style=BODY),
+                Text(self._assistant_text, style=theme.BODY),
                 preserve_inline=preserve_inline,
             )
         self._stream_kind = self._stream_identity = None
@@ -782,7 +779,7 @@ class TUIApp(
             return
         self._assistant_text += value
         self._partial = self._assistant_text
-        self._presenter.update_assistant(Text(self._assistant_text, style=BODY))
+        self._presenter.update_assistant(Text(self._assistant_text, style=theme.BODY))
 
     def _reset_stream_state(self) -> None:
         self._stream_kind = self._stream_identity = None
@@ -795,10 +792,10 @@ class TUIApp(
         self._thinking_duration = self._thinking_started_at = None
 
     def _print_system(self, output: str) -> None:
-        self._print_unit(Text(f"system · {output}", style=ERROR if output.startswith("mcp error:") else CHROME))
+        self._print_unit(Text(f"system · {output}", style=theme.ERROR if output.startswith("mcp error:") else theme.CHROME))
 
     def _print_hook_notice(self, output: str) -> None:
-        self._print_unit(Text(f"hook · {output}", style=DIM))
+        self._print_unit(Text(f"hook · {output}", style=theme.DIM))
 
     def _prepare_stream_event(self, event: StreamEvent) -> None:
         if event.type is StreamEventType.MESSAGE_START:
@@ -891,18 +888,18 @@ class TUIApp(
         self._rebuild_transcript()
         await self.loop.ensure_mcp_servers()
         for warning in self._startup_warnings:
-            self._print_unit(Text(warning, style=ERROR))
+            self._print_unit(Text(warning, style=theme.ERROR))
         # After the MCP mount so argument-scoped rules dropped for a
         # just-mounted subject-less tool are reported too (ZETA-86).
         if self._approval_policy is not None:
             for notice in self._approval_policy.notices:
-                self._print_unit(Text(notice, style=ERROR))
+                self._print_unit(Text(notice, style=theme.ERROR))
         for alert in self._startup_alerts:
-            self._print_unit(Text(alert, style=COMMAND))
+            self._print_unit(Text(alert, style=theme.COMMAND))
         for notice in self._startup_notices:
-            self._print_unit(Text(notice, style=DIM))
+            self._print_unit(Text(notice, style=theme.DIM))
         for notice in self._slash_commands.notices:
-            style = COMMAND if notice in self._slash_commands.warning_notices else DIM
+            style = theme.COMMAND if notice in self._slash_commands.warning_notices else theme.DIM
             self._print_unit(Text(f"command · {notice}", style=style))
         self._present_pending_approvals()
         prompt_task: asyncio.Task[str | None] | None = None
