@@ -17,6 +17,7 @@ from zeta.core.store import ConversationStore
 from zeta.prompts import load_identity
 from zeta.providers.anthropic import (
     ANTHROPIC_MAX_IMAGE_BYTES,
+    AnthropicApiKeyCredential,
     AnthropicAuthError,
     AnthropicBackend,
     AnthropicCredentialStore,
@@ -464,6 +465,68 @@ async def test_401_refresh_failure_propagates_without_retry(
     client = client_for(handler)
     with pytest.raises(RuntimeError, match="refresh failed"):
         [event async for event in AnthropicBackend(client=client, token_store=store).complete([], [])]
+
+    assert len(requests) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_api_key_credential_sends_x_api_key_without_oauth_beta(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=SSE,
+            request=request,
+        )
+
+    client = client_for(handler)
+    events = [
+        event
+        async for event in AnthropicBackend(
+            client=client,
+            token_store=AnthropicApiKeyCredential("sk-ant-test-key"),
+            diagnostics_path=tmp_path / "stream-diagnostics.jsonl",
+            base_url="https://test.invalid/v1/messages",
+        ).complete([], [])
+    ]
+
+    assert len(requests) == 1
+    assert requests[0].headers["x-api-key"] == "sk-ant-test-key"
+    assert "authorization" not in requests[0].headers
+    beta = requests[0].headers["anthropic-beta"]
+    assert "oauth-2025-04-20" not in beta
+    assert "claude-code-20250219" in beta
+    assert "interleaved-thinking-2025-05-14" in beta
+    assert events[-1].type is StreamEventType.MESSAGE_END
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_api_key_401_fails_loudly_without_refresh_attempt(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            401, json={"error": {"message": "invalid x-api-key"}}, request=request
+        )
+
+    client = client_for(handler)
+    with pytest.raises(AnthropicAuthError, match="check ANTHROPIC_API_KEY"):
+        [
+            event
+            async for event in AnthropicBackend(
+                client=client,
+                token_store=AnthropicApiKeyCredential("sk-ant-bad-key"),
+                diagnostics_path=tmp_path / "stream-diagnostics.jsonl",
+            ).complete([], [])
+        ]
 
     assert len(requests) == 1
     await client.aclose()
