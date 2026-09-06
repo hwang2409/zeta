@@ -156,25 +156,23 @@ class CheckpointTranscriptMixin:
 
     def _render_fork_picker(self) -> str:
         forkpoints = self.loop.store.list_user_message_forkpoints()
-        if not forkpoints:
+        checkpoints = self.loop.store.list_checkpoints()
+        if not forkpoints and not checkpoints:
             return "no user messages to fork from; run a turn first"
         snapshots = self._snapshots()
-        checkpoint_by_id = {
-            entry.id: entry for entry, _ in self.loop.store.list_checkpoints()
-        }
-        lines = ["prior user messages on the active branch:"]
-        for index, entry, preview in forkpoints:
-            snap = snapshots.by_checkpoint(entry.id)
-            snap_note = _snapshot_note(snap)
-            lines.append(
-                f"{index} · seq {entry.seq} · {snap_note} · "
-                f"{preview or '(empty)'}"
-            )
-        if checkpoint_by_id:
+        lines: list[str] = []
+        if forkpoints:
+            lines.append("prior user messages on the active branch:")
+            for index, entry, preview in forkpoints:
+                snap_note = _snapshot_note(snapshots.by_checkpoint(entry.id))
+                lines.append(
+                    f"{index} · seq {entry.seq} · {snap_note} · "
+                    f"{preview or '(empty)'}"
+                )
+        if checkpoints:
             lines.append("explicit checkpoint labels:")
-            for entry, preview in self.loop.store.list_checkpoints():
-                snap = snapshots.by_checkpoint(entry.id)
-                snap_note = _snapshot_note(snap)
+            for entry, preview in checkpoints:
+                snap_note = _snapshot_note(snapshots.by_checkpoint(entry.id))
                 next_message = preview or "(no message after checkpoint)"
                 lines.append(
                     f"{entry.data['label']} · seq {entry.seq} · "
@@ -317,10 +315,7 @@ class CheckpointTranscriptMixin:
                 )
                 continue
             if entry.type == "fork":
-                self._print_system(
-                    f"forked to checkpoint '{entry.data['label']}' at seq "
-                    f"{entry.data['from_seq']}"
-                )
+                self._print_system(_fork_banner(entry))
                 continue
             if entry.type == "compaction":
                 self._print_system(
@@ -383,6 +378,20 @@ class CheckpointTranscriptMixin:
                 )
 
 
+def _fork_banner(entry: object) -> str:
+    """Format the transcript banner for a fork entry by source type."""
+
+    data = entry.data  # type: ignore[attr-defined]
+    label = data.get("label", "")
+    from_seq = data.get("from_seq", "?")
+    source_type = data.get("source_type", "checkpoint")
+    if source_type == "message":
+        return f"forked to user message '{label}' at seq {from_seq}"
+    if source_type == "branch":
+        return f"switched to branch '{label}' at seq {from_seq}"
+    return f"forked to checkpoint '{label}' at seq {from_seq}"
+
+
 def _format_checkpoint_result(
     seq: int, label: str, snapshot: WorkspaceSnapshot
 ) -> str:
@@ -404,11 +413,30 @@ def _format_checkpoint_result(
     return base
 
 
+TREE_SOFT_CAP = 20
+
+
 def _render_branch_tree(branches: list[BranchInfo]) -> str:
     if not branches:
         return "no branches"
     lines = ["branches on this session:"]
+    # Soft cap: long branch lists pushed the "* current" marker and the
+    # /tree usage footer off the visible transcript. Keep the first and last
+    # halves so the current branch marker stays visible.
+    head_count = TREE_SOFT_CAP // 2
+    hidden_start, hidden_end = None, None
+    if len(branches) > TREE_SOFT_CAP:
+        hidden_start = head_count
+        hidden_end = len(branches) - head_count
     for index, branch in enumerate(branches, start=1):
+        if (
+            hidden_start is not None
+            and hidden_end is not None
+            and hidden_start < index - 1 < hidden_end
+        ):
+            if index - 1 == hidden_start + 1:
+                lines.append(f"  ... {hidden_end - hidden_start} more branches ...")
+            continue
         marker = "*" if branch.is_current else " "
         divergence = (
             f" · from seq {branch.divergence.seq}"

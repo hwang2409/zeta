@@ -387,3 +387,109 @@ def test_list_branches_empty_store(tmp_path: Path) -> None:
     assert store.list_branches() == []
     with pytest.raises(ValueError, match="branch head not found"):
         store.switch_to_branch("nope")
+
+
+# --- ZETA-81 sweep coverage -----------------------------------------------
+
+
+def test_fork_entries_record_source_type_for_each_flavor(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "checkpoint"
+    store = ConversationStore(checkpoint_dir)
+    store.append_message(_msg(MessageRole.USER, "one"))
+    store.append_message(_msg(MessageRole.ASSISTANT, "reply one"))
+    store.append_checkpoint("saved")
+    assert store.append_fork("saved").data["source_type"] == "checkpoint"
+
+    message_dir = tmp_path / "message"
+    store = ConversationStore(message_dir)
+    user = store.append_message(_msg(MessageRole.USER, "hello"))
+    store.append_message(_msg(MessageRole.ASSISTANT, "hi"))
+    assert store.append_message_fork(user.id).data["source_type"] == "message"
+
+    branch_dir = tmp_path / "branch"
+    store = ConversationStore(branch_dir, session_id="branchsession")
+    root = store.append_message(_msg(MessageRole.USER, "root"))
+    store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
+    # Create a second branch to switch to.
+    store.append_message_fork(root.id)
+    reopened = ConversationStore(branch_dir, session_id="branchsession")
+    leaves = [branch.head for branch in reopened.list_branches()]
+    current_head_id = reopened.replay()[-1].id
+    target = next(leaf for leaf in leaves if leaf.id != current_head_id)
+    assert reopened.switch_to_branch(target.id).data["source_type"] == "branch"
+
+
+def test_fork_rebuild_banner_names_the_source(tmp_path: Path) -> None:
+    from zeta.core.checkpoints import ConversationEntry
+    from zeta.tui.checkpoints import _fork_banner
+
+    checkpoint_entry = ConversationEntry(
+        id="a",
+        seq=3,
+        type="fork",
+        parent_id=None,
+        lane="conversation",
+        data={"label": "saved", "from_seq": 2, "source_type": "checkpoint"},
+    )
+    message_entry = ConversationEntry(
+        id="b",
+        seq=4,
+        type="fork",
+        parent_id=None,
+        lane="conversation",
+        data={"label": "hello", "from_seq": 1, "source_type": "message"},
+    )
+    branch_entry = ConversationEntry(
+        id="c",
+        seq=5,
+        type="fork",
+        parent_id=None,
+        lane="conversation",
+        data={"label": "hello", "from_seq": 2, "source_type": "branch"},
+    )
+    legacy_entry = ConversationEntry(
+        id="d",
+        seq=6,
+        type="fork",
+        parent_id=None,
+        lane="conversation",
+        data={"label": "saved", "from_seq": 2},
+    )
+    assert _fork_banner(checkpoint_entry) == "forked to checkpoint 'saved' at seq 2"
+    assert _fork_banner(message_entry) == "forked to user message 'hello' at seq 1"
+    assert _fork_banner(branch_entry) == "switched to branch 'hello' at seq 2"
+    # Legacy entries (no source_type) fall back to the original label.
+    assert _fork_banner(legacy_entry) == "forked to checkpoint 'saved' at seq 2"
+
+
+def test_slash_fork_picker_falls_through_to_checkpoints_without_user_messages(
+    tmp_path: Path,
+) -> None:
+    """Sweep (b): the picker used to hide checkpoints when no user messages
+    existed on the branch. Now it renders both sections independently."""
+
+    store = ConversationStore(tmp_path)
+    # Append a checkpoint directly (no user messages yet).
+    store.append_checkpoint("bare")
+    app = _make_tui(store)
+    result = app.slash_fork("")
+    assert "explicit checkpoint labels:" in result
+    assert "bare" in result
+
+
+def test_slash_tree_soft_caps_long_branch_lists(tmp_path: Path) -> None:
+    """Sweep (d): /tree elides overflow with an ellipsis marker."""
+
+    from zeta.tui.checkpoints import TREE_SOFT_CAP
+
+    store = ConversationStore(tmp_path)
+    root = store.append_message(_msg(MessageRole.USER, "root"))
+    store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
+    # Spin up TREE_SOFT_CAP + 5 fork branches off the root.
+    for _ in range(TREE_SOFT_CAP + 5):
+        store.append_message_fork(root.id)
+    app = _make_tui(store)
+    result = app.slash_tree("")
+    assert "... " in result and "more branches" in result
+    # Current branch marker still visible in the output.
+    assert "* " in result

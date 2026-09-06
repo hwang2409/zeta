@@ -1,10 +1,16 @@
-"""Prompt-toolkit sessions and key bindings for the TUI."""
+"""Prompt-toolkit sessions and key bindings for the TUI.
+
+The action-name → key remap layer lives at the top of this file (users author
+it via the ``[keybindings]`` table in ``settings.toml`` — see ZETA-73). It is
+kept here rather than a sibling module so the ``tui/`` package stays within
+its per-directory file cap (see :mod:`tests.test_module_limits`).
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import partial
-from typing import Any
+from typing import Any, Final
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
@@ -21,8 +27,117 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 from prompt_toolkit.key_binding.vi_state import InputMode
-from prompt_toolkit.keys import Keys
+from prompt_toolkit.keys import ALL_KEYS, Keys
 from prompt_toolkit.output import Output
+
+# --- keybinding remap layer ------------------------------------------------
+
+
+class KeybindingError(Exception):
+    """Raised when a remap file names an unknown action or an unparseable key."""
+
+
+# Canonical action names, in the order they appear in ``build_key_bindings``.
+# The value is the default key sequence prompt-toolkit expects for the action;
+# the same map doubles as the "valid actions" set for error messages.
+DEFAULTS: Final[Mapping[str, tuple[str, ...]]] = {
+    "submit": ("enter",),
+    "insert-newline": ("c-j",),
+    "interrupt": ("c-c",),
+    "exit": ("c-d",),
+    "retry": ("c-y",),
+    "undo": ("c-u",),
+    "paste": ("c-v",),
+    "page-up": ("pageup",),
+    "page-down": ("pagedown",),
+    "search-start": ("c-f",),
+    "transcript-previous-user": ("c-up",),
+    "transcript-next-user": ("c-down",),
+    "toggle-agent": ("c-x", "c-o"),
+    "plan-mode-toggle": ("s-tab",),
+}
+
+ACTIONS: Final[frozenset[str]] = frozenset(DEFAULTS)
+
+
+_MODIFIER_ALIASES: Final[Mapping[str, str]] = {
+    "ctrl": "c",
+    "control": "c",
+    "c": "c",
+    "shift": "s",
+    "s": "s",
+}
+
+
+def parse_key_spec(spec: str) -> tuple[str, ...]:
+    """Turn ``spec`` into a prompt-toolkit key tuple.
+
+    Accepts ``c-r`` / ``ctrl-r`` / ``ctrl+r`` / ``Ctrl-R``, chords like
+    ``c-x c-o``, and named keys such as ``pageup`` / ``f5`` / ``escape``.
+    Raises :class:`KeybindingError` when any segment does not resolve.
+    """
+
+    if not isinstance(spec, str) or not spec.strip():
+        raise KeybindingError("empty key spec")
+    normalized: list[str] = []
+    for segment in spec.split():
+        canonical = _normalize_key_segment(segment)
+        if canonical not in ALL_KEYS:
+            raise KeybindingError(f"unknown key {segment!r}")
+        normalized.append(canonical)
+    return tuple(normalized)
+
+
+def _normalize_key_segment(segment: str) -> str:
+    lowered = segment.lower().replace("+", "-").replace("_", "-")
+    if not lowered:
+        raise KeybindingError("empty key segment")
+    parts = lowered.split("-")
+    if any(part == "" for part in parts):
+        raise KeybindingError(f"invalid key spec {segment!r}")
+    if len(parts) == 1:
+        return parts[0]
+    canonical: list[str] = []
+    for modifier in parts[:-1]:
+        if modifier not in _MODIFIER_ALIASES:
+            raise KeybindingError(
+                f"unknown modifier {modifier!r} in {segment!r}"
+            )
+        canonical.append(_MODIFIER_ALIASES[modifier])
+    canonical.append(parts[-1])
+    return "-".join(canonical)
+
+
+def resolve_keybindings(
+    user_map: Mapping[str, str] | None,
+) -> dict[str, tuple[str, ...]]:
+    """Return the final ``action -> key tuple`` map.
+
+    Defaults from :data:`DEFAULTS` apply first; each user entry replaces the
+    default for that action. Unknown action names or unparseable key specs
+    raise :class:`KeybindingError` naming the valid actions so a typo does
+    not silently disable a shortcut.
+    """
+
+    resolved: dict[str, tuple[str, ...]] = dict(DEFAULTS)
+    if not user_map:
+        return resolved
+    for action, spec in user_map.items():
+        if action not in ACTIONS:
+            valid = ", ".join(sorted(ACTIONS))
+            raise KeybindingError(
+                f"keybindings: unknown action {action!r}; valid: {valid}"
+            )
+        try:
+            resolved[action] = parse_key_spec(spec)
+        except KeybindingError as exc:
+            raise KeybindingError(
+                f"keybindings: {action!r} = {spec!r}: {exc}"
+            ) from exc
+    return resolved
+
+
+# --- prompt-toolkit session/key wiring -------------------------------------
 
 SHIFT_ENTER_SEQUENCES = frozenset(
     {
@@ -133,9 +248,11 @@ def build_key_bindings(
     on_plan_toggle: Callable[[], None] | None = None,
     on_scroll_up: Callable[[], None] | None = None,
     on_scroll_down: Callable[[], None] | None = None,
+    key_remap: Mapping[str, str] | None = None,
 ) -> KeyBindings:
     """Build the small key map used by the full-screen composer."""
 
+    resolved_keys = resolve_keybindings(key_remap)
     bindings = KeyBindings()
     escape_chord_pending = False
     escape_chord_cursor_position: int | None = None
@@ -202,7 +319,7 @@ def build_key_bindings(
     def insert_newline(event: KeyPressEvent) -> None:
         event.current_buffer.insert_text("\n")
 
-    @bindings.add("enter")
+    @bindings.add(*resolved_keys["submit"])
     def submit(event: KeyPressEvent) -> None:
         nonlocal escape_chord_cursor_position, escape_chord_pending
         if escape_chord_pending:
@@ -224,7 +341,7 @@ def build_key_bindings(
         else:
             event.current_buffer.validate_and_handle()
 
-    @bindings.add("c-j")
+    @bindings.add(*resolved_keys["insert-newline"])
     def newline(event: KeyPressEvent) -> None:
         insert_newline(event)
 
@@ -237,21 +354,21 @@ def build_key_bindings(
 
     if on_retry is not None:
 
-        @bindings.add("c-y", filter=retry_ready, eager=True)
+        @bindings.add(*resolved_keys["retry"], filter=retry_ready, eager=True)
         def retry(event: KeyPressEvent) -> None:
             del event
             on_retry()
 
     if on_undo is not None:
 
-        @bindings.add("c-u", eager=True)
+        @bindings.add(*resolved_keys["undo"], eager=True)
         def undo(event: KeyPressEvent) -> None:
             del event
             on_undo()
 
     if on_paste is not None:
 
-        @bindings.add("c-v")
+        @bindings.add(*resolved_keys["paste"])
         def paste(event: KeyPressEvent) -> None:
             on_paste(event)
 
@@ -318,33 +435,33 @@ def build_key_bindings(
             suppress_history_detach = False
         history_navigation_active = buffer.text != ""
 
-    @bindings.add("c-c")
+    @bindings.add(*resolved_keys["interrupt"])
     def interrupt(event: KeyPressEvent) -> None:
         on_interrupt()
         event.current_buffer.reset()
 
-    @bindings.add("c-d")
+    @bindings.add(*resolved_keys["exit"])
     def exit_prompt(event: KeyPressEvent) -> None:
         on_exit()
         event.app.exit(exception=EOFError())
 
     if on_page_up is not None:
 
-        @bindings.add("pageup")
+        @bindings.add(*resolved_keys["page-up"])
         def page_up(event: KeyPressEvent) -> None:
             del event
             on_page_up()
 
     if on_page_down is not None:
 
-        @bindings.add("pagedown")
+        @bindings.add(*resolved_keys["page-down"])
         def page_down(event: KeyPressEvent) -> None:
             del event
             on_page_down()
 
     if on_search_start is not None:
 
-        @bindings.add("c-f", filter=full_screen_mode & ~transcript_search_mode, eager=True)
+        @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~transcript_search_mode, eager=True)
         def start_transcript_search(event: KeyPressEvent) -> None:
             nonlocal search_input_active
             event.current_buffer.cancel_completion()
@@ -412,21 +529,21 @@ def build_key_bindings(
 
     if on_previous_user is not None:
 
-        @bindings.add(Keys.ControlUp, filter=full_screen_mode, eager=True)
+        @bindings.add(*resolved_keys["transcript-previous-user"], filter=full_screen_mode, eager=True)
         def previous_user(event: KeyPressEvent) -> None:
             del event
             on_previous_user()
 
     if on_next_user is not None:
 
-        @bindings.add(Keys.ControlDown, filter=full_screen_mode, eager=True)
+        @bindings.add(*resolved_keys["transcript-next-user"], filter=full_screen_mode, eager=True)
         def next_user(event: KeyPressEvent) -> None:
             del event
             on_next_user()
 
     if on_toggle_agent is not None:
 
-        @bindings.add("c-x", "c-o")
+        @bindings.add(*resolved_keys["toggle-agent"])
         def toggle_agent(event: KeyPressEvent) -> None:
             del event
             on_toggle_agent()
@@ -462,9 +579,10 @@ def build_key_bindings(
         # Shift+Tab cycles modes in the harnesses people arrive from, so it
         # toggles plan mode here. It stands down while the completion menu is
         # open, where the terminal's own back-tab walks the list, and during
-        # either search, which takes the keyboard whole.
+        # either search, which takes the keyboard whole. (``s-tab`` is
+        # prompt-toolkit's alias for ``BackTab``.)
         @bindings.add(
-            Keys.BackTab,
+            *resolved_keys["plan-mode-toggle"],
             filter=~has_completions & ~transcript_search_mode & ~is_searching,
             eager=True,
         )

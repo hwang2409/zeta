@@ -37,13 +37,13 @@ from ..types import (
     TextContent,
     image_signature_matches,
 )
+from . import theme
 from .key_bindings import (
     FullScreenPromptSession,
     VimCursorShapeConfig,
     build_key_bindings,
 )
 from .render import is_retryable_error, render_event
-from .theme import BODY, CHROME, DIM, ERROR, USER_ROLE
 
 ATTACHMENT_MAX_TEXT_BYTES = 200 * 1024
 ATTACHMENT_TOKEN_RE = re.compile(r'(?<!\S)@(?:"([^"\n]+)"|([^\s]+))')
@@ -111,7 +111,7 @@ class TurnConsumerMixin:
                 self._prepare_stream_event(event)
                 stop_after_tool = self._handle_tool_event(event)
                 if self.verbose:
-                    self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style=DIM))
+                    self._print(Text(json.dumps(event.to_dict(), sort_keys=True), style=theme.DIM))
                 if event.type is StreamEventType.MESSAGE_UPDATE:
                     self._consume_text(event)
                     self._invalidate_prompt()
@@ -136,7 +136,7 @@ class TurnConsumerMixin:
                     if not turn_failed:
                         self._failed_turn = None
                     if not self._turn_had_visible_output:
-                        self._print_unit(Text("no response", style=CHROME))
+                        self._print_unit(Text("no response", style=theme.CHROME))
                         self._turn_had_visible_output = True
                 if event.type not in {
                     StreamEventType.TOOL_APPROVAL_START,
@@ -172,7 +172,7 @@ class TurnConsumerMixin:
             self._presenter.reset_assistant_unit()
             self._reset_stream_state()
             self._loop_state = "interrupted"
-            self._print_unit(Text("[aborted]", style=ERROR))
+            self._print_unit(Text("[aborted]", style=theme.ERROR))
             raise
         except Exception as exc:
             self._flush_stream_kind(preserve_inline=True)
@@ -693,7 +693,7 @@ class ComposerAttachmentMixin:
                 not in {"streaming", "compacting", "tool-running", "approval"}
             ):
                 self._print_unit(
-                    Text("undo unavailable: turn already completed", style=DIM)
+                    Text("undo unavailable: turn already completed", style=theme.DIM)
                 )
                 return
             self._undo_candidate = None
@@ -718,7 +718,9 @@ class ComposerAttachmentMixin:
     def _print_user(self, user: str | Message) -> None:
         self._presenter.reset_assistant_unit()
         if isinstance(user, str):
-            self._presenter.print_user(Text.assemble(("▌ ", USER_ROLE), (user, BODY)))
+            self._presenter.print_user(
+                Text.assemble(("▌ ", theme.USER_ROLE), (user, theme.BODY))
+            )
             return
         prompt = next(
             (
@@ -728,7 +730,7 @@ class ComposerAttachmentMixin:
             ),
             "",
         )
-        rendered = Text.assemble(("▌ ", USER_ROLE), (prompt, BODY))
+        rendered = Text.assemble(("▌ ", theme.USER_ROLE), (prompt, theme.BODY))
         for block in user.content:
             if isinstance(block, TextContent) and block.path is not None:
                 label = self._display_attachment_path(Path(block.path))

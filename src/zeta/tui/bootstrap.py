@@ -27,6 +27,8 @@ from ..loop import AgentLoop
 from ..settings import ResolvedConfig
 from ..settings import resolve as resolve_settings
 from ..tools._user_discovery import apply_external_tools
+from . import theme as _theme
+from .key_bindings import KeybindingError, resolve_keybindings
 from .layout import content_width, resume_picker_line
 
 if TYPE_CHECKING:
@@ -295,10 +297,13 @@ def _create_app_with_root(
         project_dir=repo_root / ".zeta",
     )
     loop.tool_schemas = list(loop.tool_registry.schemas)
+    theme_notices = _apply_startup_theme(config.theme, home)
+    _validate_keybindings(config.keybindings)
     startup_notices = (
         tuple(loaded_settings.notices)
         + project_context.notices
         + external_tools.notices
+        + theme_notices
     )
     startup_warnings = tuple(loaded_settings.warnings) + external_tools.warnings
     if ephemeral:
@@ -340,7 +345,39 @@ def _create_app_with_root(
         ephemeral_root=ephemeral_root,
         session_name=metadata.name,
         on_name_change=lambda label: manager.record_name(metadata, name=label),
+        key_remap=config.keybindings,
     )
+
+
+def _apply_startup_theme(name: str | None, home: Path) -> tuple[str, ...]:
+    """Apply the theme selected via settings; return dim notices for failures."""
+
+    if name is None:
+        _theme.set_active_palette(_theme.DARK)
+        return ()
+    palette, notice = _theme.resolve_palette(name, home=home)
+    if palette is None:
+        fallback = _theme.DARK
+        _theme.set_active_palette(fallback)
+        if notice is not None:
+            return (notice,)
+        return (f"theme · unknown theme {name!r}; using {fallback.name!r}",)
+    _theme.set_active_palette(palette)
+    return () if notice is None else (notice,)
+
+
+def _validate_keybindings(remap: object) -> None:
+    """Loud-fail keybindings validation happens before the TUI opens.
+
+    ``settings.py`` only checks the table+string shape; unknown ACTIONs and
+    unparseable KEYs are rejected here so a bad file cannot silently disable
+    a shortcut.
+    """
+
+    try:
+        resolve_keybindings(remap)  # type: ignore[arg-type]
+    except KeybindingError as exc:
+        raise SessionError(str(exc)) from exc
 
 
 __all__ = ["RECENT_SESSION_LIMIT", "create_app", "format_picker_row"]

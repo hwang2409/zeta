@@ -18,6 +18,7 @@ from ...core.slash import (
 from ...core.todo import todo_count_tuple
 from ...mcp.prompt_commands import SlashModelInput
 from ...tools._user_discovery import trust_project_tools
+from .. import theme as _theme
 from ..models import validate_model_name
 
 
@@ -265,6 +266,41 @@ class SlashHandlerMixin:
             return f"session name unchanged: {exc}"
         self._session_name = label
         return f"session name: {label}"
+
+    def slash_theme(self, args: str) -> str:
+        """Show, list, or switch the active TUI theme."""
+
+        home = getattr(self, "_zeta_home", None)
+        requested = args.strip()
+        if not requested or requested.lower() == "list":
+            available = ", ".join(_theme.list_available(home))
+            return (
+                f"theme: {_theme.active_palette().name} · available: {available}"
+            )
+        palette, notice = _theme.resolve_palette(requested, home=home)
+        if palette is None:
+            if notice is not None:
+                return f"theme unchanged: {notice}"
+            available = ", ".join(_theme.list_available(home))
+            return (
+                f"theme unchanged: unknown theme {requested!r}; "
+                f"available: {available}"
+            )
+        _theme.set_active_palette(palette)
+        self._on_theme_change()
+        message = f"theme: {palette.name}"
+        return message if notice is None else f"{message} ({notice})"
+
+    def _on_theme_change(self) -> None:
+        """Refresh the prompt style cache and re-render the transcript."""
+
+        # Cached DynamicStyle values were built from the previous palette; drop
+        # them so the next _prompt_style() call rebuilds against the new one.
+        prompt_styles = getattr(self, "_prompt_styles", None)
+        if isinstance(prompt_styles, dict):
+            prompt_styles.clear()
+        self._rebuild_transcript()
+        self._invalidate_prompt()
 
     def slash_vim(self, args: str) -> str:
         requested = args.strip().lower()

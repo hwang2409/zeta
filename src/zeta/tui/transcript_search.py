@@ -9,7 +9,8 @@ from io import StringIO
 from rich.console import Console
 from rich.text import Text
 
-from .theme import RICH_THEME, SEARCH_CURRENT, SEARCH_MATCH
+from . import theme
+from .theme import RICH_THEME
 
 
 class SearchMatch:
@@ -69,7 +70,7 @@ class HighlightCache:
                 text_fragments.append(line[offset:start])
             match_text = line[start:end]
             match_text.stylize(
-                SEARCH_CURRENT if match_index == current_index else SEARCH_MATCH,
+                theme.SEARCH_CURRENT if match_index == current_index else theme.SEARCH_MATCH,
                 0,
                 end - start,
             )
@@ -96,7 +97,7 @@ class HighlightCache:
         fragment_index = match_fragments[match_index]
         match_text = match_texts[match_index].copy()
         match_text.stylize(
-            SEARCH_CURRENT if match_index == current_index else SEARCH_MATCH,
+            theme.SEARCH_CURRENT if match_index == current_index else theme.SEARCH_MATCH,
             0,
             len(match_text),
         )
@@ -114,7 +115,7 @@ class HighlightCache:
             for match_index, start, end in ranges:
                 line = line_starts[line_index] if line_index < len(line_starts) else 0
                 text.stylize(
-                    SEARCH_CURRENT if match_index == current_index else SEARCH_MATCH,
+                    theme.SEARCH_CURRENT if match_index == current_index else theme.SEARCH_MATCH,
                     line + start,
                     line + end,
                 )
