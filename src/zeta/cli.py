@@ -47,6 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
         const="",
         help="resume a session by id, or choose one from the recent-session picker",
     )
+    session_group.add_argument(
+        "--no-session",
+        dest="no_session",
+        action="store_true",
+        help="run one ephemeral session; nothing is written to the sessions store",
+    )
     parser.add_argument(
         "--force-provider",
         action="store_true",
@@ -99,6 +105,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="anthropic",
         help="OAuth provider (default: anthropic)",
     )
+    from .session_cli import add_subcommand as _add_session_subcommand
+
+    _add_session_subcommand(commands)
     return parser
 
 
@@ -137,6 +146,21 @@ def _run_login(provider: str) -> str | None:
     return asyncio.run(run_login(_build_login_provider(provider), _pkce_values))
 
 
+def _cleanup_ephemeral(app: "object") -> None:
+    import shutil
+
+    root = app.ephemeral_root
+    if root is None:
+        return
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def _print_exit_hint(app: "object") -> None:
+    if app.ephemeral_root is not None:
+        return
+    print(f"resume with: zeta --resume {app.loop.store.session_id}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -151,19 +175,32 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"logged in as {handle}" if handle else "ok")
         return 0
+    if args.command == "session":
+        from .session_cli import run as _run_session
+
+        return _run_session(args)
     if args.prompt is not None:
         from .headless import run_headless
 
         return run_headless(args, args.prompt)
     if args.format != "text":
         parser.error("--format requires --print")
-    try:
-        app = create_app(args)
-    except SessionError as exc:
-        parser.error(str(exc))
-    with patch_stdout(raw=True):
-        asyncio.run(app.run())
-    return 0
+    while True:
+        try:
+            app = create_app(args)
+        except SessionError as exc:
+            parser.error(str(exc))
+        try:
+            with patch_stdout(raw=True):
+                asyncio.run(app.run())
+            if app.new_session_requested:
+                args.continue_session = False
+                args.resume = None
+                continue
+            _print_exit_hint(app)
+            return 0
+        finally:
+            _cleanup_ephemeral(app)
 
 
 __all__ = ["build_parser", "main"]

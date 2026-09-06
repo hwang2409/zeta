@@ -211,6 +211,8 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
         print(f"zeta: {exc}", file=sys.stderr)
         return 1
 
+    if app.ephemeral_root is not None:
+        print("zeta: ephemeral session — nothing will be persisted", file=sys.stderr)
     loop = app.loop
     policy = app.approval_policy
     if policy is not None and policy.default is not ApprovalDecision.ALLOW:
@@ -245,6 +247,11 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
     except KeyboardInterrupt:
         print("zeta: aborted", file=sys.stderr)
         return 130
+    finally:
+        if app.ephemeral_root is not None:
+            import shutil
+
+            shutil.rmtree(app.ephemeral_root, ignore_errors=True)
 
 
 __all__ = ["DENIAL_MARKER", "TOOL_RESULT_MAX_BYTES", "drive_turn", "run_headless"]

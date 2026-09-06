@@ -28,7 +28,13 @@ from ..core.project_context import (
     discover_repo_root,
     load_project_context,
 )
-from ..core.session import SessionError, SessionManager, env_home
+from ..core.session import (
+    SessionError,
+    SessionManager,
+    SessionPreview,
+    env_home,
+    format_relative_age,
+)
 from ..core.slash import (
     UsageTracker,
     context_window,
@@ -100,6 +106,14 @@ from .transcript_presenter import TranscriptPresenter
 RECENT_SESSION_LIMIT = 20
 
 
+def format_picker_row(index: int, preview: SessionPreview) -> str:
+    """Render one picker row with age, id, optional name, and preview."""
+
+    age = format_relative_age(preview.updated_at).rjust(8)
+    label = f" [{preview.name}]" if preview.name else ""
+    return f"{index}. {age}  {preview.session_id[:8]}{label}  {preview.preview}"
+
+
 def background_notice(app: Any, message: str) -> None:
     """Print one dim background task notice and refresh the prompt."""
 
@@ -162,6 +176,9 @@ class TUIApp(
         startup_warnings: Sequence[str] = (),
         external_tools: ExternalToolDiscovery | None = None,
         workspace_snapshot_cap: int | None = None,
+        ephemeral_root: Path | None = None,
+        session_name: str = "",
+        on_name_change: Callable[[str], None] | None = None,
     ) -> None:
         self.loop = loop
         self._workspace_snapshot_cap = workspace_snapshot_cap
@@ -246,6 +263,22 @@ class TUIApp(
         self._startup_notices: tuple[str, ...] = tuple(startup_notices)
         self._startup_warnings: tuple[str, ...] = tuple(startup_warnings)
         self._external_tools = external_tools
+        self._ephemeral_root = ephemeral_root
+        self._new_session_requested = False
+        self._session_name = session_name
+        self._on_name_change = on_name_change
+
+    @property
+    def ephemeral_root(self) -> Path | None:
+        return self._ephemeral_root
+
+    @property
+    def new_session_requested(self) -> bool:
+        return self._new_session_requested
+
+    def request_new_session(self) -> None:
+        self._new_session_requested = True
+        self.request_exit()
 
     @property
     def _transcript_lines(self) -> list[str]:
@@ -913,7 +946,15 @@ class TUIApp(
 
 def create_app(args: argparse.Namespace) -> TUIApp:
     home = env_home()
-    manager = SessionManager(home)
+    ephemeral = bool(getattr(args, "no_session", False))
+    ephemeral_root: Path | None = None
+    if ephemeral:
+        import tempfile
+
+        ephemeral_root = Path(tempfile.mkdtemp(prefix="zeta-ephemeral-"))
+        manager = SessionManager(ephemeral_root)
+    else:
+        manager = SessionManager(home)
     project_dir = discover_repo_root(Path.cwd()) / ".zeta"
     loaded_settings = load_settings(home=home, project_dir=project_dir)
     config: ResolvedConfig = resolve_settings(
@@ -940,12 +981,7 @@ def create_app(args: argparse.Namespace) -> TUIApp:
             width = content_width(get_terminal_size(fallback=(80, 24)).columns)
             print(resume_picker_line("recent zeta sessions:", width))
             for index, preview in enumerate(previews, start=1):
-                print(
-                    resume_picker_line(
-                        f"{index}. {preview.updated_at} {preview.session_id[:8]} {preview.preview}",
-                        width,
-                    )
-                )
+                print(resume_picker_line(format_picker_row(index, preview), width))
             try:
                 choice = input(
                     resume_picker_line("select a session:", width - 1) + " "
@@ -1116,6 +1152,11 @@ def create_app(args: argparse.Namespace) -> TUIApp:
     loop.tool_schemas = list(loop.tool_registry.schemas)
     startup_notices = tuple(loaded_settings.notices) + external_tools.notices
     startup_warnings = tuple(loaded_settings.warnings) + external_tools.warnings
+    if ephemeral:
+        startup_warnings = (
+            "ephemeral session: nothing will be persisted",
+            *startup_warnings,
+        )
     return TUIApp(
         loop,
         provider=provider,
@@ -1141,6 +1182,9 @@ def create_app(args: argparse.Namespace) -> TUIApp:
         startup_warnings=startup_warnings,
         external_tools=external_tools,
         workspace_snapshot_cap=config.workspace_snapshot_cap,
+        ephemeral_root=ephemeral_root,
+        session_name=metadata.name,
+        on_name_change=lambda label: manager.record_name(metadata, name=label),
     )
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from prompt_toolkit.enums import EditingMode
 
+from ...core.session import SessionError, normalize_session_name
 from ...core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashStatus,
@@ -231,6 +232,39 @@ class SlashHandlerMixin:
             self._print_system(notice)
         names = sorted({tool.module_stem for tool in trusted})
         return f"tools: trusted {len(names)} project tool(s): {', '.join(names)}"
+
+    def slash_new(self, args: str) -> str:
+        """Signal the CLI wrapper to start a fresh session in this window."""
+
+        if args.strip():
+            return "new unchanged: /new does not accept arguments"
+        if self.active or self.pending_approvals:
+            return (
+                "new unchanged: cannot start a new session while a turn or "
+                "approval is active"
+            )
+        self.request_new_session()
+        return "starting a fresh session..."
+
+    def slash_name(self, args: str) -> str:
+        """Persist a session label shown in the resume picker."""
+
+        raw = args.strip()
+        if not raw:
+            current = getattr(self, "_session_name", "")
+            return f"session name: {current}" if current else "session name: (unnamed)"
+        if self._on_name_change is None:
+            return "session name unchanged: names are unavailable for this session"
+        try:
+            label = normalize_session_name(raw)
+        except SessionError as exc:
+            return f"session name unchanged: {exc}"
+        try:
+            self._on_name_change(label)
+        except SessionError as exc:
+            return f"session name unchanged: {exc}"
+        self._session_name = label
+        return f"session name: {label}"
 
     def slash_vim(self, args: str) -> str:
         requested = args.strip().lower()
