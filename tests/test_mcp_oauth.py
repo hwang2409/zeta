@@ -21,8 +21,9 @@ from zeta.mcp import (
     StreamableHTTPMCPClient,
     load_mcp_config,
 )
-from zeta.mcp.client import MCPResource
+from zeta.mcp.client import MCPHTTPError, MCPResource
 from zeta.mcp.commands import parse_add_command
+from zeta.mcp.http import MAX_RESPONSE_BYTES
 from zeta.mcp.oauth import (
     MCPOAuthError,
     MCPOAuthStateError,
@@ -846,3 +847,238 @@ async def test_slash_mcp_auth_rejects_stdio_server(
     output = await loop.slash_mcp("auth local")
     assert "requires an HTTP MCP server" in output
     await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_http_client_aborts_oversized_streamed_body() -> None:
+    """A server that streams past the transport cap is aborted early."""
+
+    chunk_size = 50_000
+    total_chunks = 20  # 1MB total, transport cap is 400KB
+    chunks_yielded = 0
+
+    async def payload():
+        nonlocal chunks_yielded
+        for _ in range(total_chunks):
+            chunks_yielded += 1
+            yield b"x" * chunk_size
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "id" not in body:
+            return httpx.Response(202, request=request)
+        if body["method"] == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"protocolVersion": "2025-06-18", "capabilities": {}},
+                },
+                request=request,
+            )
+        if body["method"] == "resources/read":
+            return httpx.Response(
+                200,
+                content=payload(),
+                headers={"content-type": "application/json"},
+                request=request,
+            )
+        return httpx.Response(404, request=request)
+
+    config = MCPServerConfig("live", "streamable-http", url="https://mcp.test/rpc")
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(config, client=transport)
+    await client.connect()
+    with pytest.raises(MCPHTTPError, match="too large"):
+        await client.read_resource("mcp://big")
+    max_expected_chunks = (MAX_RESPONSE_BYTES // chunk_size) + 2
+    assert chunks_yielded <= max_expected_chunks
+    assert chunks_yielded < total_chunks
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_http_client_rejects_oversized_content_length() -> None:
+    """Content-Length declared above the cap is rejected before body reads."""
+
+    body_read = False
+
+    async def payload():
+        nonlocal body_read
+        body_read = True
+        yield b"x"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "id" not in body:
+            return httpx.Response(202, request=request)
+        if body["method"] == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"protocolVersion": "2025-06-18", "capabilities": {}},
+                },
+                request=request,
+            )
+        if body["method"] == "resources/read":
+            oversize = str(MAX_RESPONSE_BYTES + 1)
+            return httpx.Response(
+                200,
+                content=payload(),
+                headers={
+                    "content-type": "application/json",
+                    "content-length": oversize,
+                },
+                request=request,
+            )
+        return httpx.Response(404, request=request)
+
+    config = MCPServerConfig("live", "streamable-http", url="https://mcp.test/rpc")
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(config, client=transport)
+    await client.connect()
+    with pytest.raises(MCPHTTPError, match="too large"):
+        await client.read_resource("mcp://big")
+    assert body_read is False
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_http_client_single_flights_concurrent_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent 401s must trigger exactly one refresh grant."""
+
+    home = _monkey_home(monkeypatch, tmp_path)
+    _write_token("live", home, access_token="stale-token")
+
+    refresh_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal refresh_count
+        url = str(request.url)
+        if url.endswith("/token"):
+            refresh_count += 1
+            await asyncio.sleep(0.05)
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "fresh-token",
+                    "refresh_token": "refresh-token-2",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                },
+                request=request,
+            )
+        body = json.loads(request.content)
+        if "id" not in body:
+            return httpx.Response(202, request=request)
+        if body["method"] == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"protocolVersion": "2025-06-18", "capabilities": {}},
+                },
+                request=request,
+            )
+        if body["method"] == "tools/call":
+            auth_header = request.headers.get("authorization", "")
+            if auth_header == "Bearer stale-token":
+                return httpx.Response(401, text="expired", request=request)
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "ok"}],
+                        "isError": False,
+                    },
+                },
+                request=request,
+            )
+        return httpx.Response(404, request=request)
+
+    config = MCPServerConfig(
+        "live",
+        "streamable-http",
+        url="https://mcp.test/rpc",
+        auth_type="oauth",
+    )
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(config, client=transport, home=str(home))
+    await client.connect()
+
+    results = await asyncio.gather(
+        client.call_tool("echo", {}, AbortSignal()),
+        client.call_tool("echo", {}, AbortSignal()),
+    )
+    for result in results:
+        assert result["content"][0]["text"] == "ok"
+    assert refresh_count == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_http_notification_refreshes_on_401(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_send_notification` must refresh on 401 and retry with the fresh token."""
+
+    home = _monkey_home(monkeypatch, tmp_path)
+    _write_token("live", home, access_token="stale-token")
+
+    notification_calls: list[str] = []
+    refresh_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal refresh_count
+        url = str(request.url)
+        if url.endswith("/token"):
+            refresh_count += 1
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "fresh-token",
+                    "refresh_token": "refresh-token-2",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                },
+                request=request,
+            )
+        body = json.loads(request.content)
+        if "id" not in body:
+            auth = request.headers.get("authorization", "")
+            notification_calls.append(auth)
+            if auth == "Bearer stale-token":
+                return httpx.Response(401, text="expired", request=request)
+            return httpx.Response(202, request=request)
+        if body["method"] == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"protocolVersion": "2025-06-18", "capabilities": {}},
+                },
+                request=request,
+            )
+        return httpx.Response(404, request=request)
+
+    config = MCPServerConfig(
+        "live",
+        "streamable-http",
+        url="https://mcp.test/rpc",
+        auth_type="oauth",
+    )
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(config, client=transport, home=str(home))
+    await client.connect()
+    assert refresh_count == 1
+    assert notification_calls == ["Bearer stale-token", "Bearer fresh-token"]
+    await client.close()

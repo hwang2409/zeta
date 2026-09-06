@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
+import http
 import logging
 import secrets
 import time
@@ -360,7 +362,11 @@ def _write_response(
     body: str,
 ) -> None:
     payload = body.encode("utf-8")
-    status_line = f"HTTP/1.1 {status} OK\r\n"
+    try:
+        reason = http.HTTPStatus(status).phrase
+    except ValueError:
+        reason = "Unknown"
+    status_line = f"HTTP/1.1 {status} {reason}\r\n"
     headers = (
         f"Content-Type: text/plain; charset=utf-8\r\n"
         f"Content-Length: {len(payload)}\r\n"
@@ -561,7 +567,7 @@ async def authorize(
         listener = None
         if outcome.error:
             raise MCPOAuthError(f"MCP OAuth: authorization denied: {outcome.error}")
-        if outcome.state != state:
+        if outcome.state is None or not hmac.compare_digest(outcome.state, state):
             raise MCPOAuthStateError(
                 "MCP OAuth: authorization redirect state did not match"
             )

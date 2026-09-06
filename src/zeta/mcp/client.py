@@ -38,7 +38,7 @@ class MCPHTTPError(MCPTransportError):
 
     def __init__(self, status_code: int, detail: str) -> None:
         if status_code == 401:
-            message = f"MCP HTTP 401: bearer token rejected by MCP server: {detail}"
+            message = f"MCP HTTP 401: credentials rejected: {detail}"
         elif status_code == 0:
             message = f"MCP HTTP 0: MCP connection failed: {detail}"
         else:

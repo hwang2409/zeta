@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
+from typing import TypeVar
 
 import httpx
 
@@ -41,13 +42,17 @@ from .oauth_store import (
     MCPOAuthToken,
     load_token,
     save_token,
-    token_is_expired,
 )
+from .resources import RESOURCE_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 HTTP_TIMEOUT_SECONDS = 10.0
+MAX_RESPONSE_BYTES = 2 * RESOURCE_MAX_BYTES
+MAX_ERROR_DETAIL_BYTES = 8192
 
 OAUTH_HINT = "run /mcp auth {name} to reauthorize"
+
+T = TypeVar("T")
 
 
 class StreamableHTTPMCPClient(MCPClient):
@@ -168,21 +173,29 @@ class StreamableHTTPMCPClient(MCPClient):
     async def _send_with_auth(
         self, payload: Mapping[str, object], request_id: int
     ) -> dict[str, object]:
+        return await self._with_auth(lambda: self._send(payload, request_id))
+
+    async def _with_auth(self, send: Callable[[], Awaitable[T]]) -> T:
         if self.config.auth_type != "oauth":
-            return await self._send(payload, request_id)
+            return await send()
+        token_at_send = self._current_token
         try:
-            return await self._send(payload, request_id)
+            return await send()
         except MCPHTTPError as exc:
             if exc.status_code != 401:
                 raise
-            refreshed = await self._refresh_token_once(exc)
+            refreshed = await self._refresh_token_once(exc, token_at_send)
             if not refreshed:
                 raise self._auth_error(exc)
-            return await self._send(payload, request_id)
+            return await send()
 
-    async def _refresh_token_once(self, exc: MCPHTTPError) -> bool:
+    async def _refresh_token_once(
+        self, exc: MCPHTTPError, token_at_send: MCPOAuthToken | None
+    ) -> bool:
         async with self._token_lock:
             token = self._current_token
+            if token is not token_at_send:
+                return True
             if token is None or token.refresh_token is None:
                 self._record_refresh_failure(token, str(exc))
                 return False
@@ -260,6 +273,7 @@ class StreamableHTTPMCPClient(MCPClient):
                 session_id = response.headers.get("mcp-session-id")
                 if session_id is not None:
                     self._session_id = session_id
+                _enforce_content_length(response, MAX_RESPONSE_BYTES)
                 if response.status_code == 401:
                     detail = await _response_detail(response)
                     raise MCPHTTPError(401, detail or "unauthorized")
@@ -267,9 +281,10 @@ class StreamableHTTPMCPClient(MCPClient):
                     detail = await _response_detail(response)
                     raise MCPHTTPError(response.status_code, detail or "request failed")
                 if "text/event-stream" in response.headers.get("content-type", ""):
-                    return await _read_sse_response(response, request_id)
+                    return await _read_sse_response(response, request_id, MAX_RESPONSE_BYTES)
+                body = await _read_bounded_body(response, MAX_RESPONSE_BYTES)
                 try:
-                    value = response.json()
+                    value = json.loads(body)
                 except ValueError as exc:
                     raise MCPProtocolError("MCP HTTP response was not JSON") from exc
                 return parse_rpc_response(value, request_id)
@@ -277,6 +292,9 @@ class StreamableHTTPMCPClient(MCPClient):
             raise MCPHTTPError(0, str(exc)) from exc
 
     async def _send_notification(self, method: str, params: Mapping[str, object]) -> None:
+        await self._with_auth(lambda: self._send_notification_raw(method, params))
+
+    async def _send_notification_raw(self, method: str, params: Mapping[str, object]) -> None:
         headers = self._auth_headers()
         headers.update(
             {"accept": "application/json, text/event-stream", "content-type": "application/json"}
@@ -286,10 +304,17 @@ class StreamableHTTPMCPClient(MCPClient):
         if self.protocol_version is not None:
             headers["mcp-protocol-version"] = self.protocol_version
         payload = {"jsonrpc": "2.0", "method": method, "params": dict(params)}
-        async with self._client.stream("POST", self.config.url, headers=headers, json=payload) as response:
-            if response.status_code >= 400:
-                detail = await _response_detail(response)
-                raise MCPHTTPError(response.status_code, detail or "request failed")
+        try:
+            async with self._client.stream("POST", self.config.url, headers=headers, json=payload) as response:
+                _enforce_content_length(response, MAX_RESPONSE_BYTES)
+                if response.status_code == 401:
+                    detail = await _response_detail(response)
+                    raise MCPHTTPError(401, detail or "unauthorized")
+                if response.status_code >= 400:
+                    detail = await _response_detail(response)
+                    raise MCPHTTPError(response.status_code, detail or "request failed")
+        except httpx.HTTPError as exc:
+            raise MCPHTTPError(0, str(exc)) from exc
 
     def _auth_headers(self) -> dict[str, str]:
         if self.config.auth_type == "bearer" and self.config.auth_token is not None:
@@ -319,11 +344,45 @@ async def _drain_pages(request, method: str, parser, label: str) -> list:
         cursor = next_cursor
 
 
-async def _response_detail(response: httpx.Response) -> str:
+def _enforce_content_length(response: httpx.Response, cap: int) -> None:
+    """Reject responses whose declared Content-Length exceeds the cap."""
+
+    declared = response.headers.get("content-length")
+    if declared is None:
+        return
     try:
-        value = response.json()
+        length = int(declared)
     except ValueError:
-        return (await response.aread()).decode(errors="replace")[:1024]
+        return
+    if length > cap:
+        raise MCPHTTPError(
+            response.status_code,
+            f"MCP HTTP response too large: {length} bytes exceeds cap of {cap}",
+        )
+
+
+async def _read_bounded_body(response: httpx.Response, cap: int) -> bytes:
+    """Accumulate response bytes and abort early once ``cap`` is exceeded."""
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        total += len(chunk)
+        if total > cap:
+            raise MCPHTTPError(
+                response.status_code,
+                f"MCP HTTP response too large: exceeded cap of {cap} bytes; aborted",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _response_detail(response: httpx.Response) -> str:
+    body = await _read_capped_bytes(response, MAX_ERROR_DETAIL_BYTES)
+    try:
+        value = json.loads(body)
+    except ValueError:
+        return body.decode(errors="replace")[:1024]
     if type(value) is dict:
         error = value.get("error")
         if type(error) is dict and type(error.get("message")) is str:
@@ -334,9 +393,36 @@ async def _response_detail(response: httpx.Response) -> str:
     return str(value)
 
 
-async def _read_sse_response(response: httpx.Response, request_id: int) -> dict[str, object]:
+async def _read_capped_bytes(response: httpx.Response, cap: int) -> bytes:
+    """Read at most ``cap`` bytes from a response, discarding the rest."""
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        remaining = cap - total
+        if remaining <= 0:
+            break
+        if len(chunk) > remaining:
+            chunks.append(chunk[:remaining])
+            total = cap
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+async def _read_sse_response(
+    response: httpx.Response, request_id: int, cap: int
+) -> dict[str, object]:
     data_lines: list[str] = []
+    total = 0
     async for line in response.aiter_lines():
+        total += len(line.encode("utf-8")) + 1
+        if total > cap:
+            raise MCPHTTPError(
+                response.status_code,
+                f"MCP HTTP SSE response too large: exceeded cap of {cap} bytes; aborted",
+            )
         if line.startswith("data:"):
             data_lines.append(line[5:].lstrip())
             continue
