@@ -16,3 +16,4 @@ class Submission:
     attachment_paths: tuple[Path, ...] = ()
     attachment_tokens: tuple[tuple[str, Path], ...] = ()
     next_image_token: int = 1
+    steer: bool = True

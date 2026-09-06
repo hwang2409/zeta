@@ -4164,6 +4164,9 @@ async def test_verbose_transition_flushes_before_raw_event(
 
 @pytest.mark.asyncio
 async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> None:
+    # Backslash-prefixed submissions opt into the legacy follow-up behavior
+    # (deliver as a fresh turn once the running turn ends) instead of the
+    # ZETA-82 default of steering-mid-turn.
     backend = QueueOrderBackend()
     output = StringIO()
     app = TUIApp(
@@ -4176,7 +4179,7 @@ async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> N
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
         pipe.send_text("first\r")
         await backend.started.wait()
-        pipe.send_text("second\r")
+        pipe.send_text("\\ second\r")
         await wait_until(lambda: app.queued_messages == ("second",))
         backend.release.set()
         await wait_until(lambda: len(backend.calls) == 2)

@@ -285,6 +285,7 @@ class SubmissionPipeline:
         attachment_paths: tuple[Path, ...] = (),
         attachment_tokens: Mapping[str, Path] | None = None,
         next_image_token: int = 1,
+        steer: bool = True,
     ) -> Submission:
         self._ensure_open()
         submission = self._new_submission(
@@ -293,6 +294,7 @@ class SubmissionPipeline:
             attachment_paths,
             attachment_tokens,
             next_image_token,
+            steer,
         )
         self._send(_Submit(submission))
         return submission
@@ -305,6 +307,7 @@ class SubmissionPipeline:
         attachment_paths: tuple[Path, ...] = (),
         attachment_tokens: Mapping[str, Path] | None = None,
         next_image_token: int = 1,
+        steer: bool = True,
     ) -> None:
         self._ensure_open()
         submission = self._new_submission(
@@ -313,6 +316,7 @@ class SubmissionPipeline:
             attachment_paths,
             attachment_tokens,
             next_image_token,
+            steer,
         )
         acknowledged = asyncio.get_running_loop().create_future()
         self._send(_Submit(submission, acknowledged))
@@ -412,6 +416,7 @@ class SubmissionPipeline:
         attachment_paths: tuple[Path, ...],
         attachment_tokens: Mapping[str, Path] | None,
         next_image_token: int,
+        steer: bool = True,
     ) -> Submission:
         return Submission(
             next(self._next_id),
@@ -420,6 +425,7 @@ class SubmissionPipeline:
             attachment_paths,
             tuple((attachment_tokens or {}).items()),
             next_image_token,
+            steer,
         )
 
     def _send(self, message: _Message) -> None:
@@ -768,20 +774,19 @@ class SubmissionPipeline:
             for entry in self._entries.values()
         ):
             return
-        if self._provider_entry is not None:
-            if (
-                self._provider_task is not None
-                and self._provider_task.done()
-            ):
-                self._on_provider_done(
-                    _ProviderDone(
-                        self._provider_entry.submission,
-                        self._provider_task,
-                    )
+        if (
+            self._provider_entry is not None
+            and self._provider_task is not None
+            and self._provider_task.done()
+        ):
+            self._on_provider_done(
+                _ProviderDone(
+                    self._provider_entry.submission,
+                    self._provider_task,
                 )
-            else:
-                return
+            )
         if self._provider_entry is not None:
+            self._dispatch_steer_entries()
             return
         nonterminal = [
             entry
@@ -822,6 +827,35 @@ class SubmissionPipeline:
                 _ProviderDone(submission, completed)
             )
         )
+
+    def _dispatch_steer_entries(self) -> None:
+        """Hand READY steer entries to ``loop.steer`` while a turn is active.
+
+        The pipeline still owns lifecycle bookkeeping (undo candidate,
+        transcript print, acknowledgement), so the steer path mirrors the
+        fresh-turn dispatch without invoking ``_start_turn``.
+        """
+
+        ready = sorted(
+            (
+                entry
+                for entry in self._entries.values()
+                if entry.state is SubmissionState.READY
+                and entry.submission.steer
+                and entry.message is not None
+                and entry.candidate is not None
+            ),
+            key=lambda entry: entry.submission.id,
+        )
+        for entry in ready:
+            entry.state = SubmissionState.DISPATCHED
+            self._host._print_user(entry.message)
+            self._host._set_undo_candidate(entry.candidate)
+            self._host.loop.steer(entry.message)
+            self._host._release_attachment_paths(
+                entry.submission.attachment_paths
+            )
+            self._ack_entry(entry)
 
     def _retry_oldest_ready(self) -> None:
         while self._messages.empty():
@@ -1065,6 +1099,9 @@ class SubmissionPipeline:
         if entry is self._provider_entry:
             if self._provider_task is not None and not self._provider_task.done():
                 self._provider_task.cancel()
+            # Steering messages queued into the aborted turn are dropped so
+            # they cannot resurface at the top of the next fresh turn.
+            self._host.loop.clear_pending_steering()
         elif entry.child_task is not None and not entry.child_task.done():
             entry.child_task.cancel()
         entry.state = SubmissionState.CANCELED

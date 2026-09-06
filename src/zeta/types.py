@@ -800,6 +800,7 @@ class StreamEventType(StrEnum):
     TURN_END = "turn_end"
     AGENT_END = "agent_end"
     ERROR = "error"
+    USER_STEERING = "user_steering"
 
 
 @dataclass(frozen=True, slots=True)

@@ -801,14 +801,24 @@ class SubmissionMixin:
             self._active_task = task
             task.add_done_callback(self._clear_approval_task)
             return
+        text, steer, passthrough = parse_submission(value)
+        if passthrough is not None:
+            self._draft.mark_submitted()
+            task = asyncio.create_task(self._run_shell_passthrough(passthrough))
+            self._active_task = task
+            task.add_done_callback(self._clear_approval_task)
+            return
+        if text is None:
+            return
         draft_revision = self._draft.mark_submitted()
         paths, tokens, next_image_token = self._capture_pending_attachment_state()
         self._submissions.submit(
-            value,
+            text,
             draft_revision=draft_revision,
             attachment_paths=paths,
             attachment_tokens=dict(tokens),
             next_image_token=next_image_token,
+            steer=steer,
         )
 
     def _clear_approval_task(self, task: asyncio.Task[Any]) -> None:
@@ -820,14 +830,22 @@ class SubmissionMixin:
             self._submit_input(value)
             await asyncio.sleep(0)
             return
+        text, steer, passthrough = parse_submission(value)
+        if passthrough is not None:
+            self._draft.mark_submitted()
+            await self._run_shell_passthrough(passthrough)
+            return
+        if text is None:
+            return
         draft_revision = self._draft.mark_submitted()
         paths, tokens, next_image_token = self._capture_pending_attachment_state()
         await self._submissions.submit_text(
-            value,
+            text,
             draft_revision=draft_revision,
             attachment_paths=paths,
             attachment_tokens=dict(tokens),
             next_image_token=next_image_token,
+            steer=steer,
         )
 
     async def _handle_approval_input(self, value: str) -> bool:
@@ -960,3 +978,56 @@ def parse_input(value: str) -> str | None:
 
     stripped = value.strip()
     return stripped or None
+
+
+# --- composer submission intents ------------------------------------------
+#
+# Steering is the default: while a turn is running, ``Enter`` injects the
+# next composer message at the next tool boundary rather than starting a
+# fresh turn once the current one ends. A leading backslash marks a message
+# as follow-up instead — deliver it after the current turn ends. The prefix
+# is stripped from the model-visible text, so ``\\hello`` sends ``hello`` as
+# a queued follow-up. Two backslashes at the start escape to a literal
+# backslash (``\\\\path`` → ``\\path``). This is the per-message toggle
+# called out in the ZETA-82 contract.
+FOLLOW_UP_PREFIX = "\\"
+
+
+def parse_submission(value: str) -> tuple[str | None, bool, str | None]:
+    """Classify one composer submission.
+
+    Returns ``(text, steer, passthrough)``:
+
+    * ``text`` — the composer text to submit through the pipeline, or ``None``
+      when the input is blank or is a passthrough command (which never
+      reaches the model). Whitespace is preserved so undo restores exactly
+      what the user typed; the submission pipeline strips through
+      :func:`parse_input` before sending to the model.
+    * ``steer`` — whether the message should inject at the next tool boundary
+      when a turn is running (``True`` is the default); ``False`` restores
+      the pre-ZETA-82 "deliver after turn end" behavior.
+    * ``passthrough`` — a shell command to run as a one-off receipt (no model
+      turn), or ``None`` when this is a normal submission.
+    """
+
+    stripped = value.strip()
+    if not stripped:
+        return None, True, None
+    if stripped.startswith("!"):
+        rest = stripped[1:]
+        if rest.startswith("!"):
+            return None, True, rest[1:].strip()
+        return None, True, rest.strip()
+    if stripped.startswith(FOLLOW_UP_PREFIX):
+        # Two backslashes escape to a literal single-backslash message.
+        if stripped.startswith(FOLLOW_UP_PREFIX * 2):
+            return value.lstrip()[1:], True, None
+        # Strip only the marker + one trailing whitespace character so the
+        # remaining composer text stays as the user typed it. That keeps undo
+        # restore faithful and lets follow-up messages carry their own
+        # indentation.
+        prefix_index = value.find(FOLLOW_UP_PREFIX)
+        rest = value[prefix_index + len(FOLLOW_UP_PREFIX):]
+        rest = rest.removeprefix(" ")
+        return (rest or None), False, None
+    return value, True, None
