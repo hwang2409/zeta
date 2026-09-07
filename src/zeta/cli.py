@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import sys
 
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -13,6 +14,7 @@ from .core.session import SessionError, env_home
 from .providers.anthropic import (
     AnthropicCredentialStore,
 )
+from .providers.factory import anthropic_api_key_store
 from .providers.anthropic import (
     build_authorization_url as build_anthropic_authorization_url,
 )
@@ -135,6 +137,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="anthropic",
         help="OAuth provider (default: anthropic)",
     )
+    login_parser.add_argument(
+        "--method",
+        choices=("oauth", "api-key"),
+        default=None,
+        help=(
+            "skip the interactive anthropic prompt and use this method "
+            "directly (api-key is anthropic-only)"
+        ),
+    )
     from .session_cli import add_subcommand as _add_session_subcommand
 
     _add_session_subcommand(commands)
@@ -176,6 +187,31 @@ def _run_login(provider: str) -> str | None:
     return asyncio.run(run_login(_build_login_provider(provider), _pkce_values))
 
 
+def _prompt_anthropic_login_method() -> str:
+    """Ask oauth/api-key/exit, matching Claude Code's `/login` menu (ZETA-88)."""
+
+    print("How would you like to authenticate with Claude?", file=sys.stderr)
+    print("  1. Claude Pro/Max subscription (OAuth) — recommended", file=sys.stderr)
+    print("  2. Anthropic API key (for automation/benchmarking)", file=sys.stderr)
+    print("  3. Exit", file=sys.stderr)
+    while True:
+        choice = input("Enter a choice [1-3]: ").strip()
+        if choice == "1":
+            return "oauth"
+        if choice == "2":
+            return "api-key"
+        if choice == "3":
+            return "exit"
+        print("Please enter 1, 2, or 3.", file=sys.stderr)
+
+
+def _run_anthropic_api_key_login() -> None:
+    api_key = getpass.getpass("Paste your Anthropic API key: ").strip()
+    if not api_key:
+        raise ValueError("no API key entered")
+    anthropic_api_key_store(env_home()).save(api_key)
+
+
 def _cleanup_ephemeral(app: object) -> None:
     import shutil
 
@@ -195,7 +231,27 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "login":
+        method = args.method
         try:
+            if args.provider == "anthropic" and method is None:
+                method = _prompt_anthropic_login_method()
+                if method == "exit":
+                    print("login cancelled", file=sys.stderr)
+                    return 1
+            if method == "api-key":
+                if args.provider != "anthropic":
+                    raise ValueError(
+                        f"--method api-key is not supported for provider {args.provider}"
+                    )
+                _run_anthropic_api_key_login()
+                print("saved API key for Claude (zeta prefers it over OAuth)")
+                return 0
+            if args.provider == "anthropic":
+                # An explicit OAuth choice supersedes any earlier API-key
+                # login; otherwise the persisted key would keep outranking
+                # the fresh OAuth tokens we're about to save (see
+                # factory._anthropic_credential's precedence).
+                anthropic_api_key_store(env_home()).delete()
             handle = _run_login(args.provider)
         except KeyboardInterrupt:
             print("login cancelled", file=sys.stderr)

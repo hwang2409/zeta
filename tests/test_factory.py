@@ -9,7 +9,11 @@ from zeta.providers.anthropic import (
     AnthropicAuthError,
     AnthropicCredentialStore,
 )
-from zeta.providers.factory import API_KEY_OPT_IN_VAR, build_backend
+from zeta.providers.factory import (
+    API_KEY_OPT_IN_VAR,
+    anthropic_api_key_store,
+    build_backend,
+)
 
 
 def test_bare_api_key_without_opt_in_still_uses_oauth(
@@ -62,3 +66,32 @@ def test_opt_in_value_must_be_exact(
     backend, _ = build_backend("claude", None, home=tmp_path)
 
     assert isinstance(backend.token_store, AnthropicCredentialStore)
+
+
+def test_persisted_login_api_key_wins_over_oauth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ZETA-88 `zeta login` API-key choice is enough on its own, no env vars."""
+
+    monkeypatch.delenv(API_KEY_OPT_IN_VAR, raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    anthropic_api_key_store(tmp_path).save("sk-ant-from-login")
+
+    backend, _ = build_backend("claude", None, home=tmp_path)
+
+    assert isinstance(backend.token_store, AnthropicApiKeyCredential)
+    assert backend.token_store.api_key == "sk-ant-from-login"
+
+
+def test_env_opt_in_outranks_persisted_login_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Automation's env-var opt-in must not depend on prior `zeta login` state."""
+
+    monkeypatch.setenv(API_KEY_OPT_IN_VAR, "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-from-env")
+    anthropic_api_key_store(tmp_path).save("sk-ant-from-login")
+
+    backend, _ = build_backend("claude", None, home=tmp_path)
+
+    assert backend.token_store.api_key == "sk-ant-from-env"
