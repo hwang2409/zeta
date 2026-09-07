@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.server
 import os
 import select
 import signal
@@ -156,6 +157,30 @@ def test_codex_authorization_url_includes_upstream_flow_fields() -> None:
     assert query["originator"] == ["codex_cli_rs"]
 
 
+def test_redirect_server_binds_without_reverse_dns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ZETA-91: binding must never reverse-resolve 127.0.0.1.
+
+    ``HTTPServer.server_bind`` calls ``socket.getfqdn`` on the bind address;
+    on a host whose resolver has no answer for it the lookup blocks until the
+    resolver times out and ``zeta login`` prints nothing meanwhile.
+    """
+
+    def _no_lookup(name: str = "") -> str:
+        raise AssertionError(f"reverse lookup attempted for {name!r}")
+
+    monkeypatch.setattr(socket, "getfqdn", _no_lookup)
+
+    server = login_flow._create_redirect_server(http.server.BaseHTTPRequestHandler)
+    try:
+        assert server.server_name == "localhost"
+        assert server.server_port == server.server_address[1]
+        assert server.server_port > 0
+    finally:
+        server.server_close()
+
+
 def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
     environment = os.environ.copy()
     environment["ZETA_HOME"] = str(tmp_path / "zeta-home")
@@ -280,7 +305,7 @@ async def test_login_times_out() -> None:
 
 
 def test_redirect_server_falls_back_to_ephemeral_port(monkeypatch: pytest.MonkeyPatch) -> None:
-    real_server = login_flow.http.server.ThreadingHTTPServer
+    real_server = login_flow._RedirectServer
     calls: list[tuple[str, int]] = []
 
     def server_factory(address, handler):
@@ -289,7 +314,7 @@ def test_redirect_server_falls_back_to_ephemeral_port(monkeypatch: pytest.Monkey
             raise OSError("address already in use")
         return real_server(address, handler)
 
-    monkeypatch.setattr(login_flow.http.server, "ThreadingHTTPServer", server_factory)
+    monkeypatch.setattr(login_flow, "_RedirectServer", server_factory)
     server = login_flow._create_redirect_server(
         login_flow._handler_for(login_flow._CallbackReceiver("state", "/callback")),
         preferred_port=54321,

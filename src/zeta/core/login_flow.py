@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import http.server
 import queue
+import socketserver
 import sys
 import threading
 from collections.abc import Awaitable, Callable
@@ -123,19 +124,35 @@ def _handler_for(receiver: _CallbackReceiver) -> type[http.server.BaseHTTPReques
     return CallbackHandler
 
 
+class _RedirectServer(http.server.ThreadingHTTPServer):
+    """The callback server, minus ``HTTPServer.server_bind``'s reverse DNS.
+
+    The stock ``server_bind`` resolves the bind address with
+    ``socket.getfqdn``, a reverse lookup that blocks until the resolver gives
+    up on hosts with no PTR record for 127.0.0.1 (GitHub's macOS runners;
+    ZETA-91), so ``zeta login`` sat silent instead of printing its URL. The
+    name is never used: the server only answers the local OAuth redirect.
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+
+
 def _create_redirect_server(
     handler: type[http.server.BaseHTTPRequestHandler], *, preferred_port: int = 0
 ) -> http.server.ThreadingHTTPServer:
     address = ("127.0.0.1", preferred_port)
     try:
-        return http.server.ThreadingHTTPServer(address, handler)
+        return _RedirectServer(address, handler)
     except OSError as exc:
         if preferred_port == 0:
             try:
-                return http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+                return _RedirectServer(("127.0.0.1", 0), handler)
             except OSError:
                 raise exc from None
-        return http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        return _RedirectServer(("127.0.0.1", 0), handler)
 
 
 async def run_login(
