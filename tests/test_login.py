@@ -29,6 +29,7 @@ from zeta.providers.codex import CodexCredentialStore
 from zeta.providers.codex import (
     build_authorization_url as build_codex_authorization_url,
 )
+from zeta.providers.factory import anthropic_api_key_store
 
 
 @dataclass
@@ -72,6 +73,101 @@ def test_login_parser_defaults_to_anthropic() -> None:
 
     assert args.command == "login"
     assert args.provider == "anthropic"
+    assert args.method is None
+
+
+def test_prompt_anthropic_login_method_maps_choices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for raw, expected in (("1", "oauth"), ("2", "api-key"), ("3", "exit")):
+        monkeypatch.setattr("builtins.input", lambda *_a, raw=raw: raw)
+        assert cli._prompt_anthropic_login_method() == expected
+
+
+def test_prompt_anthropic_login_method_reprompts_on_garbage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    answers = iter(["nope", "9", "2"])
+    monkeypatch.setattr("builtins.input", lambda *_a: next(answers))
+
+    assert cli._prompt_anthropic_login_method() == "api-key"
+
+
+def test_run_anthropic_api_key_login_persists_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "env_home", lambda: tmp_path)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda *_a, **_k: "sk-ant-typed-key")
+
+    cli._run_anthropic_api_key_login()
+
+    assert anthropic_api_key_store(tmp_path).read() == "sk-ant-typed-key"
+
+
+def test_run_anthropic_api_key_login_rejects_empty_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.getpass, "getpass", lambda *_a, **_k: "   ")
+
+    with pytest.raises(ValueError, match="no API key entered"):
+        cli._run_anthropic_api_key_login()
+
+
+def test_login_menu_choice_two_saves_api_key_and_exits_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "env_home", lambda: tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *_a: "2")
+    monkeypatch.setattr(cli.getpass, "getpass", lambda *_a, **_k: "sk-ant-menu-key")
+
+    assert cli.main(["login"]) == 0
+    assert anthropic_api_key_store(tmp_path).read() == "sk-ant-menu-key"
+
+
+def test_login_menu_choice_three_exits_nonzero_without_writing_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "env_home", lambda: tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *_a: "3")
+
+    assert cli.main(["login"]) == 1
+    assert anthropic_api_key_store(tmp_path).read() is None
+    assert not (tmp_path / "anthropic-oauth.json").exists()
+
+
+def test_login_menu_choice_one_runs_oauth_and_clears_stale_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "env_home", lambda: tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *_a: "1")
+    anthropic_api_key_store(tmp_path).save("sk-ant-stale-key")
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "_run_login", lambda provider: calls.append(provider) or "ok")
+
+    assert cli.main(["login"]) == 0
+    assert calls == ["anthropic"]
+    assert anthropic_api_key_store(tmp_path).read() is None
+
+
+def test_method_flag_skips_the_menu_entirely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "env_home", lambda: tmp_path)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda *_a, **_k: "sk-ant-flag-key")
+    monkeypatch.setattr(
+        "builtins.input", lambda *_a: pytest.fail("menu must not run with --method set")
+    )
+
+    assert cli.main(["login", "--method", "api-key"]) == 0
+    assert anthropic_api_key_store(tmp_path).read() == "sk-ant-flag-key"
+
+
+def test_method_api_key_rejects_codex_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "env_home", lambda: tmp_path)
+
+    assert cli.main(["login", "--provider", "codex", "--method", "api-key"]) == 1
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "codex"])
@@ -164,7 +260,7 @@ def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
             sys.executable,
             "-u",
             "-c",
-            "from zeta.cli import main; raise SystemExit(main(['login']))",
+            "from zeta.cli import main; raise SystemExit(main(['login', '--method', 'oauth']))",
         ],
         env=environment,
         stdout=subprocess.PIPE,

@@ -480,6 +480,30 @@ def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
     return None
 
 
+def atomic_write_secret(path: Path, payload: Mapping[str, Any]) -> None:
+    """Write a 0600 JSON secret file via temp+rename, creating a 0700 parent.
+
+    Shared by every zeta credential store (OAuth tokens, the ZETA-88
+    persisted API key) so file permissions and atomicity stay identical
+    across secret kinds instead of being reimplemented per store.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        with temporary.open("w") as handle:
+            json.dump(dict(payload), handle, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 class OAuthCredentialStore:
     """Own one zeta OAuth file and serialize refreshes across processes."""
 
@@ -530,20 +554,7 @@ class OAuthCredentialStore:
             self._save_unlocked(tokens)
 
     def _save_unlocked(self, tokens: OAuthTokens) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
-        temporary = self.path.with_name(f".{self.path.name}.{secrets.token_hex(8)}.tmp")
-        try:
-            with temporary.open("w") as handle:
-                json.dump(tokens.to_dict(), handle, separators=(",", ":"))
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, self.path)
-            os.chmod(self.path, 0o600)
-        finally:
-            temporary.unlink(missing_ok=True)
+        atomic_write_secret(self.path, tokens.to_dict())
 
     async def access_token(self, client: httpx.AsyncClient) -> str:
         async with self._async_refresh_lock, self._async_refresh_lock_file():

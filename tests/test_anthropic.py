@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import stat
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +19,7 @@ from zeta.prompts import load_identity
 from zeta.providers.anthropic import (
     ANTHROPIC_MAX_IMAGE_BYTES,
     AnthropicApiKeyCredential,
+    AnthropicApiKeyStore,
     AnthropicAuthError,
     AnthropicBackend,
     AnthropicCredentialStore,
@@ -1415,6 +1417,38 @@ def test_claude_file_bootstrap_wins_over_keychain(
     assert AnthropicCredentialStore(tmp_path / "zeta.json").bootstrap() == OAuthTokens(
         "file-access", "file-refresh", 4_000_000_000
     )
+
+
+def test_api_key_store_round_trips_and_sets_owner_only_permissions(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "anthropic-api-key.json"
+    store = AnthropicApiKeyStore(path)
+
+    assert store.read() is None
+
+    store.save("sk-ant-persisted-key")
+
+    assert store.read() == "sk-ant-persisted-key"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_api_key_store_delete_is_idempotent(tmp_path: Path) -> None:
+    store = AnthropicApiKeyStore(tmp_path / "anthropic-api-key.json")
+    store.save("sk-ant-persisted-key")
+
+    store.delete()
+    store.delete()
+
+    assert store.read() is None
+
+
+def test_api_key_store_rejects_malformed_contents(tmp_path: Path) -> None:
+    path = tmp_path / "anthropic-api-key.json"
+    path.write_text("not json")
+
+    with pytest.raises(AnthropicAuthError, match="persisted Claude API-key store"):
+        AnthropicApiKeyStore(path).read()
 
 
 def test_anthropic_http_error_includes_safe_truncated_body() -> None:

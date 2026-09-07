@@ -18,6 +18,7 @@ from ..model_catalog import provider_for_model
 from ..types import CompletionBackend
 from .anthropic import (
     AnthropicApiKeyCredential,
+    AnthropicApiKeyStore,
     AnthropicAuthError,
     AnthropicBackend,
     AnthropicCredential,
@@ -52,24 +53,37 @@ def credential_store(
     return None
 
 
-def _anthropic_credential(auth_home: Path) -> AnthropicCredential:
-    """Pick Claude's credential source, defaulting to subscription OAuth.
+def anthropic_api_key_store(auth_home: Path) -> AnthropicApiKeyStore:
+    return AnthropicApiKeyStore(auth_home / "anthropic-api-key.json")
 
-    API-key auth is opt-in only: it exists for evaluation/automation (see
-    docs/design.md ZETA-87), never as an implicit fallback for an interactive
-    session that merely has ANTHROPIC_API_KEY set in its environment.
+
+def _anthropic_credential(auth_home: Path) -> AnthropicCredential:
+    """Pick Claude's credential source.
+
+    Precedence, highest first:
+    1. The ZETA-87 env-var opt-in (`ZETA_ALLOW_API_KEY=1` + `ANTHROPIC_API_KEY`)
+       — for automation/benchmarking, deliberately independent of anything on
+       disk so a CI runner's behavior never depends on prior `zeta login` state.
+    2. A ZETA-88 persisted API key from `zeta login` choosing "API key" — its
+       presence alone is enough, the same way an OAuth token file's presence
+       alone selects subscription auth; both are written only by an explicit
+       login action, never implicitly.
+    3. Subscription OAuth (the default when neither of the above applies).
     """
 
-    if os.environ.get(API_KEY_OPT_IN_VAR) != "1":
-        return AnthropicCredentialStore(auth_home / "anthropic-oauth.json")
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise AnthropicAuthError(
-            f"{API_KEY_OPT_IN_VAR}=1 is set but ANTHROPIC_API_KEY is empty; "
-            "either set ANTHROPIC_API_KEY to use API-key auth, or unset "
-            f"{API_KEY_OPT_IN_VAR} and run `zeta login` for subscription OAuth"
-        )
-    return AnthropicApiKeyCredential(api_key)
+    if os.environ.get(API_KEY_OPT_IN_VAR) == "1":
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise AnthropicAuthError(
+                f"{API_KEY_OPT_IN_VAR}=1 is set but ANTHROPIC_API_KEY is empty; "
+                "either set ANTHROPIC_API_KEY to use API-key auth, or unset "
+                f"{API_KEY_OPT_IN_VAR} and run `zeta login` for subscription OAuth"
+            )
+        return AnthropicApiKeyCredential(api_key)
+    persisted_key = anthropic_api_key_store(auth_home).read()
+    if persisted_key is not None:
+        return AnthropicApiKeyCredential(persisted_key)
+    return AnthropicCredentialStore(auth_home / "anthropic-oauth.json")
 
 
 def build_backend(
@@ -113,6 +127,7 @@ __all__ = [
     "API_KEY_OPT_IN_VAR",
     "DEFAULT_CLAUDE_MODEL",
     "DEFAULT_CODEX_MODEL",
+    "anthropic_api_key_store",
     "build_backend",
     "credential_store",
     "provider_for_model",

@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .auth import OAuthCredentialStore, OAuthTokens, error_body_excerpt
+from .auth import OAuthCredentialStore, OAuthTokens, atomic_write_secret, error_body_excerpt
 from .anthropic_payload import (
     ANTHROPIC_MAX_IMAGE_BYTES,
     ANTHROPIC_MAX_IMAGE_DIMENSION,
@@ -251,6 +251,41 @@ class AnthropicApiKeyCredential:
 
     def beta_header(self) -> str:
         return f"{CLAUDE_CODE_BETA},{INTERLEAVED_THINKING_BETA}"
+
+
+@dataclass(slots=True)
+class AnthropicApiKeyStore:
+    """A Claude API key persisted by an explicit `zeta login` choice (ZETA-88).
+
+    Unlike the ZETA-87 env-var opt-in, this file's mere presence is enough to
+    select API-key auth — writing it *is* the explicit, deliberate action
+    (picking "API key" at the login prompt), the same way an OAuth token file
+    existing is enough to select subscription auth after `zeta login`.
+    """
+
+    path: Path
+
+    def read(self) -> str | None:
+        if not self.path.exists():
+            return None
+        try:
+            with self.path.open() as handle:
+                value = json.load(handle)
+            os.chmod(self.path, 0o600)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise AnthropicAuthError(
+                "zeta's persisted Claude API-key store is invalid"
+            ) from exc
+        api_key = value.get("api_key") if isinstance(value, Mapping) else None
+        if type(api_key) is not str or not api_key:
+            raise AnthropicAuthError("zeta's persisted Claude API-key store is invalid")
+        return api_key
+
+    def save(self, api_key: str) -> None:
+        atomic_write_secret(self.path, {"version": 1, "api_key": api_key})
+
+    def delete(self) -> None:
+        self.path.unlink(missing_ok=True)
 
 
 def build_authorization_url(
