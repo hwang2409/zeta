@@ -174,19 +174,35 @@ def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
     port: int | None = None
     output = bytearray()
     try:
-        deadline = time.monotonic() + 3
+        # Poll-until ceiling, not a budget (ZETA-67 pattern): a cold interpreter
+        # on a loaded runner plus ThreadingHTTPServer's reverse-DNS lookup of
+        # the bind address blew a 3s deadline on macos-latest (ZETA-90). The
+        # loop exits the moment the URL appears, so the ceiling costs nothing
+        # on the happy path.
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline and port is None:
-            if process.stdout is None:
+            if process.stdout is None or process.poll() is not None:
                 break
             readable, _, _ = select.select([process.stdout], [], [], 0.1)
             if not readable:
                 continue
             output.extend(os.read(process.stdout.fileno(), 4096))
-            lines = output.splitlines()
-            if lines and lines[-1].startswith(b"https://"):
-                redirect = parse_qs(urlsplit(lines[-1].decode()).query)["redirect_uri"][0]
-                port = urlsplit(redirect).port
-        assert port is not None
+            for line in output.splitlines():
+                if line.startswith(b"https://"):
+                    query = parse_qs(urlsplit(line.decode()).query)
+                    port = urlsplit(query["redirect_uri"][0]).port
+                    break
+        if port is None:
+            # Say why: a login that died before printing looks the same as a
+            # slow one unless the exit status and stderr are reported.
+            process.kill()
+            stdout_rest, stderr_rest = process.communicate(timeout=5)
+            output.extend(stdout_rest)
+            raise AssertionError(
+                f"login never printed its URL (exit={process.returncode})\n"
+                f"stdout: {output.decode(errors='replace')!r}\n"
+                f"stderr: {stderr_rest.decode(errors='replace')!r}"
+            )
         process.send_signal(signal.SIGINT)
         shutdown_deadline = time.monotonic() + 30
         while process.poll() is None and time.monotonic() < shutdown_deadline:
