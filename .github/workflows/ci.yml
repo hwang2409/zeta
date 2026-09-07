@@ -16,9 +16,18 @@ concurrency:
 
 jobs:
   test:
-    name: pytest
-    runs-on: ubuntu-latest
+    name: pytest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      # One platform failing must still report the other; a darwin-only
+      # regression is exactly what the second runner is for (ZETA-90).
+      fail-fast: false
+      # ZETA-84 was a Linux-only bug that darwin-only testing could not see.
+      # The mirror-image gap is just as real: the F_GETPATH sandbox branch and
+      # the clipboard paste path only run on darwin, so both platforms run.
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -33,14 +42,21 @@ jobs:
       # until then this is a known coverage gap, not a pass.
       # ubuntu-latest SHIPS tmux, so the skip assumption above does not hold
       # on a stock runner — remove it explicitly or the racy tests run anyway
-      # (first hit: PR #111 run 33993051287).
+      # (first hit: PR #111 run 33993051287). macos-latest does not ship it,
+      # so the step is a no-op there; the guard keeps it platform-neutral.
       - name: Remove tmux so tmux-gated tests skip
-        run: sudo apt-get remove -y tmux || sudo rm -f "$(command -v tmux)"
+        run: |
+          if command -v tmux >/dev/null 2>&1; then
+            sudo apt-get remove -y tmux 2>/dev/null || sudo rm -f "$(command -v tmux)"
+          fi
 
       - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # uv defaults to ~/Library/Caches/uv on macOS; pin one location on
+          # both platforms so the cache step below keys the same way.
+          echo "UV_CACHE_DIR=$HOME/.cache/uv" >> "$GITHUB_ENV"
 
       - name: Cache uv downloads
         uses: actions/cache@v4
@@ -53,3 +69,24 @@ jobs:
       # turn main red without a lockfile change in the diff.
       - name: Run the suite
         run: uv run --frozen pytest -q
+
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # ruff is pinned through uv.lock (it is in the dev dependency group) and
+      # the violations that predate this job are grandfathered per file and
+      # rule in pyproject.toml's per-file-ignores, so this fails only on NEW
+      # violations. Fix a file to delete its entry; never add to that list in
+      # a feature PR. --output-format github annotates the offending lines in
+      # the pull request.
+      - name: Run ruff
+        run: uv run --frozen ruff check --output-format github

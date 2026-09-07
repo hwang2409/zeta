@@ -17,6 +17,7 @@ dev = [
     "pip",
     "pytest>=8",
     "pytest-asyncio>=0.24",
+    "ruff>=0.16.6",
 ]
 
 [build-system]
@@ -39,3 +40,46 @@ asyncio_mode = "auto"
 markers = [
     "environment_sensitive: test behavior that depends on terminal environment",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Baseline recorded 2026-09-07 (ZETA-90): violations that predate the CI lint
+# job, grandfathered per file and rule so the job fails only on new ones. Fix
+# a file's violations to delete its entry; never add to this list in a feature
+# PR. RUF100 appears where grandfathering a rule makes a file's existing
+# `# noqa` directives for it look unused.
+"src/zeta/__init__.py" = ["I001", "RUF022"]
+"src/zeta/cli.py" = ["BLE001"]
+"src/zeta/core/context.py" = ["I001"]
+"src/zeta/core/fake.py" = ["UP035"]
+"src/zeta/core/hooks.py" = ["BLE001", "I001", "UP041"]
+"src/zeta/core/login_flow.py" = ["I001", "UP041", "UP046", "UP047"]
+"src/zeta/core/loop.py" = ["F822", "I001"]
+"src/zeta/core/session.py" = ["I001", "UP035"]
+"src/zeta/core/tool_dispatch.py" = ["BLE001", "S112"]
+"src/zeta/mcp/server_actor.py" = ["B008", "BLE001", "F401", "I001", "RUF100"]
+"src/zeta/model_catalog.py" = ["I001"]
+"src/zeta/persistence.py" = ["I001"]
+"src/zeta/providers/__init__.py" = ["I001"]
+"src/zeta/providers/anthropic.py" = ["BLE001", "F401", "F821", "FURB188", "I001", "TRY004"]
+"src/zeta/providers/anthropic_payload.py" = ["TRY004"]
+"src/zeta/providers/codex.py" = ["BLE001", "I001", "SIM102", "SIM114"]
+"src/zeta/providers/stream_diagnostics.py" = ["I001", "UP040"]
+"src/zeta/providers/transport.py" = ["BLE001"]
+"src/zeta/skills/loader.py" = ["TRY004"]
+"src/zeta/submission_pipeline.py" = ["BLE001", "RUF100", "S110"]
+"src/zeta/tools/__init__.py" = ["I001"]
+"src/zeta/tools/_process.py" = ["B012", "UP041"]
+"src/zeta/tui/app.py" = ["BLE001", "F822"]
+"src/zeta/tui/composer.py" = ["BLE001", "RUF007"]
+"src/zeta/tui/layout.py" = ["I001"]
+"src/zeta/tui/models.py" = ["I001"]
+"src/zeta/tui/slash_handlers/__init__.py" = ["BLE001"]
+"src/zeta/tui/transcript.py" = ["I001"]
+"tests/test_anthropic.py" = ["FLY002", "I001", "RUF012", "SIM117"]
+"tests/test_context.py" = ["I001"]
+"tests/test_hooks.py" = ["I001"]
+"tests/test_import_boundaries.py" = ["I001", "PLW1510"]
+"tests/test_project_context.py" = ["ISC004"]
+"tests/test_session.py" = ["BLE001"]
+"tests/test_slash.py" = ["I001"]
+"tests/test_store.py" = ["SIM117"]
