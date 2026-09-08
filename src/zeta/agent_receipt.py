@@ -487,11 +487,7 @@ def finalize_agent_results(
                     )
                     child_store.finish_agent_parent()
             if child_store is not None:
-                prefix = (
-                    owner.agent_instance_id
-                    if owner.agent_instance_id is not None
-                    else owner.store.session_id
-                )
+                prefix = owner.agent_instance_id or owner.store.session_id
                 owner.store.finish_agent_child(f"{prefix}:{child_store.session_id}")
             else:
                 owner.store.finish_agent_child(call.id)

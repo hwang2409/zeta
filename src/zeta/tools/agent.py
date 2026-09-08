@@ -895,22 +895,22 @@ def send_to_run(
         return "child_instance_id must be a nonempty string"
     if type(message) is not str or not message.strip():
         return "message must be a nonempty string"
+    # The marker is removed once a run's result is durable, so a missing one
+    # means the run already finished rather than that it never existed.
+    no_live_run = (
+        f"no live run {child_instance_id!r}; it already finished or was "
+        "never started"
+    )
     marker = parent_store.agent_children().get(child_instance_id)
     if marker is None:
-        # The marker is removed once a run's result is durable, so a missing one
-        # means the run already finished rather than that it never existed.
-        return (
-            f"no live run {child_instance_id!r}; it already finished or was "
-            "never started"
-        )
+        return no_live_run
     # Only runs drain queued follow-ups. Other agent types would leave the
     # prompt in the child's store with no one to consume it.
-    agent_type = marker.get("agent_type")
+    agent_type = marker.get("agent_type") or "general"
     if agent_type != "run":
-        actual = agent_type if type(agent_type) is str and agent_type else "general"
         return (
-            f"{child_instance_id!r} is a {actual} agent, not a run; agent_send "
-            "only works with agent_type=run"
+            f"{child_instance_id!r} is a {agent_type} agent, not a run; "
+            "agent_send only works with agent_type=run"
         )
     child_path = Path(str(marker["child_session_path"]))
     child_store = ConversationStore(
@@ -920,11 +920,7 @@ def send_to_run(
         child_store.append_pending_prompt(message)
     except PendingPromptsClosedError:
         # consume_run closed the queue while we were checking the marker.
-        # The run is on its way out; report it the same as any finished run.
-        return (
-            f"no live run {child_instance_id!r}; it already finished or was "
-            "never started"
-        )
+        return no_live_run
     return None
 
 
