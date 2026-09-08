@@ -297,8 +297,13 @@ mod tests {
             panic!("must reuse the server")
         })
         .unwrap();
+        drop(listener.accept().unwrap());
         drop(client);
         drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        // Use an independent abandoned socket: macOS may defer teardown of a
+        // listener that had an established connection.
+        drop(UnixListener::bind(&path).unwrap());
         assert!(matches!(
             connect_or_spawn(&path, false, &mut process, || panic!(
                 "explicit paths never spawn"
