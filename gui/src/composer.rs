@@ -504,9 +504,29 @@ fn closest_caret(layout: &TextLayout, position: Point<Pixels>) -> (usize, bool) 
         let line_height = height * (line.wrap_boundaries().len() + 1) as f32;
         if y < line_height {
             let row = (y / height) as usize;
-            let index = line
+            let mut index = line
                 .closest_index_for_position(point(position.x - layout.bounds().left(), y), height)
                 .unwrap_or_else(|index| index);
+            // GPUI falls through to len after the final glyph's start. Include
+            // its midpoint locally, using unwrapped coordinates for the last row.
+            if index == line.len() {
+                if let Some(last) = line.runs().iter().rev().find_map(|run| run.glyphs.last()) {
+                    let row_start_x = if row > 0 {
+                        let boundary = line.wrap_boundaries()[row - 1];
+                        line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix]
+                            .position
+                            .x
+                    } else {
+                        px(0.)
+                    };
+                    let x = position.x - layout.bounds().left() + row_start_x;
+                    if x >= last.position.x
+                        && x <= (last.position.x + line.unwrapped_layout.width) / 2.
+                    {
+                        index = last.index;
+                    }
+                }
+            }
             let downstream = row > 0 && {
                 let boundary = line.wrap_boundaries()[row - 1];
                 index == line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index
@@ -815,6 +835,86 @@ mod tests {
                     cx,
                 );
                 assert_caret(view, &layout, second_wrap, 2, px(0.), window, cx);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn final_glyph_clicks_use_nearest_boundary(cx: &mut gpui::TestAppContext) {
+        let window = cx.open_window(size(px(240.), px(400.)), |_, cx| Composer::new(cx));
+        for text in ["abcd".to_owned(), "abcdefghij".repeat(6)] {
+            window
+                .update(cx, |view, window, cx| {
+                    view.reset();
+                    view.replace_text_in_range(None, &text, window, cx);
+                })
+                .unwrap();
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            window
+                .update(cx, |view, window, cx| {
+                    let layout = view.layout.as_ref().unwrap().clone();
+                    let wrapped = layout.wrapped_text();
+                    let rows: Vec<_> = wrapped.split('\n').collect();
+                    let line = layout.line_layouts().remove(0);
+                    let mut start = 0;
+                    for (row, text) in rows.iter().enumerate() {
+                        assert!(text.len() > 1);
+                        let end = start + text.len();
+                        let row_x = line.unwrapped_layout.x_for_index(start);
+                        let left = line.unwrapped_layout.x_for_index(end - 1) - row_x;
+                        let right = line.unwrapped_layout.x_for_index(end) - row_x;
+                        for (fraction, index, x) in [(0.25, end - 1, left), (0.75, end, right)] {
+                            let position = layout.bounds().origin
+                                + point(
+                                    left + (right - left) * fraction,
+                                    layout.line_height() * (row as f32 + 0.5),
+                                );
+                            view.on_mouse_down(
+                                &MouseDownEvent {
+                                    position,
+                                    button: MouseButton::Left,
+                                    ..Default::default()
+                                },
+                                window,
+                                cx,
+                            );
+                            assert_caret(view, &layout, index, row, x, window, cx);
+                        }
+                        start = end;
+                    }
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn vertical_movement_uses_final_glyph_midpoint(cx: &mut gpui::TestAppContext) {
+        let text = "aa\na\u{10400}\naa";
+        let window = cx.open_window(size(px(240.), px(400.)), |_, cx| Composer::new(cx));
+        window
+            .update(cx, |view, window, cx| {
+                view.replace_text_in_range(None, text, window, cx);
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        window
+            .update(cx, |view, window, cx| {
+                let layout = view.layout.as_ref().unwrap().clone();
+                let lines = layout.line_layouts();
+                let left = lines[1].unwrapped_layout.x_for_index(1);
+                let right = lines[1].unwrapped_layout.width;
+                for (source, row, down) in [(2, 0, true), (text.len(), 2, false)] {
+                    // GPUI's test font gives supplementary letters double width.
+                    // The source caret lands at the final glyph's midpoint.
+                    let x = lines[row].unwrapped_layout.width;
+                    assert_eq!(x, (left + right) / 2.);
+                    view.move_to(source, cx);
+                    assert_caret(view, &layout, source, row, x, window, cx);
+                    view.vertical(down, false, cx);
+                    assert_caret(view, &layout, 4, 1, left, window, cx);
+                }
             })
             .unwrap();
     }
