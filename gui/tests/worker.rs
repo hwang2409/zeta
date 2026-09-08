@@ -374,6 +374,115 @@ fn reconnect_resumes_selected_session_and_restores_pending_approvals() {
 }
 
 #[test]
+fn stale_remembered_session_reconnects_and_allows_a_new_session() {
+    let harness = Harness::new(|listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([]));
+        peer.wait_for_close();
+
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        let request = peer.request("resume");
+        assert_eq!(request["params"]["session_id"], "session-1");
+        peer.write(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32602,"message":"session session-1 was not found"}}));
+        peer.status(false, "idle", json!([]));
+        peer.wait_for_close();
+
+        // The cleared selection must not trigger another resume on reconnect.
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(false, "idle", json!([]));
+        peer.respond("new_session", json!({"session":session()}));
+        peer.status(true, "idle", json!([]));
+        peer.wait_for_close();
+    });
+    harness.connected();
+    harness.command(CommandMessage::Reconnect);
+    assert!(matches!(harness.next(), WorkerMessage::Sessions(list) if list.sessions.len() == 1));
+    assert!(
+        matches!(harness.next(), WorkerMessage::Rejected(error) if error == "could not resume previous session: server error -32602: session session-1 was not found")
+    );
+    let WorkerMessage::Status(status) = harness.next() else {
+        panic!("expected cleared session status");
+    };
+    assert!(status.session.is_none());
+    let mut state = AppState::default();
+    state.select_session(Some("session-1".into()));
+    state.apply_status(status);
+    assert!(state.active_session.is_none());
+    assert!(matches!(harness.next(), WorkerMessage::Connected));
+    harness.command(CommandMessage::Reconnect);
+    harness.connected();
+    harness.command(CommandMessage::NewSession);
+    assert!(
+        matches!(harness.next(), WorkerMessage::Session(session) if session.session_id == "session-1")
+    );
+    assert!(
+        matches!(harness.next(), WorkerMessage::Status(status) if status.session.as_ref().unwrap().session_id == "session-1")
+    );
+    harness.finish();
+}
+
+#[test]
+fn explicit_missing_session_is_rejected_without_losing_the_connection() {
+    let harness = Harness::new(|listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([]));
+        let request = peer.request("resume");
+        assert_eq!(request["params"]["session_id"], "missing");
+        peer.write(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32602,"message":"session missing was not found"}}));
+        peer.send();
+        peer.event(json!({"event":"agent_end","data":{}}));
+        peer.wait_for_close();
+    });
+    harness.connected();
+    harness.command(CommandMessage::Resume("missing".into()));
+    assert!(
+        matches!(harness.next(), WorkerMessage::Rejected(error) if error == "server error -32602: session missing was not found")
+    );
+    harness.command(CommandMessage::Send("still connected".into()));
+    assert!(matches!(harness.next(), WorkerMessage::Sent(text) if text == "still connected"));
+    assert!(
+        matches!(harness.event(), ServerEvent::AgentEnd { session_id, .. } if session_id.as_deref() == Some("session-1"))
+    );
+    harness.finish();
+}
+
+#[test]
+fn transport_failure_during_resume_loses_the_connection() {
+    for remembered in [false, true] {
+        let harness = Harness::new(move |listener| {
+            let mut peer = Peer::accept(&listener);
+            peer.hello();
+            peer.status(true, "idle", json!([]));
+            if remembered {
+                peer.wait_for_close();
+                peer = Peer::accept(&listener);
+                peer.hello();
+            }
+            let request = peer.request("resume");
+            assert_eq!(request["params"]["session_id"], "session-1");
+            // Close the socket before replying to the resume request.
+        });
+        harness.connected();
+        if remembered {
+            harness.command(CommandMessage::Reconnect);
+            assert!(matches!(harness.next(), WorkerMessage::Sessions(_)));
+        } else {
+            harness.command(CommandMessage::Resume("session-1".into()));
+        }
+        assert!(matches!(harness.next(), WorkerMessage::Lost(_)));
+        harness.command(CommandMessage::NewSession);
+        assert!(
+            matches!(harness.next(), WorkerMessage::Rejected(error) if error == "connection lost; reconnect before sending commands")
+        );
+        harness.finish();
+    }
+}
+
+#[test]
 fn missing_explicit_socket_fails_without_spawning() {
     let path = std::env::temp_dir().join(format!("zg-missing-{}.sock", std::process::id()));
     let (commands, receiver) = mpsc::channel();

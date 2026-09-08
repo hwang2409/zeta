@@ -83,7 +83,14 @@ impl ConnectionWorker {
         let sessions = client.list_sessions()?;
         let _ = self.messages.send(WorkerMessage::Sessions(sessions));
         if let Some(id) = selected.as_deref() {
-            client.resume(id)?;
+            match client.resume(id) {
+                Ok(_) => {}
+                Err(error @ ClientError::Rpc { .. }) => {
+                    *selected = None;
+                    self.reject(&format!("could not resume previous session: {error}"));
+                }
+                Err(error) => return Err(error),
+            }
         }
         let status = self.status(&mut client)?;
         *selected = status
