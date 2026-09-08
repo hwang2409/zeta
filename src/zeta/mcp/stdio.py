@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from collections.abc import Callable, Mapping
 from typing import BinaryIO
 
 from ..core.abort import AbortSignal
+from ..core.process_env import subprocess_env
 from ..tools._process import _kill_and_reap
 from .client import (
     MCPCanceled,
@@ -68,12 +68,11 @@ class StdioMCPClient(MCPClient):
         log_root.mkdir(parents=True, exist_ok=True)
         log_handle = log_path.open("ab")
         try:
-            child_env = os.environ.copy()
-            child_env.update(self.config.env)
             self._process = await asyncio.create_subprocess_exec(
                 self.config.command, *self.config.args,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                stderr=log_handle, env=child_env, start_new_session=True,
+                stderr=log_handle, env=subprocess_env(self.config.env),
+                start_new_session=True,
             )
         except BaseException:
             log_handle.close()

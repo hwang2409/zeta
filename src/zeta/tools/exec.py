@@ -20,7 +20,7 @@ from ..types import (
     ToolTextBlock,
     flatten_tool_content,
 )
-from ._process import _kill_and_reap
+from ._process import _kill_and_reap, tool_subprocess_env
 from .registry import (
     ToolRegistry,
     ToolStream,
@@ -228,6 +228,7 @@ async def _exec(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            env=tool_subprocess_env(),
         )
     except OSError as exc:
         if log_handle is not None:

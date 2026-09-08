@@ -13,6 +13,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..core.process_env import subprocess_env
+
+
+def tool_subprocess_env() -> dict[str, str]:
+    """Return the scrubbed parent environment for a tool child."""
+
+    return subprocess_env()
+
+
 BACKGROUND_TASK_LIMIT = 8
 BACKGROUND_OUTPUT_LIMIT = 512 * 1024
 BACKGROUND_OUTPUT_CALL_LIMIT = 32 * 1024
@@ -109,6 +118,7 @@ class BackgroundTaskRegistry:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
+                env=tool_subprocess_env(),
             )
         except OSError as exc:
             raise ValueError(f"could not execute command: {exc}") from exc

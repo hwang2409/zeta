@@ -411,6 +411,52 @@ async def test_stdio_handshake_list_call_and_close(tmp_path: Path, monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_stdio_child_scrubs_parent_env_and_applies_config_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "environment.json"
+    source = f"""
+import json
+import os
+import pathlib
+import sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("method") == "initialize":
+        pathlib.Path({str(marker)!r}).write_text(json.dumps(dict(os.environ)))
+        result = {{"protocolVersion": "2025-06-18", "capabilities": {{}}}}
+    elif request.get("method") == "notifications/initialized":
+        continue
+    else:
+        result = {{"content": [], "isError": False}}
+    if "id" in request:
+        print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": result}}), flush=True)
+"""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "parent-secret")
+    monkeypatch.setenv("SEC-WEBSOCKET-KEY", "hyphen-secret")
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "parent-home"))
+    config = MCPServerConfig(
+        "environment",
+        "stdio",
+        sys.executable,
+        ("-u", "-c", source),
+        env={
+            "ANTHROPIC_API_KEY": "explicit-secret",
+            "ZETA_HOME": str(tmp_path / "explicit-home"),
+        },
+    )
+
+    client = StdioMCPClient(config)
+    await client.connect()
+    await client.close()
+    environment = json.loads(marker.read_text(encoding="utf-8"))
+
+    assert environment["ANTHROPIC_API_KEY"] == "explicit-secret"
+    assert environment["ZETA_HOME"] == str(tmp_path / "explicit-home")
+    assert "SEC-WEBSOCKET-KEY" not in environment
+
+
+@pytest.mark.asyncio
 async def test_stdio_abort_returns_canceled_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     source = _stdio_source().replace(
         'result = {"content": [{"type": "text", "text": request["params"]["arguments"]["value"]}], "isError": False, "structuredContent": {"ok": True, "latency": 1.5}}',

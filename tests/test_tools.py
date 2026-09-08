@@ -18,6 +18,7 @@ import zeta.tools.read as read_module
 import zeta.tools.write as write_module
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
+from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
 from zeta.core.store import ConversationStore
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.types import MessageRole, StreamEventType, TextContent, ToolCall, ToolResult
@@ -1702,3 +1703,145 @@ async def test_registry_abort_cancels_loop_batch_and_next_tool(tmp_path: Path) -
         "tool execution canceled",
         "tool execution canceled",
     ]
+
+
+_CREDENTIAL_ENV_FIXTURES: dict[str, str] = {
+    name: f"{name.lower()}-should-not-leak" for name in CREDENTIAL_ENV_NAMES
+}
+_UNRELATED_ENV_FIXTURES: dict[str, str] = {
+    "ZETA_CANARY_UNRELATED": "survives",
+    "HOSTNAME_HINT": "kept",
+    "TOKENIZERS_PARALLELISM": "true",
+    "SECRETARY_MODE": "briefing",
+    "COOKIECUTTER_REPLAY": "enabled",
+}
+
+
+def _seed_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in _CREDENTIAL_ENV_FIXTURES.items():
+        monkeypatch.setenv(name, value)
+    for name, value in _UNRELATED_ENV_FIXTURES.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("ZETA_HOME", "/tmp/zeta-private-home")
+
+
+def _assert_env_dump_is_scrubbed(dump: str) -> None:
+    names = {
+        line.split("=", 1)[0]
+        for line in dump.splitlines()
+        if "=" in line
+    }
+    for credential in _CREDENTIAL_ENV_FIXTURES:
+        assert credential not in names, (
+            f"{credential} leaked into tool subprocess env"
+        )
+    for keeper in _UNRELATED_ENV_FIXTURES:
+        assert keeper in names, f"{keeper} was stripped by the credential filter"
+    assert "PATH" in names, "PATH must survive so shell commands still resolve"
+    assert "HOME" in names, "HOME must survive for ordinary child behavior"
+    assert "ZETA_HOME" not in names, "ZETA_HOME must not expose the credential store"
+
+
+def test_tool_subprocess_env_blocks_credentials_and_preserves_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.tools._process import tool_subprocess_env
+
+    _seed_env(monkeypatch)
+
+    env = tool_subprocess_env()
+
+    for credential in _CREDENTIAL_ENV_FIXTURES:
+        assert credential not in env
+    for keeper, expected in _UNRELATED_ENV_FIXTURES.items():
+        assert env[keeper] == expected
+    assert env["PATH"] == os.environ["PATH"]
+    assert env["HOME"] == os.environ["HOME"]
+    assert "ZETA_HOME" not in env
+
+
+def test_subprocess_env_applies_explicit_overrides_after_scrubbing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "parent-secret")
+    monkeypatch.setenv("ZETA_HOME", "/tmp/parent-zeta-home")
+
+    env = subprocess_env(
+        {
+            "ANTHROPIC_API_KEY": "explicit-secret",
+            "ZETA_HOME": "/tmp/explicit-zeta-home",
+        }
+    )
+
+    assert env["ANTHROPIC_API_KEY"] == "explicit-secret"
+    assert env["ZETA_HOME"] == "/tmp/explicit-zeta-home"
+
+
+def test_subprocess_env_uses_exact_normalized_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SEC-WEBSOCKET-KEY", "hyphen-secret")
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "true")
+    monkeypatch.setenv("SECRETARY_MODE", "briefing")
+    monkeypatch.setenv("COOKIECUTTER_REPLAY", "enabled")
+
+    env = subprocess_env()
+
+    assert "SEC-WEBSOCKET-KEY" not in env
+    assert env["TOKENIZERS_PARALLELISM"] == "true"
+    assert env["SECRETARY_MODE"] == "briefing"
+    assert env["COOKIECUTTER_REPLAY"] == "enabled"
+
+
+@pytest.mark.asyncio
+async def test_bash_scrubs_credentials_from_child_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_env(monkeypatch)
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("bash-env-dump", "bash", {"cmd": "/usr/bin/env"})
+    )
+
+    assert result["isError"] is False
+    _assert_env_dump_is_scrubbed(result["structuredContent"]["stdout"])
+
+
+@pytest.mark.asyncio
+async def test_exec_scrubs_credentials_from_child_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_env(monkeypatch)
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("exec-env-dump", "exec", {"command": "/usr/bin/env"})
+    )
+
+    assert result["isError"] is False
+    _assert_env_dump_is_scrubbed(result["content"][0]["text"])
+
+
+@pytest.mark.asyncio
+async def test_run_background_scrubs_credentials_from_child_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_env(monkeypatch)
+    registry = ToolRegistry(tmp_path)
+
+    started = await registry.execute(
+        ToolCall(
+            "bg-env-dump",
+            "run_background",
+            {"command": "/usr/bin/env"},
+        )
+    )
+    task_id = started["structuredContent"]["task_id"]
+    await asyncio.wait_for(registry.background_tasks.wait(task_id), timeout=15)
+    output = await registry.execute(
+        ToolCall("bg-env-read", "task_output", {"task_id": task_id})
+    )
+
+    _assert_env_dump_is_scrubbed(output["structuredContent"]["output"])
+    await registry.close()

@@ -30,6 +30,7 @@ from html import escape
 from pathlib import Path
 
 from ..prompts import load_identity
+from .process_env import subprocess_env
 
 AGENTS_FILENAME = "AGENTS.md"
 CLAUDE_FILENAME = "CLAUDE.md"
@@ -61,6 +62,7 @@ def discover_repo_root(cwd: str | Path | None = None) -> Path:
             check=True,
             capture_output=True,
             text=True,
+            env=subprocess_env(),
         )
     except (OSError, subprocess.CalledProcessError):
         return directory
