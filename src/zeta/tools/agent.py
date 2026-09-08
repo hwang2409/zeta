@@ -22,7 +22,7 @@ from ..agent_receipt import (
 )
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.checkpoints import ConversationEntry, ConversationIntegrityError
-from ..core.store import ConversationStore
+from ..core.store import ConversationStore, PendingPromptsClosedError
 from ..model_catalog import known_model_names
 from ..types import (
     Message,
@@ -916,7 +916,15 @@ def send_to_run(
     child_store = ConversationStore(
         child_path.parent, session_id=child_path.name, cwd=parent_store.cwd
     )
-    child_store.append_pending_prompt(message)
+    try:
+        child_store.append_pending_prompt(message)
+    except PendingPromptsClosedError:
+        # consume_run closed the queue while we were checking the marker.
+        # The run is on its way out; report it the same as any finished run.
+        return (
+            f"no live run {child_instance_id!r}; it already finished or was "
+            "never started"
+        )
     return None
 
 

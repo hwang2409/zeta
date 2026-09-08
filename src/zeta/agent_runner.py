@@ -213,13 +213,23 @@ async def consume_run(
     """
 
     result = await consume_child(child_loop, prompt, **kwargs)
+    current_entry = None
     while not result.get("isError"):
-        pending = child_store.pending_prompts()
+        # Ack only after a follow-up actually reached the child. A cancel or
+        # backend error mid-consume_child leaves the prompt pending, so the
+        # next run gets a chance to redeliver it instead of it silently gone.
+        if current_entry is not None:
+            child_store.acknowledge_pending_prompt(current_entry.id)
+            current_entry = None
+        # close_pending_queue_if_empty holds the child's append lock across
+        # the "no pending -> mark closed" transition, so any parent that
+        # queues a follow-up after this point gets a PendingPromptsClosedError
+        # instead of silent success against a run that already returned.
+        pending = child_store.close_pending_queue_if_empty()
         if not pending:
             return result
-        entry = pending[0]
-        child_store.acknowledge_pending_prompt(entry.id)
-        result = await consume_child(child_loop, entry.data["text"], **kwargs)
+        current_entry = pending[0]
+        result = await consume_child(child_loop, current_entry.data["text"], **kwargs)
     return result
 
 

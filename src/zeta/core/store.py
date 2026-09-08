@@ -31,6 +31,10 @@ MAX_AGENT_NOTIFICATION_TEXT = 10_000
 MAX_PENDING_PROMPT_TEXT = 16_000
 
 
+class PendingPromptsClosedError(RuntimeError):
+    """Raised when a run has already decided to finish and refuses new prompts."""
+
+
 def _valid_agent_stats(value: object) -> bool:
     if type(value) is not dict:
         return False
@@ -545,6 +549,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 prompt_id = entry.data.get("prompt_id")
                 if type(prompt_id) is not str or not prompt_id:
                     raise ValueError("pending prompt id must be a nonempty string")
+            elif entry.type == "pending_queue_closed":
+                if entry.data != {}:
+                    raise ValueError("pending queue closed marker takes no fields")
             else:
                 raise ValueError(f"unsupported conversation entry type: {entry.type}")
         except (KeyError, TypeError, ValueError) as exc:
@@ -679,13 +686,51 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         Written into the run's own store, by the parent or the UI rather than by
         the run itself. It stays out of the run's context until the driver hands
         it to run_turn, because context assembly keeps only message entries.
+        Raises PendingPromptsClosedError if consume_run already decided the run
+        was finished; the parent has to treat the target as gone.
         """
 
         if type(text) is not str or not text.strip():
             raise ValueError("pending prompt text must be a nonempty string")
         if len(text) > MAX_PENDING_PROMPT_TEXT:
             raise ValueError("pending prompt text is too long")
-        return self._append_row("pending_prompt", {"text": text})
+        with self._append_lock():
+            self._load()
+            if self._pending_queue_closed_unlocked():
+                raise PendingPromptsClosedError(
+                    "pending prompt queue is closed"
+                )
+            entry = self._append_row_unlocked("pending_prompt", {"text": text})
+            return self._snapshot_entry(entry)
+
+    def _pending_queue_closed_unlocked(self) -> bool:
+        return any(entry.type == "pending_queue_closed" for entry in self._entries)
+
+    def close_pending_queue_if_empty(self) -> list[ConversationEntry]:
+        """Return pending prompts; if none, atomically close the queue.
+
+        Closes the door on new append_pending_prompt calls so that consume_run
+        can return without a parent racing an empty-queue check and a queued
+        follow-up that would then rot. If prompts are queued the door stays
+        open and the caller drains them.
+        """
+
+        with self._append_lock():
+            self._load()
+            branch = self.replay()
+            acknowledged = {
+                entry.data["prompt_id"]
+                for entry in branch
+                if entry.type == "pending_prompt_ack"
+            }
+            pending = [
+                entry
+                for entry in branch
+                if entry.type == "pending_prompt" and entry.id not in acknowledged
+            ]
+            if not pending and not self._pending_queue_closed_unlocked():
+                self._append_row_unlocked("pending_queue_closed", {})
+            return [self._snapshot_entry(entry) for entry in pending]
 
     def pending_prompts(self) -> list[ConversationEntry]:
         """Return queued follow-ups the run has not consumed yet.

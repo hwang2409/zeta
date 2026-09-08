@@ -15,7 +15,7 @@ from zeta.agent_budget import MAX_AGENT_TURN_CAP, AgentTree
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
-from zeta.core.store import ConversationStore
+from zeta.core.store import ConversationStore, PendingPromptsClosedError
 from zeta.loop import AgentLoop
 from zeta.mcp import MCPMount
 from zeta.tools import ToolRegistry
@@ -2999,6 +2999,94 @@ def test_pending_prompt_queue_round_trips(tmp_path: Path) -> None:
         store.append_pending_prompt("   ")
     with pytest.raises(ValueError):
         store.acknowledge_pending_prompt("nonexistent")
+
+
+def test_close_pending_queue_if_empty_locks_out_new_prompts(tmp_path: Path) -> None:
+    """Once a run declares itself done, further follow-ups must be rejected."""
+
+    store = ConversationStore(tmp_path, session_id="run")
+
+    # With prompts pending the queue stays open and callers still see them.
+    store.append_pending_prompt("keep working")
+    pending = store.close_pending_queue_if_empty()
+    assert [entry.data["text"] for entry in pending] == ["keep working"]
+    store.acknowledge_pending_prompt(pending[0].id)
+
+    # Second call finds nothing pending and closes the door.
+    assert store.close_pending_queue_if_empty() == []
+    with pytest.raises(PendingPromptsClosedError):
+        store.append_pending_prompt("too late")
+    # A separate handle sees the closed door too, not just this instance.
+    other = ConversationStore(tmp_path, session_id="run")
+    with pytest.raises(PendingPromptsClosedError):
+        other.append_pending_prompt("also too late")
+
+
+@pytest.mark.asyncio
+async def test_consume_run_keeps_pending_entry_when_delivery_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed follow-up delivery must leave the queue intact for recovery."""
+
+    from zeta import agent_runner
+
+    child_store = ConversationStore(tmp_path, session_id="run")
+    child_store.append_pending_prompt("follow up")
+
+    call_prompts: list[str] = []
+
+    async def fake_consume_child(child_loop, prompt, **kwargs):
+        del child_loop, kwargs
+        call_prompts.append(prompt)
+        if len(call_prompts) == 1:
+            return {"content": [], "isError": False, "structuredContent": None}
+        return {"content": [], "isError": True, "structuredContent": None}
+
+    monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
+
+    result = await agent_runner.consume_run(
+        object(),  # child_loop is unused by the fake
+        "initial",
+        child_store=child_store,
+    )
+    assert result["isError"] is True
+    assert call_prompts == ["initial", "follow up"]
+    # Ack must not have run since the follow-up delivery errored.
+    assert [entry.data["text"] for entry in child_store.pending_prompts()] == [
+        "follow up"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> None:
+    """The race the closed-queue marker prevents: a queued prompt after finish."""
+
+    from zeta.tools.agent import send_to_run
+
+    backend = RunBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    handle = _run_handle_from_receipt(store)
+
+    # Simulate the race: parent looked at the marker before the run finished,
+    # then the run drained and closed its queue before the parent got here.
+    marker = store.agent_children()[handle]
+    child_path = Path(str(marker["child_session_path"]))
+    child_store = ConversationStore(
+        child_path.parent, session_id=child_path.name, cwd=store.cwd
+    )
+    assert child_store.close_pending_queue_if_empty() == []
+
+    error = send_to_run(store, handle, "too late")
+    assert error is not None and "no live run" in error
+
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+    await loop.close()
 
 
 @pytest.mark.asyncio
