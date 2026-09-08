@@ -932,7 +932,11 @@ async def _agent_send(
     registry: ToolRegistry,
     arguments: dict[str, Any],
 ) -> dict[str, object]:
-    error = send_to_run(
+    # send_to_run reloads the run's own conversation.jsonl and appends under
+    # flock+fsync; runs with large logs would stall the event loop, so hop
+    # to a worker thread while the marker check and durable append happen.
+    error = await asyncio.to_thread(
+        send_to_run,
         registry.session_store,
         arguments.get("child_instance_id"),
         arguments.get("message"),
