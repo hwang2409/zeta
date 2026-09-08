@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-import zeta.tools.agent as agent_module
+import zeta.execution as execution_module
+import zeta.tools.agent_send as agent_send_module
 from zeta.agent_background import (
     BackgroundAgentOwner,
     adopt_agent_children,
@@ -3167,14 +3168,14 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
 
     started = threading.Event()
     release = threading.Event()
-    original_send = agent_module.send_to_run
+    original_send = agent_send_module.send_to_run
 
     def blocked_send(*args):
         started.set()
         release.wait(timeout=2)
         return original_send(*args)
 
-    monkeypatch.setattr(agent_module, "send_to_run", blocked_send)
+    monkeypatch.setattr(agent_send_module, "send_to_run", blocked_send)
     registry = ToolRegistry(tmp_path, session_store=parent_store)
     task = asyncio.create_task(
         registry.execute(
@@ -3194,6 +3195,59 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     await asyncio.sleep(0)
     assert not task.done()
     release.set()
+    result = await task
+
+    assert result["isError"] is False
+    assert [entry.data["text"] for entry in child_store.pending_prompts()] == [
+        "follow up"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(
+        parent_store.session_dir / "agents", session_id="1"
+    )
+    call = _run_agent_call()
+    child_store.mark_agent_parent(call.id, agent_type="run")
+    parent_store.allocate_agent_index()
+    parent_store.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="long horizon run",
+        agent_type="run",
+        background=True,
+        child_instance_id="parent:1",
+    )
+
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    original_gather = execution_module.asyncio.gather
+
+    async def blocked_cleanup(*args, **kwargs):
+        cleanup_started.set()
+        await release_cleanup.wait()
+        return await original_gather(*args, **kwargs)
+
+    monkeypatch.setattr(execution_module.asyncio, "gather", blocked_cleanup)
+    registry = ToolRegistry(tmp_path, session_store=parent_store)
+    task = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "agent-send-cleanup-cancel",
+                "agent_send",
+                {"child_instance_id": "parent:1", "message": "follow up"},
+            )
+        )
+    )
+
+    await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+    task.cancel()
+    release_cleanup.set()
     result = await task
 
     assert result["isError"] is False

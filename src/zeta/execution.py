@@ -200,28 +200,51 @@ async def run_handler_with_abort(
             current.cancel()
 
     abort_wait = asyncio.create_task(cancel_on_abort())
+    result: ToolHandlerResult | None = None
+    result_produced = False
     try:
         try:
-            return await invoke_handler(
+            result = await invoke_handler(
                 handler,
                 arguments,
                 execution_signal,
                 stream_publisher,
             )
+            result_produced = True
         except _ToolCanceled:
-            return canceled_result(tool_call_id)
+            result = canceled_result(tool_call_id)
+            result_produced = True
         except asyncio.CancelledError:
             if execution_signal.is_set():
-                return canceled_result(tool_call_id)
-            raise
+                result = canceled_result(tool_call_id)
+                result_produced = True
+            else:
+                raise
         except Exception as exc:  # noqa: BLE001 - tool handlers fail closed
-            return ToolResult(tool_call_id, str(exc), True)
+            result = ToolResult(tool_call_id, str(exc), True)
+            result_produced = True
     finally:
         if stream_publisher is not None:
             stream_publisher.close()
         if not abort_wait.done():
             abort_wait.cancel()
-            await asyncio.gather(abort_wait, return_exceptions=True)
+            async def cleanup_abort_wait() -> None:
+                await asyncio.gather(abort_wait, return_exceptions=True)
+
+            cleanup = asyncio.create_task(cleanup_abort_wait())
+            cleanup_canceled = False
+            while True:
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cleanup_canceled = True
+                    continue
+                break
+            if cleanup_canceled and not result_produced:
+                raise asyncio.CancelledError
+    if not result_produced:
+        raise RuntimeError("tool handler did not produce a result")
+    return result
 
 
 def build_execution_arguments(
