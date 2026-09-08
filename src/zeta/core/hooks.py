@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from .process_env import subprocess_env
+
 
 HookEvent = Literal[
     "session_start",
@@ -223,9 +225,9 @@ class HookManager:
 
     async def _run(self, hook: Hook, payload: Mapping[str, Any]) -> _CommandResult:
         event = {"event": hook.event, "session_id": self.session_id, **payload}
-        environment = os.environ.copy()
-        environment["ZETA_SESSION_ID"] = self.session_id
-        environment[HOOK_ACTIVE_ENV] = "1"
+        environment = subprocess_env(
+            {"ZETA_SESSION_ID": self.session_id, HOOK_ACTIVE_ENV: "1"}
+        )
         process: asyncio.subprocess.Process | None = None
         stderr_task: asyncio.Task[str] | None = None
         creation_task: asyncio.Task[asyncio.subprocess.Process] | None = None

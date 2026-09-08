@@ -18,6 +18,7 @@ import zeta.tools.read as read_module
 import zeta.tools.write as write_module
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
+from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
 from zeta.core.store import ConversationStore
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.types import MessageRole, StreamEventType, TextContent, ToolCall, ToolResult
@@ -1705,19 +1706,14 @@ async def test_registry_abort_cancels_loop_batch_and_next_tool(tmp_path: Path) -
 
 
 _CREDENTIAL_ENV_FIXTURES: dict[str, str] = {
-    "ANTHROPIC_API_KEY": "sk-ant-should-not-leak",
-    "ZETA_ALLOW_API_KEY": "1",
-    "OPENAI_API_KEY": "sk-open-should-not-leak",
-    "AWS_SECRET_ACCESS_KEY": "aws-should-not-leak",
-    "AWS_SESSION_TOKEN": "aws-token-should-not-leak",
-    "GITHUB_TOKEN": "gh-should-not-leak",
-    "SESSION_COOKIE": "cookie-should-not-leak",
-    "MY_PASSWORD": "pw-should-not-leak",
-    "OAUTH_BEARER": "bearer-should-not-leak",
+    name: f"{name.lower()}-should-not-leak" for name in CREDENTIAL_ENV_NAMES
 }
 _UNRELATED_ENV_FIXTURES: dict[str, str] = {
     "ZETA_CANARY_UNRELATED": "survives",
     "HOSTNAME_HINT": "kept",
+    "TOKENIZERS_PARALLELISM": "true",
+    "SECRETARY_MODE": "briefing",
+    "COOKIECUTTER_REPLAY": "enabled",
 }
 
 
@@ -1726,6 +1722,7 @@ def _seed_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(name, value)
     for name, value in _UNRELATED_ENV_FIXTURES.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv("ZETA_HOME", "/tmp/zeta-private-home")
 
 
 def _assert_env_dump_is_scrubbed(dump: str) -> None:
@@ -1741,6 +1738,8 @@ def _assert_env_dump_is_scrubbed(dump: str) -> None:
     for keeper in _UNRELATED_ENV_FIXTURES:
         assert keeper in names, f"{keeper} was stripped by the credential filter"
     assert "PATH" in names, "PATH must survive so shell commands still resolve"
+    assert "HOME" in names, "HOME must survive for ordinary child behavior"
+    assert "ZETA_HOME" not in names, "ZETA_HOME must not expose the credential store"
 
 
 def test_tool_subprocess_env_blocks_credentials_and_preserves_rest(
@@ -1757,6 +1756,41 @@ def test_tool_subprocess_env_blocks_credentials_and_preserves_rest(
     for keeper, expected in _UNRELATED_ENV_FIXTURES.items():
         assert env[keeper] == expected
     assert env["PATH"] == os.environ["PATH"]
+    assert env["HOME"] == os.environ["HOME"]
+    assert "ZETA_HOME" not in env
+
+
+def test_subprocess_env_applies_explicit_overrides_after_scrubbing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "parent-secret")
+    monkeypatch.setenv("ZETA_HOME", "/tmp/parent-zeta-home")
+
+    env = subprocess_env(
+        {
+            "ANTHROPIC_API_KEY": "explicit-secret",
+            "ZETA_HOME": "/tmp/explicit-zeta-home",
+        }
+    )
+
+    assert env["ANTHROPIC_API_KEY"] == "explicit-secret"
+    assert env["ZETA_HOME"] == "/tmp/explicit-zeta-home"
+
+
+def test_subprocess_env_uses_exact_normalized_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SEC-WEBSOCKET-KEY", "hyphen-secret")
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "true")
+    monkeypatch.setenv("SECRETARY_MODE", "briefing")
+    monkeypatch.setenv("COOKIECUTTER_REPLAY", "enabled")
+
+    env = subprocess_env()
+
+    assert "SEC-WEBSOCKET-KEY" not in env
+    assert env["TOKENIZERS_PARALLELISM"] == "true"
+    assert env["SECRETARY_MODE"] == "briefing"
+    assert env["COOKIECUTTER_REPLAY"] == "enabled"
 
 
 @pytest.mark.asyncio

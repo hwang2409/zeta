@@ -30,6 +30,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ..process_env import subprocess_env
+
 SNAPSHOT_STATE_FILE = "workspace_snapshots.json"
 SNAPSHOT_STATE_TMP_PREFIX = ".workspace_snapshots."
 SNAPSHOT_REF_NAMESPACE = "refs/zeta/checkpoints"
@@ -110,6 +112,7 @@ def _ensure_shadow_repo(session_dir: Path) -> Path:
                 ["git", "init", "--bare", "--quiet", str(shadow)],
                 check=True,
                 capture_output=True,
+                env=subprocess_env(),
             )
         except subprocess.CalledProcessError as exc:
             raise WorkspaceSnapshotError(
@@ -170,7 +173,7 @@ def _run_git(
     input_text: str | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    merged_env = os.environ.copy()
+    merged_env = subprocess_env()
     merged_env["GIT_AUTHOR_NAME"] = merged_env.get("GIT_AUTHOR_NAME", "zeta")
     merged_env["GIT_AUTHOR_EMAIL"] = merged_env.get("GIT_AUTHOR_EMAIL", "zeta@localhost")
     merged_env["GIT_COMMITTER_NAME"] = merged_env.get("GIT_COMMITTER_NAME", "zeta")

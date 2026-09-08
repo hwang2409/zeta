@@ -205,6 +205,37 @@ async def test_nonblocking_hook_does_not_delay_turn(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_hook_subprocess_scrubs_credentials_and_keeps_session_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "parent-secret")
+    monkeypatch.setenv("SEC-WEBSOCKET-KEY", "hyphen-secret")
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "true")
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "private-home"))
+    command = _python_command(
+        "import json,os,sys; sys.stderr.write(json.dumps({"
+        "'anthropic': os.environ.get('ANTHROPIC_API_KEY'),"
+        "'websocket': os.environ.get('SEC-WEBSOCKET-KEY'),"
+        "'zeta_home': os.environ.get('ZETA_HOME'),"
+        "'tokenizers': os.environ.get('TOKENIZERS_PARALLELISM'),"
+        "'session': os.environ.get('ZETA_SESSION_ID'),"
+        "'active': os.environ.get('ZETA_HOOK_ACTIVE')}))"
+    )
+
+    result = await HookManager((), session_id="session-1")._run(
+        Hook("session_start", command), {}
+    )
+    environment = json.loads(result.stderr)
+
+    assert environment["anthropic"] is None
+    assert environment["websocket"] is None
+    assert environment["zeta_home"] is None
+    assert environment["tokenizers"] == "true"
+    assert environment["session"] == "session-1"
+    assert environment["active"] == "1"
+
+
+@pytest.mark.asyncio
 async def test_tool_filter_and_event_payload(tmp_path: Path) -> None:
     marker = tmp_path / "events.jsonl"
     command = _python_command(

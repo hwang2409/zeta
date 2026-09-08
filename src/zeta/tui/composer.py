@@ -26,6 +26,7 @@ from rich.text import Text
 
 from ..core.abort import AbortSignal
 from ..core.approval import ApprovalRequest
+from ..core.process_env import subprocess_env
 from ..core.slash import SlashCommandRegistry
 from ..types import (
     ErrorInfo,
@@ -402,6 +403,7 @@ def paste_image(session_dir: str | Path) -> Path:
             [pngpaste, str(destination)],
             capture_output=True,
             check=False,
+            env=subprocess_env(),
         )
     else:
         script = """
@@ -418,6 +420,7 @@ end run
             ["osascript", "-e", script, str(destination)],
             capture_output=True,
             check=False,
+            env=subprocess_env(),
         )
     if result.returncode != 0 or not destination.is_file():
         destination.unlink(missing_ok=True)

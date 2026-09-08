@@ -13,36 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# Uppercase substrings that mark an env-var name as a credential. Any variable
-# whose upper-cased name contains one of these never propagates to a
-# bash/exec/run_background child; a prompt-injected shell command would
-# otherwise inherit ANTHROPIC_API_KEY and friends and could exfiltrate them.
-# Errs toward stripping — a leaked API key is worse than a missing CI variable.
-_CREDENTIAL_ENV_MARKERS: tuple[str, ...] = (
-    "APIKEY",
-    "API_KEY",
-    "TOKEN",
-    "SECRET",
-    "PASSWORD",
-    "PASSWD",
-    "COOKIE",
-    "AUTHORIZATION",
-    "AUTHENTICATION",
-    "CREDENTIALS",
-    "SIGNATURE",
-    "SIGNING",
-    "BEARER",
-)
+from ..core.process_env import subprocess_env
 
 
 def tool_subprocess_env() -> dict[str, str]:
-    """Return the parent env minus credential-bearing variables."""
+    """Return the scrubbed parent environment for a tool child."""
 
-    return {
-        name: value
-        for name, value in os.environ.items()
-        if not any(marker in name.upper() for marker in _CREDENTIAL_ENV_MARKERS)
-    }
+    return subprocess_env()
 
 
 BACKGROUND_TASK_LIMIT = 8
