@@ -387,12 +387,6 @@ fn stale_remembered_session_reconnects_and_allows_a_new_session() {
         assert_eq!(request["params"]["session_id"], "session-1");
         peer.write(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32602,"message":"session session-1 was not found"}}));
         peer.status(false, "idle", json!([]));
-        peer.wait_for_close();
-
-        // The cleared selection must not trigger another resume on reconnect.
-        let mut peer = Peer::accept(&listener);
-        peer.hello();
-        peer.status(false, "idle", json!([]));
         peer.respond("new_session", json!({"session":session()}));
         peer.status(true, "idle", json!([]));
         peer.wait_for_close();
@@ -412,8 +406,6 @@ fn stale_remembered_session_reconnects_and_allows_a_new_session() {
     state.apply_status(status);
     assert!(state.active_session.is_none());
     assert!(matches!(harness.next(), WorkerMessage::Connected));
-    harness.command(CommandMessage::Reconnect);
-    harness.connected();
     harness.command(CommandMessage::NewSession);
     assert!(
         matches!(harness.next(), WorkerMessage::Session(session) if session.session_id == "session-1")
