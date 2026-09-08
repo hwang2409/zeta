@@ -1702,3 +1702,112 @@ async def test_registry_abort_cancels_loop_batch_and_next_tool(tmp_path: Path) -
         "tool execution canceled",
         "tool execution canceled",
     ]
+
+
+_CREDENTIAL_ENV_FIXTURES: dict[str, str] = {
+    "ANTHROPIC_API_KEY": "sk-ant-should-not-leak",
+    "ZETA_ALLOW_API_KEY": "1",
+    "OPENAI_API_KEY": "sk-open-should-not-leak",
+    "AWS_SECRET_ACCESS_KEY": "aws-should-not-leak",
+    "AWS_SESSION_TOKEN": "aws-token-should-not-leak",
+    "GITHUB_TOKEN": "gh-should-not-leak",
+    "SESSION_COOKIE": "cookie-should-not-leak",
+    "MY_PASSWORD": "pw-should-not-leak",
+    "OAUTH_BEARER": "bearer-should-not-leak",
+}
+_UNRELATED_ENV_FIXTURES: dict[str, str] = {
+    "ZETA_CANARY_UNRELATED": "survives",
+    "HOSTNAME_HINT": "kept",
+}
+
+
+def _seed_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in _CREDENTIAL_ENV_FIXTURES.items():
+        monkeypatch.setenv(name, value)
+    for name, value in _UNRELATED_ENV_FIXTURES.items():
+        monkeypatch.setenv(name, value)
+
+
+def _assert_env_dump_is_scrubbed(dump: str) -> None:
+    names = {
+        line.split("=", 1)[0]
+        for line in dump.splitlines()
+        if "=" in line
+    }
+    for credential in _CREDENTIAL_ENV_FIXTURES:
+        assert credential not in names, (
+            f"{credential} leaked into tool subprocess env"
+        )
+    for keeper in _UNRELATED_ENV_FIXTURES:
+        assert keeper in names, f"{keeper} was stripped by the credential filter"
+    assert "PATH" in names, "PATH must survive so shell commands still resolve"
+
+
+def test_tool_subprocess_env_blocks_credentials_and_preserves_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta.tools._process import tool_subprocess_env
+
+    _seed_env(monkeypatch)
+
+    env = tool_subprocess_env()
+
+    for credential in _CREDENTIAL_ENV_FIXTURES:
+        assert credential not in env
+    for keeper, expected in _UNRELATED_ENV_FIXTURES.items():
+        assert env[keeper] == expected
+    assert env["PATH"] == os.environ["PATH"]
+
+
+@pytest.mark.asyncio
+async def test_bash_scrubs_credentials_from_child_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_env(monkeypatch)
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("bash-env-dump", "bash", {"cmd": "/usr/bin/env"})
+    )
+
+    assert result["isError"] is False
+    _assert_env_dump_is_scrubbed(result["structuredContent"]["stdout"])
+
+
+@pytest.mark.asyncio
+async def test_exec_scrubs_credentials_from_child_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_env(monkeypatch)
+    registry = ToolRegistry(tmp_path)
+
+    result = await registry.execute(
+        ToolCall("exec-env-dump", "exec", {"command": "/usr/bin/env"})
+    )
+
+    assert result["isError"] is False
+    _assert_env_dump_is_scrubbed(result["content"][0]["text"])
+
+
+@pytest.mark.asyncio
+async def test_run_background_scrubs_credentials_from_child_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_env(monkeypatch)
+    registry = ToolRegistry(tmp_path)
+
+    started = await registry.execute(
+        ToolCall(
+            "bg-env-dump",
+            "run_background",
+            {"command": "/usr/bin/env"},
+        )
+    )
+    task_id = started["structuredContent"]["task_id"]
+    await asyncio.wait_for(registry.background_tasks.wait(task_id), timeout=15)
+    output = await registry.execute(
+        ToolCall("bg-env-read", "task_output", {"task_id": task_id})
+    )
+
+    _assert_env_dump_is_scrubbed(output["structuredContent"]["output"])
+    await registry.close()

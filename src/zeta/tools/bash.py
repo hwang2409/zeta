@@ -18,7 +18,7 @@ from typing import TypedDict
 
 from ..core.abort import AbortSignal
 from ..types import StructuredToolResult
-from ._process import _kill_and_reap
+from ._process import _kill_and_reap, tool_subprocess_env
 from ._sandbox import expand_user_path
 from .registry import (
     ToolRegistry,
@@ -129,6 +129,7 @@ async def _bash(
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             pass_fds=(write_fd,),
+            env=tool_subprocess_env(),
         )
         os.close(write_fd)
         write_fd = -1
