@@ -244,3 +244,120 @@ Error responses use standard JSON-RPC codes where applicable:
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. A malformed frame never terminates the server process. The
 server returns its parse error and continues reading frames.
+
+## normative wire schema
+
+The following schema uses JSON Schema-like notation. `required` lists fields
+that always exist. Other listed fields are optional.
+
+```text
+SessionMetadata = {
+  required: {
+    version: integer, session_id: string, created_at: string,
+    updated_at: string, provider: string, model: string, cwd: string,
+    retained_tail: integer, compaction_budget: integer,
+    override_audit: array[object], system_prompt: string,
+    context_files: array[string], vim_mode: boolean, budget_pinned: boolean,
+    plan_mode: boolean, name: string
+  }
+}
+ToolCall = { required: { id: string, name: string, arguments: object } }
+ContentBlock = one of:
+  { required: { type: "text", text: string }, optional: { path: string, size: integer } }
+  { required: { type: "image", data: string, mimeType: string }, optional: { path: string, size: integer } }
+  { required: { type: "thinking", text: string }, optional: { signature: string } }
+  { required: { type: "redacted_thinking", data: string } }
+  { required: { type: "tool_use", tool_call: ToolCall } }
+Message = {
+  required: { role: string, content: array[ContentBlock] },
+  optional: { tool_result: ToolResult, metadata: object }
+}
+ToolResult = {
+  required: { tool_call_id: string, content: string, is_error: boolean },
+  optional: { is_canceled: boolean, content_blocks: array, structured_content: object }
+}
+Approval = { required: { request_id: string, tool_call: ToolCall } }
+Usage = object with provider-defined JSON values
+```
+
+`created_at` and `updated_at` are ISO-8601 strings. IDs, names, paths, and
+provider values are strings. `retained_tail` and `compaction_budget` are
+positive integers. The server preserves usage keys and values.
+
+Tool result `content_blocks` uses the MCP-compatible union. A `text` block
+requires `text`, `truncated`, and `full_size`. An `image` block requires
+`data` and `mimeType`. A `resource` block requires `resource` with `uri` and
+exactly one of `text` or `blob`. Optional annotations contain `audience`,
+`priority`, and `lastModified`. `structured_content` is a recursive JSON value.
+
+The event envelope is always:
+
+```text
+Event = {
+  required: { jsonrpc: "2.0", method: "event", params: { event: string } },
+  optional params: { session_id: string, ...event_fields }
+}
+```
+
+Event fields are:
+
+| event | required fields | optional fields |
+| --- | --- | --- |
+| `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, `compaction_start`, `compaction_end` | `event` | `session_id`, `data: object` |
+| `assistant_delta` | `event`, `delta: string`, `kind: string` | `session_id` |
+| `assistant_message` | `event`, `message: Message` | `session_id` |
+| `usage` | `event`, `usage: Usage` | `session_id` |
+| `tool_start`, `tool_output` | `event`, `tool_call: ToolCall`, `data: object` | `session_id`, `output: string` for `tool_output` |
+| `tool_end` | `event`, `tool_call: ToolCall`, `tool_result: ToolResult or null`, `data: object` | `session_id` |
+| `approval_request` | `event`, `request_id: string`, `tool_call: ToolCall` | `session_id` |
+| `approval_end` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
+| `sub_agent_receipt` | `event`, `data: object` | `session_id` |
+| `retry` | `event`, `data: object` | `session_id` |
+| `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
+
+The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
+and `is_stall: boolean`. Unknown provider keys remain allowed inside `data`.
+
+## ordering and lifecycle rules
+
+1. The server processes complete request lines in order. It serializes all
+   responses and notifications through one write lock.
+2. The client sends `hello` first. Any rejected first request closes the client
+   after its error response. A successful `hello` enables session operations.
+3. `send` returns its acknowledgement before `turn_start`. Stream events keep
+   loop order. `turn_end` follows that turn's tool events, then `agent_end`.
+4. `approval_request` precedes `approval_end`. The tool does not execute until
+   an allow decision exists. Delegated approval keys are opaque and map to the
+   full `(child_instance_id, request_id)` key.
+5. `tool_start`, `tool_output`, and `tool_end` identify one tool call.
+   `status.state` is `tool` during tool execution, `running` during model
+   streaming, and `idle` after the active task ends.
+6. `retry` can occur between provider stream attempts. Clients must not assume
+   one provider attempt per turn.
+7. The server awaits `drain()` after each frame. A slow client delays later
+   notifications. A disconnected client drops writes and cancels its turn.
+8. Disconnect marks unresolved approvals as `abort`. They are not pending after
+   reconnect, and an approve request cannot run an aborted tool.
+9. SIGINT, SIGTERM, and orderly close use one path. The server closes clients
+   and turns, closes the listener, and removes the Unix socket.
+10. Match responses by `id`. Continue processing notifications until the
+    matching response arrives.
+
+## size and pagination rules
+
+Every inbound and outbound frame is at most `MAX_FRAME_BYTES` bytes, including
+the newline. An oversized inbound line gets a structured `-32600` error. The
+server discards that line and keeps the connection usable.
+
+`list_sessions` returns the largest fitting prefix. A truncated result has
+`truncated: true`, `sessions`, and zero-based `next_offset`. Version `1.0`
+does not expose an offset request, so clients should treat this marker as a
+safe display warning. Other oversized payloads become a bounded `-32007`
+response or error event.
+
+## conformance
+
+The repository tests construct every request and event family. They check the
+JSON-RPC envelope, required discriminators, size limit, ordering, pagination,
+resume failure, second-client refusal, and disconnect cleanup. Changes to
+event names, states, or field optionality must update this section and tests.

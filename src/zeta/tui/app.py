@@ -887,7 +887,6 @@ class TUIApp(
         self._attach_draft(session)
         if isinstance(session, FullScreenPromptSession):
             self._install_full_screen_layout(session)
-        self.loop.session_start()
         self._rebuild_transcript()
         await self.loop.ensure_mcp_servers()
         for warning in self._startup_warnings:

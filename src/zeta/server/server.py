@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
+import os
+import signal
+import socket
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
@@ -59,6 +65,7 @@ class ZetaServer:
         self._server: asyncio.AbstractServer | None = None
         self._client_active = False
         self._client: _Client | None = None
+        self._socket_created = False
 
     @property
     def address(self) -> str:
@@ -68,12 +75,12 @@ class ZetaServer:
 
     async def start(self) -> None:
         if self.port is None:
-            self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-            if self.socket_path.exists():
-                self.socket_path.unlink()
+            self._prepare_socket_path()
             self._server = await asyncio.start_unix_server(
                 self._accept, path=str(self.socket_path), limit=MAX_FRAME_BYTES + 1
             )
+            os.chmod(self.socket_path, 0o600)
+            self._socket_created = True
         else:
             self._server = await asyncio.start_server(
                 self._accept, "127.0.0.1", self.port, limit=MAX_FRAME_BYTES + 1
@@ -90,17 +97,47 @@ class ZetaServer:
             await self._server.serve_forever()
 
     async def close(self) -> None:
+        if self._client is not None:
+            await self._client.close()
+            self._client = None
+        self._client_active = False
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
-        if self._client is not None:
-            await self._client.close()
-            self._client = None
         await self.runtime.close()
-        if self.port is None:
+        if self.port is None and self._socket_created:
             with contextlib.suppress(FileNotFoundError):
-                self.socket_path.unlink()
+                if stat.S_ISSOCK(self.socket_path.stat().st_mode):
+                    self.socket_path.unlink()
+            self._socket_created = False
+
+    def _prepare_socket_path(self) -> None:
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            parent_stat = self.socket_path.parent.stat()
+            if parent_stat.st_uid == os.getuid():
+                os.chmod(self.socket_path.parent, 0o700)
+        except OSError:
+            pass
+        try:
+            path_mode = self.socket_path.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(path_mode):
+            raise RuntimeError(f"refusing to replace non-socket path: {self.socket_path}")
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.2)
+            probe.connect(str(self.socket_path))
+        except OSError as exc:
+            if exc.errno not in {errno.ECONNREFUSED, errno.ENOENT}:
+                raise RuntimeError(f"could not inspect socket: {self.socket_path}") from exc
+        else:
+            raise RuntimeError(f"a server is already listening on {self.socket_path}")
+        finally:
+            probe.close()
+        self.socket_path.unlink()
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -114,9 +151,11 @@ class ZetaServer:
             return
         self._client_active = True
         self._client = _Client(self, reader, writer)
+        self.runtime.set_background_event_sink(self._client._event)
         try:
             await self._client.run()
         finally:
+            self.runtime.set_background_event_sink(None)
             self._client = None
             self._client_active = False
 
@@ -130,25 +169,36 @@ class _Client:
         self.writer = writer
         self.handshaken = False
         self._write_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+        self._closed = False
         self._turn_task: asyncio.Task[None] | None = None
         self.turn_state = "idle"
+        self._approval_wires: dict[str | tuple[str, str], str] = {}
+        self._approval_keys: dict[str, str | tuple[str, str]] = {}
 
     async def run(self) -> None:
         try:
             while True:
                 try:
                     line = await self.reader.readline()
-                except asyncio.LimitOverrunError:
+                except (asyncio.LimitOverrunError, ValueError) as exc:
                     await self._write(
                         error_response(None, -32600, "request frame exceeds 1048576 bytes")
                     )
-                    break
+                    if not self.handshaken:
+                        break
+                    separator_consumed = "Separator is found" in str(exc)
+                    if not separator_consumed and not await self._discard_frame():
+                        break
+                    continue
                 if not line:
                     break
                 try:
                     request = parse_request(line)
                 except ProtocolError as exc:
                     await self._write(error_response(None, exc.code, exc.message, exc.data))
+                    if not self.handshaken:
+                        break
                     continue
                 request_id = request["id"]
                 try:
@@ -160,23 +210,40 @@ class _Client:
                 except Exception as exc:  # noqa: BLE001 - keep the socket alive
                     await self._write(error_response(request_id, -32000, str(exc)))
                 else:
-                    await self._write(response(request_id, result))
-                if request["method"] == "hello" and not self.handshaken:
+                    await self._write(response(request_id, result), request_id=request_id)
+                if not self.handshaken:
                     break
         finally:
             await self.close()
 
     async def close(self) -> None:
-        if self._turn_task is not None and not self._turn_task.done():
-            loop = self.server.runtime.loop
-            if loop is not None:
-                loop.abort()
-            self._turn_task.cancel()
-            await asyncio.gather(self._turn_task, return_exceptions=True)
-        self._turn_task = None
-        self.writer.close()
-        with contextlib.suppress(Exception):
-            await self.writer.wait_closed()
+        async with self._close_lock:
+            if self._closed:
+                return
+            policy = self.server.runtime.policy
+            if policy is not None:
+                for request in policy.pending_requests():
+                    with contextlib.suppress(ValueError, RuntimeError):
+                        policy.abort(request.key)
+            if self._turn_task is not None and not self._turn_task.done():
+                loop = self.server.runtime.loop
+                if loop is not None:
+                    loop.abort()
+                self._turn_task.cancel()
+                await asyncio.gather(self._turn_task, return_exceptions=True)
+            self._turn_task = None
+            self.writer.close()
+            with contextlib.suppress(Exception):
+                await self.writer.wait_closed()
+            self._closed = True
+
+    async def _discard_frame(self) -> bool:
+        while True:
+            byte = await self.reader.read(1)
+            if not byte:
+                return False
+            if byte == b"\n":
+                return True
 
     async def _dispatch(self, method: str, params: dict[str, Any]) -> object:
         if method == "hello":
@@ -184,11 +251,10 @@ class _Client:
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
         if method == "list_sessions":
-            return {"sessions": [item.to_dict() for item in self.server.runtime.list_sessions()]}
+            return self._list_sessions()
         if method == "new_session":
             await self._require_idle()
-            await self.server.runtime.close()
-            metadata = self.server.runtime.create_session(
+            metadata = await self.server.runtime.create_session(
                 provider=_optional_string(params, "provider"),
                 model=_optional_string(params, "model"),
             )
@@ -196,8 +262,7 @@ class _Client:
         if method == "resume":
             await self._require_idle()
             session_id = _required_string(params, "session_id")
-            await self.server.runtime.close()
-            metadata = self.server.runtime.resume_session(session_id)
+            metadata = await self.server.runtime.resume_session(session_id)
             return {"session": metadata.to_dict()}
         if method == "send":
             return await self._send(_required_string(params, "text"))
@@ -261,13 +326,17 @@ class _Client:
         loop = self.server.runtime.loop
         if policy is None or loop is None:
             raise ProtocolError(-32003, "no active session")
-        resolved = policy.resolve(request_id, ApprovalDecision.ALLOW if method == "approve" else ApprovalDecision.DENY)
+        core_key = self._approval_keys.get(request_id, request_id)
+        resolved = policy.resolve(
+            core_key,
+            ApprovalDecision.ALLOW if method == "approve" else ApprovalDecision.DENY,
+        )
         if not resolved:
             raise ProtocolError(-32006, f"approval request not found or already resolved: {request_id}")
         active = self._turn_task is not None and not self._turn_task.done()
-        if not active and loop.prepare_resume_pending_tool(request_id):
+        if not active and isinstance(core_key, str) and loop.prepare_resume_pending_tool(core_key):
             self.turn_state = "tool"
-            task = asyncio.create_task(self._resume_tool(request_id))
+            task = asyncio.create_task(self._resume_tool(core_key))
             self._turn_task = task
         return {"accepted": True, "request_id": request_id, "decision": method}
 
@@ -291,7 +360,7 @@ class _Client:
         if runtime.policy is not None:
             pending = [
                 {
-                    "request_id": item.request_id,
+                    "request_id": self._wire_approval_key(item.key),
                     "tool_call": item.tool_call.to_dict(),
                 }
                 for item in runtime.policy.pending_requests()
@@ -368,9 +437,11 @@ class _Client:
             )
             return
         if kind is StreamEventType.TOOL_EXECUTION_START:
+            self.turn_state = "tool"
             await self._notify("tool_start", tool_call=_tool_call(event), data=dict(event.data))
             return
         if kind is StreamEventType.TOOL_EXECUTION_END:
+            self.turn_state = "running"
             await self._notify(
                 "tool_end",
                 tool_call=_tool_call(event),
@@ -384,9 +455,17 @@ class _Client:
             )
             return
         if kind is StreamEventType.TOOL_APPROVAL_START:
+            self.turn_state = "tool"
+            raw_request_id = event.tool_call.id if event.tool_call else ""
+            child_id = event.data.get("agent_instance_id")
+            core_key: str | tuple[str, str] = (
+                (child_id, raw_request_id)
+                if isinstance(child_id, str) and raw_request_id
+                else raw_request_id
+            )
             await self._notify(
                 "approval_request",
-                request_id=event.tool_call.id if event.tool_call else None,
+                request_id=self._wire_approval_key(core_key),
                 tool_call=_tool_call(event),
             )
             return
@@ -406,11 +485,55 @@ class _Client:
 
     async def _notify(self, event: str, **fields: object) -> None:
         session_id = self.server.runtime.opened.metadata.session_id if self.server.runtime.opened else None
-        await self._write(notification(event, session_id, **fields))
+        payload = notification(event, session_id, **fields)
+        if len(payload) > MAX_FRAME_BYTES:
+            payload = notification(
+                "error",
+                session_id,
+                error={
+                    "code": "frame_too_large",
+                    "message": "outbound event exceeded 1048576 bytes",
+                },
+                data={"event": event},
+            )
+        await self._write(payload)
 
-    async def _write(self, payload: bytes) -> None:
+    def _list_sessions(self) -> dict[str, object]:
+        sessions = [item.to_dict() for item in self.server.runtime.list_sessions()]
+        page: list[dict[str, Any]] = []
+        for offset, item in enumerate(sessions):
+            candidate = [*page, item]
+            if len(response(0, {"sessions": candidate})) > MAX_FRAME_BYTES - 128:
+                return {
+                    "sessions": page,
+                    "truncated": True,
+                    "next_offset": offset,
+                }
+            page = candidate
+        return {"sessions": page}
+
+    def _wire_approval_key(self, key: str | tuple[str, str]) -> str:
+        if isinstance(key, str):
+            self._approval_keys[key] = key
+            return key
+        wire = self._approval_wires.get(key)
+        if wire is None:
+            wire = f"approval-{uuid4().hex}"
+            self._approval_wires[key] = wire
+            self._approval_keys[wire] = key
+        return wire
+
+    async def _write(
+        self, payload: bytes, *, request_id: str | int | None = None
+    ) -> None:
         async with self._write_lock:
             try:
+                if len(payload) > MAX_FRAME_BYTES:
+                    payload = error_response(
+                        request_id,
+                        -32007,
+                        "outbound frame exceeds 1048576 bytes",
+                    )
                 self.writer.write(payload)
                 await self.writer.drain()
             except (ConnectionError, BrokenPipeError):
@@ -451,11 +574,25 @@ def _data_text(data: Mapping[str, object]) -> str:
 
 
 async def run_server(server: ZetaServer) -> None:
+    loop = asyncio.get_running_loop()
+    stopped = asyncio.Event()
+    installed: list[signal.Signals] = []
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, stopped.set)
+        except (NotImplementedError, RuntimeError):
+            continue
+        installed.append(signum)
     await server.start()
+    serving = asyncio.create_task(server.serve_forever())
     try:
-        await server.serve_forever()
+        await stopped.wait()
     finally:
         await server.close()
+        serving.cancel()
+        await asyncio.gather(serving, return_exceptions=True)
+        for signum in installed:
+            loop.remove_signal_handler(signum)
 
 
 __all__ = ["ZetaServer", "run_server"]

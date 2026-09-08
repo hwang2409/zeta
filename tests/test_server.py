@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
+import socket
+import stat
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from zeta.core.fake import FakeBackend, ScriptedTurn
+from zeta.core.session import SessionMetadata
 from zeta.server import ZetaServer
+from zeta.server.protocol import MAX_FRAME_BYTES
+from zeta.server.server import _Client
 from zeta.types import TextContent, ToolCall
 
 TIMEOUT = 3
@@ -213,3 +221,185 @@ async def test_server_can_bind_localhost_port(tmp_path: Path) -> None:
         assert result[-1]["result"]["protocol_version"] == "1.0"
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_oversized_frame_returns_error_and_keeps_connection_usable(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    reader, writer = await _ready(server)
+    try:
+        writer.write(b"x" * (MAX_FRAME_BYTES + 32) + b"\n")
+        await writer.drain()
+        error = await _read(reader)
+        assert error["error"]["code"] == -32600
+        status = await _request(reader, writer, 3, "status")
+        assert status[-1]["result"]["session"] is not None
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_marks_oversized_result_as_truncated(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    huge = SessionMetadata.new(
+        session_id="a" * 32,
+        provider="fake",
+        model="offline",
+        cwd=str(tmp_path),
+        retained_tail=8,
+        compaction_budget=200_000,
+        system_prompt="x" * MAX_FRAME_BYTES,
+    )
+    server.runtime.list_sessions = lambda: [huge]
+    reader, writer = await _ready(server)
+    try:
+        frames = await _request(reader, writer, 3, "list_sessions")
+        result = frames[-1]["result"]
+        assert result["truncated"] is True
+        assert result["sessions"] == []
+        assert len(json.dumps(frames[-1]).encode()) <= MAX_FRAME_BYTES
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_socket_start_rejects_regular_path_and_removes_stale_socket(
+    tmp_path: Path,
+) -> None:
+    socket_path = _socket_path(tmp_path)
+    socket_path.write_text("do not delete")
+    server = ZetaServer(home=tmp_path, socket_path=socket_path, provider="fake")
+    with pytest.raises(RuntimeError, match="non-socket"):
+        await server.start()
+    socket_path.unlink()
+
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(socket_path))
+    stale.close()
+    await server.start()
+    try:
+        assert stat.S_IMODE(socket_path.stat().st_mode) == 0o600
+    finally:
+        await server.close()
+    assert not socket_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_rejected_pre_hello_request_closes_connection(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    reader, writer = await _connect(server)
+    try:
+        writer.write(
+            b'{"jsonrpc":"2.0","id":1,"method":"status","params":{}}\n'
+        )
+        await writer.drain()
+        error = await _read(reader)
+        assert error["error"]["code"] == -32002
+        assert await asyncio.wait_for(reader.read(), TIMEOUT) == b""
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_aborts_pending_approval_without_phantom(tmp_path: Path) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    await _request(reader, writer, 3, "send", {"text": "read it"})
+    await _event(reader, "approval_request")
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    assert server.runtime.policy is not None
+    assert server.runtime.policy.pending_requests() == []
+    await server.close()
+
+
+def test_delegated_approval_wire_keys_are_unique() -> None:
+    client = object.__new__(_Client)
+    client._approval_wires = {}
+    client._approval_keys = {}
+    first = client._wire_approval_key(("child-a", "same"))
+    second = client._wire_approval_key(("child-b", "same"))
+    assert first != second
+    assert client._approval_keys[first] == ("child-a", "same")
+    assert client._approval_keys[second] == ("child-b", "same")
+
+
+@pytest.mark.asyncio
+async def test_bad_resume_preserves_current_session(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    reader, writer = await _ready(server)
+    try:
+        before = (await _request(reader, writer, 3, "status"))[-1]["result"]["session"][
+            "session_id"
+        ]
+        error = (await _request(reader, writer, 4, "resume", {"session_id": "missing"}))[-1]
+        assert error["error"]["code"] == -32602
+        after = (await _request(reader, writer, 5, "status"))[-1]["result"]["session"][
+            "session_id"
+        ]
+        assert after == before
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_sigterm_cleans_socket_after_streaming_delta(tmp_path: Path) -> None:
+    socket_path = _socket_path(tmp_path)
+    script = """
+import asyncio
+import sys
+from zeta.server import ZetaServer, run_server
+
+
+async def main() -> None:
+    server = ZetaServer(
+        home=sys.argv[1], socket_path=sys.argv[2], provider="fake"
+    )
+    await run_server(server)
+
+
+asyncio.run(main())
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        str(tmp_path),
+        str(socket_path),
+        env=environment,
+    )
+    try:
+        for _ in range(100):
+            if socket_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(reader, writer, 3, "send", {"text": "hello"})
+        assert (await _event(reader, "assistant_delta"))["delta"]
+        process.send_signal(signal.SIGTERM)
+        await asyncio.wait_for(process.wait(), TIMEOUT)
+        assert process.returncode == 0
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+    assert not socket_path.exists()

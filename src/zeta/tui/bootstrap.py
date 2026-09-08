@@ -5,10 +5,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from ..core.approval import ApprovalDecision, ApprovalPolicy
-from ..core.hooks import load_hooks_for_provider
 from ..core.project_context import (
     ProjectContext,
     PromptArgumentError,
@@ -22,11 +20,9 @@ from ..core.session import (
     env_home,
     format_relative_age,
 )
-from ..core.slash import resolve_session_budget
-from ..loop import AgentLoop
 from ..settings import ResolvedConfig
 from ..settings import resolve as resolve_settings
-from ..tools._user_discovery import apply_external_tools
+from ..submission import compose_runtime
 from . import theme as _theme
 from .key_bindings import KeybindingError, resolve_keybindings
 from .layout import content_width, resume_picker_line
@@ -74,6 +70,7 @@ def _create_app_with_root(
 
     ephemeral = ephemeral_root is not None
     manager = SessionManager(ephemeral_root if ephemeral else home)
+    opened = None
     try:
         system_prompt_override = resolve_prompt_argument(
             getattr(args, "system_prompt", None)
@@ -149,7 +146,6 @@ def _create_app_with_root(
             )
         provider = provider_override or metadata.provider
         model = model_override or metadata.model
-        store = opened.store
         # Explicit --system-prompt / --append-system-prompt on resume WINS
         # over the snapshot: rebuild the context from the flags, overwrite
         # the snapshot, and warn that the prompt cache will rebuild. The
@@ -184,13 +180,7 @@ def _create_app_with_root(
             )
     else:
         provider = config.provider
-        backend, selected_model = _app.build_backend(
-            provider,
-            config.model,
-            home=home,
-            stall_seconds=config.stream_stall_seconds,
-            stall_retries=config.stream_stall_retries,
-        )
+        model = config.model
         project_context = _app.load_project_context(
             cwd=Path.cwd(),
             repo_root=discover_repo_root(Path.cwd()),
@@ -198,39 +188,6 @@ def _create_app_with_root(
             system_override=system_prompt_override,
             system_append=system_prompt_append,
         )
-        created_budget, created_pin = resolve_session_budget(
-            0, False, provider, selected_model, config.token_budget
-        )
-        opened = manager.create(
-            provider=provider,
-            model=selected_model,
-            cwd=Path.cwd(),
-            compaction_budget=created_budget,
-            system_prompt=project_context.system_prompt,
-            context_files=[str(path) for path in project_context.files],
-            budget_pinned=created_pin,
-        )
-        metadata = opened.metadata
-        store = opened.store
-    if resuming:
-        backend, selected_model = _app.build_backend(
-            provider,
-            model,
-            home=home,
-            stall_seconds=config.stream_stall_seconds,
-            stall_retries=config.stream_stall_retries,
-        )
-    hooks = load_hooks_for_provider(home, provider)
-    approval_default = (
-        ApprovalDecision.ALLOW if config.yolo else ApprovalDecision.ASK
-    )
-    approval_policy = ApprovalPolicy(
-        store=store,
-        default=approval_default,
-        always_allow=config.approval_allow,
-        always_deny=config.approval_deny,
-        always_ask=config.approval_ask,
-    )
     pending_override = None
     if resuming and mismatches:
         pending_override = (
@@ -260,43 +217,28 @@ def _create_app_with_root(
     def plan_mode_changed(enabled: bool) -> None:
         manager.record_plan_mode(metadata, enabled=enabled)
 
-    effective_token_budget, budget_pinned = resolve_session_budget(
-        metadata.compaction_budget,
-        metadata.budget_pinned,
-        provider,
-        selected_model,
-        config.token_budget,
-    )
-    if (
-        effective_token_budget != metadata.compaction_budget
-        or budget_pinned != metadata.budget_pinned
-    ):
-        manager.record_budget(
-            metadata, budget=effective_token_budget, pinned=budget_pinned
-        )
     max_turns_override = getattr(args, "max_turns", None)
-    loop_kwargs: dict[str, Any] = {
-        "approval_policy": approval_policy,
-        "hooks": hooks,
-        "token_budget": effective_token_budget,
-        "retained_tail": metadata.retained_tail,
-        "on_completion_success": completion_success,
-        "on_plan_mode_change": plan_mode_changed,
-        "system_prompt": project_context.system_prompt,
-    }
-    if max_turns_override is not None and max_turns_override > 0:
-        loop_kwargs["max_turns"] = max_turns_override
-    loop = AgentLoop(backend, store, **loop_kwargs)
-    if metadata.plan_mode:
-        loop.set_plan_mode(True)
-    repo_root = discover_repo_root(Path(store.cwd))
-    loop.set_mcp_scope(home=home, project_dir=repo_root)
-    external_tools = apply_external_tools(
-        loop.tool_registry,
+    composition = compose_runtime(
         home=home,
-        project_dir=repo_root / ".zeta",
+        cwd=Path.cwd(),
+        manager=manager,
+        config=config,
+        provider=provider,
+        model=model,
+        project_context=project_context,
+        backend_builder=_app.build_backend,
+        opened=opened,
+        on_completion_success=completion_success,
+        on_plan_mode_change=plan_mode_changed,
+        max_turns=max_turns_override,
     )
-    loop.tool_schemas = list(loop.tool_registry.schemas)
+    opened = composition.opened
+    metadata = opened.metadata
+    loop = composition.loop
+    approval_policy = composition.policy
+    selected_model = composition.model
+    external_tools = composition.external_tools
+    budget_pinned = composition.budget_pinned
     theme_notices = _apply_startup_theme(config.theme, home)
     _validate_keybindings(config.keybindings)
     startup_notices = (
