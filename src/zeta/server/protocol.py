@@ -321,31 +321,6 @@ def _request_id_hint(line: bytes) -> str | int | None:
     return None
 
 
-_CODEC = FrameCodec()
-
-
-def parse_request(line: bytes) -> dict[str, Any]:
-    return _CODEC.parse_request(line)
-
-
-def encode(value: dict[str, Any]) -> bytes:
-    return _CODEC.encode(value)
-
-
-def response(request_id: str | int | None, result: object) -> bytes:
-    return _CODEC.response(request_id, result)
-
-
-def error_response(
-    request_id: str | int | None, code: int, message: str, data: object | None = None
-) -> bytes:
-    return _CODEC.error_response(request_id, code, message, data)
-
-
-def notification(event: str, session_id: str | None, **fields: object) -> bytes:
-    return _CODEC.notification(event, session_id, **fields)
-
-
 def bounded(value: str, limit: int = TOOL_OUTPUT_MAX_BYTES) -> str:
     raw = value.encode("utf-8")
     if len(raw) <= limit:
@@ -363,9 +338,4 @@ __all__ = [
     "FrameCodec",
     "ProtocolError",
     "bounded",
-    "encode",
-    "error_response",
-    "notification",
-    "parse_request",
-    "response",
 ]

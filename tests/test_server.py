@@ -121,6 +121,32 @@ async def test_server_streams_fake_turn_over_real_socket(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_unexpected_turn_error_matches_event_schema(tmp_path: Path) -> None:
+    duplicate = ToolCall("duplicate-id", "read", {})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[duplicate, duplicate])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "trigger failure"})
+        error = await _event(reader, "error")
+        assert error["error"] == {
+            "code": "server_error",
+            "message": "duplicate tool call id in one execution batch",
+        }
+        assert error["data"] == {}
+        assert isinstance(error["session_id"], str)
+        assert (await _request(reader, writer, 4, "status"))[-1]["result"][
+            "state"
+        ] == "idle"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_approval_round_trip_and_deny(tmp_path: Path) -> None:
     target = tmp_path / "input.txt"
     target.write_text("approved")
@@ -357,11 +383,12 @@ def test_request_id_limit_is_inclusive() -> None:
             "method": "status",
         }
     ).encode()
-    from zeta.server.protocol import ProtocolError, parse_request
+    from zeta.server.protocol import ProtocolError
 
-    assert parse_request(valid)["id"] == "x" * MAX_REQUEST_ID_BYTES
+    codec = FrameCodec()
+    assert codec.parse_request(valid)["id"] == "x" * MAX_REQUEST_ID_BYTES
     with pytest.raises(ProtocolError, match="request id exceeds"):
-        parse_request(invalid)
+        codec.parse_request(invalid)
 
 
 @pytest.mark.asyncio

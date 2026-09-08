@@ -28,10 +28,8 @@ class RuntimeComposition:
     opened: OpenedSession
     loop: AgentLoop
     policy: ApprovalPolicy
-    provider: str
     model: str
     external_tools: ExternalToolDiscovery
-    effective_token_budget: int
     budget_pinned: bool
 
 
@@ -127,10 +125,8 @@ def compose_runtime(
         opened=opened,
         loop=loop,
         policy=policy,
-        provider=provider,
         model=selected_model,
         external_tools=external_tools,
-        effective_token_budget=effective_budget,
         budget_pinned=budget_pinned,
     )
 

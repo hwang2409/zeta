@@ -185,11 +185,6 @@ class _Client:
         self._approval_wires: dict[str | tuple[str, str], str] = {}
         self._approval_keys: dict[str, str | tuple[str, str]] = {}
 
-    @property
-    def turn_state(self) -> str:
-        state = self.server.runtime.state
-        return state.status if state is not None else "idle"
-
     async def run(self) -> None:
         try:
             while True:
@@ -465,6 +460,7 @@ class _Client:
                 "error",
                 session_id,
                 error={"code": "server_error", "message": str(exc)},
+                data={},
             )
         finally:
             if self.server.runtime.state is state:

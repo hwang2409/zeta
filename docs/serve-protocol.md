@@ -223,8 +223,8 @@ the tool call and empty or loop-provided `data`.
 ```
 
 `error` is a loud structured event. It carries `error` with `code` and
-`message`, plus optional loop `data`. The server emits it for provider and
-loop failures, then returns to `idle`.
+`message`, plus a `data` object. The server emits it for provider and loop
+failures, then returns to `idle`.
 
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"error","session_id":"abc123","error":{"code":"backend_error","message":"provider failed"},"data":{}}}
