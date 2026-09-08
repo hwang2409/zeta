@@ -903,6 +903,15 @@ def send_to_run(
             f"no live run {child_instance_id!r}; it already finished or was "
             "never started"
         )
+    # Only runs drain queued follow-ups. Other agent types would leave the
+    # prompt in the child's store with no one to consume it.
+    agent_type = marker.get("agent_type")
+    if agent_type != "run":
+        actual = agent_type if type(agent_type) is str and agent_type else "general"
+        return (
+            f"{child_instance_id!r} is a {actual} agent, not a run; agent_send "
+            "only works with agent_type=run"
+        )
     child_path = Path(str(marker["child_session_path"]))
     child_store = ConversationStore(
         child_path.parent, session_id=child_path.name, cwd=parent_store.cwd

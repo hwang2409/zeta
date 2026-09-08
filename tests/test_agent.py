@@ -3087,6 +3087,29 @@ def test_send_to_run_rejects_unknown_and_finished_runs(tmp_path: Path) -> None:
     assert error == "message must be a nonempty string"
 
 
+def test_send_to_run_rejects_non_run_children(tmp_path: Path) -> None:
+    """A queued prompt would rot: only consume_run drains the queue."""
+
+    store = ConversationStore(tmp_path)
+    child_call = ToolCall(
+        "explore-1",
+        "agent",
+        {"prompt": "look", "description": "explore", "agent_type": "explore"},
+    )
+    store.register_agent_child(
+        child_call,
+        child_session_path=str(tmp_path / "agents" / "1"),
+        description="explore",
+        agent_type="explore",
+        background=True,
+        child_instance_id="sess:1",
+    )
+
+    error = send_to_run(store, "sess:1", "hello")
+    assert error is not None
+    assert "explore" in error and "agent_send" in error
+
+
 @pytest.mark.asyncio
 async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
     backend = RunBackend()
