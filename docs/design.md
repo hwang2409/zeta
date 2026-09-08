@@ -160,6 +160,8 @@ the harness-native distillation.
 
 ## Deferred / open followups (not yet ticketed)
 
+- **Residual login-test flake**: `tests/test_login.py::test_login_sigint_closes_callback_server` failed once under full-suite load with concurrent filesystem writes (2026-09-08, post-ZETA-91, post-ZETA-88-round-2; 5/5 green isolated). One occurrence; fold into the next deflake round if it recurs.
+- **zeta serve session hardening**: a killed serve can leave a half-written session dir (`conversation.jsonl` without `meta.json`) that `status` still advertises as current, wedging clients on resume (hit live 2026-09-08; client-side recovery shipped in #131). Server side: create session dirs atomically (write meta.json via tmp+rename before advertising) and exclude unopenable sessions from `status`/`list_sessions`.
 - **Prompt-cache management**: ZETA-23 landed usage observability, cache-aware accounting, and /status hit rate. Explicit breakpoint tuning and richer observability UI remain deferred.
 - **Sub-agents, slash-command DSL**: skills half is now ticketed as ZETA-26; sub-agents landed via ZETA-37..49; the slash-command DSL is now ticketed as ZETA-53..55 (macro DSL arc).
 - **MCP**: OAuth / token-refresh auth flows and resources-as-attachments deferred; QoL arc (observability, config ergonomics, resilience, prompts) ticketed as ZETA-56..59.
