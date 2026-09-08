@@ -20,11 +20,11 @@ from zeta.loop import AgentLoop
 from zeta.mcp import MCPMount
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
-from zeta.tui.agent_card import AgentRunCommandMixin
 from zeta.tools.agent_presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
 )
+from zeta.tui.agent_card import AgentRunCommandMixin
 from zeta.tui.render import render_event
 from zeta.tui.todo import TodoWidget
 from zeta.types import (
@@ -2924,33 +2924,33 @@ def test_run_preset_is_registered_with_a_long_cap(tmp_path: Path) -> None:
 async def test_a_run_does_not_draw_on_the_shared_sibling_budget(
     tmp_path: Path,
 ) -> None:
-    """The pool is sized by whichever preset spawns first; a run must not inherit it."""
+    """A tree budget is fresh per top-level call (ZETA-62), so a run started
+    after a smaller-preset sibling on the same loop must not inherit its cap.
+    """
 
     backend = FakeBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call("explore-1", agent_type="explore")]),
-            ScriptedTurn([TextContent("done")]),
-        ]
-    )
-    store = ConversationStore(tmp_path / "explore-first")
-    loop = AgentLoop(backend, store, max_turns=1)
-    await _collect(loop.run_turn("start"))
-    # An explore child sized the shared pool at its own 15-turn cap.
-    assert loop._shared_agent_budget is not None
-    assert loop._shared_agent_budget.limit == 15
-
-    run_backend = FakeBackend(
-        [
+            ScriptedTurn([TextContent("explore done")]),
             ScriptedTurn(tool_calls=[_run_agent_call()]),
-            ScriptedTurn([TextContent("done")]),
+            ScriptedTurn([TextContent("run done")]),
         ]
     )
-    run_store = ConversationStore(tmp_path / "run-only")
-    run_loop = AgentLoop(run_backend, run_store, max_turns=1)
-    await _collect(run_loop.run_turn("start"))
-    # A run provisions its own budget, so the parent's pool is never created.
-    assert run_loop._shared_agent_budget is None
-    await run_loop.close()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    # The explore child sized its own tree at its 15-turn preset cap.
+    explore_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    assert explore_store.agent_lifecycle()["tree_budget"] == 15
+
+    await _collect(loop.run_turn("now start the run"))
+    # The run gets a fresh tree, not the explore sibling's smaller cap.
+    run_store = ConversationStore(store.session_dir / "agents", session_id="2")
+    assert run_store.agent_lifecycle()["tree_budget"] == 150
+
+    await _wait_for_notification(store, "completed")
+    await loop.close()
 
 
 @pytest.mark.asyncio
