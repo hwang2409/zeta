@@ -14,7 +14,11 @@ from zeta.core.project_context import (
 from zeta.core.slash import SlashStatus, _format_status
 
 
-def test_packaged_identity_loads_from_clean_wheel_install(tmp_path: Path) -> None:
+def test_packaged_identity_loads_from_clean_wheel_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pip cache writes belong to this fixture, not the watched default home.
+    monkeypatch.setenv("PIP_CACHE_DIR", str(tmp_path / "pip-cache"))
     repo_root = Path(__file__).parents[1]
     wheel_dir = tmp_path / "wheel"
     wheel_dir.mkdir()
