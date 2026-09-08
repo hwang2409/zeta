@@ -8,6 +8,7 @@ import json
 import math
 import os
 import tempfile
+import time
 import uuid
 import warnings
 from collections.abc import Iterable, Iterator, Mapping
@@ -35,6 +36,95 @@ class PendingPromptsClosedError(RuntimeError):
     """Raised when a run has already decided to finish and refuses new prompts."""
 
 
+class PendingPromptCommitTimeoutError(TimeoutError):
+    """Raised when a pending-prompt commit misses its pre-write deadline."""
+
+
+class PendingPromptQueue:
+    """Own every durable append, acknowledgement, close, and timeout decision."""
+
+    def __init__(self, store: ConversationStore) -> None:
+        self._store = store
+
+    @staticmethod
+    def _check_deadline(deadline: float | None) -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise PendingPromptCommitTimeoutError(
+                "pending prompt commit deadline exceeded"
+            )
+
+    def append(
+        self, text: str, *, deadline: float | None = None
+    ) -> ConversationEntry:
+        if type(text) is not str or not text.strip():
+            raise ValueError("pending prompt text must be a nonempty string")
+        if len(text) > MAX_PENDING_PROMPT_TEXT:
+            raise ValueError("pending prompt text is too long")
+        with self._store._append_lock(deadline=deadline):
+            self._store._load()
+            self._check_deadline(deadline)
+            if self._queue_closed_unlocked():
+                raise PendingPromptsClosedError("pending prompt queue is closed")
+            entry = self._store._append_row_unlocked(
+                "pending_prompt", {"text": text}, deadline=deadline
+            )
+            return self._store._snapshot_entry(entry)
+
+    def pending(self) -> list[ConversationEntry]:
+        with self._store._append_lock():
+            self._store._load()
+            return self._pending_unlocked()
+
+    def acknowledge(self, prompt_id: str) -> None:
+        with self._store._append_lock():
+            self._store._load()
+            branch = self._store.replay()
+            prompts = [entry for entry in branch if entry.type == "pending_prompt"]
+            if not any(entry.id == prompt_id for entry in prompts):
+                raise ValueError(f"unknown pending prompt: {prompt_id}")
+            acknowledged = {
+                entry.data["prompt_id"]
+                for entry in branch
+                if entry.type == "pending_prompt_ack"
+            }
+            if prompt_id not in acknowledged:
+                self._store._append_row_unlocked(
+                    "pending_prompt_ack", {"prompt_id": prompt_id}
+                )
+
+    def close_if_empty(self) -> list[ConversationEntry]:
+        with self._store._append_lock():
+            self._store._load()
+            pending = self._pending_unlocked()
+            if not pending and not self._queue_closed_unlocked():
+                self._store._append_row_unlocked("pending_queue_closed", {})
+            return pending
+
+    def close(self) -> None:
+        with self._store._append_lock():
+            self._store._load()
+            if not self._queue_closed_unlocked():
+                self._store._append_row_unlocked("pending_queue_closed", {})
+
+    def _queue_closed_unlocked(self) -> bool:
+        return any(
+            entry.type == "pending_queue_closed" for entry in self._store._entries
+        )
+
+    def _pending_unlocked(self) -> list[ConversationEntry]:
+        branch = self._store.replay()
+        acknowledged = {
+            entry.data["prompt_id"]
+            for entry in branch
+            if entry.type == "pending_prompt_ack"
+        }
+        return [
+            self._store._snapshot_entry(entry)
+            for entry in branch
+            if entry.type == "pending_prompt" and entry.id not in acknowledged
+        ]
+
+
 def _valid_agent_stats(value: object) -> bool:
     if type(value) is not dict:
         return False
@@ -59,6 +149,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         session_id: str | None = None,
         cwd: str | Path | None = None,
         bash_cwd: str | Path | None = None,
+        _lock_deadline: float | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -91,7 +182,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._agent_parent: dict[str, Any] | None = None
         self._agent_canceled: dict[str, Any] | None = None
         self._agent_lifecycle: dict[str, Any] | None = None
-        with self._append_lock():
+        self._write_deadline: float | None = None
+        self.pending_prompt_queue = PendingPromptQueue(self)
+        with self._append_lock(deadline=_lock_deadline):
             self._load()
             self._load_session_state()
 
@@ -560,15 +653,41 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             ) from exc
 
     def _write_line(self, row: dict[str, Any]) -> None:
+        encoded = encode_json(row) + b"\n"
+        if (
+            self._write_deadline is not None
+            and time.monotonic() >= self._write_deadline
+        ):
+            raise PendingPromptCommitTimeoutError(
+                "pending prompt commit deadline exceeded"
+            )
+        self._write_bytes(encoded)
+
+    def _write_bytes(self, line: bytes) -> None:
         with self.path.open("ab") as handle:
-            handle.write(encode_json(row) + b"\n")
+            handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
 
     @contextmanager
-    def _append_lock(self) -> Iterator[None]:
+    def _append_lock(self, *, deadline: float | None = None) -> Iterator[None]:
         with self.lock_path.open("a+") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            if deadline is None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            else:
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise PendingPromptCommitTimeoutError(
+                            "pending prompt commit deadline exceeded"
+                        )
+                    try:
+                        fcntl.flock(
+                            handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                        )
+                    except BlockingIOError:
+                        time.sleep(max(0, min(0.01, deadline - time.monotonic())))
+                    else:
+                        break
             try:
                 yield
             finally:
@@ -590,6 +709,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         entry_type: str,
         data: dict[str, Any],
         parent_id: str | None = None,
+        *,
+        deadline: float | None = None,
     ) -> ConversationEntry:
         prior_ids = {entry.id for entry in self._entries}
         if parent_id is not None and parent_id not in prior_ids:
@@ -605,7 +726,12 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             type=entry_type,
             data=copy.deepcopy(data),
         )
-        self._write_line(entry.to_dict())
+        previous_deadline = self._write_deadline
+        self._write_deadline = deadline
+        try:
+            self._write_line(entry.to_dict())
+        finally:
+            self._write_deadline = previous_deadline
         self._entries.append(entry)
         return entry
 
@@ -681,100 +807,29 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._append_row("notification_ack", {"notification_id": notification_id})
 
     def append_pending_prompt(self, text: str) -> ConversationEntry:
-        """Queue a follow-up for a run to pick up at its next turn boundary.
+        """Queue a follow-up through the pending-prompt queue owner."""
 
-        Written into the run's own store, by the parent or the UI rather than by
-        the run itself. It stays out of the run's context until the driver hands
-        it to run_turn, because context assembly keeps only message entries.
-        Raises PendingPromptsClosedError if consume_run already decided the run
-        was finished; the parent has to treat the target as gone.
-        """
-
-        if type(text) is not str or not text.strip():
-            raise ValueError("pending prompt text must be a nonempty string")
-        if len(text) > MAX_PENDING_PROMPT_TEXT:
-            raise ValueError("pending prompt text is too long")
-        with self._append_lock():
-            self._load()
-            if self._pending_queue_closed_unlocked():
-                raise PendingPromptsClosedError(
-                    "pending prompt queue is closed"
-                )
-            entry = self._append_row_unlocked("pending_prompt", {"text": text})
-            return self._snapshot_entry(entry)
-
-    def _pending_queue_closed_unlocked(self) -> bool:
-        return any(entry.type == "pending_queue_closed" for entry in self._entries)
+        return self.pending_prompt_queue.append(text)
 
     def close_pending_queue_if_empty(self) -> list[ConversationEntry]:
-        """Return pending prompts; if none, atomically close the queue.
+        """Return pending prompts or close the queue through its owner."""
 
-        Closes the door on new append_pending_prompt calls so that consume_run
-        can return without a parent racing an empty-queue check and a queued
-        follow-up that would then rot. If prompts are queued the door stays
-        open and the caller drains them.
-        """
-
-        with self._append_lock():
-            self._load()
-            branch = self.replay()
-            acknowledged = {
-                entry.data["prompt_id"]
-                for entry in branch
-                if entry.type == "pending_prompt_ack"
-            }
-            pending = [
-                entry
-                for entry in branch
-                if entry.type == "pending_prompt" and entry.id not in acknowledged
-            ]
-            if not pending and not self._pending_queue_closed_unlocked():
-                self._append_row_unlocked("pending_queue_closed", {})
-            return [self._snapshot_entry(entry) for entry in pending]
+        return self.pending_prompt_queue.close_if_empty()
 
     def close_pending_queue(self) -> None:
-        """Close the prompt queue, including when prompts remain unacknowledged."""
+        """Close the pending-prompt queue through its owner."""
 
-        with self._append_lock():
-            self._load()
-            if not self._pending_queue_closed_unlocked():
-                self._append_row_unlocked("pending_queue_closed", {})
+        self.pending_prompt_queue.close()
 
     def pending_prompts(self) -> list[ConversationEntry]:
-        """Return queued follow-ups the run has not consumed yet.
+        """Return queued follow-ups through the pending-prompt queue owner."""
 
-        Reloads first: the queue is written by the parent or the UI through a
-        different handle on the same directory, so an in-memory branch would
-        never show a follow-up that arrived after this handle's last write.
-        """
-
-        with self._append_lock():
-            self._load()
-        branch = self.replay()
-        acknowledged = {
-            entry.data["prompt_id"]
-            for entry in branch
-            if entry.type == "pending_prompt_ack"
-        }
-        return [
-            entry
-            for entry in branch
-            if entry.type == "pending_prompt" and entry.id not in acknowledged
-        ]
+        return self.pending_prompt_queue.pending()
 
     def acknowledge_pending_prompt(self, prompt_id: str) -> None:
-        """Durably mark one queued follow-up as delivered to the run."""
+        """Acknowledge a follow-up through the pending-prompt queue owner."""
 
-        prompts = [entry for entry in self.replay() if entry.type == "pending_prompt"]
-        if not any(entry.id == prompt_id for entry in prompts):
-            raise ValueError(f"unknown pending prompt: {prompt_id}")
-        if any(
-            entry.data["prompt_id"] == prompt_id
-            for entry in self.replay()
-            if entry.type == "pending_prompt_ack"
-        ):
-            return
-        self._append_row("pending_prompt_ack", {"prompt_id": prompt_id})
+        self.pending_prompt_queue.acknowledge(prompt_id)
 
     def append_compaction_marker(
         self,

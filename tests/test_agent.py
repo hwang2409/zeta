@@ -1,6 +1,7 @@
 import asyncio
 import json
 import threading
+import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -3189,6 +3190,9 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     task.cancel()
     await asyncio.sleep(0)
     assert not task.done()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
     release.set()
     result = await task
 
@@ -3196,6 +3200,53 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     assert [entry.data["text"] for entry in child_store.pending_prompts()] == [
         "follow up"
     ]
+
+
+@pytest.mark.asyncio
+async def test_agent_send_aborts_before_append_when_store_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(
+        parent_store.session_dir / "agents", session_id="1"
+    )
+    call = _run_agent_call()
+    child_store.mark_agent_parent(call.id, agent_type="run")
+    parent_store.allocate_agent_index()
+    parent_store.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="long horizon run",
+        agent_type="run",
+        background=True,
+        child_instance_id="parent:1",
+    )
+
+    registry = ToolRegistry(tmp_path, session_store=parent_store)
+    lock = child_store._append_lock()
+    lock.__enter__()
+    try:
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "agent-send-call",
+                    "agent_send",
+                    {"child_instance_id": "parent:1", "message": "follow up"},
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        started = time.monotonic()
+        task.cancel()
+        result = await asyncio.wait_for(task, timeout=2)
+        elapsed = time.monotonic() - started
+    finally:
+        lock.__exit__(None, None, None)
+
+    assert elapsed < 1.8
+    assert result["isError"] is True
+    assert "timed out" in result["content"][0]["text"]
+    assert child_store.pending_prompts() == []
 
 
 @pytest.mark.asyncio

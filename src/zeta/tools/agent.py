@@ -22,7 +22,11 @@ from ..agent_receipt import (
 )
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from ..core.checkpoints import ConversationEntry, ConversationIntegrityError
-from ..core.store import ConversationStore, PendingPromptsClosedError
+from ..core.store import (
+    ConversationStore,
+    PendingPromptCommitTimeoutError,
+    PendingPromptsClosedError,
+)
 from ..model_catalog import known_model_names
 from ..types import (
     Message,
@@ -49,6 +53,7 @@ from .registry import (
 MAX_AGENT_STATUS_STEP = 160
 MAX_AGENT_STATUS_RESULT = 4_000
 MAX_AGENT_STATUS_DESCRIPTION = 160
+AGENT_SEND_COMMIT_TIMEOUT_SECONDS = 1.0
 _TRUNCATION_NOTE = "\n[truncated]"
 
 
@@ -912,12 +917,18 @@ def send_to_run(
             f"{child_instance_id!r} is a {agent_type} agent, not a run; "
             "agent_send only works with agent_type=run"
         )
-    child_path = Path(str(marker["child_session_path"]))
-    child_store = ConversationStore(
-        child_path.parent, session_id=child_path.name, cwd=parent_store.cwd
-    )
+    deadline = time.monotonic() + AGENT_SEND_COMMIT_TIMEOUT_SECONDS
     try:
-        child_store.append_pending_prompt(message)
+        child_path = Path(str(marker["child_session_path"]))
+        child_store = ConversationStore(
+            child_path.parent,
+            session_id=child_path.name,
+            cwd=parent_store.cwd,
+            _lock_deadline=deadline,
+        )
+        child_store.pending_prompt_queue.append(message, deadline=deadline)
+    except PendingPromptCommitTimeoutError:
+        return "pending prompt commit timed out before the queue could be changed"
     except PendingPromptsClosedError:
         # consume_run closed the queue while we were checking the marker.
         return no_live_run
@@ -939,12 +950,16 @@ async def _agent_send(
             arguments.get("message"),
         )
     )
-    try:
-        error = await asyncio.shield(commit)
-    except asyncio.CancelledError:
-        # The thread cannot be canceled. Wait for its durable result before
-        # allowing tool cancellation to reach the caller.
-        error = await commit
+    while True:
+        try:
+            error = await asyncio.shield(commit)
+        except asyncio.CancelledError:
+            # The worker cannot be canceled. Absorb every caller cancellation
+            # until its one commit decision is known.
+            if commit.cancelled():
+                raise
+            continue
+        break
     if error is not None:
         return {
             "content": [text_block(f"agent_send error: {error}")],
