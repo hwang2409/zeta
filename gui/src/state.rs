@@ -4,7 +4,10 @@ use crate::{
 };
 use std::collections::HashMap;
 
-use crate::client::{Approval, Message, ServerEvent, SessionMetadata, StatusResult, ToolCall};
+use crate::client::{
+    Approval, Message, ServerEvent, SessionMetadata, StatusResult, SubAgentReceipt, SubAgentStatus,
+    ToolCall,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolReceiptKey {
@@ -135,7 +138,7 @@ impl AppState {
                     Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
                     _ => self
                         .transcript
-                        .push(TranscriptEntry::Assistant(delta.into())),
+                        .push(TranscriptEntry::Assistant(Markdown::streaming(delta))),
                 }
             }
             ServerEvent::AssistantDelta { .. } => {}
@@ -187,6 +190,15 @@ impl AppState {
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
                 ) {
+                    if name.eq_ignore_ascii_case("agent") {
+                        if let Some(child) = tool_result
+                            .as_ref()
+                            .and_then(|result| result.structured_content.as_ref())
+                            .and_then(|data| data["child_instance_id"].as_str())
+                        {
+                            card.child_instance_id = Some(child.to_owned());
+                        }
+                    }
                     *complete = !name.eq_ignore_ascii_case("agent")
                         || !tool_result
                             .as_ref()
@@ -209,6 +221,12 @@ impl AppState {
                         );
                     }
                 }
+            }
+            ServerEvent::SubAgentReceipt {
+                session_id,
+                receipt,
+            } => {
+                self.commit_sub_agent(session_id, receipt);
             }
             ServerEvent::ApprovalRequest { approval, .. } => {
                 if !self
@@ -268,6 +286,59 @@ impl AppState {
                 self.transcript.len() - 1
             });
         &mut self.transcript[index]
+    }
+
+    fn commit_sub_agent(&mut self, session_id: Option<String>, receipt: SubAgentReceipt) {
+        // Durable notifications have no raw tool ID. The launch result supplies
+        // the child identity when we saw it; reconnect drains can create it alone.
+        let index = self
+            .transcript
+            .iter()
+            .position(|entry| {
+                matches!(entry, TranscriptEntry::Tool { key, card, .. }
+                if key.session_id == session_id
+                    && card.child_instance_id.as_deref() == Some(&receipt.child_instance_id))
+            })
+            .unwrap_or_else(|| {
+                self.transcript.push(TranscriptEntry::Tool {
+                    key: ToolReceiptKey {
+                        session_id,
+                        agent_instance_id: Some(receipt.child_instance_id.clone()),
+                        tool_call_id: String::new(),
+                    },
+                    name: "agent".into(),
+                    summary: String::new(),
+                    complete: false,
+                    error: false,
+                    card: Card {
+                        child_instance_id: Some(receipt.child_instance_id.clone()),
+                        ..Default::default()
+                    },
+                });
+                self.transcript.len() - 1
+            });
+        if let TranscriptEntry::Tool {
+            summary,
+            complete,
+            error,
+            card,
+            ..
+        } = &mut self.transcript[index]
+        {
+            *complete = true;
+            *error = receipt.status != SubAgentStatus::Completed;
+            *summary = bounded_summary(
+                receipt
+                    .text
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or(""),
+            );
+            card.agent_label = Some(bounded_summary(&receipt.description));
+            // Replace the authoritative receipt tail so replay is idempotent.
+            card.tail = OutputTail::default();
+            card.tail.append(&receipt.text);
+        }
     }
 
     fn commit_assistant(&mut self, message: Message) {
@@ -480,6 +551,40 @@ mod tests {
             state.transcript,
             vec![TranscriptEntry::Assistant("hello".into())]
         );
+    }
+
+    #[test]
+    fn multi_frame_fence_stream_never_builds_a_markdown_tree() {
+        let mut state = AppState::default();
+        let mut source = String::new();
+        for delta in std::iter::once("```rust\n").chain(std::iter::repeat_n("let x = 1;\n", 2000)) {
+            source.push_str(delta);
+            state.apply(ServerEvent::AssistantDelta {
+                session_id: None,
+                delta: delta.into(),
+                kind: "assistant".into(),
+            });
+            assert!(
+                matches!(&state.transcript[0], TranscriptEntry::Assistant(doc) if doc.root.is_none())
+            );
+        }
+        assert!(
+            matches!(&state.transcript[0], TranscriptEntry::Assistant(doc) if doc.source == source)
+        );
+        source.push_str("```\n");
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![crate::client::ContentBlock::Text { text: source }],
+            },
+        });
+        let TranscriptEntry::Assistant(doc) = &state.transcript[0] else {
+            panic!("missing assistant")
+        };
+        let code = &doc.root.as_ref().unwrap().children[0];
+        assert_eq!(code.kind, crate::markdown::BlockKind::Code("rust".into()));
+        assert!(code.syntax.is_empty());
     }
 
     #[test]

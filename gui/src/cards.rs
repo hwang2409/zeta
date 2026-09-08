@@ -30,6 +30,7 @@ pub struct Card {
     pub expanded: bool,
     pub tail: OutputTail,
     pub agent_label: Option<String>,
+    pub child_instance_id: Option<String>,
 }
 
 impl Card {

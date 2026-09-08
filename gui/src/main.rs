@@ -332,11 +332,14 @@ impl ZetaView {
                     .text_color(gpui::rgb(p.text))
                     .font_weight(gpui::FontWeight::BOLD)
                     .child(text.clone()),
-                TranscriptEntry::Assistant(text) => div().child(transcript::render_block(
-                    &text.root,
-                    self.appearance,
-                    format!("markdown-{index}"),
-                )),
+                TranscriptEntry::Assistant(text) => match &text.root {
+                    Some(root) => div().child(transcript::render_block(
+                        root,
+                        self.appearance,
+                        format!("markdown-{index}"),
+                    )),
+                    None => div().child(text.source.clone()),
+                },
                 TranscriptEntry::Tool {
                     name,
                     summary,

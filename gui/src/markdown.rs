@@ -1,10 +1,19 @@
-//! Markdown render tree, parsed once per text update without GPUI.
+//! Markdown render tree, parsed on commit with bounded syntax work off the UI thread.
 use crate::appearance::Appearance;
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
-use std::{ops::Range, sync::LazyLock};
+use std::{
+    ops::Range,
+    sync::{mpsc, LazyLock},
+    time::{Duration, Instant},
+};
 use syntect::{
     easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
 };
+
+const MAX_MARKDOWN_BYTES: usize = 128 * 1024;
+const MAX_FENCE_BYTES: usize = 16 * 1024;
+const MAX_SYNTAX_LINE_BYTES: usize = 1024;
+const HIGHLIGHT_BUDGET: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Inline {
@@ -68,12 +77,13 @@ impl Block {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Markdown {
     pub source: String,
-    pub root: Block,
+    pub root: Option<Block>,
 }
 
 impl From<String> for Markdown {
     fn from(source: String) -> Self {
-        let root = parse(&source);
+        let root = (source.len() <= MAX_MARKDOWN_BYTES)
+            .then(|| parse(&source, Instant::now() + HIGHLIGHT_BUDGET));
         Self { source, root }
     }
 }
@@ -83,13 +93,17 @@ impl From<&str> for Markdown {
     }
 }
 impl Markdown {
+    pub fn streaming(source: String) -> Self {
+        Self { source, root: None }
+    }
+
     pub fn push_str(&mut self, delta: &str) {
         self.source.push_str(delta);
-        self.root = parse(&self.source);
+        self.root = None;
     }
 }
 
-fn parse(source: &str) -> Block {
+fn parse(source: &str, deadline: Instant) -> Block {
     let mut stack = vec![Block::new(BlockKind::Document)];
     let mut bold = 0;
     let mut italic = 0;
@@ -121,7 +135,7 @@ fn parse(source: &str) -> Block {
             ) => {
                 let mut block = stack.pop().expect("balanced markdown tags");
                 if let BlockKind::Code(language) = &block.kind {
-                    block.syntax = highlight(&block.text(), language);
+                    block.syntax = highlight(&block.text(), language, deadline);
                 }
                 stack.last_mut().unwrap().children.push(block);
             }
@@ -161,7 +175,70 @@ fn parse(source: &str) -> Block {
 static SYNTAX: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
-fn highlight(text: &str, language: &str) -> Vec<SyntaxRun> {
+struct HighlightRequest {
+    text: String,
+    language: String,
+    deadline: Instant,
+    reply: mpsc::SyncSender<Vec<SyntaxRun>>,
+}
+
+// One owner and one queued fence: a slow regex cannot create more threads or an
+// unbounded backlog. Both syntax loading and regex execution stay off the UI.
+static HIGHLIGHTER: LazyLock<Option<mpsc::SyncSender<HighlightRequest>>> = LazyLock::new(|| {
+    let (sender, receiver) = mpsc::sync_channel::<HighlightRequest>(1);
+    std::thread::Builder::new()
+        .name("syntax-highlight".into())
+        .spawn(move || {
+            for request in receiver {
+                if Instant::now() < request.deadline {
+                    let runs = syntax_colors(&request.text, &request.language, request.deadline);
+                    let _ = request.reply.try_send(runs);
+                }
+            }
+        })
+        .ok()
+        .map(|_| sender)
+});
+
+fn highlight(text: &str, language: &str, deadline: Instant) -> Vec<SyntaxRun> {
+    if text.len() > MAX_FENCE_BYTES
+        || text.lines().any(|line| line.len() > MAX_SYNTAX_LINE_BYTES)
+        || Instant::now() >= deadline
+    {
+        return Vec::new();
+    }
+    let Some(worker) = HIGHLIGHTER.as_ref() else {
+        return Vec::new();
+    };
+    highlight_on(worker, text, language, deadline)
+}
+
+fn highlight_on(
+    worker: &mpsc::SyncSender<HighlightRequest>,
+    text: &str,
+    language: &str,
+    deadline: Instant,
+) -> Vec<SyntaxRun> {
+    let (reply, result) = mpsc::sync_channel(1);
+    if worker
+        .try_send(HighlightRequest {
+            text: text.to_owned(),
+            language: language.to_owned(),
+            deadline,
+            reply,
+        })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    // This deadline covers ALL fences in the message, including both palettes.
+    // Checking only between highlight_line calls cannot stop a single slow regex.
+    result
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_default()
+}
+
+fn syntax_colors(text: &str, language: &str, deadline: Instant) -> Vec<SyntaxRun> {
     let syntax = SYNTAX
         .find_syntax_by_token(language)
         .unwrap_or_else(|| SYNTAX.find_syntax_plain_text());
@@ -170,10 +247,16 @@ fn highlight(text: &str, language: &str) -> Vec<SyntaxRun> {
         let mut offset = 0;
         let mut runs = Vec::new();
         for line in LinesWithEndings::from(text) {
+            if Instant::now() >= deadline {
+                return None;
+            }
             let Ok(parts) = highlighter.highlight_line(line, &SYNTAX) else {
                 // A syntax failure falls back to plain text for the whole fence.
-                return Vec::new();
+                return None;
             };
+            if Instant::now() >= deadline {
+                return None;
+            }
             for (style, text) in parts {
                 let color = style.foreground;
                 runs.push((
@@ -183,10 +266,11 @@ fn highlight(text: &str, language: &str) -> Vec<SyntaxRun> {
                 offset += text.len();
             }
         }
-        runs
+        Some(runs)
     };
-    let light = colors("InspiredGitHub");
-    let dark = colors("base16-ocean.dark");
+    let (Some(light), Some(dark)) = (colors("InspiredGitHub"), colors("base16-ocean.dark")) else {
+        return Vec::new();
+    };
     // Theme changes can coalesce different token boundaries. Merge their endpoints.
     let mut boundaries: Vec<_> = light
         .iter()
@@ -215,8 +299,9 @@ mod tests {
     use crate::appearance::contrast;
     #[test]
     fn maps_headings_lists_inline_code_and_fences() {
-        let doc = Markdown::from("# Title\n\n## Second\n\nplain **bold** `code`\n\n3. first\n4. second\n   - nested\n\n```rust\nfn main() { println!(\"hi\"); }\n```\n");
-        let blocks = &doc.root.children;
+        let source = "# Title\n\n## Second\n\nplain **bold** `code`\n\n3. first\n4. second\n   - nested\n\n```rust\nfn main() { println!(\"hi\"); }\n```\n";
+        let root = parse(source, Instant::now());
+        let blocks = &root.children;
         assert_eq!(blocks[0].kind, BlockKind::Heading(1));
         assert_eq!(blocks[1].kind, BlockKind::Heading(2));
         assert!(blocks[2].spans.iter().any(|s| s.code && s.text == "code"));
@@ -230,25 +315,89 @@ mod tests {
         let code = &blocks[4];
         assert_eq!(code.kind, BlockKind::Code("rust".into()));
         assert_eq!(code.text(), "fn main() { println!(\"hi\"); }\n");
-        assert!(code.syntax.len() > 1);
-        assert_eq!(code.syntax.first().unwrap().range.start, 0);
-        assert_eq!(code.syntax.last().unwrap().range.end, code.text().len());
+        // Check colors independently of queue contention and cold-start timing.
+        let syntax = syntax_colors(
+            &code.text(),
+            "rust",
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(syntax.len() > 1);
+        assert_eq!(syntax.first().unwrap().range.start, 0);
+        assert_eq!(syntax.last().unwrap().range.end, code.text().len());
         for mode in [Appearance::Light, Appearance::Dark] {
-            assert!(code
-                .syntax
+            assert!(syntax
                 .iter()
                 .all(|run| contrast(run.color(mode), mode.palette().background) >= 4.5));
         }
-        assert!(code
-            .syntax
+        assert!(syntax
             .iter()
             .any(|run| run.color(Appearance::Light) != run.color(Appearance::Dark)));
     }
     #[test]
-    fn incomplete_stream_reparses_to_closed_fence() {
-        let mut doc = Markdown::from("```python\nprint(");
+    fn streaming_defers_parse_until_commit() {
+        let mut doc = Markdown::streaming("```python\nprint(".into());
         doc.push_str("'hello')\n```\n\nafter");
-        assert_eq!(doc.root.children.len(), 2);
-        assert_eq!(doc.root.children[0].text(), "print('hello')\n");
+        assert!(doc.root.is_none());
+        let committed = Markdown::from(doc.source);
+        let root = committed.root.unwrap();
+        assert_eq!(root.children.len(), 2);
+        assert_eq!(root.children[0].text(), "print('hello')\n");
+    }
+
+    #[test]
+    fn giant_fence_and_message_fall_back_without_syntax_work() {
+        let text = "let x = 1;\n".repeat(MAX_FENCE_BYTES / 10);
+        let doc = Markdown::from(format!("```rust\n{text}```"));
+        let code = &doc.root.as_ref().unwrap().children[0];
+        assert_eq!(code.text(), text);
+        assert!(code.syntax.is_empty());
+        let source = "x".repeat(MAX_MARKDOWN_BYTES + 1);
+        let doc = Markdown::from(source.clone());
+        assert!(doc.root.is_none());
+        assert_eq!(doc.source, source);
+    }
+
+    #[test]
+    fn pathological_syntax_uses_plain_text() {
+        // Deeply nested, unterminated syntax exceeds the per-line work bound
+        // even though the entire fence is below the byte limit.
+        let text = format!("{}!\n", "(".repeat(MAX_SYNTAX_LINE_BYTES + 1));
+        assert!(text.len() < MAX_FENCE_BYTES);
+        let doc = Markdown::from(format!("```javascript\n{text}```"));
+        let code = &doc.root.as_ref().unwrap().children[0];
+        assert_eq!(code.text(), text);
+        assert!(code.syntax.is_empty());
+    }
+
+    #[test]
+    fn stalled_highlighter_cannot_block_the_caller_or_grow_the_queue() {
+        // A worker that cannot finish even one regex must not hold the UI.
+        let (worker, receiver) = mpsc::sync_channel(1);
+        let started = Instant::now();
+        assert!(
+            highlight_on(&worker, "fn main() {}", "rust", started + HIGHLIGHT_BUDGET).is_empty()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // The first request is still queued. A second request must fail fast,
+        // regardless of its deadline, rather than waiting for queue capacity.
+        assert!(highlight_on(
+            &worker,
+            "next",
+            "rust",
+            Instant::now() + Duration::from_secs(5)
+        )
+        .is_empty());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let pending = receiver.try_recv().unwrap();
+        assert_eq!(pending.text, "fn main() {}");
+        assert!(receiver.try_recv().is_err());
+        assert!(pending.reply.try_send(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn expired_budget_preserves_fences_as_plain_text() {
+        let root = parse("```rust\nfn main() {}\n```", Instant::now());
+        assert_eq!(root.children[0].text(), "fn main() {}\n");
+        assert!(root.children[0].syntax.is_empty());
     }
 }

@@ -588,7 +588,9 @@ fn old_session_events_queued_during_a_switch_do_not_leak_or_block_sends() {
     state.apply(harness.event());
     assert_eq!(
         state.transcript,
-        vec![TranscriptEntry::Assistant("new text".into())]
+        vec![TranscriptEntry::Assistant(
+            zeta_gui::markdown::Markdown::streaming("new text".into())
+        )]
     );
     assert!(!state.streaming);
     assert!(state.approvals.is_empty());
@@ -804,5 +806,137 @@ fn status_metrics_bind_only_at_boundaries_and_ignore_streamed_usage() {
     assert_eq!(state.metrics.tokens_label(), "110");
     assert_eq!(state.metrics.cache_label(), "60.0%");
     state.apply(harness.event());
+    harness.finish();
+}
+
+// Matches loop.py's next-turn drain and core/store.py's persisted notification.
+fn durable_receipt(child: &str, status: &str, text: &str) -> Value {
+    json!({"event":"sub_agent_receipt","data":{
+        "notification_id":format!("notification-{child}"),
+        "child_instance_id":child,
+        "child_session_path":format!("/tmp/children/{child}.jsonl"),
+        "description":format!("review {child}"),
+        "status":status,
+        "text":text,
+        "stats":{"turns_used":2,"elapsed":1.2,"tool_calls":3,"error":status == "error","canceled":status == "canceled"}
+    }})
+}
+
+#[test]
+fn reconnect_next_turn_drain_creates_a_durable_agent_card_without_tool_events() {
+    let (disconnect, wait) = mpsc::channel();
+    let harness = Harness::new(move |listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([]));
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(peer);
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.respond("resume", json!({"session":session()}));
+        peer.status(true, "idle", json!([]));
+        peer.send();
+        // Completion occurred while disconnected. No tool_start/tool_end replay.
+        peer.event(durable_receipt(
+            "child-one",
+            "completed",
+            &"review passed\n".repeat(30),
+        ));
+        peer.boundary(json!({"event":"agent_end","data":{}}));
+        peer.wait_for_close();
+    });
+    harness.connected();
+    let mut state = AppState::default();
+    state.select_session(Some("session-1".into()));
+    disconnect.send(()).unwrap();
+    let WorkerMessage::Lost(reason) = harness.next() else {
+        panic!("missing disconnect")
+    };
+    state.mark_connection_lost(reason);
+    state.begin_reconnect();
+    harness.command(CommandMessage::Reconnect);
+    assert!(matches!(harness.next(), WorkerMessage::Sessions(_)));
+    let WorkerMessage::Status(status) = harness.next() else {
+        panic!("missing status")
+    };
+    state.apply_status(status);
+    assert!(matches!(harness.next(), WorkerMessage::Connected));
+    harness.command(CommandMessage::Send("next turn".into()));
+    assert!(matches!(harness.next(), WorkerMessage::Sent(_)));
+    let receipt = harness.event();
+    assert!(matches!(receipt, ServerEvent::SubAgentReceipt { .. }));
+    state.apply(receipt.clone());
+    state.toggle_card(0);
+    state.apply(receipt);
+    assert_eq!(state.transcript.len(), 1);
+    assert!(matches!(&state.transcript[0], TranscriptEntry::Tool {
+        complete: true, error: false, summary, card, ..
+    } if summary == "review passed"
+        && card.agent_label.as_deref() == Some("review child-one")
+        && card.child_instance_id.as_deref() == Some("child-one")
+        && card.expanded && card.tail.truncated
+        && card.tail.text.lines().count() == zeta_gui::cards::TAIL_LINES));
+    state.apply(harness.event());
+    harness.finish();
+}
+
+#[test]
+fn durable_receipts_update_launch_cards_with_duplicate_raw_tool_ids() {
+    let harness = Harness::new(|listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([]));
+        peer.event(json!({"event":"tool_start","tool_call":call("duplicate"),"data":{}}));
+        for (parent, child) in [("parent-one", "child-one"), ("parent-two", "child-two")] {
+            let call = json!({"id":"duplicate","name":"agent","arguments":{"description":child}});
+            peer.event(
+                json!({"event":"tool_start","tool_call":call,"data":{"agent_instance_id":parent}}),
+            );
+            peer.event(json!({"event":"tool_end","tool_call":call,"tool_result":{
+                "tool_call_id":"duplicate","content":"background agent started","is_error":false,
+                "structured_content":{"status":"running","child_instance_id":child}
+            },"data":{"agent_instance_id":parent}}));
+        }
+        for (child, status, text) in [
+            ("child-two", "error", "review failed\nerror details"),
+            ("child-one", "completed", "review passed\nsummary"),
+            ("child-two", "error", "review failed\nerror details"),
+        ] {
+            peer.event(durable_receipt(child, status, text));
+        }
+        peer.event(durable_receipt(
+            "child-three",
+            "canceled",
+            "background child canceled",
+        ));
+        peer.wait_for_close();
+    });
+    harness.connected();
+    let mut state = AppState::default();
+    for _ in 0..5 {
+        state.apply(harness.event());
+    }
+    state.toggle_card(2);
+    for _ in 0..4 {
+        state.apply(harness.event());
+    }
+    assert_eq!(state.transcript.len(), 4);
+    assert!(
+        matches!(&state.transcript[0], TranscriptEntry::Tool { complete: false, card, .. } if card.child_instance_id.is_none())
+    );
+    for (index, child, summary, error) in [
+        (1, "child-one", "review passed", false),
+        (2, "child-two", "review failed", true),
+        (3, "child-three", "background child canceled", true),
+    ] {
+        assert!(matches!(&state.transcript[index], TranscriptEntry::Tool {
+            complete: true, error: actual_error, summary: actual_summary, card, ..
+        } if *actual_error == error && actual_summary == summary
+            && card.child_instance_id.as_deref() == Some(child)
+            && card.expanded == (index == 2)));
+    }
+    assert!(
+        matches!(&state.transcript[2], TranscriptEntry::Tool { card, .. } if card.tail.text == "review failed\nerror details")
+    );
     harness.finish();
 }

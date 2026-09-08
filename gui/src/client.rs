@@ -208,6 +208,10 @@ impl EventParams {
                 tool_result: self.field("tool_result")?,
                 data: self.field_or_empty("data")?,
             },
+            "sub_agent_receipt" => ServerEvent::SubAgentReceipt {
+                session_id,
+                receipt: self.field("data")?,
+            },
             "approval_request" => ServerEvent::ApprovalRequest {
                 session_id,
                 approval: Approval {
@@ -243,6 +247,23 @@ impl EventParams {
             |value| serde_json::from_value(value.clone()).map_err(ClientError::Json),
         )
     }
+}
+
+/// Durable notification data emitted by agent_background through zeta serve.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct SubAgentReceipt {
+    pub child_instance_id: String,
+    pub description: String,
+    pub status: SubAgentStatus,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SubAgentStatus {
+    Completed,
+    Error,
+    Canceled,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -289,6 +310,10 @@ pub enum ServerEvent {
         tool_result: Option<ToolResult>,
         data: Value,
     },
+    SubAgentReceipt {
+        session_id: Option<String>,
+        receipt: SubAgentReceipt,
+    },
     ApprovalRequest {
         session_id: Option<String>,
         approval: Approval,
@@ -322,6 +347,7 @@ impl ServerEvent {
             | Self::ToolStart { session_id, .. }
             | Self::ToolOutput { session_id, .. }
             | Self::ToolEnd { session_id, .. }
+            | Self::SubAgentReceipt { session_id, .. }
             | Self::ApprovalRequest { session_id, .. }
             | Self::ApprovalEnd { session_id, .. }
             | Self::Error { session_id, .. }
