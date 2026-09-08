@@ -15,11 +15,11 @@ from typing import Any
 import pytest
 
 from zeta.core.fake import FakeBackend, ScriptedTurn
-from zeta.core.session import SessionMetadata
+from zeta.core.session import SessionManager, SessionMetadata
 from zeta.server import ZetaServer
-from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES
+from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
 from zeta.server.server import _Client
-from zeta.types import TextContent, ToolCall
+from zeta.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
 
 TIMEOUT = 3
 
@@ -59,7 +59,7 @@ async def _read_raw(reader: asyncio.StreamReader) -> bytes:
 async def _request(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
-    request_id: int,
+    request_id: str | int,
     method: str,
     params: dict[str, object] | None = None,
 ) -> list[dict[str, Any]]:
@@ -169,6 +169,38 @@ async def test_approval_and_steer_continue_the_same_turn(tmp_path: Path) -> None
             and any(getattr(block, "text", "") == "also check this" for block in message.content)
             for message in backend.calls[1][0]
         )
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_resumed_approval_finishes_idle_after_terminal_event(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call = ToolCall("resumed-call", "read", {"path": str(target)})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+        await _request(reader, writer, 2, "resume", {"session_id": opened.metadata.session_id})
+        approved = await _request(
+            reader, writer, 3, "approve", {"request_id": call.id}
+        )
+        assert approved[-1]["result"]["decision"] == "approve"
+        await _event(reader, "tool_end")
+        status = await _request(reader, writer, 4, "status")
+        assert status[-1]["result"]["state"] == "idle"
     finally:
         await _close(server, writer)
 
@@ -421,6 +453,63 @@ async def test_list_sessions_marks_oversized_result_as_truncated(
         assert result["truncated"] is True
         assert result["sessions"] == []
         assert len(json.dumps(frames[-1]).encode()) <= MAX_FRAME_BYTES
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_uses_maximum_request_id_for_boundary(
+    tmp_path: Path,
+) -> None:
+    codec = FrameCodec()
+    probe = SessionMetadata.new(
+        session_id="a" * 32,
+        provider="fake",
+        model="offline",
+        cwd=str(tmp_path),
+        retained_tail=8,
+        compaction_budget=200_000,
+    )
+    base_size = len(codec.response(0, {"sessions": [probe.to_dict()]}))
+    huge = SessionMetadata.new(
+        session_id=probe.session_id,
+        provider="fake",
+        model="offline",
+        cwd=str(tmp_path),
+        retained_tail=8,
+        compaction_budget=200_000,
+        system_prompt="x" * (MAX_FRAME_BYTES - 128 - base_size),
+    )
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    server.runtime.list_sessions = lambda: [huge]
+    reader, writer = await _connect(server)
+    request_id = "x" * MAX_REQUEST_ID_BYTES
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        frames = await _request(reader, writer, request_id, "list_sessions")
+        assert frames[-1]["result"] == {
+            "sessions": [],
+            "truncated": True,
+            "next_offset": 0,
+        }
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_invalid_utf8_tail_preserves_request_id(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    reader, writer = await _ready(server)
+    try:
+        writer.write(
+            b'{"jsonrpc":"2.0","id":"tail-id","method":"status","params":{}}'
+            b"\xff\n"
+        )
+        await writer.drain()
+        error = await _read(reader)
+        assert error["id"] == "tail-id"
+        assert error["error"]["code"] == -32700
     finally:
         await _close(server, writer)
 

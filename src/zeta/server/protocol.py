@@ -277,8 +277,8 @@ def _request_id_hint(line: bytes) -> str | int | None:
 
     try:
         text = line.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
+    except UnicodeDecodeError as exc:
+        text = line[: exc.start].decode("utf-8")
     decoder = json.JSONDecoder(
         parse_int=_parse_integer,
         parse_constant=_reject_constant,

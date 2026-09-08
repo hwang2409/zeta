@@ -209,7 +209,9 @@ class _Client:
                     continue
                 request_id = request["id"]
                 try:
-                    result = await self._dispatch(request["method"], request["params"])
+                    result = await self._dispatch(
+                        request["id"], request["method"], request["params"]
+                    )
                 except ProtocolError as exc:
                     await self._write(
                         self.codec.error_response(
@@ -297,13 +299,15 @@ class _Client:
                 await self.writer.wait_closed()
             self._closed = True
 
-    async def _dispatch(self, method: str, params: dict[str, Any]) -> object:
+    async def _dispatch(
+        self, request_id: str | int, method: str, params: dict[str, Any]
+    ) -> object:
         if method == "hello":
             return self._hello(params)
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
         if method == "list_sessions":
-            return self._list_sessions()
+            return self._list_sessions(request_id)
         if method == "new_session":
             await self._require_idle()
             metadata = await self.server.runtime.create_session(
@@ -474,15 +478,18 @@ class _Client:
         if loop is None or state is None:
             return
         session_id = state.session_id
+        event_tasks: list[asyncio.Task[None]] = []
         try:
             await loop.resume_pending_tool(
                 request_id,
                 prepared=True,
-                event_sink=lambda event: asyncio.create_task(
-                    self._event(event, session_id=session_id)
+                event_sink=lambda event: event_tasks.append(
+                    asyncio.create_task(self._event(event, session_id=session_id))
                 ),
             )
         finally:
+            if event_tasks:
+                await asyncio.gather(*event_tasks, return_exceptions=True)
             if self.server.runtime.state is state:
                 state.turn_finished()
             if self._turn_task is asyncio.current_task():
@@ -628,19 +635,19 @@ class _Client:
             session_id = self.server.runtime.session_id
         await self._write(self.codec.notification(event, session_id, **fields))
 
-    def _list_sessions(self) -> dict[str, object]:
+    def _list_sessions(self, request_id: str | int) -> dict[str, object]:
         sessions = [item.to_dict() for item in self.server.runtime.list_sessions()]
         page: list[dict[str, Any]] = []
         for offset, item in enumerate(sessions):
             candidate = [*page, item]
-            if not self.codec.response_fits(0, {"sessions": candidate}):
+            if not self.codec.response_fits(request_id, {"sessions": candidate}):
                 return {
                     "sessions": page,
                     "truncated": True,
                     "next_offset": offset,
                 }
             if (
-                len(self.codec.response(0, {"sessions": candidate}))
+                len(self.codec.response(request_id, {"sessions": candidate}))
                 > MAX_FRAME_BYTES - 128
             ):
                 return {
