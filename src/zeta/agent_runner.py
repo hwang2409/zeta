@@ -14,7 +14,7 @@ from .agent_budget import (
     AgentTree,
 )
 from .agent_budget import child_depth as next_agent_depth
-from .agent_receipt import TerminalState
+from .agent_receipt import TerminalState, _without_agent_receipt_suffix
 from .core.abort import AbortSignal as ToolAbortSignal
 from .core.checkpoints import _now
 from .core.store import ConversationStore
@@ -212,15 +212,63 @@ async def consume_run(
     The run finishes when it has nothing left to do and nothing queued.
     """
 
-    result = await consume_child(child_loop, prompt, **kwargs)
-    while not result.get("isError"):
-        pending = child_store.pending_prompts()
-        if not pending:
-            return result
-        entry = pending[0]
-        child_store.acknowledge_pending_prompt(entry.id)
-        result = await consume_child(child_loop, entry.data["text"], **kwargs)
-    return result
+    finish_lifecycle = kwargs.get("finish_lifecycle")
+    child_turns = kwargs.get("child_turns")
+
+    def keep_lifecycle_running(state: str, text: str) -> dict[str, object]:
+        del state, text
+        if not callable(child_turns):
+            return {}
+        return agent_stats(
+            child_store.agent_lifecycle(),
+            status="running",
+            turns_used=child_turns(),
+        )
+
+    if callable(finish_lifecycle):
+        kwargs["finish_lifecycle"] = keep_lifecycle_running
+    result: dict[str, object] | None = None
+    terminal_result: dict[str, object] | None = None
+    current_entry = None
+    try:
+        result = await consume_child(child_loop, prompt, **kwargs)
+        while not result.get("isError"):
+            # Ack only after a follow-up actually reached the child. A cancel or
+            # backend error mid-consume_child leaves the prompt pending, so the
+            # next run gets a chance to redeliver it instead of it silently gone.
+            if current_entry is not None:
+                child_store.acknowledge_pending_prompt(current_entry.id)
+                current_entry = None
+            pending = child_store.close_pending_queue_if_empty()
+            if not pending:
+                terminal_result = result
+                return result
+            current_entry = pending[0]
+            result = await consume_child(
+                child_loop, current_entry.data["text"], **kwargs
+            )
+        terminal_result = result
+        return result
+    finally:
+        try:
+            child_store.close_pending_queue()
+        finally:
+            if terminal_result is not None and callable(finish_lifecycle):
+                content = terminal_result.get("content")
+                text = (
+                    content[0].get("text")
+                    if (
+                        isinstance(content, list)
+                        and content
+                        and isinstance(content[0], dict)
+                        and isinstance(content[0].get("text"), str)
+                    )
+                    else "agent run ended without a final response"
+                )
+                finish_lifecycle(
+                    "failed" if terminal_result.get("isError") else "completed",
+                    _without_agent_receipt_suffix(text),
+                )
 
 
 def resolve_child_backend(
@@ -392,7 +440,7 @@ async def run_agent_tool(
         description=description,
         agent_type=stored_agent_type,
         background=background,
-        child_instance_id=(child_instance_id if child_depth > 1 else None),
+        child_instance_id=child_instance_id,
     )
     child_store.start_agent_lifecycle(
         handle=child_instance_id,
@@ -406,7 +454,7 @@ async def run_agent_tool(
         loop._agent_child_stores[tool_call.id] = child_store
         loop._agent_child_turns[tool_call.id] = 0
         loop._agent_child_types[tool_call.id] = preset.name
-        child_marker_key = child_instance_id if child_depth > 1 else tool_call.id
+        child_marker_key = child_instance_id
         if publisher is not None:
             publisher.set_metadata(
                 {"child_session_path": child_path, "depth": child_depth}

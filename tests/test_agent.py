@@ -1,11 +1,15 @@
 import asyncio
 import json
+import threading
+import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import zeta.execution as execution_module
+import zeta.tools.agent_send as agent_send_module
 from zeta.agent_background import (
     BackgroundAgentOwner,
     adopt_agent_children,
@@ -15,7 +19,7 @@ from zeta.agent_budget import MAX_AGENT_TURN_CAP, AgentTree
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
-from zeta.core.store import ConversationStore
+from zeta.core.store import ConversationStore, PendingPromptsClosedError
 from zeta.loop import AgentLoop
 from zeta.mcp import MCPMount
 from zeta.tools import ToolRegistry
@@ -3001,6 +3005,335 @@ def test_pending_prompt_queue_round_trips(tmp_path: Path) -> None:
         store.acknowledge_pending_prompt("nonexistent")
 
 
+def test_close_pending_queue_if_empty_locks_out_new_prompts(tmp_path: Path) -> None:
+    """Once a run declares itself done, further follow-ups must be rejected."""
+
+    store = ConversationStore(tmp_path, session_id="run")
+
+    # With prompts pending the queue stays open and callers still see them.
+    store.append_pending_prompt("keep working")
+    pending = store.close_pending_queue_if_empty()
+    assert [entry.data["text"] for entry in pending] == ["keep working"]
+    store.acknowledge_pending_prompt(pending[0].id)
+
+    # Second call finds nothing pending and closes the door.
+    assert store.close_pending_queue_if_empty() == []
+    with pytest.raises(PendingPromptsClosedError):
+        store.append_pending_prompt("too late")
+    # A separate handle sees the closed door too, not just this instance.
+    other = ConversationStore(tmp_path, session_id="run")
+    with pytest.raises(PendingPromptsClosedError):
+        other.append_pending_prompt("also too late")
+
+
+@pytest.mark.asyncio
+async def test_consume_run_keeps_pending_entry_when_delivery_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed follow-up delivery must leave the queue intact for recovery."""
+
+    from zeta import agent_runner
+
+    child_store = ConversationStore(tmp_path, session_id="run")
+    child_store.append_pending_prompt("follow up")
+
+    call_prompts: list[str] = []
+
+    async def fake_consume_child(child_loop, prompt, **kwargs):
+        del child_loop, kwargs
+        call_prompts.append(prompt)
+        if len(call_prompts) == 1:
+            return {"content": [], "isError": False, "structuredContent": None}
+        return {"content": [], "isError": True, "structuredContent": None}
+
+    monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
+
+    result = await agent_runner.consume_run(
+        object(),  # child_loop is unused by the fake
+        "initial",
+        child_store=child_store,
+    )
+    assert result["isError"] is True
+    assert call_prompts == ["initial", "follow up"]
+    # Ack must not have run since the follow-up delivery errored.
+    assert [entry.data["text"] for entry in child_store.pending_prompts()] == [
+        "follow up"
+    ]
+    with pytest.raises(PendingPromptsClosedError):
+        child_store.append_pending_prompt("after failure")
+
+
+@pytest.mark.asyncio
+async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta import agent_runner
+
+    child_store = ConversationStore(tmp_path, session_id="run")
+    child_store.start_agent_lifecycle(
+        handle="parent:run",
+        started_at="2026-09-08T00:00:00+00:00",
+        tree_budget=150,
+        depth=1,
+        agent_type="run",
+        description="long horizon run",
+    )
+    child_store.append_pending_prompt("follow up")
+    prompts: list[str] = []
+    finish_calls = 0
+
+    async def fake_consume_child(child_loop, prompt, **kwargs):
+        del child_loop, kwargs
+        prompts.append(prompt)
+        return {
+            "content": [
+                {
+                    "text": (
+                        f"handled {prompt} · 2 turns · 1.2s · 3 tool calls "
+                        "· error=false · canceled=false"
+                    )
+                }
+            ],
+            "isError": False,
+            "structuredContent": None,
+        }
+
+    def finish_lifecycle(state: str, text: str) -> dict[str, object]:
+        nonlocal finish_calls
+        finish_calls += 1
+        child_store.finish_agent_lifecycle(state, final_result=text)
+        return {}
+
+    original_close = child_store.close_pending_queue_if_empty
+    checked_restart = False
+
+    def close_after_restart_check():
+        nonlocal checked_restart
+        if not checked_restart:
+            checked_restart = True
+            restarted = ConversationStore(tmp_path, session_id="run")
+            lifecycle = restarted.agent_lifecycle()
+            assert lifecycle is not None
+            assert lifecycle["finished_at"] is None
+            assert restarted.pending_prompts()[0].data["text"] == "follow up"
+        return original_close()
+
+    monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
+    monkeypatch.setattr(
+        child_store,
+        "close_pending_queue_if_empty",
+        close_after_restart_check,
+    )
+
+    result = await agent_runner.consume_run(
+        object(),
+        "initial",
+        child_store=child_store,
+        child_turns=lambda: len(prompts),
+        finish_lifecycle=finish_lifecycle,
+    )
+
+    assert result["isError"] is False
+    assert prompts == ["initial", "follow up"]
+    assert finish_calls == 1
+    lifecycle = child_store.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["state"] == "completed"
+    assert lifecycle["finished_at"] is not None
+    assert lifecycle["final_result"] == "handled follow up"
+
+
+@pytest.mark.asyncio
+async def test_agent_send_waits_for_blocked_append_before_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(
+        parent_store.session_dir / "agents", session_id="1"
+    )
+    call = _run_agent_call()
+    child_store.mark_agent_parent(call.id, agent_type="run")
+    parent_store.allocate_agent_index()
+    parent_store.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="long horizon run",
+        agent_type="run",
+        background=True,
+        child_instance_id="parent:1",
+    )
+
+    started = threading.Event()
+    release = threading.Event()
+    original_send = agent_send_module.send_to_run
+
+    def blocked_send(*args):
+        started.set()
+        release.wait(timeout=2)
+        return original_send(*args)
+
+    monkeypatch.setattr(agent_send_module, "send_to_run", blocked_send)
+    registry = ToolRegistry(tmp_path, session_store=parent_store)
+    task = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "agent-send-call",
+                "agent_send",
+                {"child_instance_id": "parent:1", "message": "follow up"},
+            )
+        )
+    )
+    await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=2)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    result = await task
+
+    assert result["isError"] is False
+    assert [entry.data["text"] for entry in child_store.pending_prompts()] == [
+        "follow up"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(
+        parent_store.session_dir / "agents", session_id="1"
+    )
+    call = _run_agent_call()
+    child_store.mark_agent_parent(call.id, agent_type="run")
+    parent_store.allocate_agent_index()
+    parent_store.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="long horizon run",
+        agent_type="run",
+        background=True,
+        child_instance_id="parent:1",
+    )
+
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    original_gather = execution_module.asyncio.gather
+
+    async def blocked_cleanup(*args, **kwargs):
+        cleanup_started.set()
+        await release_cleanup.wait()
+        return await original_gather(*args, **kwargs)
+
+    monkeypatch.setattr(execution_module.asyncio, "gather", blocked_cleanup)
+    registry = ToolRegistry(tmp_path, session_store=parent_store)
+    task = asyncio.create_task(
+        registry.execute(
+            ToolCall(
+                "agent-send-cleanup-cancel",
+                "agent_send",
+                {"child_instance_id": "parent:1", "message": "follow up"},
+            )
+        )
+    )
+
+    await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+    task.cancel()
+    release_cleanup.set()
+    result = await task
+
+    assert result["isError"] is False
+    assert [entry.data["text"] for entry in child_store.pending_prompts()] == [
+        "follow up"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_send_aborts_before_append_when_store_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(
+        parent_store.session_dir / "agents", session_id="1"
+    )
+    call = _run_agent_call()
+    child_store.mark_agent_parent(call.id, agent_type="run")
+    parent_store.allocate_agent_index()
+    parent_store.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="long horizon run",
+        agent_type="run",
+        background=True,
+        child_instance_id="parent:1",
+    )
+
+    registry = ToolRegistry(tmp_path, session_store=parent_store)
+    lock = child_store._append_lock()
+    lock.__enter__()
+    try:
+        task = asyncio.create_task(
+            registry.execute(
+                ToolCall(
+                    "agent-send-call",
+                    "agent_send",
+                    {"child_instance_id": "parent:1", "message": "follow up"},
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        started = time.monotonic()
+        task.cancel()
+        result = await asyncio.wait_for(task, timeout=2)
+        elapsed = time.monotonic() - started
+    finally:
+        lock.__exit__(None, None, None)
+
+    assert elapsed < 1.8
+    assert result["isError"] is True
+    assert "timed out" in result["content"][0]["text"]
+    assert child_store.pending_prompts() == []
+
+
+@pytest.mark.asyncio
+async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> None:
+    """The race the closed-queue marker prevents: a queued prompt after finish."""
+
+    from zeta.tools.agent import send_to_run
+
+    backend = RunBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+    handle = _run_handle_from_receipt(store)
+
+    # Simulate the race: parent looked at the marker before the run finished,
+    # then the run drained and closed its queue before the parent got here.
+    marker = store.agent_children()[handle]
+    child_path = Path(str(marker["child_session_path"]))
+    child_store = ConversationStore(
+        child_path.parent, session_id=child_path.name, cwd=store.cwd
+    )
+    assert child_store.close_pending_queue_if_empty() == []
+
+    error = send_to_run(store, handle, "too late")
+    assert error is not None and "no live run" in error
+
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+    await loop.close()
+
+
 @pytest.mark.asyncio
 async def test_a_queued_prompt_stays_out_of_the_run_context(tmp_path: Path) -> None:
     """Only messages reach the model; a queued follow-up must not leak in early."""
@@ -3022,6 +3355,22 @@ async def test_a_queued_prompt_stays_out_of_the_run_context(tmp_path: Path) -> N
     assert "secret follow-up" not in rendered
 
 
+def _run_handle_from_receipt(store: ConversationStore) -> str:
+    """Return the child_instance_id a real model would receive for the run."""
+
+    for message in store.messages():
+        result = message.tool_result
+        if result is None:
+            continue
+        structured = result.structured_content
+        if structured is None:
+            continue
+        handle = structured.get("child_instance_id")
+        if type(handle) is str and handle:
+            return handle
+    raise AssertionError("no run receipt with a child_instance_id")
+
+
 @pytest.mark.asyncio
 async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> None:
     backend = RunBackend()
@@ -3031,8 +3380,10 @@ async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> N
     await _collect(loop.run_turn("start"))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
 
-    # Queue while the run is still mid-turn, exactly as agent_send does.
-    assert send_to_run(store, "run-1", "also check the tests") is None
+    # The model queues follow-ups by the child_instance_id it saw in the tool
+    # result, not by the provider tool_call.id, so round-trip that handle.
+    handle = _run_handle_from_receipt(store)
+    assert send_to_run(store, handle, "also check the tests") is None
 
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
@@ -3069,12 +3420,49 @@ def test_send_to_run_rejects_unknown_and_finished_runs(tmp_path: Path) -> None:
     assert error == "message must be a nonempty string"
 
 
+def test_send_to_run_rejects_non_run_children(tmp_path: Path) -> None:
+    """A queued prompt would rot: only consume_run drains the queue."""
+
+    store = ConversationStore(tmp_path)
+    child_call = ToolCall(
+        "explore-1",
+        "agent",
+        {"prompt": "look", "description": "explore", "agent_type": "explore"},
+    )
+    store.register_agent_child(
+        child_call,
+        child_session_path=str(tmp_path / "agents" / "1"),
+        description="explore",
+        agent_type="explore",
+        background=True,
+        child_instance_id="sess:1",
+    )
+
+    error = send_to_run(store, "sess:1", "hello")
+    assert error is not None
+    assert "explore" in error and "agent_send" in error
+
+
 @pytest.mark.asyncio
 async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
     backend = RunBackend()
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1)
     commands = _RunCommands(loop)
+
+    explore_call = ToolCall(
+        "explore-1",
+        "agent",
+        {"prompt": "look", "description": "explore", "agent_type": "explore"},
+    )
+    store.register_agent_child(
+        explore_call,
+        child_session_path=str(tmp_path / "agents" / "explore"),
+        description="explore",
+        agent_type="explore",
+        background=True,
+        child_instance_id="sess:explore",
+    )
 
     assert commands.slash_runs("") == "no live runs"
 
@@ -3083,13 +3471,19 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
 
     listing = commands.slash_runs("")
     assert "long horizon run" in listing
-    assert "run-1" in listing
+    assert "explore" not in listing
+    handle = _run_handle_from_receipt(store)
+    # /runs shows the model-facing handle, not the opaque provider tool_call.id.
+    assert handle in listing
+    assert "run-1" not in listing
 
     assert commands.slash_send("nonsense") == (
         "use /send <run-id> <message>; /runs lists the live ones"
     )
     assert "no live run" in commands.slash_send("bogus-id hello")
-    assert "queued for run-1" in commands.slash_send("run-1 also check the tests")
+    assert f"queued for {handle}" in commands.slash_send(
+        f"{handle} also check the tests"
+    )
 
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
