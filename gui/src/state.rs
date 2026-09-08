@@ -1,10 +1,11 @@
-use crate::client::{Approval, Message, ServerEvent, SessionMetadata, ToolCall};
+use crate::client::{Approval, Message, ServerEvent, SessionMetadata, StatusResult, ToolCall};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptEntry {
     User(String),
     Assistant(String),
     Tool {
+        id: String,
         name: String,
         summary: String,
         complete: bool,
@@ -24,8 +25,7 @@ pub struct AppState {
     pub sessions: Vec<SessionMetadata>,
     pub active_session: Option<String>,
     pub transcript: Vec<TranscriptEntry>,
-    pub composer: String,
-    pub approval: Option<Approval>,
+    pub approvals: Vec<Approval>,
     pub connection: ConnectionState,
     pub streaming: bool,
 }
@@ -36,8 +36,7 @@ impl Default for AppState {
             sessions: Vec::new(),
             active_session: None,
             transcript: Vec::new(),
-            composer: String::new(),
-            approval: None,
+            approvals: Vec::new(),
             connection: ConnectionState::Reconnecting,
             streaming: false,
         }
@@ -47,16 +46,28 @@ impl Default for AppState {
 impl AppState {
     pub fn mark_connection_lost(&mut self, error: impl Into<String>) {
         self.connection = ConnectionState::Lost(error.into());
+        self.streaming = false;
+        self.approvals.clear();
     }
 
     pub fn begin_reconnect(&mut self) {
         self.connection = ConnectionState::Reconnecting;
     }
 
+    pub fn apply_status(&mut self, status: StatusResult) {
+        self.active_session = status.session.map(|session| session.session_id);
+        self.streaming = status.state != "idle";
+        self.approvals = status.pending_approvals;
+    }
+
     pub fn apply(&mut self, event: ServerEvent) {
         match event {
             ServerEvent::TurnStart { .. } => self.streaming = true,
-            ServerEvent::TurnEnd { .. } | ServerEvent::TurnAborted { .. } => self.streaming = false,
+            ServerEvent::AgentEnd { .. } | ServerEvent::TurnAborted { .. } => {
+                self.streaming = false;
+                self.approvals.clear();
+            }
+            ServerEvent::TurnEnd { .. } => {}
             ServerEvent::AssistantDelta { delta, kind, .. } if kind == "assistant" => {
                 match self.transcript.last_mut() {
                     Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
@@ -71,15 +82,8 @@ impl AppState {
             ServerEvent::ToolOutput {
                 tool_call, output, ..
             } => {
-                if let Some(TranscriptEntry::Tool { name, summary, .. }) = self
-                    .transcript
-                    .iter_mut()
-                    .rev()
-                    .find(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
-                {
-                    if *name == tool_call.name {
-                        summary.push_str(&output.replace(['\n', '\r'], " "));
-                    }
+                if let TranscriptEntry::Tool { summary, .. } = self.tool_receipt(&tool_call) {
+                    *summary = bounded_summary(&format!("{summary}{output}"));
                 }
             }
             ServerEvent::ToolEnd {
@@ -87,33 +91,53 @@ impl AppState {
                 tool_result,
                 ..
             } => {
-                if let Some(TranscriptEntry::Tool {
+                if let TranscriptEntry::Tool {
                     complete, error, ..
-                }) = self
-                    .transcript
-                    .iter_mut()
-                    .rev()
-                    .find(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+                } = self.tool_receipt(&tool_call)
                 {
                     *complete = true;
                     *error = tool_result.as_ref().is_some_and(|result| result.is_error);
-                } else {
-                    self.transcript.push(tool_entry(&tool_call));
                 }
             }
-            ServerEvent::ApprovalRequest { approval, .. } => self.approval = Some(approval),
-            ServerEvent::ApprovalEnd { .. } => self.approval = None,
+            ServerEvent::ApprovalRequest { approval, .. } => {
+                if !self
+                    .approvals
+                    .iter()
+                    .any(|item| item.request_id == approval.request_id)
+                {
+                    self.approvals.push(approval);
+                }
+            }
+            ServerEvent::ApprovalEnd { tool_call, .. } => self
+                .approvals
+                .retain(|item| item.tool_call.id != tool_call.id),
             ServerEvent::Error { error, .. } => {
                 self.streaming = false;
+                self.approvals.clear();
                 self.transcript.push(TranscriptEntry::Tool {
+                    id: String::new(),
                     name: "error".to_owned(),
-                    summary: error.message,
+                    summary: bounded_summary(&error.message),
                     complete: true,
                     error: true,
                 });
             }
             ServerEvent::Other { .. } => {}
         }
+    }
+
+    fn tool_receipt(&mut self, tool_call: &ToolCall) -> &mut TranscriptEntry {
+        let index = self
+            .transcript
+            .iter()
+            .position(
+                |entry| matches!(entry, TranscriptEntry::Tool { id, .. } if id == &tool_call.id),
+            )
+            .unwrap_or_else(|| {
+                self.transcript.push(tool_entry(tool_call));
+                self.transcript.len() - 1
+            });
+        &mut self.transcript[index]
     }
 
     fn commit_assistant(&mut self, message: Message) {
@@ -128,11 +152,23 @@ impl AppState {
     }
 }
 
+const SUMMARY_CHARS: usize = 240;
+
+fn bounded_summary(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(SUMMARY_CHARS)
+        .collect()
+}
+
 fn tool_entry(tool_call: &ToolCall) -> TranscriptEntry {
     TranscriptEntry::Tool {
+        id: tool_call.id.clone(),
         name: tool_call.name.clone(),
-        summary: serde_json::to_string(&tool_call.arguments)
-            .unwrap_or_else(|_| "arguments unavailable".to_owned()),
+        summary: bounded_summary(
+            &serde_json::to_string(&tool_call.arguments)
+                .unwrap_or_else(|_| "arguments unavailable".to_owned()),
+        ),
         complete: false,
         error: false,
     }
@@ -197,13 +233,13 @@ mod tests {
                 tool_call: tool.clone(),
             },
         });
-        assert!(state.approval.is_some());
+        assert!(!state.approvals.is_empty());
         state.apply(ServerEvent::ApprovalEnd {
             session_id: None,
             tool_call: tool,
             data: json!({ "decision": "deny" }),
         });
-        assert!(state.approval.is_none());
+        assert!(state.approvals.is_empty());
     }
 
     #[test]
@@ -244,6 +280,67 @@ mod tests {
         ));
         assert!(
             matches!(&state.transcript[0], TranscriptEntry::Tool { summary, .. } if summary.contains("README.md"))
+        );
+    }
+
+    #[test]
+    fn parallel_same_name_receipts_use_ids_and_bound_all_output() {
+        let mut state = AppState::default();
+        let first = call();
+        let second = ToolCall {
+            id: "tool-2".into(),
+            ..call()
+        };
+        for tool in [&first, &second] {
+            state.apply(ServerEvent::ToolStart {
+                session_id: None,
+                tool_call: tool.clone(),
+                data: json!({}),
+            });
+        }
+        state.apply(ServerEvent::ToolOutput {
+            session_id: None,
+            tool_call: first.clone(),
+            output: "\nα".repeat(1000),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::ToolOutput {
+            session_id: None,
+            tool_call: second.clone(),
+            output: "second".into(),
+            data: json!({}),
+        });
+        for (tool, error) in [(second, true), (first, false)] {
+            state.apply(ServerEvent::ToolEnd {
+                session_id: None,
+                tool_call: tool.clone(),
+                tool_result: Some(ToolResult {
+                    tool_call_id: tool.id,
+                    content: String::new(),
+                    is_error: error,
+                    is_canceled: false,
+                    content_blocks: vec![],
+                    structured_content: None,
+                }),
+                data: json!({}),
+            });
+        }
+        assert!(
+            matches!(&state.transcript[0], TranscriptEntry::Tool { id, summary, complete: true, error: false, .. }
+            if id == "tool-1" && summary.chars().count() == SUMMARY_CHARS && !summary.contains('\n'))
+        );
+        assert!(
+            matches!(&state.transcript[1], TranscriptEntry::Tool { id, summary, complete: true, error: true, .. }
+            if id == "tool-2" && summary.ends_with("second"))
+        );
+        let huge = ToolCall {
+            arguments: [("arg".into(), json!("x".repeat(1000)))]
+                .into_iter()
+                .collect(),
+            ..call()
+        };
+        assert!(
+            matches!(tool_entry(&huge), TranscriptEntry::Tool { summary, .. } if summary.chars().count() == SUMMARY_CHARS)
         );
     }
 

@@ -168,6 +168,10 @@ impl EventParams {
                 session_id,
                 data: self.field_or_empty("data")?,
             },
+            "agent_end" => ServerEvent::AgentEnd {
+                session_id,
+                data: self.field_or_empty("data")?,
+            },
             "turn_end" => ServerEvent::TurnEnd {
                 session_id,
                 data: self.field_or_empty("data")?,
@@ -242,6 +246,10 @@ impl EventParams {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerEvent {
     TurnStart {
+        session_id: Option<String>,
+        data: Value,
+    },
+    AgentEnd {
         session_id: Option<String>,
         data: Value,
     },
@@ -574,8 +582,15 @@ impl ProtocolClient {
                         .data
                         .as_ref()
                         .and_then(|data| data.get("supported"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
+                        .and_then(Value::as_array)
+                        .map(|versions| {
+                            versions
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_else(|| "unknown".to_owned());
                     return Err(ClientError::VersionMismatch {
                         requested: requested.to_owned(),
                         supported: supported.to_owned(),
@@ -698,12 +713,15 @@ mod tests {
         let path = std::env::temp_dir().join(format!("zeta-gui-test-{}", std::process::id()));
         let server = fake_server(
             &path,
-            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32002, "message": "version mismatch", "data": { "requested": "1.0", "supported": "2.0" } } }),
+            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32002, "message": "version mismatch", "data": { "requested": "1.0", "supported": ["2.0"] } } }),
             None,
         );
         let mut client = ProtocolClient::connect_socket(&path).expect("connect fake server");
         let error = client.handshake().expect_err("mismatch should fail");
-        assert!(error.to_string().contains("protocol version mismatch"));
+        assert_eq!(
+            error.to_string(),
+            "protocol version mismatch: requested 1.0, server supports 2.0"
+        );
         server.join().expect("fake server exits");
         let _ = std::fs::remove_file(path);
     }

@@ -1,3 +1,5 @@
+mod composer;
+use composer::Composer;
 use gpui::{
     div, prelude::*, px, App, Bounds, Context, FocusHandle, Focusable, KeyDownEvent, Render, Task,
     Window, WindowBounds, WindowOptions,
@@ -5,13 +7,12 @@ use gpui::{
 use gpui_platform::application;
 use std::env;
 use std::path::PathBuf;
-use std::process::{Child, Command};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::Duration;
-use zeta_gui::client::{Approval, ClientError, ProtocolClient, ServerEvent, SessionMetadata};
+use zeta_gui::client::Approval;
 use zeta_gui::state::{AppState, ConnectionState, TranscriptEntry};
+use zeta_gui::worker::{CommandMessage, ConnectionWorker, WorkerMessage};
 
 const BG: u32 = 0x111210;
 const PANEL: u32 = 0x181a17;
@@ -20,270 +21,11 @@ const TEXT: u32 = 0xd8ddd5;
 const MUTED: u32 = 0x8a9287;
 const SIGNAL: u32 = 0xe1a84b;
 
-#[derive(Clone, Copy)]
-struct Palette {
-    bg: u32,
-    text: u32,
-}
-
-impl Palette {
-    fn for_window(window: &Window) -> Self {
-        match window.appearance() {
-            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => {
-                Self { bg: BG, text: TEXT }
-            }
-            gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => Self {
-                bg: 0xf7f8f5,
-                text: 0x1b1e1a,
-            },
-        }
-    }
-}
-
-enum CommandMessage {
-    NewSession,
-    Resume(String),
-    Send(String),
-    Approve(String),
-    Deny(String),
-    Abort,
-    Reconnect,
-}
-
-enum WorkerMessage {
-    Sessions(Vec<SessionMetadata>),
-    Session(SessionMetadata),
-    Connected,
-    Event(ServerEvent),
-    Lost(String),
-}
-
-struct ConnectionWorker {
-    commands: Receiver<CommandMessage>,
-    messages: Sender<WorkerMessage>,
-    socket: Option<PathBuf>,
-}
-
-impl ConnectionWorker {
-    fn run(self) {
-        let mut server_process: Option<Child> = None;
-        let mut client = None;
-        loop {
-            if client.is_none() {
-                match connect(&self.socket, &mut server_process) {
-                    Ok(mut connected) => match connected
-                        .handshake()
-                        .and_then(|_| connected.list_sessions())
-                    {
-                        Ok(sessions) => {
-                            let _ = self.messages.send(WorkerMessage::Sessions(sessions));
-                            let _ = self.messages.send(WorkerMessage::Connected);
-                            client = Some(connected);
-                        }
-                        Err(error) => {
-                            let _ = self.messages.send(WorkerMessage::Lost(error.to_string()));
-                            wait_for_reconnect(&self.commands);
-                        }
-                    },
-                    Err(error) => {
-                        let _ = self.messages.send(WorkerMessage::Lost(error.to_string()));
-                        wait_for_reconnect(&self.commands);
-                    }
-                }
-                continue;
-            }
-
-            let mut disconnected = false;
-            match self.commands.recv_timeout(Duration::from_millis(40)) {
-                Ok(command) => {
-                    if command_is_reconnect(&command) {
-                        client = None;
-                        continue;
-                    }
-                    let result = client.as_mut().map_or_else(
-                        || Err(ClientError::UnexpectedResponse),
-                        |active| handle_command(active, command, &self.messages, &self.commands),
-                    );
-                    if let Err(error) = result {
-                        let _ = self.messages.send(WorkerMessage::Lost(error.to_string()));
-                        disconnected = true;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-            if disconnected {
-                client = None;
-            } else if let Some(event) = client.as_mut().and_then(ProtocolClient::try_event) {
-                let _ = self.messages.send(WorkerMessage::Event(event));
-            }
-        }
-    }
-}
-
-fn command_is_reconnect(command: &CommandMessage) -> bool {
-    matches!(command, CommandMessage::Reconnect)
-}
-
-fn wait_for_reconnect(commands: &Receiver<CommandMessage>) {
-    while let Ok(command) = commands.recv_timeout(Duration::from_millis(250)) {
-        if command_is_reconnect(&command) {
-            return;
-        }
-    }
-}
-
-fn handle_command(
-    client: &mut ProtocolClient,
-    command: CommandMessage,
-    messages: &Sender<WorkerMessage>,
-    commands: &Receiver<CommandMessage>,
-) -> Result<(), ClientError> {
-    match command {
-        CommandMessage::NewSession => {
-            let session = client.new_session(None, None)?;
-            let _ = messages.send(WorkerMessage::Session(session));
-        }
-        CommandMessage::Resume(id) => {
-            let session = client.resume(&id)?;
-            let _ = messages.send(WorkerMessage::Session(session));
-        }
-        CommandMessage::Send(text) => {
-            client.send(&text)?;
-            client.set_read_timeout(Some(Duration::from_millis(100)))?;
-            drain_turn(client, messages, commands)?;
-            client.set_read_timeout(Some(Duration::from_secs(5)))?;
-        }
-        CommandMessage::Approve(id) => {
-            client.approve(&id)?;
-        }
-        CommandMessage::Deny(id) => {
-            client.deny(&id)?;
-        }
-        CommandMessage::Abort => {
-            client.abort()?;
-        }
-        CommandMessage::Reconnect => {}
-    }
-    Ok(())
-}
-
-fn drain_turn(
-    client: &mut ProtocolClient,
-    messages: &Sender<WorkerMessage>,
-    commands: &Receiver<CommandMessage>,
-) -> Result<(), ClientError> {
-    loop {
-        match client.next_event() {
-            Ok(event) => {
-                let done = matches!(
-                    event,
-                    ServerEvent::TurnEnd { .. } | ServerEvent::TurnAborted { .. }
-                );
-                let approval_wait = matches!(event, ServerEvent::ApprovalRequest { .. });
-                let _ = messages.send(WorkerMessage::Event(event));
-                if done {
-                    return Ok(());
-                }
-                if approval_wait {
-                    process_turn_commands(client, commands)?;
-                }
-            }
-            Err(ClientError::Io(error)) => {
-                if error.kind() == std::io::ErrorKind::TimedOut {
-                    process_available_turn_command(client, commands)?;
-                } else {
-                    return Err(ClientError::Io(error));
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn process_available_turn_command(
-    client: &mut ProtocolClient,
-    commands: &Receiver<CommandMessage>,
-) -> Result<(), ClientError> {
-    if let Ok(command) = commands.try_recv() {
-        process_command_during_turn(client, command)?;
-    }
-    Ok(())
-}
-
-fn process_turn_commands(
-    client: &mut ProtocolClient,
-    commands: &Receiver<CommandMessage>,
-) -> Result<(), ClientError> {
-    loop {
-        match commands.recv() {
-            Ok(command) => {
-                if matches!(
-                    command,
-                    CommandMessage::Approve(_) | CommandMessage::Deny(_) | CommandMessage::Abort
-                ) {
-                    return process_command_during_turn(client, command);
-                }
-            }
-            Err(_) => return Err(ClientError::UnexpectedResponse),
-        }
-    }
-}
-
-fn process_command_during_turn(
-    client: &mut ProtocolClient,
-    command: CommandMessage,
-) -> Result<(), ClientError> {
-    match command {
-        CommandMessage::Approve(id) => {
-            client.approve(&id)?;
-        }
-        CommandMessage::Deny(id) => {
-            client.deny(&id)?;
-        }
-        CommandMessage::Abort => {
-            client.abort()?;
-        }
-        CommandMessage::NewSession
-        | CommandMessage::Resume(_)
-        | CommandMessage::Send(_)
-        | CommandMessage::Reconnect => {}
-    }
-    Ok(())
-}
-
-fn connect(
-    socket: &Option<PathBuf>,
-    process: &mut Option<Child>,
-) -> Result<ProtocolClient, ClientError> {
-    let path = socket.clone().unwrap_or_else(default_socket);
-    if !path.exists() {
-        let mut command = Command::new(zeta_binary());
-        command.arg("serve").arg("--socket").arg(&path);
-        *process = Some(command.spawn().map_err(ClientError::Io)?);
-        for _ in 0..50 {
-            if path.exists() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-    ProtocolClient::connect_socket(path)
-}
-
-fn zeta_binary() -> String {
-    env::var("ZETA_BIN").unwrap_or_else(|_| "zeta".to_owned())
-}
-
-fn default_socket() -> PathBuf {
-    if let Some(home) = env::var_os("ZETA_HOME") {
-        return PathBuf::from(home).join("run/serve.sock");
-    }
-    PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".zeta/run/serve.sock")
-}
-
 struct ZetaView {
     state: AppState,
+    composer: gpui::Entity<Composer>,
+    pending_command: bool,
+    command_error: Option<String>,
     commands: Sender<CommandMessage>,
     focus_handle: FocusHandle,
     _poll_task: Task<()>,
@@ -299,33 +41,26 @@ impl ZetaView {
     fn new(window: &mut Window, cx: &mut Context<Self>, socket: Option<PathBuf>) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let (message_tx, message_rx) = mpsc::channel();
-        let messages = Arc::new(Mutex::new(message_rx));
-        let worker_messages = message_tx;
         thread::spawn(move || {
             ConnectionWorker {
                 commands: command_rx,
-                messages: worker_messages,
+                messages: message_tx,
                 socket,
             }
             .run()
         });
-        let messages_for_poll = Arc::clone(&messages);
         let poll_task = cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(50))
                 .await;
-            let Ok(receiver) = messages_for_poll.lock() else {
-                return;
-            };
-            let updates = receiver.try_iter().collect::<Vec<_>>();
-            drop(receiver);
+            let updates = message_rx.try_iter().collect::<Vec<_>>();
             if updates.is_empty() {
                 continue;
             }
             if this
                 .update_in(cx, |view, _window, cx| {
                     for update in updates {
-                        view.apply_worker_message(update);
+                        view.apply_worker_message(update, cx);
                     }
                     cx.notify();
                 })
@@ -334,18 +69,28 @@ impl ZetaView {
                 return;
             }
         });
+        let composer = cx.new(Composer::new);
+        cx.subscribe(&composer, |view, _, _: &composer::Submit, cx| {
+            view.send_composer(cx);
+        })
+        .detach();
+        window.focus(&composer.focus_handle(cx), cx);
         Self {
             state: AppState::default(),
+            composer,
+            pending_command: false,
+            command_error: None,
             commands: command_tx,
             focus_handle: cx.focus_handle(),
             _poll_task: poll_task,
         }
     }
 
-    fn apply_worker_message(&mut self, message: WorkerMessage) {
+    fn apply_worker_message(&mut self, message: WorkerMessage, cx: &mut Context<Self>) {
         match message {
             WorkerMessage::Sessions(sessions) => self.state.sessions = sessions,
             WorkerMessage::Session(session) => {
+                self.pending_command = false;
                 self.state.active_session = Some(session.session_id.clone());
                 if !self
                     .state
@@ -357,78 +102,95 @@ impl ZetaView {
                 }
                 self.state.transcript.clear();
             }
+            WorkerMessage::Status(status) => self.state.apply_status(status),
+            WorkerMessage::Sent(text) => {
+                self.pending_command = false;
+                self.state.streaming = true;
+                self.state.transcript.push(TranscriptEntry::User(text));
+                self.composer.update(cx, |composer, cx| {
+                    composer.reset();
+                    cx.notify();
+                });
+            }
+            WorkerMessage::Rejected(error) => {
+                self.pending_command = false;
+                self.command_error = Some(error);
+            }
             WorkerMessage::Connected => self.state.connection = ConnectionState::Connected,
             WorkerMessage::Event(event) => self.state.apply(event),
-            WorkerMessage::Lost(error) => self.state.mark_connection_lost(error),
-        }
-    }
-
-    fn new_session(&mut self, _: &gpui::ClickEvent, _: &mut Window, _: &mut Context<Self>) {
-        let _ = self.commands.send(CommandMessage::NewSession);
-        self.state.transcript.clear();
-        self.state.active_session = None;
-    }
-
-    fn resume(&mut self, id: String, _: &gpui::ClickEvent, _: &mut Window, _: &mut Context<Self>) {
-        let _ = self.commands.send(CommandMessage::Resume(id.clone()));
-        self.state.active_session = Some(id);
-        self.state.transcript.clear();
-    }
-
-    fn composer_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.state.approval.is_some() {
-            return;
-        }
-        let key = event.keystroke.key.as_str();
-        if key == "escape" || (key == "c" && event.keystroke.modifiers.control) {
-            let _ = self.commands.send(CommandMessage::Abort);
-            self.state.streaming = false;
-        } else if key == "enter" {
-            if event.keystroke.modifiers.shift {
-                self.state.composer.push('\n');
-            } else {
-                self.send_composer();
-            }
-        } else if key == "backspace" {
-            self.state.composer.pop();
-        } else if !event.keystroke.modifiers.modified() {
-            if let Some(character) = event.keystroke.key_char.as_deref().or(Some(key)) {
-                self.state.composer.push_str(character);
+            WorkerMessage::Lost(error) => {
+                self.pending_command = false;
+                self.state.mark_connection_lost(error);
             }
         }
-        window.focus(&self.focus_handle, cx);
+    }
+
+    fn can_change_session(&self) -> bool {
+        matches!(self.state.connection, ConnectionState::Connected)
+            && !self.state.streaming
+            && self.state.approvals.is_empty()
+            && !self.pending_command
+    }
+
+    fn queue(&mut self, command: CommandMessage) {
+        self.command_error = None;
+        if self.commands.send(command).is_err() {
+            self.pending_command = false;
+            self.state.mark_connection_lost("connection worker stopped");
+        }
+    }
+
+    fn new_session(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.can_change_session() {
+            self.pending_command = true;
+            self.queue(CommandMessage::NewSession);
+            cx.notify();
+        }
+    }
+
+    fn resume(&mut self, id: String, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.can_change_session() {
+            self.pending_command = true;
+            self.queue(CommandMessage::Resume(id));
+            cx.notify();
+        }
+    }
+
+    fn control_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.approvals.is_empty() {
+            let command = match event.keystroke.key.as_str() {
+                "enter" => Some(CommandMessage::Approve(
+                    self.state.approvals[0].request_id.clone(),
+                )),
+                "escape" => Some(CommandMessage::Deny(
+                    self.state.approvals[0].request_id.clone(),
+                )),
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.queue(command);
+                cx.stop_propagation();
+            }
+        } else if event.keystroke.key == "escape"
+            || (event.keystroke.key == "c" && event.keystroke.modifiers.control)
+        {
+            self.queue(CommandMessage::Abort);
+            cx.stop_propagation();
+        }
         cx.notify();
     }
 
-    fn approval_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(approval) = self.state.approval.take() else {
+    fn send_composer(&mut self, cx: &mut Context<Self>) {
+        if !self.can_change_session() || self.state.active_session.is_none() {
             return;
-        };
-        match event.keystroke.key.as_str() {
-            "enter" => {
-                let _ = self
-                    .commands
-                    .send(CommandMessage::Approve(approval.request_id));
-            }
-            "escape" => {
-                let _ = self
-                    .commands
-                    .send(CommandMessage::Deny(approval.request_id));
-            }
-            _ => self.state.approval = Some(approval),
         }
-        cx.notify();
-    }
-
-    fn send_composer(&mut self) {
-        let text = std::mem::take(&mut self.state.composer);
+        let text = self.composer.read(cx).content.to_string();
         if text.trim().is_empty() {
             return;
         }
-        self.state
-            .transcript
-            .push(TranscriptEntry::User(text.clone()));
-        let _ = self.commands.send(CommandMessage::Send(text));
+        self.pending_command = true;
+        self.queue(CommandMessage::Send(text));
+        cx.notify();
     }
 
     fn approval_action(
@@ -444,12 +206,12 @@ impl ZetaView {
         } else {
             CommandMessage::Deny(approval.request_id)
         };
-        let _ = self.commands.send(command);
+        self.queue(command);
     }
 
     fn reconnect(&mut self, _: &gpui::ClickEvent, _: &mut Window, _: &mut Context<Self>) {
         self.state.begin_reconnect();
-        let _ = self.commands.send(CommandMessage::Reconnect);
+        self.queue(CommandMessage::Reconnect);
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -480,6 +242,7 @@ impl ZetaView {
             .border_1()
             .border_color(gpui::rgb(LINE))
             .text_color(gpui::rgb(TEXT))
+            .opacity(if self.can_change_session() { 1. } else { 0.4 })
             .child("new session")
             .hover(|this| this.bg(gpui::rgb(LINE)))
             .on_click(cx.listener(Self::new_session));
@@ -499,6 +262,7 @@ impl ZetaView {
                     .px_3()
                     .py_2()
                     .text_color(gpui::rgb(MUTED))
+                    .opacity(if self.can_change_session() { 1. } else { 0.4 })
                     .child(label)
                     .hover(|this| this.text_color(gpui::rgb(TEXT)))
                     .on_click(cx.listener(move |view, event, window, cx| {
@@ -531,6 +295,7 @@ impl ZetaView {
                     summary,
                     complete,
                     error,
+                    ..
                 } => {
                     let marker = if *error {
                         "error"
@@ -551,35 +316,29 @@ impl ZetaView {
         transcript
     }
 
-    fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let placeholder = if self.state.composer.is_empty() {
-            "write a message...".to_owned()
+    fn render_composer(&self) -> impl IntoElement {
+        let hint = if self.state.streaming {
+            "waiting for response; escape aborts"
+        } else if self.state.active_session.is_none() {
+            "select or create a session to send"
         } else {
-            self.state.composer.clone()
+            "enter sends; shift-enter adds a line"
         };
         div()
             .w_full()
             .border_t_1()
             .border_color(gpui::rgb(LINE))
             .p_4()
+            .child(self.composer.clone())
             .child(
                 div()
-                    .id("composer")
-                    .min_h(px(72.))
-                    .w_full()
-                    .p_3()
-                    .border_1()
-                    .border_color(gpui::rgb(LINE))
-                    .text_color(gpui::rgb(if self.state.composer.is_empty() {
-                        MUTED
-                    } else {
-                        TEXT
-                    }))
-                    .focusable()
-                    .track_focus(&self.focus_handle)
-                    .on_key_down(cx.listener(Self::composer_key))
-                    .child(placeholder),
+                    .text_size(px(12.))
+                    .text_color(gpui::rgb(MUTED))
+                    .child(hint),
             )
+            .when_some(self.command_error.clone(), |view, error| {
+                view.child(div().text_color(gpui::rgb(0xd97979)).child(error))
+            })
     }
 
     fn render_approval(&self, approval: &Approval, cx: &mut Context<Self>) -> impl IntoElement {
@@ -656,15 +415,25 @@ impl ZetaView {
 }
 
 impl Render for ZetaView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = Palette::for_window(window);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let enabled = !self.pending_command && self.state.approvals.is_empty();
+        self.composer
+            .update(cx, |composer, _| composer.enabled = enabled);
         let mut root = div()
             .size_full()
             .flex()
-            .bg(gpui::rgb(palette.bg))
+            .bg(gpui::rgb(BG))
             .text_size(px(14.))
-            .text_color(gpui::rgb(palette.text))
-            .on_key_down(cx.listener(Self::approval_key))
+            .text_color(gpui::rgb(TEXT))
+            .track_focus(&self.focus_handle)
+            .capture_action(cx.listener(|view, _: &composer::Submit, _, cx| {
+                if let Some(approval) = view.state.approvals.first() {
+                    view.queue(CommandMessage::Approve(approval.request_id.clone()));
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .on_key_down(cx.listener(Self::control_key))
             .child(self.render_sidebar(cx))
             .child(
                 div()
@@ -673,7 +442,7 @@ impl Render for ZetaView {
                     .flex()
                     .flex_col()
                     .child(self.render_transcript())
-                    .child(self.render_composer(cx)),
+                    .child(self.render_composer()),
             );
         root = match &self.state.connection {
             ConnectionState::Connected => root,
@@ -716,7 +485,7 @@ impl Render for ZetaView {
                     ),
             ),
         };
-        if let Some(approval) = self.state.approval.clone() {
+        if let Some(approval) = self.state.approvals.first().cloned() {
             root = root.child(self.render_approval(&approval, cx));
         }
         root
@@ -731,6 +500,7 @@ fn main() {
         .find(|pair| pair[0] == "--socket")
         .map(|pair| PathBuf::from(&pair[1]));
     application().run(move |cx: &mut App| {
+        composer::bind_keys(cx);
         let bounds = Bounds::centered(None, gpui::size(px(1100.), px(760.)), cx);
         cx.open_window(
             WindowOptions {
@@ -742,4 +512,53 @@ fn main() {
         .expect("open zeta window");
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeta_gui::client::ToolCall;
+
+    #[gpui::test]
+    fn approval_and_abort_keys_reach_worker_from_composer(cx: &mut gpui::TestAppContext) {
+        cx.update(composer::bind_keys);
+        let (commands, receiver) = mpsc::channel();
+        let window = cx.add_window(move |window, cx| {
+            let composer = cx.new(Composer::new);
+            window.focus(&composer.focus_handle(cx), cx);
+            ZetaView {
+                state: AppState {
+                    connection: ConnectionState::Connected,
+                    approvals: vec![Approval {
+                        request_id: "one".into(),
+                        tool_call: ToolCall {
+                            id: "one".into(),
+                            name: "read".into(),
+                            arguments: Default::default(),
+                        },
+                    }],
+                    ..Default::default()
+                },
+                composer,
+                pending_command: false,
+                command_error: None,
+                commands,
+                focus_handle: cx.focus_handle(),
+                _poll_task: Task::ready(()),
+            }
+        });
+        cx.simulate_keystrokes(window.into(), "enter");
+        assert!(matches!(receiver.try_recv(), Ok(CommandMessage::Approve(id)) if id == "one"));
+        cx.simulate_keystrokes(window.into(), "escape");
+        assert!(matches!(receiver.try_recv(), Ok(CommandMessage::Deny(id)) if id == "one"));
+        window
+            .update(cx, |view, _, cx| {
+                view.state.approvals.clear();
+                view.state.streaming = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "escape");
+        assert!(matches!(receiver.try_recv(), Ok(CommandMessage::Abort)));
+    }
 }
