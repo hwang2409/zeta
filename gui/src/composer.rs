@@ -40,6 +40,8 @@ pub struct Composer {
     placeholder: SharedString,
     selected_range: Range<usize>,
     selection_reversed: bool,
+    // At a soft wrap, true places the caret at the start of the next row.
+    cursor_downstream: bool,
     marked_range: Option<Range<usize>>,
     layout: Option<TextLayout>,
     scroll: ScrollHandle,
@@ -119,11 +121,7 @@ impl Composer {
         window.focus(&self.focus_handle, cx);
         self.is_selecting = true;
 
-        if event.modifiers.shift {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
-        } else {
-            self.move_to(self.index_for_mouse_position(event.position), cx)
-        }
+        self.move_to_position(event.position, event.modifiers.shift, cx);
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _: &mut Context<Self>) {
@@ -132,7 +130,7 @@ impl Composer {
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+            self.move_to_position(event.position, true, cx);
         }
     }
 
@@ -170,6 +168,7 @@ impl Composer {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selection_reversed = false;
         self.selected_range = offset..offset;
+        self.cursor_downstream = true;
         self.reveal_cursor = true;
         cx.notify()
     }
@@ -182,18 +181,46 @@ impl Composer {
         }
     }
 
-    fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+    fn caret_for_mouse_position(&self, position: Point<Pixels>) -> (usize, bool) {
         if self.content.is_empty() {
-            return 0;
+            return (0, true);
         }
 
         let Some(layout) = &self.layout else {
-            return 0;
+            return (0, true);
         };
-        layout
-            .index_for_position(position)
-            .unwrap_or_else(|index| index)
-            .min(self.content.len())
+        let (index, downstream) = closest_caret(layout, position);
+        (index.min(self.content.len()), downstream)
+    }
+
+    fn move_to_position(&mut self, position: Point<Pixels>, select: bool, cx: &mut Context<Self>) {
+        let (offset, downstream) = self.caret_for_mouse_position(position);
+        if select {
+            self.select_to(offset, cx);
+        } else {
+            self.move_to(offset, cx);
+        }
+        self.cursor_downstream = downstream;
+    }
+
+    fn position_for_index(&self, layout: &TextLayout, index: usize) -> Option<Point<Pixels>> {
+        let position = layout.position_for_index(index)?;
+        if index != self.cursor_offset() || self.cursor_downstream {
+            let mut start = 0;
+            for line in layout.line_layouts() {
+                for boundary in line.wrap_boundaries() {
+                    let glyph = &line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix];
+                    if start + glyph.index == index {
+                        return Some(point(
+                            layout.bounds().left(),
+                            position.y + layout.line_height(),
+                        ));
+                    }
+                }
+                start += line.len() + 1;
+            }
+        }
+        Some(position)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -206,6 +233,7 @@ impl Composer {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.cursor_downstream = true;
         self.reveal_cursor = true;
         cx.notify()
     }
@@ -259,6 +287,7 @@ impl Composer {
         self.marked_range = None;
         self.layout = None;
         self.scroll.set_offset(point(px(0.), px(0.)));
+        self.cursor_downstream = true;
         self.reveal_cursor = true;
         self.is_selecting = false;
     }
@@ -328,6 +357,7 @@ impl EntityInputHandler for Composer {
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
         self.selection_reversed = false;
+        self.cursor_downstream = true;
         self.reveal_cursor = true;
         cx.notify();
     }
@@ -367,6 +397,7 @@ impl EntityInputHandler for Composer {
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
 
         self.selection_reversed = false;
+        self.cursor_downstream = true;
         self.reveal_cursor = true;
         cx.notify();
     }
@@ -380,8 +411,8 @@ impl EntityInputHandler for Composer {
     ) -> Option<Bounds<Pixels>> {
         let range = self.range_from_utf16(&range_utf16);
         let layout = self.layout.as_ref()?;
-        let start = layout.position_for_index(range.start)?;
-        let end = layout.position_for_index(range.end)?;
+        let start = self.position_for_index(layout, range.start)?;
+        let end = self.position_for_index(layout, range.end)?;
         // Native input methods anchor to the first visual row of a selection.
         let right = if end.y == start.y {
             end.x
@@ -398,7 +429,7 @@ impl EntityInputHandler for Composer {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         self.layout.as_ref()?;
-        Some(self.offset_to_utf16(self.index_for_mouse_position(point)))
+        Some(self.offset_to_utf16(self.caret_for_mouse_position(point).0))
     }
 }
 
@@ -412,6 +443,7 @@ impl Composer {
             placeholder: "write a message...".into(),
             selected_range: 0..0,
             selection_reversed: false,
+            cursor_downstream: true,
             marked_range: None,
             layout: None,
             scroll: ScrollHandle::new(),
@@ -435,19 +467,17 @@ impl Composer {
         let Some(position) = self
             .layout
             .as_ref()
-            .and_then(|layout| layout.position_for_index(self.cursor_offset()))
+            .and_then(|layout| self.position_for_index(layout, self.cursor_offset()))
         else {
             return;
         };
-        let offset = self.index_for_mouse_position(
+        self.move_to_position(
             position + point(px(0.), if down { px(33.) } else { px(-11.) }),
+            select,
+            cx,
         );
-        if select {
-            self.select_to(offset, cx);
-        } else {
-            self.move_to(offset, cx);
-        }
     }
+
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
         self.vertical(false, false, cx);
     }
@@ -460,6 +490,33 @@ impl Composer {
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
         self.vertical(true, true, cx);
     }
+}
+
+// TextLayout exposes only containing-glyph hit testing. Use its shaped lines for
+// nearest insertion boundaries, retaining which side of a soft wrap was hit.
+fn closest_caret(layout: &TextLayout, position: Point<Pixels>) -> (usize, bool) {
+    let height = layout.line_height();
+    let mut y = (position.y - layout.bounds().top())
+        .max(px(0.))
+        .min(layout.bounds().size.height - height / 2.);
+    let mut start = 0;
+    for line in layout.line_layouts() {
+        let line_height = height * (line.wrap_boundaries().len() + 1) as f32;
+        if y < line_height {
+            let row = (y / height) as usize;
+            let index = line
+                .closest_index_for_position(point(position.x - layout.bounds().left(), y), height)
+                .unwrap_or_else(|index| index);
+            let downstream = row > 0 && {
+                let boundary = line.wrap_boundaries()[row - 1];
+                index == line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index
+            };
+            return (start + index, downstream);
+        }
+        y -= line_height;
+        start += line.len() + 1;
+    }
+    (layout.len(), false)
 }
 
 fn utf16_offset(text: &str, offset: usize) -> usize {
@@ -602,7 +659,8 @@ impl Render for Composer {
                                     ElementInputHandler::new(bounds, cx.entity()),
                                     cx,
                                 );
-                                let cursor = layout.position_for_index(input.cursor_offset());
+                                let cursor =
+                                    input.position_for_index(&layout, input.cursor_offset());
                                 if let Some(cursor) = cursor {
                                     if input.reveal_cursor {
                                         input.reveal_cursor = false;
@@ -649,6 +707,160 @@ impl Render for Composer {
 mod tests {
     use super::*;
 
+    fn assert_caret(
+        view: &mut Composer,
+        layout: &TextLayout,
+        index: usize,
+        row: usize,
+        x: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Composer>,
+    ) {
+        assert_eq!(view.cursor_offset(), index);
+        let expected = layout.bounds().origin + point(x, layout.line_height() * row as f32);
+        assert_eq!(view.position_for_index(layout, index), Some(expected));
+        let range = view.range_to_utf16(&(index..index));
+        assert_eq!(
+            view.bounds_for_range(range, layout.bounds(), window, cx)
+                .unwrap()
+                .origin,
+            expected
+        );
+    }
+
+    #[gpui::test]
+    fn clicks_use_nearest_boundaries_and_preserve_wrap_row(cx: &mut gpui::TestAppContext) {
+        let window = cx.open_window(size(px(240.), px(400.)), |_, cx| Composer::new(cx));
+        window
+            .update(cx, |view, window, cx| {
+                view.replace_text_in_range(None, &"abcdefghij".repeat(6), window, cx);
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        window
+            .update(cx, |view, window, cx| {
+                let layout = view.layout.as_ref().unwrap().clone();
+                let wrapped = layout.wrapped_text();
+                let rows: Vec<_> = wrapped.split('\n').collect();
+                assert!(rows.len() >= 3);
+                let wrap = rows[0].len();
+                let second_wrap = wrap + rows[1].len();
+                let line = layout.line_layouts().remove(0);
+                let glyph_x = |index| line.unwrapped_layout.x_for_index(index);
+                let origin = layout.bounds().origin;
+                let height = layout.line_height();
+                // Both halves of a glyph, including the first glyph after wrapping.
+                for (row, start) in [(0, 0), (1, wrap)] {
+                    let width = glyph_x(start + 1) - glyph_x(start);
+                    for (fraction, index, x) in [(0.25, start, px(0.)), (0.75, start + 1, width)] {
+                        let position =
+                            origin + point(width * fraction, height * (row as f32 + 0.5));
+                        assert_eq!(view.caret_for_mouse_position(position).0, index);
+                        assert_eq!(
+                            view.character_index_for_point(position, window, cx),
+                            Some(index)
+                        );
+                        view.on_mouse_down(
+                            &MouseDownEvent {
+                                position,
+                                button: MouseButton::Left,
+                                ..Default::default()
+                            },
+                            window,
+                            cx,
+                        );
+                        assert_caret(view, &layout, index, row, x, window, cx);
+                    }
+                }
+                // The same byte index has two valid visual positions.
+                let end_x = glyph_x(wrap);
+                let last_width = end_x - glyph_x(wrap - 1);
+                view.move_to_position(
+                    origin + point(end_x - last_width * 0.25, height / 2.),
+                    false,
+                    cx,
+                );
+                assert_caret(view, &layout, wrap, 0, end_x, window, cx);
+                view.move_to_position(origin + point(px(0.), height * 1.5), false, cx);
+                assert_caret(view, &layout, wrap, 1, px(0.), window, cx);
+                view.vertical(true, false, cx);
+                assert_caret(view, &layout, second_wrap, 2, px(0.), window, cx);
+                view.vertical(false, true, cx);
+                assert_caret(view, &layout, wrap, 1, px(0.), window, cx);
+                assert!(view.selection_reversed);
+                view.vertical(false, false, cx);
+                assert_caret(view, &layout, 0, 0, px(0.), window, cx);
+                // A drag and a shift-click retain the target row, too.
+                view.on_mouse_move(
+                    &MouseMoveEvent {
+                        position: origin + point(px(0.), height * 1.5),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                assert_caret(view, &layout, wrap, 1, px(0.), window, cx);
+                view.on_mouse_down(
+                    &MouseDownEvent {
+                        position: origin + point(px(0.), height * 2.5),
+                        button: MouseButton::Left,
+                        modifiers: gpui::Modifiers {
+                            shift: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                assert_caret(view, &layout, second_wrap, 2, px(0.), window, cx);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn empty_rows_and_trailing_newlines_keep_exact_caret_rows(cx: &mut gpui::TestAppContext) {
+        let window = cx.open_window(size(px(240.), px(400.)), |_, cx| Composer::new(cx));
+        for text in ["", "\n", "a\n\nb\n\n"] {
+            window
+                .update(cx, |view, window, cx| {
+                    view.reset();
+                    view.replace_text_in_range(None, text, window, cx);
+                })
+                .unwrap();
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            window
+                .update(cx, |view, window, cx| {
+                    let layout = view.layout.as_ref().unwrap().clone();
+                    let mut start = 0;
+                    let mut starts = Vec::new();
+                    for (row, line) in text.split('\n').enumerate() {
+                        starts.push(start);
+                        let position = layout.bounds().origin
+                            + point(px(0.), layout.line_height() * (row as f32 + 0.5));
+                        view.move_to_position(position, false, cx);
+                        assert_caret(view, &layout, start, row, px(0.), window, cx);
+                        assert_eq!(
+                            view.character_index_for_point(position, window, cx),
+                            Some(start)
+                        );
+                        start += line.len() + 1;
+                    }
+                    for row in (0..starts.len().saturating_sub(1)).rev() {
+                        view.vertical(false, false, cx);
+                        assert_caret(view, &layout, starts[row], row, px(0.), window, cx);
+                    }
+                    for (row, index) in starts.iter().enumerate().skip(1) {
+                        view.vertical(true, false, cx);
+                        assert_caret(view, &layout, *index, row, px(0.), window, cx);
+                    }
+                })
+                .unwrap();
+        }
+    }
+
     #[gpui::test]
     fn wrapped_prompt_supports_caret_selection_and_scrolling(cx: &mut gpui::TestAppContext) {
         cx.update(bind_keys);
@@ -675,7 +887,7 @@ mod tests {
                 assert!(caret.y + px(22.) <= view.scroll.bounds().bottom());
                 let suffix = prompt.len() - 3;
                 let position = layout.position_for_index(suffix).unwrap() + point(px(1.), px(11.));
-                assert_eq!(view.index_for_mouse_position(position), suffix);
+                assert_eq!(view.caret_for_mouse_position(position).0, suffix);
                 view.on_mouse_down(
                     &MouseDownEvent {
                         position,
