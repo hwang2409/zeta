@@ -53,7 +53,9 @@ impl Peer {
     }
 
     fn event(&mut self, mut event: Value) {
-        event["session_id"] = json!("session-1");
+        if event.get("session_id").is_none() {
+            event["session_id"] = json!("session-1");
+        }
         self.write(json!({"jsonrpc":"2.0", "method":"event", "params":event}));
     }
 
@@ -344,8 +346,8 @@ fn reconnect_resumes_selected_session_and_restores_pending_approvals() {
     assert_eq!(state.approvals[0].request_id, "one");
     harness.command(CommandMessage::Deny("one".into()));
     assert!(matches!(harness.next(), WorkerMessage::Status(status) if status.state == "tool"));
-    assert!(matches!(harness.next(), WorkerMessage::Status(status) if status.state == "idle"));
     assert!(matches!(harness.event(), ServerEvent::ApprovalEnd { .. }));
+    assert!(matches!(harness.next(), WorkerMessage::Status(status) if status.state == "idle"));
     assert!(matches!(harness.event(), ServerEvent::ToolEnd { .. }));
     assert!(matches!(harness.next(), WorkerMessage::Status(status) if status.state == "idle"));
     disconnect.send(()).unwrap();
@@ -383,4 +385,134 @@ fn missing_explicit_socket_fails_without_spawning() {
     assert!(messages.recv_timeout(Duration::from_millis(300)).is_err());
     drop(commands);
     worker.join().unwrap();
+}
+
+#[test]
+fn background_tool_events_do_not_block_a_foreground_send() {
+    let harness = Harness::new(|listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([]));
+        peer.event(json!({"event":"tool_start","tool_call":call("same-provider-id"),"data":{"agent_instance_id":"child-one"}}));
+        peer.event(json!({"event":"tool_end","tool_call":call("same-provider-id"),"tool_result":null,"data":{"agent_instance_id":"child-one"}}));
+        peer.send();
+        peer.event(json!({"event":"agent_end","data":{}}));
+        assert_eq!(peer.reader.read_line(&mut String::new()).unwrap(), 0);
+    });
+    harness.connected();
+    let mut state = AppState::default();
+    state.apply(harness.event());
+    state.apply(harness.event());
+    assert!(!state.streaming);
+    harness.command(CommandMessage::Send("after background tool".into()));
+    assert!(matches!(harness.next(), WorkerMessage::Sent(_)));
+    assert!(matches!(harness.event(), ServerEvent::AgentEnd { .. }));
+    harness.finish();
+}
+
+#[test]
+fn old_session_events_queued_during_a_switch_do_not_leak_or_block_sends() {
+    let harness = Harness::new(|listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([]));
+        let request = peer.request("new_session");
+        // These arrive before the RPC response, but the client delivers them
+        // after the actor switches to the new session.
+        for event in [
+            json!({"event":"turn_start","data":{}}),
+            json!({"event":"assistant_delta","delta":"old text","kind":"assistant"}),
+            json!({"event":"tool_start","tool_call":call("old"),"data":{}}),
+            json!({"event":"approval_request","tool_call":call("old"),"request_id":"old"}),
+            json!({"event":"approval_end","tool_call":call("old"),"data":{}}),
+            json!({"event":"error","error":{"code":"old","message":"old failure"},"data":{}}),
+        ] {
+            peer.event(event);
+        }
+        let mut new_session = session();
+        new_session["session_id"] = json!("session-2");
+        peer.write(json!({"jsonrpc":"2.0","id":request["id"],"result":{"session":new_session}}));
+        peer.respond(
+            "status",
+            json!({"session":new_session,"state":"idle","pending_approvals":[]}),
+        );
+        peer.event(json!({"event":"assistant_delta","delta":"new text","kind":"assistant","session_id":"session-2"}));
+        peer.respond("send", json!({"accepted":true,"session_id":"session-2"}));
+        peer.event(json!({"event":"agent_end","data":{},"session_id":"session-2"}));
+        assert_eq!(peer.reader.read_line(&mut String::new()).unwrap(), 0);
+    });
+    harness.connected();
+    harness.command(CommandMessage::NewSession);
+    assert!(matches!(harness.next(), WorkerMessage::Session(_)));
+    let WorkerMessage::Status(status) = harness.next() else {
+        panic!("missing status");
+    };
+    let mut state = AppState::default();
+    state.apply_status(status);
+    state.apply(harness.event());
+    assert_eq!(
+        state.transcript,
+        vec![TranscriptEntry::Assistant("new text".into())]
+    );
+    assert!(!state.streaming);
+    assert!(state.approvals.is_empty());
+    harness.command(CommandMessage::Send("new question".into()));
+    assert!(matches!(harness.next(), WorkerMessage::Sent(_)));
+    assert!(matches!(harness.event(), ServerEvent::AgentEnd { .. }));
+    harness.finish();
+}
+
+#[test]
+fn approval_end_preserves_the_other_delegated_request_with_the_same_raw_id() {
+    let first = json!({"request_id":"delegated-one","tool_call":call("same-provider-id")});
+    let second = json!({"request_id":"delegated-two","tool_call":call("same-provider-id")});
+    let harness = Harness::new(move |listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([first, second]));
+        for (request_id, agent, remaining) in [
+            ("delegated-one", "child-one", json!([second])),
+            ("delegated-two", "child-two", json!([])),
+        ] {
+            let request = peer.request("deny");
+            assert_eq!(request["params"]["request_id"], request_id);
+            // The event may already be queued when the command's status arrives.
+            peer.event(json!({"event":"approval_end","tool_call":call("same-provider-id"),"data":{"agent_instance_id":agent}}));
+            peer.write(json!({"jsonrpc":"2.0","id":request["id"],"result":{"accepted":true}}));
+            peer.status(true, "idle", remaining.clone());
+            peer.status(true, "idle", remaining);
+        }
+        peer.send();
+        peer.event(json!({"event":"agent_end","data":{}}));
+        assert_eq!(peer.reader.read_line(&mut String::new()).unwrap(), 0);
+    });
+    assert!(matches!(harness.next(), WorkerMessage::Sessions(_)));
+    let WorkerMessage::Status(status) = harness.next() else {
+        panic!("missing status");
+    };
+    let mut state = AppState::default();
+    state.apply_status(status);
+    assert!(matches!(harness.next(), WorkerMessage::Connected));
+    assert_eq!(state.approvals.len(), 2);
+    for (request, remaining) in [("delegated-one", 1), ("delegated-two", 0)] {
+        harness.command(CommandMessage::Deny(request.into()));
+        let WorkerMessage::Status(status) = harness.next() else {
+            panic!("missing status");
+        };
+        state.apply_status(status);
+        state.apply(harness.event());
+        assert_eq!(state.approvals.len(), remaining);
+        let WorkerMessage::Status(status) = harness.next() else {
+            panic!("missing status");
+        };
+        state.apply_status(status);
+        assert_eq!(state.approvals.len(), remaining);
+        if remaining == 1 {
+            assert_eq!(state.approvals[0].request_id, "delegated-two");
+        }
+    }
+    harness.command(CommandMessage::Send("after approvals".into()));
+    assert!(matches!(harness.next(), WorkerMessage::Sent(_)));
+    assert!(matches!(harness.event(), ServerEvent::AgentEnd { .. }));
+    harness.finish();
 }

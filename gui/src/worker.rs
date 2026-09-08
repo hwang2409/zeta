@@ -169,6 +169,10 @@ impl ConnectionWorker {
             client.set_read_timeout(Some(Duration::from_millis(20)))?;
             match client.next_event() {
                 Ok(event) => {
+                    if event.session_id() != selected.as_deref() {
+                        continue;
+                    }
+                    let refresh_approvals = matches!(event, ServerEvent::ApprovalEnd { .. });
                     match &event {
                         ServerEvent::AgentEnd { .. }
                         | ServerEvent::TurnAborted { .. }
@@ -178,15 +182,15 @@ impl ConnectionWorker {
                         }
                         ServerEvent::TurnStart { .. } => busy = true,
                         ServerEvent::ApprovalRequest { .. } => pending_approvals = true,
-                        ServerEvent::ApprovalEnd { .. } => {
-                            // status handles multiple pending approvals and resumed tools.
-                            client.set_read_timeout(Some(Duration::from_secs(5)))?;
-                            let status = self.status(&mut client)?;
-                            pending_approvals = !status.pending_approvals.is_empty();
-                        }
                         _ => {}
                     }
                     let _ = self.messages.send(WorkerMessage::Event(event));
+                    if refresh_approvals {
+                        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+                        let status = self.status(&mut client)?;
+                        busy = status.state != "idle";
+                        pending_approvals = !status.pending_approvals.is_empty();
+                    }
                 }
                 Err(ClientError::Io(error))
                     if matches!(
@@ -204,15 +208,42 @@ fn connect(
     process: &mut Option<Child>,
 ) -> Result<ProtocolClient, ClientError> {
     let path = socket.clone().unwrap_or_else(default_socket);
-    if socket.is_none() && !path.exists() {
-        let mut command = Command::new(zeta_binary());
-        command.arg("serve").arg("--socket").arg(&path);
-        *process = Some(command.spawn().map_err(ClientError::Io)?);
-        for _ in 0..50 {
-            if path.exists() {
-                break;
+    connect_or_spawn(&path, socket.is_none(), process, || {
+        Command::new(zeta_binary())
+            .arg("serve")
+            .arg("--socket")
+            .arg(&path)
+            .spawn()
+    })
+}
+
+fn connect_or_spawn(
+    path: &std::path::Path,
+    spawn_allowed: bool,
+    process: &mut Option<Child>,
+    spawn: impl FnOnce() -> std::io::Result<Child>,
+) -> Result<ProtocolClient, ClientError> {
+    match ProtocolClient::connect_socket(path) {
+        Err(ClientError::Io(error))
+            if spawn_allowed
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) => {}
+        result => return result,
+    }
+    *process = Some(spawn()?);
+    for _ in 0..50 {
+        match ProtocolClient::connect_socket(path) {
+            Err(ClientError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(100));
             }
-            thread::sleep(Duration::from_millis(100));
+            result => return result,
         }
     }
     ProtocolClient::connect_socket(path)
@@ -227,4 +258,58 @@ fn default_socket() -> PathBuf {
         return PathBuf::from(home).join("run/serve.sock");
     }
     PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".zeta/run/serve.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn default_connection_spawns_for_missing_and_stale_sockets() {
+        for stale in [false, true] {
+            let path =
+                env::temp_dir().join(format!("zg-spawn-{}-{stale}.sock", std::process::id()));
+            if stale {
+                drop(UnixListener::bind(&path).unwrap());
+                assert!(path.exists());
+            }
+            let mut process = None;
+            let client = connect_or_spawn(&path, true, &mut process, || {
+                Command::new("python3")
+                    .arg("-c")
+                    .arg("import os,socket,sys,time; p=sys.argv[1]; time.sleep(0.15); os.path.exists(p) and os.unlink(p); s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1); c,_=s.accept(); c.recv(1)")
+                    .arg(&path)
+                    .spawn()
+            }).unwrap();
+            drop(client);
+            assert!(process.unwrap().wait().unwrap().success());
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn existing_server_connects_without_spawning_and_explicit_stale_socket_fails() {
+        let path = env::temp_dir().join(format!("zg-existing-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut process = None;
+        let client = connect_or_spawn(&path, true, &mut process, || {
+            panic!("must reuse the server")
+        })
+        .unwrap();
+        drop(client);
+        drop(listener);
+        assert!(matches!(
+            connect_or_spawn(&path, false, &mut process, || panic!(
+                "explicit paths never spawn"
+            )),
+            Err(ClientError::Io(_))
+        ));
+        assert!(
+            path.exists(),
+            "the GUI must not remove stale socket files itself"
+        );
+        assert!(process.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
 }

@@ -1,11 +1,28 @@
 use crate::client::{Approval, Message, ServerEvent, SessionMetadata, StatusResult, ToolCall};
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ToolReceiptKey {
+    pub session_id: Option<String>,
+    pub agent_instance_id: Option<String>,
+    pub tool_call_id: String,
+}
+
+impl ToolReceiptKey {
+    fn new(session_id: Option<String>, data: &serde_json::Value, tool_call: &ToolCall) -> Self {
+        Self {
+            session_id,
+            agent_instance_id: data["agent_instance_id"].as_str().map(str::to_owned),
+            tool_call_id: tool_call.id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptEntry {
     User(String),
     Assistant(String),
     Tool {
-        id: String,
+        key: ToolReceiptKey,
         name: String,
         summary: String,
         complete: bool,
@@ -76,25 +93,39 @@ impl AppState {
             }
             ServerEvent::AssistantDelta { .. } => {}
             ServerEvent::AssistantMessage { message, .. } => self.commit_assistant(message),
-            ServerEvent::ToolStart { tool_call, .. } => {
-                self.transcript.push(tool_entry(&tool_call))
-            }
+            ServerEvent::ToolStart {
+                session_id,
+                tool_call,
+                data,
+            } => self.transcript.push(tool_entry(
+                &tool_call,
+                ToolReceiptKey::new(session_id, &data, &tool_call),
+            )),
             ServerEvent::ToolOutput {
-                tool_call, output, ..
+                session_id,
+                tool_call,
+                output,
+                data,
             } => {
-                if let TranscriptEntry::Tool { summary, .. } = self.tool_receipt(&tool_call) {
+                if let TranscriptEntry::Tool { summary, .. } = self.tool_receipt(
+                    &tool_call,
+                    ToolReceiptKey::new(session_id, &data, &tool_call),
+                ) {
                     *summary = bounded_summary(&format!("{summary}{output}"));
                 }
             }
             ServerEvent::ToolEnd {
                 tool_call,
                 tool_result,
-                ..
+                session_id,
+                data,
             } => {
                 if let TranscriptEntry::Tool {
                     complete, error, ..
-                } = self.tool_receipt(&tool_call)
-                {
+                } = self.tool_receipt(
+                    &tool_call,
+                    ToolReceiptKey::new(session_id, &data, &tool_call),
+                ) {
                     *complete = true;
                     *error = tool_result.as_ref().is_some_and(|result| result.is_error);
                 }
@@ -108,14 +139,18 @@ impl AppState {
                     self.approvals.push(approval);
                 }
             }
-            ServerEvent::ApprovalEnd { tool_call, .. } => self
-                .approvals
-                .retain(|item| item.tool_call.id != tool_call.id),
+            // The protocol has no request ID here. The worker follows this event
+            // with authoritative status, which preserves other delegated approvals.
+            ServerEvent::ApprovalEnd { .. } => {}
             ServerEvent::Error { error, .. } => {
                 self.streaming = false;
                 self.approvals.clear();
                 self.transcript.push(TranscriptEntry::Tool {
-                    id: String::new(),
+                    key: ToolReceiptKey {
+                        session_id: None,
+                        agent_instance_id: None,
+                        tool_call_id: String::new(),
+                    },
                     name: "error".to_owned(),
                     summary: bounded_summary(&error.message),
                     complete: true,
@@ -126,15 +161,15 @@ impl AppState {
         }
     }
 
-    fn tool_receipt(&mut self, tool_call: &ToolCall) -> &mut TranscriptEntry {
+    fn tool_receipt(&mut self, tool_call: &ToolCall, key: ToolReceiptKey) -> &mut TranscriptEntry {
         let index = self
             .transcript
             .iter()
             .position(
-                |entry| matches!(entry, TranscriptEntry::Tool { id, .. } if id == &tool_call.id),
+                |entry| matches!(entry, TranscriptEntry::Tool { key: existing, .. } if existing == &key),
             )
             .unwrap_or_else(|| {
-                self.transcript.push(tool_entry(tool_call));
+                self.transcript.push(tool_entry(tool_call, key));
                 self.transcript.len() - 1
             });
         &mut self.transcript[index]
@@ -161,9 +196,9 @@ fn bounded_summary(text: &str) -> String {
         .collect()
 }
 
-fn tool_entry(tool_call: &ToolCall) -> TranscriptEntry {
+fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey) -> TranscriptEntry {
     TranscriptEntry::Tool {
-        id: tool_call.id.clone(),
+        key,
         name: tool_call.name.clone(),
         summary: bounded_summary(
             &serde_json::to_string(&tool_call.arguments)
@@ -223,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_and_deny_clear_the_modal() {
+    fn approval_end_waits_for_authoritative_status() {
         let mut state = AppState::default();
         let tool = call();
         state.apply(ServerEvent::ApprovalRequest {
@@ -239,7 +274,7 @@ mod tests {
             tool_call: tool,
             data: json!({ "decision": "deny" }),
         });
-        assert!(state.approvals.is_empty());
+        assert_eq!(state.approvals[0].request_id, "approval-1");
     }
 
     #[test]
@@ -326,12 +361,12 @@ mod tests {
             });
         }
         assert!(
-            matches!(&state.transcript[0], TranscriptEntry::Tool { id, summary, complete: true, error: false, .. }
-            if id == "tool-1" && summary.chars().count() == SUMMARY_CHARS && !summary.contains('\n'))
+            matches!(&state.transcript[0], TranscriptEntry::Tool { key, summary, complete: true, error: false, .. }
+            if key.tool_call_id == "tool-1" && summary.chars().count() == SUMMARY_CHARS && !summary.contains('\n'))
         );
         assert!(
-            matches!(&state.transcript[1], TranscriptEntry::Tool { id, summary, complete: true, error: true, .. }
-            if id == "tool-2" && summary.ends_with("second"))
+            matches!(&state.transcript[1], TranscriptEntry::Tool { key, summary, complete: true, error: true, .. }
+            if key.tool_call_id == "tool-2" && summary.ends_with("second"))
         );
         let huge = ToolCall {
             arguments: [("arg".into(), json!("x".repeat(1000)))]
@@ -340,7 +375,70 @@ mod tests {
             ..call()
         };
         assert!(
-            matches!(tool_entry(&huge), TranscriptEntry::Tool { summary, .. } if summary.chars().count() == SUMMARY_CHARS)
+            matches!(tool_entry(&huge, ToolReceiptKey::new(None, &json!({}), &huge)), TranscriptEntry::Tool { summary, .. } if summary.chars().count() == SUMMARY_CHARS)
+        );
+    }
+
+    #[test]
+    fn delegated_receipts_with_duplicate_raw_ids_keep_their_own_output_and_result() {
+        let mut state = AppState::default();
+        // Match the server's delegated lifecycle shape: the session is the parent,
+        // while data.agent_instance_id identifies each child.
+        for agent in [None, Some("child-one"), Some("child-two")] {
+            state.apply(ServerEvent::ToolStart {
+                session_id: Some("parent".into()),
+                tool_call: call(),
+                data: json!({"agent_instance_id":agent}),
+            });
+        }
+        // Finish out of order, updating exactly one receipt each time.
+        for (agent, output, error) in [
+            (Some("child-two"), "second", true),
+            (None, "parent", false),
+            (Some("child-one"), "first", false),
+        ] {
+            state.apply(ServerEvent::ToolOutput {
+                session_id: Some("parent".into()),
+                tool_call: call(),
+                output: output.into(),
+                data: json!({"agent_instance_id":agent}),
+            });
+            state.apply(ServerEvent::ToolEnd {
+                session_id: Some("parent".into()),
+                tool_call: call(),
+                tool_result: Some(ToolResult {
+                    tool_call_id: call().id,
+                    content: output.into(),
+                    is_error: error,
+                    is_canceled: false,
+                    content_blocks: vec![],
+                    structured_content: None,
+                }),
+                data: json!({"agent_instance_id":agent}),
+            });
+        }
+        assert_eq!(state.transcript.len(), 3);
+        for (index, output, expected_error) in [
+            (0, "parent", false),
+            (1, "first", false),
+            (2, "second", true),
+        ] {
+            assert!(
+                matches!(&state.transcript[index], TranscriptEntry::Tool { summary, complete: true, error, .. }
+                if summary.ends_with(output) && *error == expected_error)
+            );
+        }
+        // A different parent session must not reuse an existing receipt either.
+        state.apply(ServerEvent::ToolOutput {
+            session_id: Some("other-parent".into()),
+            tool_call: call(),
+            output: "other session".into(),
+            data: json!({"agent_instance_id":"child-one"}),
+        });
+        assert_eq!(state.transcript.len(), 4);
+        assert!(
+            matches!(&state.transcript[3], TranscriptEntry::Tool { complete: false, summary, .. }
+            if summary.ends_with("other session"))
         );
     }
 

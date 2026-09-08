@@ -308,6 +308,26 @@ pub enum ServerEvent {
     },
 }
 
+impl ServerEvent {
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::TurnStart { session_id, .. }
+            | Self::AgentEnd { session_id, .. }
+            | Self::TurnEnd { session_id, .. }
+            | Self::TurnAborted { session_id, .. }
+            | Self::AssistantDelta { session_id, .. }
+            | Self::AssistantMessage { session_id, .. }
+            | Self::ToolStart { session_id, .. }
+            | Self::ToolOutput { session_id, .. }
+            | Self::ToolEnd { session_id, .. }
+            | Self::ApprovalRequest { session_id, .. }
+            | Self::ApprovalEnd { session_id, .. }
+            | Self::Error { session_id, .. }
+            | Self::Other { session_id, .. } => session_id.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct EventError {
     pub code: String,

@@ -1,8 +1,8 @@
 mod composer;
 use composer::Composer;
 use gpui::{
-    div, prelude::*, px, App, Bounds, Context, FocusHandle, Focusable, KeyDownEvent, Render, Task,
-    Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, App, Bounds, Context, FocusHandle, Focusable, KeyDownEvent, Render,
+    ScrollHandle, Task, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use std::env;
@@ -23,6 +23,7 @@ const SIGNAL: u32 = 0xe1a84b;
 
 struct ZetaView {
     state: AppState,
+    transcript_scroll: ScrollHandle,
     composer: gpui::Entity<Composer>,
     pending_command: bool,
     command_error: Option<String>,
@@ -77,6 +78,7 @@ impl ZetaView {
         window.focus(&composer.focus_handle(cx), cx);
         Self {
             state: AppState::default(),
+            transcript_scroll: ScrollHandle::new(),
             composer,
             pending_command: false,
             command_error: None,
@@ -101,6 +103,7 @@ impl ZetaView {
                     self.state.sessions.push(session);
                 }
                 self.state.transcript.clear();
+                self.transcript_scroll = ScrollHandle::new();
             }
             WorkerMessage::Status(status) => self.state.apply_status(status),
             WorkerMessage::Sent(text) => {
@@ -274,8 +277,19 @@ impl ZetaView {
     }
 
     fn render_transcript(&self) -> impl IntoElement {
+        // Read the previous layout before new output changes the content height.
+        // Scrolling away leaves the offset in place until the user returns to the tail.
+        if self.transcript_scroll.offset().y + self.transcript_scroll.max_offset().y <= px(1.) {
+            self.transcript_scroll.scroll_to_bottom();
+        }
         let mut transcript = div()
+            .id("transcript")
             .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.transcript_scroll)
+            .flex()
+            .flex_col()
             .w_full()
             .max_w(px(760.))
             .self_center()
@@ -311,7 +325,7 @@ impl ZetaView {
                         .child(format!("{marker}  {name}  {summary}"))
                 }
             };
-            transcript = transcript.child(row);
+            transcript = transcript.child(row.flex_shrink_0());
         }
         transcript
     }
@@ -325,6 +339,7 @@ impl ZetaView {
             "enter sends; shift-enter adds a line"
         };
         div()
+            .flex_shrink_0()
             .w_full()
             .border_t_1()
             .border_color(gpui::rgb(LINE))
@@ -520,6 +535,88 @@ mod tests {
     use zeta_gui::client::ToolCall;
 
     #[gpui::test]
+    fn transcript_scrolls_and_follows_output_only_at_the_tail(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, size, ScrollDelta, ScrollWheelEvent};
+        let scroll = ScrollHandle::new();
+        let handle = scroll.clone();
+        let (commands, _receiver) = mpsc::channel();
+        let window = cx.open_window(size(px(1100.), px(760.)), move |_, cx| ZetaView {
+            state: AppState {
+                connection: ConnectionState::Connected,
+                transcript: vec![TranscriptEntry::Assistant("line\n".repeat(100))],
+                ..Default::default()
+            },
+            transcript_scroll: handle,
+            composer: cx.new(Composer::new),
+            pending_command: false,
+            command_error: None,
+            commands,
+            focus_handle: cx.focus_handle(),
+            _poll_task: Task::ready(()),
+        });
+        let draw = |cx: &mut gpui::TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        };
+        let append = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |view, _, cx| {
+                    if let Some(TranscriptEntry::Assistant(text)) = view.state.transcript.last_mut()
+                    {
+                        text.push_str(&"new line\n".repeat(20));
+                    }
+                    cx.notify();
+                })
+                .unwrap();
+        };
+        let wheel = |cx: &mut gpui::TestAppContext, delta| {
+            gpui::VisualTestContext::from_window(window.into(), cx).simulate_event(
+                ScrollWheelEvent {
+                    position: scroll.bounds().center(),
+                    delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+                    ..Default::default()
+                },
+            );
+            cx.executor().run_until_parked();
+        };
+        draw(cx);
+        assert!(scroll.max_offset().y > px(0.), "long output must overflow");
+        assert_eq!(scroll.offset().y, -scroll.max_offset().y);
+        assert!(
+            scroll.bounds().bottom() < px(760.),
+            "the composer stays in the viewport"
+        );
+        let previous_max = scroll.max_offset().y;
+        append(cx);
+        draw(cx);
+        assert!(scroll.max_offset().y > previous_max);
+        assert_eq!(scroll.offset().y, -scroll.max_offset().y);
+
+        wheel(cx, 200.);
+        draw(cx);
+        let away = scroll.offset().y;
+        assert!(away > -scroll.max_offset().y);
+        append(cx);
+        draw(cx);
+        assert_eq!(
+            scroll.offset().y,
+            away,
+            "new output must preserve the reading position"
+        );
+
+        wheel(cx, -10000.);
+        draw(cx);
+        assert_eq!(scroll.offset().y, -scroll.max_offset().y);
+        append(cx);
+        draw(cx);
+        assert_eq!(
+            scroll.offset().y,
+            -scroll.max_offset().y,
+            "returning to the tail resumes following"
+        );
+    }
+
+    #[gpui::test]
     fn approval_and_abort_keys_reach_worker_from_composer(cx: &mut gpui::TestAppContext) {
         cx.update(composer::bind_keys);
         let (commands, receiver) = mpsc::channel();
@@ -540,6 +637,7 @@ mod tests {
                     ..Default::default()
                 },
                 composer,
+                transcript_scroll: ScrollHandle::new(),
                 pending_command: false,
                 command_error: None,
                 commands,
