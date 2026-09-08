@@ -226,6 +226,7 @@ class AgentLoop:
         self._background_event_sink: Callable[[StreamEvent], None] | None = None
         self._mcp_notice_sink: Callable[[str], None] | None = None
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
+        self._activated = False
         recover_agent_children(self)
         if registry is not None and tools is not None:
             raise ValueError("pass only one tool registry")
@@ -703,6 +704,14 @@ class AgentLoop:
     def session_start(self) -> None:
         if self.hooks is not None:
             self.hooks.session_start()
+
+    async def activate(self) -> None:
+        """Run frontend startup hooks after the frontend installs its sinks."""
+
+        if self._activated:
+            return
+        self._activated = True
+        self.session_start()
 
     async def _ensure_mcp_servers(self) -> None:
         if self._mcp_mount_attempted:

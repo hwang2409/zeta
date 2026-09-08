@@ -882,12 +882,12 @@ class TUIApp(
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run the alternate-screen app until Ctrl-D or an exit request."""
 
+        await self.loop.activate()
         session = session or self._session or self._make_session()
         self._active_session = session
         self._attach_draft(session)
         if isinstance(session, FullScreenPromptSession):
             self._install_full_screen_layout(session)
-        self.loop.session_start()
         self._rebuild_transcript()
         await self.loop.ensure_mcp_servers()
         for warning in self._startup_warnings:

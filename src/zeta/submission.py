@@ -1,4 +1,4 @@
-"""Immutable state captured when the user submits a prompt."""
+"""Immutable values submitted by the composer."""
 
 from __future__ import annotations
 
@@ -17,3 +17,6 @@ class Submission:
     attachment_tokens: tuple[tuple[str, Path], ...] = ()
     next_image_token: int = 1
     steer: bool = True
+
+
+__all__ = ["Submission"]

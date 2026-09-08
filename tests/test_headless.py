@@ -3,6 +3,10 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,9 +23,7 @@ from zeta.tools import ToolRegistry
 from zeta.types import TextContent, ToolCall
 
 
-async def _drive(
-    loop: AgentLoop, prompt: str, output_format: str
-) -> tuple[int, str, str]:
+async def _drive(loop: AgentLoop, prompt: str, output_format: str) -> tuple[int, str, str]:
     stdout = io.StringIO()
     stderr = io.StringIO()
     code = await drive_turn(
@@ -32,6 +34,45 @@ async def _drive(
         stderr=stderr,
     )
     return code, stdout.getvalue(), stderr.getvalue()
+
+
+def test_print_mode_runs_session_hook_inside_async_activation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    artifact = home / "session-hook-ran"
+    hook_code = f"from pathlib import Path; Path({str(artifact)!r}).write_text('ran')"
+    hook = f"{shlex.quote(sys.executable)} -c {shlex.quote(hook_code)}"
+    (home / "hooks.toml").write_text(
+        f'[[hook]]\nevent = "session_start"\ncommand = {json.dumps(hook)}\n',
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["ZETA_HOME"] = str(home)
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from zeta.cli import main; raise SystemExit(main())",
+            "--provider",
+            "fake",
+            "-p",
+            "hello",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("you said: hello")
+    assert artifact.read_text(encoding="utf-8") == "ran"
 
 
 async def test_text_mode_prints_final_message_and_exits_zero(tmp_path: Path) -> None:
@@ -153,9 +194,7 @@ async def test_json_mode_tool_result_bound_is_byte_based(tmp_path: Path) -> None
     events = [json.loads(line) for line in out.splitlines() if line]
     result_event = next(event for event in events if event["type"] == "tool_result")
     assert "[truncated:" in result_event["content"]
-    assert len(result_event["content"].encode("utf-8")) <= (
-        TOOL_RESULT_MAX_BYTES + 64
-    )
+    assert len(result_event["content"].encode("utf-8")) <= (TOOL_RESULT_MAX_BYTES + 64)
 
 
 async def test_json_mode_bounds_large_tool_call_arguments(tmp_path: Path) -> None:
@@ -206,9 +245,7 @@ async def test_headless_hook_rejection_does_not_show_yolo_hint(tmp_path: Path) -
     # Hook denial is distinct from approval-required denial. Headless must not
     # falsely suggest --yolo unlocks it — that only unlocks the approval path.
     assert "--yolo" not in err
-    tool_results = [
-        message.tool_result for message in store.messages() if message.tool_result
-    ]
+    tool_results = [message.tool_result for message in store.messages() if message.tool_result]
     assert tool_results[0].content == "tool execution denied by hook"
 
 
@@ -314,9 +351,7 @@ def test_headless_no_yolo_flag_beats_settings_yolo(
     (home / "settings.toml").write_text("yolo = true\n")
 
     monkeypatch.chdir(tmp_path)
-    args = build_parser().parse_args(
-        ["--provider", "fake", "--no-yolo", "-p", "hi"]
-    )
+    args = build_parser().parse_args(["--provider", "fake", "--no-yolo", "-p", "hi"])
     assert args.yolo is False
 
     import zeta.tui.app as tui_app
@@ -357,9 +392,7 @@ def test_headless_hard_denies_argument_scoped_ask_rules(
 
     home = tmp_path / "home"
     home.mkdir()
-    (home / "settings.toml").write_text(
-        '[approval]\nask = ["bash(git push*)"]\n', encoding="utf-8"
-    )
+    (home / "settings.toml").write_text('[approval]\nask = ["bash(git push*)"]\n', encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
     args = build_parser().parse_args(["--provider", "fake", "-p", "hi"])
@@ -400,9 +433,7 @@ def test_headless_reports_dropped_scoped_rules_on_stderr(
 
     home = tmp_path / "home"
     home.mkdir()
-    (home / "settings.toml").write_text(
-        '[approval]\nallow = ["todo(*)"]\n', encoding="utf-8"
-    )
+    (home / "settings.toml").write_text('[approval]\nallow = ["todo(*)"]\n', encoding="utf-8")
     monkeypatch.setenv("ZETA_HOME", str(home))
     monkeypatch.chdir(tmp_path)
     args = build_parser().parse_args(["--provider", "fake", "-p", "hi"])
@@ -427,9 +458,7 @@ async def test_headless_denies_ask_tool_and_writes_stderr_note(tmp_path: Path) -
     policy = ApprovalPolicy(default=ApprovalDecision.DENY, store=store)
     registry = ToolRegistry(tmp_path, register_builtin=False)
     registry.register("danger", lambda arguments: "must not run")
-    loop = AgentLoop(
-        backend, store, registry=registry, approval_policy=policy
-    )
+    loop = AgentLoop(backend, store, registry=registry, approval_policy=policy)
 
     code, out, err = await _drive(loop, "start", "text")
 
@@ -498,11 +527,7 @@ def test_cli_headless_fake_provider_writes_final_text_to_stdout(
     assert captured.err == ""
     # session persisted for this working directory
     cwd = str(tmp_path.resolve())
-    sessions = [
-        item
-        for item in SessionManager(env_home()).list_sessions()
-        if item.cwd == cwd
-    ]
+    sessions = [item for item in SessionManager(env_home()).list_sessions() if item.cwd == cwd]
     assert sessions, "headless run should persist a session"
 
 
@@ -512,9 +537,7 @@ def test_cli_headless_json_mode_yields_valid_jsonl(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    args = build_parser().parse_args(
-        ["--provider", "fake", "-p", "greet", "--format", "json"]
-    )
+    args = build_parser().parse_args(["--provider", "fake", "-p", "greet", "--format", "json"])
 
     code = run_headless(args, args.prompt)
 
@@ -546,17 +569,13 @@ def test_cli_headless_resume_reuses_persisted_session(
     assert len(sessions) == 1
     session_id = sessions[0].session_id
 
-    second = parser.parse_args(
-        ["--provider", "fake", "--resume", session_id, "-p", "second turn"]
-    )
+    second = parser.parse_args(["--provider", "fake", "--resume", session_id, "-p", "second turn"])
     assert run_headless(second, second.prompt) == 0
     capsys.readouterr()
 
     resumed = ConversationStore(manager.sessions_dir, session_id=session_id)
     user_texts = [
-        "".join(
-            block.text for block in message.content if isinstance(block, TextContent)
-        )
+        "".join(block.text for block in message.content if isinstance(block, TextContent))
         for message in resumed.messages()
         if message.role.value == "user"
     ]
