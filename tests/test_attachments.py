@@ -181,8 +181,11 @@ def test_paste_image_queues_a_session_attachment(
 ) -> None:
     monkeypatch.setattr(composer.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(composer.shutil, "which", lambda _: "/usr/bin/pngpaste")
+    real_run = composer.subprocess.run
 
-    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        if command[0] != "/usr/bin/pngpaste":
+            return real_run(command, **kwargs)
         Path(command[1]).write_bytes(PNG)
         return SimpleNamespace(returncode=0)
 
@@ -201,8 +204,11 @@ async def test_ctrl_v_queues_one_image_and_preserves_composer_text(
     monkeypatch.setenv("COLORTERM", "truecolor")
     monkeypatch.setattr(composer.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(composer.shutil, "which", lambda _: "/usr/bin/pngpaste")
+    real_run = composer.subprocess.run
 
-    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        if command[0] != "/usr/bin/pngpaste":
+            return real_run(command, **kwargs)
         Path(command[1]).write_bytes(PNG)
         return SimpleNamespace(returncode=0)
 
@@ -231,8 +237,11 @@ async def test_ctrl_v_numbers_multiple_images_without_renumbering(
     monkeypatch.setenv("COLORTERM", "truecolor")
     monkeypatch.setattr(composer.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(composer.shutil, "which", lambda _: "/usr/bin/pngpaste")
+    real_run = composer.subprocess.run
 
-    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        if command[0] != "/usr/bin/pngpaste":
+            return real_run(command, **kwargs)
         Path(command[1]).write_bytes(PNG)
         return SimpleNamespace(returncode=0)
 
@@ -259,8 +268,11 @@ async def test_slash_paste_inserts_the_same_token_without_notice(
     monkeypatch.setenv("COLORTERM", "truecolor")
     monkeypatch.setattr(composer.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(composer.shutil, "which", lambda _: "/usr/bin/pngpaste")
+    real_run = composer.subprocess.run
 
-    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        if command[0] != "/usr/bin/pngpaste":
+            return real_run(command, **kwargs)
         Path(command[1]).write_bytes(PNG)
         return SimpleNamespace(returncode=0)
 

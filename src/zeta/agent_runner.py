@@ -14,7 +14,7 @@ from .agent_budget import (
     AgentTree,
 )
 from .agent_budget import child_depth as next_agent_depth
-from .agent_receipt import TerminalState
+from .agent_receipt import TerminalState, _without_agent_receipt_suffix
 from .core.abort import AbortSignal as ToolAbortSignal
 from .core.checkpoints import _now
 from .core.store import ConversationStore
@@ -267,7 +267,7 @@ async def consume_run(
                 )
                 finish_lifecycle(
                     "failed" if terminal_result.get("isError") else "completed",
-                    text,
+                    _without_agent_receipt_suffix(text),
                 )
 
 

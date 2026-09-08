@@ -541,7 +541,7 @@ class AgentRunCommandMixin:
         runs = [
             (marker_key, marker)
             for marker_key, marker in children.items()
-            if marker.get("background")
+            if marker.get("background") and marker.get("agent_type") == "run"
         ]
         if not runs:
             return "no live runs"

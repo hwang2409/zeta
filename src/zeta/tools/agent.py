@@ -944,8 +944,7 @@ async def _agent_send(
     except asyncio.CancelledError:
         # The thread cannot be canceled. Wait for its durable result before
         # allowing tool cancellation to reach the caller.
-        await commit
-        raise
+        error = await commit
     if error is not None:
         return {
             "content": [text_block(f"agent_send error: {error}")],

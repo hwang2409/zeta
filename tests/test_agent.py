@@ -3086,7 +3086,14 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
         del child_loop, kwargs
         prompts.append(prompt)
         return {
-            "content": [{"text": f"handled {prompt}"}],
+            "content": [
+                {
+                    "text": (
+                        f"handled {prompt} · 2 turns · 1.2s · 3 tool calls "
+                        "· error=false · canceled=false"
+                    )
+                }
+            ],
             "isError": False,
             "structuredContent": None,
         }
@@ -3133,6 +3140,7 @@ async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
     assert lifecycle is not None
     assert lifecycle["state"] == "completed"
     assert lifecycle["finished_at"] is not None
+    assert lifecycle["final_result"] == "handled follow up"
 
 
 @pytest.mark.asyncio
@@ -3168,9 +3176,12 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     monkeypatch.setattr(agent_module, "send_to_run", blocked_send)
     registry = ToolRegistry(tmp_path, session_store=parent_store)
     task = asyncio.create_task(
-        agent_module._agent_send(
-            registry,
-            {"child_instance_id": "parent:1", "message": "follow up"},
+        registry.execute(
+            ToolCall(
+                "agent-send-call",
+                "agent_send",
+                {"child_instance_id": "parent:1", "message": "follow up"},
+            )
         )
     )
     await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=2)
@@ -3179,9 +3190,9 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
     await asyncio.sleep(0)
     assert not task.done()
     release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    result = await task
 
+    assert result["isError"] is False
     assert [entry.data["text"] for entry in child_store.pending_prompts()] == [
         "follow up"
     ]
@@ -3334,6 +3345,20 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
     loop = AgentLoop(backend, store, max_turns=1)
     commands = _RunCommands(loop)
 
+    explore_call = ToolCall(
+        "explore-1",
+        "agent",
+        {"prompt": "look", "description": "explore", "agent_type": "explore"},
+    )
+    store.register_agent_child(
+        explore_call,
+        child_session_path=str(tmp_path / "agents" / "explore"),
+        description="explore",
+        agent_type="explore",
+        background=True,
+        child_instance_id="sess:explore",
+    )
+
     assert commands.slash_runs("") == "no live runs"
 
     await _collect(loop.run_turn("start"))
@@ -3341,6 +3366,7 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
 
     listing = commands.slash_runs("")
     assert "long horizon run" in listing
+    assert "explore" not in listing
     handle = _run_handle_from_receipt(store)
     # /runs shows the model-facing handle, not the opaque provider tool_call.id.
     assert handle in listing
