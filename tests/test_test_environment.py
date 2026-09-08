@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-LIVE_ZETA_HOME = Path.home() / ".zeta"
+COLLECTION_HOME = Path.home()
 
 
 def test_console_defaults_are_suite_stable() -> None:
@@ -23,11 +23,73 @@ def test_console_defaults_are_suite_stable() -> None:
 
 
 def test_test_home_is_isolated() -> None:
-    assert Path(os.environ["ZETA_HOME"]) != LIVE_ZETA_HOME
+    assert not Path(os.environ["ZETA_HOME"]).is_relative_to(COLLECTION_HOME)
 
 
-def test_teardown_guard_defaults_to_live_zeta_home(live_home_write_guard) -> None:
-    assert live_home_write_guard.live_home == LIVE_ZETA_HOME.resolve()
+def test_teardown_guard_defaults_to_collection_home(live_home_write_guard) -> None:
+    assert live_home_write_guard.live_home == COLLECTION_HOME.resolve()
+    assert Path.home() == COLLECTION_HOME
+
+
+@pytest.mark.parametrize(
+    ("leak_path", "during_collection"),
+    [(None, False), ("unexpected", False), (".zeta/history", False), ("import-leak", True)],
+)
+def test_session_home_guard_ignores_external_writes_and_catches_home_leaks(
+    tmp_path: Path, leak_path: str | None, during_collection: bool
+) -> None:
+    # Run the actual session hooks and teardown in a child pytest process so
+    # intentional leaks fail that session without contaminating this one.
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    external_home = tmp_path / "external-home"
+    external_home.mkdir()
+    for name in ("conftest.py", "sitecustomize.py"):
+        shutil.copyfile(Path(__file__).with_name(name), probe / name)
+    (probe / "test_probe.py").write_text(
+        "from pathlib import Path\n"
+        "COLLECTED_HOME = Path.home()\n"
+        f"assert COLLECTED_HOME != Path({str(external_home)!r})\n"
+        + (
+            "(COLLECTED_HOME / 'import-leak').write_text('collection leak')\n"
+            if during_collection
+            else ""
+        )
+        + "def test_probe():\n"
+        "    assert Path.home() == COLLECTED_HOME\n"
+        f"    external = Path({str(external_home)!r}) / '.zeta/run/serve.sock'\n"
+        "    external.parent.mkdir(parents=True)\n"
+        "    external.write_text('external writer')\n"
+        + (
+            f"    leaked = Path.home() / {leak_path!r}\n"
+            "    leaked.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    leaked.write_text('ignored ZETA_HOME')\n"
+            if leak_path is not None and not during_collection
+            else ""
+        ),
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["HOME"] = str(external_home)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--confcutdir", str(probe)],
+        cwd=probe,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+
+    if leak_path is None:
+        assert result.returncode == 0, output
+        assert "1 passed" in output
+    else:
+        assert result.returncode == 1, output
+        assert "1 passed, 1 error" in output
+        assert "tests wrote to live zeta home" in output
+        assert leak_path in output
 
 
 def test_path_home_follows_home_environment(

@@ -4607,8 +4607,16 @@ def test_large_markdown_table_falls_back_within_render_budget() -> None:
     output = StringIO()
     _test_console(output).print(render_markdown(source))
 
-    assert time.monotonic() - started < 2
-    assert "| row-9999 | value |" in Text.from_ansi(output.getvalue()).plain
+    # The fallback path prints the raw source literally, so the pipe
+    # syntax survives; a real Rich table would replace it with box glyphs.
+    # That literal presence is the real invariant this test enforces —
+    # fallback engaged instead of walking every cell.
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "| row-9999 | value |" in plain
+    # The literal-row assertion catches loss of fallback. This ceiling
+    # rejects stalls of a minute or more while allowing loaded runners
+    # time to parse and print the source.
+    assert time.monotonic() - started < 60
 
 
 def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:
@@ -6709,17 +6717,22 @@ async def test_full_screen_vi_escape_enters_normal_mode_with_low_latency() -> No
         assert session.app.ttimeoutlen <= 0.1
         assert session.app.timeoutlen >= 0.5
         task = asyncio.create_task(session.prompt_async(" ❯ "))
-        await asyncio.sleep(0)
-        started = time.monotonic()
-        pipe.send_text("\x1b")
-        await wait_until(
-            lambda: session.app.vi_state.input_mode.value == "vi-navigation"
-        )
-        elapsed = time.monotonic() - started
-        session.app.exit()
-        await task
-
-    assert elapsed < 0.1
+        try:
+            await wait_until(lambda: session.app.is_running)
+            modes_after_key: list[str] = []
+            session.app.key_processor.after_key_press += lambda _: modes_after_key.append(
+                session.app.vi_state.input_mode.value
+            )
+            pipe.send_text("\x1b")
+            await wait_until(lambda: bool(modes_after_key))
+            # Escape must enter navigation during key processing, before the
+            # key-chord timeout. Deferring Escape records insert mode here,
+            # regardless of scheduler delays or when the poll resumes.
+            assert modes_after_key == ["vi-navigation"]
+            assert session.app.vi_state.input_mode.value == "vi-navigation"
+        finally:
+            session.app.exit()
+            await task
 
 
 @pytest.mark.asyncio

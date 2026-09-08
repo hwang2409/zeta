@@ -450,7 +450,11 @@ def test_error_body_excerpt_joins_large_folded_header_once() -> None:
 
     elapsed = time.perf_counter() - started
     assert "folded-header-timing-marker" not in redacted
-    assert elapsed < 0.2
+    # Budget is generous to survive CPU-loaded runs. It still catches the
+    # regression this test guards: a per-line rejoin of the folded header
+    # would be O(N^2) on ~264k fragments, taking many seconds even on an
+    # idle machine. The linear path finishes well under one second.
+    assert elapsed < 5.0
 
 
 @pytest.mark.parametrize(

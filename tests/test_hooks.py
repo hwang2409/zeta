@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
+import signal
 import sys
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
@@ -260,39 +263,93 @@ async def test_tool_filter_and_event_payload(tmp_path: Path) -> None:
     }
 
 
+@pytest.fixture
+async def hook_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[tuple[str, asyncio.Future[asyncio.StreamReader]]]:
+    connected: asyncio.Future[asyncio.StreamReader] = asyncio.get_running_loop().create_future()
+    writers: list[asyncio.StreamWriter] = []
+    processes: list[asyncio.subprocess.Process] = []
+
+    def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writers.append(writer)
+        connected.set_result(reader)
+
+    server = await asyncio.start_server(accept, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    # The child holds its socket open until killed. EOF proves termination;
+    # an absent delayed marker could pass before a surviving child ran.
+    child = (
+        "import socket; "
+        f"s = socket.create_connection(('127.0.0.1', {port})); "
+        "s.recv(1)"
+    )
+    parent = (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}], "
+        "stderr=subprocess.DEVNULL).wait()"
+    )
+    create_process = asyncio.create_subprocess_exec
+
+    async def create_ready_process(*args: str, **kwargs: object) -> asyncio.subprocess.Process:
+        process = await create_process(*args, **kwargs)
+        processes.append(process)
+        # Start the hook's timeout only after its child exists. Keep the real
+        # subprocess, timeout, cancellation, and process-group cleanup paths.
+        await asyncio.wait_for(asyncio.shield(connected), timeout=10)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_ready_process)
+    try:
+        yield "exec " + _python_command(parent), connected
+    finally:
+        # Clean up survivors even when a regression makes the EOF assertion fail.
+        for process in processes:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await process.wait()
+        for writer in writers:
+            writer.close()
+            await writer.wait_closed()
+        server.close()
+        await server.wait_closed()
+
+
 @pytest.mark.asyncio
-async def test_timeout_kills_hook_process_group(tmp_path: Path) -> None:
-    marker = tmp_path / "child-alive"
-    child = f"import pathlib,time; time.sleep(.2); pathlib.Path({str(marker)!r}).write_text('alive')"
-    parent = f"import subprocess,sys,time; subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(5)"
+async def test_timeout_kills_hook_process_group(
+    hook_process_group: tuple[str, asyncio.Future[asyncio.StreamReader]],
+) -> None:
+    command, connected = hook_process_group
     manager = HookManager((), session_id="session-1")
     result = await manager._run(
-        Hook("session_start", _python_command(parent), timeout_seconds=0.05),
-        {},
+        Hook("session_start", command, timeout_seconds=0.05), {},
     )
 
     assert result.timed_out is True
-    await asyncio.sleep(0.3)
-    assert not marker.exists()
+    reader = connected.result()
+    assert await asyncio.wait_for(reader.read(), timeout=10) == b""
 
 
 @pytest.mark.asyncio
-async def test_cancellation_kills_hook_process_group(tmp_path: Path) -> None:
-    marker = tmp_path / "child-canceled"
-    child = f"import pathlib,time; time.sleep(.2); pathlib.Path({str(marker)!r}).write_text('alive')"
-    parent = f"import subprocess,sys,time; subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(5)"
+async def test_cancellation_kills_hook_process_group(
+    hook_process_group: tuple[str, asyncio.Future[asyncio.StreamReader]],
+) -> None:
+    command, connected = hook_process_group
     manager = HookManager((), session_id="session-1")
     task = asyncio.create_task(
-        manager._run(Hook("session_start", _python_command(parent)), {})
+        manager._run(Hook("session_start", command), {})
     )
-
-    await asyncio.sleep(0.05)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    await asyncio.sleep(0.3)
-
-    assert not marker.exists()
+    try:
+        reader = await asyncio.wait_for(asyncio.shield(connected), timeout=10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.wait_for(reader.read(), timeout=10) == b""
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
