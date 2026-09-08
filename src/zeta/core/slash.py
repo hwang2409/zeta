@@ -518,6 +518,11 @@ class SlashSession(Protocol):
 
     def slash_tree(self, args: str) -> str: ...
 
+    def slash_runs(self, args: str) -> str: ...
+
+    def slash_send(self, args: str) -> str: ...
+
+
     def slash_tools(self, args: str) -> str: ...
 
     def slash_undo(self, args: str) -> str: ...
@@ -883,6 +888,14 @@ def _run_checkpoint(session: SlashSession, args: str) -> str:
     return session.slash_checkpoint(args)
 
 
+def _run_runs(session: SlashSession, args: str) -> str:
+    return session.slash_runs(args)
+
+
+def _run_send(session: SlashSession, args: str) -> str:
+    return session.slash_send(args)
+
+
 def _run_fork(session: SlashSession, args: str) -> str:
     return session.slash_fork(args)
 
@@ -963,6 +976,10 @@ def create_slash_registry(
     )
     registry.register(
         SlashCommand("theme", _run_theme, "list themes or switch the active theme")
+    )
+    registry.register(SlashCommand("runs", _run_runs, "list live agent runs"))
+    registry.register(
+        SlashCommand("send", _run_send, "send a follow-up to a run: /send <id> <message>")
     )
     registry.register(
         SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")

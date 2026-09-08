@@ -877,3 +877,87 @@ def register(registry: ToolRegistry) -> None:
         parallel_safe=True,
         requires_approval=False,
     )
+    register_send(registry)
+
+
+def send_to_run(
+    parent_store: ConversationStore,
+    child_instance_id: object,
+    message: object,
+) -> str | None:
+    """Queue a follow-up for a live run, returning an error message if not possible.
+
+    Shared by the agent_send tool and the /send command so both reach a run the
+    same way.
+    """
+
+    if type(child_instance_id) is not str or not child_instance_id.strip():
+        return "child_instance_id must be a nonempty string"
+    if type(message) is not str or not message.strip():
+        return "message must be a nonempty string"
+    marker = parent_store.agent_children().get(child_instance_id)
+    if marker is None:
+        # The marker is removed once a run's result is durable, so a missing one
+        # means the run already finished rather than that it never existed.
+        return (
+            f"no live run {child_instance_id!r}; it already finished or was "
+            "never started"
+        )
+    child_path = Path(str(marker["child_session_path"]))
+    child_store = ConversationStore(
+        child_path.parent, session_id=child_path.name, cwd=parent_store.cwd
+    )
+    child_store.append_pending_prompt(message)
+    return None
+
+
+async def _agent_send(
+    registry: ToolRegistry,
+    arguments: dict[str, Any],
+) -> dict[str, object]:
+    error = send_to_run(
+        registry.session_store,
+        arguments.get("child_instance_id"),
+        arguments.get("message"),
+    )
+    if error is not None:
+        return {
+            "content": [text_block(f"agent_send error: {error}")],
+            "isError": True,
+            "structuredContent": None,
+        }
+    child_instance_id = arguments["child_instance_id"]
+    return {
+        "content": [
+            text_block(
+                f"queued a follow-up for {child_instance_id}; it is delivered "
+                "when the run finishes its current turn"
+            )
+        ],
+        "isError": False,
+        "structuredContent": {"child_instance_id": child_instance_id},
+    }
+
+
+def register_send(registry: ToolRegistry) -> None:
+    registry.register_session_tool(
+        "agent_send",
+        _agent_send,
+        description=(
+            "Send a follow-up instruction to a run you started that is still "
+            "working. The run picks it up at its next turn boundary, so it "
+            "never interrupts a tool call. Use the child_instance_id the agent "
+            "tool returned."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "child_instance_id": {"type": "string", "minLength": 1},
+                "message": {"type": "string", "minLength": 1},
+            },
+            "required": ["child_instance_id", "message"],
+            "additionalProperties": False,
+        },
+        requires_approval=False,
+        parallel_safe=True,
+    )

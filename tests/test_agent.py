@@ -19,11 +19,12 @@ from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.mcp import MCPMount
 from zeta.tools import ToolRegistry
-from zeta.tools.agent import ChildApprovalPolicy
+from zeta.tools.agent import ChildApprovalPolicy, send_to_run
 from zeta.tools.agent_presets import (
     AGENT_PRESETS,
     GENERAL_PRESET,
 )
+from zeta.tui.agent_card import AgentRunCommandMixin
 from zeta.tui.render import render_event
 from zeta.tui.todo import TodoWidget
 from zeta.types import (
@@ -2839,3 +2840,258 @@ async def test_max_turns_bounded_by_hard_cap_constant() -> None:
     assert MAX_AGENT_TURN_CAP >= max(
         preset.turn_cap for preset in AGENT_PRESETS.values()
     )
+
+
+class RunBackend(CompletionBackend):
+    """Drive a long run whose first turn can be held open mid-flight."""
+
+    def __init__(self) -> None:
+        self.child_started = asyncio.Event()
+        self.release_child = asyncio.Event()
+        self.child_prompts: list[str] = []
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        if last_user == "start":
+            blocks = [ToolUseContent(_run_agent_call())]
+        elif last_user == "work the big task":
+            self.child_prompts.append(last_user)
+            self.child_started.set()
+            await self.release_child.wait()
+            blocks = [TextContent("first pass done")]
+        else:
+            self.child_prompts.append(last_user)
+            blocks = [TextContent("follow-up handled")]
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+def _run_agent_call(call_id: str = "run-1") -> ToolCall:
+    return ToolCall(
+        call_id,
+        "agent",
+        {
+            "prompt": "work the big task",
+            "description": "long horizon run",
+            "agent_type": "run",
+        },
+    )
+
+
+class _RunCommands(AgentRunCommandMixin):
+    """Minimal host for the mixin: it only needs loop.store."""
+
+    def __init__(self, loop: AgentLoop) -> None:
+        self.loop = loop
+
+
+def test_run_preset_is_registered_with_a_long_cap(tmp_path: Path) -> None:
+    from zeta.tools.agent_presets import AGENT_PRESETS, RUN_PRESET
+
+    assert RUN_PRESET.turn_cap == 150
+    assert RUN_PRESET.tool_names is None
+    assert AGENT_PRESETS["run"] is RUN_PRESET
+
+    registry = ToolRegistry(tmp_path)
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    AgentLoop(FakeBackend([]), store, registry=registry)
+    agent_schema = next(
+        schema for schema in registry.schemas if schema["name"] == "agent"
+    )
+    assert "run" in agent_schema["parameters"]["properties"]["agent_type"]["enum"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_does_not_draw_on_the_shared_sibling_budget(
+    tmp_path: Path,
+) -> None:
+    """A tree budget is fresh per top-level call (ZETA-62), so a run started
+    after a smaller-preset sibling on the same loop must not inherit its cap.
+    """
+
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[_agent_call("explore-1", agent_type="explore")]),
+            ScriptedTurn([TextContent("explore done")]),
+            ScriptedTurn(tool_calls=[_run_agent_call()]),
+            ScriptedTurn([TextContent("run done")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    # The explore child sized its own tree at its 15-turn preset cap.
+    explore_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    assert explore_store.agent_lifecycle()["tree_budget"] == 15
+
+    await _collect(loop.run_turn("now start the run"))
+    # The run gets a fresh tree, not the explore sibling's smaller cap.
+    run_store = ConversationStore(store.session_dir / "agents", session_id="2")
+    assert run_store.agent_lifecycle()["tree_budget"] == 150
+
+    await _wait_for_notification(store, "completed")
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_a_run_goes_to_the_background_without_being_asked(
+    tmp_path: Path,
+) -> None:
+    backend = RunBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+
+    result = next(
+        message.tool_result for message in store.messages() if message.tool_result
+    )
+    assert result.structured_content is not None
+    assert result.structured_content["status"] == "running"
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+    await loop.close()
+
+
+def test_pending_prompt_queue_round_trips(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="run")
+    first = store.append_pending_prompt("also update the docs")
+    store.append_pending_prompt("and run the linter")
+    assert [entry.data["text"] for entry in store.pending_prompts()] == [
+        "also update the docs",
+        "and run the linter",
+    ]
+
+    store.acknowledge_pending_prompt(first.id)
+    assert [entry.data["text"] for entry in store.pending_prompts()] == [
+        "and run the linter"
+    ]
+    # Acknowledging twice is a no-op rather than an integrity error.
+    store.acknowledge_pending_prompt(first.id)
+
+    # A separate handle sees the queue, and the queue survives a reload.
+    assert [
+        entry.data["text"]
+        for entry in ConversationStore(tmp_path, session_id="run").pending_prompts()
+    ] == ["and run the linter"]
+
+    with pytest.raises(ValueError):
+        store.append_pending_prompt("   ")
+    with pytest.raises(ValueError):
+        store.acknowledge_pending_prompt("nonexistent")
+
+
+@pytest.mark.asyncio
+async def test_a_queued_prompt_stays_out_of_the_run_context(tmp_path: Path) -> None:
+    """Only messages reach the model; a queued follow-up must not leak in early."""
+
+    store = ConversationStore(tmp_path, session_id="run")
+    store.append_message(Message(MessageRole.USER, [TextContent("work the big task")]))
+    store.append_pending_prompt("secret follow-up")
+    loop = AgentLoop(FakeBackend([]), store)
+
+    assembled = await loop.context_assembler.assemble()
+
+    rendered = "\n".join(
+        block.text
+        for message in assembled
+        for block in message.content
+        if isinstance(block, TextContent)
+    )
+    assert "work the big task" in rendered
+    assert "secret follow-up" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> None:
+    backend = RunBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+
+    # Queue while the run is still mid-turn, exactly as agent_send does.
+    assert send_to_run(store, "run-1", "also check the tests") is None
+
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+
+    assert backend.child_prompts == ["work the big task", "also check the tests"]
+    await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_an_empty_queue_finishes_normally(tmp_path: Path) -> None:
+    backend = RunBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+
+    await _collect(loop.run_turn("start"))
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+
+    assert backend.child_prompts == ["work the big task"]
+    assert not store.agent_children()
+    await loop.close()
+
+
+def test_send_to_run_rejects_unknown_and_finished_runs(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+
+    error = send_to_run(store, "run-1", "hello")
+    assert error is not None and "no live run" in error
+
+    assert send_to_run(store, "", "hello") == (
+        "child_instance_id must be a nonempty string"
+    )
+    error = send_to_run(store, "run-1", "  ")
+    assert error == "message must be a nonempty string"
+
+
+@pytest.mark.asyncio
+async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
+    backend = RunBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1)
+    commands = _RunCommands(loop)
+
+    assert commands.slash_runs("") == "no live runs"
+
+    await _collect(loop.run_turn("start"))
+    await asyncio.wait_for(backend.child_started.wait(), timeout=2)
+
+    listing = commands.slash_runs("")
+    assert "long horizon run" in listing
+    assert "run-1" in listing
+
+    assert commands.slash_send("nonsense") == (
+        "use /send <run-id> <message>; /runs lists the live ones"
+    )
+    assert "no live run" in commands.slash_send("bogus-id hello")
+    assert "queued for run-1" in commands.slash_send("run-1 also check the tests")
+
+    backend.release_child.set()
+    await _wait_for_notification(store, "completed")
+    assert backend.child_prompts == ["work the big task", "also check the tests"]
+    await loop.close()
