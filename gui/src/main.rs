@@ -1,4 +1,5 @@
 mod composer;
+mod transcript;
 use composer::Composer;
 use gpui::{
     div, prelude::*, px, App, Bounds, Context, FocusHandle, Focusable, KeyDownEvent, Render,
@@ -14,15 +15,18 @@ use zeta_gui::client::Approval;
 use zeta_gui::state::{AppState, ConnectionState, TranscriptEntry};
 use zeta_gui::worker::{CommandMessage, ConnectionWorker, WorkerMessage};
 
-const BG: u32 = 0x111210;
-const PANEL: u32 = 0x181a17;
-const LINE: u32 = 0x343832;
-const TEXT: u32 = 0xd8ddd5;
-const MUTED: u32 = 0x8a9287;
-const SIGNAL: u32 = 0xe1a84b;
+use zeta_gui::appearance::{Appearance, Palette};
+
+fn appearance(window: &Window) -> Appearance {
+    match window.appearance() {
+        gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight => Appearance::Light,
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => Appearance::Dark,
+    }
+}
 
 struct ZetaView {
     state: AppState,
+    appearance: Appearance,
     transcript_scroll: ScrollHandle,
     composer: gpui::Entity<Composer>,
     pending_command: bool,
@@ -70,6 +74,11 @@ impl ZetaView {
                 return;
             }
         });
+        cx.observe_window_appearance(window, |view, window, cx| {
+            view.appearance = appearance(window);
+            cx.notify();
+        })
+        .detach();
         let composer = cx.new(Composer::new);
         cx.subscribe(&composer, |view, _, _: &composer::Submit, cx| {
             view.send_composer(cx);
@@ -78,6 +87,7 @@ impl ZetaView {
         window.focus(&composer.focus_handle(cx), cx);
         Self {
             state: AppState::default(),
+            appearance: appearance(window),
             transcript_scroll: ScrollHandle::new(),
             composer,
             pending_command: false,
@@ -163,7 +173,7 @@ impl ZetaView {
         }
     }
 
-    fn control_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn control_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.state.approvals.is_empty() {
             let command = match event.keystroke.key.as_str() {
                 "enter" => Some(CommandMessage::Approve(
@@ -178,6 +188,13 @@ impl ZetaView {
                 self.queue(command);
                 cx.stop_propagation();
             }
+        } else if event.keystroke.key == "tab" {
+            if event.keystroke.modifiers.shift {
+                window.focus_prev(cx);
+            } else {
+                window.focus_next(cx);
+            }
+            cx.stop_propagation();
         } else if event.keystroke.key == "escape"
             || (event.keystroke.key == "c" && event.keystroke.modifiers.control)
         {
@@ -222,6 +239,7 @@ impl ZetaView {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.appearance.palette();
         let mut sidebar = div()
             .w(px(260.))
             .flex_shrink_0()
@@ -230,17 +248,17 @@ impl ZetaView {
             .flex_col()
             .p_4()
             .gap_3()
-            .bg(gpui::rgb(PANEL))
+            .bg(gpui::rgb(p.panel))
             .border_r_1()
-            .border_color(gpui::rgb(LINE));
+            .border_color(gpui::rgb(p.border));
         sidebar = sidebar.child(
             div()
                 .text_size(px(18.))
                 .font_weight(gpui::FontWeight::BOLD)
-                .text_color(gpui::rgb(TEXT))
+                .text_color(gpui::rgb(p.text))
                 .child("zeta"),
         );
-        sidebar = sidebar.child(div().h(px(1.)).w_full().bg(gpui::rgb(LINE)));
+        sidebar = sidebar.child(div().h(px(1.)).w_full().bg(gpui::rgb(p.border)));
         let new_button = div()
             .id("new-session")
             .w_full()
@@ -248,17 +266,17 @@ impl ZetaView {
             .px_3()
             .py_2()
             .border_1()
-            .border_color(gpui::rgb(LINE))
-            .text_color(gpui::rgb(TEXT))
+            .border_color(gpui::rgb(p.border))
+            .text_color(gpui::rgb(p.text))
             .opacity(if self.can_change_session() { 1. } else { 0.4 })
             .child("new session")
-            .hover(|this| this.bg(gpui::rgb(LINE)))
+            .hover(|this| this.bg(gpui::rgb(p.border)))
             .on_click(cx.listener(Self::new_session));
         sidebar = sidebar.child(new_button);
         if self.state.sessions_truncated {
             sidebar = sidebar.child(
                 div()
-                    .text_color(gpui::rgb(MUTED))
+                    .text_color(gpui::rgb(p.muted))
                     .child("showing a partial session list"),
             );
         }
@@ -276,10 +294,10 @@ impl ZetaView {
                     .min_h(px(40.))
                     .px_3()
                     .py_2()
-                    .text_color(gpui::rgb(MUTED))
+                    .text_color(gpui::rgb(p.muted))
                     .opacity(if self.can_change_session() { 1. } else { 0.4 })
                     .child(label)
-                    .hover(|this| this.text_color(gpui::rgb(TEXT)))
+                    .hover(|this| this.text_color(gpui::rgb(p.text)))
                     .on_click(cx.listener(move |view, event, window, cx| {
                         view.resume(id.clone(), event, window, cx)
                     })),
@@ -288,7 +306,8 @@ impl ZetaView {
         sidebar
     }
 
-    fn render_transcript(&self) -> impl IntoElement {
+    fn render_transcript(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.appearance.palette();
         // Read the previous layout before new output changes the content height.
         // Scrolling away leaves the offset in place until the user returns to the tail.
         if self.transcript_scroll.offset().y + self.transcript_scroll.max_offset().y <= px(1.) {
@@ -307,34 +326,111 @@ impl ZetaView {
             .self_center()
             .p_6()
             .gap_4();
-        for entry in &self.state.transcript {
+        for (index, entry) in self.state.transcript.iter().enumerate() {
             let row = match entry {
                 TranscriptEntry::User(text) => div()
-                    .text_color(gpui::rgb(TEXT))
+                    .text_color(gpui::rgb(p.text))
                     .font_weight(gpui::FontWeight::BOLD)
                     .child(text.clone()),
-                TranscriptEntry::Assistant(text) => {
-                    div().text_color(gpui::rgb(TEXT)).pl_4().child(text.clone())
-                }
+                TranscriptEntry::Assistant(text) => div().child(transcript::render_block(
+                    &text.root,
+                    self.appearance,
+                    format!("markdown-{index}"),
+                )),
                 TranscriptEntry::Tool {
                     name,
                     summary,
                     complete,
                     error,
+                    card,
                     ..
                 } => {
                     let marker = if *error {
-                        "error"
+                        "[failed]"
                     } else if *complete {
-                        "done"
+                        "[done]"
                     } else {
-                        "running"
+                        "[working]"
                     };
-                    div()
-                        .font_family("monospace")
+                    let label = card
+                        .agent_label
+                        .as_ref()
+                        .map_or_else(|| name.clone(), |label| format!("{label} / {name}"));
+                    let disclosure = if card.expanded { "collapse" } else { "expand" };
+                    let border = if card.agent_label.is_some() {
+                        p.nested_border
+                    } else {
+                        p.border
+                    };
+                    let header = div()
+                        .id(format!("card-{index}"))
+                        .debug_selector(|| format!("card-{index}"))
+                        .tab_index(0)
+                        .min_h(px(40.))
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
                         .text_size(px(12.))
-                        .text_color(gpui::rgb(if *error { 0xd97979 } else { MUTED }))
-                        .child(format!("{marker}  {name}  {summary}"))
+                        .text_color(gpui::rgb(if *error { p.error } else { p.muted }))
+                        .hover(|view| view.bg(gpui::rgb(p.panel)))
+                        .focus(|view| view.border_color(gpui::rgb(p.accent)).border_1())
+                        .child(div().flex_shrink_0().font_family("monospace").child(marker))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .child(format!("{label}  {summary}")),
+                        )
+                        .child(div().flex_shrink_0().child(disclosure))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.state.toggle_card(index);
+                            cx.notify();
+                        }))
+                        .on_key_down(cx.listener(move |view, event: &KeyDownEvent, _, cx| {
+                            if event.keystroke.key == "enter" && view.state.approvals.is_empty() {
+                                view.state.toggle_card(index);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }));
+                    div()
+                        .min_w_0()
+                        .border_1()
+                        .border_color(gpui::rgb(border))
+                        .rounded(px(4.))
+                        .when(card.agent_label.is_some(), |view| view.ml_4())
+                        .child(header)
+                        .when(card.expanded, |view| {
+                            view.child(
+                                div()
+                                    .id(format!("tail-{index}"))
+                                    .max_h(px(320.))
+                                    .overflow_y_scroll()
+                                    .border_t_1()
+                                    .border_color(gpui::rgb(border))
+                                    .px_3()
+                                    .py_2()
+                                    .font_family("monospace")
+                                    .text_size(px(12.))
+                                    .line_height(px(20.))
+                                    .when(card.tail.truncated, |view| {
+                                        view.child(
+                                            div()
+                                                .text_color(gpui::rgb(p.muted))
+                                                .child("output truncated"),
+                                        )
+                                    })
+                                    .child(if card.tail.text.is_empty() {
+                                        "waiting for output".into()
+                                    } else {
+                                        card.tail.text.clone()
+                                    }),
+                            )
+                        })
                 }
             };
             transcript = transcript.child(row.flex_shrink_0());
@@ -343,6 +439,7 @@ impl ZetaView {
     }
 
     fn render_composer(&self) -> impl IntoElement {
+        let p = self.appearance.palette();
         let hint = if self.state.streaming {
             "waiting for response; escape aborts"
         } else if self.state.active_session.is_none() {
@@ -354,21 +451,22 @@ impl ZetaView {
             .flex_shrink_0()
             .w_full()
             .border_t_1()
-            .border_color(gpui::rgb(LINE))
+            .border_color(gpui::rgb(p.border))
             .p_4()
             .child(self.composer.clone())
             .child(
                 div()
                     .text_size(px(12.))
-                    .text_color(gpui::rgb(MUTED))
+                    .text_color(gpui::rgb(p.muted))
                     .child(hint),
             )
             .when_some(self.command_error.clone(), |view, error| {
-                view.child(div().text_color(gpui::rgb(0xd97979)).child(error))
+                view.child(div().text_color(gpui::rgb(p.error)).child(error))
             })
     }
 
     fn render_approval(&self, approval: &Approval, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.appearance.palette();
         let approval_for_yes = approval.clone();
         let approval_for_no = approval.clone();
         let approve = div()
@@ -376,8 +474,8 @@ impl ZetaView {
             .min_w(px(100.))
             .min_h(px(40.))
             .p_3()
-            .bg(gpui::rgb(SIGNAL))
-            .text_color(gpui::black())
+            .bg(gpui::rgb(p.accent))
+            .text_color(gpui::rgb(p.background))
             .child("approve")
             .on_click(cx.listener(move |view, event, window, cx| {
                 view.approval_action(approval_for_yes.clone(), true, event, window, cx)
@@ -388,8 +486,8 @@ impl ZetaView {
             .min_h(px(40.))
             .p_3()
             .border_1()
-            .border_color(gpui::rgb(LINE))
-            .text_color(gpui::rgb(TEXT))
+            .border_color(gpui::rgb(p.border))
+            .text_color(gpui::rgb(p.text))
             .child("deny")
             .on_click(cx.listener(move |view, event, window, cx| {
                 view.approval_action(approval_for_no.clone(), false, event, window, cx)
@@ -405,9 +503,9 @@ impl ZetaView {
                 div()
                     .w(px(430.))
                     .p_6()
-                    .bg(gpui::rgb(PANEL))
+                    .bg(gpui::rgb(p.panel))
                     .border_1()
-                    .border_color(gpui::rgb(SIGNAL))
+                    .border_color(gpui::rgb(p.accent))
                     .child(
                         div()
                             .flex()
@@ -417,19 +515,19 @@ impl ZetaView {
                                 div()
                                     .text_size(px(16.))
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(gpui::rgb(TEXT))
+                                    .text_color(gpui::rgb(p.text))
                                     .child("approval required"),
                             )
                             .child(
                                 div()
-                                    .text_color(gpui::rgb(TEXT))
+                                    .text_color(gpui::rgb(p.text))
                                     .child(approval.tool_call.name.clone()),
                             )
                             .child(
                                 div()
                                     .font_family("monospace")
                                     .text_size(px(12.))
-                                    .text_color(gpui::rgb(MUTED))
+                                    .text_color(gpui::rgb(p.muted))
                                     .child(
                                         serde_json::to_string(&approval.tool_call.arguments)
                                             .unwrap_or_else(|_| "arguments unavailable".to_owned()),
@@ -441,17 +539,52 @@ impl ZetaView {
     }
 }
 
+impl ZetaView {
+    fn render_status(&self, p: Palette) -> impl IntoElement {
+        div()
+            .flex()
+            .justify_between()
+            .items_center()
+            .flex_shrink_0()
+            .min_h(px(32.))
+            .border_t_1()
+            .border_color(gpui::rgb(p.border))
+            .px_4()
+            .gap_4()
+            .text_size(px(12.))
+            .text_color(gpui::rgb(p.muted))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .child(self.state.metrics.model_label().to_owned()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_family("monospace")
+                    .child(format!(
+                        "tokens {}    cache {}",
+                        self.state.metrics.tokens_label(),
+                        self.state.metrics.cache_label()
+                    )),
+            )
+    }
+}
+
 impl Render for ZetaView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.appearance.palette();
         let enabled = !self.pending_command && self.state.approvals.is_empty();
         self.composer
             .update(cx, |composer, _| composer.enabled = enabled);
         let mut root = div()
             .size_full()
             .flex()
-            .bg(gpui::rgb(BG))
+            .font_family("Helvetica Neue")
+            .bg(gpui::rgb(p.background))
             .text_size(px(14.))
-            .text_color(gpui::rgb(TEXT))
+            .text_color(gpui::rgb(p.text))
             .track_focus(&self.focus_handle)
             .capture_action(cx.listener(|view, _: &composer::Submit, _, cx| {
                 if let Some(approval) = view.state.approvals.first() {
@@ -469,8 +602,9 @@ impl Render for ZetaView {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(self.render_transcript())
-                    .child(self.render_composer()),
+                    .child(self.render_transcript(cx))
+                    .child(self.render_composer())
+                    .child(self.render_status(p)),
             );
         root = match &self.state.connection {
             ConnectionState::Connected => root,
@@ -481,8 +615,8 @@ impl Render for ZetaView {
                     .right_0()
                     .m_4()
                     .p_2()
-                    .bg(gpui::rgb(LINE))
-                    .text_color(gpui::rgb(TEXT))
+                    .bg(gpui::rgb(p.border))
+                    .text_color(gpui::rgb(p.text))
                     .child("connecting..."),
             ),
             ConnectionState::Lost(error) => root.child(
@@ -492,9 +626,9 @@ impl Render for ZetaView {
                     .right_0()
                     .m_4()
                     .p_3()
-                    .bg(gpui::rgb(PANEL))
+                    .bg(gpui::rgb(p.panel))
                     .border_1()
-                    .border_color(gpui::rgb(0xd97979))
+                    .border_color(gpui::rgb(p.error))
                     .child(
                         div()
                             .flex()
@@ -506,7 +640,7 @@ impl Render for ZetaView {
                                     .id("reconnect")
                                     .min_h(px(40.))
                                     .p_2()
-                                    .text_color(gpui::rgb(SIGNAL))
+                                    .text_color(gpui::rgb(p.accent))
                                     .child("reconnect")
                                     .on_click(cx.listener(Self::reconnect)),
                             ),
@@ -548,6 +682,110 @@ mod tests {
     use zeta_gui::client::ToolCall;
 
     #[gpui::test]
+    fn cards_support_click_enter_and_both_appearances(cx: &mut gpui::TestAppContext) {
+        cx.update(composer::bind_keys);
+        let window = cx.open_window(gpui::size(px(1100.), px(760.)), |window, cx| {
+            ZetaView::new(
+                window,
+                cx,
+                Some(PathBuf::from("/tmp/zeta-94-test-no-server.sock")),
+            )
+        });
+        window
+            .update(cx, |view, _, cx| {
+                view.state.apply(zeta_gui::client::ServerEvent::ToolStart {
+                    session_id: None,
+                    tool_call: ToolCall {
+                        id: "tool".into(),
+                        name: "read".into(),
+                        arguments: Default::default(),
+                    },
+                    data: serde_json::json!({}),
+                });
+                view.state.transcript.push(TranscriptEntry::Assistant(
+                    "```rust\nfn main() {}\n```".into(),
+                ));
+                cx.notify();
+            })
+            .unwrap();
+        // GPUI's platform appearance simulator is private. Force our palette
+        // explicitly; production uses the window appearance observer above.
+        for mode in [Appearance::Dark, Appearance::Light] {
+            window
+                .update(cx, |view, _, cx| {
+                    view.appearance = mode;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        }
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let header = visual.debug_bounds("card-0").expect("receipt header");
+        assert!(header.size.height >= px(40.));
+        visual.simulate_click(header.center(), Default::default());
+        window.update(cx, |view, _, _| assert!(matches!(&view.state.transcript[0], TranscriptEntry::Tool { card, .. } if card.expanded))).unwrap();
+        cx.simulate_keystrokes(window.into(), "enter");
+        window.update(cx, |view, _, _| assert!(matches!(&view.state.transcript[0], TranscriptEntry::Tool { card, .. } if !card.expanded))).unwrap();
+        // Keyboard navigation reaches the receipt from the composer as well.
+        window
+            .update(cx, |view, window, cx| {
+                window.focus(&view.composer.focus_handle(cx), cx)
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "tab enter");
+        window.update(cx, |view, _, _| assert!(matches!(&view.state.transcript[0], TranscriptEntry::Tool { card, .. } if card.expanded))).unwrap();
+    }
+
+    #[gpui::test]
+    fn code_scrolls_inside_its_block_in_both_palettes(cx: &mut gpui::TestAppContext) {
+        let window = cx.open_window(gpui::size(px(700.), px(500.)), |window, cx| {
+            ZetaView::new(
+                window,
+                cx,
+                Some(PathBuf::from("/tmp/zeta-94-test-no-server.sock")),
+            )
+        });
+        window
+            .update(cx, |view, _, cx| {
+                view.state.transcript = vec![TranscriptEntry::Assistant(
+                    format!("```rust\nlet text = \"{}\";\n```", "long line ".repeat(80)).into(),
+                )];
+                cx.notify();
+            })
+            .unwrap();
+        for mode in [Appearance::Light, Appearance::Dark] {
+            window
+                .update(cx, |view, _, cx| {
+                    view.appearance = mode;
+                    cx.notify();
+                })
+                .unwrap();
+            let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let viewport = visual.debug_bounds("code-scroll").unwrap();
+            let before = visual.debug_bounds("code-content").unwrap();
+            assert!(viewport.right() <= px(700.));
+            assert!(
+                before.size.width > viewport.size.width,
+                "long code must not wrap"
+            );
+            visual.simulate_event(gpui::ScrollWheelEvent {
+                position: viewport.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(-80.), px(0.))),
+                ..Default::default()
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let after = visual.debug_bounds("code-content").unwrap();
+            assert!(
+                after.left() < before.left(),
+                "horizontal scrolling stays inside the code block"
+            );
+        }
+    }
+
+    #[gpui::test]
     fn active_session_click_is_a_no_op_and_switching_restores_transcripts(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -561,6 +799,7 @@ mod tests {
                 transcript: vec![TranscriptEntry::Assistant("first transcript".into())],
                 ..Default::default()
             },
+            appearance: Appearance::Light,
             transcript_scroll: ScrollHandle::new(),
             composer: cx.new(Composer::new),
             pending_command: false,
@@ -611,9 +850,10 @@ mod tests {
         let window = cx.open_window(size(px(1100.), px(760.)), move |_, cx| ZetaView {
             state: AppState {
                 connection: ConnectionState::Connected,
-                transcript: vec![TranscriptEntry::Assistant("line\n".repeat(100))],
+                transcript: vec![TranscriptEntry::Assistant("line\n".repeat(100).into())],
                 ..Default::default()
             },
+            appearance: Appearance::Light,
             transcript_scroll: handle,
             composer: cx.new(Composer::new),
             pending_command: false,
@@ -704,6 +944,7 @@ mod tests {
                     }],
                     ..Default::default()
                 },
+                appearance: Appearance::Light,
                 composer,
                 transcript_scroll: ScrollHandle::new(),
                 pending_command: false,

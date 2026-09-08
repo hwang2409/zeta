@@ -1,3 +1,7 @@
+use crate::{
+    cards::{Card, OutputTail},
+    markdown::Markdown,
+};
 use std::collections::HashMap;
 
 use crate::client::{Approval, Message, ServerEvent, SessionMetadata, StatusResult, ToolCall};
@@ -22,13 +26,14 @@ impl ToolReceiptKey {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptEntry {
     User(String),
-    Assistant(String),
+    Assistant(Markdown),
     Tool {
         key: ToolReceiptKey,
         name: String,
         summary: String,
         complete: bool,
         error: bool,
+        card: Card,
     },
 }
 
@@ -49,6 +54,8 @@ pub struct AppState {
     pub approvals: Vec<Approval>,
     pub connection: ConnectionState,
     pub streaming: bool,
+    pub metrics: StatusMetrics,
+    pub metrics_boundary: bool,
 }
 
 impl Default for AppState {
@@ -62,6 +69,8 @@ impl Default for AppState {
             approvals: Vec::new(),
             connection: ConnectionState::Reconnecting,
             streaming: false,
+            metrics: StatusMetrics::default(),
+            metrics_boundary: true,
         }
     }
 }
@@ -90,26 +99,43 @@ impl AppState {
             .and_then(|id| self.saved_transcripts.remove(id))
             .unwrap_or_default();
         self.active_session = session_id;
+        self.metrics = StatusMetrics::default();
+        self.metrics_boundary = true;
     }
 
     pub fn apply_status(&mut self, status: StatusResult) {
-        self.select_session(status.session.map(|session| session.session_id));
+        self.select_session(
+            status
+                .session
+                .as_ref()
+                .map(|session| session.session_id.clone()),
+        );
+        if self.metrics_boundary || (!self.streaming && status.state == "idle") {
+            self.metrics = StatusMetrics::from_status(&status);
+            self.metrics_boundary = false;
+        }
         self.streaming = status.state != "idle";
         self.approvals = status.pending_approvals;
     }
 
     pub fn apply(&mut self, event: ServerEvent) {
         match event {
-            ServerEvent::TurnStart { .. } => self.streaming = true,
+            ServerEvent::TurnStart { .. } => {
+                self.streaming = true;
+                self.metrics_boundary = false;
+            }
             ServerEvent::AgentEnd { .. } | ServerEvent::TurnAborted { .. } => {
                 self.streaming = false;
+                self.metrics_boundary = true;
                 self.approvals.clear();
             }
-            ServerEvent::TurnEnd { .. } => {}
+            ServerEvent::TurnEnd { .. } => self.metrics_boundary = true,
             ServerEvent::AssistantDelta { delta, kind, .. } if kind == "assistant" => {
                 match self.transcript.last_mut() {
                     Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
-                    _ => self.transcript.push(TranscriptEntry::Assistant(delta)),
+                    _ => self
+                        .transcript
+                        .push(TranscriptEntry::Assistant(delta.into())),
                 }
             }
             ServerEvent::AssistantDelta { .. } => {}
@@ -128,11 +154,20 @@ impl AppState {
                 output,
                 data,
             } => {
-                if let TranscriptEntry::Tool { summary, .. } = self.tool_receipt(
+                if let TranscriptEntry::Tool { summary, card, .. } = self.tool_receipt(
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
                 ) {
-                    *summary = bounded_summary(&format!("{summary}{output}"));
+                    card.tail.append(&output);
+                    if let Some(line) = card
+                        .tail
+                        .text
+                        .lines()
+                        .rev()
+                        .find(|line| !line.trim().is_empty())
+                    {
+                        *summary = bounded_summary(line);
+                    }
                 }
             }
             ServerEvent::ToolEnd {
@@ -142,13 +177,37 @@ impl AppState {
                 data,
             } => {
                 if let TranscriptEntry::Tool {
-                    complete, error, ..
+                    complete,
+                    error,
+                    summary,
+                    card,
+                    name,
+                    ..
                 } = self.tool_receipt(
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
                 ) {
-                    *complete = true;
+                    *complete = !name.eq_ignore_ascii_case("agent")
+                        || !tool_result
+                            .as_ref()
+                            .and_then(|result| result.structured_content.as_ref())
+                            .is_some_and(|data| data["status"] == "running");
                     *error = tool_result.as_ref().is_some_and(|result| result.is_error);
+                    if let Some(result) = tool_result.filter(|result| !result.content.is_empty()) {
+                        if card.tail.text != result.content {
+                            if !card.tail.text.is_empty() && !card.tail.text.ends_with('\n') {
+                                card.tail.append("\n");
+                            }
+                            card.tail.append(&result.content);
+                        }
+                        *summary = bounded_summary(
+                            result
+                                .content
+                                .lines()
+                                .find(|line| !line.trim().is_empty())
+                                .unwrap_or(""),
+                        );
+                    }
                 }
             }
             ServerEvent::ApprovalRequest { approval, .. } => {
@@ -165,6 +224,7 @@ impl AppState {
             ServerEvent::ApprovalEnd { .. } => {}
             ServerEvent::Error { error, .. } => {
                 self.streaming = false;
+                self.metrics_boundary = true;
                 self.approvals.clear();
                 self.transcript.push(TranscriptEntry::Tool {
                     key: ToolReceiptKey {
@@ -174,11 +234,25 @@ impl AppState {
                     },
                     name: "error".to_owned(),
                     summary: bounded_summary(&error.message),
+                    card: Card {
+                        tail: {
+                            let mut tail = OutputTail::default();
+                            tail.append(&error.message);
+                            tail
+                        },
+                        ..Default::default()
+                    },
                     complete: true,
                     error: true,
                 });
             }
             ServerEvent::Other { .. } => {}
+        }
+    }
+
+    pub fn toggle_card(&mut self, index: usize) {
+        if let Some(TranscriptEntry::Tool { card, .. }) = self.transcript.get_mut(index) {
+            card.toggle();
         }
     }
 
@@ -202,9 +276,54 @@ impl AppState {
             return;
         }
         match self.transcript.last_mut() {
-            Some(TranscriptEntry::Assistant(current)) => *current = text,
-            _ => self.transcript.push(TranscriptEntry::Assistant(text)),
+            Some(TranscriptEntry::Assistant(current)) => *current = text.into(),
+            _ => self
+                .transcript
+                .push(TranscriptEntry::Assistant(text.into())),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StatusMetrics {
+    pub model: Option<String>,
+    pub tokens: Option<u64>,
+    pub cache_hit_rate: Option<f64>,
+}
+
+impl StatusMetrics {
+    fn from_status(status: &StatusResult) -> Self {
+        let usage = &status.usage;
+        let input = usage["input_tokens"].as_u64();
+        let output = usage["output_tokens"].as_u64();
+        let read = usage["cache_read_input_tokens"].as_u64();
+        let write = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        let prompt =
+            input.and_then(|input| input.checked_add(read.unwrap_or(0))?.checked_add(write));
+        Self {
+            model: status
+                .session
+                .as_ref()
+                .map(|s| s.model.clone())
+                .filter(|s| !s.is_empty()),
+            tokens: prompt
+                .zip(output)
+                .and_then(|(input, output)| input.checked_add(output)),
+            cache_hit_rate: read
+                .zip(prompt)
+                .filter(|(read, total)| *total > 0 && read <= total)
+                .map(|(read, total)| read as f64 / total as f64 * 100.),
+        }
+    }
+    pub fn model_label(&self) -> &str {
+        self.model.as_deref().unwrap_or("—")
+    }
+    pub fn tokens_label(&self) -> String {
+        self.tokens.map_or_else(|| "—".into(), |n| n.to_string())
+    }
+    pub fn cache_label(&self) -> String {
+        self.cache_hit_rate
+            .map_or_else(|| "—".into(), |n| format!("{n:.1}%"))
     }
 }
 
@@ -218,7 +337,24 @@ fn bounded_summary(text: &str) -> String {
 }
 
 fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey) -> TranscriptEntry {
+    let agent_label = if tool_call.name.eq_ignore_ascii_case("agent") {
+        Some(
+            tool_call
+                .arguments
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("agent")
+                .to_owned(),
+        )
+    } else {
+        key.agent_instance_id.clone()
+    };
+    let agent_label = agent_label.map(|label| bounded_summary(&label));
     TranscriptEntry::Tool {
+        card: Card {
+            agent_label,
+            ..Default::default()
+        },
         key,
         name: tool_call.name.clone(),
         summary: bounded_summary(
@@ -235,6 +371,74 @@ mod tests {
     use super::*;
     use crate::client::{EventError, ToolResult};
     use serde_json::json;
+
+    #[test]
+    fn metrics_ignore_midstream_status_and_clear_on_session_switch() {
+        let status = |usage| {
+            serde_json::from_value(json!({"session":{"session_id":"one","model":"test"},"state":"running","usage":usage})).unwrap()
+        };
+        let mut state = AppState::default();
+        state.apply_status(status(json!({"input_tokens":10,"output_tokens":4})));
+        assert_eq!(state.metrics.tokens_label(), "14");
+        assert_eq!(state.metrics.cache_label(), "—");
+        state.apply(ServerEvent::TurnStart {
+            session_id: Some("one".into()),
+            data: json!({}),
+        });
+        state.apply_status(status(json!({"input_tokens":900,"output_tokens":100})));
+        assert_eq!(state.metrics.tokens_label(), "14");
+        state.apply(ServerEvent::TurnEnd {
+            session_id: Some("one".into()),
+            data: json!({}),
+        });
+        state.apply_status(status(json!({"input_tokens":900,"output_tokens":100})));
+        assert_eq!(state.metrics.tokens_label(), "1000");
+        state.select_session(Some("two".into()));
+        assert_eq!(state.metrics.model_label(), "—");
+        assert_eq!(state.metrics.tokens_label(), "—");
+    }
+
+    #[test]
+    fn background_agent_receipt_stays_running_until_final_result() {
+        let mut state = AppState::default();
+        let agent = ToolCall {
+            name: "agent".into(),
+            arguments: [("description".into(), json!("review code"))]
+                .into_iter()
+                .collect(),
+            ..call()
+        };
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: agent.clone(),
+            data: json!({}),
+        });
+        for (status, text, complete) in [
+            ("running", "started", false),
+            ("completed", "review passed\nfull summary", true),
+        ] {
+            state.apply(ServerEvent::ToolEnd {
+                session_id: None,
+                tool_call: agent.clone(),
+                data: json!({}),
+                tool_result: Some(ToolResult {
+                    tool_call_id: agent.id.clone(),
+                    content: text.into(),
+                    is_error: false,
+                    is_canceled: false,
+                    content_blocks: vec![],
+                    structured_content: Some(json!({"status":status})),
+                }),
+            });
+            assert!(
+                matches!(&state.transcript[0], TranscriptEntry::Tool { complete: actual, card, .. } if *actual == complete && card.agent_label.as_deref() == Some("review code"))
+            );
+        }
+        assert_eq!(state.transcript.len(), 1);
+        assert!(
+            matches!(&state.transcript[0], TranscriptEntry::Tool { summary, card, .. } if summary == "review passed" && card.tail.text.ends_with("full summary"))
+        );
+    }
 
     fn call() -> ToolCall {
         ToolCall {
@@ -274,7 +478,7 @@ mod tests {
         });
         assert_eq!(
             state.transcript,
-            vec![TranscriptEntry::Assistant("hello".to_owned())]
+            vec![TranscriptEntry::Assistant("hello".into())]
         );
     }
 
@@ -335,7 +539,7 @@ mod tests {
             }
         ));
         assert!(
-            matches!(&state.transcript[0], TranscriptEntry::Tool { summary, .. } if summary.contains("README.md"))
+            matches!(&state.transcript[0], TranscriptEntry::Tool { summary, .. } if summary == "no")
         );
     }
 
@@ -383,7 +587,7 @@ mod tests {
         }
         assert!(
             matches!(&state.transcript[0], TranscriptEntry::Tool { key, summary, complete: true, error: false, .. }
-            if key.tool_call_id == "tool-1" && summary.chars().count() == SUMMARY_CHARS && !summary.contains('\n'))
+            if key.tool_call_id == "tool-1" && summary == "α" && !summary.contains('\n'))
         );
         assert!(
             matches!(&state.transcript[1], TranscriptEntry::Tool { key, summary, complete: true, error: true, .. }
