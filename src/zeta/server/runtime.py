@@ -3,24 +3,26 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..core.approval import ApprovalPolicy
 from ..core.project_context import (
     ProjectContext,
     discover_repo_root,
     load_project_context,
 )
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
+from ..loop import AgentLoop
+from ..runtime import RuntimeComposition, compose_runtime
 from ..settings import load_settings
 from ..settings import resolve as resolve_settings
-from ..submission import RuntimeComposition, compose_runtime
 from ..types import CompletionBackend, StreamEvent
 from .fake_backend import ServerFakeBackend
 
-BackendFactory = Callable[
-    [str, str | None, Path], tuple[CompletionBackend, str]
-]
+BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]]
+SessionEventSink = Callable[[str, StreamEvent], None]
 
 
 def default_backend(
@@ -45,6 +47,53 @@ def default_backend(
     )
 
 
+@dataclass(slots=True)
+class SessionState:
+    """Own the active session identity, metadata, usage, and status."""
+
+    opened: OpenedSession
+    loop: AgentLoop
+    policy: ApprovalPolicy
+    usage: dict[str, Any] = field(default_factory=dict)
+    status: str = "idle"
+
+    @classmethod
+    def from_composition(cls, composition: RuntimeComposition) -> SessionState:
+        return cls(
+            opened=composition.opened,
+            loop=composition.loop,
+            policy=composition.policy,
+        )
+
+    @property
+    def metadata(self) -> SessionMetadata:
+        return self.opened.metadata
+
+    @property
+    def session_id(self) -> str:
+        return self.metadata.session_id
+
+    @property
+    def provider(self) -> str:
+        return self.metadata.provider
+
+    @property
+    def model(self) -> str:
+        return self.metadata.model
+
+    def turn_started(self) -> None:
+        self.status = "running"
+
+    def tool_started(self) -> None:
+        self.status = "tool"
+
+    def tool_finished(self) -> None:
+        self.status = "running"
+
+    def turn_finished(self) -> None:
+        self.status = "idle"
+
+
 class ServerRuntime:
     """Own the current session and its provider-neutral agent loop."""
 
@@ -59,21 +108,48 @@ class ServerRuntime:
     ) -> None:
         self.home = Path(home).expanduser().resolve()
         self.cwd = Path(cwd or Path.cwd()).expanduser().resolve()
-        self.provider = provider
-        self.model = model
+        self._server_provider = provider
+        self._server_model = model
         self.backend_factory = backend_factory
         self.manager = SessionManager(self.home)
-        self.opened: OpenedSession | None = None
-        self.loop = None
-        self.policy = None
-        self.usage: dict[str, Any] = {}
-        self._background_event_sink: Callable[[StreamEvent], None] | None = None
+        self._state: SessionState | None = None
+        self._background_event_sink: SessionEventSink | None = None
+
+    @property
+    def opened(self) -> OpenedSession | None:
+        return self._state.opened if self._state is not None else None
+
+    @property
+    def loop(self) -> AgentLoop | None:
+        return self._state.loop if self._state is not None else None
+
+    @property
+    def policy(self) -> ApprovalPolicy | None:
+        return self._state.policy if self._state is not None else None
+
+    @property
+    def provider(self) -> str | None:
+        return (
+            self._state.provider if self._state is not None else self._server_provider
+        )
+
+    @property
+    def model(self) -> str | None:
+        return self._state.model if self._state is not None else self._server_model
+
+    @property
+    def usage(self) -> dict[str, Any]:
+        return self._state.usage if self._state is not None else {}
+
+    @property
+    def state(self) -> SessionState | None:
+        return self._state
 
     @property
     def metadata(self) -> SessionMetadata:
-        if self.opened is None:
+        if self._state is None:
             raise RuntimeError("server has no active session")
-        return self.opened.metadata
+        return self._state.metadata
 
     @property
     def session_id(self) -> str:
@@ -82,14 +158,12 @@ class ServerRuntime:
     def list_sessions(self) -> list[SessionMetadata]:
         return self.manager.list_sessions()
 
-    def set_background_event_sink(
-        self, sink: Callable[[StreamEvent], None] | None
-    ) -> None:
+    def set_background_event_sink(self, sink: SessionEventSink | None) -> None:
         """Attach the current frontend to child-agent progress events."""
 
         self._background_event_sink = sink
-        if self.loop is not None:
-            self.loop.set_background_event_sink(sink)
+        if self._state is not None:
+            self._bind_background_event_sink(self._state)
 
     async def create_session(
         self, *, provider: str | None = None, model: str | None = None
@@ -127,22 +201,27 @@ class ServerRuntime:
         return self.metadata
 
     async def close(self) -> None:
-        if self.loop is not None:
-            await self.loop.close()
-        self.loop = None
-        self.policy = None
+        state = self._state
+        if state is not None:
+            await state.loop.close()
+            self._state = None
 
     async def _replace(self, composition: RuntimeComposition) -> None:
-        old_loop = self.loop
-        self.opened = composition.opened
-        self.provider = composition.provider
-        self.model = composition.model
-        self.loop = composition.loop
-        self.policy = composition.policy
-        self.usage = {}
-        if old_loop is not None:
-            await old_loop.close()
-        await self.loop.activate()
+        old_state = self._state
+        if old_state is not None:
+            await old_state.loop.close()
+        state = SessionState.from_composition(composition)
+        self._state = state
+        self._bind_background_event_sink(state)
+        await state.loop.activate()
+
+    def _bind_background_event_sink(self, state: SessionState) -> None:
+        sink = self._background_event_sink
+        if sink is None:
+            state.loop.set_background_event_sink(None)
+            return
+        session_id = state.session_id
+        state.loop.set_background_event_sink(lambda event: sink(session_id, event))
 
     def _compose(self, **kwargs: object) -> RuntimeComposition:
         return compose_runtime(
@@ -150,7 +229,6 @@ class ServerRuntime:
             cwd=self.cwd,
             manager=self.manager,
             backend_builder=self._build_backend,
-            background_event_sink=self._background_event_sink,
             **kwargs,
         )
 
@@ -178,11 +256,11 @@ class ServerRuntime:
         settings = load_settings(home=self.home, project_dir=project_dir)
         return resolve_settings(
             settings.settings,
-            cli_provider=provider or self.provider,
-            cli_model=model or self.model,
+            cli_provider=provider if provider is not None else self._server_provider,
+            cli_model=model if model is not None else self._server_model,
             cli_yolo=None,
             cli_token_budget=None,
         )
 
 
-__all__ = ["BackendFactory", "ServerRuntime", "default_backend"]
+__all__ = ["BackendFactory", "ServerRuntime", "SessionState", "default_backend"]

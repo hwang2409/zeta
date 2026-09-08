@@ -20,9 +20,9 @@ from ..core.session import (
     env_home,
     format_relative_age,
 )
+from ..runtime import compose_runtime
 from ..settings import ResolvedConfig
 from ..settings import resolve as resolve_settings
-from ..submission import compose_runtime
 from . import theme as _theme
 from .key_bindings import KeybindingError, resolve_keybindings
 from .layout import content_width, resume_picker_line

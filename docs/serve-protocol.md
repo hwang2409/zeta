@@ -39,6 +39,11 @@ within the frame limit.
 Every notification has method `event`. Its `params.event` names the event and
 its `params.session_id` identifies the active session when one exists.
 
+The codec limits string request ids to 128 UTF-8 bytes and numeric request ids
+to 128 decimal digits. An error uses the parsed id when the frame exposed a
+safe id. It uses `null` when parsing did not expose an id or the id exceeded a
+documented limit.
+
 ## requests
 
 ### `list_sessions`
@@ -324,8 +329,9 @@ and `is_stall: boolean`. Unknown provider keys remain allowed inside `data`.
 
 ## ordering and lifecycle rules
 
-1. The server processes complete request lines in order. It serializes all
-   responses and notifications through one write lock.
+1. The server processes complete request lines in order. It parses inbound
+   frames and serializes all responses and notifications through one bounded
+   codec and one write lock.
 2. The client sends `hello` first. Any rejected first request closes the client
    after its error response. A successful `hello` enables session operations.
 3. `send` returns its acknowledgement before `turn_start`. Stream events keep
@@ -346,18 +352,25 @@ and `is_stall: boolean`. Unknown provider keys remain allowed inside `data`.
    and turns, closes the listener, and removes the Unix socket.
 10. Match responses by `id`. Continue processing notifications until the
     matching response arrives.
+11. A session replacement closes the old loop before publishing the new
+    session. Events from old background children keep the old session id.
+    Background events do not change the foreground `status.state`.
 
 ## size and pagination rules
 
 Every inbound and outbound frame is at most `MAX_FRAME_BYTES` bytes, including
 the newline. An oversized inbound line gets a structured `-32600` error. The
-server discards that line and keeps the connection usable.
+server discards that line and keeps a handshaken connection usable. A valid
+request can receive `-32007` when its result does not fit. That response keeps
+the request id when it is within the request-id limits.
 
 `list_sessions` returns the largest fitting prefix. A truncated result has
 `truncated: true`, `sessions`, and zero-based `next_offset`. Version `1.0`
 does not expose an offset request, so clients should treat this marker as a
 safe display warning. Other oversized payloads become a bounded `-32007`
-response or error event.
+response or error event. A malformed frame returns a structured error. Once
+the handshake succeeds, the server continues reading after malformed JSON,
+wrong types, oversized string ids, and oversized numeric ids.
 
 ## conformance
 

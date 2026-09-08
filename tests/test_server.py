@@ -64,7 +64,17 @@ async def _request(
     params: dict[str, object] | None = None,
 ) -> list[dict[str, Any]]:
     writer.write(
-        (json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}) + "\n").encode()
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params or {},
+                }
+            )
+            + "\n"
+        ).encode()
     )
     await asyncio.wait_for(writer.drain(), TIMEOUT)
     frames: list[dict[str, Any]] = []
@@ -75,9 +85,7 @@ async def _request(
             return frames
 
 
-async def _event(
-    reader: asyncio.StreamReader, name: str
-) -> dict[str, Any]:
+async def _event(reader: asyncio.StreamReader, name: str) -> dict[str, Any]:
     while True:
         frame = await _read(reader)
         if frame.get("params", {}).get("event") == name:
@@ -179,9 +187,7 @@ async def test_abort_mid_stream(tmp_path: Path) -> None:
         await _event(reader, "assistant_delta")
         frames = await _request(reader, writer, 4, "abort")
         assert frames[-1]["result"]["aborted"] is True
-        assert any(
-            frame.get("params", {}).get("event") == "turn_aborted" for frame in frames
-        )
+        assert any(frame.get("params", {}).get("event") == "turn_aborted" for frame in frames)
     finally:
         await _close(server, writer)
 
@@ -221,9 +227,7 @@ async def test_server_can_bind_localhost_port(tmp_path: Path) -> None:
     try:
         assert server.port != 0
         assert server.address.startswith("127.0.0.1:")
-        result = await _request(
-            reader, writer, 1, "hello", {"protocol_version": "1.0"}
-        )
+        result = await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
         assert result[-1]["result"]["protocol_version"] == "1.0"
     finally:
         await _close(server, writer)
@@ -236,9 +240,15 @@ async def test_oversized_frame_returns_error_and_keeps_connection_usable(
     server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
     reader, writer = await _ready(server)
     try:
-        writer.write(b"x" * (MAX_FRAME_BYTES + 32) + b"\n")
+        oversized = (
+            b'{"jsonrpc":"2.0","id":"oversized","method":"status","params":{"padding":"'
+            + b"x" * MAX_FRAME_BYTES
+            + b'"}}\n'
+        )
+        writer.write(oversized)
         await writer.drain()
         error = await _read(reader)
+        assert error["id"] == "oversized"
         assert error["error"]["code"] == -32600
         status = await _request(reader, writer, 3, "status")
         assert status[-1]["result"]["session"] is not None
@@ -253,15 +263,19 @@ async def test_maximum_legal_frame_gets_bounded_error_response(
     server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
     reader, writer = await _connect(server)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-    request_id_length = MAX_FRAME_BYTES
+    await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+    assert server.runtime.opened is not None
+    server.runtime.opened.metadata.system_prompt = "x" * MAX_FRAME_BYTES
+    request_id = "legal-frame"
+    padding_length = MAX_FRAME_BYTES
     while True:
         candidate = (
             json.dumps(
                 {
                     "jsonrpc": "2.0",
-                    "id": "x" * request_id_length,
+                    "id": request_id,
                     "method": "status",
-                    "params": {},
+                    "params": {"padding": "x" * padding_length},
                 },
                 separators=(",", ":"),
             )
@@ -269,28 +283,28 @@ async def test_maximum_legal_frame_gets_bounded_error_response(
         ).encode()
         if len(candidate) <= MAX_FRAME_BYTES:
             break
-        request_id_length -= len(candidate) - MAX_FRAME_BYTES
-    while len(candidate) < MAX_FRAME_BYTES:
-        request_id_length += MAX_FRAME_BYTES - len(candidate)
-        candidate = (
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": "x" * request_id_length,
-                    "method": "status",
-                    "params": {},
-                },
-                separators=(",", ":"),
-            )
-            + "\n"
-        ).encode()
+        padding_length -= len(candidate) - MAX_FRAME_BYTES
+    padding_length += MAX_FRAME_BYTES - len(candidate)
+    candidate = (
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "status",
+                "params": {"padding": "x" * padding_length},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
     assert len(candidate) == MAX_FRAME_BYTES
     try:
         writer.write(candidate)
         await writer.drain()
         raw = await _read_raw(reader)
         response_frame = json.loads(raw)
-        assert response_frame["error"]["code"] == -32600
+        assert response_frame["id"] == request_id
+        assert response_frame["error"]["code"] == -32007
         assert len(raw) <= MAX_FRAME_BYTES
     finally:
         await _close(server, writer)
@@ -318,16 +332,70 @@ def test_request_id_limit_is_inclusive() -> None:
         parse_request(invalid)
 
 
+@pytest.mark.asyncio
+async def test_huge_numeric_request_id_returns_error_and_keeps_connection_usable(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    reader, writer = await _ready(server)
+    try:
+        writer.write(
+            b'{"jsonrpc":"2.0","id":' + b"7" * 5_000 + b',"method":"status","params":{}}\n'
+        )
+        await writer.drain()
+        error = await _read(reader)
+        assert error["id"] is None
+        assert error["error"]["code"] == -32600
+        status = await _request(reader, writer, 3, "status")
+        assert status[-1]["result"]["session"] is not None
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_malformed_and_wrong_type_frames_keep_connection_usable(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    reader, writer = await _ready(server)
+    try:
+        writer.write(
+            b'{"jsonrpc":"2.0","id":"known-id","method":NaN,"params":{}}\n'
+        )
+        await writer.drain()
+        malformed = await _read(reader)
+        assert malformed["id"] == "known-id"
+        assert malformed["error"]["code"] == -32700
+
+        writer.write(
+            b'{"jsonrpc":"2.0","id":["wrong-type"],"method":"status","params":{}}\n'
+        )
+        await writer.drain()
+        wrong_type = await _read(reader)
+        assert wrong_type["id"] is None
+        assert wrong_type["error"]["code"] == -32600
+
+        status = await _request(reader, writer, 3, "status")
+        assert status[-1]["result"]["session"] is not None
+    finally:
+        await _close(server, writer)
+
+
 def test_protocol_schema_documents_all_reviewed_event_contracts() -> None:
     protocol = (Path(__file__).parents[1] / "docs" / "serve-protocol.md").read_text(
         encoding="utf-8"
     )
-    assert "`-32007`" in protocol
-    assert "`turn_aborted`" in protocol
+    rows = protocol.splitlines()
+    assert "| `-32007` | outbound frame exceeds the size limit |" in rows
+    assert (
+        "| `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, "
+        "`turn_aborted`, `compaction_start`, `compaction_end` | `event` | "
+        "`session_id`, `data: object` |"
+    ) in rows
     assert (
         "| `tool_output` | `event`, `tool_call: ToolCall`, `output: string`, "
         "`data: object` | `session_id` |"
-    ) in protocol
+    ) in rows
     assert "during tool execution or approval waits" in protocol
 
 
@@ -384,9 +452,7 @@ async def test_rejected_pre_hello_request_closes_connection(tmp_path: Path) -> N
     server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
     reader, writer = await _connect(server)
     try:
-        writer.write(
-            b'{"jsonrpc":"2.0","id":1,"method":"status","params":{}}\n'
-        )
+        writer.write(b'{"jsonrpc":"2.0","id":1,"method":"status","params":{}}\n')
         await writer.drain()
         error = await _read(reader)
         assert error["error"]["code"] == -32002
@@ -398,7 +464,9 @@ async def test_rejected_pre_hello_request_closes_connection(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_disconnect_aborts_pending_approval_without_phantom(tmp_path: Path) -> None:
+async def test_disconnect_aborts_pending_approval_without_phantom(
+    tmp_path: Path,
+) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
     server = ZetaServer(
@@ -432,9 +500,7 @@ async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) 
     writer.close()
     await writer.wait_closed()
     await asyncio.sleep(0.05)
-    second_reader, second_writer = await asyncio.open_unix_connection(
-        str(server.socket_path)
-    )
+    second_reader, second_writer = await asyncio.open_unix_connection(str(server.socket_path))
     try:
         await _request(second_reader, second_writer, 1, "hello", {"protocol_version": "1.0"})
         error = (
@@ -453,9 +519,7 @@ async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
-    backend = FakeBackend(
-        [ScriptedTurn([TextContent("first"), TextContent("second")], delay=0.2)]
-    )
+    backend = FakeBackend([ScriptedTurn([TextContent("first"), TextContent("second")], delay=0.2)])
     server = ZetaServer(
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
@@ -471,9 +535,7 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
     messages = server.runtime.manager.open(session_id).store.messages()
     assert any(
         message.role.value == "assistant"
-        and "first" in "".join(
-            getattr(block, "text", "") for block in message.content
-        )
+        and "first" in "".join(getattr(block, "text", "") for block in message.content)
         for message in messages
     )
     await server.close()
@@ -500,9 +562,7 @@ async def test_bad_resume_preserves_current_session(tmp_path: Path) -> None:
         ]
         error = (await _request(reader, writer, 4, "resume", {"session_id": "missing"}))[-1]
         assert error["error"]["code"] == -32602
-        after = (await _request(reader, writer, 5, "status"))[-1]["result"]["session"][
-            "session_id"
-        ]
+        after = (await _request(reader, writer, 5, "status"))[-1]["result"]["session"]["session_id"]
         assert after == before
         frames = await _request(reader, writer, 6, "send", {"text": "still here"})
         assert frames[-1]["result"]["accepted"] is True
@@ -530,21 +590,105 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
     try:
         await _request(reader, writer, 3, "send", {"text": "first"})
         await _event(reader, "usage")
-        assert (
-            await _request(reader, writer, 4, "status")
-        )[-1]["result"]["usage"]
+        assert (await _request(reader, writer, 4, "status"))[-1]["result"]["usage"]
 
         await _request(reader, writer, 5, "new_session", {"provider": "fake"})
         assert (await _request(reader, writer, 6, "status"))[-1]["result"]["usage"] == {}
 
         await _request(reader, writer, 7, "send", {"text": "second"})
         await _event(reader, "usage")
-        assert (
-            await _request(reader, writer, 8, "status")
-        )[-1]["result"]["usage"]
+        assert (await _request(reader, writer, 8, "status"))[-1]["result"]["usage"]
 
         await _request(reader, writer, 9, "resume", {"session_id": first_session})
         assert (await _request(reader, writer, 10, "status"))[-1]["result"]["usage"] == {}
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_parameterless_new_session_uses_server_defaults_after_override(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str | None]] = []
+
+    def build_backend(provider: str, model: str | None, home: Path) -> tuple[FakeBackend, str]:
+        calls.append((provider, model))
+        return FakeBackend([]), model or "offline"
+
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="fake",
+        model="server-default",
+        backend_factory=build_backend,
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+        await _request(reader, writer, 2, "new_session", {"provider": "fake"})
+        await _request(
+            reader,
+            writer,
+            3,
+            "new_session",
+            {"provider": "fake", "model": "session-override"},
+        )
+        result = await _request(reader, writer, 4, "new_session")
+        assert result[-1]["result"]["session"]["model"] == "server-default"
+        assert calls[-1] == ("fake", "server-default")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_swap_keeps_old_background_event_identity_until_shutdown(
+    tmp_path: Path,
+) -> None:
+    parent_call = ToolCall(
+        "agent-one",
+        "agent",
+        {"prompt": "wait", "description": "child", "background": True},
+    )
+    child_call = ToolCall("child-call", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[parent_call]), ScriptedTurn(tool_calls=[child_call])]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    old_session_id = server.runtime.session_id
+    try:
+        await _request(reader, writer, 3, "send", {"text": "start"})
+        await _event(reader, "approval_request")
+        swap_frames = await _request(reader, writer, 4, "new_session", {"provider": "fake"})
+        new_session_id = swap_frames[-1]["result"]["session"]["session_id"]
+        assert new_session_id != old_session_id
+        assert all(
+            frame.get("params", {}).get("session_id") == old_session_id
+            for frame in swap_frames
+            if frame.get("params") is not None
+        )
+
+        terminal = next(
+            (
+                frame
+                for frame in swap_frames
+                if frame.get("params", {}).get("event") == "tool_end"
+                and frame.get("params", {}).get("data", {}).get("notification_id")
+            ),
+            None,
+        )
+        while terminal is None:
+            frame = json.loads(await asyncio.wait_for(reader.readline(), TIMEOUT))
+            params = frame.get("params", {})
+            if params.get("event") == "tool_end" and params.get("data", {}).get("notification_id"):
+                terminal = frame
+        assert terminal["params"]["session_id"] == old_session_id
+        status = await _request(reader, writer, 5, "status")
+        assert status[-1]["result"]["session"]["session_id"] == new_session_id
     finally:
         await _close(server, writer)
 
@@ -599,9 +743,34 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
         )
         assert first_result[-1]["result"]["accepted"] is True
         assert second_result[-1]["result"]["accepted"] is True
-        await asyncio.sleep(0.2)
+        terminal_children: set[str] = set()
+
+        def record_terminal_children(frames: list[dict[str, Any]]) -> None:
+            for event in frames:
+                params = event.get("params", {})
+                if params.get("event") != "tool_end":
+                    continue
+                tool_call = params.get("tool_call") or {}
+                result = params.get("tool_result") or {}
+                structured = result.get("structured_content") or {}
+                if (
+                    tool_call.get("id") in {"agent-one", "agent-two"}
+                    and params.get("data", {}).get("notification_id")
+                    and structured.get("status") != "running"
+                ):
+                    terminal_children.add(tool_call["id"])
+
+        record_terminal_children(first_result)
+        record_terminal_children(second_result)
+        while len(terminal_children) < 2:
+            frame = await asyncio.wait_for(reader.readline(), TIMEOUT)
+            assert frame
+            record_terminal_children([json.loads(frame)])
         assert server.runtime.policy is not None
         assert server.runtime.policy.pending_requests() == []
+        status = await _request(reader, writer, 6, "status")
+        assert status[-1]["result"]["state"] == "idle"
+        assert terminal_children == {"agent-one", "agent-two"}
     finally:
         await _close(server, writer)
 
@@ -614,7 +783,7 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
     home = tmp_path / "zeta-home"
     home.mkdir()
     (home / "settings.toml").write_text(
-        "provider = \"fake\"\n"
+        'provider = "fake"\n'
         "token_budget = 12345\n"
         "stream_stall_seconds = 45\n"
         "stream_stall_retries = 4\n",
@@ -668,7 +837,9 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
         assert serve_loop is not None
         assert tui_calls == serve_calls
         assert tui_loop.context_assembler.token_budget == serve_loop.context_assembler.token_budget
-        assert tui_loop.context_assembler.retained_tail == serve_loop.context_assembler.retained_tail
+        assert (
+            tui_loop.context_assembler.retained_tail == serve_loop.context_assembler.retained_tail
+        )
         assert (tui_loop._background_event_sink is not None) == (
             serve_loop._background_event_sink is not None
         )

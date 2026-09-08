@@ -20,12 +20,9 @@ from ..types import StreamEvent, StreamEventType, TextContent
 from .protocol import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
+    FrameCodec,
     ProtocolError,
     bounded,
-    error_response,
-    notification,
-    parse_request,
-    response,
 )
 from .runtime import BackendFactory, ServerRuntime
 
@@ -125,14 +122,18 @@ class ZetaServer:
         except FileNotFoundError:
             return
         if not stat.S_ISSOCK(path_mode):
-            raise RuntimeError(f"refusing to replace non-socket path: {self.socket_path}")
+            raise RuntimeError(
+                f"refusing to replace non-socket path: {self.socket_path}"
+            )
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             probe.settimeout(0.2)
             probe.connect(str(self.socket_path))
         except OSError as exc:
             if exc.errno not in {errno.ECONNREFUSED, errno.ENOENT}:
-                raise RuntimeError(f"could not inspect socket: {self.socket_path}") from exc
+                raise RuntimeError(
+                    f"could not inspect socket: {self.socket_path}"
+                ) from exc
         else:
             raise RuntimeError(f"a server is already listening on {self.socket_path}")
         finally:
@@ -143,9 +144,13 @@ class ZetaServer:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         if self._client_active:
-            writer.write(error_response(None, -32001, "another client is already connected"))
-            with contextlib.suppress(ConnectionError):
-                await writer.drain()
+            codec = FrameCodec()
+            await codec.write(
+                writer,
+                codec.error_response(
+                    None, -32001, "another client is already connected"
+                ),
+            )
             writer.close()
             await writer.wait_closed()
             return
@@ -162,7 +167,10 @@ class ZetaServer:
 
 class _Client:
     def __init__(
-        self, server: ZetaServer, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self,
+        server: ZetaServer,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
     ) -> None:
         self.server = server
         self.reader = reader
@@ -172,31 +180,30 @@ class _Client:
         self._close_lock = asyncio.Lock()
         self._closed = False
         self._turn_task: asyncio.Task[None] | None = None
-        self.turn_state = "idle"
+        self._read_buffer = bytearray()
+        self.codec = FrameCodec()
         self._approval_wires: dict[str | tuple[str, str], str] = {}
         self._approval_keys: dict[str, str | tuple[str, str]] = {}
+
+    @property
+    def turn_state(self) -> str:
+        state = self.server.runtime.state
+        return state.status if state is not None else "idle"
 
     async def run(self) -> None:
         try:
             while True:
-                try:
-                    line = await self.reader.readline()
-                except (asyncio.LimitOverrunError, ValueError) as exc:
-                    await self._write(
-                        error_response(None, -32600, "request frame exceeds 1048576 bytes")
-                    )
-                    if not self.handshaken:
-                        break
-                    separator_consumed = "Separator is found" in str(exc)
-                    if not separator_consumed and not await self._discard_frame():
-                        break
-                    continue
+                line = await self._read_frame()
                 if not line:
                     break
                 try:
-                    request = parse_request(line)
+                    request = self.codec.parse_request(line)
                 except ProtocolError as exc:
-                    await self._write(error_response(None, exc.code, exc.message, exc.data))
+                    await self._write(
+                        self.codec.error_response(
+                            exc.request_id, exc.code, exc.message, exc.data
+                        )
+                    )
                     if not self.handshaken:
                         break
                     continue
@@ -204,17 +211,70 @@ class _Client:
                 try:
                     result = await self._dispatch(request["method"], request["params"])
                 except ProtocolError as exc:
-                    await self._write(error_response(request_id, exc.code, exc.message, exc.data))
+                    await self._write(
+                        self.codec.error_response(
+                            exc.request_id
+                            if exc.request_id is not None
+                            else request_id,
+                            exc.code,
+                            exc.message,
+                            exc.data,
+                        )
+                    )
                 except (SessionError, ValueError) as exc:
-                    await self._write(error_response(request_id, -32602, str(exc)))
+                    await self._write(
+                        self.codec.error_response(request_id, -32602, str(exc))
+                    )
                 except Exception as exc:  # noqa: BLE001 - keep the socket alive
-                    await self._write(error_response(request_id, -32000, str(exc)))
+                    await self._write(
+                        self.codec.error_response(request_id, -32000, str(exc))
+                    )
                 else:
-                    await self._write(response(request_id, result), request_id=request_id)
+                    await self._write(self.codec.response(request_id, result))
                 if not self.handshaken:
                     break
         finally:
             await self.close()
+
+    async def _read_frame(self) -> bytes | None:
+        """Read one line while retaining a bounded prefix of oversized input."""
+
+        while True:
+            newline = self._read_buffer.find(b"\n")
+            if newline >= 0:
+                end = newline + 1
+                if end <= MAX_FRAME_BYTES:
+                    line = bytes(self._read_buffer[:end])
+                    del self._read_buffer[:end]
+                    return line
+                prefix = bytes(self._read_buffer[:MAX_FRAME_BYTES])
+                del self._read_buffer[:end]
+                return prefix + b"\n"
+            if len(self._read_buffer) > MAX_FRAME_BYTES:
+                prefix = bytes(self._read_buffer[:MAX_FRAME_BYTES])
+                self._read_buffer.clear()
+                return await self._discard_oversized_frame(prefix)
+            chunk = await self.reader.read(65_536)
+            if not chunk:
+                if not self._read_buffer:
+                    return None
+                line = bytes(self._read_buffer)
+                self._read_buffer.clear()
+                return line
+            self._read_buffer.extend(chunk)
+
+    async def _discard_oversized_frame(self, prefix: bytes) -> bytes:
+        """Discard an oversized line and preserve any complete later frames."""
+
+        while True:
+            chunk = await self.reader.read(65_536)
+            if not chunk:
+                return prefix + b"\n"
+            newline = chunk.find(b"\n")
+            if newline < 0:
+                continue
+            self._read_buffer.extend(chunk[newline + 1 :])
+            return prefix + b"\n"
 
     async def close(self) -> None:
         async with self._close_lock:
@@ -236,14 +296,6 @@ class _Client:
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
             self._closed = True
-
-    async def _discard_frame(self) -> bool:
-        while True:
-            byte = await self.reader.read(1)
-            if not byte:
-                return False
-            if byte == b"\n":
-                return True
 
     async def _dispatch(self, method: str, params: dict[str, Any]) -> object:
         if method == "hello":
@@ -292,8 +344,15 @@ class _Client:
             "server": "zeta",
             "capabilities": {
                 "requests": [
-                    "list_sessions", "new_session", "resume", "send", "steer",
-                    "approve", "deny", "abort", "status",
+                    "list_sessions",
+                    "new_session",
+                    "resume",
+                    "send",
+                    "steer",
+                    "approve",
+                    "deny",
+                    "abort",
+                    "status",
                 ],
                 "notifications": ["event"],
             },
@@ -332,10 +391,17 @@ class _Client:
             ApprovalDecision.ALLOW if method == "approve" else ApprovalDecision.DENY,
         )
         if not resolved:
-            raise ProtocolError(-32006, f"approval request not found or already resolved: {request_id}")
+            raise ProtocolError(
+                -32006, f"approval request not found or already resolved: {request_id}"
+            )
         active = self._turn_task is not None and not self._turn_task.done()
-        if not active and isinstance(core_key, str) and loop.prepare_resume_pending_tool(core_key):
-            self.turn_state = "tool"
+        if (
+            not active
+            and isinstance(core_key, str)
+            and loop.prepare_resume_pending_tool(core_key)
+        ):
+            if self.server.runtime.state is not None:
+                self.server.runtime.state.tool_started()
             task = asyncio.create_task(self._resume_tool(core_key))
             self._turn_task = task
         return {"accepted": True, "request_id": request_id, "decision": method}
@@ -349,8 +415,9 @@ class _Client:
         self._turn_task.cancel()
         await asyncio.gather(self._turn_task, return_exceptions=True)
         self._turn_task = None
-        self.turn_state = "idle"
-        await self._notify("turn_aborted")
+        if self.server.runtime.state is not None:
+            self.server.runtime.state.turn_finished()
+        await self._notify("turn_aborted", self.server.runtime.session_id)
         return {"aborted": True}
 
     def _status(self) -> dict[str, object]:
@@ -367,7 +434,7 @@ class _Client:
             ]
         return {
             "session": session,
-            "state": self.turn_state,
+            "state": runtime.state.status if runtime.state is not None else "idle",
             "pending_approvals": pending,
             "usage": dict(runtime.usage),
             "compaction_markers": (
@@ -379,35 +446,64 @@ class _Client:
 
     async def _run_turn(self, text: str) -> None:
         loop = self.server.runtime.loop
-        if loop is None:
+        state = self.server.runtime.state
+        if loop is None or state is None:
             return
-        self.turn_state = "running"
+        session_id = state.session_id
+        state.turn_started()
         try:
             async for event in loop.run_turn(text):
-                await self._event(event)
+                await self._event(event, session_id=session_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - serialize all turn failures
-            await self._notify("error", error={"code": "server_error", "message": str(exc)})
+            await self._notify(
+                "error",
+                session_id,
+                error={"code": "server_error", "message": str(exc)},
+            )
         finally:
-            self.turn_state = "idle"
-            self._turn_task = None
+            if self.server.runtime.state is state:
+                state.turn_finished()
+            if self._turn_task is asyncio.current_task():
+                self._turn_task = None
 
     async def _resume_tool(self, request_id: str) -> None:
         loop = self.server.runtime.loop
-        if loop is None:
+        state = self.server.runtime.state
+        if loop is None or state is None:
             return
+        session_id = state.session_id
         try:
             await loop.resume_pending_tool(
                 request_id,
                 prepared=True,
-                event_sink=lambda event: asyncio.create_task(self._event(event)),
+                event_sink=lambda event: asyncio.create_task(
+                    self._event(event, session_id=session_id)
+                ),
             )
         finally:
-            self.turn_state = "idle"
-            self._turn_task = None
+            if self.server.runtime.state is state:
+                state.turn_finished()
+            if self._turn_task is asyncio.current_task():
+                self._turn_task = None
 
-    async def _event(self, event: StreamEvent) -> None:
+    async def _event(
+        self,
+        event: StreamEvent,
+        *,
+        session_id: str | None = None,
+        background: bool = False,
+    ) -> None:
+        state = self.server.runtime.state
+        if session_id is None and not background and state is not None:
+            session_id = state.session_id
+        foreground = (
+            not background
+            and state is not None
+            and session_id is not None
+            and state.session_id == session_id
+        )
         kind = event.type
         if kind is StreamEventType.MESSAGE_UPDATE:
             delta = event.delta
@@ -418,44 +514,66 @@ class _Client:
                 delta = getattr(event.content, "text", None)
                 stream_kind = str(getattr(event.content, "type", "content"))
             if delta:
-                await self._notify("assistant_delta", delta=bounded(delta), kind=stream_kind)
+                await self._notify(
+                    "assistant_delta",
+                    session_id,
+                    delta=bounded(delta),
+                    kind=stream_kind,
+                )
             return
         if kind is StreamEventType.MESSAGE_END:
             usage = event.data.get("usage")
-            if isinstance(usage, Mapping) and usage:
-                self.server.runtime.usage.update(usage)
-                await self._notify("usage", usage=dict(usage))
+            if foreground and isinstance(usage, Mapping) and usage:
+                state.usage.update(usage)
+                await self._notify("usage", session_id, usage=dict(usage))
             if event.message is not None:
-                await self._notify("assistant_message", message=event.message.to_dict())
+                await self._notify(
+                    "assistant_message", session_id, message=event.message.to_dict()
+                )
             return
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
             await self._notify(
                 "tool_output",
+                session_id,
                 tool_call=_tool_call(event),
                 output=bounded(event.delta or _data_text(event.data)),
                 data=dict(event.data),
             )
             return
         if kind is StreamEventType.TOOL_EXECUTION_START:
-            self.turn_state = "tool"
-            await self._notify("tool_start", tool_call=_tool_call(event), data=dict(event.data))
+            if foreground:
+                state.tool_started()
+            await self._notify(
+                "tool_start",
+                session_id,
+                tool_call=_tool_call(event),
+                data=dict(event.data),
+            )
             return
         if kind is StreamEventType.TOOL_EXECUTION_END:
-            self.turn_state = "running"
+            if foreground:
+                state.tool_finished()
             await self._notify(
                 "tool_end",
+                session_id,
                 tool_call=_tool_call(event),
-                tool_result=(event.tool_result.to_dict() if event.tool_result else None),
+                tool_result=(
+                    event.tool_result.to_dict() if event.tool_result else None
+                ),
                 data=dict(event.data),
             )
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:
             await self._notify(
-                "approval_end", tool_call=_tool_call(event), data=dict(event.data)
+                "approval_end",
+                session_id,
+                tool_call=_tool_call(event),
+                data=dict(event.data),
             )
             return
         if kind is StreamEventType.TOOL_APPROVAL_START:
-            self.turn_state = "tool"
+            if foreground:
+                state.tool_started()
             raw_request_id = event.tool_call.id if event.tool_call else ""
             child_id = event.data.get("agent_instance_id")
             core_key: str | tuple[str, str] = (
@@ -465,51 +583,66 @@ class _Client:
             )
             await self._notify(
                 "approval_request",
+                session_id,
                 request_id=self._wire_approval_key(core_key),
                 tool_call=_tool_call(event),
             )
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
-            await self._notify("sub_agent_receipt", data=dict(event.data))
+            await self._notify("sub_agent_receipt", session_id, data=dict(event.data))
             return
         if kind is StreamEventType.ERROR:
-            await self._notify("error", error=event.error.to_dict() if event.error else {"code": "unknown", "message": "unknown error"}, data=dict(event.data))
+            await self._notify(
+                "error",
+                session_id,
+                error=(
+                    event.error.to_dict()
+                    if event.error
+                    else {"code": "unknown", "message": "unknown error"}
+                ),
+                data=dict(event.data),
+            )
             return
         if kind is StreamEventType.COMPACTION_START:
-            await self._notify("compaction_start", data=dict(event.data))
+            await self._notify("compaction_start", session_id, data=dict(event.data))
             return
         if kind is StreamEventType.COMPACTION_END:
-            await self._notify("compaction_end", data=dict(event.data))
+            await self._notify("compaction_end", session_id, data=dict(event.data))
             return
-        await self._notify(kind.value, data=dict(event.data))
+        if foreground and kind is StreamEventType.AGENT_END:
+            state.turn_finished()
+        await self._notify(kind.value, session_id, data=dict(event.data))
 
-    def _publish_background_event(self, event: StreamEvent) -> None:
+    def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
         """Schedule child events from the loop's synchronous sink."""
 
         if not self._closed:
-            asyncio.create_task(self._event(event))
-
-    async def _notify(self, event: str, **fields: object) -> None:
-        session_id = self.server.runtime.opened.metadata.session_id if self.server.runtime.opened else None
-        payload = notification(event, session_id, **fields)
-        if len(payload) > MAX_FRAME_BYTES:
-            payload = notification(
-                "error",
-                session_id,
-                error={
-                    "code": "frame_too_large",
-                    "message": "outbound event exceeded 1048576 bytes",
-                },
-                data={"event": event},
+            asyncio.create_task(
+                self._event(event, session_id=session_id, background=True)
             )
-        await self._write(payload)
+
+    async def _notify(
+        self, event: str, session_id: str | None = None, **fields: object
+    ) -> None:
+        if session_id is None and self.server.runtime.opened is not None:
+            session_id = self.server.runtime.session_id
+        await self._write(self.codec.notification(event, session_id, **fields))
 
     def _list_sessions(self) -> dict[str, object]:
         sessions = [item.to_dict() for item in self.server.runtime.list_sessions()]
         page: list[dict[str, Any]] = []
         for offset, item in enumerate(sessions):
             candidate = [*page, item]
-            if len(response(0, {"sessions": candidate})) > MAX_FRAME_BYTES - 128:
+            if not self.codec.response_fits(0, {"sessions": candidate}):
+                return {
+                    "sessions": page,
+                    "truncated": True,
+                    "next_offset": offset,
+                }
+            if (
+                len(self.codec.response(0, {"sessions": candidate}))
+                > MAX_FRAME_BYTES - 128
+            ):
                 return {
                     "sessions": page,
                     "truncated": True,
@@ -529,27 +662,9 @@ class _Client:
             self._approval_keys[wire] = key
         return wire
 
-    async def _write(
-        self, payload: bytes, *, request_id: str | int | None = None
-    ) -> None:
+    async def _write(self, payload: bytes) -> None:
         async with self._write_lock:
-            try:
-                if len(payload) > MAX_FRAME_BYTES:
-                    payload = error_response(
-                        request_id,
-                        -32007,
-                        "outbound frame exceeds 1048576 bytes",
-                    )
-                    if len(payload) > MAX_FRAME_BYTES:
-                        payload = error_response(
-                            None,
-                            -32007,
-                            "outbound frame exceeds 1048576 bytes",
-                        )
-                self.writer.write(payload)
-                await self.writer.drain()
-            except (ConnectionError, BrokenPipeError):
-                pass
+            await self.codec.write(self.writer, payload)
 
     async def _require_idle(self) -> None:
         if self._turn_task is not None and not self._turn_task.done():
