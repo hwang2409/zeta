@@ -5,19 +5,32 @@ import os
 import stat
 import uuid
 from collections.abc import Generator
+from contextlib import ExitStack
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from runpy import run_path
+from tempfile import TemporaryDirectory
 
 import httpx
 import pytest
 from rich.console import Console
 
-LIVE_ZETA_HOME = Path.home() / ".zeta"
 _TEST_SITE_PACKAGES = Path(__file__).parent
 
 run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    # Configure HOME before collection: module-level Path.home() values and
+    # child processes must use the same watched home as the test fixtures.
+    cleanup = ExitStack()
+    config.add_cleanup(cleanup.close)
+    fake_home = cleanup.enter_context(TemporaryDirectory(prefix="zeta-test-home-"))
+    monkeypatch = cleanup.enter_context(pytest.MonkeyPatch.context())
+    monkeypatch.setenv("HOME", fake_home)
+    audit_dir = cleanup.enter_context(TemporaryDirectory(prefix="zeta-test-audit-"))
+    config.stash[_HOME_GUARD] = LiveHomeWriteGuard(Path(fake_home), Path(audit_dir))
 
 
 def _path_snapshot(path: Path) -> tuple[object, ...] | None:
@@ -308,12 +321,12 @@ class LiveHomeWriteGuard:
         self._external_declarations.clear()
 
 
+_HOME_GUARD = pytest.StashKey[LiveHomeWriteGuard]()
+
+
 @pytest.fixture(scope="session")
-def live_home_write_guard(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> LiveHomeWriteGuard:
-    audit_dir = tmp_path_factory.mktemp("zeta-live-home-audit")
-    return LiveHomeWriteGuard(LIVE_ZETA_HOME, audit_dir)
+def live_home_write_guard(pytestconfig: pytest.Config) -> LiveHomeWriteGuard:
+    return pytestconfig.stash[_HOME_GUARD]
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -324,7 +337,6 @@ def isolate_zeta_home(
     """Keep every test away from the developer's real zeta home."""
 
     isolated_home = tmp_path_factory.mktemp("zeta-home")
-    fake_home = isolated_home.parent / "home"
     audit_path = str(_TEST_SITE_PACKAGES)
     inherited_pythonpath = os.environ.get("PYTHONPATH")
     pythonpath = (
@@ -334,7 +346,6 @@ def isolate_zeta_home(
     )
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setenv("ZETA_HOME", str(isolated_home))
-        monkeypatch.setenv("HOME", str(fake_home))
         monkeypatch.setenv("ZETA_TEST_AUDIT_LEDGER", str(live_home_write_guard._ledger))
         monkeypatch.setenv(
             "ZETA_TEST_LIVE_HOME", str(live_home_write_guard.live_home)
