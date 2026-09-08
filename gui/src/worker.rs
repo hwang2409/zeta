@@ -1,5 +1,7 @@
 //! The connection actor owns the socket, session identity, and command ordering.
-use crate::client::{ClientError, ProtocolClient, ServerEvent, SessionMetadata, StatusResult};
+use crate::client::{
+    ClientError, ProtocolClient, ServerEvent, SessionList, SessionMetadata, StatusResult,
+};
 use std::env;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -20,7 +22,7 @@ pub enum CommandMessage {
 
 #[derive(Debug)]
 pub enum WorkerMessage {
-    Sessions(Vec<SessionMetadata>),
+    Sessions(SessionList),
     Session(SessionMetadata),
     Status(StatusResult),
     Sent(String),
@@ -150,7 +152,9 @@ impl ConnectionWorker {
                         CommandMessage::Abort => client.abort().map(|_| ()),
                     };
                     match result {
-                        Err(error @ ClientError::Rpc { .. }) => self.reject(&error.to_string()),
+                        Err(error @ (ClientError::Rpc { .. } | ClientError::RequestTooLarge)) => {
+                            self.reject(&error.to_string());
+                        }
                         Err(error) => return Err(error),
                         Ok(()) => {}
                     }

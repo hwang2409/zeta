@@ -3,7 +3,8 @@ use gpui::{
     actions, canvas, div, fill, point, prelude::*, px, rgb, rgba, size, App, Bounds, ClipboardItem,
     Context, CursorStyle, ElementInputHandler, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, ShapedLine, SharedString, TextRun, UTF16Selection, UnderlineStyle, Window,
+    Point, ScrollHandle, SharedString, StyledText, TextLayout, TextRun, UTF16Selection,
+    UnderlineStyle, Window,
 };
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -40,9 +41,10 @@ pub struct Composer {
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
-    lines: Vec<(usize, ShapedLine)>,
+    layout: Option<TextLayout>,
+    scroll: ScrollHandle,
+    reveal_cursor: bool,
     pub enabled: bool,
-    last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
 }
 
@@ -168,6 +170,7 @@ impl Composer {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selection_reversed = false;
         self.selected_range = offset..offset;
+        self.reveal_cursor = true;
         cx.notify()
     }
 
@@ -184,15 +187,13 @@ impl Composer {
             return 0;
         }
 
-        let Some(bounds) = self.last_bounds else {
+        let Some(layout) = &self.layout else {
             return 0;
         };
-        let row = ((position.y - bounds.top()) / px(22.)).floor().max(0.) as usize;
-        let Some((start, line)) = self.lines.get(row.min(self.lines.len().saturating_sub(1)))
-        else {
-            return 0;
-        };
-        (start + line.closest_index_for_x(position.x - bounds.left())).min(self.content.len())
+        layout
+            .index_for_position(position)
+            .unwrap_or_else(|index| index)
+            .min(self.content.len())
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -205,6 +206,7 @@ impl Composer {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.reveal_cursor = true;
         cx.notify()
     }
 
@@ -255,8 +257,9 @@ impl Composer {
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.marked_range = None;
-        self.lines.clear();
-        self.last_bounds = None;
+        self.layout = None;
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        self.reveal_cursor = true;
         self.is_selecting = false;
     }
 }
@@ -324,6 +327,8 @@ impl EntityInputHandler for Composer {
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
+        self.selection_reversed = false;
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -361,6 +366,8 @@ impl EntityInputHandler for Composer {
             })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
 
+        self.selection_reversed = false;
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -372,20 +379,16 @@ impl EntityInputHandler for Composer {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let range = self.range_from_utf16(&range_utf16);
-        let (row, (start, line)) = self
-            .lines
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, (start, _))| *start <= range.start)?;
-        let top = bounds.top() + px(22.) * row as f32;
-        Some(Bounds::from_corners(
-            point(bounds.left() + line.x_for_index(range.start - start), top),
-            point(
-                bounds.left() + line.x_for_index((range.end - start).min(line.text.len())),
-                top + px(22.),
-            ),
-        ))
+        let layout = self.layout.as_ref()?;
+        let start = layout.position_for_index(range.start)?;
+        let end = layout.position_for_index(range.end)?;
+        // Native input methods anchor to the first visual row of a selection.
+        let right = if end.y == start.y {
+            end.x
+        } else {
+            bounds.right()
+        };
+        Some(Bounds::from_corners(start, point(right, start.y + px(22.))))
     }
 
     fn character_index_for_point(
@@ -394,7 +397,7 @@ impl EntityInputHandler for Composer {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        self.last_bounds?;
+        self.layout.as_ref()?;
         Some(self.offset_to_utf16(self.index_for_mouse_position(point)))
     }
 }
@@ -410,8 +413,9 @@ impl Composer {
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
-            lines: Vec::new(),
-            last_bounds: None,
+            layout: None,
+            scroll: ScrollHandle::new(),
+            reveal_cursor: false,
             is_selecting: false,
             enabled: true,
         }
@@ -428,32 +432,16 @@ impl Composer {
     }
 
     fn vertical(&mut self, down: bool, select: bool, cx: &mut Context<Self>) {
-        let cursor = self.cursor_offset();
-        let start = self.content[..cursor]
-            .rfind('\n')
-            .map_or(0, |index| index + 1);
-        let column = self.content[start..cursor].graphemes(true).count();
-        let target_start = if down {
-            self.content[cursor..]
-                .find('\n')
-                .map(|index| cursor + index + 1)
-        } else {
-            start
-                .checked_sub(1)
-                .map(|end| self.content[..end].rfind('\n').map_or(0, |index| index + 1))
-        };
-        let Some(target_start) = target_start else {
+        let Some(position) = self
+            .layout
+            .as_ref()
+            .and_then(|layout| layout.position_for_index(self.cursor_offset()))
+        else {
             return;
         };
-        let line = self.content[target_start..]
-            .split('\n')
-            .next()
-            .unwrap_or("");
-        let offset = target_start
-            + line
-                .grapheme_indices(true)
-                .nth(column)
-                .map_or(line.len(), |(index, _)| index);
+        let offset = self.index_for_mouse_position(
+            position + point(px(0.), if down { px(33.) } else { px(-11.) }),
+        );
         if select {
             self.select_to(offset, cx);
         } else {
@@ -519,9 +507,52 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 impl Render for Composer {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let input = cx.entity();
-        let height = self.content.split('\n').count() as f32 * 22.;
+        let display = if self.content.is_empty() {
+            self.placeholder.clone()
+        } else {
+            self.content.clone()
+        };
+        let style = window.text_style();
+        let mut boundaries = vec![0, display.len()];
+        if !self.content.is_empty() {
+            boundaries.extend([self.selected_range.start, self.selected_range.end]);
+            if let Some(marked) = &self.marked_range {
+                boundaries.extend([marked.start, marked.end]);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let runs = boundaries
+            .windows(2)
+            .map(|range| TextRun {
+                len: range[1] - range[0],
+                font: style.font(),
+                color: rgb(if self.content.is_empty() {
+                    0x8a9287
+                } else {
+                    0xd8ddd5
+                })
+                .into(),
+                background_color: self
+                    .selected_range
+                    .contains(&range[0])
+                    .then(|| rgba(0x6e8eaa60).into()),
+                underline: self
+                    .marked_range
+                    .as_ref()
+                    .is_some_and(|marked| marked.contains(&range[0]))
+                    .then_some(UnderlineStyle {
+                        color: Some(style.color),
+                        thickness: px(1.),
+                        wavy: false,
+                    }),
+                strikethrough: None,
+            })
+            .collect();
+        let text = StyledText::new(display).with_runs(runs);
+        let layout = text.layout().clone();
         div()
             .id("composer-input")
             .key_context("Composer")
@@ -554,135 +585,62 @@ impl Render for Composer {
             .min_h(px(72.))
             .max_h(px(220.))
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .line_height(px(22.))
             .p_3()
             .border_1()
             .border_color(rgb(0x343832))
             .text_color(rgb(0xd8ddd5))
             .child(
-                canvas(
-                    move |_, _, _| (),
-                    move |bounds, (), window, cx| {
-                        input.update(cx, |input, cx| {
-                            window.handle_input(
-                                &input.focus_handle,
-                                ElementInputHandler::new(bounds, cx.entity()),
-                                cx,
-                            );
-                            let style = window.text_style();
-                            let display = if input.content.is_empty() {
-                                input.placeholder.clone()
-                            } else {
-                                input.content.clone()
-                            };
-                            input.lines.clear();
-                            let mut offset = 0;
-                            for (row, text) in display.split('\n').enumerate() {
-                                let run = TextRun {
-                                    len: text.len(),
-                                    font: style.font(),
-                                    color: if input.content.is_empty() {
-                                        rgb(0x8a9287).into()
-                                    } else {
-                                        style.color
-                                    },
-                                    background_color: None,
-                                    underline: None,
-                                    strikethrough: None,
-                                };
-                                let mut runs = Vec::new();
-                                if let Some(marked) = &input.marked_range {
-                                    let start = marked.start.saturating_sub(offset).min(text.len());
-                                    let end = marked.end.saturating_sub(offset).min(text.len());
-                                    if start > 0 {
-                                        runs.push(TextRun {
-                                            len: start,
-                                            ..run.clone()
-                                        });
-                                    }
-                                    if end > start {
-                                        runs.push(TextRun {
-                                            len: end - start,
-                                            underline: Some(UnderlineStyle {
-                                                color: Some(style.color),
-                                                thickness: px(1.),
-                                                wavy: false,
-                                            }),
-                                            ..run.clone()
-                                        });
-                                    }
-                                    if end < text.len() {
-                                        runs.push(TextRun {
-                                            len: text.len() - end,
-                                            ..run.clone()
-                                        });
-                                    }
-                                } else {
-                                    runs.push(run);
-                                }
-                                let line = window.text_system().shape_line(
-                                    text.to_owned().into(),
-                                    style.font_size.to_pixels(window.rem_size()),
-                                    &runs,
-                                    None,
-                                );
-                                let top = bounds.top() + px(row as f32 * 22.);
-                                let start = input
-                                    .selected_range
-                                    .start
-                                    .saturating_sub(offset)
-                                    .min(text.len());
-                                let end = input
-                                    .selected_range
-                                    .end
-                                    .saturating_sub(offset)
-                                    .min(text.len());
-                                if end > start {
-                                    window.paint_quad(fill(
-                                        Bounds::from_corners(
-                                            point(bounds.left() + line.x_for_index(start), top),
-                                            point(
-                                                bounds.left() + line.x_for_index(end),
-                                                top + px(22.),
-                                            ),
-                                        ),
-                                        rgba(0x6e8eaa60),
-                                    ));
-                                }
-                                let cursor = input.cursor_offset();
-                                if input.enabled
-                                    && input.focus_handle.is_focused(window)
-                                    && cursor >= offset
-                                    && cursor <= offset + text.len()
-                                    && input.selected_range.is_empty()
-                                {
-                                    window.paint_quad(fill(
-                                        Bounds::new(
-                                            point(
-                                                bounds.left() + line.x_for_index(cursor - offset),
-                                                top,
-                                            ),
-                                            size(px(1.), px(22.)),
-                                        ),
-                                        rgb(0xe1a84b),
-                                    ));
-                                }
-                                let _ = line.paint(
-                                    point(bounds.left(), top),
-                                    px(22.),
-                                    gpui::TextAlign::Left,
-                                    None,
-                                    window,
+                div().relative().w_full().child(text).child(
+                    canvas(
+                        move |_, _, _| (),
+                        move |bounds, (), window, cx| {
+                            input.update(cx, |input, cx| {
+                                window.handle_input(
+                                    &input.focus_handle,
+                                    ElementInputHandler::new(bounds, cx.entity()),
                                     cx,
                                 );
-                                input.lines.push((offset, line));
-                                offset += text.len() + 1;
-                            }
-                            input.last_bounds = Some(bounds);
-                        });
-                    },
-                )
-                .w_full()
-                .h(px(height)),
+                                let cursor = layout.position_for_index(input.cursor_offset());
+                                if let Some(cursor) = cursor {
+                                    if input.reveal_cursor {
+                                        input.reveal_cursor = false;
+                                        let viewport = input.scroll.bounds();
+                                        let adjustment = if cursor.y < viewport.top() + px(13.) {
+                                            viewport.top() + px(13.) - cursor.y
+                                        } else if cursor.y + px(22.) > viewport.bottom() - px(13.) {
+                                            viewport.bottom() - px(13.) - cursor.y - px(22.)
+                                        } else {
+                                            px(0.)
+                                        };
+                                        if adjustment != px(0.) {
+                                            let offset = input.scroll.offset();
+                                            input
+                                                .scroll
+                                                .set_offset(point(offset.x, offset.y + adjustment));
+                                            cx.notify();
+                                        }
+                                    }
+                                    if input.enabled
+                                        && input.focus_handle.is_focused(window)
+                                        && input.selected_range.is_empty()
+                                    {
+                                        window.paint_quad(fill(
+                                            Bounds::new(cursor, size(px(1.), px(22.))),
+                                            rgb(0xe1a84b),
+                                        ));
+                                    }
+                                }
+                                input.layout = Some(layout);
+                            });
+                        },
+                    )
+                    .absolute()
+                    .size_full()
+                    .top_0()
+                    .left_0(),
+                ),
             )
     }
 }
@@ -690,6 +648,74 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn wrapped_prompt_supports_caret_selection_and_scrolling(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_keys);
+        let window = cx.open_window(size(px(240.), px(400.)), |_, cx| Composer::new(cx));
+        window
+            .update(cx, |view, window, cx| window.focus(&view.focus_handle, cx))
+            .unwrap();
+        let draw = |cx: &mut gpui::TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        };
+        let prompt = "abcdefghij".repeat(60);
+        cx.simulate_input(window.into(), &prompt);
+        draw(cx);
+        draw(cx); // Apply the caret's scroll request.
+        window
+            .update(cx, |view, window, cx| {
+                let layout = view.layout.as_ref().unwrap().clone();
+                assert!(layout.wrapped_text().lines().count() > 10);
+                assert!(view.scroll.max_offset().y > px(0.));
+                let caret = layout.position_for_index(prompt.len()).unwrap();
+                assert!(caret.x <= view.scroll.bounds().right());
+                assert!(caret.y >= view.scroll.bounds().top());
+                assert!(caret.y + px(22.) <= view.scroll.bounds().bottom());
+                let suffix = prompt.len() - 3;
+                let position = layout.position_for_index(suffix).unwrap() + point(px(1.), px(11.));
+                assert_eq!(view.index_for_mouse_position(position), suffix);
+                view.on_mouse_down(
+                    &MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(view.cursor_offset(), suffix);
+                view.select_to(prompt.len(), cx);
+                view.copy(&Copy, window, cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().unwrap(),
+                    &prompt[suffix..]
+                );
+                let range = view.range_to_utf16(&(suffix..suffix));
+                let ime_bounds = view
+                    .bounds_for_range(range, layout.bounds(), window, cx)
+                    .unwrap();
+                assert_eq!(
+                    ime_bounds.origin,
+                    layout.position_for_index(suffix).unwrap()
+                );
+                view.move_to(suffix, cx);
+                view.vertical(false, true, cx);
+                assert!(view.cursor_offset() < suffix);
+                assert!(view.selection_reversed);
+                view.home(&Home, window, cx);
+            })
+            .unwrap();
+        draw(cx);
+        draw(cx);
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.scroll.offset().y, px(0.));
+                assert_eq!(view.cursor_offset(), 0);
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     fn native_input_edits_multiline_unicode_and_pastes(cx: &mut gpui::TestAppContext) {

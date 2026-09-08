@@ -34,6 +34,8 @@ pub enum ClientError {
     UnexpectedResponse,
     #[error("protocol frame exceeds {MAX_FRAME_BYTES} bytes")]
     FrameTooLarge,
+    #[error("command exceeds the {MAX_FRAME_BYTES}-byte (1 MiB) encoded request limit; shorten the message")]
+    RequestTooLarge,
     #[error("unix sockets are not supported on this platform")]
     UnixSocketUnavailable,
 }
@@ -405,6 +407,13 @@ impl Connection {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionList {
+    pub sessions: Vec<SessionMetadata>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 pub struct ProtocolClient {
     connection: Connection,
     read_buffer: Vec<u8>,
@@ -466,10 +475,8 @@ impl ProtocolClient {
         Ok(hello)
     }
 
-    pub fn list_sessions(&mut self) -> Result<Vec<SessionMetadata>, ClientError> {
-        let result: Value = self.request("list_sessions", Value::Object(Map::new()))?;
-        serde_json::from_value(result.get("sessions").cloned().unwrap_or_default())
-            .map_err(ClientError::Json)
+    pub fn list_sessions(&mut self) -> Result<SessionList, ClientError> {
+        self.request("list_sessions", Value::Object(Map::new()))
     }
 
     pub fn new_session(
@@ -587,7 +594,13 @@ impl ProtocolClient {
                 continue;
             }
             let response: RpcResponse = serde_json::from_value(value)?;
-            if response.id != Some(id) {
+            if response.id != Some(id)
+                && !(response.id.is_none()
+                    && response
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.code == -32001))
+            {
                 return Err(ClientError::UnexpectedResponse);
             }
             if let Some(error) = response.error {
@@ -631,7 +644,7 @@ impl ProtocolClient {
         let mut frame = serde_json::to_vec(value)?;
         frame.push(b'\n');
         if frame.len() > MAX_FRAME_BYTES {
-            return Err(ClientError::FrameTooLarge);
+            return Err(ClientError::RequestTooLarge);
         }
         self.connection.write_all(&frame)?;
         self.connection.flush()?;
@@ -710,6 +723,28 @@ mod tests {
             serde_json::to_writer(&mut stream, &response).expect("write response");
             stream.write_all(b"\n").expect("write newline");
         })
+    }
+
+    #[test]
+    fn list_preserves_truncation_and_connection_errors_require_the_expected_id() {
+        for (index, response) in [
+            serde_json::json!({"id":1,"result":{"sessions":[],"truncated":true}}),
+            serde_json::json!({"id":null,"error":{"code":-32001,"message":"another client is connected"}}),
+            serde_json::json!({"id":2,"error":{"code":-32001,"message":"wrong request"}}),
+            serde_json::json!({"id":null,"error":{"code":-32000,"message":"unrelated error"}}),
+        ].into_iter().enumerate() {
+            let path = std::env::temp_dir().join(format!("zg-response-{}-{index}", std::process::id()));
+            let server = fake_server(&path, response, None);
+            let mut client = ProtocolClient::connect_socket(&path).unwrap();
+            let result = client.list_sessions();
+            match index {
+                0 => assert!(result.unwrap().truncated),
+                1 => assert!(matches!(result, Err(ClientError::Rpc { code: -32001, message, .. }) if message == "another client is connected")),
+                _ => assert!(matches!(result, Err(ClientError::UnexpectedResponse))),
+            }
+            server.join().unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -822,7 +857,7 @@ mod tests {
         });
         let mut client = ProtocolClient::connect_socket(&path).expect("connect scripted server");
         assert_eq!(client.handshake().expect("hello").protocol_version, "1.0");
-        assert!(client.list_sessions().expect("list").is_empty());
+        assert!(client.list_sessions().expect("list").sessions.is_empty());
         assert_eq!(
             client.new_session(None, None).expect("new").session_id,
             "session-1"

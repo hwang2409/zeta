@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::client::{Approval, Message, ServerEvent, SessionMetadata, StatusResult, ToolCall};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +43,8 @@ pub enum ConnectionState {
 pub struct AppState {
     pub sessions: Vec<SessionMetadata>,
     pub active_session: Option<String>,
+    pub sessions_truncated: bool,
+    pub saved_transcripts: HashMap<String, Vec<TranscriptEntry>>,
     pub transcript: Vec<TranscriptEntry>,
     pub approvals: Vec<Approval>,
     pub connection: ConnectionState,
@@ -52,6 +56,8 @@ impl Default for AppState {
         Self {
             sessions: Vec::new(),
             active_session: None,
+            sessions_truncated: false,
+            saved_transcripts: HashMap::new(),
             transcript: Vec::new(),
             approvals: Vec::new(),
             connection: ConnectionState::Reconnecting,
@@ -71,8 +77,23 @@ impl AppState {
         self.connection = ConnectionState::Reconnecting;
     }
 
+    pub fn select_session(&mut self, session_id: Option<String>) {
+        if self.active_session == session_id {
+            return;
+        }
+        let transcript = std::mem::take(&mut self.transcript);
+        if let Some(previous) = self.active_session.take() {
+            self.saved_transcripts.insert(previous, transcript);
+        }
+        self.transcript = session_id
+            .as_ref()
+            .and_then(|id| self.saved_transcripts.remove(id))
+            .unwrap_or_default();
+        self.active_session = session_id;
+    }
+
     pub fn apply_status(&mut self, status: StatusResult) {
-        self.active_session = status.session.map(|session| session.session_id);
+        self.select_session(status.session.map(|session| session.session_id));
         self.streaming = status.state != "idle";
         self.approvals = status.pending_approvals;
     }

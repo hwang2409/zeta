@@ -525,3 +525,36 @@ fn approval_end_preserves_the_other_delegated_request_with_the_same_raw_id() {
     assert!(matches!(harness.event(), ServerEvent::AgentEnd { .. }));
     harness.finish();
 }
+
+#[test]
+fn oversized_send_is_rejected_without_losing_the_connection() {
+    use zeta_gui::client::MAX_FRAME_BYTES;
+    let harness = Harness::new(|listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([]));
+        // Neither oversized request may reach this healthy socket.
+        let request = peer.respond("send", json!({"accepted":true}));
+        assert_eq!(request["params"]["text"], "short message");
+        peer.event(json!({"event":"agent_end","data":{}}));
+        peer.wait_for_close();
+    });
+    harness.connected();
+    for text in [
+        "x".repeat(MAX_FRAME_BYTES + 1),
+        "\n".repeat(MAX_FRAME_BYTES / 2),
+    ] {
+        harness.command(CommandMessage::Send(text));
+        match harness.next() {
+            WorkerMessage::Rejected(error) => {
+                assert!(error.contains("1048576-byte (1 MiB)"));
+                assert!(error.contains("encoded request"));
+            }
+            other => panic!("expected command rejection, got {other:?}"),
+        }
+    }
+    harness.command(CommandMessage::Send("short message".into()));
+    assert!(matches!(harness.next(), WorkerMessage::Sent(text) if text == "short message"));
+    assert!(matches!(harness.event(), ServerEvent::AgentEnd { .. }));
+    harness.finish();
+}

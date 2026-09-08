@@ -90,10 +90,16 @@ impl ZetaView {
 
     fn apply_worker_message(&mut self, message: WorkerMessage, cx: &mut Context<Self>) {
         match message {
-            WorkerMessage::Sessions(sessions) => self.state.sessions = sessions,
+            WorkerMessage::Sessions(list) => {
+                self.state.sessions = list.sessions;
+                self.state.sessions_truncated = list.truncated;
+            }
             WorkerMessage::Session(session) => {
                 self.pending_command = false;
-                self.state.active_session = Some(session.session_id.clone());
+                if self.state.active_session.as_deref() != Some(&session.session_id) {
+                    self.transcript_scroll = ScrollHandle::new();
+                }
+                self.state.select_session(Some(session.session_id.clone()));
                 if !self
                     .state
                     .sessions
@@ -102,8 +108,6 @@ impl ZetaView {
                 {
                     self.state.sessions.push(session);
                 }
-                self.state.transcript.clear();
-                self.transcript_scroll = ScrollHandle::new();
             }
             WorkerMessage::Status(status) => self.state.apply_status(status),
             WorkerMessage::Sent(text) => {
@@ -152,7 +156,7 @@ impl ZetaView {
     }
 
     fn resume(&mut self, id: String, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.can_change_session() {
+        if self.can_change_session() && self.state.active_session.as_deref() != Some(&id) {
             self.pending_command = true;
             self.queue(CommandMessage::Resume(id));
             cx.notify();
@@ -220,6 +224,7 @@ impl ZetaView {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut sidebar = div()
             .w(px(260.))
+            .flex_shrink_0()
             .h_full()
             .flex()
             .flex_col()
@@ -250,6 +255,13 @@ impl ZetaView {
             .hover(|this| this.bg(gpui::rgb(LINE)))
             .on_click(cx.listener(Self::new_session));
         sidebar = sidebar.child(new_button);
+        if self.state.sessions_truncated {
+            sidebar = sidebar.child(
+                div()
+                    .text_color(gpui::rgb(MUTED))
+                    .child("showing a partial session list"),
+            );
+        }
         for session in &self.state.sessions {
             let id = session.session_id.clone();
             let label = if session.name.is_empty() {
@@ -453,6 +465,7 @@ impl Render for ZetaView {
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .h_full()
                     .flex()
                     .flex_col()
@@ -533,6 +546,61 @@ fn main() {
 mod tests {
     use super::*;
     use zeta_gui::client::ToolCall;
+
+    #[gpui::test]
+    fn active_session_click_is_a_no_op_and_switching_restores_transcripts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (commands, receiver) = mpsc::channel();
+        let session = |id| serde_json::from_value(serde_json::json!({"session_id":id})).unwrap();
+        let window = cx.add_window(move |_, cx| ZetaView {
+            state: AppState {
+                active_session: Some("one".into()),
+                sessions: vec![session("one"), session("two")],
+                connection: ConnectionState::Connected,
+                transcript: vec![TranscriptEntry::Assistant("first transcript".into())],
+                ..Default::default()
+            },
+            transcript_scroll: ScrollHandle::new(),
+            composer: cx.new(Composer::new),
+            pending_command: false,
+            command_error: None,
+            commands,
+            focus_handle: cx.focus_handle(),
+            _poll_task: Task::ready(()),
+        });
+        window
+            .update(cx, |view, window, cx| {
+                let original = view.state.transcript.clone();
+                view.resume("one".into(), &Default::default(), window, cx);
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "active row must not queue a resume"
+                );
+                assert!(!view.pending_command);
+                assert_eq!(view.state.transcript, original);
+                // Also tolerate an idempotent session response without erasing output.
+                view.apply_worker_message(WorkerMessage::Session(session("one")), cx);
+                assert_eq!(view.state.transcript, original);
+                view.resume("two".into(), &Default::default(), window, cx);
+                assert!(
+                    matches!(receiver.try_recv(), Ok(CommandMessage::Resume(id)) if id == "two")
+                );
+                view.apply_worker_message(WorkerMessage::Session(session("two")), cx);
+                assert!(view.state.transcript.is_empty());
+                view.state
+                    .transcript
+                    .push(TranscriptEntry::User("second transcript".into()));
+                view.apply_worker_message(WorkerMessage::Session(session("one")), cx);
+                assert_eq!(view.state.transcript, original);
+                view.apply_worker_message(WorkerMessage::Session(session("two")), cx);
+                assert_eq!(
+                    view.state.transcript,
+                    vec![TranscriptEntry::User("second transcript".into())]
+                );
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     fn transcript_scrolls_and_follows_output_only_at_the_tail(cx: &mut gpui::TestAppContext) {
