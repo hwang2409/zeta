@@ -265,13 +265,25 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
+    fn stale_socket(path: &std::path::Path) {
+        // Bind without listening: the path exists but cannot accept connections,
+        // regardless of when macOS finishes closing the process's socket.
+        assert!(Command::new("python3")
+            .arg("-c")
+            .arg("import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])")
+            .arg(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
     #[test]
     fn default_connection_spawns_for_missing_and_stale_sockets() {
         for stale in [false, true] {
             let path =
                 env::temp_dir().join(format!("zg-spawn-{}-{stale}.sock", std::process::id()));
             if stale {
-                drop(UnixListener::bind(&path).unwrap());
+                stale_socket(&path);
                 assert!(path.exists());
             }
             let mut process = None;
@@ -301,9 +313,7 @@ mod tests {
         drop(client);
         drop(listener);
         std::fs::remove_file(&path).unwrap();
-        // Use an independent abandoned socket: macOS may defer teardown of a
-        // listener that had an established connection.
-        drop(UnixListener::bind(&path).unwrap());
+        stale_socket(&path);
         assert!(matches!(
             connect_or_spawn(&path, false, &mut process, || panic!(
                 "explicit paths never spawn"

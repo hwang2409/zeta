@@ -37,6 +37,12 @@ impl Peer {
         writeln!(self.writer, "{value}").unwrap();
     }
 
+    fn wait_for_close(&mut self) {
+        // Keep the server alive until the actor consumes its last event/response.
+        // Closing earlier can make macOS reject the actor's timeout update.
+        assert_eq!(self.reader.read_line(&mut String::new()).unwrap(), 0);
+    }
+
     fn request(&mut self, method: &str) -> Value {
         let mut line = String::new();
         self.reader.read_line(&mut line).unwrap();
@@ -184,6 +190,7 @@ fn tool_turn_then_final_answer_and_terminal_error_preserve_order() {
         peer.event(json!({"event":"error","error":{"code":"server_error","message":"provider failed"},"data":{}}));
         peer.respond("new_session", json!({"session":session()}));
         peer.status(true, "idle", json!([]));
+        peer.wait_for_close();
     });
     harness.connected();
     harness.command(CommandMessage::Send("question".into()));
@@ -270,6 +277,7 @@ fn live_abort_is_processed_between_continuous_events() {
         peer.write(json!({"jsonrpc":"2.0","id":abort["id"],"result":{"aborted":true}}));
         peer.respond("new_session", json!({"session":session()}));
         peer.status(true, "idle", json!([]));
+        peer.wait_for_close();
     });
     harness.connected();
     harness.command(CommandMessage::Send("stream".into()));
@@ -333,6 +341,7 @@ fn reconnect_resumes_selected_session_and_restores_pending_approvals() {
         peer.status(true, "idle", json!([]));
         peer.send();
         peer.event(json!({"event":"agent_end","data":{}}));
+        peer.wait_for_close();
     });
     harness.connected();
     harness.command(CommandMessage::Resume("session-1".into()));
@@ -397,7 +406,7 @@ fn background_tool_events_do_not_block_a_foreground_send() {
         peer.event(json!({"event":"tool_end","tool_call":call("same-provider-id"),"tool_result":null,"data":{"agent_instance_id":"child-one"}}));
         peer.send();
         peer.event(json!({"event":"agent_end","data":{}}));
-        assert_eq!(peer.reader.read_line(&mut String::new()).unwrap(), 0);
+        peer.wait_for_close();
     });
     harness.connected();
     let mut state = AppState::default();
@@ -439,7 +448,7 @@ fn old_session_events_queued_during_a_switch_do_not_leak_or_block_sends() {
         peer.event(json!({"event":"assistant_delta","delta":"new text","kind":"assistant","session_id":"session-2"}));
         peer.respond("send", json!({"accepted":true,"session_id":"session-2"}));
         peer.event(json!({"event":"agent_end","data":{},"session_id":"session-2"}));
-        assert_eq!(peer.reader.read_line(&mut String::new()).unwrap(), 0);
+        peer.wait_for_close();
     });
     harness.connected();
     harness.command(CommandMessage::NewSession);
@@ -484,7 +493,7 @@ fn approval_end_preserves_the_other_delegated_request_with_the_same_raw_id() {
         }
         peer.send();
         peer.event(json!({"event":"agent_end","data":{}}));
-        assert_eq!(peer.reader.read_line(&mut String::new()).unwrap(), 0);
+        peer.wait_for_close();
     });
     assert!(matches!(harness.next(), WorkerMessage::Sessions(_)));
     let WorkerMessage::Status(status) = harness.next() else {
