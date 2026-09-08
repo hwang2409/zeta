@@ -392,7 +392,7 @@ async def run_agent_tool(
         description=description,
         agent_type=stored_agent_type,
         background=background,
-        child_instance_id=(child_instance_id if child_depth > 1 else None),
+        child_instance_id=child_instance_id,
     )
     child_store.start_agent_lifecycle(
         handle=child_instance_id,
@@ -406,7 +406,7 @@ async def run_agent_tool(
         loop._agent_child_stores[tool_call.id] = child_store
         loop._agent_child_turns[tool_call.id] = 0
         loop._agent_child_types[tool_call.id] = preset.name
-        child_marker_key = child_instance_id if child_depth > 1 else tool_call.id
+        child_marker_key = child_instance_id
         if publisher is not None:
             publisher.set_metadata(
                 {"child_session_path": child_path, "depth": child_depth}

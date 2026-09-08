@@ -3022,6 +3022,22 @@ async def test_a_queued_prompt_stays_out_of_the_run_context(tmp_path: Path) -> N
     assert "secret follow-up" not in rendered
 
 
+def _run_handle_from_receipt(store: ConversationStore) -> str:
+    """Return the child_instance_id a real model would receive for the run."""
+
+    for message in store.messages():
+        result = message.tool_result
+        if result is None:
+            continue
+        structured = result.structured_content
+        if structured is None:
+            continue
+        handle = structured.get("child_instance_id")
+        if type(handle) is str and handle:
+            return handle
+    raise AssertionError("no run receipt with a child_instance_id")
+
+
 @pytest.mark.asyncio
 async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> None:
     backend = RunBackend()
@@ -3031,8 +3047,10 @@ async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> N
     await _collect(loop.run_turn("start"))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
 
-    # Queue while the run is still mid-turn, exactly as agent_send does.
-    assert send_to_run(store, "run-1", "also check the tests") is None
+    # The model queues follow-ups by the child_instance_id it saw in the tool
+    # result, not by the provider tool_call.id, so round-trip that handle.
+    handle = _run_handle_from_receipt(store)
+    assert send_to_run(store, handle, "also check the tests") is None
 
     backend.release_child.set()
     await _wait_for_notification(store, "completed")
@@ -3083,13 +3101,18 @@ async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
 
     listing = commands.slash_runs("")
     assert "long horizon run" in listing
-    assert "run-1" in listing
+    handle = _run_handle_from_receipt(store)
+    # /runs shows the model-facing handle, not the opaque provider tool_call.id.
+    assert handle in listing
+    assert "run-1" not in listing
 
     assert commands.slash_send("nonsense") == (
         "use /send <run-id> <message>; /runs lists the live ones"
     )
     assert "no live run" in commands.slash_send("bogus-id hello")
-    assert "queued for run-1" in commands.slash_send("run-1 also check the tests")
+    assert f"queued for {handle}" in commands.slash_send(
+        f"{handle} also check the tests"
+    )
 
     backend.release_child.set()
     await _wait_for_notification(store, "completed")

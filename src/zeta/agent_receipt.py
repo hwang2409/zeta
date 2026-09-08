@@ -486,11 +486,15 @@ def finalize_agent_results(
                         background_owner=owner._background_owner,
                     )
                     child_store.finish_agent_parent()
-            owner.store.finish_agent_child(
-                f"{owner.agent_instance_id}:{child_store.session_id}"
-                if child_store is not None and owner.agent_instance_id is not None
-                else call.id
-            )
+            if child_store is not None:
+                prefix = (
+                    owner.agent_instance_id
+                    if owner.agent_instance_id is not None
+                    else owner.store.session_id
+                )
+                owner.store.finish_agent_child(f"{prefix}:{child_store.session_id}")
+            else:
+                owner.store.finish_agent_child(call.id)
             owner._agent_child_turns.pop(call.id, None)
             owner._agent_child_types.pop(call.id, None)
     return results
