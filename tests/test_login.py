@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.server
 import os
 import select
 import signal
@@ -156,6 +157,30 @@ def test_codex_authorization_url_includes_upstream_flow_fields() -> None:
     assert query["originator"] == ["codex_cli_rs"]
 
 
+def test_redirect_server_binds_without_reverse_dns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ZETA-91: binding must never reverse-resolve 127.0.0.1.
+
+    ``HTTPServer.server_bind`` calls ``socket.getfqdn`` on the bind address;
+    on a host whose resolver has no answer for it the lookup blocks until the
+    resolver times out and ``zeta login`` prints nothing meanwhile.
+    """
+
+    def _no_lookup(name: str = "") -> str:
+        raise AssertionError(f"reverse lookup attempted for {name!r}")
+
+    monkeypatch.setattr(socket, "getfqdn", _no_lookup)
+
+    server = login_flow._create_redirect_server(http.server.BaseHTTPRequestHandler)
+    try:
+        assert server.server_name == "localhost"
+        assert server.server_port == server.server_address[1]
+        assert server.server_port > 0
+    finally:
+        server.server_close()
+
+
 def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
     environment = os.environ.copy()
     environment["ZETA_HOME"] = str(tmp_path / "zeta-home")
@@ -174,19 +199,35 @@ def test_login_sigint_closes_callback_server(tmp_path: Path) -> None:
     port: int | None = None
     output = bytearray()
     try:
-        deadline = time.monotonic() + 3
+        # Poll-until ceiling, not a budget (ZETA-67 pattern): a cold interpreter
+        # on a loaded runner plus ThreadingHTTPServer's reverse-DNS lookup of
+        # the bind address blew a 3s deadline on macos-latest (ZETA-90). The
+        # loop exits the moment the URL appears, so the ceiling costs nothing
+        # on the happy path.
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline and port is None:
-            if process.stdout is None:
+            if process.stdout is None or process.poll() is not None:
                 break
             readable, _, _ = select.select([process.stdout], [], [], 0.1)
             if not readable:
                 continue
             output.extend(os.read(process.stdout.fileno(), 4096))
-            lines = output.splitlines()
-            if lines and lines[-1].startswith(b"https://"):
-                redirect = parse_qs(urlsplit(lines[-1].decode()).query)["redirect_uri"][0]
-                port = urlsplit(redirect).port
-        assert port is not None
+            for line in output.splitlines():
+                if line.startswith(b"https://"):
+                    query = parse_qs(urlsplit(line.decode()).query)
+                    port = urlsplit(query["redirect_uri"][0]).port
+                    break
+        if port is None:
+            # Say why: a login that died before printing looks the same as a
+            # slow one unless the exit status and stderr are reported.
+            process.kill()
+            stdout_rest, stderr_rest = process.communicate(timeout=5)
+            output.extend(stdout_rest)
+            raise AssertionError(
+                f"login never printed its URL (exit={process.returncode})\n"
+                f"stdout: {output.decode(errors='replace')!r}\n"
+                f"stderr: {stderr_rest.decode(errors='replace')!r}"
+            )
         process.send_signal(signal.SIGINT)
         shutdown_deadline = time.monotonic() + 30
         while process.poll() is None and time.monotonic() < shutdown_deadline:
@@ -264,7 +305,7 @@ async def test_login_times_out() -> None:
 
 
 def test_redirect_server_falls_back_to_ephemeral_port(monkeypatch: pytest.MonkeyPatch) -> None:
-    real_server = login_flow.http.server.ThreadingHTTPServer
+    real_server = login_flow._RedirectServer
     calls: list[tuple[str, int]] = []
 
     def server_factory(address, handler):
@@ -273,7 +314,7 @@ def test_redirect_server_falls_back_to_ephemeral_port(monkeypatch: pytest.Monkey
             raise OSError("address already in use")
         return real_server(address, handler)
 
-    monkeypatch.setattr(login_flow.http.server, "ThreadingHTTPServer", server_factory)
+    monkeypatch.setattr(login_flow, "_RedirectServer", server_factory)
     server = login_flow._create_redirect_server(
         login_flow._handler_for(login_flow._CallbackReceiver("state", "/callback")),
         preferred_port=54321,
