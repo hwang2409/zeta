@@ -212,25 +212,63 @@ async def consume_run(
     The run finishes when it has nothing left to do and nothing queued.
     """
 
-    result = await consume_child(child_loop, prompt, **kwargs)
+    finish_lifecycle = kwargs.get("finish_lifecycle")
+    child_turns = kwargs.get("child_turns")
+
+    def keep_lifecycle_running(state: str, text: str) -> dict[str, object]:
+        del state, text
+        if not callable(child_turns):
+            return {}
+        return agent_stats(
+            child_store.agent_lifecycle(),
+            status="running",
+            turns_used=child_turns(),
+        )
+
+    if callable(finish_lifecycle):
+        kwargs["finish_lifecycle"] = keep_lifecycle_running
+    result: dict[str, object] | None = None
+    terminal_result: dict[str, object] | None = None
     current_entry = None
-    while not result.get("isError"):
-        # Ack only after a follow-up actually reached the child. A cancel or
-        # backend error mid-consume_child leaves the prompt pending, so the
-        # next run gets a chance to redeliver it instead of it silently gone.
-        if current_entry is not None:
-            child_store.acknowledge_pending_prompt(current_entry.id)
-            current_entry = None
-        # close_pending_queue_if_empty holds the child's append lock across
-        # the "no pending -> mark closed" transition, so any parent that
-        # queues a follow-up after this point gets a PendingPromptsClosedError
-        # instead of silent success against a run that already returned.
-        pending = child_store.close_pending_queue_if_empty()
-        if not pending:
-            return result
-        current_entry = pending[0]
-        result = await consume_child(child_loop, current_entry.data["text"], **kwargs)
-    return result
+    try:
+        result = await consume_child(child_loop, prompt, **kwargs)
+        while not result.get("isError"):
+            # Ack only after a follow-up actually reached the child. A cancel or
+            # backend error mid-consume_child leaves the prompt pending, so the
+            # next run gets a chance to redeliver it instead of it silently gone.
+            if current_entry is not None:
+                child_store.acknowledge_pending_prompt(current_entry.id)
+                current_entry = None
+            pending = child_store.close_pending_queue_if_empty()
+            if not pending:
+                terminal_result = result
+                return result
+            current_entry = pending[0]
+            result = await consume_child(
+                child_loop, current_entry.data["text"], **kwargs
+            )
+        terminal_result = result
+        return result
+    finally:
+        try:
+            child_store.close_pending_queue()
+        finally:
+            if terminal_result is not None and callable(finish_lifecycle):
+                content = terminal_result.get("content")
+                text = (
+                    content[0].get("text")
+                    if (
+                        isinstance(content, list)
+                        and content
+                        and isinstance(content[0], dict)
+                        and isinstance(content[0].get("text"), str)
+                    )
+                    else "agent run ended without a final response"
+                )
+                finish_lifecycle(
+                    "failed" if terminal_result.get("isError") else "completed",
+                    text,
+                )
 
 
 def resolve_child_backend(

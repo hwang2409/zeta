@@ -931,12 +931,21 @@ async def _agent_send(
     # send_to_run reloads the run's own conversation.jsonl and appends under
     # flock+fsync; runs with large logs would stall the event loop, so hop
     # to a worker thread while the marker check and durable append happen.
-    error = await asyncio.to_thread(
-        send_to_run,
-        registry.session_store,
-        arguments.get("child_instance_id"),
-        arguments.get("message"),
+    commit = asyncio.create_task(
+        asyncio.to_thread(
+            send_to_run,
+            registry.session_store,
+            arguments.get("child_instance_id"),
+            arguments.get("message"),
+        )
     )
+    try:
+        error = await asyncio.shield(commit)
+    except asyncio.CancelledError:
+        # The thread cannot be canceled. Wait for its durable result before
+        # allowing tool cancellation to reach the caller.
+        await commit
+        raise
     if error is not None:
         return {
             "content": [text_block(f"agent_send error: {error}")],

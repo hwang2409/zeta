@@ -732,6 +732,14 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 self._append_row_unlocked("pending_queue_closed", {})
             return [self._snapshot_entry(entry) for entry in pending]
 
+    def close_pending_queue(self) -> None:
+        """Close the prompt queue, including when prompts remain unacknowledged."""
+
+        with self._append_lock():
+            self._load()
+            if not self._pending_queue_closed_unlocked():
+                self._append_row_unlocked("pending_queue_closed", {})
+
     def pending_prompts(self) -> list[ConversationEntry]:
         """Return queued follow-ups the run has not consumed yet.
 

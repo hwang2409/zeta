@@ -1,11 +1,13 @@
 import asyncio
 import json
+import threading
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import zeta.tools.agent as agent_module
 from zeta.agent_background import (
     BackgroundAgentOwner,
     adopt_agent_children,
@@ -3053,6 +3055,133 @@ async def test_consume_run_keeps_pending_entry_when_delivery_fails(
     assert result["isError"] is True
     assert call_prompts == ["initial", "follow up"]
     # Ack must not have run since the follow-up delivery errored.
+    assert [entry.data["text"] for entry in child_store.pending_prompts()] == [
+        "follow up"
+    ]
+    with pytest.raises(PendingPromptsClosedError):
+        child_store.append_pending_prompt("after failure")
+
+
+@pytest.mark.asyncio
+async def test_restart_keeps_run_lifecycle_open_for_an_in_flight_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zeta import agent_runner
+
+    child_store = ConversationStore(tmp_path, session_id="run")
+    child_store.start_agent_lifecycle(
+        handle="parent:run",
+        started_at="2026-09-08T00:00:00+00:00",
+        tree_budget=150,
+        depth=1,
+        agent_type="run",
+        description="long horizon run",
+    )
+    child_store.append_pending_prompt("follow up")
+    prompts: list[str] = []
+    finish_calls = 0
+
+    async def fake_consume_child(child_loop, prompt, **kwargs):
+        del child_loop, kwargs
+        prompts.append(prompt)
+        return {
+            "content": [{"text": f"handled {prompt}"}],
+            "isError": False,
+            "structuredContent": None,
+        }
+
+    def finish_lifecycle(state: str, text: str) -> dict[str, object]:
+        nonlocal finish_calls
+        finish_calls += 1
+        child_store.finish_agent_lifecycle(state, final_result=text)
+        return {}
+
+    original_close = child_store.close_pending_queue_if_empty
+    checked_restart = False
+
+    def close_after_restart_check():
+        nonlocal checked_restart
+        if not checked_restart:
+            checked_restart = True
+            restarted = ConversationStore(tmp_path, session_id="run")
+            lifecycle = restarted.agent_lifecycle()
+            assert lifecycle is not None
+            assert lifecycle["finished_at"] is None
+            assert restarted.pending_prompts()[0].data["text"] == "follow up"
+        return original_close()
+
+    monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
+    monkeypatch.setattr(
+        child_store,
+        "close_pending_queue_if_empty",
+        close_after_restart_check,
+    )
+
+    result = await agent_runner.consume_run(
+        object(),
+        "initial",
+        child_store=child_store,
+        child_turns=lambda: len(prompts),
+        finish_lifecycle=finish_lifecycle,
+    )
+
+    assert result["isError"] is False
+    assert prompts == ["initial", "follow up"]
+    assert finish_calls == 1
+    lifecycle = child_store.agent_lifecycle()
+    assert lifecycle is not None
+    assert lifecycle["state"] == "completed"
+    assert lifecycle["finished_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_agent_send_waits_for_blocked_append_before_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(
+        parent_store.session_dir / "agents", session_id="1"
+    )
+    call = _run_agent_call()
+    child_store.mark_agent_parent(call.id, agent_type="run")
+    parent_store.allocate_agent_index()
+    parent_store.register_agent_child(
+        call,
+        child_session_path=str(child_store.session_dir),
+        description="long horizon run",
+        agent_type="run",
+        background=True,
+        child_instance_id="parent:1",
+    )
+
+    started = threading.Event()
+    release = threading.Event()
+    original_send = agent_module.send_to_run
+
+    def blocked_send(*args):
+        started.set()
+        release.wait(timeout=2)
+        return original_send(*args)
+
+    monkeypatch.setattr(agent_module, "send_to_run", blocked_send)
+    registry = ToolRegistry(tmp_path, session_store=parent_store)
+    task = asyncio.create_task(
+        agent_module._agent_send(
+            registry,
+            {"child_instance_id": "parent:1", "message": "follow up"},
+        )
+    )
+    await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=2)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
     assert [entry.data["text"] for entry in child_store.pending_prompts()] == [
         "follow up"
     ]
