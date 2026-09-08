@@ -33,6 +33,8 @@ Example response:
 Every request has `jsonrpc` (`"2.0"`), `id` (a string or integer), `method`
 (a non-empty string), and optional `params` (an object). Every response has
 the request `id` and exactly one of `result` or `error`.
+String request ids are limited to 128 UTF-8 bytes. This keeps error responses
+within the frame limit.
 
 Every notification has method `event`. Its `params.event` names the event and
 its `params.session_id` identifies the active session when one exists.
@@ -240,6 +242,7 @@ Error responses use standard JSON-RPC codes where applicable:
 | `-32004` | a turn is already running |
 | `-32005` | no turn is running for steering |
 | `-32006` | approval request is missing or already resolved |
+| `-32007` | outbound frame exceeds the size limit |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. A malformed frame never terminates the server process. The
@@ -303,11 +306,12 @@ Event fields are:
 
 | event | required fields | optional fields |
 | --- | --- | --- |
-| `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, `compaction_start`, `compaction_end` | `event` | `session_id`, `data: object` |
+| `turn_start`, `turn_end`, `agent_start`, `agent_end`, `message_start`, `turn_aborted`, `compaction_start`, `compaction_end` | `event` | `session_id`, `data: object` |
 | `assistant_delta` | `event`, `delta: string`, `kind: string` | `session_id` |
 | `assistant_message` | `event`, `message: Message` | `session_id` |
 | `usage` | `event`, `usage: Usage` | `session_id` |
-| `tool_start`, `tool_output` | `event`, `tool_call: ToolCall`, `data: object` | `session_id`, `output: string` for `tool_output` |
+| `tool_start` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
+| `tool_output` | `event`, `tool_call: ToolCall`, `output: string`, `data: object` | `session_id` |
 | `tool_end` | `event`, `tool_call: ToolCall`, `tool_result: ToolResult or null`, `data: object` | `session_id` |
 | `approval_request` | `event`, `request_id: string`, `tool_call: ToolCall` | `session_id` |
 | `approval_end` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
@@ -330,8 +334,8 @@ and `is_stall: boolean`. Unknown provider keys remain allowed inside `data`.
    an allow decision exists. Delegated approval keys are opaque and map to the
    full `(child_instance_id, request_id)` key.
 5. `tool_start`, `tool_output`, and `tool_end` identify one tool call.
-   `status.state` is `tool` during tool execution, `running` during model
-   streaming, and `idle` after the active task ends.
+   `status.state` is `tool` during tool execution or approval waits,
+   `running` during model streaming, and `idle` after the active task ends.
 6. `retry` can occur between provider stream attempts. Clients must not assume
    one provider attempt per turn.
 7. The server awaits `drain()` after each frame. A slow client delays later

@@ -882,6 +882,7 @@ class TUIApp(
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run the alternate-screen app until Ctrl-D or an exit request."""
 
+        await self.loop.activate()
         session = session or self._session or self._make_session()
         self._active_session = session
         self._attach_draft(session)

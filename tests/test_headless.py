@@ -3,6 +3,10 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +36,42 @@ async def _drive(
         stderr=stderr,
     )
     return code, stdout.getvalue(), stderr.getvalue()
+
+
+def test_print_mode_runs_session_hook_inside_async_activation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    hook = f"{shlex.quote(sys.executable)} -c {shlex.quote('pass')}"
+    (home / "hooks.toml").write_text(
+        f"[[hook]]\nevent = \"session_start\"\ncommand = {json.dumps(hook)}\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["ZETA_HOME"] = str(home)
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from zeta.cli import main; raise SystemExit(main())",
+            "--provider",
+            "fake",
+            "-p",
+            "hello",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("you said: hello")
 
 
 async def test_text_mode_prints_final_message_and_exits_zero(tmp_path: Path) -> None:

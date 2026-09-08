@@ -235,7 +235,7 @@ def run_headless(args: argparse.Namespace, prompt: str) -> int:
     loop.set_mcp_prompt_refresh(None)
 
     async def _run() -> int:
-        loop.session_start()
+        await loop.activate()
         try:
             return await drive_turn(
                 loop,

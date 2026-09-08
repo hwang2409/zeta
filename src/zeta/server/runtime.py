@@ -139,8 +139,10 @@ class ServerRuntime:
         self.model = composition.model
         self.loop = composition.loop
         self.policy = composition.policy
+        self.usage = {}
         if old_loop is not None:
             await old_loop.close()
+        await self.loop.activate()
 
     def _compose(self, **kwargs: object) -> RuntimeComposition:
         return compose_runtime(

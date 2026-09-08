@@ -7,6 +7,7 @@ from typing import Any
 
 PROTOCOL_VERSION = "1.0"
 MAX_FRAME_BYTES = 1_048_576
+MAX_REQUEST_ID_BYTES = 128
 TOOL_OUTPUT_MAX_BYTES = 8_000
 
 
@@ -35,6 +36,8 @@ def parse_request(line: bytes) -> dict[str, Any]:
         raise ProtocolError(-32600, "request method must be a nonempty string")
     if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
         raise ProtocolError(-32600, "request id must be a string or integer")
+    if isinstance(request_id, str) and len(request_id.encode("utf-8")) > MAX_REQUEST_ID_BYTES:
+        raise ProtocolError(-32600, "request id exceeds 128 UTF-8 bytes")
     params = value.get("params", {})
     if not isinstance(params, dict):
         raise ProtocolError(-32602, "request params must be an object")
@@ -78,6 +81,7 @@ def bounded(value: str, limit: int = TOOL_OUTPUT_MAX_BYTES) -> str:
 
 __all__ = [
     "MAX_FRAME_BYTES",
+    "MAX_REQUEST_ID_BYTES",
     "PROTOCOL_VERSION",
     "TOOL_OUTPUT_MAX_BYTES",
     "ProtocolError",

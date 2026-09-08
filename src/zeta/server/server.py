@@ -151,7 +151,7 @@ class ZetaServer:
             return
         self._client_active = True
         self._client = _Client(self, reader, writer)
-        self.runtime.set_background_event_sink(self._client._event)
+        self.runtime.set_background_event_sink(self._client._publish_background_event)
         try:
             await self._client.run()
         finally:
@@ -483,6 +483,12 @@ class _Client:
             return
         await self._notify(kind.value, data=dict(event.data))
 
+    def _publish_background_event(self, event: StreamEvent) -> None:
+        """Schedule child events from the loop's synchronous sink."""
+
+        if not self._closed:
+            asyncio.create_task(self._event(event))
+
     async def _notify(self, event: str, **fields: object) -> None:
         session_id = self.server.runtime.opened.metadata.session_id if self.server.runtime.opened else None
         payload = notification(event, session_id, **fields)
@@ -534,6 +540,12 @@ class _Client:
                         -32007,
                         "outbound frame exceeds 1048576 bytes",
                     )
+                    if len(payload) > MAX_FRAME_BYTES:
+                        payload = error_response(
+                            None,
+                            -32007,
+                            "outbound frame exceeds 1048576 bytes",
+                        )
                 self.writer.write(payload)
                 await self.writer.drain()
             except (ConnectionError, BrokenPipeError):

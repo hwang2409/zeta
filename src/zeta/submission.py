@@ -137,7 +137,6 @@ def compose_runtime(
     loop.tool_schemas = list(loop.tool_registry.schemas)
     if background_event_sink is not None:
         loop.set_background_event_sink(background_event_sink)
-    loop.session_start()
     return RuntimeComposition(
         opened=opened,
         loop=loop,

@@ -17,7 +17,7 @@ import pytest
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionMetadata
 from zeta.server import ZetaServer
-from zeta.server.protocol import MAX_FRAME_BYTES
+from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES
 from zeta.server.server import _Client
 from zeta.types import TextContent, ToolCall
 
@@ -48,6 +48,12 @@ async def _read(reader: asyncio.StreamReader) -> dict[str, Any]:
     line = await asyncio.wait_for(reader.readline(), TIMEOUT)
     assert line, "server closed the socket"
     return json.loads(line)
+
+
+async def _read_raw(reader: asyncio.StreamReader) -> bytes:
+    line = await asyncio.wait_for(reader.readline(), TIMEOUT)
+    assert line, "server closed the socket"
+    return line
 
 
 async def _request(
@@ -241,6 +247,91 @@ async def test_oversized_frame_returns_error_and_keeps_connection_usable(
 
 
 @pytest.mark.asyncio
+async def test_maximum_legal_frame_gets_bounded_error_response(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="fake")
+    reader, writer = await _connect(server)
+    await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+    request_id_length = MAX_FRAME_BYTES
+    while True:
+        candidate = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "x" * request_id_length,
+                    "method": "status",
+                    "params": {},
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        if len(candidate) <= MAX_FRAME_BYTES:
+            break
+        request_id_length -= len(candidate) - MAX_FRAME_BYTES
+    while len(candidate) < MAX_FRAME_BYTES:
+        request_id_length += MAX_FRAME_BYTES - len(candidate)
+        candidate = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "x" * request_id_length,
+                    "method": "status",
+                    "params": {},
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+    assert len(candidate) == MAX_FRAME_BYTES
+    try:
+        writer.write(candidate)
+        await writer.drain()
+        raw = await _read_raw(reader)
+        response_frame = json.loads(raw)
+        assert response_frame["error"]["code"] == -32600
+        assert len(raw) <= MAX_FRAME_BYTES
+    finally:
+        await _close(server, writer)
+
+
+def test_request_id_limit_is_inclusive() -> None:
+    valid = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": "x" * MAX_REQUEST_ID_BYTES,
+            "method": "status",
+        }
+    ).encode()
+    invalid = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": "x" * (MAX_REQUEST_ID_BYTES + 1),
+            "method": "status",
+        }
+    ).encode()
+    from zeta.server.protocol import ProtocolError, parse_request
+
+    assert parse_request(valid)["id"] == "x" * MAX_REQUEST_ID_BYTES
+    with pytest.raises(ProtocolError, match="request id exceeds"):
+        parse_request(invalid)
+
+
+def test_protocol_schema_documents_all_reviewed_event_contracts() -> None:
+    protocol = (Path(__file__).parents[1] / "docs" / "serve-protocol.md").read_text(
+        encoding="utf-8"
+    )
+    assert "`-32007`" in protocol
+    assert "`turn_aborted`" in protocol
+    assert (
+        "| `tool_output` | `event`, `tool_call: ToolCall`, `output: string`, "
+        "`data: object` | `session_id` |"
+    ) in protocol
+    assert "during tool execution or approval waits" in protocol
+
+
+@pytest.mark.asyncio
 async def test_list_sessions_marks_oversized_result_as_truncated(
     tmp_path: Path,
 ) -> None:
@@ -326,6 +417,68 @@ async def test_disconnect_aborts_pending_approval_without_phantom(tmp_path: Path
     await server.close()
 
 
+@pytest.mark.asyncio
+async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    await _request(reader, writer, 3, "send", {"text": "read it"})
+    await _event(reader, "approval_request")
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    second_reader, second_writer = await asyncio.open_unix_connection(
+        str(server.socket_path)
+    )
+    try:
+        await _request(second_reader, second_writer, 1, "hello", {"protocol_version": "1.0"})
+        error = (
+            await _request(
+                second_reader,
+                second_writer,
+                2,
+                "approve",
+                {"request_id": "call-1"},
+            )
+        )[-1]
+        assert error["error"]["code"] == -32006
+    finally:
+        await _close(server, second_writer)
+
+
+@pytest.mark.asyncio
+async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn([TextContent("first"), TextContent("second")], delay=0.2)]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    session_id = server.runtime.session_id
+    await _request(reader, writer, 3, "send", {"text": "stream"})
+    await _event(reader, "assistant_delta")
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.1)
+    messages = server.runtime.manager.open(session_id).store.messages()
+    assert any(
+        message.role.value == "assistant"
+        and "first" in "".join(
+            getattr(block, "text", "") for block in message.content
+        )
+        for message in messages
+    )
+    await server.close()
+
+
 def test_delegated_approval_wire_keys_are_unique() -> None:
     client = object.__new__(_Client)
     client._approval_wires = {}
@@ -351,7 +504,176 @@ async def test_bad_resume_preserves_current_session(tmp_path: Path) -> None:
             "session_id"
         ]
         assert after == before
+        frames = await _request(reader, writer, 6, "send", {"text": "still here"})
+        assert frames[-1]["result"]["accepted"] is True
+        await _event(reader, "assistant_message")
+        await _event(reader, "turn_end")
     finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first")], usage={"input_tokens": 3}),
+            ScriptedTurn([TextContent("second")], usage={"input_tokens": 5}),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    first_session = server.runtime.session_id
+    try:
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        await _event(reader, "usage")
+        assert (
+            await _request(reader, writer, 4, "status")
+        )[-1]["result"]["usage"]
+
+        await _request(reader, writer, 5, "new_session", {"provider": "fake"})
+        assert (await _request(reader, writer, 6, "status"))[-1]["result"]["usage"] == {}
+
+        await _request(reader, writer, 7, "send", {"text": "second"})
+        await _event(reader, "usage")
+        assert (
+            await _request(reader, writer, 8, "status")
+        )[-1]["result"]["usage"]
+
+        await _request(reader, writer, 9, "resume", {"session_id": first_session})
+        assert (await _request(reader, writer, 10, "status"))[-1]["result"]["usage"] == {}
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_parent_mode_resolves_live_delegated_approvals_independently(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("child data", encoding="utf-8")
+    child_call = ToolCall("same-provider-id", "read", {"path": str(target)})
+    parent_calls = [
+        ToolCall(
+            "agent-one",
+            "agent",
+            {"prompt": "read", "description": "child one", "background": True},
+        ),
+        ToolCall(
+            "agent-two",
+            "agent",
+            {"prompt": "read", "description": "child two", "background": True},
+        ),
+    ]
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=parent_calls),
+            ScriptedTurn(tool_calls=[child_call]),
+            ScriptedTurn(tool_calls=[child_call]),
+            ScriptedTurn([TextContent("done")]),
+            ScriptedTurn([TextContent("done")]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        first = await _event(reader, "approval_request")
+        second = await _event(reader, "approval_request")
+        assert first["request_id"] != second["request_id"]
+        assert first["tool_call"]["id"] == second["tool_call"]["id"]
+
+        first_result = await _request(
+            reader, writer, 4, "approve", {"request_id": first["request_id"]}
+        )
+        second_result = await _request(
+            reader, writer, 5, "approve", {"request_id": second["request_id"]}
+        )
+        assert first_result[-1]["result"]["accepted"] is True
+        assert second_result[-1]["result"]["accepted"] is True
+        await asyncio.sleep(0.2)
+        assert server.runtime.policy is not None
+        assert server.runtime.policy.pending_requests() == []
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_and_tui_composition_have_matching_runtime_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "zeta-home"
+    home.mkdir()
+    (home / "settings.toml").write_text(
+        "provider = \"fake\"\n"
+        "token_budget = 12345\n"
+        "stream_stall_seconds = 45\n"
+        "stream_stall_retries = 4\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    tui_calls: list[tuple[object, ...]] = []
+    serve_calls: list[tuple[object, ...]] = []
+    from zeta.cli import build_parser
+    from zeta.server import runtime as server_runtime
+    from zeta.server.fake_backend import ServerFakeBackend
+    from zeta.tui import app as tui_app
+    from zeta.tui.fake_backend import FakeInteractiveBackend
+
+    def tui_backend(
+        provider: str,
+        model: str | None,
+        *,
+        home: Path,
+        stall_seconds: float | None = None,
+        stall_retries: int | None = None,
+    ) -> tuple[FakeInteractiveBackend, str]:
+        tui_calls.append((provider, model, home, stall_seconds, stall_retries))
+        selected = model or "offline"
+        return FakeInteractiveBackend(model=selected), selected
+
+    def serve_backend(
+        provider: str,
+        model: str | None,
+        home: Path,
+        *,
+        stall_seconds: float | None = None,
+        stall_retries: int | None = None,
+    ) -> tuple[ServerFakeBackend, str]:
+        serve_calls.append((provider, model, home, stall_seconds, stall_retries))
+        selected = model or "offline"
+        return ServerFakeBackend(model=selected), selected
+
+    monkeypatch.setattr(tui_app, "build_backend", tui_backend)
+    monkeypatch.setattr(server_runtime, "default_backend", serve_backend)
+    tui = tui_app.create_app(build_parser().parse_args(["--provider", "fake"]))
+    server = ZetaServer(home=home, socket_path=_socket_path(tmp_path), provider="fake")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+        await _request(reader, writer, 2, "new_session")
+        tui_loop = tui.loop
+        serve_loop = server.runtime.loop
+        assert serve_loop is not None
+        assert tui_calls == serve_calls
+        assert tui_loop.context_assembler.token_budget == serve_loop.context_assembler.token_budget
+        assert tui_loop.context_assembler.retained_tail == serve_loop.context_assembler.retained_tail
+        assert (tui_loop._background_event_sink is not None) == (
+            serve_loop._background_event_sink is not None
+        )
+    finally:
+        await tui.loop.close()
         await _close(server, writer)
 
 
