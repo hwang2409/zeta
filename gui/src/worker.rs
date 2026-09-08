@@ -1,0 +1,334 @@
+//! The connection actor owns the socket, session identity, and command ordering.
+use crate::client::{
+    ClientError, ProtocolClient, ServerEvent, SessionList, SessionMetadata, StatusResult,
+};
+use std::env;
+use std::path::PathBuf;
+use std::process::{Child, Command};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Debug)]
+pub enum CommandMessage {
+    NewSession,
+    Resume(String),
+    Send(String),
+    Approve(String),
+    Deny(String),
+    Abort,
+    Reconnect,
+}
+
+#[derive(Debug)]
+pub enum WorkerMessage {
+    Sessions(SessionList),
+    Session(SessionMetadata),
+    Status(StatusResult),
+    Sent(String),
+    Connected,
+    Event(ServerEvent),
+    Rejected(String),
+    Lost(String),
+}
+
+pub struct ConnectionWorker {
+    pub commands: Receiver<CommandMessage>,
+    pub messages: Sender<WorkerMessage>,
+    pub socket: Option<PathBuf>,
+}
+
+impl ConnectionWorker {
+    pub fn run(self) {
+        let mut process = None;
+        let mut selected = None;
+        loop {
+            let result = self.connected(&mut process, &mut selected);
+            if let Err(error) = result {
+                let _ = self.messages.send(WorkerMessage::Lost(error.to_string()));
+            } else if matches!(result, Ok(true)) {
+                continue;
+            } else {
+                return; // The UI closed its command channel.
+            }
+            loop {
+                match self.commands.recv() {
+                    Ok(CommandMessage::Reconnect) => break,
+                    Ok(_) => self.reject("connection lost; reconnect before sending commands"),
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+
+    fn reject(&self, reason: &str) {
+        let _ = self
+            .messages
+            .send(WorkerMessage::Rejected(reason.to_owned()));
+    }
+
+    fn status(&self, client: &mut ProtocolClient) -> Result<StatusResult, ClientError> {
+        let status = client.status()?;
+        let _ = self.messages.send(WorkerMessage::Status(status.clone()));
+        Ok(status)
+    }
+
+    fn connected(
+        &self,
+        process: &mut Option<Child>,
+        selected: &mut Option<String>,
+    ) -> Result<bool, ClientError> {
+        let mut client = connect(&self.socket, process)?;
+        client.handshake()?;
+        let sessions = client.list_sessions()?;
+        let _ = self.messages.send(WorkerMessage::Sessions(sessions));
+        if let Some(id) = selected.as_deref() {
+            client.resume(id)?;
+        }
+        let status = self.status(&mut client)?;
+        *selected = status
+            .session
+            .as_ref()
+            .map(|session| session.session_id.clone());
+        let mut busy = status.state != "idle";
+        let mut pending_approvals = !status.pending_approvals.is_empty();
+        let _ = self.messages.send(WorkerMessage::Connected);
+        let mut resumed_tool = false;
+        let mut last_status = Instant::now();
+        loop {
+            // Commands get a chance between every event, even with continuous output.
+            client.set_read_timeout(Some(Duration::from_secs(5)))?;
+            match self.commands.try_recv() {
+                Ok(command) => {
+                    let approve = matches!(&command, CommandMessage::Approve(_));
+                    let result = match command {
+                        CommandMessage::NewSession
+                        | CommandMessage::Resume(_)
+                        | CommandMessage::Send(_)
+                        | CommandMessage::Reconnect
+                            if busy || pending_approvals =>
+                        {
+                            self.reject("finish or abort the current operation before changing sessions or sending");
+                            Ok(())
+                        }
+                        CommandMessage::Reconnect => return Ok(true),
+                        CommandMessage::NewSession | CommandMessage::Resume(_) => {
+                            let session = match command {
+                                CommandMessage::Resume(id) => client.resume(&id),
+                                _ => client.new_session(None, None),
+                            };
+                            session.and_then(|session| {
+                                *selected = Some(session.session_id.clone());
+                                let _ = self.messages.send(WorkerMessage::Session(session));
+                                let status = self.status(&mut client)?;
+                                busy = status.state != "idle";
+                                pending_approvals = !status.pending_approvals.is_empty();
+                                Ok(())
+                            })
+                        }
+                        CommandMessage::Send(text) => client.send(&text).map(|accepted| {
+                            if accepted {
+                                busy = true;
+                                let _ = self.messages.send(WorkerMessage::Sent(text));
+                            } else {
+                                self.reject("server did not accept the message");
+                            }
+                        }),
+                        CommandMessage::Approve(id) | CommandMessage::Deny(id) => {
+                            let was_idle = !busy;
+                            let result = if approve {
+                                client.approve(&id)
+                            } else {
+                                client.deny(&id)
+                            };
+                            result.and_then(|_| {
+                                let status = self.status(&mut client)?;
+                                busy = status.state != "idle";
+                                pending_approvals = !status.pending_approvals.is_empty();
+                                resumed_tool |= was_idle && busy;
+                                Ok(())
+                            })
+                        }
+                        CommandMessage::Abort => client.abort().map(|_| ()),
+                    };
+                    match result {
+                        Err(error @ (ClientError::Rpc { .. } | ClientError::RequestTooLarge)) => {
+                            self.reject(&error.to_string());
+                        }
+                        Err(error) => return Err(error),
+                        Ok(()) => {}
+                    }
+                }
+                Err(TryRecvError::Disconnected) => return Ok(false),
+                Err(TryRecvError::Empty) => {}
+            }
+            // Resumed approvals run a tool without an agent_end event.
+            if resumed_tool && last_status.elapsed() >= Duration::from_millis(100) {
+                let status = self.status(&mut client)?;
+                busy = status.state != "idle";
+                pending_approvals = !status.pending_approvals.is_empty();
+                resumed_tool = busy;
+                last_status = Instant::now();
+            }
+            client.set_read_timeout(Some(Duration::from_millis(20)))?;
+            match client.next_event() {
+                Ok(event) => {
+                    if event.session_id() != selected.as_deref() {
+                        continue;
+                    }
+                    let refresh_approvals = matches!(event, ServerEvent::ApprovalEnd { .. });
+                    match &event {
+                        ServerEvent::AgentEnd { .. }
+                        | ServerEvent::TurnAborted { .. }
+                        | ServerEvent::Error { .. } => {
+                            busy = false;
+                            pending_approvals = false;
+                        }
+                        ServerEvent::TurnStart { .. } => busy = true,
+                        ServerEvent::ApprovalRequest { .. } => pending_approvals = true,
+                        _ => {}
+                    }
+                    let _ = self.messages.send(WorkerMessage::Event(event));
+                    if refresh_approvals {
+                        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+                        let status = self.status(&mut client)?;
+                        busy = status.state != "idle";
+                        pending_approvals = !status.pending_approvals.is_empty();
+                    }
+                }
+                Err(ClientError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+fn connect(
+    socket: &Option<PathBuf>,
+    process: &mut Option<Child>,
+) -> Result<ProtocolClient, ClientError> {
+    let path = socket.clone().unwrap_or_else(default_socket);
+    connect_or_spawn(&path, socket.is_none(), process, || {
+        Command::new(zeta_binary())
+            .arg("serve")
+            .arg("--socket")
+            .arg(&path)
+            .spawn()
+    })
+}
+
+fn connect_or_spawn(
+    path: &std::path::Path,
+    spawn_allowed: bool,
+    process: &mut Option<Child>,
+    spawn: impl FnOnce() -> std::io::Result<Child>,
+) -> Result<ProtocolClient, ClientError> {
+    match ProtocolClient::connect_socket(path) {
+        Err(ClientError::Io(error))
+            if spawn_allowed
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) => {}
+        result => return result,
+    }
+    *process = Some(spawn()?);
+    for _ in 0..50 {
+        match ProtocolClient::connect_socket(path) {
+            Err(ClientError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(100));
+            }
+            result => return result,
+        }
+    }
+    ProtocolClient::connect_socket(path)
+}
+
+fn zeta_binary() -> String {
+    env::var("ZETA_BIN").unwrap_or_else(|_| "zeta".to_owned())
+}
+
+fn default_socket() -> PathBuf {
+    if let Some(home) = env::var_os("ZETA_HOME") {
+        return PathBuf::from(home).join("run/serve.sock");
+    }
+    PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".zeta/run/serve.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    fn stale_socket(path: &std::path::Path) {
+        // Bind without listening: the path exists but cannot accept connections,
+        // regardless of when macOS finishes closing the process's socket.
+        assert!(Command::new("python3")
+            .arg("-c")
+            .arg("import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])")
+            .arg(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn default_connection_spawns_for_missing_and_stale_sockets() {
+        for stale in [false, true] {
+            let path =
+                env::temp_dir().join(format!("zg-spawn-{}-{stale}.sock", std::process::id()));
+            if stale {
+                stale_socket(&path);
+                assert!(path.exists());
+            }
+            let mut process = None;
+            let client = connect_or_spawn(&path, true, &mut process, || {
+                Command::new("python3")
+                    .arg("-c")
+                    .arg("import os,socket,sys,time; p=sys.argv[1]; time.sleep(0.15); os.path.exists(p) and os.unlink(p); s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1); c,_=s.accept(); c.recv(1)")
+                    .arg(&path)
+                    .spawn()
+            }).unwrap();
+            drop(client);
+            assert!(process.unwrap().wait().unwrap().success());
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn existing_server_connects_without_spawning_and_explicit_stale_socket_fails() {
+        let path = env::temp_dir().join(format!("zg-existing-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut process = None;
+        let client = connect_or_spawn(&path, true, &mut process, || {
+            panic!("must reuse the server")
+        })
+        .unwrap();
+        drop(listener.accept().unwrap());
+        drop(client);
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        stale_socket(&path);
+        assert!(matches!(
+            connect_or_spawn(&path, false, &mut process, || panic!(
+                "explicit paths never spawn"
+            )),
+            Err(ClientError::Io(_))
+        ));
+        assert!(
+            path.exists(),
+            "the GUI must not remove stale socket files itself"
+        );
+        assert!(process.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+}
