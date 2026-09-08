@@ -12,6 +12,7 @@ FORBIDDEN = {
     "providers": {"tools", "skills", "tui", "cli"},
     "tools": {"providers", "skills", "tui", "cli"},
     "skills": {"providers", "tui", "cli"},
+    "server": {"tui"},
 }
 
 

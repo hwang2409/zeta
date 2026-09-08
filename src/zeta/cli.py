@@ -138,6 +138,18 @@ def build_parser() -> argparse.ArgumentParser:
     from .session_cli import add_subcommand as _add_session_subcommand
 
     _add_session_subcommand(commands)
+    serve_parser = commands.add_parser(
+        "serve", help="serve zeta to one local frontend client"
+    )
+    serve_parser.add_argument(
+        "--socket", dest="socket_path", help="Unix socket path"
+    )
+    serve_parser.add_argument(
+        "--port", type=int, help="listen on localhost TCP instead of a Unix socket"
+    )
+    serve_parser.add_argument("--provider", dest="serve_provider", choices=("fake", "claude", "codex"))
+    serve_parser.add_argument("--model", dest="serve_model")
+    serve_parser.add_argument("--cwd", help="working directory for new sessions")
     return parser
 
 
@@ -209,6 +221,21 @@ def main(argv: list[str] | None = None) -> int:
         from .session_cli import run as _run_session
 
         return _run_session(args)
+    if args.command == "serve":
+        from .server import ZetaServer, run_server
+
+        server = ZetaServer(
+            cwd=args.cwd,
+            socket_path=args.socket_path,
+            port=args.port,
+            provider=args.serve_provider or args.provider,
+            model=args.serve_model or args.model,
+        )
+        try:
+            asyncio.run(run_server(server))
+        except KeyboardInterrupt:
+            return 130
+        return 0
     if args.prompt is not None:
         from .headless import run_headless
 
