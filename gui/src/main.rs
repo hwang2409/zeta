@@ -2,8 +2,8 @@ mod composer;
 mod transcript;
 use composer::Composer;
 use gpui::{
-    div, prelude::*, px, App, Bounds, Context, FocusHandle, Focusable, KeyDownEvent, Render,
-    ScrollHandle, Task, Window, WindowBounds, WindowOptions,
+    div, list, prelude::*, px, App, Bounds, Context, FocusHandle, Focusable, FollowMode,
+    KeyDownEvent, ListAlignment, ListState, Render, Task, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use std::env;
@@ -24,16 +24,24 @@ fn appearance(window: &Window) -> Appearance {
     }
 }
 
+fn transcript_list() -> ListState {
+    let state = ListState::new(0, ListAlignment::Top, px(200.));
+    state.set_follow_mode(FollowMode::Tail);
+    state
+}
+
 struct ZetaView {
     state: AppState,
     appearance: Appearance,
-    transcript_scroll: ScrollHandle,
+    transcript_scroll: ListState,
     composer: gpui::Entity<Composer>,
     pending_command: bool,
     command_error: Option<String>,
     commands: Sender<CommandMessage>,
     focus_handle: FocusHandle,
     _poll_task: Task<()>,
+    #[cfg(test)]
+    rendered_rows: usize,
 }
 
 impl Focusable for ZetaView {
@@ -88,17 +96,20 @@ impl ZetaView {
         Self {
             state: AppState::default(),
             appearance: appearance(window),
-            transcript_scroll: ScrollHandle::new(),
+            transcript_scroll: transcript_list(),
             composer,
             pending_command: false,
             command_error: None,
             commands: command_tx,
             focus_handle: cx.focus_handle(),
             _poll_task: poll_task,
+            #[cfg(test)]
+            rendered_rows: 0,
         }
     }
 
     fn apply_worker_message(&mut self, message: WorkerMessage, cx: &mut Context<Self>) {
+        let previous_session = self.state.active_session.clone();
         match message {
             WorkerMessage::Sessions(list) => {
                 self.state.sessions = list.sessions;
@@ -106,9 +117,6 @@ impl ZetaView {
             }
             WorkerMessage::Session(session) => {
                 self.pending_command = false;
-                if self.state.active_session.as_deref() != Some(&session.session_id) {
-                    self.transcript_scroll = ScrollHandle::new();
-                }
                 self.state.select_session(Some(session.session_id.clone()));
                 if !self
                     .state
@@ -134,11 +142,24 @@ impl ZetaView {
                 self.command_error = Some(error);
             }
             WorkerMessage::Connected => self.state.connection = ConnectionState::Connected,
-            WorkerMessage::Event(event) => self.state.apply(event),
+            WorkerMessage::Event(event) => {
+                if let Some(index) = self.state.apply(event) {
+                    self.remeasure_row(index);
+                }
+            }
             WorkerMessage::Lost(error) => {
                 self.pending_command = false;
                 self.state.mark_connection_lost(error);
             }
+        }
+        if self.state.active_session != previous_session {
+            self.transcript_scroll = transcript_list();
+        }
+    }
+
+    fn remeasure_row(&self, index: usize) {
+        if index < self.transcript_scroll.item_count() {
+            self.transcript_scroll.remeasure_items(index..index + 1);
         }
     }
 
@@ -307,138 +328,157 @@ impl ZetaView {
     }
 
     fn render_transcript(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = self.state.transcript.len();
+        let previous_count = self.transcript_scroll.item_count();
+        if count != previous_count {
+            self.transcript_scroll.splice(
+                previous_count.min(count)..previous_count,
+                count.saturating_sub(previous_count),
+            );
+        }
+        list(
+            self.transcript_scroll.clone(),
+            cx.processor(|view, index, _, cx| {
+                view.render_transcript_row(index, cx).into_any_element()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .max_w(px(760.))
+        .self_center()
+        .p_6()
+    }
+
+    fn render_transcript_row(&mut self, index: usize, cx: &mut Context<Self>) -> gpui::Div {
+        #[cfg(test)]
+        {
+            self.rendered_rows += 1;
+        }
         let p = self.appearance.palette();
-        // Read the previous layout before new output changes the content height.
-        // Scrolling away leaves the offset in place until the user returns to the tail.
-        if self.transcript_scroll.offset().y + self.transcript_scroll.max_offset().y <= px(1.) {
-            self.transcript_scroll.scroll_to_bottom();
-        }
-        let mut transcript = div()
-            .id("transcript")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.transcript_scroll)
-            .flex()
-            .flex_col()
-            .w_full()
-            .max_w(px(760.))
-            .self_center()
-            .p_6()
-            .gap_4();
-        for (index, entry) in self.state.transcript.iter().enumerate() {
-            let row = match entry {
-                TranscriptEntry::User(text) => div()
-                    .text_color(gpui::rgb(p.text))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child(text.clone()),
-                TranscriptEntry::Assistant(text) => match &text.root {
-                    Some(root) => div().child(transcript::render_block(
-                        root,
-                        self.appearance,
-                        format!("markdown-{index}"),
-                    )),
-                    None => div().child(text.source.clone()),
-                },
-                TranscriptEntry::Tool {
-                    name,
-                    summary,
-                    complete,
-                    error,
-                    card,
-                    ..
-                } => {
-                    let marker = if *error {
-                        "[failed]"
-                    } else if *complete {
-                        "[done]"
-                    } else {
-                        "[working]"
-                    };
-                    let label = card
-                        .agent_label
-                        .as_ref()
-                        .map_or_else(|| name.clone(), |label| format!("{label} / {name}"));
-                    let disclosure = if card.expanded { "collapse" } else { "expand" };
-                    let border = if card.agent_label.is_some() {
-                        p.nested_border
-                    } else {
-                        p.border
-                    };
-                    let header = div()
-                        .id(format!("card-{index}"))
-                        .debug_selector(|| format!("card-{index}"))
-                        .tab_index(0)
-                        .min_h(px(40.))
-                        .px_3()
-                        .py_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .cursor_pointer()
-                        .text_size(px(12.))
-                        .text_color(gpui::rgb(if *error { p.error } else { p.muted }))
-                        .hover(|view| view.bg(gpui::rgb(p.panel)))
-                        .focus(|view| view.border_color(gpui::rgb(p.accent)).border_1())
-                        .child(div().flex_shrink_0().font_family("monospace").child(marker))
-                        .child(
+        let entry = &self.state.transcript[index];
+        let row = match entry {
+            TranscriptEntry::User(text) => div()
+                .text_color(gpui::rgb(p.text))
+                .font_weight(gpui::FontWeight::BOLD)
+                .child(text.clone()),
+            TranscriptEntry::Assistant(text) => match &text.root {
+                Some(root) => div().child(transcript::render_block(
+                    root,
+                    self.appearance,
+                    format!("markdown-{index}"),
+                )),
+                None => div()
+                    .when(text.preview_truncated, |view| {
+                        view.child(
                             div()
-                                .min_w_0()
-                                .flex_1()
-                                .truncate()
-                                .child(format!("{label}  {summary}")),
+                                .text_color(gpui::rgb(p.muted))
+                                .child("showing latest response text"),
                         )
-                        .child(div().flex_shrink_0().child(disclosure))
-                        .on_click(cx.listener(move |view, _, _, cx| {
+                    })
+                    .child(gpui::SharedString::from(text.source.clone())),
+            },
+            TranscriptEntry::Tool {
+                name,
+                summary,
+                card,
+                ..
+            } => {
+                let marker = entry.tool_marker();
+                let label = card
+                    .agent_label
+                    .as_ref()
+                    .map_or_else(|| name.clone(), |label| format!("{label} / {name}"));
+                let disclosure = if card.expanded { "collapse" } else { "expand" };
+                let border = if card.agent_label.is_some() {
+                    p.nested_border
+                } else {
+                    p.border
+                };
+                let header = div()
+                    .id(format!("card-{index}"))
+                    .debug_selector(|| format!("card-{index}"))
+                    .tab_index(0)
+                    .min_h(px(40.))
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(gpui::rgb(if entry.unsuccessful() {
+                        p.error
+                    } else {
+                        p.muted
+                    }))
+                    .hover(|view| view.bg(gpui::rgb(p.panel)))
+                    .focus(|view| view.border_color(gpui::rgb(p.accent)).border_1())
+                    .child(
+                        div()
+                            .debug_selector(move || format!("tool-marker-{marker}"))
+                            .flex_shrink_0()
+                            .font_family("monospace")
+                            .child(marker),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .child(format!("{label}  {summary}")),
+                    )
+                    .child(div().flex_shrink_0().child(disclosure))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.state.toggle_card(index);
+                        view.remeasure_row(index);
+                        cx.notify();
+                    }))
+                    .on_key_down(cx.listener(move |view, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "enter" && view.state.approvals.is_empty() {
                             view.state.toggle_card(index);
+                            view.remeasure_row(index);
+                            cx.stop_propagation();
                             cx.notify();
-                        }))
-                        .on_key_down(cx.listener(move |view, event: &KeyDownEvent, _, cx| {
-                            if event.keystroke.key == "enter" && view.state.approvals.is_empty() {
-                                view.state.toggle_card(index);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                        }));
-                    div()
-                        .min_w_0()
-                        .border_1()
-                        .border_color(gpui::rgb(border))
-                        .rounded(px(4.))
-                        .when(card.agent_label.is_some(), |view| view.ml_4())
-                        .child(header)
-                        .when(card.expanded, |view| {
-                            view.child(
-                                div()
-                                    .id(format!("tail-{index}"))
-                                    .max_h(px(320.))
-                                    .overflow_y_scroll()
-                                    .border_t_1()
-                                    .border_color(gpui::rgb(border))
-                                    .px_3()
-                                    .py_2()
-                                    .font_family("monospace")
-                                    .text_size(px(12.))
-                                    .line_height(px(20.))
-                                    .when(card.tail.truncated, |view| {
-                                        view.child(
-                                            div()
-                                                .text_color(gpui::rgb(p.muted))
-                                                .child("output truncated"),
-                                        )
-                                    })
-                                    .child(if card.tail.text.is_empty() {
-                                        "waiting for output".into()
-                                    } else {
-                                        card.tail.text.clone()
-                                    }),
-                            )
-                        })
-                }
-            };
-            transcript = transcript.child(row.flex_shrink_0());
-        }
-        transcript
+                        }
+                    }));
+                div()
+                    .min_w_0()
+                    .border_1()
+                    .border_color(gpui::rgb(border))
+                    .rounded(px(4.))
+                    .when(card.agent_label.is_some(), |view| view.ml_4())
+                    .child(header)
+                    .when(card.expanded, |view| {
+                        view.child(
+                            div()
+                                .id(format!("tail-{index}"))
+                                .max_h(px(320.))
+                                .overflow_y_scroll()
+                                .border_t_1()
+                                .border_color(gpui::rgb(border))
+                                .px_3()
+                                .py_2()
+                                .font_family("monospace")
+                                .text_size(px(12.))
+                                .line_height(px(20.))
+                                .when(card.tail.truncated, |view| {
+                                    view.child(
+                                        div()
+                                            .text_color(gpui::rgb(p.muted))
+                                            .child("output truncated"),
+                                    )
+                                })
+                                .child(if card.tail.text.is_empty() {
+                                    "waiting for output".into()
+                                } else {
+                                    card.tail.text.clone()
+                                }),
+                        )
+                    })
+            }
+        };
+        div().w_full().min_h(px(24.)).pb_4().child(row)
     }
 
     fn render_composer(&self) -> impl IntoElement {
@@ -711,6 +751,30 @@ mod tests {
                 cx.notify();
             })
             .unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                view.apply_worker_message(
+                    WorkerMessage::Event(zeta_gui::client::ServerEvent::ToolEnd {
+                        session_id: None,
+                        tool_call: ToolCall {
+                            id: "tool".into(),
+                            name: "read".into(),
+                            arguments: Default::default(),
+                        },
+                        tool_result: Some(
+                            serde_json::from_value(serde_json::json!({
+                                "tool_call_id": "tool", "content": "tool execution canceled",
+                                "is_error": false, "is_canceled": true
+                            }))
+                            .unwrap(),
+                        ),
+                        data: serde_json::json!({}),
+                    }),
+                    cx,
+                );
+                cx.notify();
+            })
+            .unwrap();
         // GPUI's platform appearance simulator is private. Force our palette
         // explicitly; production uses the window appearance observer above.
         for mode in [Appearance::Dark, Appearance::Light] {
@@ -725,6 +789,8 @@ mod tests {
         }
         let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
         visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("tool-marker-[canceled]").is_some());
+        assert!(visual.debug_bounds("tool-marker-[done]").is_none());
         let header = visual.debug_bounds("card-0").expect("receipt header");
         assert!(header.size.height >= px(40.));
         visual.simulate_click(header.center(), Default::default());
@@ -803,13 +869,14 @@ mod tests {
                 ..Default::default()
             },
             appearance: Appearance::Light,
-            transcript_scroll: ScrollHandle::new(),
+            transcript_scroll: transcript_list(),
             composer: cx.new(Composer::new),
             pending_command: false,
             command_error: None,
             commands,
             focus_handle: cx.focus_handle(),
             _poll_task: Task::ready(()),
+            rendered_rows: 0,
         });
         window
             .update(cx, |view, window, cx| {
@@ -847,13 +914,18 @@ mod tests {
     #[gpui::test]
     fn transcript_scrolls_and_follows_output_only_at_the_tail(cx: &mut gpui::TestAppContext) {
         use gpui::{point, size, ScrollDelta, ScrollWheelEvent};
-        let scroll = ScrollHandle::new();
+        let scroll = transcript_list();
         let handle = scroll.clone();
         let (commands, _receiver) = mpsc::channel();
         let window = cx.open_window(size(px(1100.), px(760.)), move |_, cx| ZetaView {
             state: AppState {
                 connection: ConnectionState::Connected,
-                transcript: vec![TranscriptEntry::Assistant("line\n".repeat(100).into())],
+                transcript: (0..50)
+                    .map(|_| TranscriptEntry::User("line".into()))
+                    .chain([TranscriptEntry::Assistant(
+                        zeta_gui::markdown::Markdown::streaming("line\n".repeat(10)),
+                    )])
+                    .collect(),
                 ..Default::default()
             },
             appearance: Appearance::Light,
@@ -864,6 +936,7 @@ mod tests {
             commands,
             focus_handle: cx.focus_handle(),
             _poll_task: Task::ready(()),
+            rendered_rows: 0,
         });
         let draw = |cx: &mut gpui::TestAppContext| {
             cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
@@ -872,10 +945,14 @@ mod tests {
         let append = |cx: &mut gpui::TestAppContext| {
             window
                 .update(cx, |view, _, cx| {
-                    if let Some(TranscriptEntry::Assistant(text)) = view.state.transcript.last_mut()
-                    {
-                        text.push_str(&"new line\n".repeat(20));
-                    }
+                    view.apply_worker_message(
+                        WorkerMessage::Event(zeta_gui::client::ServerEvent::AssistantDelta {
+                            session_id: None,
+                            kind: "assistant".into(),
+                            delta: "new line\n".repeat(5),
+                        }),
+                        cx,
+                    );
                     cx.notify();
                 })
                 .unwrap();
@@ -883,7 +960,7 @@ mod tests {
         let wheel = |cx: &mut gpui::TestAppContext, delta| {
             gpui::VisualTestContext::from_window(window.into(), cx).simulate_event(
                 ScrollWheelEvent {
-                    position: scroll.bounds().center(),
+                    position: point(px(700.), px(300.)),
                     delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
                     ..Default::default()
                 },
@@ -891,39 +968,161 @@ mod tests {
             cx.executor().run_until_parked();
         };
         draw(cx);
-        assert!(scroll.max_offset().y > px(0.), "long output must overflow");
-        assert_eq!(scroll.offset().y, -scroll.max_offset().y);
         assert!(
-            scroll.bounds().bottom() < px(760.),
-            "the composer stays in the viewport"
+            scroll.logical_scroll_top().item_ix > 0,
+            "long transcript must overflow"
         );
-        let previous_max = scroll.max_offset().y;
+        assert!(scroll.is_following_tail());
+        let bottom = scroll.bounds_for_item(50).unwrap().bottom();
+        assert!(bottom < px(760.), "the composer stays in the viewport");
+        let before = scroll.logical_scroll_top();
         append(cx);
         draw(cx);
-        assert!(scroll.max_offset().y > previous_max);
-        assert_eq!(scroll.offset().y, -scroll.max_offset().y);
+        assert!(
+            scroll.logical_scroll_top().item_ix != before.item_ix
+                || scroll.logical_scroll_top().offset_in_item != before.offset_in_item
+        );
+        assert_eq!(scroll.bounds_for_item(50).unwrap().bottom(), bottom);
+        assert!(scroll.is_following_tail());
 
         wheel(cx, 200.);
         draw(cx);
-        let away = scroll.offset().y;
-        assert!(away > -scroll.max_offset().y);
+        let away = scroll.logical_scroll_top();
+        assert!(!scroll.is_following_tail());
         append(cx);
         draw(cx);
         assert_eq!(
-            scroll.offset().y,
-            away,
+            (
+                scroll.logical_scroll_top().item_ix,
+                scroll.logical_scroll_top().offset_in_item
+            ),
+            (away.item_ix, away.offset_in_item),
             "new output must preserve the reading position"
         );
 
         wheel(cx, -10000.);
         draw(cx);
-        assert_eq!(scroll.offset().y, -scroll.max_offset().y);
+        assert!(scroll.is_following_tail());
         append(cx);
         draw(cx);
-        assert_eq!(
-            scroll.offset().y,
-            -scroll.max_offset().y,
+        assert_eq!(scroll.bounds_for_item(50).unwrap().bottom(), bottom);
+        assert!(
+            scroll.is_following_tail(),
             "returning to the tail resumes following"
+        );
+    }
+
+    #[gpui::test]
+    fn streaming_draw_work_is_independent_of_transcript_length(cx: &mut gpui::TestAppContext) {
+        let (commands, _receiver) = mpsc::channel();
+        let window = cx.open_window(gpui::size(px(1100.), px(760.)), move |_, cx| ZetaView {
+            state: AppState {
+                connection: ConnectionState::Connected,
+                ..Default::default()
+            },
+            appearance: Appearance::Light,
+            transcript_scroll: transcript_list(),
+            composer: cx.new(Composer::new),
+            pending_command: false,
+            command_error: None,
+            commands,
+            focus_handle: cx.focus_handle(),
+            _poll_task: Task::ready(()),
+            rendered_rows: 0,
+        });
+        let mut work = Vec::new();
+        for count in [100, 10_000] {
+            window
+                .update(cx, |view, _, cx| {
+                    view.state.transcript = (0..count)
+                        .map(|_| TranscriptEntry::User("history".into()))
+                        .collect();
+                    view.state.transcript.push(TranscriptEntry::Assistant(
+                        zeta_gui::markdown::Markdown::streaming("x".repeat(5 * 1024 * 1024)),
+                    ));
+                    view.transcript_scroll = transcript_list();
+                    cx.notify();
+                })
+                .unwrap();
+            for _ in 0..3 {
+                window
+                    .update(cx, |view, _, cx| {
+                        view.rendered_rows = 0;
+                        view.apply_worker_message(
+                            WorkerMessage::Event(zeta_gui::client::ServerEvent::AssistantDelta {
+                                session_id: None,
+                                kind: "assistant".into(),
+                                delta: "latest\n".into(),
+                            }),
+                            cx,
+                        );
+                        cx.notify();
+                    })
+                    .unwrap();
+                cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                    .unwrap();
+                window
+                    .update(cx, |view, _, _| {
+                        assert!(
+                            view.rendered_rows > 0 && view.rendered_rows < 60,
+                            "rendered {} rows of {count}",
+                            view.rendered_rows
+                        );
+                        work.push(view.rendered_rows);
+                    })
+                    .unwrap();
+            }
+            // Scrolling into history must also render only a viewport, and the
+            // offscreen streaming row must not pull the viewport back to the end.
+            window
+                .update(cx, |view, _, cx| {
+                    view.transcript_scroll.scroll_to(gpui::ListOffset {
+                        item_ix: 20,
+                        offset_in_item: px(0.),
+                    });
+                    view.rendered_rows = 0;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            window
+                .update(cx, |view, _, _| {
+                    assert!(view.rendered_rows > 0 && view.rendered_rows < 60);
+                    assert_eq!(
+                        view.transcript_scroll.item_is_below_viewport(count),
+                        Some(true)
+                    );
+                })
+                .unwrap();
+            window
+                .update(cx, |view, _, cx| {
+                    view.rendered_rows = 0;
+                    view.apply_worker_message(
+                        WorkerMessage::Event(zeta_gui::client::ServerEvent::AssistantDelta {
+                            session_id: None,
+                            kind: "assistant".into(),
+                            delta: "offscreen update\n".into(),
+                        }),
+                        cx,
+                    );
+                    cx.notify();
+                })
+                .unwrap();
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            window
+                .update(cx, |view, _, _| {
+                    assert!(view.rendered_rows > 0 && view.rendered_rows < 60);
+                    assert_eq!(view.transcript_scroll.logical_scroll_top().item_ix, 20);
+                    assert!(!view.transcript_scroll.is_following_tail());
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            &work[..3],
+            &work[3..],
+            "10,000 rows must cost the same as 100 rows"
         );
     }
 
@@ -949,12 +1148,13 @@ mod tests {
                 },
                 appearance: Appearance::Light,
                 composer,
-                transcript_scroll: ScrollHandle::new(),
+                transcript_scroll: transcript_list(),
                 pending_command: false,
                 command_error: None,
                 commands,
                 focus_handle: cx.focus_handle(),
                 _poll_task: Task::ready(()),
+                rendered_rows: 0,
             }
         });
         cx.simulate_keystrokes(window.into(), "enter");

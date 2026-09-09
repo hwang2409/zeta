@@ -36,8 +36,27 @@ pub enum TranscriptEntry {
         summary: String,
         complete: bool,
         error: bool,
+        canceled: bool,
         card: Card,
     },
+}
+
+impl TranscriptEntry {
+    pub fn tool_marker(&self) -> &'static str {
+        match self {
+            Self::Tool { canceled: true, .. } => "[canceled]",
+            Self::Tool { error: true, .. } => "[failed]",
+            Self::Tool { complete: true, .. } => "[done]",
+            _ => "[working]",
+        }
+    }
+
+    pub fn unsuccessful(&self) -> bool {
+        matches!(
+            self,
+            Self::Tool { error: true, .. } | Self::Tool { canceled: true, .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,7 +140,8 @@ impl AppState {
         self.approvals = status.pending_approvals;
     }
 
-    pub fn apply(&mut self, event: ServerEvent) {
+    pub fn apply(&mut self, event: ServerEvent) -> Option<usize> {
+        let mut changed = None;
         match event {
             ServerEvent::TurnStart { .. } => {
                 self.streaming = true;
@@ -140,27 +160,35 @@ impl AppState {
                         .transcript
                         .push(TranscriptEntry::Assistant(Markdown::streaming(delta))),
                 }
+                changed = self.transcript.len().checked_sub(1);
             }
             ServerEvent::AssistantDelta { .. } => {}
-            ServerEvent::AssistantMessage { message, .. } => self.commit_assistant(message),
+            ServerEvent::AssistantMessage { message, .. } => {
+                changed = self.commit_assistant(message)
+            }
             ServerEvent::ToolStart {
                 session_id,
                 tool_call,
                 data,
-            } => self.transcript.push(tool_entry(
-                &tool_call,
-                ToolReceiptKey::new(session_id, &data, &tool_call),
-            )),
+            } => {
+                self.transcript.push(tool_entry(
+                    &tool_call,
+                    ToolReceiptKey::new(session_id, &data, &tool_call),
+                ));
+                changed = self.transcript.len().checked_sub(1);
+            }
             ServerEvent::ToolOutput {
                 session_id,
                 tool_call,
                 output,
                 data,
             } => {
-                if let TranscriptEntry::Tool { summary, card, .. } = self.tool_receipt(
+                let (index, entry) = self.tool_receipt(
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
-                ) {
+                );
+                changed = Some(index);
+                if let TranscriptEntry::Tool { summary, card, .. } = entry {
                     card.tail.append(&output);
                     if let Some(line) = card
                         .tail
@@ -179,17 +207,21 @@ impl AppState {
                 session_id,
                 data,
             } => {
+                let (index, entry) = self.tool_receipt(
+                    &tool_call,
+                    ToolReceiptKey::new(session_id, &data, &tool_call),
+                );
+                changed = Some(index);
                 if let TranscriptEntry::Tool {
                     complete,
                     error,
+                    canceled,
                     summary,
                     card,
                     name,
                     ..
-                } = self.tool_receipt(
-                    &tool_call,
-                    ToolReceiptKey::new(session_id, &data, &tool_call),
-                ) {
+                } = entry
+                {
                     if name.eq_ignore_ascii_case("agent") {
                         if let Some(child) = tool_result
                             .as_ref()
@@ -199,7 +231,11 @@ impl AppState {
                             card.child_instance_id = Some(child.to_owned());
                         }
                     }
-                    *complete = !name.eq_ignore_ascii_case("agent")
+                    *canceled = tool_result
+                        .as_ref()
+                        .is_some_and(|result| result.is_canceled);
+                    *complete = *canceled
+                        || !name.eq_ignore_ascii_case("agent")
                         || !tool_result
                             .as_ref()
                             .and_then(|result| result.structured_content.as_ref())
@@ -226,7 +262,7 @@ impl AppState {
                 session_id,
                 receipt,
             } => {
-                self.commit_sub_agent(session_id, receipt);
+                changed = Some(self.commit_sub_agent(session_id, receipt));
             }
             ServerEvent::ApprovalRequest { approval, .. } => {
                 if !self
@@ -262,10 +298,13 @@ impl AppState {
                     },
                     complete: true,
                     error: true,
+                    canceled: false,
                 });
+                changed = self.transcript.len().checked_sub(1);
             }
             ServerEvent::Other { .. } => {}
         }
+        changed
     }
 
     pub fn toggle_card(&mut self, index: usize) {
@@ -274,7 +313,11 @@ impl AppState {
         }
     }
 
-    fn tool_receipt(&mut self, tool_call: &ToolCall, key: ToolReceiptKey) -> &mut TranscriptEntry {
+    fn tool_receipt(
+        &mut self,
+        tool_call: &ToolCall,
+        key: ToolReceiptKey,
+    ) -> (usize, &mut TranscriptEntry) {
         let index = self
             .transcript
             .iter()
@@ -285,10 +328,10 @@ impl AppState {
                 self.transcript.push(tool_entry(tool_call, key));
                 self.transcript.len() - 1
             });
-        &mut self.transcript[index]
+        (index, &mut self.transcript[index])
     }
 
-    fn commit_sub_agent(&mut self, session_id: Option<String>, receipt: SubAgentReceipt) {
+    fn commit_sub_agent(&mut self, session_id: Option<String>, receipt: SubAgentReceipt) -> usize {
         // Durable notifications have no raw tool ID. The launch result supplies
         // the child identity when we saw it; reconnect drains can create it alone.
         let index = self
@@ -310,6 +353,7 @@ impl AppState {
                     summary: String::new(),
                     complete: false,
                     error: false,
+                    canceled: false,
                     card: Card {
                         child_instance_id: Some(receipt.child_instance_id.clone()),
                         ..Default::default()
@@ -321,12 +365,14 @@ impl AppState {
             summary,
             complete,
             error,
+            canceled,
             card,
             ..
         } = &mut self.transcript[index]
         {
             *complete = true;
             *error = receipt.status != SubAgentStatus::Completed;
+            *canceled = receipt.status == SubAgentStatus::Canceled;
             *summary = bounded_summary(
                 receipt
                     .text
@@ -339,12 +385,13 @@ impl AppState {
             card.tail = OutputTail::default();
             card.tail.append(&receipt.text);
         }
+        index
     }
 
-    fn commit_assistant(&mut self, message: Message) {
+    fn commit_assistant(&mut self, message: Message) -> Option<usize> {
         let text = message.text();
         if text.is_empty() {
-            return;
+            return None;
         }
         match self.transcript.last_mut() {
             Some(TranscriptEntry::Assistant(current)) => *current = text.into(),
@@ -352,6 +399,7 @@ impl AppState {
                 .transcript
                 .push(TranscriptEntry::Assistant(text.into())),
         }
+        self.transcript.len().checked_sub(1)
     }
 }
 
@@ -434,6 +482,7 @@ fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey) -> TranscriptEntry {
         ),
         complete: false,
         error: false,
+        canceled: false,
     }
 }
 
@@ -442,6 +491,42 @@ mod tests {
     use super::*;
     use crate::client::{EventError, ToolResult};
     use serde_json::json;
+
+    #[test]
+    fn canceled_server_results_never_show_success() {
+        for is_error in [false, true] {
+            let mut state = AppState::default();
+            // server/server.py forwards ToolResult.to_dict() unchanged. Agent
+            // cancellations use false/true; approval cancellations use true/true.
+            let result = serde_json::from_value(json!({
+                "tool_call_id": "tool-1", "content": "tool execution canceled",
+                "is_error": is_error, "is_canceled": true,
+                "structured_content": {"status": "running"}
+            }))
+            .unwrap();
+            let changed = state.apply(ServerEvent::ToolEnd {
+                session_id: None,
+                tool_call: ToolCall {
+                    name: "agent".into(),
+                    ..call()
+                },
+                tool_result: Some(result),
+                data: json!({}),
+            });
+            assert_eq!(changed, Some(0));
+            let entry = &state.transcript[0];
+            assert_eq!(entry.tool_marker(), "[canceled]");
+            assert!(entry.unsuccessful());
+            assert!(matches!(
+                entry,
+                TranscriptEntry::Tool {
+                    complete: true,
+                    canceled: true,
+                    ..
+                }
+            ));
+        }
+    }
 
     #[test]
     fn metrics_ignore_midstream_status_and_clear_on_session_switch() {
@@ -569,7 +654,7 @@ mod tests {
             );
         }
         assert!(
-            matches!(&state.transcript[0], TranscriptEntry::Assistant(doc) if doc.source == source)
+            matches!(&state.transcript[0], TranscriptEntry::Assistant(doc) if source.ends_with(doc.source.as_ref()) && doc.preview_truncated)
         );
         source.push_str("```\n");
         state.apply(ServerEvent::AssistantMessage {

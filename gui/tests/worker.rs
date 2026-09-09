@@ -266,7 +266,7 @@ fn tool_turn_then_final_answer_and_terminal_error_preserve_order() {
     }
     assert!(!state.streaming);
     assert!(
-        matches!(state.transcript.last(), Some(TranscriptEntry::Assistant(text)) if text.source == "final answer")
+        matches!(state.transcript.last(), Some(TranscriptEntry::Assistant(text)) if text.source.as_ref() == "final answer")
     );
     harness.command(CommandMessage::Send("fail".into()));
     assert!(matches!(harness.next(), WorkerMessage::Sent(_)));
@@ -938,5 +938,9 @@ fn durable_receipts_update_launch_cards_with_duplicate_raw_tool_ids() {
     assert!(
         matches!(&state.transcript[2], TranscriptEntry::Tool { card, .. } if card.tail.text == "review failed\nerror details")
     );
+    assert_eq!(state.transcript[1].tool_marker(), "[done]");
+    assert_eq!(state.transcript[2].tool_marker(), "[failed]");
+    assert_eq!(state.transcript[3].tool_marker(), "[canceled]");
+    assert!(state.transcript[3].unsuccessful());
     harness.finish();
 }
