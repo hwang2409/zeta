@@ -2972,3 +2972,27 @@ async def test_tool_identifiers_must_be_strings(tmp_path: Path) -> None:
             ]
         ),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detail,code,status", [
+    ({"type": "permission_error"}, "permission_denied", None),
+    ({"type": "authentication_error"}, "auth_error", None),
+    ({"type": "not_found_error"}, "model_not_found", None),
+    ({"status_code": 403}, "stream_error", 403),
+    ({"type": "api_error"}, "api_error", None),
+    ({"status_code": "403"}, "stream_error", None),
+])
+async def test_stream_error_preserves_structured_metadata(detail, code, status):
+    from zeta.loop import _error_info
+
+    payload = {"type": "error", "error": {**detail, "message": "Denied"}}
+    response = httpx.Response(200, text=f"data: {json.dumps(payload)}\n\n")
+    try:
+        with pytest.raises(AnthropicStreamError) as raised:
+            [event async for event in anthropic_module._decode_response(response)]
+        info = _error_info(raised.value, provider_error=True)
+        assert (info.code, info.status_code) == (code, status)
+        assert info.provider_error
+    finally:
+        await response.aclose()

@@ -582,8 +582,12 @@ def _translate_event(
         if not isinstance(detail, Mapping) and not isinstance(payload.get("message"), str):
             raise CodexStreamError("Codex stream error payload is invalid")
         error_type = detail.get("type") if isinstance(detail, Mapping) else None
+        if not isinstance(detail, Mapping):
+            detail = payload
         raise CodexStreamError(
             "Codex response reported an error",
+            code=detail.get("code") or error_type,
+            status_code=detail.get("status_code"),
             retryable=error_type in {"overloaded_error", "rate_limit_error"},
             retry_reason=(
                 error_type
@@ -609,7 +613,15 @@ def _translate_event(
     if response_state == "stopped":
         raise CodexStreamError("Codex event follows response completion")
     if event_type == "response.failed":
-        raise CodexStreamError("Codex response failed")
+        response = payload.get("response")
+        detail = response.get("error") if isinstance(response, Mapping) else None
+        if not isinstance(detail, Mapping):
+            detail = {}
+        raise CodexStreamError(
+            "Codex response failed",
+            code=detail.get("code") or detail.get("type"),
+            status_code=detail.get("status_code"),
+        )
     if event_type == "response.incomplete":
         raise CodexStreamError("Codex response was incomplete")
     if event_type in {"response.completed", "response.done"}:

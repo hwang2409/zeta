@@ -2423,3 +2423,37 @@ async def test_cancellation_wins_over_failing_cleanup(tmp_path: Path) -> None:
     with pytest.raises(asyncio.CancelledError) as raised:
         await task
     assert isinstance(raised.value.__cause__, CodexStreamError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["flat", "nested", "failed"])
+@pytest.mark.parametrize("detail,code,status", [
+    ({"code": "model_not_found"}, "model_not_found", None),
+    ({"code": "permission_denied"}, "permission_denied", None),
+    ({"status_code": 403}, "stream_error", 403),
+    ({"code": "server_error"}, "server_error", None),
+    ({"code": None, "status_code": "403"}, "stream_error", None),
+])
+async def test_stream_error_preserves_structured_metadata(shape, detail, code, status):
+    from zeta.loop import _error_info
+
+    detail = {**detail, "message": "Denied"}
+    if shape == "flat":
+        events = [event("error", **detail)]
+    elif shape == "nested":
+        events = [event("error", error=detail)]
+    else:
+        events = [
+            event("response.created", response={"id": "test-response"}),
+            event("response.failed", response={"error": detail}),
+        ]
+    response = httpx.Response(200, text=sse(events))
+    try:
+        with pytest.raises(CodexStreamError) as raised:
+            [item async for item in codex_module._decode_response(response)]
+        info = _error_info(raised.value, provider_error=True)
+        assert (info.code, info.status_code) == (code, status)
+        assert info.provider_error
+        assert "Denied" not in info.message
+    finally:
+        await response.aclose()

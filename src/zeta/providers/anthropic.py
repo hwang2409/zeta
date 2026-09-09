@@ -760,9 +760,10 @@ def _translate_event(
             raise AnthropicStreamError("Anthropic stream error message is invalid")
         reason = detail.get("type")
         reason_text = error_body_excerpt(message.encode()) or "Anthropic stream error"
-        detail = f"{reason}: {reason_text}" if type(reason) is str else reason_text
         raise AnthropicStreamError(
-            detail,
+            f"{reason}: {reason_text}" if type(reason) is str else reason_text,
+            code=reason,
+            status_code=detail.get("status_code"),
             retryable=reason in {"overloaded_error", "rate_limit_error"},
             retry_reason=reason if reason in {"overloaded_error", "rate_limit_error"} else None,
         )
