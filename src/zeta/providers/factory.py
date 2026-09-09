@@ -79,6 +79,7 @@ def build_backend(
     home: str | Path | None = None,
     stall_seconds: float | None = None,
     stall_retries: int | None = None,
+    require_credentials: bool = False,
 ) -> tuple[CompletionBackend, str]:
     """Build a network provider backend and report the model it settled on."""
 
@@ -92,21 +93,39 @@ def build_backend(
         ),
     }
     if provider == "claude":
+        credential = _anthropic_credential(auth_home)
         selected_model = model or DEFAULT_CLAUDE_MODEL
+        if require_credentials:
+            _require_credentials(credential)
         return AnthropicBackend(
             model=selected_model,
-            token_store=_anthropic_credential(auth_home),
+            token_store=credential,
             diagnostics_path=auth_home / "logs" / "stream-diagnostics.jsonl",
             **stall_kwargs,
         ), selected_model
     if provider == "codex":
+        credential = CodexCredentialStore(auth_home / "codex-oauth.json")
+        if require_credentials:
+            _require_credentials(credential)
         selected_model = model or DEFAULT_CODEX_MODEL
         return CodexBackend(
             model=selected_model,
-            token_store=CodexCredentialStore(auth_home / "codex-oauth.json"),
+            token_store=credential,
             **stall_kwargs,
         ), selected_model
     raise ValueError(f"unsupported provider: {provider}")
+
+
+def _require_credentials(credential: AnthropicCredential | OAuthCredentialStore) -> None:
+    """Check local login availability without refreshing or sending a request."""
+    if (
+        isinstance(credential, OAuthCredentialStore)
+        and credential.read() is None
+        and credential.bootstrap() is None
+    ):
+        raise credential.auth_error_type(
+            f"no {credential.provider_label} OAuth login found; log in first"
+        )
 
 
 __all__ = [

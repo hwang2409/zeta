@@ -987,15 +987,15 @@ fn extensions_fetch_switch_fork_apply_settings_and_send_images() {
         peer.respond("session_history", history);
         peer.respond(
             "session_settings",
-            json!({"model":"offline","approval_mode":"ask"}),
+            json!({"model":"claude-sonnet-4-6","approval_mode":"ask"}),
         );
-        peer.respond("model_catalog", json!({"models":["offline","faster"]}));
+        peer.respond("model_catalog", json!({"models":["claude-sonnet-4-6","gpt-5.4"],"providers":{"claude-sonnet-4-6":"claude","gpt-5.4":"codex"}}));
         assert_eq!(
             peer.respond(
                 "set_settings",
-                json!({"model":"faster","approval_mode":"deny"})
+                json!({"model":"gpt-5.4","approval_mode":"deny"})
             )["params"],
-            json!({"session_id":"session-1","model":"faster","approval_mode":"deny"})
+            json!({"session_id":"session-1","model":"gpt-5.4","approval_mode":"deny"})
         );
         peer.status(true, "idle", json!([]));
         let send = peer.respond("send_images", json!({"accepted":true}));
@@ -1026,14 +1026,14 @@ fn extensions_fetch_switch_fork_apply_settings_and_send_images() {
     }
     harness.command(CommandMessage::LoadSettings);
     assert!(
-        matches!(harness.next(), WorkerMessage::Settings(settings, models) if settings.approval_mode == "ask" && models == ["offline", "faster"])
+        matches!(harness.next(), WorkerMessage::Settings(settings, models) if settings.approval_mode == "ask" && models.models == ["claude-sonnet-4-6", "gpt-5.4"] && models.providers.get("gpt-5.4").map(String::as_str) == Some("codex"))
     );
     harness.command(CommandMessage::SetSettings(SessionSettings {
-        model: "faster".into(),
+        model: "gpt-5.4".into(),
         approval_mode: "deny".into(),
     }));
     assert!(
-        matches!(harness.next(), WorkerMessage::SettingsApplied(settings) if settings.model == "faster" && settings.approval_mode == "deny")
+        matches!(harness.next(), WorkerMessage::SettingsApplied(settings) if settings.model == "gpt-5.4" && settings.approval_mode == "deny")
     );
     assert!(matches!(harness.next(), WorkerMessage::Status(_)));
     harness.command(CommandMessage::SendImages(

@@ -935,7 +935,9 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
         *,
         stall_seconds: float | None = None,
         stall_retries: int | None = None,
+        require_credentials: bool = False,
     ) -> tuple[ServerFakeBackend, str]:
+        assert not require_credentials
         serve_calls.append((provider, model, home, stall_seconds, stall_retries))
         selected = model or "offline"
         return ServerFakeBackend(model=selected), selected
@@ -1367,3 +1369,158 @@ async def test_attachment_failure_removes_entire_batch(tmp_path, monkeypatch, fa
         assert runtime.opened.store.messages() == []
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex", None])
+async def test_real_catalog_is_complete_and_fake_requires_explicit_launch(tmp_path, provider):
+    from zeta.model_catalog import PROVIDER_MODELS, known_model_names
+
+    server = ZetaServer(home=tmp_path, port=0, provider=provider,
+                        backend_factory=lambda p, m, h: (FakeBackend([]), m or "offline"))
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        sid = server.runtime.session_id
+        result = (await _request(reader, writer, 3, "model_catalog", {"session_id": sid}))[-1]["result"]
+        assert result["models"] == known_model_names()
+        assert result["providers"] == {m: p for p, models in PROVIDER_MODELS.items() for m in models}
+        assert not {"offline", "faster"} & set(result["models"])
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("failure", [None, "backend", "metadata"])
+async def test_cross_provider_settings_preserve_session_and_budget(tmp_path, monkeypatch, pinned, failure):
+    from zeta.core.slash import budget_for_model
+
+    if pinned:
+        (tmp_path / "settings.toml").write_text("token_budget = 123456\n")
+    builds = []
+
+    def build(provider, model, home):
+        builds.append((provider, model, home))
+        if provider == "codex" and failure == "backend":
+            raise RuntimeError("target backend failed")
+        return FakeBackend([ScriptedTurn([TextContent(provider)])]), model
+
+    server = ZetaServer(home=tmp_path, port=0, provider="claude", model="claude-sonnet-4-6", backend_factory=build)
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        runtime = server.runtime
+        sid = runtime.session_id
+        state, loop, opened = runtime.state, runtime.loop, runtime.opened
+        backend = loop.backend
+        metadata_before = runtime.metadata.to_dict()
+        budget_before = loop.context_assembler.token_budget
+        opened.store.append_message(Message(MessageRole.USER, [TextContent("keep history")]))
+        history = opened.store.messages()
+        runtime.usage["input_tokens"] = 123
+        with monkeypatch.context() as patch:
+            if failure == "metadata":
+                def fail_metadata(*args, **kwargs):
+                    raise OSError("metadata persistence failed")
+                patch.setattr(runtime.manager, "record_session_settings", fail_metadata)
+            response = (await _request(reader, writer, 3, "set_settings", {
+                "session_id": sid, "model": "gpt-5.4", "approval_mode": "deny",
+            }))[-1]
+        assert builds[-1] == ("codex", "gpt-5.4", tmp_path)
+        assert runtime.state is state and runtime.loop is loop and runtime.opened is opened
+        assert opened.store.messages() == history
+        assert runtime.usage == {"input_tokens": 123}
+        if failure:
+            assert response["error"]["code"] == -32000
+            assert runtime.metadata.to_dict() == metadata_before
+            assert SessionManager(tmp_path).open(sid).metadata.to_dict() == metadata_before
+            assert loop.backend is backend
+            assert loop.context_assembler.backend is backend
+            assert loop.context_assembler.token_budget == budget_before
+            assert runtime.policy.default.value == "ask"
+        else:
+            assert response["result"] == {"model": "gpt-5.4", "approval_mode": "deny"}
+            assert loop.backend is not backend
+            assert loop.context_assembler.backend is loop.backend
+            assert loop.context_assembler.compaction_policy.backend is loop.backend
+            expected = 123456 if pinned else budget_for_model("codex", "gpt-5.4")
+            assert loop.context_assembler.token_budget == expected
+            assert runtime.metadata.compaction_budget == expected
+            assert runtime.metadata.budget_pinned == pinned
+            assert runtime.metadata.provider == "codex"
+            assert runtime.metadata.override_audit[-1]["provider"] == {"from": "claude", "to": "codex"}
+            await _request(reader, writer, 4, "send", {"text": "use new backend"})
+            await _event(reader, "agent_end")
+            assert runtime.opened.store.messages()[-1].content == [TextContent("codex")]
+            await _request(reader, writer, 5, "resume", {"session_id": sid})
+            assert runtime.provider == "codex" and runtime.model == "gpt-5.4"
+            assert runtime.loop.context_assembler.token_budget == expected
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_cross_provider_settings_reject_mid_turn_then_apply_when_idle(tmp_path):
+    from zeta.server.fake_backend import ServerFakeBackend
+
+    server = ZetaServer(home=tmp_path, port=0, provider="claude", model="claude-sonnet-4-6",
+                        backend_factory=lambda p, m, h: (ServerFakeBackend(delay=0.2, model=m), m))
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        params = {"session_id": server.runtime.session_id, "model": "gpt-5.4", "approval_mode": "ask"}
+        backend = server.runtime.loop.backend
+        await _request(reader, writer, 3, "send", {"text": "hello"})
+        response = (await _request(reader, writer, 4, "set_settings", params))[-1]
+        assert response["error"]["code"] == -32004
+        assert server.runtime.loop.backend is backend
+        await _request(reader, writer, 5, "abort")
+        assert "result" in (await _request(reader, writer, 6, "set_settings", params))[-1]
+        assert server.runtime.provider == "codex"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["claude", "codex"])
+async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, monkeypatch, target):
+    from zeta.providers.anthropic import AnthropicCredentialStore
+    from zeta.providers.auth import OAuthTokens
+    from zeta.providers.codex import CodexCredentialStore
+
+    monkeypatch.delenv("ZETA_ALLOW_API_KEY", raising=False)
+    monkeypatch.setattr(AnthropicCredentialStore, "bootstrap", lambda self: None)
+    monkeypatch.setattr(CodexCredentialStore, "bootstrap", lambda self: None)
+    source, source_model, model = ("claude", "claude-sonnet-4-6", "gpt-5.4") if target == "codex" else ("codex", "gpt-5.4", "claude-sonnet-4-6")
+    server = ZetaServer(home=tmp_path, port=0, provider=source, model=source_model)
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        runtime = server.runtime
+        before = runtime.metadata.to_dict()
+        backend = runtime.loop.backend
+        response = (await _request(reader, writer, 3, "set_settings", {
+            "session_id": runtime.session_id, "model": model, "approval_mode": "deny",
+        }))[-1]
+        assert response["error"]["code"] == -32000
+        assert "login" in response["error"]["message"]
+        assert runtime.metadata.to_dict() == before
+        assert runtime.loop.backend is backend
+        assert "result" in (await _request(reader, writer, 4, "status"))[-1]
+        credential_type = AnthropicCredentialStore if target == "claude" else CodexCredentialStore
+        credential_path = "anthropic-oauth.json" if target == "claude" else "codex-oauth.json"
+        credential_type(tmp_path / credential_path).save(OAuthTokens("test-access", "test-refresh", 4_000_000_000))
+        response = (await _request(reader, writer, 5, "set_settings", {
+            "session_id": runtime.session_id, "model": model, "approval_mode": "deny",
+        }))[-1]
+        assert response["result"] == {"model": model, "approval_mode": "deny"}
+        assert runtime.provider == target
+        assert runtime.loop.backend is not backend
+        assert isinstance(runtime.loop.backend.token_store, credential_type)
+    finally:
+        await _close(server, writer)

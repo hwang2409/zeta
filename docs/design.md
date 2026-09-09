@@ -158,6 +158,8 @@ the harness-native distillation.
 | ZETA-94 | gpui GUI milestone 2 (arc: gpui GUI): transcript rendering parity — markdown (headings, lists, code fences with syntax color), collapsible tool cards with bounded output tails, sub-agent receipt cards, a status bar (model, token spend, cache hit rate via the status request), and light/dark following system appearance. | ZETA-93 |
 | ZETA-95 | gpui GUI milestone 3 (arc: gpui GUI): session ergonomics — fork/tree view driving the ZETA-80 seams over the protocol (new serve requests where needed, version-gated), settings surface (model swap, approval mode), image attachments as a protocol extension, and packaging so the GUI launches as a normal Mac app. | ZETA-93, ZETA-80 |
 
+| ZETA-97 | Real models in the GUI (arc: GUI polish): GUI-spawned servers explicitly use Claude and the default Claude model; real sessions list the complete Claude and Codex catalog in provider groups with the current model marked. Idle settings changes rebuild the backend across providers, retain the session and pinned budget, retune unpinned budgets, and report missing logins as RPC errors. Explicit fake servers retain their sealed test catalog. | ZETA-95, ZETA-96 |
+
 ## Deferred / open followups (not yet ticketed)
 
 - **Residual login-test flake**: `tests/test_login.py::test_login_sigint_closes_callback_server` failed once under full-suite load with concurrent filesystem writes (2026-09-08, post-ZETA-91, post-ZETA-88-round-2; 5/5 green isolated). One occurrence; fold into the next deflake round if it recurs.

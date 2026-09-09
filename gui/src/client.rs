@@ -812,6 +812,8 @@ pub struct TreeResult {
 #[derive(Debug, Deserialize)]
 pub struct ModelCatalog {
     pub models: Vec<String>,
+    #[serde(default)]
+    pub providers: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]

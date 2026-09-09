@@ -522,17 +522,23 @@ class SessionManager:
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
-    def record_session_settings(self, metadata: SessionMetadata, *, model: str, approval_mode: str, budget: int) -> None:
+    def record_session_settings(self, metadata: SessionMetadata, *, model: str, approval_mode: str, budget: int, provider: str) -> None:
         """Persist active-session settings together, without changing global config."""
         if approval_mode not in {"ask", "allow", "deny"} or not model.strip() or budget <= 0:
             raise SessionError("invalid session settings")
-        expected = (metadata.model, metadata.approval_mode, metadata.compaction_budget, metadata.budget_pinned)
+        expected = (metadata.provider, metadata.model, metadata.approval_mode, metadata.compaction_budget, metadata.budget_pinned)
 
         def update(item: SessionMetadata) -> SessionMetadata:
-            if (item.model, item.approval_mode, item.compaction_budget, item.budget_pinned) != expected:
+            if (item.provider, item.model, item.approval_mode, item.compaction_budget, item.budget_pinned) != expected:
                 raise SessionError("session settings changed before commit")
-            if item.model != model:
-                item.override_audit.append({"at": _now(), "provider": None, "model": {"from": item.model, "to": model}})
+            if item.model != model or item.provider != provider:
+                item.override_audit.append({
+                    "at": _now(),
+                    "provider": {"from": item.provider, "to": provider}
+                    if item.provider != provider else None,
+                    "model": {"from": item.model, "to": model} if item.model != model else None,
+                })
+            item.provider = provider
             item.model = model
             item.approval_mode = approval_mode
             item.compaction_budget = budget

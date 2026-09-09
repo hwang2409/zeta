@@ -169,7 +169,26 @@ impl ZetaView {
             .id("settings-models")
             .max_h(px(240.))
             .overflow_y_scroll();
+        let mut previous_provider = None;
         for (index, model) in view.models.iter().enumerate() {
+            let provider = view.model_providers.get(model);
+            if provider != previous_provider {
+                if let Some(provider) = provider {
+                    let selector = format!("provider-{provider}");
+                    models = models.child(
+                        div()
+                            .debug_selector(move || selector.clone())
+                            .mt_3()
+                            .mb_1()
+                            .px_2()
+                            .text_size(px(12.))
+                            .text_color(gpui::rgb(p.muted))
+                            .child(provider.clone()),
+                    );
+                }
+                previous_provider = provider;
+            }
+            let selector = format!("model-{model}");
             models = models.child(
                 self.session_button(
                     format!("model-{index}"),
@@ -182,6 +201,19 @@ impl ZetaView {
                         cx.notify();
                     },
                 )
+                .debug_selector(move || selector.clone())
+                .flex()
+                .items_center()
+                .justify_between()
+                .when(model == &view.current_model, |row| {
+                    row.font_weight(gpui::FontWeight::BOLD).child(
+                        div()
+                            .debug_selector(|| "current-model".into())
+                            .text_size(px(12.))
+                            .text_color(gpui::rgb(p.muted))
+                            .child("current"),
+                    )
+                })
                 .when(index == view.selected_model, |row| {
                     row.bg(gpui::rgb(p.code_chip))
                         .border_l_2()

@@ -137,7 +137,15 @@ impl ZetaView {
                 }
                 self.pending_command = false;
             }
-            WorkerMessage::Settings(settings, models) => {
+            WorkerMessage::Settings(settings, catalog) => {
+                let mut models = catalog.models;
+                models.sort_by(|a, b| {
+                    catalog
+                        .providers
+                        .get(a)
+                        .cmp(&catalog.providers.get(b))
+                        .then_with(|| a.cmp(b))
+                });
                 let view = &mut self.state.session_view;
                 view.selected_model = models
                     .iter()
@@ -148,6 +156,8 @@ impl ZetaView {
                     .position(|mode| *mode == settings.approval_mode)
                     .unwrap_or(0);
                 view.models = models;
+                view.model_providers = catalog.providers;
+                view.current_model = settings.model;
                 view.settings_open = true;
                 self.pending_command = false;
             }
@@ -1367,7 +1377,10 @@ mod session_tests {
                         model: "offline".into(),
                         approval_mode: "ask".into(),
                     },
-                    vec!["offline".into(), "faster".into()],
+                    zeta_gui::client::ModelCatalog {
+                        models: vec!["offline".into(), "faster".into()],
+                        providers: Default::default(),
+                    },
                 ),
                 cx,
             );
@@ -1386,6 +1399,86 @@ mod session_tests {
             })
             .unwrap();
         assert!(receiver.try_recv().is_err(), "escape must not abort a turn");
+    }
+
+    #[gpui::test]
+    fn settings_group_real_models_and_dispatch_cross_provider(cx: &mut gpui::TestAppContext) {
+        cx.update(composer::bind_keys);
+        let (commands, receiver) = mpsc::channel();
+        let window = cx.open_window(gpui::size(px(1100.), px(760.)), move |window, cx| {
+            let mut view = ZetaView::new(window, cx, Some("/tmp/zeta-97-no-server.sock".into()));
+            view.commands = commands;
+            view.state.connection = ConnectionState::Connected;
+            view.state.active_session = Some("session".into());
+            view.state.session_view.available = true;
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: "claude-sonnet-4-6".into(),
+                        approval_mode: "ask".into(),
+                    },
+                    serde_json::from_value(serde_json::json!({
+                        "models": ["claude-sonnet-4-6", "gpt-5.4"],
+                        "providers": {"claude-sonnet-4-6": "claude", "gpt-5.4": "codex"}
+                    }))
+                    .unwrap(),
+                ),
+                cx,
+            );
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            window
+                .update(&mut visual, |view, _, cx| {
+                    view.appearance = appearance;
+                    cx.notify();
+                })
+                .unwrap();
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let claude = visual
+                .debug_bounds("provider-claude")
+                .expect("claude heading");
+            let codex = visual
+                .debug_bounds("provider-codex")
+                .expect("codex heading");
+            let first = visual
+                .debug_bounds("model-claude-sonnet-4-6")
+                .expect("claude model");
+            let second = visual.debug_bounds("model-gpt-5.4").expect("codex model");
+            assert!(claude.origin.y < first.origin.y && first.origin.y < codex.origin.y);
+            assert!(codex.origin.y < second.origin.y);
+            assert!(second.size.height >= px(40.));
+            assert!(visual.debug_bounds("current-model").is_some());
+            assert!(visual.debug_bounds("model-offline").is_none());
+            assert!(visual.debug_bounds("model-faster").is_none());
+        }
+        let target = visual.debug_bounds("model-gpt-5.4").unwrap();
+        visual.simulate_click(target.center(), Default::default());
+        visual.simulate_keystrokes("enter");
+        assert!(
+            matches!(receiver.try_recv(), Ok(CommandMessage::SetSettings(settings)) if settings.model == "gpt-5.4")
+        );
+        window
+            .update(&mut visual, |view, _, cx| {
+                view.apply_worker_message(
+                    WorkerMessage::Rejected("no Codex OAuth login found; log in first".into()),
+                    cx,
+                );
+                assert!(view.state.session_view.settings_open);
+                assert!(!view.pending_command);
+                assert!(view.command_error.as_ref().unwrap().contains("login"));
+                view.apply_worker_message(
+                    WorkerMessage::SettingsApplied(SessionSettings {
+                        model: "gpt-5.4".into(),
+                        approval_mode: "ask".into(),
+                    }),
+                    cx,
+                );
+                assert!(!view.state.session_view.settings_open);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

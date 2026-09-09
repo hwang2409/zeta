@@ -32,6 +32,7 @@ def default_backend(
     *,
     stall_seconds: float | None = None,
     stall_retries: int | None = None,
+    require_credentials: bool = False,
 ) -> tuple[CompletionBackend, str]:
     if provider == "fake":
         selected = model or "offline"
@@ -44,6 +45,7 @@ def default_backend(
         home=home,
         stall_seconds=stall_seconds,
         stall_retries=stall_retries,
+        require_credentials=require_credentials,
     )
 
 
@@ -114,6 +116,22 @@ class ServerRuntime:
         self.manager = SessionManager(self.home)
         self._state: SessionState | None = None
         self._background_event_sink: SessionEventSink | None = None
+
+    @property
+    def fake_catalog(self) -> bool:
+        return self._server_provider == "fake"
+
+    def backend_for_model(self, provider: str, model: str) -> CompletionBackend:
+        config = self._config(provider, model)
+        backend, _ = self._build_backend(
+            provider,
+            model,
+            self.home,
+            stall_seconds=config.stream_stall_seconds,
+            stall_retries=config.stream_stall_retries,
+            require_credentials=True,
+        )
+        return backend
 
     @property
     def opened(self) -> OpenedSession | None:
@@ -240,6 +258,7 @@ class ServerRuntime:
         *,
         stall_seconds: float | None = None,
         stall_retries: int | None = None,
+        require_credentials: bool = False,
     ) -> tuple[CompletionBackend, str]:
         if self.backend_factory is not None:
             return self.backend_factory(provider, model, home)
@@ -249,6 +268,7 @@ class ServerRuntime:
             home,
             stall_seconds=stall_seconds,
             stall_retries=stall_retries,
+            require_credentials=require_credentials,
         )
 
     def _config(self, provider: str | None, model: str | None):
