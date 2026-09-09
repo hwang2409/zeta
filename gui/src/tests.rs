@@ -708,7 +708,7 @@ fn error_block_keeps_full_text_wraps_and_opens_settings(cx: &mut TestAppContext)
         });
         visual.update(|window, cx| window.draw(cx).clear(cx));
         view.read_with(&visual, |view, _| {
-        assert!(matches!(&view.state.transcript[0], TranscriptEntry::Error { message: text, settings_action: true } if *text == message));
+        assert!(matches!(&view.state.transcript[0], TranscriptEntry::Error { message: text, settings_action: true, .. } if *text == message));
     });
         let text_bounds = visual
             .debug_bounds("error-message-0")
@@ -775,4 +775,135 @@ fn errors_without_settings_recovery_have_no_action(cx: &mut TestAppContext) {
         assert!(visual.debug_bounds("error-block-0").is_some());
         assert!(visual.debug_bounds("error-settings-0").is_none());
     }
+}
+
+#[gpui::test]
+fn login_controls_share_progress_cancel_and_retry_across_surfaces(cx: &mut TestAppContext) {
+    for surface in ["first", "settings", "error"] {
+        let (window, view, receiver) = setup(cx);
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_worker_message(
+                    WorkerMessage::LoginProviders(vec![LoginProvider {
+                        provider: "claude".into(),
+                        credentials_present: false,
+                        progress: LoginProgress::Idle,
+                    }]),
+                    window,
+                    cx,
+                );
+                match surface {
+                    "settings" => view.settings_open = true,
+                    "error" => {
+                        view.apply_worker_message(
+                            WorkerMessage::Event(ServerEvent::Error {
+                                session_id: view.state.active_session.clone(),
+                                error: zeta_gui::client::EventError {
+                                    code: "model_access_error".into(),
+                                    message: "Sign in required".into(),
+                                },
+                                data: json!({"login_provider":"claude"}),
+                            }),
+                            window,
+                            cx,
+                        );
+                    }
+                    _ => view.state.active_session = None,
+                }
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let selector = match surface {
+            "first" => "first-login-claude-start",
+            "settings" => "settings-login-claude-start",
+            _ => "error-login-0-claude-start",
+        };
+        let button = visual.debug_bounds(selector).unwrap();
+        assert!(button.size.height >= px(40.));
+        visual.simulate_click(button.center(), Default::default());
+        assert!(
+            matches!(receiver.try_recv(), Ok(CommandMessage::LoginStart(provider)) if provider == "claude")
+        );
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.login_providers[0].progress, LoginProgress::Starting);
+                view.apply_worker_message(
+                    WorkerMessage::Login(
+                        "claude".into(),
+                        LoginProgress::Pending {
+                            authorization_url: None,
+                        },
+                    ),
+                    window,
+                    cx,
+                );
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        // First-run progress remains visible after its initial button disappears.
+        let selector = match surface {
+            "first" => "login-progress-claude-cancel",
+            "settings" => "settings-login-claude-cancel",
+            _ => "error-login-0-claude-cancel",
+        };
+        let cancel = visual.debug_bounds(selector).unwrap();
+        visual.simulate_click(cancel.center(), Default::default());
+        assert!(
+            matches!(receiver.try_recv(), Ok(CommandMessage::LoginCancel(provider)) if provider == "claude")
+        );
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_worker_message(
+                    WorkerMessage::Login("claude".into(), LoginProgress::Cancelled),
+                    window,
+                    cx,
+                );
+                view.start_login("claude", cx);
+                view.apply_worker_message(
+                    WorkerMessage::Login(
+                        "claude".into(),
+                        LoginProgress::failed("Browser sign-in timed out".into()),
+                    ),
+                    window,
+                    cx,
+                );
+                assert!(!view.login_providers[0].progress.busy());
+                view.start_login("claude", cx);
+                view.apply_worker_message(
+                    WorkerMessage::Login("claude".into(), LoginProgress::Succeeded),
+                    window,
+                    cx,
+                );
+                assert!(view.login_providers[0].credentials_present);
+                assert!(view.can_change_session());
+            });
+        });
+    }
+}
+
+#[gpui::test]
+fn legacy_login_controls_stay_hidden_and_disconnect_clears_pending(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.start_login("claude", cx);
+            assert!(receiver.try_recv().is_err());
+            view.login_providers.push(LoginProvider {
+                provider: "claude".into(),
+                credentials_present: false,
+                progress: LoginProgress::Starting,
+            });
+            view.apply_worker_message(WorkerMessage::Lost("offline".into()), window, cx);
+            assert!(!view.login_providers[0].progress.busy());
+            view.apply_worker_message(WorkerMessage::LoginProviders(Vec::new()), window, cx);
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("first-login-claude-start").is_none());
+    assert!(visual.debug_bounds("login-progress-claude-start").is_none());
 }

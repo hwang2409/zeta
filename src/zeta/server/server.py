@@ -17,7 +17,7 @@ from uuid import uuid4
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
 from ..types import StreamEvent, StreamEventType, TextContent
-from . import ergonomics, model_selection
+from . import ergonomics, login, model_selection
 from .protocol import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
@@ -176,6 +176,7 @@ class _Client:
         self.server = server
         self.reader = reader
         self.writer = writer
+        self.logins = login.Logins(server.home)
         self.handshaken = False
         self.protocol_version = "1.0"
         self._write_lock = asyncio.Lock()
@@ -291,6 +292,7 @@ class _Client:
                 self._turn_task.cancel()
                 await asyncio.gather(self._turn_task, return_exceptions=True)
             self._turn_task = None
+            await self.logins.close()
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
@@ -303,6 +305,10 @@ class _Client:
             return self._hello(params)
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
+        if method in login.REQUESTS:
+            if self.protocol_version != "1.1" or self.server.runtime.fake_catalog:
+                raise ProtocolError(-32601, "login is unavailable on this server")
+            return await self.logins.request(method, params)
         if method in ergonomics.EXTENSION_REQUESTS:
             if self.protocol_version != "1.1":
                 raise ProtocolError(-32601, "request requires protocol 1.1")
@@ -361,7 +367,8 @@ class _Client:
                     "deny",
                     "abort",
                     "status",
-                ] + (ergonomics.EXTENSION_REQUESTS if self.protocol_version == "1.1" else []),
+                ] + (ergonomics.EXTENSION_REQUESTS if self.protocol_version == "1.1" else [])
+                + (login.REQUESTS if self.protocol_version == "1.1" and not self.server.runtime.fake_catalog else []),
                 "notifications": ["event"],
             },
         }
@@ -643,12 +650,17 @@ class _Client:
                 {"code": event.error.code, "message": event.error.message}
                 if event.error else {"code": "unknown", "message": "unknown error"}
             )
+            login_provider = None
+            if (foreground and event.error is not None and event.error.provider_error
+                    and (event.error.code == "auth_error" or event.error.status_code == 401)
+                    and self.protocol_version == "1.1" and not self.server.runtime.fake_catalog):
+                login_provider = self.server.runtime.metadata.provider
             if foreground and event.error is not None:
                 recovered = model_selection.recover(self.server.runtime, event.error)
                 if self.protocol_version == "1.1":
                     error = recovered
             await self._notify(
-                "error", session_id, error=error, data=dict(event.data),
+                "error", session_id, error=error, data={**event.data, **({"login_provider": login_provider} if login_provider else {})},
             )
             return
         if kind is StreamEventType.COMPACTION_START:

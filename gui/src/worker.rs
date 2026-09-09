@@ -4,6 +4,7 @@ use crate::client::{
     StatusResult,
 };
 use crate::client::{HistoryMessage, TreeResult};
+use crate::login::{LoginProgress, LoginProvider};
 use crate::session::{ImageAttachment, SessionSettings};
 use std::env;
 use std::path::PathBuf;
@@ -21,6 +22,8 @@ pub enum CommandMessage {
     SwitchBranch(String),
     ForkMessage(String),
     LoadSettings,
+    LoginStart(String),
+    LoginCancel(String),
     SetSettings(SessionSettings),
     Approve(String),
     Deny(String),
@@ -36,6 +39,8 @@ pub enum WorkerMessage {
     Sent(String),
     Connected,
     Extensions(bool),
+    LoginProviders(Vec<LoginProvider>),
+    Login(String, LoginProgress),
     Tree(TreeResult),
     History(Vec<HistoryMessage>, bool),
     Settings(SessionSettings, ModelCatalog),
@@ -134,6 +139,29 @@ impl ConnectionWorker {
         Ok(())
     }
 
+    fn login_update(
+        &self,
+        client: &mut ProtocolClient,
+        method: &str,
+        provider: &str,
+        pending: &mut std::collections::HashSet<String>,
+    ) -> Result<(), ClientError> {
+        let progress = match client.login(method, provider) {
+            Ok(progress) => progress,
+            Err(error @ ClientError::Rpc { .. }) => LoginProgress::failed(error.to_string()),
+            Err(error) => return Err(error),
+        };
+        if progress.busy() {
+            pending.insert(provider.to_owned());
+        } else {
+            pending.remove(provider);
+        }
+        let _ = self
+            .messages
+            .send(WorkerMessage::Login(provider.to_owned(), progress));
+        Ok(())
+    }
+
     fn connected(
         &self,
         process: &mut Option<Child>,
@@ -144,6 +172,12 @@ impl ConnectionWorker {
         let _ = self
             .messages
             .send(WorkerMessage::Extensions(client.session_extensions));
+        if client.login_extensions {
+            let providers = client.login_providers()?.providers;
+            let _ = self.messages.send(WorkerMessage::LoginProviders(providers));
+        }
+        let mut pending_logins = std::collections::HashSet::new();
+        let mut last_login_status = Instant::now();
         match client.list_sessions() {
             Ok(sessions) => {
                 let _ = self.messages.send(WorkerMessage::Sessions(sessions));
@@ -172,6 +206,7 @@ impl ConnectionWorker {
             client.set_read_timeout(Some(Duration::from_secs(5)))?;
             match self.commands.try_recv() {
                 Ok(command) => {
+                    let login_start = matches!(&command, CommandMessage::LoginStart(_));
                     let approve = matches!(&command, CommandMessage::Approve(_));
                     let result = match command {
                         CommandMessage::NewSession
@@ -187,6 +222,15 @@ impl ConnectionWorker {
                         {
                             self.reject("finish or abort the current operation before changing sessions or sending");
                             Ok(())
+                        }
+                        CommandMessage::LoginStart(provider)
+                        | CommandMessage::LoginCancel(provider) => {
+                            let method = if login_start {
+                                "login_start"
+                            } else {
+                                "login_cancel"
+                            };
+                            self.login_update(&mut client, method, &provider, &mut pending_logins)
                         }
                         CommandMessage::Reconnect => return Ok(true),
                         CommandMessage::NewSession | CommandMessage::Resume(_) => {
@@ -285,6 +329,14 @@ impl ConnectionWorker {
                 }
                 Err(TryRecvError::Disconnected) => return Ok(false),
                 Err(TryRecvError::Empty) => {}
+            }
+            if !pending_logins.is_empty()
+                && last_login_status.elapsed() >= Duration::from_millis(500)
+            {
+                for provider in pending_logins.clone() {
+                    self.login_update(&mut client, "login_status", &provider, &mut pending_logins)?;
+                }
+                last_login_status = Instant::now();
             }
             // Resumed approvals run a tool without an agent_end event.
             if resumed_tool && last_status.elapsed() >= Duration::from_millis(100) {
@@ -550,6 +602,104 @@ mod tests {
             server.join().unwrap();
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn login_actor_polls_completion_and_cancels_without_blocking_commands() {
+        use serde_json::{json, Value};
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::mpsc;
+        let path = env::temp_dir().join(format!("zg-login-worker-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut methods = Vec::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap();
+                methods.push(method.to_owned());
+                let result = match method {
+                    "hello" => {
+                        json!({"protocol_version":"1.1","server":"zeta","capabilities":{"requests":["login_start","login_status","login_cancel","login_providers"]}})
+                    }
+                    "login_providers" => {
+                        json!({"providers":[{"provider":"claude","credentials_present":false},{"provider":"codex","credentials_present":false}]})
+                    }
+                    "list_sessions" => json!({"sessions":[]}),
+                    "status" => json!({"session":null,"state":"idle"}),
+                    "login_start" => {
+                        json!({"state":"pending","authorization_url":"https://authorize.invalid/"})
+                    }
+                    "login_status" => {
+                        assert_eq!(request["params"]["provider"], "claude");
+                        json!({"state":"succeeded"})
+                    }
+                    "login_cancel" => {
+                        assert_eq!(request["params"]["provider"], "codex");
+                        json!({"state":"cancelled"})
+                    }
+                    other => panic!("unexpected request {other}"),
+                };
+                writeln!(socket, "{}", json!({"id":request["id"],"result":result})).unwrap();
+            }
+            assert!(methods.iter().any(|method| method == "login_status"));
+            assert!(methods.iter().any(|method| method == "login_cancel"));
+        });
+        let (commands, receiver) = mpsc::channel();
+        let (sender, messages) = mpsc::channel();
+        let worker_path = path.clone();
+        let worker = thread::spawn(move || {
+            ConnectionWorker {
+                commands: receiver,
+                messages: sender,
+                socket: Some(worker_path),
+            }
+            .run()
+        });
+        loop {
+            if matches!(
+                messages.recv_timeout(Duration::from_secs(5)).unwrap(),
+                WorkerMessage::Connected
+            ) {
+                break;
+            }
+        }
+        commands
+            .send(CommandMessage::LoginStart("claude".into()))
+            .unwrap();
+        let next_login = || loop {
+            match messages.recv_timeout(Duration::from_secs(5)).unwrap() {
+                WorkerMessage::Login(provider, progress) => break (provider, progress),
+                WorkerMessage::Lost(error) | WorkerMessage::Rejected(error) => panic!("{error}"),
+                _ => {}
+            }
+        };
+        assert!(
+            matches!(next_login(), (provider, LoginProgress::Pending { authorization_url: Some(url) }) if provider == "claude" && url == "https://authorize.invalid/")
+        );
+        assert_eq!(next_login(), ("claude".into(), LoginProgress::Succeeded));
+        commands
+            .send(CommandMessage::LoginStart("codex".into()))
+            .unwrap();
+        assert!(
+            matches!(next_login(), (provider, LoginProgress::Pending { .. }) if provider == "codex")
+        );
+        commands
+            .send(CommandMessage::LoginCancel("codex".into()))
+            .unwrap();
+        assert_eq!(next_login(), ("codex".into(), LoginProgress::Cancelled));
+        drop(commands);
+        worker.join().unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     fn stale_socket(path: &std::path::Path) {

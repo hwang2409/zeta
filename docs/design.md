@@ -162,6 +162,7 @@ the harness-native distillation.
 | ZETA-98 | Rewrite the core GUI on GPUI Kit (arc: gpui-kit rewrite, M1): Kit semantic themes and embedded JetBrains Mono; virtual session previews and transcript; rich markdown with syntax highlighting; Kit composer, approval dialog, reconnect, abort, and status metrics. Preserve the protocol client and connection actor, including RPC degradation and real/fake isolation. Add optional first-message previews to session listings. M2 = ZETA-99: tree/fork, settings, attachments, packaging. | ZETA-95, ZETA-97 |
 | ZETA-99 | Restore full session ergonomics on GPUI Kit (arc: gpui-kit rewrite, M2): branch list in the sidebar and a per-message `Fork here` affordance driving `switch_branch`/`fork_message`; a Kit settings overlay with a grouped Claude/Codex model picker (current model marked, selection auto-scrolls into view), approval-mode selection, keyboard nav, and inline credential-error rendering that keeps the modal open on cross-provider RPC failure; image attachments through Kit — file picker plus Cmd-V paste intercept, per-image chips, inline validation errors, `SendImages` dispatch, and post-send attachment history on the transcript row. Packaging remains `make gui-app` (unsigned dev bundle). ZETA-96's RPC-degradation contract survives: a failing branch swap flushes stale transcript state via the worker's status refresh. | ZETA-98 |
 | ZETA-100 | Surface tool output and model errors (arc: GUI consumer pass): clickable receipts disclose their stored output tail; failed tools expand by default. Provider errors get a full wrapped block with an Open Settings action. Model changes keep a durable previous provider/model/budget until the first successful provider response; entitlement errors restore that choice and explain the revert. Existing protocol 1.1 settings gating and the sealed fake catalog remain intact. | ZETA-99 |
+| ZETA-101 | Add in-app login (arc: GUI consumer pass): settings, credential error blocks, and the first-run empty state share browser OAuth login for Claude and ChatGPT. Reuse the CLI PKCE listener and credential stores; show pending, cancel, success, and typed failures. Advertised protocol 1.1 login RPCs exclude legacy and fake servers. | ZETA-100 |
 
 ## Deferred / open followups (not yet ticketed)
 
@@ -206,3 +207,35 @@ catalog and do not create entitlement fallbacks. Fallback metadata stays interna
 and does not appear in session responses at either protocol version. Only 1.1
 clients receive `model_access_error` or `model_reverted` recovery codes; 1.0
 clients retain the original error code and message.
+
+
+### GUI browser login (ZETA-101)
+
+Protocol 1.1 servers advertise `login_providers`, `login_start`, `login_status`,
+and `login_cancel` only for real providers. Clients require all four capabilities;
+older 1.1 servers also remain compatible. Login requests do not require an active
+session. Providers use the session names `claude` and `codex` on the wire.
+
+`login_providers` returns each provider's `credentials_present` flag. This checks
+local OAuth stores and the existing bootstrap sources without token refresh or
+an account probe. The GUI says "Credentials available" because presence does not
+prove that credentials are current or that an account can use a given model.
+Unreadable credentials show the login action as available.
+
+`login_start` returns `state: pending` and `authorization_url` after the existing
+PKCE redirect listener binds. The GUI opens that URL in the default browser and
+polls `login_status` every 500 ms while pending. There is one task per provider,
+owned by the connection. A second start returns RPC error `-32005` with
+`data.code: login_in_progress`. Providers can log in independently. Results remain
+available until the next start; disconnect cancels all pending logins.
+
+The five-minute deadline covers the callback and token exchange. Terminal states
+are `succeeded`, `cancelled`, and `failed`; an untouched provider reports `idle`.
+Failures include a typed error (`login_timeout`, `login_callback_error`, or
+`login_failed`) and safe user text. Cancel waits for listener cleanup before
+returning. No provider exception details, tokens, or callback codes reach the GUI.
+
+Foreground provider authentication errors carry `data.login_provider` on the
+1.1 wire. The server captures the failed provider before existing model recovery
+runs. MCP, transport, and background-agent errors do not offer provider login.
+Success permits a manual retry; it never resends a message automatically.

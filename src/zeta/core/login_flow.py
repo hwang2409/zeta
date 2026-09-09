@@ -161,6 +161,7 @@ async def run_login(
     *,
     timeout_seconds: float = 300,
     output: TextIO | None = None,
+    on_authorization_url: Callable[[str], None] | None = None,
 ) -> str | None:
     """Run one provider login and return its optional account handle."""
 
@@ -182,11 +183,14 @@ async def run_login(
     try:
         redirect_uri = f"http://localhost:{server.server_port}/callback"
         authorization_url = provider.build_authorization_url(state, challenge, redirect_uri)
-        print(
-            f"open this URL to log in with {provider.name}:\n{authorization_url}",
-            file=output or sys.stdout,
-            flush=True,
-        )
+        if on_authorization_url is not None:
+            on_authorization_url(authorization_url)
+        else:
+            print(
+                f"open this URL to log in with {provider.name}:\n{authorization_url}",
+                file=output or sys.stdout,
+                flush=True,
+            )
         try:
             await asyncio.wait_for(callback_ready.wait(), timeout_seconds)
         except asyncio.TimeoutError:
@@ -208,9 +212,19 @@ async def run_login(
         provider.credential_store.save(tokens)
         return provider.token_handle(tokens)
     finally:
-        server.shutdown()
-        server.server_close()
-        server_thread.join(timeout=2)
+        # Cancellation can arrive after exchange, while shutdown is running.
+        # Finish closing the listener before reporting a terminal login state.
+        def close_listener() -> None:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+        cleanup = asyncio.create_task(asyncio.to_thread(close_listener))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+            raise
 
 
 __all__ = ["LoginError", "LoginProvider", "run_login"]
