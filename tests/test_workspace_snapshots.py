@@ -990,3 +990,133 @@ def test_all_invalid_history_points_undo_to_reset(tmp_path: Path, args: str) -> 
     assert "/checkpoint --reset" in result
     assert "--force" not in result
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("root_kind", ["missing", "non-git", "file"])
+def test_reset_discards_invalid_restore_root(
+    git_repo: Path, tmp_path: Path, root_kind: str
+) -> None:
+    conversation = _make_store(tmp_path / "session", git_repo)
+    app = _make_tui(conversation)
+    app.slash_checkpoint("valid")
+    app.slash_checkpoint("bad-root")
+    snapshots = app._snapshots()
+    valid = snapshots.snapshots[0]
+    root = tmp_path / "invalid-root"
+    if root_kind == "non-git":
+        root.mkdir()
+    elif root_kind == "file":
+        root.write_text("not a directory")
+    state = json.loads(snapshots.state_path.read_text())
+    state["snapshots"][-1]["repo_root"] = str(root)
+    snapshots.state_path.write_text(json.dumps(state))
+    original = snapshots.state_path.read_bytes()
+
+    reopened = _make_tui(conversation)
+    assert "snapshot state reset" in reopened.slash_checkpoint("--reset")
+    loaded = _make_tui(conversation)._snapshots()
+    assert loaded.snapshots == (valid,)
+    assert loaded.current_id is None
+    archives = list(conversation.session_dir.glob("workspace_snapshots.corrupt.*.json"))
+    assert len(archives) == 1 and archives[0].read_bytes() == original
+
+
+@pytest.mark.parametrize("malformed_row", [False, True])
+def test_reset_preserves_unavailable_snapshots(tmp_path: Path, malformed_row: bool) -> None:
+    conversation = _make_store(tmp_path / "session", tmp_path)
+    app = _make_tui(conversation)
+    app.slash_checkpoint("older")
+    app.slash_checkpoint("current")
+    snapshots = app._snapshots()
+    expected = snapshots.snapshots
+    if malformed_row:
+        state = json.loads(snapshots.state_path.read_text())
+        state["snapshots"].append({"id": "invalid"})
+        snapshots.state_path.write_text(json.dumps(state))
+    original = snapshots.state_path.read_bytes()
+    original_stat = snapshots.state_path.stat()
+
+    reopened = _make_tui(conversation)
+    assert "snapshot state reset" in reopened.slash_checkpoint("--reset")
+    loaded = _make_tui(conversation)._snapshots()
+    assert loaded.snapshots == expected
+    assert loaded.current_id == expected[-1].id
+    assert not loaded.is_corrupt
+    archives = list(conversation.session_dir.glob("workspace_snapshots.corrupt.*.json"))
+    if malformed_row:
+        assert len(archives) == 1 and archives[0].read_bytes() == original
+    else:
+        assert archives == []
+        assert snapshots.state_path.read_bytes() == original
+        assert snapshots.state_path.stat().st_ino == original_stat.st_ino
+        assert snapshots.state_path.stat().st_mtime_ns == original_stat.st_mtime_ns
+
+
+@pytest.mark.parametrize("target_kind", ["unavailable", "non-git-root"])
+def test_failed_forced_undo_preserves_cursor_and_files(
+    git_repo: Path, tmp_path: Path, target_kind: str
+) -> None:
+    conversation = _make_store(tmp_path / "session", git_repo)
+    app = _make_tui(conversation)
+    snapshots = app._snapshots()
+    snapshots.take(tmp_path if target_kind == "unavailable" else git_repo, label="older")
+    snapshots.take(git_repo, label="current")
+    state = json.loads(snapshots.state_path.read_text())
+    non_git_root = tmp_path / "non-git"
+    non_git_root.mkdir()
+    (non_git_root / "tracked.txt").write_text("keep non-git files")
+    if target_kind == "non-git-root":
+        state["snapshots"][0]["repo_root"] = str(non_git_root)
+    snapshots.state_path.write_text(json.dumps(state))
+    original = snapshots.state_path.read_bytes()
+    (git_repo / "tracked.txt").write_text("unsaved work")
+    before = _repo_workspace_files(git_repo)
+    non_git_before = _repo_workspace_files(non_git_root)
+    reopened = _make_tui(conversation)
+
+    result = reopened.slash_undo("--force")
+
+    assert "undo failed" in result
+    assert "undone" not in result
+    assert reopened._snapshots().current_id == state["current_id"]
+    assert snapshots.state_path.read_bytes() == original
+    assert _repo_workspace_files(git_repo) == before
+    assert _repo_workspace_files(non_git_root) == non_git_before
+
+
+def test_corruption_warning_rejects_missing_restore_root(git_repo: Path, tmp_path: Path) -> None:
+    store = WorkspaceSnapshotStore(tmp_path / "session", "session")
+    store.take(git_repo, label="missing-root")
+    state = json.loads(store.state_path.read_text())
+    state["snapshots"][0]["repo_root"] = str(tmp_path / "missing")
+    state["snapshots"].append({"id": "invalid"})
+    store.state_path.write_text(json.dumps(state))
+    reopened = WorkspaceSnapshotStore(store.session_dir, "session")
+
+    assert "--force" not in reopened.corruption_message
+    assert "no valid workspace snapshot" in reopened.corruption_message
+
+
+@pytest.mark.parametrize("snapshot_count", [2, 50])
+def test_corruption_warning_stops_after_first_restorable_snapshot(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, snapshot_count: int
+) -> None:
+    store = WorkspaceSnapshotStore(tmp_path / "session", "session")
+    for index in range(snapshot_count):
+        store.take(git_repo, label=str(index))
+    state = json.loads(store.state_path.read_text())
+    state["snapshots"].append({"id": "invalid"})
+    store.state_path.write_text(json.dumps(state))
+    reopened = WorkspaceSnapshotStore(store.session_dir, "session")
+    calls = []
+    run_git = workspace_module._run_git
+
+    def counted_git(args, **kwargs):
+        calls.append(args)
+        return run_git(args, **kwargs)
+
+    monkeypatch.setattr(workspace_module, "_run_git", counted_git)
+    assert "--force" in reopened.corruption_message
+    # One root lookup and one ref/commit/tree/object resolution, independent
+    # of history length. Full history validation belongs only to reset.
+    assert len(calls) <= 4

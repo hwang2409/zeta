@@ -510,12 +510,15 @@ def _restore_workspace(
 ) -> tuple[bool, str]:
     if target is None:
         return False, ""
+    resolution = snapshots.resolve_restore_target(target)
+    if resolution.status == "unavailable-by-design":
+        return False, "no restorable workspace snapshot"
+    if resolution.status == "damaged":
+        return False, f"workspace restore failed: {resolution.reason}"
     try:
         restored = snapshots.restore(target.id, cwd, force=forced)
     except WorkspaceSnapshotError as exc:
         return False, f"workspace restore failed: {exc}"
-    if restored.mode != SNAPSHOT_MODE_GIT:
-        return False, "no restorable workspace snapshot"
     return True, (
         f"workspace restored: {restored.file_count} files, "
         f"{_format_size(restored.size_bytes)}"

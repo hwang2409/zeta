@@ -28,7 +28,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..process_env import subprocess_env
 from . import ConversationIntegrityError, load_session_json
@@ -119,6 +119,16 @@ class WorkspaceSnapshot:
             label=value.get("label"),
             checkpoint_entry_id=value.get("checkpoint_entry_id"),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceRestoreResolution:
+    """Read-only resolution of a snapshot's workspace restore inputs."""
+
+    status: Literal["restorable", "unavailable-by-design", "damaged"]
+    repo_root: str | None = None
+    tree_sha: str | None = None
+    reason: str = ""
 
 
 def _now() -> str:
@@ -518,7 +528,10 @@ class WorkspaceSnapshotStore:
 
     @property
     def corruption_message(self) -> str:
-        if self._restorable_snapshots():
+        if any(
+            self.resolve_restore_target(snapshot).status == "restorable"
+            for snapshot in self._snapshots
+        ):
             return SNAPSHOT_CORRUPTION_MESSAGE
         return (
             "workspace snapshot state is corrupt; no valid workspace snapshot "
@@ -526,48 +539,65 @@ class WorkspaceSnapshotStore:
             "manifest and reset snapshot state"
         )
 
-    def _validate_restore_target(self, snapshot: WorkspaceSnapshot) -> None:
-        if snapshot.mode != SNAPSHOT_MODE_GIT:
-            raise WorkspaceSnapshotError("snapshot has no restorable workspace tree")
-        env = {"GIT_DIR": str(_shadow_dir(self.session_dir))}
-        ref = f"{SNAPSHOT_REF_NAMESPACE}/{snapshot.id}"
+    def resolve_restore_target(
+        self, snapshot: WorkspaceSnapshot
+    ) -> WorkspaceRestoreResolution:
+        """Resolve restore inputs without writing refs, files, or the cursor.
+
+        Row schema validation happens on load. A supported conversation-only
+        row is valid even though workspace navigation cannot restore it.
+        Restore, reset, and corruption advice all use this resolution.
+        """
+
+        if snapshot.mode == SNAPSHOT_MODE_UNAVAILABLE:
+            return WorkspaceRestoreResolution("unavailable-by-design")
         try:
+            repo_root = snapshot.repo_root
+            actual_root = git_repo_root(repo_root) if repo_root else None
+            if (
+                actual_root is None
+                or Path(actual_root).resolve() != Path(repo_root).resolve()
+            ):
+                raise WorkspaceSnapshotError(
+                    "snapshot restore root is not a Git working tree"
+                )
+            env = {"GIT_DIR": str(_shadow_dir(self.session_dir))}
+            ref = f"{SNAPSHOT_REF_NAMESPACE}/{snapshot.id}"
             commit = _run_git(
                 ["rev-parse", "--verify", f"{ref}^{{commit}}"],
                 cwd=self.session_dir,
                 env=env,
             ).stdout.strip()
-        except WorkspaceSnapshotError as exc:
-            raise WorkspaceSnapshotError(f"invalid snapshot ref {ref}: {exc}") from exc
-        if commit != snapshot.commit_sha:
-            raise WorkspaceSnapshotError(f"snapshot ref {ref} does not match its commit")
-        tree = _run_git(
-            ["rev-parse", "--verify", f"{commit}^{{tree}}"],
-            cwd=self.session_dir,
-            env=env,
-        ).stdout.strip()
-        if tree != snapshot.tree_sha:
-            raise WorkspaceSnapshotError(f"snapshot ref {ref} does not match its tree")
-        _run_git(
-            ["rev-list", "--objects", "--missing=error", commit],
-            cwd=self.session_dir,
-            env=env,
-        )
-
-    def _restorable_snapshots(self) -> list[WorkspaceSnapshot]:
-        valid = []
-        for snapshot in self._snapshots:
-            try:
-                self._validate_restore_target(snapshot)
-            except WorkspaceSnapshotError:
-                continue
-            valid.append(snapshot)
-        return valid
+            if commit != snapshot.commit_sha:
+                raise WorkspaceSnapshotError(
+                    f"snapshot ref {ref} does not match its commit"
+                )
+            tree = _run_git(
+                ["rev-parse", "--verify", f"{commit}^{{tree}}"],
+                cwd=self.session_dir,
+                env=env,
+            ).stdout.strip()
+            if tree != snapshot.tree_sha:
+                raise WorkspaceSnapshotError(
+                    f"snapshot ref {ref} does not match its tree"
+                )
+            _run_git(
+                ["rev-list", "--objects", "--missing=error", commit],
+                cwd=self.session_dir,
+                env=env,
+            )
+        except (WorkspaceSnapshotError, OSError) as exc:
+            return WorkspaceRestoreResolution("damaged", reason=str(exc))
+        return WorkspaceRestoreResolution("restorable", repo_root=repo_root, tree_sha=tree)
 
     def reset_corruption(self) -> None:
         """Archive the original manifest, then persist only validated rows."""
 
-        valid = self._restorable_snapshots()
+        valid = [
+            snapshot
+            for snapshot in self._snapshots
+            if self.resolve_restore_target(snapshot).status != "damaged"
+        ]
         if not self._is_corrupt and valid == self._snapshots:
             return
         archive = self.state_path.with_name(
@@ -671,17 +701,14 @@ class WorkspaceSnapshotStore:
         snapshot = self.by_id(snapshot_id)
         if snapshot is None:
             raise WorkspaceSnapshotError(f"snapshot not found: {snapshot_id}")
-        if snapshot.mode == SNAPSHOT_MODE_UNAVAILABLE:
-            self._current_id = snapshot.id
-            self._persist()
-            return snapshot
-        self._validate_restore_target(snapshot)
-        repo_root = snapshot.repo_root or git_repo_root(cwd)
-        if repo_root is None or snapshot.tree_sha is None:
-            raise WorkspaceSnapshotError(
-                f"snapshot {snapshot_id} has no restorable tree"
+        resolution = self.resolve_restore_target(snapshot)
+        if resolution.status == "damaged":
+            raise WorkspaceSnapshotError(resolution.reason)
+        if resolution.status == "restorable":
+            assert resolution.repo_root is not None and resolution.tree_sha is not None
+            _restore_from_tree(
+                self.session_dir, resolution.repo_root, resolution.tree_sha
             )
-        _restore_from_tree(self.session_dir, repo_root, snapshot.tree_sha)
         self._current_id = snapshot.id
         self._persist()
         return snapshot
