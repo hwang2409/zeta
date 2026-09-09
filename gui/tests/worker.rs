@@ -975,14 +975,16 @@ fn extensions_fetch_switch_fork_apply_settings_and_send_images() {
             peer.respond("switch_branch", tree.clone())["params"],
             json!({"session_id":"session-1","head_id":"other-head"})
         );
-        peer.respond("session_history", history.clone());
         peer.status(true, "idle", json!([]));
+        peer.respond("session_tree", tree.clone());
+        peer.respond("session_history", history.clone());
         assert_eq!(
-            peer.respond("fork_message", tree)["params"],
+            peer.respond("fork_message", tree.clone())["params"],
             json!({"session_id":"session-1","message_id":"user-1"})
         );
-        peer.respond("session_history", history);
         peer.status(true, "idle", json!([]));
+        peer.respond("session_tree", tree);
+        peer.respond("session_history", history);
         peer.respond(
             "session_settings",
             json!({"model":"offline","approval_mode":"ask"}),
@@ -1018,9 +1020,9 @@ fn extensions_fetch_switch_fork_apply_settings_and_send_images() {
         CommandMessage::ForkMessage("user-1".into()),
     ] {
         harness.command(command);
+        assert!(matches!(harness.next(), WorkerMessage::Status(_)));
         assert!(matches!(harness.next(), WorkerMessage::Tree(_)));
         assert!(matches!(harness.next(), WorkerMessage::History(_, true)));
-        assert!(matches!(harness.next(), WorkerMessage::Status(_)));
     }
     harness.command(CommandMessage::LoadSettings);
     assert!(
@@ -1134,4 +1136,127 @@ fn old_server_disables_extensions_without_sending_new_requests() {
     harness.command(CommandMessage::Send("old server still works".into()));
     assert!(matches!(harness.next(), WorkerMessage::Sent(_)));
     harness.finish();
+}
+
+fn branch_history_failure(command: CommandMessage, method: &'static str, rpc: bool) {
+    let harness = Harness::new(move |listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.respond("hello", json!({"protocol_version":"1.1", "server":"zeta"}));
+        peer.respond("list_sessions", json!({"sessions":[session()]}));
+        peer.status(true, "idle", json!([]));
+        peer.respond("session_tree", json!({"branches":[]}));
+        peer.respond("session_history", json!({"messages":[{"id":"old","role":"user","content":[{"type":"text","text":"old transcript"}]}],"next_offset":null}));
+        peer.respond(
+            method,
+            json!({"branches":[{"id":"new","label":"new branch","depth":1,"current":true}]}),
+        );
+        // Permit a status/tree refresh before the history fetch. The branch
+        // mutation has already succeeded, so old history is no longer current.
+        loop {
+            let mut line = String::new();
+            peer.reader.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "session_history" => {
+                    if rpc {
+                        peer.write(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32602,"message":"history is corrupt"}}));
+                        peer.wait_for_close();
+                    }
+                    return;
+                }
+                "status" => json!({"session":session(),"state":"idle"}),
+                "session_tree" => {
+                    json!({"branches":[{"id":"new","label":"new branch","depth":1,"current":true}]})
+                }
+                other => panic!("unexpected request: {other}"),
+            };
+            peer.write(json!({"jsonrpc":"2.0","id":request["id"],"result":result}));
+        }
+    });
+    let mut state = AppState::default();
+    loop {
+        match harness.next() {
+            WorkerMessage::Status(status) => state.apply_status(status),
+            WorkerMessage::History(history, replace) => state.apply_history(history, replace),
+            WorkerMessage::Connected => break,
+            WorkerMessage::Extensions(_) | WorkerMessage::Sessions(_) | WorkerMessage::Tree(_) => {}
+            other => panic!("unexpected startup message: {other:?}"),
+        }
+    }
+    assert_eq!(state.active_session.as_deref(), Some("session-1"));
+    assert!(!state.transcript.is_empty());
+    harness.command(command);
+    let mut rejected = false;
+    let mut lost = false;
+    while let Ok(message) = harness.messages.recv_timeout(Duration::from_secs(5)) {
+        match message {
+            WorkerMessage::Status(status) => {
+                state.apply_status(status);
+                if state.active_session.is_none() {
+                    break;
+                }
+            }
+            WorkerMessage::Tree(tree) => state.session_view.branches = tree.branches,
+            WorkerMessage::Rejected(error) => {
+                assert!(error.contains("history is corrupt"));
+                rejected = true;
+            }
+            WorkerMessage::Lost(error) => {
+                state.mark_connection_lost(error);
+                lost = true;
+                break;
+            }
+            other => panic!("unexpected recovery message: {other:?}"),
+        }
+    }
+    harness.finish();
+    if rpc {
+        assert!(rejected);
+        assert!(!lost, "RPC failures must retain the connection");
+        assert!(
+            state.transcript.is_empty(),
+            "old transcript remained current"
+        );
+        assert!(state.active_session.is_none());
+        assert!(state.session_view.branches.is_empty());
+    } else {
+        assert!(lost, "transport failures must lose the connection");
+        assert!(!rejected);
+    }
+}
+
+#[test]
+fn switch_history_rpc_failure_clears_old_transcript() {
+    branch_history_failure(
+        CommandMessage::SwitchBranch("new".into()),
+        "switch_branch",
+        true,
+    );
+}
+
+#[test]
+fn fork_history_rpc_failure_clears_old_transcript() {
+    branch_history_failure(
+        CommandMessage::ForkMessage("old".into()),
+        "fork_message",
+        true,
+    );
+}
+
+#[test]
+fn switch_history_transport_failure_loses_connection() {
+    branch_history_failure(
+        CommandMessage::SwitchBranch("new".into()),
+        "switch_branch",
+        false,
+    );
+}
+
+#[test]
+fn fork_history_transport_failure_loses_connection() {
+    branch_history_failure(
+        CommandMessage::ForkMessage("old".into()),
+        "fork_message",
+        false,
+    );
 }

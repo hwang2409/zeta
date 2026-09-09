@@ -80,10 +80,42 @@ impl ConnectionWorker {
             .send(WorkerMessage::Rejected(reason.to_owned()));
     }
 
-    fn status(&self, client: &mut ProtocolClient) -> Result<StatusResult, ClientError> {
-        let status = client.status()?;
-        let _ = self.messages.send(WorkerMessage::Status(status.clone()));
-        Ok(status)
+    fn status(
+        &self,
+        client: &mut ProtocolClient,
+        selected: &mut Option<String>,
+        refresh: Option<bool>,
+    ) -> Result<StatusResult, ClientError> {
+        let result = (|| {
+            let status = client.status()?;
+            *selected = status
+                .session
+                .as_ref()
+                .map(|session| session.session_id.clone());
+            let _ = self.messages.send(WorkerMessage::Status(status.clone()));
+            if let Some(replace) = refresh {
+                if replace || status.state == "idle" {
+                    self.refresh_session(client, selected.as_deref(), replace)?;
+                }
+            }
+            Ok(status)
+        })();
+        match result {
+            Err(error @ ClientError::Rpc { .. }) => {
+                *selected = None;
+                self.reject(&error.to_string());
+                let status = StatusResult {
+                    session: None,
+                    state: "idle".into(),
+                    pending_approvals: Vec::new(),
+                    usage: serde_json::Value::Null,
+                    compaction_markers: 0,
+                };
+                let _ = self.messages.send(WorkerMessage::Status(status.clone()));
+                Ok(status)
+            }
+            result => result,
+        }
     }
 
     fn refresh_session(
@@ -111,8 +143,13 @@ impl ConnectionWorker {
         let _ = self
             .messages
             .send(WorkerMessage::Extensions(client.session_extensions));
-        let sessions = client.list_sessions()?;
-        let _ = self.messages.send(WorkerMessage::Sessions(sessions));
+        match client.list_sessions() {
+            Ok(sessions) => {
+                let _ = self.messages.send(WorkerMessage::Sessions(sessions));
+            }
+            Err(error @ ClientError::Rpc { .. }) => self.reject(&error.to_string()),
+            Err(error) => return Err(error),
+        }
         if let Some(id) = selected.as_deref() {
             match client.resume(id) {
                 Ok(_) => {}
@@ -123,12 +160,7 @@ impl ConnectionWorker {
                 Err(error) => return Err(error),
             }
         }
-        let status = self.status(&mut client)?;
-        *selected = status
-            .session
-            .as_ref()
-            .map(|session| session.session_id.clone());
-        self.refresh_session(&mut client, selected.as_deref(), true)?;
+        let status = self.status(&mut client, selected, Some(true))?;
         let mut busy = status.state != "idle";
         let mut pending_approvals = !status.pending_approvals.is_empty();
         let _ = self.messages.send(WorkerMessage::Connected);
@@ -164,10 +196,9 @@ impl ConnectionWorker {
                             session.and_then(|session| {
                                 *selected = Some(session.session_id.clone());
                                 let _ = self.messages.send(WorkerMessage::Session(session));
-                                let status = self.status(&mut client)?;
+                                let status = self.status(&mut client, selected, Some(true))?;
                                 busy = status.state != "idle";
                                 pending_approvals = !status.pending_approvals.is_empty();
-                                self.refresh_session(&mut client, selected.as_deref(), true)?;
                                 Ok(())
                             })
                         }
@@ -201,11 +232,10 @@ impl ConnectionWorker {
                                 }
                                 _ => unreachable!(),
                             };
-                            result.and_then(|tree| {
-                                let _ = self.messages.send(WorkerMessage::Tree(tree));
-                                let history = client.history(id)?;
-                                let _ = self.messages.send(WorkerMessage::History(history, true));
-                                self.status(&mut client)?;
+                            result.and_then(|_| {
+                                let status = self.status(&mut client, selected, Some(true))?;
+                                busy = status.state != "idle";
+                                pending_approvals = !status.pending_approvals.is_empty();
                                 Ok(())
                             })
                         }
@@ -224,7 +254,7 @@ impl ConnectionWorker {
                             .and_then(|settings| {
                                 let _ =
                                     self.messages.send(WorkerMessage::SettingsApplied(settings));
-                                self.status(&mut client)?;
+                                self.status(&mut client, selected, None)?;
                                 Ok(())
                             }),
                         CommandMessage::Approve(id) | CommandMessage::Deny(id) => {
@@ -235,7 +265,7 @@ impl ConnectionWorker {
                                 client.deny(&id)
                             };
                             result.and_then(|_| {
-                                let status = self.status(&mut client)?;
+                                let status = self.status(&mut client, selected, None)?;
                                 busy = status.state != "idle";
                                 pending_approvals = !status.pending_approvals.is_empty();
                                 resumed_tool |= was_idle && busy;
@@ -257,7 +287,7 @@ impl ConnectionWorker {
             }
             // Resumed approvals run a tool without an agent_end event.
             if resumed_tool && last_status.elapsed() >= Duration::from_millis(100) {
-                let status = self.status(&mut client)?;
+                let status = self.status(&mut client, selected, None)?;
                 busy = status.state != "idle";
                 pending_approvals = !status.pending_approvals.is_empty();
                 resumed_tool = busy;
@@ -291,12 +321,9 @@ impl ConnectionWorker {
                     let _ = self.messages.send(WorkerMessage::Event(event));
                     if refresh_status {
                         client.set_read_timeout(Some(Duration::from_secs(5)))?;
-                        let status = self.status(&mut client)?;
+                        let status = self.status(&mut client, selected, Some(false))?;
                         busy = status.state != "idle";
                         pending_approvals = !status.pending_approvals.is_empty();
-                        if !busy {
-                            self.refresh_session(&mut client, selected.as_deref(), false)?;
-                        }
                     }
                 }
                 Err(ClientError::Io(error))
@@ -371,6 +398,136 @@ fn default_socket() -> PathBuf {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn session_rpc_errors_keep_commands_alive() {
+        use serde_json::{json, Value};
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::mpsc;
+
+        for (failed_method, after_connect) in [
+            ("list_sessions", false),
+            ("status", false),
+            ("session_tree", false),
+            ("session_history", false),
+            ("status", true),
+            ("session_tree", true),
+            ("session_history", true),
+        ] {
+            let path = env::temp_dir().join(format!(
+                "zg-recovery-{}-{failed_method}-{after_connect}.sock",
+                std::process::id()
+            ));
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut failed = false;
+                let mut connected = false;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 {
+                        break;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    let response =
+                        if method == failed_method && !failed && (!after_connect || connected) {
+                            failed = true;
+                            json!({"jsonrpc":"2.0", "id":request["id"],
+                            "error":{"code":-32602,"message":"session metadata is missing"}})
+                        } else {
+                            let result = match method {
+                                "hello" => json!({"protocol_version":"1.1","server":"zeta"}),
+                                "list_sessions" => json!({"sessions":[]}),
+                                "status" => {
+                                    json!({"session":{"session_id":"session-1"},"state":"idle"})
+                                }
+                                "session_tree" => json!({"branches":[]}),
+                                "session_history" => json!({"messages":[],"next_offset":null}),
+                                "new_session" => json!({"session":{"session_id":"session-1"}}),
+                                "send" => json!({"accepted":true,"session_id":"session-1"}),
+                                other => panic!("unexpected request: {other}"),
+                            };
+                            json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                        };
+                    writeln!(socket, "{response}").unwrap();
+                    if after_connect && !connected && method == "session_history" {
+                        connected = true;
+                        writeln!(
+                            socket,
+                            "{}",
+                            json!({"jsonrpc":"2.0", "method":"event",
+                            "params":{"event":"agent_end","session_id":"session-1","data":{}}})
+                        )
+                        .unwrap();
+                    }
+                }
+                assert!(failed);
+            });
+            let (commands, receiver) = mpsc::channel();
+            let (sender, messages) = mpsc::channel();
+            let worker_path = path.clone();
+            let worker = thread::spawn(move || {
+                ConnectionWorker {
+                    commands: receiver,
+                    messages: sender,
+                    socket: Some(worker_path),
+                }
+                .run()
+            });
+            let mut rejected = false;
+            let mut connected = false;
+            let mut cleared = failed_method == "list_sessions";
+            while !rejected || !connected || !cleared {
+                match messages.recv_timeout(Duration::from_secs(5)).unwrap() {
+                    WorkerMessage::Rejected(error) => {
+                        assert!(error.contains("session metadata is missing"));
+                        rejected = true;
+                    }
+                    WorkerMessage::Connected => connected = true,
+                    WorkerMessage::Status(status)
+                        if rejected && failed_method != "list_sessions" =>
+                    {
+                        cleared = status.session.is_none();
+                    }
+                    WorkerMessage::Lost(error) => {
+                        panic!("{failed_method} lost connection: {error}")
+                    }
+                    _ => {}
+                }
+            }
+            commands.send(CommandMessage::NewSession).unwrap();
+            loop {
+                match messages.recv_timeout(Duration::from_secs(5)).unwrap() {
+                    WorkerMessage::Session(_) => break,
+                    WorkerMessage::Lost(error) | WorkerMessage::Rejected(error) => {
+                        panic!("{error}")
+                    }
+                    _ => {}
+                }
+            }
+            commands
+                .send(CommandMessage::Send("still connected".into()))
+                .unwrap();
+            loop {
+                match messages.recv_timeout(Duration::from_secs(5)).unwrap() {
+                    WorkerMessage::Sent(_) => break,
+                    WorkerMessage::Lost(error) | WorkerMessage::Rejected(error) => {
+                        panic!("{error}")
+                    }
+                    _ => {}
+                }
+            }
+            drop(commands);
+            worker.join().unwrap();
+            server.join().unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 
     fn stale_socket(path: &std::path::Path) {
         // Bind without listening: the path exists but cannot accept connections,

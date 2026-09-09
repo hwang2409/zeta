@@ -91,13 +91,19 @@ class CheckpointTranscriptMixin:
     def slash_checkpoint(self, args: str) -> str:
         if self.active or self.loop.store.turn_in_flight():
             return "checkpoint unavailable while a turn is running"
+        if args.strip() == "--reset":
+            try:
+                self._snapshots().reset_corruption()
+            except (WorkspaceSnapshotError, OSError) as exc:
+                return f"snapshot state reset failed: {exc}"
+            return "workspace snapshot state reset; valid snapshots retained"
         try:
             entry = self.loop.store.append_checkpoint(args.strip() or None)
         except ValueError as exc:
             return f"checkpoint failed: {exc}"
         label = entry.data["label"]
-        snapshots = self._snapshots()
         try:
+            snapshots = self._snapshots()
             snapshot = snapshots.take(
                 self.loop.store.bash_cwd,
                 label=label,
@@ -204,8 +210,8 @@ class CheckpointTranscriptMixin:
             entry = self.loop.store.append_message_fork(source.id)
         except (ValueError, ConversationIntegrityError) as exc:
             return f"fork failed: {exc}"
-        restore_note = _restore_workspace(
-            snapshots, target_snapshot, self.loop.store.bash_cwd
+        _, restore_note = _restore_workspace(
+            snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
         )
         self._rebuild_transcript()
         self._fork_rebuilt = True
@@ -219,16 +225,18 @@ class CheckpointTranscriptMixin:
 
     def _fork_from_checkpoint_label(self, selector: str, forced: bool) -> str:
         snapshots = self._snapshots()
-        dirty_warning = _dirty_guard(snapshots, self.loop.store.bash_cwd, forced)
-        if dirty_warning is not None:
-            return dirty_warning
+        # With no snapshots this fork only changes the conversation.
+        if snapshots.snapshots:
+            dirty_warning = _dirty_guard(snapshots, self.loop.store.bash_cwd, forced)
+            if dirty_warning is not None:
+                return dirty_warning
         try:
             entry = self.loop.store.append_fork(selector)
         except ValueError as exc:
             return f"fork failed: {exc}"
         target_snapshot = _resolve_fork_snapshot(snapshots, entry)
-        restore_note = _restore_workspace(
-            snapshots, target_snapshot, self.loop.store.bash_cwd
+        _, restore_note = _restore_workspace(
+            snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
         )
         self._rebuild_transcript()
         self._fork_rebuilt = True
@@ -282,16 +290,24 @@ class CheckpointTranscriptMixin:
         if self.loop.background_children_running:
             return f"{verb} unavailable while background agents are running"
         snapshots = self._snapshots()
+        if snapshots.is_corrupt and not forced:
+            return snapshots.corruption_message
         target = (
             snapshots.undo_target() if verb == "undo" else snapshots.redo_target()
         )
         if target is None:
+            if snapshots.is_corrupt:
+                return snapshots.corruption_message
             direction = "earlier" if verb == "undo" else "later"
             return f"{verb} unavailable: no {direction} workspace snapshot"
         dirty_warning = _dirty_guard(snapshots, self.loop.store.bash_cwd, forced)
         if dirty_warning is not None:
             return dirty_warning
-        restore_note = _restore_workspace(snapshots, target, self.loop.store.bash_cwd)
+        restored, restore_note = _restore_workspace(
+            snapshots, target, self.loop.store.bash_cwd, forced=forced
+        )
+        if not restored:
+            return f"{verb} failed: {restore_note}"
         label = target.label or target.id[:8]
         message = f"{past} to workspace snapshot '{label}'"
         if restore_note:
@@ -473,11 +489,9 @@ def _dirty_guard(
 ) -> str | None:
     if forced:
         return None
+    if snapshots.is_corrupt:
+        return snapshots.corruption_message
     if git_repo_root(cwd) is None:
-        return None
-    # Gate on "any restorable snapshot exists" so a corrupt or missing
-    # current_id in the state file cannot silently bypass the confirm.
-    if not snapshots.has_restorable_snapshot():
         return None
     if not snapshots.is_dirty(cwd):
         return None
@@ -491,16 +505,21 @@ def _restore_workspace(
     snapshots: WorkspaceSnapshotStore,
     target: WorkspaceSnapshot | None,
     cwd: str,
-) -> str:
+    *,
+    forced: bool = False,
+) -> tuple[bool, str]:
     if target is None:
-        return ""
+        return False, ""
+    resolution = snapshots.resolve_restore_target(target)
+    if resolution.status == "unavailable-by-design":
+        return False, "no restorable workspace snapshot"
+    if resolution.status == "damaged":
+        return False, f"workspace restore failed: {resolution.reason}"
     try:
-        restored = snapshots.restore(target.id, cwd)
+        restored = snapshots.restore(target.id, cwd, force=forced)
     except WorkspaceSnapshotError as exc:
-        return f"workspace unchanged: {exc}"
-    if restored.mode != SNAPSHOT_MODE_GIT:
-        return ""
-    return (
+        return False, f"workspace restore failed: {exc}"
+    return True, (
         f"workspace restored: {restored.file_count} files, "
         f"{_format_size(restored.size_bytes)}"
     )

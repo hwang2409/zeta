@@ -247,3 +247,20 @@ def test_background_tools_are_discovered() -> None:
         "task_output",
         "task_kill",
     }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"[" * 65 + b"]" * 65, b"[" * 10_000 + b"]" * 10_000, b"\xff"],
+    ids=["depth65", "depth10000", "binary"],
+)
+async def test_registry_setup_ignores_corrupt_background_state(
+    tmp_path: Path, payload: bytes
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    path = store.session_dir / "background_tasks.json"
+    path.write_bytes(payload)
+    registry = ToolRegistry(tmp_path, session_store=store)
+    assert registry.background_tasks.running_count == 0
+    assert path.read_bytes() == payload
+    await registry.close()

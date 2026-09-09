@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import fcntl
 import json
+import logging
 import os
 import re
 import unicodedata
@@ -14,12 +15,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Mapping
 
 from rich.cells import cell_len
 
+from .checkpoints import ConversationIntegrityError, load_session_json
 from .store import ConversationStore
 
+
+logger = logging.getLogger(__name__)
 
 META_VERSION = 1
 
@@ -318,9 +323,7 @@ class SessionManager:
         for _ in range(8):
             session_id = uuid.uuid4().hex
             session_dir = self.sessions_dir / session_id
-            try:
-                session_dir.mkdir()
-            except FileExistsError:
+            if session_dir.exists():
                 continue
             metadata = SessionMetadata.new(
                 session_id=session_id,
@@ -335,16 +338,32 @@ class SessionManager:
                 budget_pinned=budget_pinned,
                 name=name,
             )
-            store = ConversationStore(
-                self.sessions_dir,
-                session_id=session_id,
-                cwd=resolved_cwd,
-            )
-            self._write(metadata)
-            return OpenedSession(metadata, store)
+            # Finish all writes outside discovery before claiming the final ID.
+            with TemporaryDirectory(prefix=".session-", dir=self.home) as temporary:
+                staged = SessionManager(temporary)
+                ConversationStore(
+                    staged.sessions_dir,
+                    session_id=session_id,
+                    cwd=resolved_cwd,
+                )
+                staged._write(metadata)
+                # mkdir atomically claims the ID without replacing any existing
+                # path, including a non-cooperating creator's empty directory.
+                try:
+                    session_dir.mkdir()
+                except FileExistsError:
+                    continue
+                staged_dir = staged.sessions_dir / session_id
+                for path in staged_dir.iterdir():
+                    if path.name != "meta.json":
+                        path.rename(session_dir / path.name)
+                # Publish metadata last: a crash before this leaves an incomplete
+                # directory that discovery skips and future creators preserve.
+                (staged_dir / "meta.json").rename(session_dir / "meta.json")
+            return self.open(session_id)
         raise SessionError("could not allocate a unique session id")
 
-    def open(self, session_id: str) -> OpenedSession:
+    def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
         self._validate_id(session_id)
         metadata = self._read(session_id)
         if metadata.session_id != session_id:
@@ -356,7 +375,9 @@ class SessionManager:
         if not conversation_path.exists():
             raise SessionError(f"session {session_id} has no conversation.jsonl")
         try:
-            store = ConversationStore(self.sessions_dir, session_id=session_id)
+            store = ConversationStore(
+                self.sessions_dir, session_id=session_id, _read_only=_read_only
+            )
         except (OSError, ValueError) as exc:
             raise SessionError(f"session {session_id} could not be opened") from exc
         if store.cwd != metadata.cwd:
@@ -368,48 +389,55 @@ class SessionManager:
             return []
         sessions: list[SessionMetadata] = []
         for session_path in self.sessions_dir.iterdir():
-            if not session_path.is_dir():
-                continue
-            self._validate_id(session_path.name)
-            sessions.append(self._read(session_path.name))
+            try:
+                if not session_path.is_dir():
+                    continue
+                opened = self.open(session_path.name, _read_only=True)
+                sessions.append(opened.metadata)
+            except (SessionError, ConversationIntegrityError) as exc:
+                logger.warning("Skipping session %s: %s", session_path.name, exc)
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
 
     def list_session_previews(self, *, limit: int = 20) -> list[SessionPreview]:
         """Return recent sessions with safe, single-line first-message previews."""
 
         sessions = self.list_sessions()
-        sessions = sessions[:limit]
         previews: list[SessionPreview] = []
         for metadata in sessions:
-            opened = self.open(metadata.session_id)
-            first_message = ""
-            for entry in opened.store.replay():
-                if entry.type != "message":
-                    continue
-                message = entry.data.get("message")
-                if not isinstance(message, dict):
-                    continue
-                if message.get("role") != "user":
-                    continue
-                parts = []
-                for block in message.get("content", []):
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") in {
-                        "text",
-                        "thinking",
-                    } and isinstance(block.get("text"), str):
-                        parts.append(block["text"])
-                first_message = "".join(parts)
+            if len(previews) >= limit:
                 break
-            previews.append(
-                SessionPreview(
-                    session_id=metadata.session_id,
-                    updated_at=metadata.updated_at,
-                    preview=_preview_text(first_message) or "(no user message)",
-                    name=metadata.name,
+            try:
+                opened = self.open(metadata.session_id, _read_only=True)
+                first_message = ""
+                for entry in opened.store.replay():
+                    if entry.type != "message":
+                        continue
+                    message = entry.data.get("message")
+                    if not isinstance(message, dict):
+                        continue
+                    if message.get("role") != "user":
+                        continue
+                    parts = []
+                    for block in message.get("content", []):
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") in {
+                            "text",
+                            "thinking",
+                        } and isinstance(block.get("text"), str):
+                            parts.append(block["text"])
+                    first_message = "".join(parts)
+                    break
+                previews.append(
+                    SessionPreview(
+                        session_id=metadata.session_id,
+                        updated_at=metadata.updated_at,
+                        preview=_preview_text(first_message) or "(no user message)",
+                        name=metadata.name,
+                    )
                 )
-            )
+            except (SessionError, ConversationIntegrityError) as exc:
+                logger.warning("Skipping session preview %s: %s", metadata.session_id, exc)
         return previews
 
     def find_most_recent(self, *, cwd: str | Path | None = None) -> SessionMetadata:
@@ -615,11 +643,14 @@ class SessionManager:
             raise SessionError(f"session {full_id} has no conversation.jsonl")
         header = {"type": "session_export", "metadata": metadata.to_dict()}
         lines = [json.dumps(header, separators=(",", ":"), sort_keys=True)]
-        with conversation_path.open() as handle:
-            for line in handle:
-                stripped = line.rstrip("\n")
-                if stripped:
-                    lines.append(stripped)
+        try:
+            with conversation_path.open("rb") as handle:
+                for line in handle:
+                    if line.strip():
+                        row = load_session_json(line)
+                        lines.append(json.dumps(row, separators=(",", ":")))
+        except (ConversationIntegrityError, OSError) as exc:
+            raise SessionError(f"session {full_id} could not be exported") from exc
         return "\n".join(lines) + "\n"
 
     def record_budget(
@@ -684,12 +715,13 @@ class SessionManager:
 
     def _read(self, session_id: str) -> SessionMetadata:
         path = self.sessions_dir / session_id / "meta.json"
-        if not path.exists():
-            raise SessionError(f"session {session_id} was not found")
         try:
-            with path.open() as handle:
-                value = json.load(handle)
-        except (OSError, json.JSONDecodeError) as exc:
+            value = load_session_json(path)
+        except ConversationIntegrityError as exc:
+            if isinstance(exc.__cause__, FileNotFoundError):
+                if path.parent.is_dir():
+                    raise SessionError(f"session {session_id} has no meta.json") from exc
+                raise SessionError(f"session {session_id} was not found") from exc
             raise SessionError(f"session metadata could not be read: {path}") from exc
         if not isinstance(value, Mapping):
             raise SessionError(f"session metadata is not an object: {path}")
