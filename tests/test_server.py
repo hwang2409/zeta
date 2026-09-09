@@ -2061,3 +2061,74 @@ async def test_stream_access_error_restores_model_over_wire(tmp_path, provider, 
         await _event(reader, "agent_end")
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["claude", "codex-flat", "codex-nested", "codex-failed"])
+@pytest.mark.parametrize("status", [403, 404])
+@pytest.mark.parametrize("message_fields", [{}, {"message": None}, {"message": {"text": "Denied"}}])
+@pytest.mark.parametrize("partial", [False, True])
+async def test_stream_access_recovery_does_not_depend_on_message(
+    tmp_path, shape, status, message_fields, partial,
+):
+    import httpx
+
+    from zeta.loop import _error_info
+    from zeta.providers.anthropic import AnthropicStreamError
+    from zeta.providers.anthropic import _decode_response as decode_anthropic
+    from zeta.providers.codex import CodexStreamError
+    from zeta.providers.codex import _decode_response as decode_codex
+    from zeta.server.model_selection import entitlement_error
+
+    provider = "claude" if shape == "claude" else "codex"
+    code = "permission_denied" if status == 403 else "model_not_found"
+    detail = {"status_code": status, **message_fields}
+    events = []
+    if provider == "claude":
+        detail["type"] = "permission_error" if status == 403 else "not_found_error"
+        if partial:
+            events = [
+                {"type": "message_start", "message": {"id": "test-message"}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
+                {"type": "content_block_delta", "index": 0,
+                 "delta": {"type": "text_delta", "text": "partial"}},
+            ]
+        events.append({"type": "error", "error": detail})
+    else:
+        detail["code"] = code
+        if partial or shape == "codex-failed":
+            events = [{"type": "response.created", "response": {"id": "test-response"}}]
+        if partial:
+            events.extend([
+                {"type": "response.output_item.added", "output_index": 0,
+                 "item": {"type": "message", "id": "test-message"}},
+                {"type": "response.content_part.added", "output_index": 0, "content_index": 0,
+                 "part": {"type": "output_text"}},
+                {"type": "response.output_text.delta", "output_index": 0, "content_index": 0,
+                 "delta": "partial"},
+            ])
+        if shape == "codex-flat":
+            events.append({"type": "error", **detail})
+        elif shape == "codex-nested":
+            events.append({"type": "error", "error": detail})
+        else:
+            events.append({"type": "response.failed", "response": {"error": detail}})
+
+    decode = decode_anthropic if provider == "claude" else decode_codex
+    error_type = AnthropicStreamError if provider == "claude" else CodexStreamError
+    response = httpx.Response(200, text="".join(f"data: {json.dumps(e)}\n\n" for e in events))
+    decoded = []
+    try:
+        with pytest.raises(error_type) as raised:
+            async for item in decode(response):
+                decoded.append(item)
+        info = _error_info(raised.value, provider_error=True)
+        assert (info.code, info.status_code) == (code, status)
+        assert entitlement_error(info)
+        assert any(item.delta == "partial" for item in decoded) is partial
+    finally:
+        await response.aclose()
+
+    # Reuse the round-3 wire scenario without changing its assertions:
+    # dedicated code, durable restoration, and a successful next send.
+    await test_stream_access_error_restores_model_over_wire(tmp_path, provider, events)

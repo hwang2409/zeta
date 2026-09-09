@@ -2457,3 +2457,35 @@ async def test_stream_error_preserves_structured_metadata(shape, detail, code, s
         assert "Denied" not in info.message
     finally:
         await response.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["flat", "nested", "failed"])
+@pytest.mark.parametrize("message_fields", [
+    {}, {"message": None}, {"message": {"text": "Denied"}}, {"message": ""},
+    {"message": "\ud800"},
+])
+@pytest.mark.parametrize("detail,code,status", [
+    ({"code": "model_not_found"}, "model_not_found", None),
+    ({"code": "permission_denied"}, "permission_denied", None),
+    ({"status_code": 403}, "stream_error", 403),
+])
+async def test_stream_error_message_cannot_discard_metadata(shape, message_fields, detail, code, status):
+    detail = {**detail, **message_fields}
+    if shape == "flat":
+        events = [event("error", **detail)]
+    elif shape == "nested":
+        events = [event("error", error=detail)]
+    else:
+        events = [
+            event("response.created", response={"id": "test-response"}),
+            event("response.failed", response={"error": detail}),
+        ]
+    response = httpx.Response(200, text=sse(events))
+    try:
+        with pytest.raises(CodexStreamError) as raised:
+            [item async for item in codex_module._decode_response(response)]
+        assert (raised.value.code, raised.value.status_code) == (code, status)
+        assert str(raised.value) == (f"{code}: stream error" if "code" in detail else "stream error")
+    finally:
+        await response.aclose()

@@ -31,6 +31,7 @@ from .anthropic_errors import (
     http_error as _http_error,
 )
 from .stream_diagnostics import Cause, StreamDiagnostics
+from .stream_errors import decode_stream_error
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
@@ -755,17 +756,13 @@ def _translate_event(
         detail = payload.get("error")
         if not isinstance(detail, Mapping):
             raise AnthropicStreamError("Anthropic stream error payload is invalid")
-        message = detail.get("message")
-        if type(message) is not str:
-            raise AnthropicStreamError("Anthropic stream error message is invalid")
-        reason = detail.get("type")
-        reason_text = error_body_excerpt(message.encode()) or "Anthropic stream error"
+        error = decode_stream_error(detail, include_message=True)
         raise AnthropicStreamError(
-            f"{reason}: {reason_text}" if type(reason) is str else reason_text,
-            code=reason,
-            status_code=detail.get("status_code"),
-            retryable=reason in {"overloaded_error", "rate_limit_error"},
-            retry_reason=reason if reason in {"overloaded_error", "rate_limit_error"} else None,
+            error.message,
+            code=error.code,
+            status_code=error.status_code,
+            retryable=error.retry_reason is not None,
+            retry_reason=error.retry_reason,
         )
     if event_type == "message_start":
         message = payload.get("message", {})

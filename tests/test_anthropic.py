@@ -2996,3 +2996,28 @@ async def test_stream_error_preserves_structured_metadata(detail, code, status):
         assert info.provider_error
     finally:
         await response.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_fields", [
+    {}, {"message": None}, {"message": {"text": "Denied"}}, {"message": ""},
+    {"message": "\ud800"}, {"message": '"\\ud800"'},
+    {"message": "[" * 2000 + "0" + "]" * 2000},
+])
+@pytest.mark.parametrize("detail,code,status", [
+    ({"type": "permission_error"}, "permission_denied", None),
+    ({"type": "not_found_error"}, "model_not_found", None),
+    ({"status_code": 403}, "stream_error", 403),
+    ({"code": [], "type": "permission_error"}, "permission_denied", None),
+])
+async def test_stream_error_message_cannot_discard_metadata(message_fields, detail, code, status):
+    payload = {"type": "error", "error": {**detail, **message_fields}}
+    response = httpx.Response(200, text=f"data: {json.dumps(payload)}\n\n")
+    try:
+        with pytest.raises(AnthropicStreamError) as raised:
+            [item async for item in anthropic_module._decode_response(response)]
+        assert (raised.value.code, raised.value.status_code) == (code, status)
+        reason = detail.get("type")
+        assert str(raised.value) == (f"{reason}: stream error" if reason else "stream error")
+    finally:
+        await response.aclose()
