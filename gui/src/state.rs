@@ -33,6 +33,7 @@ pub enum TranscriptEntry {
     Error {
         message: String,
         settings_action: bool,
+        login_provider: Option<String>,
     },
     Tool {
         key: ToolReceiptKey,
@@ -367,7 +368,7 @@ impl AppState {
             // The protocol has no request ID here. The worker follows this event
             // with authoritative status, which preserves other delegated approvals.
             ServerEvent::ApprovalEnd { .. } => {}
-            ServerEvent::Error { error, .. } => {
+            ServerEvent::Error { error, data, .. } => {
                 self.streaming = false;
                 self.metrics_boundary = true;
                 self.approvals.clear();
@@ -376,6 +377,7 @@ impl AppState {
                 self.transcript.push(TranscriptEntry::Error {
                     message: error.message,
                     settings_action,
+                    login_provider: data["login_provider"].as_str().map(str::to_owned),
                 });
                 changed = self.transcript.len().checked_sub(1);
             }
@@ -973,7 +975,7 @@ mod tests {
                 data: json!({}),
             });
             assert!(matches!(&state.transcript[0], TranscriptEntry::Error {
-                message: text, settings_action,
+                message: text, settings_action, ..
             } if text == message && *settings_action == expected));
         }
     }

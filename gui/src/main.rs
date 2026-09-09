@@ -27,6 +27,7 @@ use std::{
 };
 use zeta_gui::{
     client::Approval,
+    login::{LoginProgress, LoginProvider},
     session::{ImageAttachment, SessionSettings, APPROVAL_MODES},
     state::{AppState, ConnectionState, TranscriptEntry},
     worker::{CommandMessage, ConnectionWorker, WorkerMessage},
@@ -52,6 +53,7 @@ struct ZetaView {
     dialog_request: Option<String>,
     approval_pending: bool,
     settings_open: bool,
+    login_providers: Vec<LoginProvider>,
     settings_error: Option<String>,
     composer_images: Vec<ImageAttachment>,
     composer_image_error: Option<String>,
@@ -104,6 +106,7 @@ impl ZetaView {
             dialog_request: None,
             approval_pending: false,
             settings_open: false,
+            login_providers: Vec::new(),
             settings_error: None,
             composer_images: Vec::new(),
             composer_image_error: None,
@@ -150,12 +153,34 @@ impl ZetaView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let login_changed = matches!(
+            &message,
+            WorkerMessage::Extensions(_)
+                | WorkerMessage::LoginProviders(_)
+                | WorkerMessage::Login(..)
+                | WorkerMessage::Lost(_)
+        );
         let previous_session = self.state.active_session.clone();
         let previous_count = self.state.transcript.len();
         let mut changed_row = None;
         let mut replace = false;
         match message {
-            WorkerMessage::Extensions(available) => self.state.session_view.available = available,
+            WorkerMessage::LoginProviders(providers) => self.login_providers = providers,
+            WorkerMessage::Login(provider, progress) => {
+                if let Some(row) = self
+                    .login_providers
+                    .iter_mut()
+                    .find(|row| row.provider == provider)
+                {
+                    if let Some(url) = row.update(progress) {
+                        cx.open_url(&url);
+                    }
+                }
+            }
+            WorkerMessage::Extensions(available) => {
+                self.state.session_view.available = available;
+                self.login_providers.clear();
+            }
             WorkerMessage::Tree(tree) => self.state.session_view.branches = tree.branches,
             WorkerMessage::History(history, reset) => {
                 self.state.apply_history(history, reset);
@@ -262,6 +287,13 @@ impl ZetaView {
             WorkerMessage::Lost(error) => {
                 self.pending_command = false;
                 self.approval_pending = false;
+                for row in &mut self.login_providers {
+                    if row.progress.busy() {
+                        row.progress = LoginProgress::failed(
+                            "Connection lost during sign-in. Reconnect and try again.".into(),
+                        );
+                    }
+                }
                 self.state.mark_connection_lost(error);
             }
         }
@@ -283,6 +315,9 @@ impl ZetaView {
                 }
             }
         });
+        if login_changed {
+            self.remeasure_login_rows(cx);
+        }
         self.sync_approval(window, cx);
         cx.notify();
     }
@@ -333,6 +368,130 @@ impl ZetaView {
             self.queue(CommandMessage::Send(text));
         }
         cx.notify();
+    }
+
+    fn remeasure_login_rows(&self, cx: &mut Context<Self>) {
+        self.transcript.update(cx, |scroll, cx| {
+            for (index, row) in self.state.transcript.iter().enumerate() {
+                if matches!(
+                    row,
+                    TranscriptEntry::Error {
+                        login_provider: Some(_),
+                        ..
+                    }
+                ) {
+                    scroll.remeasure_items(index..index + 1, cx);
+                }
+            }
+        });
+    }
+
+    fn start_login(&mut self, provider: &str, cx: &mut Context<Self>) {
+        if self.state.connection != ConnectionState::Connected {
+            return;
+        }
+        if let Some(row) = self
+            .login_providers
+            .iter_mut()
+            .find(|row| row.provider == provider)
+        {
+            if row.progress.busy() {
+                return;
+            }
+            row.progress = LoginProgress::Starting;
+            self.queue(CommandMessage::LoginStart(provider.to_owned()));
+            self.remeasure_login_rows(cx);
+            cx.notify();
+        }
+    }
+
+    fn cancel_login(&mut self, provider: &str, cx: &mut Context<Self>) {
+        if let Some(row) = self
+            .login_providers
+            .iter_mut()
+            .find(|row| row.provider == provider)
+        {
+            if !row.progress.busy() || row.progress == LoginProgress::Cancelling {
+                return;
+            }
+            row.progress = LoginProgress::Cancelling;
+            self.queue(CommandMessage::LoginCancel(provider.to_owned()));
+            self.remeasure_login_rows(cx);
+            cx.notify();
+        }
+    }
+
+    fn render_login_row(
+        &self,
+        provider: &LoginProvider,
+        prefix: &str,
+        view: gpui::WeakEntity<Self>,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let id = format!("{prefix}-{}", provider.provider);
+        let name = provider.provider.clone();
+        let cancel = name.clone();
+        let cancel_view = view.clone();
+        div()
+            .id(id.clone())
+            .v_flex()
+            .gap_2()
+            .p_2()
+            .child(
+                div()
+                    .h_flex()
+                    .gap_3()
+                    .items_center()
+                    .justify_between()
+                    .child(provider.label().to_owned())
+                    .child(
+                        Button::new(format!("{id}-start"))
+                            .debug_selector({
+                                let selector = format!("{id}-start");
+                                move || selector.clone()
+                            })
+                            .h(px(40.))
+                            .label(format!("Log in with {}", provider.label()))
+                            .disabled(
+                                provider.progress.busy()
+                                    || self.state.connection != ConnectionState::Connected,
+                            )
+                            .on_click(move |_, _, cx| {
+                                let _ = view.update(cx, |view, cx| view.start_login(&name, cx));
+                            }),
+                    )
+                    .when(provider.progress.busy(), |row| {
+                        row.child(
+                            Button::new(format!("{id}-cancel"))
+                                .debug_selector({
+                                    let selector = format!("{id}-cancel");
+                                    move || selector.clone()
+                                })
+                                .h(px(40.))
+                                .label("Cancel")
+                                .disabled(provider.progress == LoginProgress::Cancelling)
+                                .on_click(move |_, _, cx| {
+                                    let _ = cancel_view
+                                        .update(cx, |view, cx| view.cancel_login(&cancel, cx));
+                                }),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .whitespace_normal()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(provider.status()),
+            )
+            .when_some(
+                match &provider.progress {
+                    LoginProgress::Failed { error } => Some(error.message.clone()),
+                    _ => None,
+                },
+                |row, error| row.child(Alert::error(format!("{id}-error"), error)),
+            )
+            .into_any_element()
     }
 
     fn open_settings(&mut self, cx: &mut Context<Self>) {
@@ -778,6 +937,14 @@ impl ZetaView {
                             .child("Approval mode"),
                     )
                     .child(mode_row)
+                    .children(self.login_providers.iter().map(|provider| {
+                        self.render_login_row(
+                            provider,
+                            "settings-login",
+                            cx.entity().downgrade(),
+                            cx,
+                        )
+                    }))
                     .when_some(error, |dialog, error| {
                         dialog.child(Alert::error("settings-error", error))
                     })
@@ -973,6 +1140,7 @@ impl ZetaView {
             TranscriptEntry::Error {
                 message,
                 settings_action,
+                login_provider,
             } => row
                 .child(
                     div()
@@ -988,6 +1156,21 @@ impl ZetaView {
                                 .debug_selector(move || format!("error-message-{index}"))
                                 .whitespace_normal()
                                 .child(message.clone()),
+                        )
+                        .when_some(
+                            login_provider.as_ref().and_then(|provider| {
+                                self.login_providers
+                                    .iter()
+                                    .find(|row| &row.provider == provider)
+                            }),
+                            |block, provider| {
+                                block.child(self.render_login_row(
+                                    provider,
+                                    &format!("error-login-{index}"),
+                                    view.clone(),
+                                    cx,
+                                ))
+                            },
                         )
                         .when(
                             *settings_action && self.state.session_view.available,
@@ -1011,6 +1194,11 @@ impl ZetaView {
 
 impl Render for ZetaView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let needs_login = !self.login_providers.is_empty()
+            && self
+                .login_providers
+                .iter()
+                .all(|row| !row.credentials_present);
         let can_send = self.can_change_session() && self.state.active_session.is_some();
         let view = cx.entity();
         let row_view = view.downgrade();
@@ -1053,6 +1241,21 @@ impl Render for ZetaView {
             .min_w_0()
             .h_full()
             .children(banner)
+            .when(!self.settings_open, |main| {
+                main.children(
+                    self.login_providers
+                        .iter()
+                        .filter(|provider| provider.progress != LoginProgress::Idle)
+                        .map(|provider| {
+                            self.render_login_row(
+                                provider,
+                                "login-progress",
+                                cx.entity().downgrade(),
+                                cx,
+                            )
+                        }),
+                )
+            })
             .when_some(self.command_error.clone(), |main, error| {
                 main.child(Alert::error("command-error", error).banner())
             })
@@ -1070,7 +1273,28 @@ impl Render for ZetaView {
                             div()
                                 .p_6()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("Start a conversation"),
+                                .v_flex()
+                                .gap_3()
+                                .child(if needs_login {
+                                    "Log in with a provider to start a conversation"
+                                } else {
+                                    "Start a conversation"
+                                })
+                                .children(
+                                    self.login_providers
+                                        .iter()
+                                        .filter(|row| {
+                                            needs_login && row.progress == LoginProgress::Idle
+                                        })
+                                        .map(|provider| {
+                                            self.render_login_row(
+                                                provider,
+                                                "first-login",
+                                                cx.entity().downgrade(),
+                                                cx,
+                                            )
+                                        }),
+                                ),
                         )
                     })
                     .child(transcript),

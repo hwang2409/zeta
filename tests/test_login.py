@@ -20,10 +20,10 @@ from urllib.request import urlopen
 import httpx
 import pytest
 
-from zeta import cli
 from zeta.cli import build_parser
 from zeta.core import login_flow
 from zeta.core.login_flow import LoginError, LoginProvider, run_login
+from zeta.providers import login as provider_login
 from zeta.providers.anthropic import AnthropicCredentialStore
 from zeta.providers.auth import OAuthTokens
 from zeta.providers.codex import CodexCredentialStore
@@ -104,10 +104,9 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
         assert verifier
         return expected
 
-    monkeypatch.setattr(cli, "env_home", lambda: tmp_path)
     if provider == "anthropic":
         store = AnthropicCredentialStore(tmp_path / "anthropic-oauth.json")
-        real_builder = cli.build_anthropic_authorization_url
+        real_builder = provider_login.build_anthropic_authorization_url
 
         def build_url_for_anthropic(
             state: str, challenge: str, redirect_uri: str
@@ -116,23 +115,23 @@ async def test_login_dispatches_provider_and_stores_exchange_result(
             build_url(state, challenge, redirect_uri)
             return value
 
-        monkeypatch.setattr(cli, "build_anthropic_authorization_url", build_url_for_anthropic)
-        monkeypatch.setattr(cli, "exchange_anthropic_authorization_code", exchange)
+        monkeypatch.setattr(provider_login, "build_anthropic_authorization_url", build_url_for_anthropic)
+        monkeypatch.setattr(provider_login, "exchange_anthropic_authorization_code", exchange)
     else:
         store = CodexCredentialStore(tmp_path / "codex-oauth.json")
-        real_builder = cli.build_codex_authorization_url
+        real_builder = provider_login.build_codex_authorization_url
 
         def build_url_for_codex(state: str, challenge: str, redirect_uri: str) -> str:
             value = real_builder(state, challenge, redirect_uri)
             build_url(state, challenge, redirect_uri)
             return value
 
-        monkeypatch.setattr(cli, "build_codex_authorization_url", build_url_for_codex)
-        monkeypatch.setattr(cli, "exchange_codex_authorization_code", exchange)
-        monkeypatch.setattr(cli, "extract_account_id", lambda access_token: "account")
+        monkeypatch.setattr(provider_login, "build_codex_authorization_url", build_url_for_codex)
+        monkeypatch.setattr(provider_login, "exchange_codex_authorization_code", exchange)
+        monkeypatch.setattr(provider_login, "extract_account_id", lambda access_token: "account")
 
     result = await run_login(
-        cli._build_login_provider(provider),
+        provider_login.build_login_provider(provider, tmp_path),
         lambda: ("verifier", "challenge", "state"),
         timeout_seconds=2,
         output=StringIO(),

@@ -449,6 +449,7 @@ pub struct ProtocolClient {
     events: VecDeque<ServerEvent>,
     next_id: u64,
     pub session_extensions: bool,
+    pub login_extensions: bool,
 }
 
 impl ProtocolClient {
@@ -480,6 +481,7 @@ impl ProtocolClient {
             events: VecDeque::new(),
             next_id: 1,
             session_extensions: false,
+            login_extensions: false,
         })
     }
 
@@ -504,7 +506,51 @@ impl ProtocolClient {
             });
         }
         self.session_extensions = hello.protocol_version == "1.1";
+        self.login_extensions = self.session_extensions
+            && [
+                "login_start",
+                "login_status",
+                "login_cancel",
+                "login_providers",
+            ]
+            .iter()
+            .all(|method| {
+                hello.capabilities["requests"]
+                    .as_array()
+                    .is_some_and(|requests| {
+                        requests
+                            .iter()
+                            .any(|request| request.as_str() == Some(method))
+                    })
+            });
         Ok(hello)
+    }
+
+    pub fn login_providers(&mut self) -> Result<crate::login::LoginProviders, ClientError> {
+        self.login_request("login_providers", serde_json::json!({}))
+    }
+
+    pub fn login(
+        &mut self,
+        method: &str,
+        provider: &str,
+    ) -> Result<crate::login::LoginProgress, ClientError> {
+        self.login_request(method, serde_json::json!({"provider": provider}))
+    }
+
+    fn login_request<T: for<'de> Deserialize<'de>>(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<T, ClientError> {
+        if !self.login_extensions {
+            return Err(ClientError::Rpc {
+                code: -32601,
+                message: "login is unavailable on this server".into(),
+                data: None,
+            });
+        }
+        self.request(method, params)
     }
 
     pub fn list_sessions(&mut self) -> Result<SessionList, ClientError> {
@@ -923,6 +969,56 @@ mod tests {
                 kind: "assistant".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn login_requires_version_and_all_advertised_requests() {
+        for (index, (version, methods, expected)) in [
+            (
+                "1.0",
+                vec![
+                    "login_start",
+                    "login_status",
+                    "login_cancel",
+                    "login_providers",
+                ],
+                false,
+            ),
+            ("1.1", vec![], false),
+            ("1.1", vec!["login_start"], false),
+            (
+                "1.1",
+                vec![
+                    "login_start",
+                    "login_status",
+                    "login_cancel",
+                    "login_providers",
+                ],
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path =
+                std::env::temp_dir().join(format!("zg-login-gate-{}-{index}", std::process::id()));
+            let server = fake_server(
+                &path,
+                serde_json::json!({"id":1,"result":{"protocol_version":version,"server":"zeta","capabilities":{"requests":methods}}}),
+                None,
+            );
+            let mut client = ProtocolClient::connect_socket(&path).unwrap();
+            client.handshake().unwrap();
+            assert_eq!(client.login_extensions, expected);
+            if !expected {
+                assert!(matches!(
+                    client.login("login_start", "claude"),
+                    Err(ClientError::Rpc { code: -32601, .. })
+                ));
+            }
+            server.join().unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

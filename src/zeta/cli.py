@@ -8,28 +8,9 @@ import sys
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from .core.login_flow import LoginProvider, run_login
+from .core.login_flow import run_login
 from .core.session import SessionError, env_home
-from .providers.anthropic import (
-    AnthropicCredentialStore,
-)
-from .providers.anthropic import (
-    build_authorization_url as build_anthropic_authorization_url,
-)
-from .providers.anthropic import (
-    exchange_authorization_code as exchange_anthropic_authorization_code,
-)
-from .providers.auth import OAuthTokens, build_pkce_parameters
-from .providers.codex import (
-    CodexCredentialStore,
-    extract_account_id,
-)
-from .providers.codex import (
-    build_authorization_url as build_codex_authorization_url,
-)
-from .providers.codex import (
-    exchange_authorization_code as exchange_codex_authorization_code,
-)
+from .providers.login import build_login_provider, pkce_values
 from .tui.app import create_app
 
 
@@ -153,39 +134,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _pkce_values() -> tuple[str, str, str]:
-    parameters = build_pkce_parameters()
-    return parameters.verifier, parameters.challenge, parameters.state
-
-
-def _no_handle(tokens: OAuthTokens) -> str | None:
-    del tokens
-    return None
-
-
-def _build_login_provider(provider: str) -> LoginProvider[OAuthTokens]:
-    home = env_home()
-    if provider == "anthropic":
-        return LoginProvider(
-            name="anthropic",
-            build_authorization_url=build_anthropic_authorization_url,
-            exchange_authorization_code=exchange_anthropic_authorization_code,
-            credential_store=AnthropicCredentialStore(home / "anthropic-oauth.json"),
-            token_handle=_no_handle,
-        )
-    if provider == "codex":
-        return LoginProvider(
-            name="codex",
-            build_authorization_url=build_codex_authorization_url,
-            exchange_authorization_code=exchange_codex_authorization_code,
-            credential_store=CodexCredentialStore(home / "codex-oauth.json"),
-            token_handle=lambda tokens: extract_account_id(tokens.access_token),
-        )
-    raise ValueError(f"unsupported login provider: {provider}")
-
-
 def _run_login(provider: str) -> str | None:
-    return asyncio.run(run_login(_build_login_provider(provider), _pkce_values))
+    return asyncio.run(run_login(build_login_provider(provider, env_home()), pkce_values))
 
 
 def _cleanup_ephemeral(app: object) -> None:
