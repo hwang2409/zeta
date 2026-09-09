@@ -45,11 +45,16 @@ class CodexStreamError(CodexBackendError):
         self,
         message: str,
         *,
+        code: str | None = None,
+        status_code: int | None = None,
         retryable: bool = False,
         retry_reason: str | None = None,
         is_stall: bool = False,
     ) -> None:
         super().__init__(message)
+        if type(code) is str and code:
+            self.code = code
+        self.status_code = status_code if type(status_code) is int else None
         self.retryable = retryable
         self.retry_reason = retry_reason
         self.is_stall = is_stall

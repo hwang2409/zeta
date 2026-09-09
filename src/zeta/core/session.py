@@ -163,6 +163,8 @@ class SessionMetadata:
     plan_mode: bool = False
     name: str = ""
     approval_mode: str | None = None
+    # Previous provider, model, and budget until a GUI selection succeeds.
+    model_fallback: tuple[str, str, int] | None = None
 
     @classmethod
     def new(
@@ -231,6 +233,14 @@ class SessionMetadata:
         audit = value.get("override_audit", [])
         if type(audit) is not list or any(type(item) is not dict for item in audit):
             raise SessionError(f"session metadata override audit is invalid: {path}")
+        fallback = value.get("model_fallback")
+        if fallback is not None and (
+            type(fallback) is not list or len(fallback) != 3
+            or type(fallback[0]) is not str or fallback[0] not in {"claude", "codex"}
+            or type(fallback[1]) is not str or not fallback[1].strip()
+            or type(fallback[2]) is not int or fallback[2] <= 0
+        ):
+            raise SessionError(f"session model fallback is invalid: {path}")
         has_context_snapshot = "system_prompt" in value and "context_files" in value
         system_prompt = value.get("system_prompt", "") if has_context_snapshot else ""
         context_files = value.get("context_files", []) if has_context_snapshot else []
@@ -267,6 +277,7 @@ class SessionMetadata:
             plan_mode=plan_mode,
             name=name,
             approval_mode=value.get("approval_mode"),
+            model_fallback=tuple(fallback) if fallback is not None else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -288,6 +299,12 @@ class SessionMetadata:
             "plan_mode": self.plan_mode,
             "name": self.name,
             "approval_mode": self.approval_mode,
+        }
+
+    def to_storage_dict(self) -> dict[str, Any]:
+        return {
+            **self.to_dict(),
+            "model_fallback": list(self.model_fallback) if self.model_fallback else None,
         }
 
 
@@ -530,14 +547,14 @@ class SessionManager:
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
-    def record_session_settings(self, metadata: SessionMetadata, *, model: str, approval_mode: str, budget: int, provider: str) -> None:
+    def record_session_settings(self, metadata: SessionMetadata, *, model: str, approval_mode: str, budget: int, provider: str, model_fallback: tuple[str, str, int] | None = None) -> None:
         """Persist active-session settings together, without changing global config."""
         if approval_mode not in {"ask", "allow", "deny"} or not model.strip() or budget <= 0:
             raise SessionError("invalid session settings")
-        expected = (metadata.provider, metadata.model, metadata.approval_mode, metadata.compaction_budget, metadata.budget_pinned)
+        expected = (metadata.provider, metadata.model, metadata.approval_mode, metadata.compaction_budget, metadata.budget_pinned, metadata.model_fallback)
 
         def update(item: SessionMetadata) -> SessionMetadata:
-            if (item.provider, item.model, item.approval_mode, item.compaction_budget, item.budget_pinned) != expected:
+            if (item.provider, item.model, item.approval_mode, item.compaction_budget, item.budget_pinned, item.model_fallback) != expected:
                 raise SessionError("session settings changed before commit")
             if item.model != model or item.provider != provider:
                 item.override_audit.append({
@@ -549,6 +566,7 @@ class SessionManager:
             item.provider = provider
             item.model = model
             item.approval_mode = approval_mode
+            item.model_fallback = model_fallback
             item.compaction_budget = budget
             return self._touch(item)
 
@@ -726,6 +744,7 @@ class SessionManager:
         target.plan_mode = source.plan_mode
         target.name = source.name
         target.approval_mode = source.approval_mode
+        target.model_fallback = source.model_fallback
 
     def _read(self, session_id: str) -> SessionMetadata:
         path = self.sessions_dir / session_id / "meta.json"
@@ -751,7 +770,7 @@ class SessionManager:
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
             with temporary.open("w") as handle:
-                json.dump(metadata.to_dict(), handle, separators=(",", ":"), sort_keys=True)
+                json.dump(metadata.to_storage_dict(), handle, separators=(",", ":"), sort_keys=True)
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())

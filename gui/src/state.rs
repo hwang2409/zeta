@@ -30,6 +30,10 @@ impl ToolReceiptKey {
 pub enum TranscriptEntry {
     User(String),
     Assistant(Markdown),
+    Error {
+        message: String,
+        settings_action: bool,
+    },
     Tool {
         key: ToolReceiptKey,
         name: String,
@@ -323,7 +327,11 @@ impl AppState {
                             .as_ref()
                             .and_then(|result| result.structured_content.as_ref())
                             .is_some_and(|data| data["status"] == "running");
-                    *error = tool_result.as_ref().is_some_and(|result| result.is_error);
+                    let failed = tool_result.as_ref().is_some_and(|result| result.is_error);
+                    if failed && !*error {
+                        card.expanded = true;
+                    }
+                    *error = failed;
                     if let Some(result) = tool_result.filter(|result| !result.content.is_empty()) {
                         if card.tail.text != result.content {
                             if !card.tail.text.is_empty() && !card.tail.text.ends_with('\n') {
@@ -363,25 +371,11 @@ impl AppState {
                 self.streaming = false;
                 self.metrics_boundary = true;
                 self.approvals.clear();
-                self.transcript.push(TranscriptEntry::Tool {
-                    key: ToolReceiptKey {
-                        session_id: None,
-                        agent_instance_id: None,
-                        tool_call_id: String::new(),
-                    },
-                    name: "error".to_owned(),
-                    summary: bounded_summary(&error.message),
-                    card: Card {
-                        tail: {
-                            let mut tail = OutputTail::default();
-                            tail.append(&error.message);
-                            tail
-                        },
-                        ..Default::default()
-                    },
-                    complete: true,
-                    error: true,
-                    canceled: false,
+                let settings_action =
+                    matches!(error.code.as_str(), "model_access_error" | "model_reverted");
+                self.transcript.push(TranscriptEntry::Error {
+                    message: error.message,
+                    settings_action,
                 });
                 changed = self.transcript.len().checked_sub(1);
             }
@@ -454,7 +448,11 @@ impl AppState {
         } = &mut self.transcript[index]
         {
             *complete = true;
-            *error = receipt.status != SubAgentStatus::Completed;
+            let failed = receipt.status != SubAgentStatus::Completed;
+            if failed && receipt.status != SubAgentStatus::Canceled && !*error {
+                card.expanded = true;
+            }
+            *error = failed;
             *canceled = receipt.status == SubAgentStatus::Canceled;
             *summary = bounded_summary(
                 receipt
@@ -939,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn errors_stop_streaming_and_render_as_distinct_receipt() {
+    fn errors_stop_streaming_and_render_as_distinct_block() {
         let mut state = AppState {
             streaming: true,
             ..Default::default()
@@ -953,10 +951,31 @@ mod tests {
             data: json!({}),
         });
         assert!(!state.streaming);
-        assert!(matches!(
-            state.transcript[0],
-            TranscriptEntry::Tool { error: true, .. }
-        ));
+        assert!(matches!(state.transcript[0], TranscriptEntry::Error { .. }));
+    }
+
+    #[test]
+    fn settings_recovery_uses_codes_not_error_text() {
+        for (code, message, expected) in [
+            ("model_access_error", "Access denied", true),
+            ("model_reverted", "Restored previous selection", true),
+            ("auth_error", "MCP OAuth credentials expired", false),
+            ("backend_error", "MCP OAuth credentials expired", false),
+            ("http_error", "Model not found", false),
+        ] {
+            let mut state = AppState::default();
+            state.apply(ServerEvent::Error {
+                session_id: None,
+                error: EventError {
+                    code: code.into(),
+                    message: message.into(),
+                },
+                data: json!({}),
+            });
+            assert!(matches!(&state.transcript[0], TranscriptEntry::Error {
+                message: text, settings_action,
+            } if text == message && *settings_action == expected));
+        }
     }
 
     #[test]

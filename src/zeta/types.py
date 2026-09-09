@@ -806,13 +806,26 @@ class StreamEventType(StrEnum):
 class ErrorInfo:
     code: str
     message: str
+    # Internal provider context; the server projects versioned wire errors.
+    status_code: int | None = None
+    provider_error: bool = False
 
-    def to_dict(self) -> dict[str, str]:
-        return {"code": self.code, "message": self.message}
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"code": self.code, "message": self.message}
+        if self.status_code is not None:
+            result["status_code"] = self.status_code
+        if self.provider_error:
+            result["provider_error"] = True
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ErrorInfo:
-        return cls(code=str(value["code"]), message=str(value["message"]))
+        return cls(
+            code=str(value["code"]),
+            message=str(value["message"]),
+            status_code=value.get("status_code"),
+            provider_error=value.get("provider_error", False),
+        )
 
 
 @dataclass(frozen=True, slots=True)

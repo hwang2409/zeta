@@ -8,6 +8,7 @@ import shlex
 import warnings
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -113,7 +114,7 @@ def _task_is_cancelling() -> bool:
     return task is not None and task.cancelling() > 0
 
 
-def _error_info(error: BaseException) -> ErrorInfo:
+def _error_info(error: BaseException, *, provider_error: bool = False) -> ErrorInfo:
     """Normalize provider and transport failures for the transcript."""
 
     code = getattr(error, "code", None)
@@ -139,7 +140,10 @@ def _error_info(error: BaseException) -> ErrorInfo:
         message = type(error).__name__
     if len(message) > MAX_ERROR_MESSAGE:
         message = f"{message[: MAX_ERROR_MESSAGE - 3]}..."
-    return ErrorInfo(code, message)
+    return ErrorInfo(
+        code, message, status_code=getattr(error, "status_code", None),
+        provider_error=provider_error,
+    )
 
 
 def _validated_tool_result(result: object, expected_id: str) -> ToolResult:
@@ -984,7 +988,7 @@ class AgentLoop:
                     self.context_assembler.observe_event(event)
                     if event.type is StreamEventType.ERROR:
                         provider_error = (
-                            event.error
+                            replace(event.error, provider_error=True)
                             if isinstance(event.error, ErrorInfo)
                             else ErrorInfo(
                                 "backend_error",
@@ -1048,7 +1052,7 @@ class AgentLoop:
                 if _task_is_cancelling():
                     self._persist_partial_for_control(partial_blocks, assistant_message)
                     raise asyncio.CancelledError() from exc
-                error = _error_info(exc)
+                error = _error_info(exc, provider_error=True)
                 self._persist_partial_with_cancelled_tools(
                     partial_blocks, assistant_message, failure=error
                 )

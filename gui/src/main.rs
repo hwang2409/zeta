@@ -15,7 +15,7 @@ use gpui_kit::component::{
     input::{InputEvent, Textarea, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
     text::TextView,
-    ActiveTheme, Disableable, Root, Selectable, StyledExt, Theme, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, Root, Selectable, StyledExt, Theme, WindowExt,
 };
 use std::{
     borrow::Cow,
@@ -903,12 +903,33 @@ impl ZetaView {
                         .selectable(true),
                 )
                 .into_any_element(),
-            entry @ TranscriptEntry::Tool { name, summary, .. } => row
+            entry @ TranscriptEntry::Tool {
+                name,
+                summary,
+                card,
+                ..
+            } => row
+                .id(("tool-receipt", index))
+                .debug_selector(move || format!("tool-receipt-{index}"))
                 .py_1()
+                .cursor_pointer()
+                .hover(|style| style.bg(cx.theme().muted))
+                .on_click(move |_, _, cx| {
+                    let _ = view.update(cx, |view, cx| {
+                        view.state.toggle_card(index);
+                        view.transcript.update(cx, |scroll, cx| {
+                            scroll.remeasure_items(index..index + 1, cx);
+                        });
+                        cx.notify();
+                    });
+                })
                 .child(
                     div()
+                        .h_flex()
+                        .gap_2()
                         .px_3()
                         .py_2()
+                        .min_h(px(40.))
                         .bg(cx.theme().muted)
                         .text_size(px(12.))
                         .text_color(if entry.unsuccessful() {
@@ -916,8 +937,72 @@ impl ZetaView {
                         } else {
                             cx.theme().muted_foreground
                         })
-                        .truncate()
-                        .child(format!("{} {name}  {summary}", entry.tool_marker())),
+                        .child(
+                            Icon::new(if card.expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(px(12.)),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(format!("{} {name}  {summary}", entry.tool_marker())),
+                        ),
+                )
+                .when(card.expanded, |row| {
+                    row.child(
+                        div()
+                            .debug_selector(move || format!("tool-output-{index}"))
+                            .ml_3()
+                            .pl_3()
+                            .py_2()
+                            .border_l_2()
+                            .border_color(cx.theme().border)
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .when(card.tail.truncated, |output| {
+                                output.child(div().child("Earlier output omitted"))
+                            })
+                            .child(div().whitespace_normal().child(card.tail.text.clone())),
+                    )
+                })
+                .into_any_element(),
+            TranscriptEntry::Error {
+                message,
+                settings_action,
+            } => row
+                .child(
+                    div()
+                        .debug_selector(move || format!("error-block-{index}"))
+                        .v_flex()
+                        .gap_2()
+                        .pl_3()
+                        .border_l_2()
+                        .border_color(cx.theme().danger)
+                        .child(div().text_color(cx.theme().danger).child("Error"))
+                        .child(
+                            div()
+                                .debug_selector(move || format!("error-message-{index}"))
+                                .whitespace_normal()
+                                .child(message.clone()),
+                        )
+                        .when(
+                            *settings_action && self.state.session_view.available,
+                            |block| {
+                                block.child(
+                                    Button::new(("error-settings", index))
+                                        .debug_selector(move || format!("error-settings-{index}"))
+                                        .label("Open Settings")
+                                        .on_click(move |_, _, cx| {
+                                            let _ =
+                                                view.update(cx, |view, cx| view.open_settings(cx));
+                                        }),
+                                )
+                            },
+                        ),
                 )
                 .into_any_element(),
         }

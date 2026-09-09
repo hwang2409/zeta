@@ -25,6 +25,7 @@ from .codex_errors import (
 )
 from .codex_payload import build_responses_payload
 from .stream_diagnostics import StreamDiagnostics
+from .stream_errors import decode_stream_error
 from .transport import (
     DEFAULT_STREAM_STALL_RETRIES,
     DEFAULT_STREAM_STALL_SECONDS,
@@ -579,17 +580,15 @@ def _translate_event(
         return None, response_state
     if event_type == "error":
         detail = payload.get("error")
-        if not isinstance(detail, Mapping) and not isinstance(payload.get("message"), str):
-            raise CodexStreamError("Codex stream error payload is invalid")
-        error_type = detail.get("type") if isinstance(detail, Mapping) else None
+        if not isinstance(detail, Mapping):
+            detail = {key: value for key, value in payload.items() if key != "type"}
+        error = decode_stream_error(detail)
         raise CodexStreamError(
-            "Codex response reported an error",
-            retryable=error_type in {"overloaded_error", "rate_limit_error"},
-            retry_reason=(
-                error_type
-                if error_type in {"overloaded_error", "rate_limit_error"}
-                else None
-            ),
+            error.message,
+            code=error.code,
+            status_code=error.status_code,
+            retryable=error.retry_reason is not None,
+            retry_reason=error.retry_reason,
         )
     if event_type == "response.created":
         if response_state != "not-started":
@@ -609,7 +608,16 @@ def _translate_event(
     if response_state == "stopped":
         raise CodexStreamError("Codex event follows response completion")
     if event_type == "response.failed":
-        raise CodexStreamError("Codex response failed")
+        response = payload.get("response")
+        detail = response.get("error") if isinstance(response, Mapping) else None
+        if not isinstance(detail, Mapping):
+            detail = {}
+        error = decode_stream_error(detail)
+        raise CodexStreamError(
+            error.message,
+            code=error.code,
+            status_code=error.status_code,
+        )
     if event_type == "response.incomplete":
         raise CodexStreamError("Codex response was incomplete")
     if event_type in {"response.completed", "response.done"}:
