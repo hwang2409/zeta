@@ -337,8 +337,7 @@ class SessionManager:
                 budget_pinned=budget_pinned,
                 name=name,
             )
-            # Stage beside sessions, on the same filesystem, so discovery only
-            # sees complete sessions even if the process dies during a write.
+            # Finish all writes outside discovery before claiming the final ID.
             with TemporaryDirectory(prefix=".session-", dir=self.home) as temporary:
                 staged = SessionManager(temporary)
                 ConversationStore(
@@ -347,13 +346,19 @@ class SessionManager:
                     cwd=resolved_cwd,
                 )
                 staged._write(metadata)
-                # Serialize the final check and publication across creators.
-                # Rename alone can replace an existing empty session directory.
-                with (self.home / ".sessions.lock").open("a+") as lock:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                    if session_dir.exists() or session_dir.is_symlink():
-                        continue
-                    (staged.sessions_dir / session_id).rename(session_dir)
+                # mkdir atomically claims the ID without replacing any existing
+                # path, including a non-cooperating creator's empty directory.
+                try:
+                    session_dir.mkdir()
+                except FileExistsError:
+                    continue
+                staged_dir = staged.sessions_dir / session_id
+                for path in staged_dir.iterdir():
+                    if path.name != "meta.json":
+                        path.rename(session_dir / path.name)
+                # Publish metadata last: a crash before this leaves an incomplete
+                # directory that discovery skips and future creators preserve.
+                (staged_dir / "meta.json").rename(session_dir / "meta.json")
             return self.open(session_id)
         raise SessionError("could not allocate a unique session id")
 

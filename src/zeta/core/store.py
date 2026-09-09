@@ -343,7 +343,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             return
         try:
             value = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, json.JSONDecodeError, RecursionError) as exc:
             raise ConversationIntegrityError(
                 f"session state could not be read: {self.state_path}"
             ) from exc
@@ -377,7 +377,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 lifecycle = json.loads(
                     self.agent_lifecycle_path.read_text(encoding="utf-8")
                 )
-            except (OSError, json.JSONDecodeError) as exc:
+            except (OSError, json.JSONDecodeError, RecursionError) as exc:
                 raise ConversationIntegrityError(
                     f"agent lifecycle could not be read: {self.agent_lifecycle_path}"
                 ) from exc
