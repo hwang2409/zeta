@@ -82,6 +82,8 @@ pub struct AppState {
     pub approvals: Vec<Approval>,
     pub connection: ConnectionState,
     pub streaming: bool,
+    pub thinking: bool,
+    assistant_started: bool,
     pub metrics: StatusMetrics,
     pub metrics_boundary: bool,
 }
@@ -98,6 +100,8 @@ impl Default for AppState {
             approvals: Vec::new(),
             connection: ConnectionState::Reconnecting,
             streaming: false,
+            thinking: false,
+            assistant_started: false,
             metrics: StatusMetrics::default(),
             metrics_boundary: true,
         }
@@ -185,6 +189,7 @@ impl AppState {
     pub fn mark_connection_lost(&mut self, error: impl Into<String>) {
         self.connection = ConnectionState::Lost(error.into());
         self.streaming = false;
+        self.thinking = false;
         self.approvals.clear();
     }
 
@@ -205,6 +210,8 @@ impl AppState {
             .and_then(|id| self.saved_transcripts.remove(id))
             .unwrap_or_default();
         self.active_session = session_id;
+        self.thinking = false;
+        self.assistant_started = false;
         self.session_view = crate::session::SessionView {
             available: self.session_view.available,
             ..Default::default()
@@ -225,6 +232,9 @@ impl AppState {
             self.metrics_boundary = false;
         }
         self.streaming = status.state != "idle";
+        if !self.streaming {
+            self.thinking = false;
+        }
         self.approvals = status.pending_approvals;
     }
 
@@ -233,15 +243,25 @@ impl AppState {
         match event {
             ServerEvent::TurnStart { .. } => {
                 self.streaming = true;
+                self.thinking = false;
+                self.assistant_started = false;
                 self.metrics_boundary = false;
             }
             ServerEvent::AgentEnd { .. } | ServerEvent::TurnAborted { .. } => {
                 self.streaming = false;
+                self.thinking = false;
                 self.metrics_boundary = true;
                 self.approvals.clear();
             }
-            ServerEvent::TurnEnd { .. } => self.metrics_boundary = true,
-            ServerEvent::AssistantDelta { delta, kind, .. } if kind == "assistant" => {
+            ServerEvent::TurnEnd { .. } => {
+                self.thinking = false;
+                self.metrics_boundary = true;
+            }
+            ServerEvent::AssistantDelta { delta, kind, .. }
+                if kind == "assistant" && !delta.is_empty() =>
+            {
+                self.thinking = false;
+                self.assistant_started = true;
                 match self.transcript.last_mut() {
                     Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
                     _ => self
@@ -250,8 +270,15 @@ impl AppState {
                 }
                 changed = self.transcript.len().checked_sub(1);
             }
+            ServerEvent::AssistantDelta { kind, delta, .. }
+                if kind == "thinking" && !delta.is_empty() =>
+            {
+                self.thinking = !self.assistant_started;
+            }
             ServerEvent::AssistantDelta { .. } => {}
             ServerEvent::AssistantMessage { message, .. } => {
+                self.thinking = false;
+                self.assistant_started |= !message.text().is_empty();
                 changed = self.commit_assistant(message)
             }
             ServerEvent::ToolStart {
@@ -259,6 +286,7 @@ impl AppState {
                 tool_call,
                 data,
             } => {
+                self.thinking = false;
                 self.transcript.push(tool_entry(
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
@@ -370,6 +398,7 @@ impl AppState {
             ServerEvent::ApprovalEnd { .. } => {}
             ServerEvent::Error { error, data, .. } => {
                 self.streaming = false;
+                self.thinking = false;
                 self.metrics_boundary = true;
                 self.approvals.clear();
                 let settings_action =

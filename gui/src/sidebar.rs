@@ -143,13 +143,7 @@ impl ZetaView {
                     .w_full()
                     .h(px(40.))
                     .disabled(!self.can_change_session())
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        if view.can_change_session() {
-                            view.pending_command = true;
-                            view.queue(CommandMessage::NewSession);
-                            cx.notify();
-                        }
-                    })),
+                    .on_click(cx.listener(|view, _, _, cx| view.new_session(cx))),
             )
             .when(self.state.sessions_truncated, |sidebar| {
                 sidebar.child(
@@ -159,7 +153,29 @@ impl ZetaView {
                         .child("Showing a partial session list"),
                 )
             })
+            .when(self.state.active_session.is_none(), |sidebar| {
+                sidebar.child(
+                    div()
+                        .px_3()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Create or select a session to use Settings"),
+                )
+            })
             .child(sessions)
+            .when(
+                self.state.session_view.available
+                    && !self.state.session_view.message_ids.is_empty(),
+                |sidebar| {
+                    sidebar.child(
+                        div()
+                            .px_3()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Hover over your message to fork from it"),
+                    )
+                },
+            )
             .children(self.render_branches(cx))
     }
 
