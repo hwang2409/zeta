@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.process_env import subprocess_env
 
 
@@ -319,8 +320,8 @@ class BackgroundTaskRegistry:
         if self._state_path is None or not self._state_path.exists():
             return
         try:
-            rows = json.loads(self._state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            rows = load_session_json(self._state_path)
+        except ConversationIntegrityError:
             return
         if type(rows) is not list:
             return

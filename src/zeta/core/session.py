@@ -394,7 +394,7 @@ class SessionManager:
                     continue
                 opened = self.open(session_path.name, _read_only=True)
                 sessions.append(opened.metadata)
-            except (SessionError, ConversationIntegrityError, RecursionError, OSError) as exc:
+            except (SessionError, ConversationIntegrityError) as exc:
                 logger.warning("Skipping session %s: %s", session_path.name, exc)
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
 
@@ -436,7 +436,7 @@ class SessionManager:
                         name=metadata.name,
                     )
                 )
-            except (SessionError, ConversationIntegrityError, RecursionError, OSError) as exc:
+            except (SessionError, ConversationIntegrityError) as exc:
                 logger.warning("Skipping session preview %s: %s", metadata.session_id, exc)
         return previews
 
@@ -643,11 +643,14 @@ class SessionManager:
             raise SessionError(f"session {full_id} has no conversation.jsonl")
         header = {"type": "session_export", "metadata": metadata.to_dict()}
         lines = [json.dumps(header, separators=(",", ":"), sort_keys=True)]
-        with conversation_path.open() as handle:
-            for line in handle:
-                stripped = line.rstrip("\n")
-                if stripped:
-                    lines.append(stripped)
+        try:
+            with conversation_path.open("rb") as handle:
+                for line in handle:
+                    if line.strip():
+                        row = load_session_json(line)
+                        lines.append(json.dumps(row, separators=(",", ":")))
+        except (ConversationIntegrityError, OSError) as exc:
+            raise SessionError(f"session {full_id} could not be exported") from exc
         return "\n".join(lines) + "\n"
 
     def record_budget(

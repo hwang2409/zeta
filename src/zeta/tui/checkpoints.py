@@ -96,8 +96,8 @@ class CheckpointTranscriptMixin:
         except ValueError as exc:
             return f"checkpoint failed: {exc}"
         label = entry.data["label"]
-        snapshots = self._snapshots()
         try:
+            snapshots = self._snapshots()
             snapshot = snapshots.take(
                 self.loop.store.bash_cwd,
                 label=label,

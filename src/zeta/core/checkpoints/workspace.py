@@ -79,14 +79,32 @@ class WorkspaceSnapshot:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> WorkspaceSnapshot:
+        for field in ("id", "created_at", "mode"):
+            if not isinstance(value.get(field), str) or not value[field]:
+                raise ConversationIntegrityError(
+                    f"snapshot {field} must be a nonempty string"
+                )
+        if value["mode"] not in {SNAPSHOT_MODE_GIT, SNAPSHOT_MODE_UNAVAILABLE}:
+            raise ConversationIntegrityError("unsupported snapshot mode")
+        for field in ("size_bytes", "file_count"):
+            number = value.get(field, 0)
+            if type(number) is not int or number < 0:
+                raise ConversationIntegrityError(
+                    f"snapshot {field} must be a nonnegative integer"
+                )
+        for field in ("commit_sha", "tree_sha", "repo_root", "label", "checkpoint_entry_id"):
+            if value.get(field) is not None and not isinstance(value[field], str):
+                raise ConversationIntegrityError(
+                    f"snapshot {field} must be a string or null"
+                )
         return cls(
-            id=str(value["id"]),
-            created_at=str(value["created_at"]),
-            mode=str(value["mode"]),
+            id=value["id"],
+            created_at=value["created_at"],
+            mode=value["mode"],
             commit_sha=value.get("commit_sha"),
             tree_sha=value.get("tree_sha"),
-            size_bytes=int(value.get("size_bytes", 0)),
-            file_count=int(value.get("file_count", 0)),
+            size_bytes=value.get("size_bytes", 0),
+            file_count=value.get("file_count", 0),
             repo_root=value.get("repo_root"),
             label=value.get("label"),
             checkpoint_entry_id=value.get("checkpoint_entry_id"),
@@ -431,11 +449,14 @@ class WorkspaceSnapshotStore:
             return
         snapshots = raw.get("snapshots", [])
         if isinstance(snapshots, list):
-            self._snapshots = [
-                WorkspaceSnapshot.from_dict(entry)
-                for entry in snapshots
-                if isinstance(entry, dict) and "id" in entry
-            ]
+            try:
+                self._snapshots = [
+                    WorkspaceSnapshot.from_dict(entry)
+                    for entry in snapshots
+                    if isinstance(entry, dict)
+                ]
+            except ConversationIntegrityError:
+                return
         current_id = raw.get("current_id")
         if isinstance(current_id, str) and any(
             snap.id == current_id for snap in self._snapshots

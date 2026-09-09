@@ -16,6 +16,8 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
 
+from .core.checkpoints import ConversationIntegrityError, load_session_json
+
 HISTORY_LIMIT = 1000
 DRAFT_WRITE_DELAY = 0.2
 
@@ -114,14 +116,15 @@ class DraftPersistence:
     def load_state(self) -> DraftState:
         try:
             raw = self.path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return DraftState("")
-        except OSError:
+        except (OSError, UnicodeError):
             return DraftState("")
         try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return DraftState(raw)
+            payload = load_session_json(raw.encode("utf-8"))
+        except ConversationIntegrityError as exc:
+            # Legacy drafts are plain text; structural/encoding failures are not.
+            if isinstance(exc.__cause__, json.JSONDecodeError):
+                return DraftState(raw)
+            return DraftState("")
         if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
             return DraftState("")
         raw_tokens = payload.get("attachment_tokens", {})

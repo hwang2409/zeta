@@ -668,3 +668,57 @@ def test_dirty_guard_still_confirms_when_current_id_is_stale(
     (git_repo / "tracked.txt").write_text("drift\n")
     warning = _dirty_guard(reopened, str(git_repo), forced=False)
     assert warning is not None and "--force" in warning
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"id": "x", "size_bytes": {}},
+        {
+            "id": "x",
+            "created_at": "2026-09-09T00:00:00+00:00",
+            "mode": "unavailable",
+            "size_bytes": {},
+        },
+        {"id": "x", "created_at": {}, "mode": "unavailable"},
+        {
+            "id": "x",
+            "created_at": "2026-09-09T00:00:00+00:00",
+            "mode": "unavailable",
+            "repo_root": {},
+        },
+    ],
+)
+def test_corrupt_snapshot_rows_degrade_in_store_and_tui(
+    tmp_path: Path, row: dict
+) -> None:
+    conversation = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    path = conversation.session_dir / "workspace_snapshots.json"
+    path.write_text(json.dumps({"snapshots": [row], "current_id": "x"}))
+    snapshots = WorkspaceSnapshotStore(
+        conversation.session_dir, conversation.session_id
+    )
+    assert snapshots.snapshots == ()
+    assert snapshots.current_id is None
+    app = _make_tui(conversation)
+    result = app.slash_checkpoint("save")
+    assert "checkpoint 'save'" in result
+    assert len(app._snapshots().snapshots) == 1
+
+
+def test_checkpoint_reports_snapshot_setup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conversation = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    app = _make_tui(conversation)
+
+    def fail():
+        raise workspace_module.WorkspaceSnapshotError(
+            "cannot initialize snapshot store"
+        )
+
+    monkeypatch.setattr(app, "_snapshots", fail)
+    assert (
+        "workspace snapshot skipped: cannot initialize snapshot store"
+        in app.slash_checkpoint("save")
+    )

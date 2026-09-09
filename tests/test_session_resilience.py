@@ -329,9 +329,8 @@ def test_mixed_store_listings_validate_without_mutating(tmp_path: Path) -> None:
     } == before
 
 
-@pytest.mark.parametrize("error", [ConversationIntegrityError, RecursionError])
 def test_preview_boundary_includes_replay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: type[Exception]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = SessionManager(tmp_path)
     good = manager.create(provider="fake", model="offline")
@@ -340,7 +339,7 @@ def test_preview_boundary_includes_replay(
 
     def fail_replay(self):
         if self.session_id == bad.metadata.session_id:
-            raise error("damaged replay")
+            raise ConversationIntegrityError("damaged replay")
         return replay(self)
 
     monkeypatch.setattr(ConversationStore, "replay", fail_replay)
@@ -360,3 +359,60 @@ def test_child_lifecycle_readers_reject_decoder_surviving_depth(
     path.write_text('{"extra":' + '{"nested":' * 500 + "0" + "}" * 501)
     reader = _read_agent_lifecycle if surface == "tool" else _read_lifecycle
     assert reader(str(tmp_path)) == {}
+
+
+@pytest.mark.parametrize("fault", [RecursionError, OSError, KeyError])
+@pytest.mark.parametrize("surface", ["listing", "preview"])
+def test_listing_boundaries_propagate_programming_faults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault, surface: str
+) -> None:
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="fake", model="offline")
+
+    def fail(*args, **kwargs):
+        raise fault("programming fault")
+
+    if surface == "listing":
+        monkeypatch.setattr(manager, "open", fail)
+        reader = manager.list_sessions
+    else:
+        monkeypatch.setattr(manager, "list_sessions", lambda: [opened.metadata])
+        monkeypatch.setattr(ConversationStore, "replay", fail)
+        reader = manager.list_session_previews
+    with pytest.raises(fault, match="programming fault"):
+        reader()
+
+
+@pytest.mark.parametrize(
+    "row",
+    [b"\xff\n", b"broken\n", b"[" * 65 + b"]" * 65 + b"\n"],
+    ids=["binary", "malformed", "deep"],
+)
+def test_export_rejects_corrupt_rows_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: bytes
+) -> None:
+    import argparse
+    from io import StringIO
+
+    from zeta import session_cli
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="fake", model="offline")
+    with opened.store.path.open("ab") as handle:
+        handle.write(row)
+    before = opened.store.path.read_bytes()
+    with pytest.raises(SessionError, match="could not be exported"):
+        manager.export(opened.metadata.session_id)
+    out, err = StringIO(), StringIO()
+    destination = tmp_path / "export.jsonl"
+    args = argparse.Namespace(
+        session_verb="export",
+        session_id=opened.metadata.session_id,
+        out=str(destination),
+    )
+    assert session_cli.run(args, stdout=out, stderr=err) == 1
+    assert "could not be exported" in err.getvalue()
+    assert out.getvalue() == ""
+    assert not destination.exists()
+    assert opened.store.path.read_bytes() == before

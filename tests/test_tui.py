@@ -7595,3 +7595,30 @@ async def test_undo_restores_next_image_token_after_deleted_token(
         "[Image #3]": pasted,
     }
     await app.loop.close()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (b"[" * 65 + b"]" * 65, ""),
+        (b"[" * 10_000 + b"]" * 10_000, ""),
+        (b"\xff", ""),
+        (b"legacy plain text", "legacy plain text"),
+    ],
+    ids=["depth65", "depth10000", "binary", "legacy"],
+)
+async def test_tui_setup_handles_corrupt_and_legacy_drafts(
+    tmp_path: Path, payload: bytes, expected: str
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    path = store.session_dir / "draft"
+    path.write_bytes(payload)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store),
+        provider="fake",
+        model="offline",
+        history_path=tmp_path / "history",
+    )
+    session = app._make_session()
+    assert session.default_buffer.text == expected
+    assert path.read_bytes() == payload
