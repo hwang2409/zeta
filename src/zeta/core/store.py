@@ -12,7 +12,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,7 @@ from .checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
     _now,
+    load_session_json,
 )
 from .todo import TodoItem, parse_todo_items
 
@@ -150,6 +151,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         cwd: str | Path | None = None,
         bash_cwd: str | Path | None = None,
         _lock_deadline: float | None = None,
+        _read_only: bool = False,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -166,7 +168,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 f"session id must be one safe path component: {self.session_id!r}"
             )
         self.session_dir = self.root_dir / self.session_id
-        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self._read_only = _read_only
+        if not _read_only:
+            self.session_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.session_dir / "conversation.jsonl"
         self.state_path = self.session_dir / "session_state.json"
         self.agent_lifecycle_path = self.session_dir / "agent_lifecycle.json"
@@ -184,12 +188,15 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._agent_lifecycle: dict[str, Any] | None = None
         self._write_deadline: float | None = None
         self.pending_prompt_queue = PendingPromptQueue(self)
-        with self._append_lock(deadline=_lock_deadline):
+        # Discovery validates without creating locks/state or repairing the log.
+        with nullcontext() if _read_only else self._append_lock(deadline=_lock_deadline):
             self._load()
             self._load_session_state()
 
     def _load(self) -> None:
         if not self.path.exists():
+            if self._read_only:
+                raise ConversationIntegrityError(f"conversation file is missing: {self.path}")
             self._entries = []
             header = {
                 "schema": SCHEMA,
@@ -207,15 +214,19 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         offset = 0
         for index, line in enumerate(lines):
             try:
-                row = json.loads(line)
-            except (ValueError, RecursionError) as exc:
-                if index != len(lines) - 1:
+                row = load_session_json(line)
+            except ConversationIntegrityError as exc:
+                # Only a malformed, unterminated tail is recoverable. Depth
+                # violations are corrupt documents, never evidence of a torn write.
+                if (
+                    self._read_only
+                    or index != len(lines) - 1
+                    or line.endswith(b"\n")
+                    or not isinstance(exc.__cause__, (json.JSONDecodeError, UnicodeError))
+                ):
+                    kind = "terminated " if line.endswith(b"\n") else ""
                     raise ConversationIntegrityError(
-                        f"invalid conversation row {index + 1}: {self.path}"
-                    ) from exc
-                if line.endswith(b"\n"):
-                    raise ConversationIntegrityError(
-                        f"invalid terminated conversation row {index + 1}: {self.path}"
+                        f"invalid {kind}conversation row {index + 1}: {self.path}"
                     ) from exc
                 torn_offset = offset
                 break
@@ -284,7 +295,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 RuntimeWarning,
                 stacklevel=2,
             )
-        elif not raw.endswith(b"\n"):
+        elif not self._read_only and not raw.endswith(b"\n"):
             with self.path.open("ab") as handle:
                 handle.write(b"\n")
                 handle.flush()
@@ -338,15 +349,12 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             self._write_session_state(self.bash_cwd, normalized)
 
     def _load_session_state(self) -> None:
-        if not self.state_path.exists():
-            self._write_session_state(self.cwd, ())
-            return
-        try:
-            value = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, RecursionError) as exc:
-            raise ConversationIntegrityError(
-                f"session state could not be read: {self.state_path}"
-            ) from exc
+        if self.state_path.exists():
+            value = load_session_json(self.state_path)
+        else:
+            if not self._read_only:
+                self._write_session_state(self.cwd, ())
+            value = {"bash_cwd": self.cwd}
         bash_cwd = value.get("bash_cwd") if isinstance(value, dict) else None
         if type(bash_cwd) is not str or not bash_cwd:
             raise ConversationIntegrityError(
@@ -373,14 +381,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._agent_canceled = agent_state["agent_canceled"]
         self._agent_lifecycle = None
         if self.agent_lifecycle_path.exists():
-            try:
-                lifecycle = json.loads(
-                    self.agent_lifecycle_path.read_text(encoding="utf-8")
-                )
-            except (OSError, json.JSONDecodeError, RecursionError) as exc:
-                raise ConversationIntegrityError(
-                    f"agent lifecycle could not be read: {self.agent_lifecycle_path}"
-                ) from exc
+            lifecycle = load_session_json(self.agent_lifecycle_path)
             if type(lifecycle) is not dict:
                 raise ConversationIntegrityError(
                     f"agent lifecycle is invalid: {self.agent_lifecycle_path}"

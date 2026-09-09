@@ -20,6 +20,7 @@ from typing import Any, Mapping
 
 from rich.cells import cell_len
 
+from .checkpoints import ConversationIntegrityError, load_session_json
 from .store import ConversationStore
 
 
@@ -362,7 +363,7 @@ class SessionManager:
             return self.open(session_id)
         raise SessionError("could not allocate a unique session id")
 
-    def open(self, session_id: str) -> OpenedSession:
+    def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
         self._validate_id(session_id)
         metadata = self._read(session_id)
         if metadata.session_id != session_id:
@@ -374,7 +375,9 @@ class SessionManager:
         if not conversation_path.exists():
             raise SessionError(f"session {session_id} has no conversation.jsonl")
         try:
-            store = ConversationStore(self.sessions_dir, session_id=session_id)
+            store = ConversationStore(
+                self.sessions_dir, session_id=session_id, _read_only=_read_only
+            )
         except (OSError, ValueError) as exc:
             raise SessionError(f"session {session_id} could not be opened") from exc
         if store.cwd != metadata.cwd:
@@ -386,16 +389,12 @@ class SessionManager:
             return []
         sessions: list[SessionMetadata] = []
         for session_path in self.sessions_dir.iterdir():
-            if not session_path.is_dir():
-                continue
             try:
-                self._validate_id(session_path.name)
-                if not (session_path / "conversation.jsonl").is_file():
-                    raise SessionError(
-                        f"session {session_path.name} has no conversation.jsonl"
-                    )
-                sessions.append(self._read(session_path.name))
-            except SessionError as exc:
+                if not session_path.is_dir():
+                    continue
+                opened = self.open(session_path.name, _read_only=True)
+                sessions.append(opened.metadata)
+            except (SessionError, ConversationIntegrityError, RecursionError, OSError) as exc:
                 logger.warning("Skipping session %s: %s", session_path.name, exc)
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
 
@@ -408,38 +407,37 @@ class SessionManager:
             if len(previews) >= limit:
                 break
             try:
-                opened = self.open(metadata.session_id)
-            except SessionError as exc:
-                logger.warning("Skipping session preview %s: %s", metadata.session_id, exc)
-                continue
-            first_message = ""
-            for entry in opened.store.replay():
-                if entry.type != "message":
-                    continue
-                message = entry.data.get("message")
-                if not isinstance(message, dict):
-                    continue
-                if message.get("role") != "user":
-                    continue
-                parts = []
-                for block in message.get("content", []):
-                    if not isinstance(block, dict):
+                opened = self.open(metadata.session_id, _read_only=True)
+                first_message = ""
+                for entry in opened.store.replay():
+                    if entry.type != "message":
                         continue
-                    if block.get("type") in {
-                        "text",
-                        "thinking",
-                    } and isinstance(block.get("text"), str):
-                        parts.append(block["text"])
-                first_message = "".join(parts)
-                break
-            previews.append(
-                SessionPreview(
-                    session_id=metadata.session_id,
-                    updated_at=metadata.updated_at,
-                    preview=_preview_text(first_message) or "(no user message)",
-                    name=metadata.name,
+                    message = entry.data.get("message")
+                    if not isinstance(message, dict):
+                        continue
+                    if message.get("role") != "user":
+                        continue
+                    parts = []
+                    for block in message.get("content", []):
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") in {
+                            "text",
+                            "thinking",
+                        } and isinstance(block.get("text"), str):
+                            parts.append(block["text"])
+                    first_message = "".join(parts)
+                    break
+                previews.append(
+                    SessionPreview(
+                        session_id=metadata.session_id,
+                        updated_at=metadata.updated_at,
+                        preview=_preview_text(first_message) or "(no user message)",
+                        name=metadata.name,
+                    )
                 )
-            )
+            except (SessionError, ConversationIntegrityError, RecursionError, OSError) as exc:
+                logger.warning("Skipping session preview %s: %s", metadata.session_id, exc)
         return previews
 
     def find_most_recent(self, *, cwd: str | Path | None = None) -> SessionMetadata:
@@ -715,13 +713,12 @@ class SessionManager:
     def _read(self, session_id: str) -> SessionMetadata:
         path = self.sessions_dir / session_id / "meta.json"
         try:
-            with path.open() as handle:
-                value = json.load(handle)
-        except FileNotFoundError as exc:
-            if path.parent.is_dir():
-                raise SessionError(f"session {session_id} has no meta.json") from exc
-            raise SessionError(f"session {session_id} was not found") from exc
-        except (OSError, ValueError, RecursionError) as exc:
+            value = load_session_json(path)
+        except ConversationIntegrityError as exc:
+            if isinstance(exc.__cause__, FileNotFoundError):
+                if path.parent.is_dir():
+                    raise SessionError(f"session {session_id} has no meta.json") from exc
+                raise SessionError(f"session {session_id} was not found") from exc
             raise SessionError(f"session metadata could not be read: {path}") from exc
         if not isinstance(value, Mapping):
             raise SessionError(f"session metadata is not an object: {path}")

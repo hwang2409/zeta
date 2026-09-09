@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from ...types import Message, MessageRole, TextContent, ToolUseContent
@@ -16,6 +18,31 @@ def _now() -> str:
 
 class ConversationIntegrityError(ValueError):
     """Raised when a session file violates the conversation schema."""
+
+
+MAX_SESSION_JSON_DEPTH = 64
+
+
+def load_session_json(source: Path | bytes) -> Any:
+    """Decode a session file or JSONL row with a bounded container depth."""
+
+    try:
+        value = json.loads(source.read_bytes() if isinstance(source, Path) else source)
+        pending = [(value, 0)]
+        while pending:
+            item, depth = pending.pop()
+            if isinstance(item, (dict, list)):
+                depth += 1
+                if depth > MAX_SESSION_JSON_DEPTH:
+                    raise ValueError(f"JSON depth exceeds {MAX_SESSION_JSON_DEPTH}")
+                children = item.values() if isinstance(item, dict) else item
+                pending.extend((child, depth) for child in children)
+        return value
+    except (OSError, ValueError, RecursionError) as exc:
+        location = str(source) if isinstance(source, Path) else "conversation row"
+        raise ConversationIntegrityError(
+            f"session JSON could not be read ({location}): {exc}"
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)

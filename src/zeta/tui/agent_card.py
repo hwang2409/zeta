@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 import time
 from collections import deque
@@ -19,6 +18,7 @@ from ..agent_receipt import (
     has_agent_receipt_suffix,
     terminal_state,
 )
+from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..tools.agent import send_to_run
 from ..tools.agent_presets import GENERAL_PRESET, get_agent_preset
 from ..types import StreamEvent, StreamEventType, ToolCall
@@ -58,10 +58,8 @@ def _read_lifecycle(path: str) -> dict[str, Any]:
     if not path:
         return {}
     try:
-        value = json.loads(
-            (Path(path) / "agent_lifecycle.json").read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError, RecursionError):
+        value = load_session_json(Path(path) / "agent_lifecycle.json")
+    except ConversationIntegrityError:
         return {}
     return value if type(value) is dict else {}
 
@@ -186,11 +184,11 @@ class AgentCard:
         path = Path(child_session_path) / "conversation.jsonl"
         lines: deque[str] = deque(maxlen=limit)
         try:
-            with path.open(encoding="utf-8") as handle:
+            with path.open("rb") as handle:
                 for raw_line in handle:
                     try:
-                        row = json.loads(raw_line)
-                    except (json.JSONDecodeError, RecursionError):
+                        row = load_session_json(raw_line)
+                    except ConversationIntegrityError:
                         continue
                     if not isinstance(row, dict) or row.get("type") != "message":
                         continue

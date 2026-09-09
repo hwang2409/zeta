@@ -21,7 +21,11 @@ from ..agent_receipt import (
     terminal_state,
 )
 from ..core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
-from ..core.checkpoints import ConversationEntry, ConversationIntegrityError
+from ..core.checkpoints import (
+    ConversationEntry,
+    ConversationIntegrityError,
+    load_session_json,
+)
 from ..core.store import ConversationStore
 from ..model_catalog import known_model_names
 from ..types import (
@@ -61,10 +65,8 @@ def _read_agent_lifecycle(path: str) -> dict[str, object]:
     if not path:
         return {}
     try:
-        value = json.loads(
-            (Path(path) / "agent_lifecycle.json").read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError, RecursionError):
+        value = load_session_json(Path(path) / "agent_lifecycle.json")
+    except ConversationIntegrityError:
         return {}
     return value if type(value) is dict else {}
 
@@ -438,9 +440,13 @@ def _read_agent_output(
         entries: list[ConversationEntry] = []
         for index, line in enumerate(rows):
             try:
-                row = json.loads(line)
-            except (ValueError, RecursionError) as exc:
-                if index == len(rows) - 1 and not line.endswith(b"\n"):
+                row = load_session_json(line)
+            except ConversationIntegrityError as exc:
+                if (
+                    index == len(rows) - 1
+                    and not line.endswith(b"\n")
+                    and isinstance(exc.__cause__, (json.JSONDecodeError, UnicodeError))
+                ):
                     break
                 raise ConversationIntegrityError(
                     f"invalid conversation row {index + 1}: {child_path}"
@@ -505,8 +511,8 @@ def _read_agent_status(
             continue
         lifecycle_path = child_path / "agent_lifecycle.json"
         try:
-            lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, RecursionError) as exc:
+            lifecycle = load_session_json(lifecycle_path)
+        except ConversationIntegrityError as exc:
             raise ValueError(f"could not read child state: {lifecycle_path}") from exc
         if type(lifecycle) is not dict:
             continue

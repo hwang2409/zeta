@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from ..process_env import subprocess_env
+from . import ConversationIntegrityError, load_session_json
 
 SNAPSHOT_STATE_FILE = "workspace_snapshots.json"
 SNAPSHOT_STATE_TMP_PREFIX = ".workspace_snapshots."
@@ -423,8 +424,8 @@ class WorkspaceSnapshotStore:
         if not self.state_path.exists():
             return
         try:
-            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            raw = load_session_json(self.state_path)
+        except ConversationIntegrityError:
             return
         if not isinstance(raw, dict):
             return

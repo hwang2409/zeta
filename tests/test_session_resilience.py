@@ -219,3 +219,144 @@ def test_interrupted_publication_is_not_discoverable(
     assert manager.list_sessions() == []
     with pytest.raises(SessionError, match="has no meta.json"):
         manager.open(interrupted.name)
+
+
+def test_shared_session_json_depth_limit() -> None:
+    import json
+
+    from zeta.core.checkpoints import MAX_SESSION_JSON_DEPTH, load_session_json
+
+    for opening, closing in (("[", "]"), ('{"nested":', "}")):
+        allowed = (
+            opening * MAX_SESSION_JSON_DEPTH
+            + '"value"'
+            + closing * MAX_SESSION_JSON_DEPTH
+        )
+        assert load_session_json(allowed.encode()) == json.loads(allowed)
+        excessive = opening + allowed + closing
+        with pytest.raises(ConversationIntegrityError, match="depth"):
+            load_session_json(excessive.encode())
+    # Brackets and escaped quotes inside strings do not contribute to depth.
+    text = json.dumps({"text": '[\\"' * 500})
+    assert load_session_json(text.encode()) == json.loads(text)
+    for invalid in (b"{", b"\xff", b"[" * 10_000 + b"]" * 10_000):
+        with pytest.raises(ConversationIntegrityError):
+            load_session_json(invalid)
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["meta.json", "session_state.json", "agent_lifecycle.json", "conversation.jsonl"],
+)
+def test_listings_skip_decoder_surviving_depth(tmp_path: Path, filename: str) -> None:
+    import json
+
+    from zeta.types import Message, MessageRole, TextContent
+
+    manager = SessionManager(tmp_path)
+    good = manager.create(provider="fake", model="offline")
+    good.store.append_message(
+        Message(MessageRole.USER, [TextContent("healthy preview")])
+    )
+    bad = manager.create(provider="fake", model="offline")
+    deep = '{"nested":' * 500 + "0" + "}" * 500
+    if filename == "session_state.json":
+        payload = (
+            '{"bash_cwd":"/tmp","agent_parent":{"tool_call_id":"call","extra":'
+            + deep
+            + "}}"
+        )
+    elif filename == "conversation.jsonl":
+        payload = (
+            '{"seq":1,"id":"deep","parent_id":null,"lane":"main","type":"warning","data":{"message":"test","extra":'
+            + deep
+            + "}}"
+        )
+    elif filename == "meta.json":
+        payload = json.dumps(bad.metadata.to_dict())[:-1] + ',"extra":' + deep + "}"
+    else:
+        payload = '{"extra":' + deep + "}"
+    assert isinstance(
+        json.loads(payload), dict
+    )  # The decoder accepts the round-3 probes.
+    path = bad.store.session_dir / filename
+    if filename == "conversation.jsonl":
+        payload = path.read_text() + payload + "\n"
+    path.write_text(payload)
+
+    assert manager.list_sessions() == [good.metadata]
+    previews = manager.list_session_previews(limit=1)
+    assert [(item.session_id, item.preview) for item in previews] == [
+        (good.metadata.session_id, "healthy preview")
+    ]
+    with pytest.raises(SessionError):
+        manager.open(bad.metadata.session_id)
+    assert path.read_text() == payload
+
+
+def test_mixed_store_listings_validate_without_mutating(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    good = manager.create(provider="fake", model="offline")
+    # Legacy sessions may lack optional state and lock files. Listing must not create them.
+    good.store.state_path.unlink()
+    good.store.lock_path.unlink()
+    for filename, content in (
+        ("meta.json", b"{"),
+        ("conversation.jsonl", b"broken\n"),
+        ("conversation.jsonl", b""),
+        ("session_state.json", b"{"),
+        ("session_state.json", b'{"bash_cwd":12}'),
+        ("agent_lifecycle.json", b"["),
+        ("agent_lifecycle.json", b"[]"),
+        ("agent_lifecycle.json", b"\xff"),
+    ):
+        bad = manager.create(provider="fake", model="offline")
+        (bad.store.session_dir / filename).write_bytes(content)
+    torn = manager.create(provider="fake", model="offline")
+    with torn.store.path.open("ab") as handle:
+        handle.write(b'{"seq":')
+    no_state = manager.create(provider="fake", model="offline")
+    no_state.store.state_path.unlink()
+    no_state.store.agent_lifecycle_path.write_text("[]")
+    before = {p: p.read_bytes() for p in manager.sessions_dir.rglob("*") if p.is_file()}
+
+    assert manager.list_sessions() == [good.metadata]
+    assert [p.session_id for p in manager.list_session_previews()] == [
+        good.metadata.session_id
+    ]
+    assert {
+        p: p.read_bytes() for p in manager.sessions_dir.rglob("*") if p.is_file()
+    } == before
+
+
+@pytest.mark.parametrize("error", [ConversationIntegrityError, RecursionError])
+def test_preview_boundary_includes_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: type[Exception]
+) -> None:
+    manager = SessionManager(tmp_path)
+    good = manager.create(provider="fake", model="offline")
+    bad = manager.create(provider="fake", model="offline")
+    replay = ConversationStore.replay
+
+    def fail_replay(self):
+        if self.session_id == bad.metadata.session_id:
+            raise error("damaged replay")
+        return replay(self)
+
+    monkeypatch.setattr(ConversationStore, "replay", fail_replay)
+    assert [p.session_id for p in manager.list_session_previews(limit=1)] == [
+        good.metadata.session_id
+    ]
+
+
+@pytest.mark.parametrize("surface", ["tool", "card"])
+def test_child_lifecycle_readers_reject_decoder_surviving_depth(
+    tmp_path: Path, surface: str
+) -> None:
+    from zeta.tools.agent import _read_agent_lifecycle
+    from zeta.tui.agent_card import _read_lifecycle
+
+    path = tmp_path / "agent_lifecycle.json"
+    path.write_text('{"extra":' + '{"nested":' * 500 + "0" + "}" * 501)
+    reader = _read_agent_lifecycle if surface == "tool" else _read_lifecycle
+    assert reader(str(tmp_path)) == {}
