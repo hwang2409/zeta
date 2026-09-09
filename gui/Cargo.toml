@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 base64 = "0.22"
 gpui-kit = { version = "0.6", features = ["tree-sitter-rust", "tree-sitter-python", "tree-sitter-bash", "tree-sitter-typescript"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -20,7 +21,7 @@ all = "deny"
 
 [features]
 default = ["gui"]
-gui = ["dep:gpui-kit"]
+gui = ["dep:gpui-kit", "dep:image"]
 # Compatibility alias: GPUI Kit always enables runtime shaders.
 runtime-shaders = []
 # Native, real-socket smoke driver and renderer capture; excluded from normal builds.

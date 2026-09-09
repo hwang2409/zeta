@@ -9024,6 +9024,7 @@ dependencies = [
  "base64",
  "chrono",
  "gpui-kit",
+ "image",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

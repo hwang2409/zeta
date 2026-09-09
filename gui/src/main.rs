@@ -60,7 +60,7 @@ struct ZetaView {
     composer_images: Vec<ImageAttachment>,
     composer_image_error: Option<String>,
     composer_empty_hint: bool,
-    sent_images: std::collections::HashMap<(usize, usize), std::sync::Arc<gpui::Image>>,
+    sent_images: std::collections::BTreeMap<(usize, usize), std::sync::Arc<gpui::Image>>,
     commands: Sender<CommandMessage>,
     _poll_task: Option<Task<()>>,
 }
@@ -238,16 +238,16 @@ impl ZetaView {
                         .map(|item| (item.name.clone(), item.size))
                         .collect(),
                 );
-                self.sent_images
-                    .extend(
-                        images
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(attachment_index, image)| {
-                                polish::image_source(image)
-                                    .map(|image| ((index, attachment_index), image))
-                            }),
-                    );
+                for (attachment_index, image) in images.iter().enumerate() {
+                    if let Some(image) = polish::image_source(image) {
+                        self.sent_images.insert((index, attachment_index), image);
+                        if self.sent_images.len() > polish::SENT_IMAGE_LIMIT {
+                            if let Some((_, image)) = self.sent_images.pop_first() {
+                                image.remove_asset(cx);
+                            }
+                        }
+                    }
+                }
                 self.composer_images.clear();
                 self.composer_image_error = None;
                 self.composer
@@ -328,7 +328,9 @@ impl ZetaView {
             replace = true;
         }
         if replace {
-            self.sent_images.clear();
+            for image in std::mem::take(&mut self.sent_images).into_values() {
+                image.remove_asset(cx);
+            }
         }
         let count = self.state.transcript.len();
         self.transcript.update(cx, |scroll, cx| {

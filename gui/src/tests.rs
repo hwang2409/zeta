@@ -1166,11 +1166,45 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
         polish::status_label(&metrics),
         "model · 12 tokens · 50.0% cache"
     );
+    let mut state = AppState::default();
+    let mut status = StatusResult {
+        session: Some(SessionMetadata {
+            model: "model".into(),
+            ..session()
+        }),
+        state: "idle".into(),
+        pending_approvals: vec![],
+        usage: json!({}),
+        compaction_markers: 0,
+    };
+    state.apply_status(status.clone());
+    assert_eq!(
+        polish::status_label(&state.metrics),
+        "model · Usage appears after the first turn"
+    );
+    status.usage = json!({
+        "input_tokens": 4, "output_tokens": 4, "cache_read_input_tokens": 4
+    });
+    state.apply_status(status);
+    assert_eq!(
+        polish::status_label(&state.metrics),
+        "model · 12 tokens · 50.0% cache"
+    );
     for (name, args, expected) in [
         (
             "bash",
             json!({"command":"echo one\necho two"}),
             Some("echo one echo two"),
+        ),
+        (
+            "bash",
+            json!({"cmd":"echo legacy\npwd"}),
+            Some("echo legacy pwd"),
+        ),
+        (
+            "bash",
+            json!({"command":"echo current", "cmd":"echo legacy"}),
+            Some("echo current"),
         ),
         ("read", json!({"path":"/tmp/test"}), Some("/tmp/test")),
         ("custom", json!({"path":"/tmp/test"}), None),
@@ -1184,15 +1218,33 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
     }
 }
 
+fn thumbnail_attachment(width: u32, height: u32, color: u8) -> ImageAttachment {
+    let pixels = image::RgbaImage::from_pixel(width, height, image::Rgba([color, 0, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    pixels
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    ImageAttachment::from_bytes("pixel.png".into(), bytes.get_ref()).unwrap()
+}
+
+#[test]
+fn thumbnails_downscale_large_images_and_reject_decode_failures() {
+    for (width, height, expected) in [(1024, 768, (128, 96)), (768, 1024, (72, 96))] {
+        let attachment = thumbnail_attachment(width, height, 1);
+        let thumbnail = polish::image_source(&attachment).unwrap();
+        let decoded = image::load_from_memory(thumbnail.bytes()).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), expected);
+        assert!(thumbnail.bytes().len() < attachment.size);
+    }
+    let invalid = ImageAttachment::from_bytes("broken.png".into(), &png_bytes()).unwrap();
+    assert!(polish::image_source(&invalid).is_none());
+}
+
 #[gpui::test]
 fn sent_image_thumbnail_survives_history_refresh_and_clears_on_switch(cx: &mut TestAppContext) {
-    use base64::Engine;
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    let bytes = base64::engine::general_purpose::STANDARD.decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII="
-    ).unwrap();
-    let image = ImageAttachment::from_bytes("pixel.png".into(), &bytes).unwrap();
+    let image = thumbnail_attachment(16, 12, 1);
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.apply_worker_message(
@@ -1200,11 +1252,10 @@ fn sent_image_thumbnail_survives_history_refresh_and_clears_on_switch(cx: &mut T
                 window,
                 cx,
             );
-            assert_eq!(view.sent_images[&(0, 0)].bytes(), bytes);
             let history = serde_json::from_value(json!([{
                 "id":"message", "role":"user", "content":[
                     {"type":"text", "text":"image"},
-                    {"type":"attachment", "name":"pixel.png", "size":bytes.len()}
+                    {"type":"attachment", "name":"pixel.png", "size":image.size}
                 ]
             }]))
             .unwrap();
@@ -1217,6 +1268,8 @@ fn sent_image_thumbnail_survives_history_refresh_and_clears_on_switch(cx: &mut T
     assert!(visual.debug_bounds("attachment-chip").is_some());
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
+            let thumbnail = view.sent_images[&(0, 0)].clone();
+            assert!(thumbnail.is_asset_cached(cx));
             view.apply_worker_message(
                 WorkerMessage::Session(SessionMetadata {
                     session_id: "other".into(),
@@ -1226,9 +1279,73 @@ fn sent_image_thumbnail_survives_history_refresh_and_clears_on_switch(cx: &mut T
                 cx,
             );
             assert!(view.sent_images.is_empty());
+            assert!(!thumbnail.is_asset_cached(cx));
         });
         window.draw(cx).clear(cx);
     });
+    assert!(visual.debug_bounds("attachment-thumbnail").is_none());
+}
+
+#[gpui::test]
+fn sent_thumbnail_cache_evicts_old_assets_and_reset_releases_remaining_assets(
+    cx: &mut TestAppContext,
+) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut sent = Vec::new();
+            for index in 0..polish::SENT_IMAGE_LIMIT * 3 {
+                view.apply_worker_message(
+                    WorkerMessage::ImagesSent(
+                        "image".into(),
+                        vec![thumbnail_attachment(16, 12, index as u8)],
+                    ),
+                    window,
+                    cx,
+                );
+                let thumbnail = view.sent_images[&(index, 0)].clone();
+                thumbnail.clone().get_render_image(window, cx);
+                sent.push(thumbnail);
+                assert_eq!(
+                    view.sent_images.len(),
+                    (index + 1).min(polish::SENT_IMAGE_LIMIT)
+                );
+                let first_retained = (index + 1).saturating_sub(polish::SENT_IMAGE_LIMIT);
+                for (index, thumbnail) in sent.iter().enumerate() {
+                    assert_eq!(thumbnail.is_asset_cached(cx), index >= first_retained);
+                }
+            }
+            view.apply_worker_message(WorkerMessage::History(vec![], true), window, cx);
+            assert!(view.sent_images.is_empty());
+            assert!(sent.iter().all(|image| !image.is_asset_cached(cx)));
+        });
+    });
+}
+
+#[gpui::test]
+fn sent_image_decode_failure_keeps_attachment_text(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::ImagesSent(
+                    "image".into(),
+                    vec![ImageAttachment::from_bytes("broken.png".into(), &png_bytes()).unwrap()],
+                ),
+                window,
+                cx,
+            );
+            assert!(view.sent_images.is_empty());
+            assert_eq!(
+                view.state.session_view.attachments[&0],
+                vec![("broken.png".into(), 8)]
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("attachment-chip").is_some());
     assert!(visual.debug_bounds("attachment-thumbnail").is_none());
 }
 
