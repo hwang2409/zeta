@@ -1,6 +1,6 @@
 # zeta serve protocol
 
-This document defines protocol version `1.0`. It is the contract for native
+This document defines protocol version `1.1` (with `1.0` compatibility). It is the contract for native
 clients. The transport is newline-delimited UTF-8 JSON. Each line is one
 JSON-RPC 2.0 object. Frames are limited to 1 MiB.
 
@@ -12,8 +12,12 @@ socket. `zeta serve --port N` selects `127.0.0.1:N`.
 ## handshake
 
 The first request must be `hello`. `protocol_version` is required and must be
-exactly `1.0`. The server returns its explicit version and capability lists.
-A mismatch returns `-32002` with `requested` and `supported` fields, then closes
+`1.0` or `1.1`. A new client sends `protocol_version: "1.0"` plus
+`client_version: "1.1"` so old servers accept the handshake. A new server returns
+`1.1` for that request, or for an explicit `protocol_version: "1.1"`. A legacy
+hello without the extra field receives `1.0` and only the legacy capabilities.
+The GUI gates all extensions on the returned version; it never sends extension
+requests to a 1.0 server. A mismatch returns `-32002` with `requested` and `supported` fields, then closes
 the connection. Clients must not send other requests before `hello`.
 
 Example request:
@@ -378,3 +382,47 @@ The repository tests construct every request and event family. They check the
 JSON-RPC envelope, required discriminators, size limit, ordering, pagination,
 resume failure, second-client refusal, and disconnect cleanup. Changes to
 event names, states, or field optionality must update this section and tests.
+
+
+## Session extensions (1.1)
+
+Every request below requires `session_id` equal to the active session ID.
+Unknown or inactive sessions return `-32003`. A connection negotiated at 1.0
+receives `-32601` for every extension. Existing notification shapes are unchanged;
+there are no new event types. Mutation requests reject running turns, outstanding
+tools, approvals, and background agents with `-32004`.
+
+- `session_tree`: returns `branches`, each with `id` (head entry ID), `label`,
+  `depth` (number of divergences), and `current`. The heads come from the core
+  `list_branches` seam.
+- `fork_message`: takes `message_id`, a user message entry on the active branch.
+  Calls `append_message_fork` and returns the updated tree. Missing messages or
+  non-user messages return `-32602`. The fork retains the selected user message.
+- `switch_branch`: takes `head_id`, an existing leaf. Calls `switch_to_branch`
+  and returns the tree. Selecting the current leaf is a no-op. Invalid heads
+  return `-32602`. Fork and switch affect conversation state, not workspace files.
+- `session_history`: takes optional nonnegative `offset` (default 0). Returns
+  `messages` and `next_offset` (null at the end), eight messages per page. Each
+  message has `id`, `role`, `content`, and optional `tool_result`. Text and tool
+  output previews are bounded to 8,000 bytes. Image content becomes
+  `{"type":"attachment","name":"shot.png","size":123}`; base64 stays off this
+  response. Tool-use content retains the existing `tool_call` shape.
+- `model_catalog`: returns `models`, sorted names from the built-in provider
+  catalog plus the current model. The fake provider returns `faster`, `offline`.
+- `session_settings`: returns `model` and `approval_mode`.
+- `set_settings`: takes `model` from that catalog and `approval_mode` (`ask`,
+  `allow`, or `deny`). Both persist atomically in session metadata and apply to
+  future completions. Explicit approval tool rules retain precedence. Invalid
+  choices return `-32602`. The response contains the applied settings.
+- `send_images`: takes `text` (possibly empty) and `images`, a list of one to four
+  objects with `name`, `mime_type`, and base64 `data`. Supported types are
+  `image/png`, `image/jpeg`, `image/gif`, and `image/webp`. The combined decoded
+  limit is 524,288 bytes. Names are plain filenames of at most 128 characters.
+  Invalid base64, signatures, names, counts, types, or sizes return `-32602`.
+  All images validate before any files are written. The server persists files at
+  `sessions/<id>/attachments/<unique-id>/<name>` and builds normal `ImageContent`
+  blocks with path and size for `AgentLoop.run_turn(user_message=...)`.
+  The response matches `send`: `accepted` and `session_id`.
+
+The generic 1 MiB frame bound applies to all requests and responses. Session
+metadata adds nullable `approval_mode`; absent or null uses configured defaults.

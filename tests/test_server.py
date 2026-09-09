@@ -1012,3 +1012,358 @@ asyncio.run(main())
             process.kill()
             await process.wait()
     assert not socket_path.exists()
+
+
+async def _ready_extensions(server):
+    reader, writer = await _connect(server)
+    hello = (await _request(reader, writer, 1, "hello", {"protocol_version": "1.0", "client_version": "1.1"}))[-1]["result"]
+    assert hello["protocol_version"] == "1.1"
+    assert "send_images" in hello["capabilities"]["requests"]
+    session = (await _request(reader, writer, 2, "new_session", {"provider": "fake"}))[-1]["result"]["session"]
+    return reader, writer, session["session_id"]
+
+
+@pytest.mark.asyncio
+async def test_extensions_negotiate_and_old_clients_remain_unchanged(tmp_path):
+    from zeta.server.ergonomics import EXTENSION_REQUESTS
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer = await _connect(server)
+    try:
+        hello = (await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"}))[-1]["result"]
+        assert hello["protocol_version"] == "1.0"
+        assert not set(EXTENSION_REQUESTS) & set(hello["capabilities"]["requests"])
+        for method in EXTENSION_REQUESTS:
+            assert (await _request(reader, writer, method, method))[-1]["error"]["code"] == -32601
+        assert "result" in (await _request(reader, writer, 3, "new_session", {"provider": "fake"}))[-1]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_tree_fork_switch_and_history_persist(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    async def rpc(method, **params):
+        return (await _request(reader, writer, method, method, {"session_id": sid, **params}))[-1]
+    try:
+        assert (await rpc("session_tree"))["result"] == {"branches": []}
+        for text in ("first", "second"):
+            await _request(reader, writer, text, "send", {"text": text})
+            await _event(reader, "agent_end")
+        history = (await rpc("session_history"))["result"]
+        user = [row for row in history["messages"] if row["role"] == "user"]
+        assert [row["content"][0]["text"] for row in user] == ["first", "second"]
+        original = (await rpc("session_tree"))["result"]["branches"][0]["id"]
+        assert (await rpc("fork_message", message_id="missing"))["error"]["code"] == -32602
+        branches = (await rpc("fork_message", message_id=user[0]["id"]))["result"]["branches"]
+        assert len(branches) == 2
+        assert all(branch["depth"] == 1 for branch in branches)
+        assert sum(branch["current"] for branch in branches) == 1
+        forked = (await rpc("session_history"))["result"]["messages"]
+        assert len(forked) == 1 and forked[0]["id"] == user[0]["id"]
+        assert (await rpc("switch_branch", head_id="missing"))["error"]["code"] == -32602
+        branches = (await rpc("switch_branch", head_id=original))["result"]["branches"]
+        assert sum(branch["current"] for branch in branches) == 1
+        restored = (await rpc("session_history"))["result"]["messages"]
+        assert restored == history["messages"]
+        reopened = SessionManager(tmp_path).open(sid)
+        assert [m.to_dict() for m in reopened.store.messages()] == [m.to_dict() for m in server.runtime.loop.store.messages()]
+        assert (await rpc("session_history", offset=-1))["error"]["code"] == -32602
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_count,text", [(0, ""), (20, "\x00" * 8000), (130, "x" * 8000)],
+                         ids=["large-tools", "json-escaping", "near-limit-message"])
+async def test_history_pages_large_messages_with_bounded_tool_arguments(tmp_path, block_count, text):
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    # The default asyncio reader limit is only 64 KiB.
+    reader._limit = MAX_FRAME_BYTES
+    try:
+        store = server.runtime.opened.store
+        entries = []
+        for index in range(17):
+            message = Message(MessageRole.ASSISTANT, [
+                *[TextContent(text) for _ in range(block_count)],
+                ToolUseContent(ToolCall(str(index), "write", {"content": "x" * 135_000})),
+            ])
+            if not block_count:
+                assert FrameCodec().response_fits("message", message.to_dict())
+            entries.append(store.append_message(message))
+        offset = 0
+        rows = []
+        page_sizes = []
+        # Control characters exercise the largest legal encoded request id.
+        request_id = "\x00" * MAX_REQUEST_ID_BYTES
+        while offset is not None:
+            response = (await _request(reader, writer, request_id, "session_history", {
+                "session_id": sid, "offset": offset,
+            }))[-1]
+            assert "error" not in response
+            page = response["result"]
+            encoded = FrameCodec().response(request_id, page)
+            assert len(encoded) <= MAX_FRAME_BYTES
+            if block_count == 130:
+                assert len(encoded) > MAX_FRAME_BYTES - 10_000
+            assert page["messages"]
+            page_sizes.append(len(page["messages"]))
+            rows.extend(page["messages"])
+            next_offset = page["next_offset"]
+            assert next_offset is None or next_offset == offset + len(page["messages"])
+            offset = next_offset
+        assert [row["id"] for row in rows] == [entry.id for entry in entries]
+        assert page_sizes == ([8, 8, 1] if not block_count else [1] * 17)
+        for index, row in enumerate(rows):
+            assert row["content"][:-1] == [{"type": "text", "text": text}] * block_count
+            assert row["content"][-1] == {
+                "type": "tool_use", "tool_call": {"id": str(index), "name": "write", "arguments": {}},
+            }
+        assert all(message.content[-1].tool_call.arguments == {"content": "x" * 135_000}
+                   for message in store.messages())
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_history_advances_past_single_oversized_persisted_message(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        store = server.runtime.opened.store
+        oversized = store.append_message(Message(MessageRole.USER, [TextContent("x" * 8000)] * 140))
+        following = store.append_message(Message(MessageRole.USER, [TextContent("after")]))
+        response = (await _request(reader, writer, "history", "session_history", {"session_id": sid}))[-1]
+        assert "error" not in response
+        page = response["result"]
+        assert page["next_offset"] is None
+        assert [row["id"] for row in page["messages"]] == [oversized.id, following.id]
+        assert "truncated" in page["messages"][0]["content"][0]["text"]
+        assert page["messages"][1]["content"] == [{"type": "text", "text": "after"}]
+        assert len(store.messages()[0].content) == 140
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_settings_apply_to_active_session_and_resume(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    async def rpc(method, **params):
+        return (await _request(reader, writer, method, method, {"session_id": sid, **params}))[-1]
+    try:
+        assert (await rpc("model_catalog"))["result"] == {"models": ["faster", "offline"]}
+        assert (await rpc("session_settings"))["result"] == {"model": "offline", "approval_mode": "ask"}
+        for model, mode in (("invalid", "ask"), ("offline", "invalid")):
+            assert (await rpc("set_settings", model=model, approval_mode=mode))["error"]["code"] == -32602
+        settings = {"model": "faster", "approval_mode": "deny"}
+        assert (await rpc("set_settings", **settings))["result"] == settings
+        assert server.runtime.loop.backend.model == "faster"
+        assert server.runtime.policy.default.value == "deny"
+        await _request(reader, writer, "new", "new_session", {"provider": "fake"})
+        assert (await rpc("set_settings", **settings))["error"]["code"] == -32003
+        assert server.runtime.policy.default.value == "ask"
+        await _request(reader, writer, "resume", "resume", {"session_id": sid})
+        assert (await rpc("session_settings"))["result"] == settings
+        assert not (tmp_path / "settings.json").exists()
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
+    import base64
+
+    from zeta.server.ergonomics import MAX_IMAGE_BYTES
+    from zeta.types import ImageContent
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("seen")])])
+    server = ZetaServer(home=tmp_path, port=0, backend_factory=lambda provider, model, home: (backend, model or "offline"))
+    reader, writer, sid = await _ready_extensions(server)
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    image = {"name": "test.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
+    async def send(images, session_id=sid):
+        return (await _request(reader, writer, "images", "send_images", {"session_id": session_id, "text": "inspect", "images": images}))[-1]
+    try:
+        assert (await send([image], "missing"))["error"]["code"] == -32003
+        for invalid in ({**image, "name": "../escape.png"}, {**image, "data": "!"}, {**image, "mime_type": "text/plain"}, {**image, "data": base64.b64encode(b'x').decode()}, {**image, "data": base64.b64encode(png + b'x' * MAX_IMAGE_BYTES).decode()}):
+            assert (await send([invalid]))["error"]["code"] == -32602
+        assert not (server.runtime.opened.store.session_dir / "attachments").exists()
+        assert (await send([image]))["result"]["accepted"]
+        await _event(reader, "agent_end")
+        message = server.runtime.loop.store.messages()[0]
+        attachment = next(block for block in message.content if isinstance(block, ImageContent))
+        assert attachment.size == len(png)
+        assert Path(attachment.path).read_bytes() == png
+        assert Path(attachment.path).is_relative_to(server.runtime.opened.store.session_dir)
+        assert attachment in backend.calls[0][0][-1].content
+        history = (await _request(reader, writer, "history", "session_history", {"session_id": sid}))[-1]["result"]["messages"]
+        assert history[0]["content"][1] == {"type": "attachment", "name": "test.png", "size": len(png)}
+        assert "data" not in history[0]["content"][1]
+        assert SessionManager(tmp_path).open(sid).store.messages()[0] == message
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("failure", [None, "backend", "metadata"])
+async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, failure):
+    from zeta.core.slash import MODEL_CONTEXT_WINDOWS
+
+    monkeypatch.setitem(MODEL_CONTEXT_WINDOWS, "fake", {"offline": 1_050_000, "faster": 400_000})
+    if pinned:
+        (tmp_path / "settings.toml").write_text("token_budget = 123456\n")
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    runtime = server.runtime
+    metadata_before = runtime.metadata.to_dict()
+    old_budget = 123456 if pinned else 1_050_000
+    assert runtime.loop.context_assembler.token_budget == old_budget
+    try:
+        with monkeypatch.context() as patch:
+            if failure == "backend":
+                original = runtime.loop.set_model
+
+                def fail_model(model):
+                    original(model)
+                    if model == "faster":
+                        raise OSError("partial backend change")
+
+                patch.setattr(runtime.loop, "set_model", fail_model)
+            elif failure == "metadata":
+                import zeta.core.session as session_module
+                original = session_module.os.replace
+
+                def fail_metadata(source, destination):
+                    if Path(destination).name == "meta.json":
+                        raise OSError("metadata persistence failed")
+                    return original(source, destination)
+
+                patch.setattr(session_module.os, "replace", fail_metadata)
+            response = (await _request(reader, writer, "settings", "set_settings", {
+                "session_id": sid, "model": "faster", "approval_mode": "deny",
+            }))[-1]
+        if failure:
+            assert response["error"]["code"] == -32000
+            assert runtime.metadata.to_dict() == metadata_before
+            assert runtime.loop.backend.model == "offline"
+            assert runtime.loop.context_assembler.token_budget == old_budget
+            assert runtime.policy.default.value == "ask"
+            assert SessionManager(tmp_path).open(sid).metadata.to_dict() == metadata_before
+        else:
+            assert response["result"] == {"model": "faster", "approval_mode": "deny"}
+            expected_budget = 123456 if pinned else 400_000
+            assert runtime.loop.context_assembler.token_budget == expected_budget
+            assert runtime.metadata.compaction_budget == expected_budget
+            assert runtime.metadata.budget_pinned == pinned
+            assert SessionManager(tmp_path).open(sid).metadata.compaction_budget == expected_budget
+            await _request(reader, writer, "resume", "resume", {"session_id": sid})
+            assert runtime.loop.context_assembler.token_budget == expected_budget
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_image_names_match_verified_types(tmp_path):
+    import base64
+
+    from zeta.server.ergonomics import DIRECTION_CONTROLS, image_message
+    from zeta.server.protocol import ProtocolError
+    from zeta.server.runtime import ServerRuntime
+
+    runtime = ServerRuntime(tmp_path, provider="fake")
+    await runtime.create_session()
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    item = {"name": "safe.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
+    invalid_names = ["../bad.png", "..\\bad.png", "bad/path.png", "bad\\path.png", "bad.jpg", "bad", "bad.png.exe", "bad\x7f.png"]
+    invalid_names += [f"bad{control}.png" for control in DIRECTION_CONTROLS]
+    try:
+        for name in invalid_names:
+            with pytest.raises(ProtocolError):
+                image_message(runtime, {"images": [{**item, "name": name}]})
+        attachments = runtime.opened.store.session_dir / "attachments"
+        assert not attachments.exists()
+        for mime, raw, names in [
+            ("image/png", png, ["safe.PNG", "写真.png"]),
+            ("image/jpeg", b"\xff\xd8\xff\xe0", ["safe.jpg", "safe.JPEG"]),
+            ("image/gif", b"GIF89a\x01\x00\x01\x00", ["safe.gif"]),
+            ("image/webp", b"RIFF" + (22).to_bytes(4, "little") + b"WEBPVP8X" + (10).to_bytes(4, "little") + bytes(10), ["safe.webp"]),
+        ]:
+            for name in names:
+                message = image_message(runtime, {"images": [{"name": name, "mime_type": mime, "data": base64.b64encode(raw).decode()}]})
+                assert Path(message.content[1].path).name == name
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["write", "flush", "replace"])
+@pytest.mark.parametrize("fail_at", [1, 2])
+@pytest.mark.parametrize("existing", [False, True])
+async def test_attachment_failure_removes_entire_batch(tmp_path, monkeypatch, failure, fail_at, existing):
+    import base64
+    from contextlib import contextmanager
+
+    from zeta.server import ergonomics
+    from zeta.server.runtime import ServerRuntime
+
+    runtime = ServerRuntime(tmp_path, provider="fake")
+    await runtime.create_session()
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    item = {"name": "same.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
+    attachments = runtime.opened.store.session_dir / "attachments"
+    if existing:
+        ergonomics.image_message(runtime, {"images": [item]})
+    before = set(attachments.rglob("*"))
+    original_open = Path.open
+    original_replace = ergonomics.os.replace
+    writes = 0
+    replacements = 0
+
+    @contextmanager
+    def failing_open(path, *args, **kwargs):
+        nonlocal writes
+        with original_open(path, *args, **kwargs) as handle:
+            if path.name == ".image.tmp" and args == ("xb",):
+                writes += 1
+                if writes == fail_at:
+                    if failure == "write":
+                        def fail_write(raw):
+                            handle.write(raw[:4])
+                            handle.flush()
+                            raise OSError("mid-write failure")
+                        from unittest.mock import Mock
+                        wrapper = Mock(wraps=handle)
+                        wrapper.write.side_effect = fail_write
+                        yield wrapper
+                        return
+                    if failure == "flush":
+                        from unittest.mock import Mock
+                        wrapper = Mock(wraps=handle)
+                        wrapper.flush.side_effect = OSError("flush failure")
+                        yield wrapper
+                        return
+            yield handle
+
+    def failing_replace(source, destination):
+        nonlocal replacements
+        assert Path(source).read_bytes() == png
+        assert not Path(destination).exists()
+        replacements += 1
+        if failure == "replace" and replacements == fail_at:
+            raise OSError("replace failure")
+        return original_replace(source, destination)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "open", failing_open)
+            patch.setattr(ergonomics.os, "replace", failing_replace)
+            with pytest.raises(OSError):
+                ergonomics.image_message(runtime, {"images": [item, item]})
+        assert attachments.exists() == existing
+        assert set(attachments.rglob("*")) == before
+        assert all(path.read_bytes() == png for path in before if path.is_file())
+        assert runtime.opened.store.messages() == []
+    finally:
+        await runtime.close()

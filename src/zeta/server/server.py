@@ -16,7 +16,9 @@ from uuid import uuid4
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
+from ..core.slash import resolve_session_budget
 from ..types import StreamEvent, StreamEventType, TextContent
+from . import ergonomics
 from .protocol import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
@@ -176,6 +178,7 @@ class _Client:
         self.reader = reader
         self.writer = writer
         self.handshaken = False
+        self.protocol_version = "1.0"
         self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
@@ -301,6 +304,10 @@ class _Client:
             return self._hello(params)
         if not self.handshaken:
             raise ProtocolError(-32002, "hello must be the first request")
+        if method in ergonomics.EXTENSION_REQUESTS:
+            if self.protocol_version != "1.1":
+                raise ProtocolError(-32601, "request requires protocol 1.1")
+            return await self._ergonomics(method, params)
         if method == "list_sessions":
             return self._list_sessions(request_id)
         if method == "new_session":
@@ -331,15 +338,18 @@ class _Client:
         if self.handshaken:
             raise ProtocolError(-32600, "hello may only be sent once")
         version = params.get("protocol_version")
-        if version != PROTOCOL_VERSION:
+        if version not in ("1.0", PROTOCOL_VERSION):
             raise ProtocolError(
                 -32002,
                 "unsupported protocol version",
                 {"requested": version, "supported": [PROTOCOL_VERSION]},
             )
+        self.protocol_version = (
+            PROTOCOL_VERSION if version == PROTOCOL_VERSION or params.get("client_version") == PROTOCOL_VERSION else "1.0"
+        )
         self.handshaken = True
         return {
-            "protocol_version": PROTOCOL_VERSION,
+            "protocol_version": self.protocol_version,
             "server": "zeta",
             "capabilities": {
                 "requests": [
@@ -352,10 +362,61 @@ class _Client:
                     "deny",
                     "abort",
                     "status",
-                ],
+                ] + (ergonomics.EXTENSION_REQUESTS if self.protocol_version == "1.1" else []),
                 "notifications": ["event"],
             },
         }
+
+    async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
+        runtime = self.server.runtime
+        store = ergonomics.active(runtime, params)
+        if method == "session_tree":
+            return ergonomics.tree(runtime)
+        if method == "session_history":
+            return ergonomics.history(runtime, params)
+        if method == "model_catalog":
+            return ergonomics.catalog(runtime)
+        if method == "session_settings":
+            return ergonomics.settings(runtime)
+        await self._require_idle()
+        ergonomics.require_mutable(runtime)
+        if method == "send_images":
+            message = ergonomics.image_message(runtime, params)
+            self._turn_task = asyncio.create_task(self._run_turn(params.get("text", ""), message))
+            return {"accepted": True, "session_id": runtime.session_id}
+        if method == "set_settings":
+            model = _required_string(params, "model")
+            mode = _required_string(params, "approval_mode")
+            if model not in ergonomics.catalog(runtime)["models"] or mode not in {"ask", "allow", "deny"}:
+                raise ProtocolError(-32602, "invalid model or approval mode")
+            previous = runtime.model
+            assembler = runtime.loop.context_assembler
+            previous_budget = assembler.token_budget
+            budget, _ = resolve_session_budget(
+                runtime.metadata.compaction_budget,
+                runtime.metadata.budget_pinned,
+                runtime.provider,
+                model,
+                None,
+            )
+            try:
+                runtime.loop.set_model(model)
+                assembler.token_budget = budget
+                runtime.manager.record_session_settings(runtime.metadata, model=model, approval_mode=mode, budget=budget)
+            except Exception:
+                assembler.token_budget = previous_budget
+                runtime.loop.set_model(previous)
+                raise
+            runtime.policy.default = ApprovalDecision(mode)
+            return ergonomics.settings(runtime)
+        if method == "fork_message":
+            store.append_message_fork(_required_string(params, "message_id"))
+        elif method == "switch_branch":
+            head = _required_string(params, "head_id")
+            current = store.replay()
+            if not current or current[-1].id != head:
+                store.switch_to_branch(head)
+        return ergonomics.tree(runtime)
 
     async def _send(self, text: str) -> dict[str, object]:
         runtime = self.server.runtime
@@ -443,7 +504,7 @@ class _Client:
             ),
         }
 
-    async def _run_turn(self, text: str) -> None:
+    async def _run_turn(self, text: str, user_message=None) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
         if loop is None or state is None:
@@ -451,7 +512,7 @@ class _Client:
         session_id = state.session_id
         state.turn_started()
         try:
-            async for event in loop.run_turn(text):
+            async for event in loop.run_turn(text, user_message=user_message):
                 await self._event(event, session_id=session_id)
         except asyncio.CancelledError:
             raise

@@ -47,6 +47,9 @@ pub struct Composer {
     scroll: ScrollHandle,
     reveal_cursor: bool,
     pub enabled: bool,
+    pub images_enabled: bool,
+    pub images: Vec<zeta_gui::session::ImageAttachment>,
+    pub image_error: Option<String>,
     is_selecting: bool,
 }
 
@@ -143,8 +146,79 @@ impl Composer {
         window.show_character_palette();
     }
 
+    fn add_images(
+        &mut self,
+        images: Result<Vec<zeta_gui::session::ImageAttachment>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.enabled || !self.images_enabled {
+            return;
+        }
+        match images {
+            Ok(images)
+                if self.images.len() + images.len() <= 4
+                    && self
+                        .images
+                        .iter()
+                        .chain(&images)
+                        .map(|item| item.size)
+                        .sum::<usize>()
+                        <= zeta_gui::session::MAX_IMAGE_BYTES =>
+            {
+                self.images.extend(images);
+                self.image_error = None;
+            }
+            Ok(_) => self.image_error = Some("attach at most 4 images, totaling 512 KiB".into()),
+            Err(error) => self.image_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn drop_images(&mut self, paths: &gpui::ExternalPaths, _: &mut Window, cx: &mut Context<Self>) {
+        if self.enabled && self.images_enabled {
+            if self.images.len() + paths.0.len() > 4 {
+                self.image_error = Some("attach at most 4 images, totaling 512 KiB".into());
+                cx.notify();
+                return;
+            }
+            self.add_images(
+                paths
+                    .0
+                    .iter()
+                    .map(|path| zeta_gui::session::ImageAttachment::from_path(path))
+                    .collect(),
+                cx,
+            );
+        }
+    }
+
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        if self.enabled && self.images_enabled {
+            for entry in item.entries() {
+                match entry {
+                    gpui::ClipboardEntry::Image(image) => {
+                        self.add_images(
+                            zeta_gui::session::ImageAttachment::from_bytes(
+                                format!("pasted-image.{}", image.format.extension()),
+                                &image.bytes,
+                            )
+                            .map(|image| vec![image]),
+                            cx,
+                        );
+                        return;
+                    }
+                    gpui::ClipboardEntry::ExternalPaths(paths) => {
+                        self.drop_images(paths, window, cx);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(text) = item.text() {
             self.replace_text_in_range(None, &text, window, cx);
         }
     }
@@ -281,6 +355,8 @@ impl Composer {
     }
 
     pub fn reset(&mut self) {
+        self.images.clear();
+        self.image_error = None;
         self.content = "".into();
         self.selected_range = 0..0;
         self.selection_reversed = false;
@@ -450,6 +526,9 @@ impl Composer {
             reveal_cursor: false,
             is_selecting: false,
             enabled: true,
+            images_enabled: false,
+            images: Vec::new(),
+            image_error: None,
         }
     }
 
@@ -633,6 +712,26 @@ impl Render for Composer {
         let layout = text.layout().clone();
         div()
             .id("composer-input")
+            .on_drop(cx.listener(Self::drop_images))
+            .children(self.images.iter().enumerate().map(|(index, image)| {
+                div()
+                    .id(format!("draft-image-{index}"))
+                    .min_h(px(40.))
+                    .px_2()
+                    .py_2()
+                    .bg(rgb(p.code_chip))
+                    .child(format!("{} · {} bytes · remove", image.name, image.size))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        if view.enabled {
+                            view.images.remove(index);
+                            cx.notify();
+                        }
+                    }))
+            }))
+            .when_some(self.image_error.clone(), |view, error| {
+                view.child(div().text_color(rgb(p.error)).child(error))
+            })
             .key_context("Composer")
             .track_focus(&self.focus_handle)
             .tab_index(0)
@@ -1076,5 +1175,114 @@ mod tests {
                 assert_eq!(view.content.as_ref(), "ab!日本語");
             })
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn pasted_image_names_follow_clipboard_format(cx: &mut gpui::TestAppContext) {
+        let window = cx.add_window(|_, cx| Composer::new(cx));
+        for (format, bytes, name) in [
+            (
+                gpui::ImageFormat::Png,
+                b"\x89PNG\r\n\x1a\n".as_slice(),
+                "pasted-image.png",
+            ),
+            (
+                gpui::ImageFormat::Jpeg,
+                b"\xff\xd8\xff".as_slice(),
+                "pasted-image.jpg",
+            ),
+            (
+                gpui::ImageFormat::Gif,
+                b"GIF89a".as_slice(),
+                "pasted-image.gif",
+            ),
+            (
+                gpui::ImageFormat::Webp,
+                b"RIFF\x04\x00\x00\x00WEBP".as_slice(),
+                "pasted-image.webp",
+            ),
+        ] {
+            window
+                .update(cx, |composer, window, cx| {
+                    composer.images_enabled = true;
+                    composer.images.clear();
+                    cx.write_to_clipboard(ClipboardItem::new_image(&gpui::Image::from_bytes(
+                        format,
+                        bytes.to_vec(),
+                    )));
+                    composer.paste(&Paste, window, cx);
+                    assert_eq!(composer.images[0].name, name);
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn failed_drop_preserves_the_previous_batch(cx: &mut gpui::TestAppContext) {
+        let directory = std::env::temp_dir().join(format!("zeta-95-batch-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let good = directory.join("good.png");
+        let bad = directory.join("bad.png");
+        std::fs::write(&good, b"\x89PNG\r\n\x1a\n").unwrap();
+        let paths = gpui::ExternalPaths([good.clone(), bad.clone()].into_iter().collect());
+        let window = cx.add_window(|_, cx| Composer::new(cx));
+        window
+            .update(cx, |composer, window, cx| {
+                composer.images_enabled = true;
+                let previous = zeta_gui::session::ImageAttachment::from_path(&good).unwrap();
+                composer.images.push(previous.clone());
+                // A missing second file, then invalid bytes, must preserve the first batch.
+                for contents in [None, Some(b"invalid".as_slice())] {
+                    if let Some(contents) = contents {
+                        std::fs::write(&bad, contents).unwrap();
+                    }
+                    composer.drop_images(&paths, window, cx);
+                    assert_eq!(composer.images, vec![previous.clone()]);
+                    assert!(composer.image_error.is_some());
+                }
+                std::fs::write(&bad, b"\x89PNG\r\n\x1a\n").unwrap();
+                composer.drop_images(&paths, window, cx);
+                assert_eq!(composer.images.len(), 3);
+                assert!(composer.image_error.is_none());
+                composer.drop_images(&paths, window, cx);
+                assert_eq!(composer.images.len(), 3);
+                assert!(composer.image_error.is_some());
+            })
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn file_drop_obeys_size_limits_and_protocol_gate(cx: &mut gpui::TestAppContext) {
+        let path = std::env::temp_dir().join(format!("zeta-95-drop-{}.png", std::process::id()));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let paths = gpui::ExternalPaths([path.clone()].into_iter().collect());
+        let composer = cx.new(Composer::new);
+        let window = cx.add_window(|_, _| gpui::Empty);
+        window
+            .update(cx, |_, window, cx| {
+                composer.update(cx, |composer, cx| {
+                    composer.drop_images(&paths, window, cx);
+                    assert!(composer.images.is_empty(), "old servers hide file input");
+                    composer.images_enabled = true;
+                    composer.drop_images(&paths, window, cx);
+                    assert_eq!(composer.images.len(), 1);
+                    assert_eq!(
+                        composer.images[0].name,
+                        path.file_name().unwrap().to_string_lossy()
+                    );
+                    std::fs::write(&path, vec![0; zeta_gui::session::MAX_IMAGE_BYTES + 1]).unwrap();
+                    composer.drop_images(&paths, window, cx);
+                    assert_eq!(composer.images.len(), 1);
+                    assert!(composer.image_error.as_ref().unwrap().contains("512 KiB"));
+                });
+            })
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 }

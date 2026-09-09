@@ -68,6 +68,7 @@ pub enum ConnectionState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppState {
+    pub session_view: crate::session::SessionView,
     pub sessions: Vec<SessionMetadata>,
     pub active_session: Option<String>,
     pub sessions_truncated: bool,
@@ -83,6 +84,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            session_view: Default::default(),
             sessions: Vec::new(),
             active_session: None,
             sessions_truncated: false,
@@ -98,6 +100,83 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn apply_history(&mut self, messages: Vec<crate::client::HistoryMessage>, replace: bool) {
+        use crate::client::HistoryContent;
+        if replace {
+            self.transcript.clear();
+        }
+        self.session_view.message_ids.clear();
+        self.session_view.attachments.clear();
+        let user_rows: Vec<_> = self
+            .transcript
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| matches!(row, TranscriptEntry::User(_)).then_some(index))
+            .collect();
+        let mut users = 0;
+        let mut calls = HashMap::new();
+        for message in messages {
+            let text: String = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    HistoryContent::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if message.role == "user" {
+                let index = if replace {
+                    let index = self.transcript.len();
+                    self.transcript.push(TranscriptEntry::User(text));
+                    Some(index)
+                } else {
+                    user_rows.get(users).copied()
+                };
+                users += 1;
+                if let Some(index) = index {
+                    self.session_view.message_ids.insert(index, message.id);
+                    let attachments = message
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            HistoryContent::Attachment { name, size } => {
+                                Some((name.clone(), *size))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    self.session_view.attachments.insert(index, attachments);
+                }
+            } else if replace && message.role == "assistant" {
+                if !text.is_empty() {
+                    self.transcript
+                        .push(TranscriptEntry::Assistant(text.into()));
+                }
+                for block in message.content {
+                    if let HistoryContent::ToolUse { tool_call } = block {
+                        self.apply(ServerEvent::ToolStart {
+                            session_id: self.active_session.clone(),
+                            tool_call: tool_call.clone(),
+                            data: Default::default(),
+                        });
+                        calls.insert(tool_call.id.clone(), tool_call);
+                    }
+                }
+            } else if replace {
+                if let Some(result) = message.tool_result {
+                    if let Some(call) = calls.remove(&result.tool_call_id) {
+                        self.apply(ServerEvent::ToolEnd {
+                            session_id: self.active_session.clone(),
+                            tool_call: call,
+                            tool_result: Some(result),
+                            data: Default::default(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     pub fn mark_connection_lost(&mut self, error: impl Into<String>) {
         self.connection = ConnectionState::Lost(error.into());
         self.streaming = false;
@@ -121,6 +200,10 @@ impl AppState {
             .and_then(|id| self.saved_transcripts.remove(id))
             .unwrap_or_default();
         self.active_session = session_id;
+        self.session_view = crate::session::SessionView {
+            available: self.session_view.available,
+            ..Default::default()
+        };
         self.metrics = StatusMetrics::default();
         self.metrics_boundary = true;
     }

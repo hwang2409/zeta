@@ -1,4 +1,4 @@
-//! A gpui-independent client for the zeta serve 1.0 protocol.
+//! A gpui-independent client for the zeta serve 1.x protocol.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -9,7 +9,8 @@ use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: &str = "1.0";
+pub const PROTOCOL_VERSION: &str = "1.1";
+use crate::session::{Branch, ImageAttachment, SessionSettings};
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -445,6 +446,7 @@ pub struct ProtocolClient {
     read_buffer: Vec<u8>,
     events: VecDeque<ServerEvent>,
     next_id: u64,
+    pub session_extensions: bool,
 }
 
 impl ProtocolClient {
@@ -475,6 +477,7 @@ impl ProtocolClient {
             read_buffer: Vec::new(),
             events: VecDeque::new(),
             next_id: 1,
+            session_extensions: false,
         })
     }
 
@@ -490,14 +493,15 @@ impl ProtocolClient {
     pub fn handshake(&mut self) -> Result<HelloResult, ClientError> {
         let hello: HelloResult = self.request(
             "hello",
-            serde_json::json!({ "protocol_version": PROTOCOL_VERSION }),
+            serde_json::json!({ "protocol_version": "1.0", "client_version": PROTOCOL_VERSION }),
         )?;
-        if hello.protocol_version != PROTOCOL_VERSION {
+        if !matches!(hello.protocol_version.as_str(), "1.0" | "1.1") {
             return Err(ClientError::VersionMismatch {
                 requested: PROTOCOL_VERSION.to_owned(),
                 supported: hello.protocol_version,
             });
         }
+        self.session_extensions = hello.protocol_version == "1.1";
         Ok(hello)
     }
 
@@ -582,6 +586,102 @@ impl ProtocolClient {
 
     pub fn status(&mut self) -> Result<StatusResult, ClientError> {
         self.request("status", Value::Object(Map::new()))
+    }
+
+    fn extension<T: for<'de> Deserialize<'de>>(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<T, ClientError> {
+        if !self.session_extensions {
+            return Err(ClientError::Rpc {
+                code: -32601,
+                message: "session extensions unavailable".into(),
+                data: None,
+            });
+        }
+        self.request(method, params)
+    }
+
+    pub fn tree(&mut self, session_id: &str) -> Result<TreeResult, ClientError> {
+        self.extension(
+            "session_tree",
+            serde_json::json!({"session_id": session_id}),
+        )
+    }
+
+    pub fn switch_branch(
+        &mut self,
+        session_id: &str,
+        head_id: &str,
+    ) -> Result<TreeResult, ClientError> {
+        self.extension(
+            "switch_branch",
+            serde_json::json!({"session_id": session_id, "head_id": head_id}),
+        )
+    }
+
+    pub fn fork_message(
+        &mut self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<TreeResult, ClientError> {
+        self.extension(
+            "fork_message",
+            serde_json::json!({"session_id": session_id, "message_id": message_id}),
+        )
+    }
+
+    pub fn history(&mut self, session_id: &str) -> Result<Vec<HistoryMessage>, ClientError> {
+        let mut messages = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page: HistoryPage = self.extension(
+                "session_history",
+                serde_json::json!({"session_id": session_id, "offset": offset}),
+            )?;
+            messages.extend(page.messages);
+            match page.next_offset {
+                Some(next) if next > offset => offset = next,
+                Some(_) => return Err(ClientError::UnexpectedResponse),
+                None => return Ok(messages),
+            }
+        }
+    }
+
+    pub fn settings(&mut self, session_id: &str) -> Result<SessionSettings, ClientError> {
+        self.extension(
+            "session_settings",
+            serde_json::json!({"session_id": session_id}),
+        )
+    }
+
+    pub fn models(&mut self, session_id: &str) -> Result<ModelCatalog, ClientError> {
+        self.extension(
+            "model_catalog",
+            serde_json::json!({"session_id": session_id}),
+        )
+    }
+
+    pub fn set_settings(
+        &mut self,
+        session_id: &str,
+        settings: &SessionSettings,
+    ) -> Result<SessionSettings, ClientError> {
+        self.extension("set_settings", serde_json::json!({"session_id": session_id, "model": settings.model, "approval_mode": settings.approval_mode}))
+    }
+
+    pub fn send_images(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        images: &[ImageAttachment],
+    ) -> Result<bool, ClientError> {
+        let result: Value = self.extension(
+            "send_images",
+            serde_json::json!({"session_id": session_id, "text": text, "images": images}),
+        )?;
+        Ok(result["accepted"].as_bool().unwrap_or(false))
     }
 
     pub fn next_event(&mut self) -> Result<ServerEvent, ClientError> {
@@ -702,6 +802,38 @@ impl ProtocolClient {
             }
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TreeResult {
+    pub branches: Vec<Branch>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelCatalog {
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryPage {
+    messages: Vec<HistoryMessage>,
+    next_offset: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryMessage {
+    pub tool_result: Option<ToolResult>,
+    pub id: String,
+    pub role: String,
+    pub content: Vec<HistoryContent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HistoryContent {
+    Text { text: String },
+    Attachment { name: String, size: usize },
+    ToolUse { tool_call: ToolCall },
 }
 
 #[derive(Debug, Deserialize)]

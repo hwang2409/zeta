@@ -2,6 +2,8 @@
 use crate::client::{
     ClientError, ProtocolClient, ServerEvent, SessionList, SessionMetadata, StatusResult,
 };
+use crate::client::{HistoryMessage, TreeResult};
+use crate::session::{ImageAttachment, SessionSettings};
 use std::env;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -14,6 +16,11 @@ pub enum CommandMessage {
     NewSession,
     Resume(String),
     Send(String),
+    SendImages(String, Vec<ImageAttachment>),
+    SwitchBranch(String),
+    ForkMessage(String),
+    LoadSettings,
+    SetSettings(SessionSettings),
     Approve(String),
     Deny(String),
     Abort,
@@ -27,6 +34,12 @@ pub enum WorkerMessage {
     Status(StatusResult),
     Sent(String),
     Connected,
+    Extensions(bool),
+    Tree(TreeResult),
+    History(Vec<HistoryMessage>, bool),
+    Settings(SessionSettings, Vec<String>),
+    SettingsApplied(SessionSettings),
+    ImagesSent(String, Vec<ImageAttachment>),
     Event(ServerEvent),
     Rejected(String),
     Lost(String),
@@ -73,6 +86,21 @@ impl ConnectionWorker {
         Ok(status)
     }
 
+    fn refresh_session(
+        &self,
+        client: &mut ProtocolClient,
+        selected: Option<&str>,
+        replace: bool,
+    ) -> Result<(), ClientError> {
+        if let Some(id) = selected.filter(|_| client.session_extensions) {
+            let tree = client.tree(id)?;
+            let _ = self.messages.send(WorkerMessage::Tree(tree));
+            let history = client.history(id)?;
+            let _ = self.messages.send(WorkerMessage::History(history, replace));
+        }
+        Ok(())
+    }
+
     fn connected(
         &self,
         process: &mut Option<Child>,
@@ -80,6 +108,9 @@ impl ConnectionWorker {
     ) -> Result<bool, ClientError> {
         let mut client = connect(&self.socket, process)?;
         client.handshake()?;
+        let _ = self
+            .messages
+            .send(WorkerMessage::Extensions(client.session_extensions));
         let sessions = client.list_sessions()?;
         let _ = self.messages.send(WorkerMessage::Sessions(sessions));
         if let Some(id) = selected.as_deref() {
@@ -97,6 +128,7 @@ impl ConnectionWorker {
             .session
             .as_ref()
             .map(|session| session.session_id.clone());
+        self.refresh_session(&mut client, selected.as_deref(), true)?;
         let mut busy = status.state != "idle";
         let mut pending_approvals = !status.pending_approvals.is_empty();
         let _ = self.messages.send(WorkerMessage::Connected);
@@ -112,6 +144,11 @@ impl ConnectionWorker {
                         CommandMessage::NewSession
                         | CommandMessage::Resume(_)
                         | CommandMessage::Send(_)
+                        | CommandMessage::SendImages(..)
+                        | CommandMessage::SwitchBranch(_)
+                        | CommandMessage::ForkMessage(_)
+                        | CommandMessage::LoadSettings
+                        | CommandMessage::SetSettings(_)
                         | CommandMessage::Reconnect
                             if busy || pending_approvals =>
                         {
@@ -130,6 +167,7 @@ impl ConnectionWorker {
                                 let status = self.status(&mut client)?;
                                 busy = status.state != "idle";
                                 pending_approvals = !status.pending_approvals.is_empty();
+                                self.refresh_session(&mut client, selected.as_deref(), true)?;
                                 Ok(())
                             })
                         }
@@ -141,6 +179,54 @@ impl ConnectionWorker {
                                 self.reject("server did not accept the message");
                             }
                         }),
+                        CommandMessage::SendImages(text, images) => client
+                            .send_images(selected.as_deref().unwrap_or(""), &text, &images)
+                            .map(|accepted| {
+                                if accepted {
+                                    busy = true;
+                                    let _ =
+                                        self.messages.send(WorkerMessage::ImagesSent(text, images));
+                                } else {
+                                    self.reject("server did not accept the message");
+                                }
+                            }),
+                        CommandMessage::SwitchBranch(_) | CommandMessage::ForkMessage(_) => {
+                            let id = selected.as_deref().unwrap_or("");
+                            let result = match command {
+                                CommandMessage::SwitchBranch(head) => {
+                                    client.switch_branch(id, &head)
+                                }
+                                CommandMessage::ForkMessage(message) => {
+                                    client.fork_message(id, &message)
+                                }
+                                _ => unreachable!(),
+                            };
+                            result.and_then(|tree| {
+                                let _ = self.messages.send(WorkerMessage::Tree(tree));
+                                let history = client.history(id)?;
+                                let _ = self.messages.send(WorkerMessage::History(history, true));
+                                self.status(&mut client)?;
+                                Ok(())
+                            })
+                        }
+                        CommandMessage::LoadSettings => {
+                            let id = selected.as_deref().unwrap_or("");
+                            client.settings(id).and_then(|settings| {
+                                let models = client.models(id)?.models;
+                                let _ = self
+                                    .messages
+                                    .send(WorkerMessage::Settings(settings, models));
+                                Ok(())
+                            })
+                        }
+                        CommandMessage::SetSettings(settings) => client
+                            .set_settings(selected.as_deref().unwrap_or(""), &settings)
+                            .and_then(|settings| {
+                                let _ =
+                                    self.messages.send(WorkerMessage::SettingsApplied(settings));
+                                self.status(&mut client)?;
+                                Ok(())
+                            }),
                         CommandMessage::Approve(id) | CommandMessage::Deny(id) => {
                             let was_idle = !busy;
                             let result = if approve {
@@ -208,6 +294,9 @@ impl ConnectionWorker {
                         let status = self.status(&mut client)?;
                         busy = status.state != "idle";
                         pending_approvals = !status.pending_approvals.is_empty();
+                        if !busy {
+                            self.refresh_session(&mut client, selected.as_deref(), false)?;
+                        }
                     }
                 }
                 Err(ClientError::Io(error))

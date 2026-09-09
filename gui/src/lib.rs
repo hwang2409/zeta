@@ -4,3 +4,5 @@ pub mod client;
 pub mod markdown;
 pub mod state;
 pub mod worker;
+
+pub mod session;
