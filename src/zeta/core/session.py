@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import errno
 import fcntl
 import json
 import logging
@@ -348,12 +347,13 @@ class SessionManager:
                     cwd=resolved_cwd,
                 )
                 staged._write(metadata)
-                try:
-                    (staged.sessions_dir / session_id).rename(session_dir)
-                except OSError as exc:
-                    if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+                # Serialize the final check and publication across creators.
+                # Rename alone can replace an existing empty session directory.
+                with (self.home / ".sessions.lock").open("a+") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    if session_dir.exists() or session_dir.is_symlink():
                         continue
-                    raise
+                    (staged.sessions_dir / session_id).rename(session_dir)
             return self.open(session_id)
         raise SessionError("could not allocate a unique session id")
 
@@ -385,6 +385,10 @@ class SessionManager:
                 continue
             try:
                 self._validate_id(session_path.name)
+                if not (session_path / "conversation.jsonl").is_file():
+                    raise SessionError(
+                        f"session {session_path.name} has no conversation.jsonl"
+                    )
                 sessions.append(self._read(session_path.name))
             except SessionError as exc:
                 logger.warning("Skipping session %s: %s", session_path.name, exc)
@@ -394,9 +398,10 @@ class SessionManager:
         """Return recent sessions with safe, single-line first-message previews."""
 
         sessions = self.list_sessions()
-        sessions = sessions[:limit]
         previews: list[SessionPreview] = []
         for metadata in sessions:
+            if len(previews) >= limit:
+                break
             try:
                 opened = self.open(metadata.session_id)
             except SessionError as exc:
@@ -711,7 +716,7 @@ class SessionManager:
             if path.parent.is_dir():
                 raise SessionError(f"session {session_id} has no meta.json") from exc
             raise SessionError(f"session {session_id} was not found") from exc
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RecursionError) as exc:
             raise SessionError(f"session metadata could not be read: {path}") from exc
         if not isinstance(value, Mapping):
             raise SessionError(f"session metadata is not an object: {path}")
