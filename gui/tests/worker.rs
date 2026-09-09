@@ -132,9 +132,15 @@ impl Harness {
     }
 
     fn next(&self) -> WorkerMessage {
-        self.messages
+        let message = self
+            .messages
             .recv_timeout(Duration::from_secs(5))
-            .expect("worker must make progress")
+            .expect("worker must make progress");
+        if matches!(message, WorkerMessage::Extensions(false)) {
+            self.next()
+        } else {
+            message
+        }
     }
 
     fn connected(&self) {
@@ -942,5 +948,130 @@ fn durable_receipts_update_launch_cards_with_duplicate_raw_tool_ids() {
     assert_eq!(state.transcript[2].tool_marker(), "[failed]");
     assert_eq!(state.transcript[3].tool_marker(), "[canceled]");
     assert!(state.transcript[3].unsuccessful());
+    harness.finish();
+}
+
+#[test]
+fn extensions_fetch_switch_fork_apply_settings_and_send_images() {
+    use zeta_gui::session::{ImageAttachment, SessionSettings};
+    let harness = Harness::new(|listener| {
+        let mut peer = Peer::accept(&listener);
+        let hello = peer.respond("hello", json!({"protocol_version":"1.1", "server":"zeta"}));
+        assert_eq!(
+            hello["params"],
+            json!({"protocol_version":"1.0", "client_version":"1.1"})
+        );
+        peer.respond("list_sessions", json!({"sessions":[session()]}));
+        peer.status(true, "idle", json!([]));
+        let tree =
+            json!({"branches":[{"id":"head","label":"first branch","depth":2,"current":true}]});
+        let history = json!({"messages":[{"id":"user-1","role":"user","content":[{"type":"text","text":"history"}]}],"next_offset":null});
+        assert_eq!(
+            peer.respond("session_tree", tree.clone())["params"]["session_id"],
+            "session-1"
+        );
+        peer.respond("session_history", history.clone());
+        assert_eq!(
+            peer.respond("switch_branch", tree.clone())["params"],
+            json!({"session_id":"session-1","head_id":"other-head"})
+        );
+        peer.respond("session_history", history.clone());
+        peer.status(true, "idle", json!([]));
+        assert_eq!(
+            peer.respond("fork_message", tree)["params"],
+            json!({"session_id":"session-1","message_id":"user-1"})
+        );
+        peer.respond("session_history", history);
+        peer.status(true, "idle", json!([]));
+        peer.respond(
+            "session_settings",
+            json!({"model":"offline","approval_mode":"ask"}),
+        );
+        peer.respond("model_catalog", json!({"models":["offline","faster"]}));
+        assert_eq!(
+            peer.respond(
+                "set_settings",
+                json!({"model":"faster","approval_mode":"deny"})
+            )["params"],
+            json!({"session_id":"session-1","model":"faster","approval_mode":"deny"})
+        );
+        peer.status(true, "idle", json!([]));
+        let send = peer.respond("send_images", json!({"accepted":true}));
+        assert_eq!(send["params"]["session_id"], "session-1");
+        assert_eq!(send["params"]["text"], "inspect");
+        assert_eq!(
+            send["params"]["images"][0],
+            json!({"name":"shot.png","mime_type":"image/png","data":"iVBORw0KGgo="})
+        );
+        peer.wait_for_close();
+    });
+    assert!(matches!(harness.next(), WorkerMessage::Extensions(true)));
+    assert!(matches!(harness.next(), WorkerMessage::Sessions(_)));
+    assert!(matches!(harness.next(), WorkerMessage::Status(_)));
+    assert!(matches!(harness.next(), WorkerMessage::Tree(tree) if tree.branches[0].depth == 2));
+    assert!(
+        matches!(harness.next(), WorkerMessage::History(history, true) if history[0].id == "user-1")
+    );
+    assert!(matches!(harness.next(), WorkerMessage::Connected));
+    for command in [
+        CommandMessage::SwitchBranch("other-head".into()),
+        CommandMessage::ForkMessage("user-1".into()),
+    ] {
+        harness.command(command);
+        assert!(matches!(harness.next(), WorkerMessage::Tree(_)));
+        assert!(matches!(harness.next(), WorkerMessage::History(_, true)));
+        assert!(matches!(harness.next(), WorkerMessage::Status(_)));
+    }
+    harness.command(CommandMessage::LoadSettings);
+    assert!(
+        matches!(harness.next(), WorkerMessage::Settings(settings, models) if settings.approval_mode == "ask" && models == ["offline", "faster"])
+    );
+    harness.command(CommandMessage::SetSettings(SessionSettings {
+        model: "faster".into(),
+        approval_mode: "deny".into(),
+    }));
+    assert!(
+        matches!(harness.next(), WorkerMessage::SettingsApplied(settings) if settings.model == "faster" && settings.approval_mode == "deny")
+    );
+    assert!(matches!(harness.next(), WorkerMessage::Status(_)));
+    harness.command(CommandMessage::SendImages(
+        "inspect".into(),
+        vec![ImageAttachment::from_bytes("shot.png".into(), b"\x89PNG\r\n\x1a\n").unwrap()],
+    ));
+    assert!(
+        matches!(harness.next(), WorkerMessage::ImagesSent(text, images) if text == "inspect" && images[0].size == 8)
+    );
+    harness.finish();
+}
+
+#[test]
+fn old_server_disables_extensions_without_sending_new_requests() {
+    let harness = Harness::new(|listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([]));
+        peer.send();
+        peer.wait_for_close();
+    });
+    assert!(matches!(
+        harness
+            .messages
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap(),
+        WorkerMessage::Extensions(false)
+    ));
+    harness.connected();
+    for command in [
+        CommandMessage::SwitchBranch("head".into()),
+        CommandMessage::ForkMessage("message".into()),
+        CommandMessage::LoadSettings,
+    ] {
+        harness.command(command);
+        assert!(
+            matches!(harness.next(), WorkerMessage::Rejected(error) if error.contains("unavailable"))
+        );
+    }
+    harness.command(CommandMessage::Send("old server still works".into()));
+    assert!(matches!(harness.next(), WorkerMessage::Sent(_)));
     harness.finish();
 }

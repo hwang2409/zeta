@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+base64 = "0.22"
 gpui = { git = "https://github.com/zed-industries/zed.git", rev = "20d3cd1d7981ed2076be5b72c817a1febbba3cb9", optional = true }
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "20d3cd1d7981ed2076be5b72c817a1febbba3cb9", features = ["font-kit", "wayland", "x11"], optional = true }
 serde = { version = "1", features = ["derive"] }

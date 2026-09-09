@@ -1012,3 +1012,121 @@ asyncio.run(main())
             process.kill()
             await process.wait()
     assert not socket_path.exists()
+
+
+async def _ready_extensions(server):
+    reader, writer = await _connect(server)
+    hello = (await _request(reader, writer, 1, "hello", {"protocol_version": "1.0", "client_version": "1.1"}))[-1]["result"]
+    assert hello["protocol_version"] == "1.1"
+    assert "send_images" in hello["capabilities"]["requests"]
+    session = (await _request(reader, writer, 2, "new_session", {"provider": "fake"}))[-1]["result"]["session"]
+    return reader, writer, session["session_id"]
+
+
+@pytest.mark.asyncio
+async def test_extensions_negotiate_and_old_clients_remain_unchanged(tmp_path):
+    from zeta.server.ergonomics import EXTENSION_REQUESTS
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer = await _connect(server)
+    try:
+        hello = (await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"}))[-1]["result"]
+        assert hello["protocol_version"] == "1.0"
+        assert not set(EXTENSION_REQUESTS) & set(hello["capabilities"]["requests"])
+        for method in EXTENSION_REQUESTS:
+            assert (await _request(reader, writer, method, method))[-1]["error"]["code"] == -32601
+        assert "result" in (await _request(reader, writer, 3, "new_session", {"provider": "fake"}))[-1]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_tree_fork_switch_and_history_persist(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    async def rpc(method, **params):
+        return (await _request(reader, writer, method, method, {"session_id": sid, **params}))[-1]
+    try:
+        assert (await rpc("session_tree"))["result"] == {"branches": []}
+        for text in ("first", "second"):
+            await _request(reader, writer, text, "send", {"text": text})
+            await _event(reader, "agent_end")
+        history = (await rpc("session_history"))["result"]
+        user = [row for row in history["messages"] if row["role"] == "user"]
+        assert [row["content"][0]["text"] for row in user] == ["first", "second"]
+        original = (await rpc("session_tree"))["result"]["branches"][0]["id"]
+        assert (await rpc("fork_message", message_id="missing"))["error"]["code"] == -32602
+        branches = (await rpc("fork_message", message_id=user[0]["id"]))["result"]["branches"]
+        assert len(branches) == 2
+        assert all(branch["depth"] == 1 for branch in branches)
+        assert sum(branch["current"] for branch in branches) == 1
+        forked = (await rpc("session_history"))["result"]["messages"]
+        assert len(forked) == 1 and forked[0]["id"] == user[0]["id"]
+        assert (await rpc("switch_branch", head_id="missing"))["error"]["code"] == -32602
+        branches = (await rpc("switch_branch", head_id=original))["result"]["branches"]
+        assert sum(branch["current"] for branch in branches) == 1
+        restored = (await rpc("session_history"))["result"]["messages"]
+        assert restored == history["messages"]
+        reopened = SessionManager(tmp_path).open(sid)
+        assert [m.to_dict() for m in reopened.store.messages()] == [m.to_dict() for m in server.runtime.loop.store.messages()]
+        assert (await rpc("session_history", offset=-1))["error"]["code"] == -32602
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_settings_apply_to_active_session_and_resume(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    async def rpc(method, **params):
+        return (await _request(reader, writer, method, method, {"session_id": sid, **params}))[-1]
+    try:
+        assert (await rpc("model_catalog"))["result"] == {"models": ["faster", "offline"]}
+        assert (await rpc("session_settings"))["result"] == {"model": "offline", "approval_mode": "ask"}
+        for model, mode in (("invalid", "ask"), ("offline", "invalid")):
+            assert (await rpc("set_settings", model=model, approval_mode=mode))["error"]["code"] == -32602
+        settings = {"model": "faster", "approval_mode": "deny"}
+        assert (await rpc("set_settings", **settings))["result"] == settings
+        assert server.runtime.loop.backend.model == "faster"
+        assert server.runtime.policy.default.value == "deny"
+        await _request(reader, writer, "new", "new_session", {"provider": "fake"})
+        assert (await rpc("set_settings", **settings))["error"]["code"] == -32003
+        assert server.runtime.policy.default.value == "ask"
+        await _request(reader, writer, "resume", "resume", {"session_id": sid})
+        assert (await rpc("session_settings"))["result"] == settings
+        assert not (tmp_path / "settings.json").exists()
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
+    import base64
+
+    from zeta.server.ergonomics import MAX_IMAGE_BYTES
+    from zeta.types import ImageContent
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("seen")])])
+    server = ZetaServer(home=tmp_path, port=0, backend_factory=lambda provider, model, home: (backend, model or "offline"))
+    reader, writer, sid = await _ready_extensions(server)
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    image = {"name": "test.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
+    async def send(images, session_id=sid):
+        return (await _request(reader, writer, "images", "send_images", {"session_id": session_id, "text": "inspect", "images": images}))[-1]
+    try:
+        assert (await send([image], "missing"))["error"]["code"] == -32003
+        for invalid in ({**image, "name": "../escape.png"}, {**image, "data": "!"}, {**image, "mime_type": "text/plain"}, {**image, "data": base64.b64encode(b'x').decode()}, {**image, "data": base64.b64encode(png + b'x' * MAX_IMAGE_BYTES).decode()}):
+            assert (await send([invalid]))["error"]["code"] == -32602
+        assert not (server.runtime.opened.store.session_dir / "attachments").exists()
+        assert (await send([image]))["result"]["accepted"]
+        await _event(reader, "agent_end")
+        message = server.runtime.loop.store.messages()[0]
+        attachment = next(block for block in message.content if isinstance(block, ImageContent))
+        assert attachment.size == len(png)
+        assert Path(attachment.path).read_bytes() == png
+        assert Path(attachment.path).is_relative_to(server.runtime.opened.store.session_dir)
+        assert attachment in backend.calls[0][0][-1].content
+        history = (await _request(reader, writer, "history", "session_history", {"session_id": sid}))[-1]["result"]["messages"]
+        assert history[0]["content"][1] == {"type": "attachment", "name": "test.png", "size": len(png)}
+        assert "data" not in history[0]["content"][1]
+        assert SessionManager(tmp_path).open(sid).store.messages()[0] == message
+    finally:
+        await _close(server, writer)

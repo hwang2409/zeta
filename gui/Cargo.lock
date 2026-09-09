@@ -7202,6 +7202,7 @@ dependencies = [
 name = "zeta-gui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "gpui",
  "gpui_platform",
  "pulldown-cmark",

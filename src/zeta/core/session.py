@@ -157,6 +157,7 @@ class SessionMetadata:
     budget_pinned: bool = False
     plan_mode: bool = False
     name: str = ""
+    approval_mode: str | None = None
 
     @classmethod
     def new(
@@ -239,6 +240,7 @@ class SessionMetadata:
             or type(vim_mode) is not bool
             or type(budget_pinned) is not bool
             or type(plan_mode) is not bool
+            or value.get("approval_mode") not in (None, "ask", "allow", "deny")
             or type(name) is not str
         ):
             raise SessionError(f"session metadata context is invalid: {path}")
@@ -259,6 +261,7 @@ class SessionMetadata:
             budget_pinned=budget_pinned,
             plan_mode=plan_mode,
             name=name,
+            approval_mode=value.get("approval_mode"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -279,6 +282,7 @@ class SessionMetadata:
             "budget_pinned": self.budget_pinned,
             "plan_mode": self.plan_mode,
             "name": self.name,
+            "approval_mode": self.approval_mode,
         }
 
 
@@ -490,6 +494,23 @@ class SessionManager:
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
+    def record_session_settings(self, metadata: SessionMetadata, *, model: str, approval_mode: str) -> None:
+        """Persist active-session settings together, without changing global config."""
+        if approval_mode not in {"ask", "allow", "deny"} or not model.strip():
+            raise SessionError("invalid session settings")
+        expected = (metadata.model, metadata.approval_mode)
+
+        def update(item: SessionMetadata) -> SessionMetadata:
+            if (item.model, item.approval_mode) != expected:
+                raise SessionError("session settings changed before commit")
+            if item.model != model:
+                item.override_audit.append({"at": _now(), "provider": None, "model": {"from": item.model, "to": model}})
+            item.model = model
+            item.approval_mode = approval_mode
+            return self._touch(item)
+
+        self._copy_metadata(metadata, self._mutate(metadata.session_id, update))
+
     def record_vim_mode(self, metadata: SessionMetadata, *, enabled: bool) -> None:
         """Persist the composer editing mode with optimistic concurrency."""
 
@@ -658,6 +679,7 @@ class SessionManager:
         target.budget_pinned = source.budget_pinned
         target.plan_mode = source.plan_mode
         target.name = source.name
+        target.approval_mode = source.approval_mode
 
     def _read(self, session_id: str) -> SessionMetadata:
         path = self.sessions_dir / session_id / "meta.json"

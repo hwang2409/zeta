@@ -7,3 +7,8 @@ GUI_FEATURES := $(if $(METAL),,--features runtime-shaders)
 .PHONY: gui
 gui:
 	cargo run --manifest-path gui/Cargo.toml $(GUI_FEATURES)
+
+.PHONY: gui-app
+gui-app:
+	cargo build --manifest-path gui/Cargo.toml --features 'gui runtime-shaders'
+	python3 gui/package_app.py

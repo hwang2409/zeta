@@ -92,7 +92,7 @@ def compose_runtime(
     completion_callback = on_completion_success or (lambda: manager.touch(metadata))
     policy = ApprovalPolicy(
         store=opened.store,
-        default=ApprovalDecision.ALLOW if config.yolo else ApprovalDecision.ASK,
+        default=metadata.approval_mode or (ApprovalDecision.ALLOW if config.yolo else ApprovalDecision.ASK),
         always_allow=config.approval_allow,
         always_deny=config.approval_deny,
         always_ask=config.approval_ask,

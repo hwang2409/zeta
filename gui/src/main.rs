@@ -1,4 +1,5 @@
 mod composer;
+mod session_view;
 mod transcript;
 use composer::Composer;
 use gpui::{
@@ -71,9 +72,17 @@ impl ZetaView {
                 continue;
             }
             if this
-                .update_in(cx, |view, _window, cx| {
+                .update_in(cx, |view, window, cx| {
                     for update in updates {
+                        let open_settings = matches!(&update, WorkerMessage::Settings(..));
+                        let close_settings = matches!(&update, WorkerMessage::SettingsApplied(_));
                         view.apply_worker_message(update, cx);
+                        if open_settings {
+                            window.focus(&view.focus_handle, cx);
+                        }
+                        if close_settings {
+                            window.focus(&view.composer.focus_handle(cx), cx);
+                        }
                     }
                     cx.notify();
                 })
@@ -111,6 +120,56 @@ impl ZetaView {
     fn apply_worker_message(&mut self, message: WorkerMessage, cx: &mut Context<Self>) {
         let previous_session = self.state.active_session.clone();
         match message {
+            WorkerMessage::Extensions(available) => self.state.session_view.available = available,
+            WorkerMessage::Tree(tree) => self.state.session_view.branches = tree.branches,
+            WorkerMessage::History(history, replace) => {
+                let previous_ids = self.state.session_view.message_ids.clone();
+                self.state.apply_history(history, replace);
+                if !replace {
+                    for (index, id) in &self.state.session_view.message_ids {
+                        if previous_ids.get(index) != Some(id) {
+                            self.remeasure_row(*index);
+                        }
+                    }
+                }
+                if replace {
+                    self.transcript_scroll = transcript_list();
+                }
+                self.pending_command = false;
+            }
+            WorkerMessage::Settings(settings, models) => {
+                let view = &mut self.state.session_view;
+                view.selected_model = models
+                    .iter()
+                    .position(|model| model == &settings.model)
+                    .unwrap_or(0);
+                view.selected_mode = session_view::MODES
+                    .iter()
+                    .position(|mode| *mode == settings.approval_mode)
+                    .unwrap_or(0);
+                view.models = models;
+                view.settings_open = true;
+                self.pending_command = false;
+            }
+            WorkerMessage::SettingsApplied(settings) => {
+                self.state.session_view.settings_open = false;
+                self.pending_command = false;
+                self.state.session_view.notice = Some(format!(
+                    "session settings applied: {} · {}",
+                    settings.model, settings.approval_mode
+                ));
+            }
+            WorkerMessage::ImagesSent(text, images) => {
+                let index = self.state.transcript.len();
+                self.apply_worker_message(WorkerMessage::Sent(text), cx);
+                self.state.session_view.attachments.insert(
+                    index,
+                    images
+                        .into_iter()
+                        .map(|image| (image.name, image.size))
+                        .collect(),
+                );
+            }
             WorkerMessage::Sessions(list) => {
                 self.state.sessions = list.sessions;
                 self.state.sessions_truncated = list.truncated;
@@ -168,10 +227,12 @@ impl ZetaView {
             && !self.state.streaming
             && self.state.approvals.is_empty()
             && !self.pending_command
+            && !self.state.session_view.settings_open
     }
 
     fn queue(&mut self, command: CommandMessage) {
         self.command_error = None;
+        self.state.session_view.notice = None;
         if self.commands.send(command).is_err() {
             self.pending_command = false;
             self.state.mark_connection_lost("connection worker stopped");
@@ -195,6 +256,10 @@ impl ZetaView {
     }
 
     fn control_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.session_view.settings_open {
+            self.settings_key(event, window, cx);
+            return;
+        }
         if !self.state.approvals.is_empty() {
             let command = match event.keystroke.key.as_str() {
                 "enter" => Some(CommandMessage::Approve(
@@ -230,11 +295,16 @@ impl ZetaView {
             return;
         }
         let text = self.composer.read(cx).content.to_string();
-        if text.trim().is_empty() {
+        let images = self.composer.read(cx).images.clone();
+        if text.trim().is_empty() && images.is_empty() {
             return;
         }
         self.pending_command = true;
-        self.queue(CommandMessage::Send(text));
+        self.queue(if images.is_empty() {
+            CommandMessage::Send(text)
+        } else {
+            CommandMessage::SendImages(text, images)
+        });
         cx.notify();
     }
 
@@ -324,7 +394,8 @@ impl ZetaView {
                     })),
             );
         }
-        sidebar
+        sidebar = sidebar.child(self.render_session_tools(cx));
+        sidebar.id("session-sidebar").overflow_y_scroll()
     }
 
     fn render_transcript(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -478,7 +549,47 @@ impl ZetaView {
                     })
             }
         };
-        div().w_full().min_h(px(24.)).pb_4().child(row)
+        div()
+            .w_full()
+            .min_h(px(24.))
+            .pb_4()
+            .child(row)
+            .children(
+                self.state
+                    .session_view
+                    .attachments
+                    .get(&index)
+                    .into_iter()
+                    .flatten()
+                    .map(|(name, size)| {
+                        div()
+                            .mt_2()
+                            .px_2()
+                            .py_1()
+                            .text_size(px(12.))
+                            .bg(gpui::rgb(p.code_chip))
+                            .child(format!("{name} · {size} bytes"))
+                    }),
+            )
+            .when(self.state.session_view.available, |row| {
+                row.when_some(
+                    self.state.session_view.message_ids.get(&index).cloned(),
+                    |row, id| {
+                        row.child(self.session_button(
+                            format!("fork-{index}"),
+                            "fork here".into(),
+                            cx,
+                            move |view, _, cx| {
+                                if view.can_change_session() {
+                                    view.pending_command = true;
+                                    view.queue(CommandMessage::ForkMessage(id.clone()));
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                    },
+                )
+            })
     }
 
     fn render_composer(&self) -> impl IntoElement {
@@ -503,6 +614,9 @@ impl ZetaView {
                     .text_color(gpui::rgb(p.muted))
                     .child(hint),
             )
+            .when_some(self.state.session_view.notice.clone(), |view, notice| {
+                view.child(div().text_color(gpui::rgb(p.accent)).child(notice))
+            })
             .when_some(self.command_error.clone(), |view, error| {
                 view.child(div().text_color(gpui::rgb(p.error)).child(error))
             })
@@ -618,9 +732,14 @@ impl ZetaView {
 impl Render for ZetaView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.appearance.palette();
-        let enabled = !self.pending_command && self.state.approvals.is_empty();
-        self.composer
-            .update(cx, |composer, _| composer.enabled = enabled);
+        let enabled = !self.pending_command
+            && self.state.approvals.is_empty()
+            && !self.state.session_view.settings_open;
+        self.composer.update(cx, |composer, _| {
+            composer.enabled = enabled;
+            composer.images_enabled =
+                self.state.session_view.available && self.state.active_session.is_some();
+        });
         let mut root = div()
             .size_full()
             .flex()
@@ -690,6 +809,9 @@ impl Render for ZetaView {
                     ),
             ),
         };
+        if self.state.session_view.settings_open {
+            root = root.child(self.render_settings(cx));
+        }
         if let Some(approval) = self.state.approvals.first().cloned() {
             root = root.child(self.render_approval(&approval, cx));
         }
@@ -1170,5 +1292,174 @@ mod tests {
             .unwrap();
         cx.simulate_keystrokes(window.into(), "escape");
         assert!(matches!(receiver.try_recv(), Ok(CommandMessage::Abort)));
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use zeta_gui::session::{Branch, SessionSettings};
+
+    #[gpui::test]
+    fn history_fork_actions_remeasure_existing_transcript_rows(cx: &mut gpui::TestAppContext) {
+        let window = cx.open_window(gpui::size(px(1100.), px(760.)), |window, cx| {
+            let mut view = ZetaView::new(window, cx, Some("/tmp/zeta-95-no-server.sock".into()));
+            view.state.transcript = vec![
+                TranscriptEntry::User("first".into()),
+                TranscriptEntry::User("second".into()),
+            ];
+            view.state.session_view.available = true;
+            view
+        });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let before = window
+            .update(cx, |view, _, _| {
+                view.transcript_scroll
+                    .bounds_for_item(0)
+                    .unwrap()
+                    .size
+                    .height
+            })
+            .unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                let history = serde_json::from_value(serde_json::json!([
+                    {"id":"first", "role":"user", "content":[{"type":"text", "text":"first"}]},
+                    {"id":"second", "role":"user", "content":[{"type":"text", "text":"second"}]}
+                ]))
+                .unwrap();
+                view.apply_worker_message(WorkerMessage::History(history, false), cx);
+                cx.notify();
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        window
+            .update(cx, |view, _, _| {
+                assert!(
+                    view.transcript_scroll
+                        .bounds_for_item(0)
+                        .unwrap()
+                        .size
+                        .height
+                        >= before + px(40.)
+                )
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn settings_keys_apply_to_session_and_escape_returns_to_composer(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(composer::bind_keys);
+        let (commands, receiver) = mpsc::channel();
+        let window = cx.add_window(move |window, cx| {
+            let mut view = ZetaView::new(window, cx, Some("/tmp/zeta-95-no-server.sock".into()));
+            view.commands = commands;
+            view.state.connection = ConnectionState::Connected;
+            view.state.active_session = Some("session".into());
+            view.state.session_view.available = true;
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: "offline".into(),
+                        approval_mode: "ask".into(),
+                    },
+                    vec!["offline".into(), "faster".into()],
+                ),
+                cx,
+            );
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        cx.simulate_keystrokes(window.into(), "down tab down enter");
+        assert!(
+            matches!(receiver.try_recv(), Ok(CommandMessage::SetSettings(settings)) if settings.model == "faster" && settings.approval_mode == "allow")
+        );
+        cx.simulate_keystrokes(window.into(), "escape");
+        window
+            .update(cx, |view, window, cx| {
+                assert!(!view.state.session_view.settings_open);
+                assert!(view.composer.focus_handle(cx).is_focused(window));
+            })
+            .unwrap();
+        assert!(receiver.try_recv().is_err(), "escape must not abort a turn");
+    }
+
+    #[gpui::test]
+    fn branch_rows_stay_single_line_and_old_servers_hide_controls(cx: &mut gpui::TestAppContext) {
+        let window = cx.open_window(gpui::size(px(1100.), px(760.)), |window, cx| {
+            let mut view = ZetaView::new(window, cx, Some("/tmp/zeta-95-no-server.sock".into()));
+            view.state.connection = ConnectionState::Connected;
+            view.state.active_session = Some("session".into());
+            view.state.session_view.available = true;
+            view.state.session_view.branches = (0..24)
+                .map(|index| Branch {
+                    id: index.to_string(),
+                    label: "a very long branch label ".repeat(20),
+                    depth: index,
+                    current: index == 23,
+                })
+                .collect();
+            view
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        for mode in [Appearance::Light, Appearance::Dark] {
+            window
+                .update(cx, |view, _, cx| {
+                    view.appearance = mode;
+                    cx.notify();
+                })
+                .unwrap();
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let bounds = visual.debug_bounds("branch-row").expect("tree row");
+            assert_eq!(bounds.size.height, px(40.));
+            assert!(bounds.size.width <= px(260.));
+        }
+        window
+            .update(cx, |view, _, cx| {
+                view.state.session_view.available = false;
+                cx.notify();
+            })
+            .unwrap();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("branch-row").is_none());
+    }
+
+    #[gpui::test]
+    fn pasted_images_are_chips_and_send_through_the_worker(cx: &mut gpui::TestAppContext) {
+        cx.update(composer::bind_keys);
+        let (commands, receiver) = mpsc::channel();
+        let window = cx.add_window(move |window, cx| {
+            let mut view = ZetaView::new(window, cx, Some("/tmp/zeta-95-no-server.sock".into()));
+            view.commands = commands;
+            view.state.connection = ConnectionState::Connected;
+            view.state.active_session = Some("session".into());
+            view.state.session_view.available = true;
+            view
+        });
+        cx.update(|cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                b"\x89PNG\r\n\x1a\n".to_vec(),
+            )))
+        });
+        cx.simulate_keystrokes(window.into(), "cmd-v enter");
+        assert!(
+            matches!(receiver.try_recv(), Ok(CommandMessage::SendImages(text, images)) if text.is_empty() && images[0].size == 8)
+        );
+        window
+            .update(cx, |view, _, cx| {
+                let images = view.composer.read(cx).images.clone();
+                view.apply_worker_message(WorkerMessage::ImagesSent("".into(), images), cx);
+                assert!(view.composer.read(cx).images.is_empty());
+                assert_eq!(
+                    view.state.session_view.attachments[&0],
+                    vec![("pasted-image.png".into(), 8)]
+                );
+            })
+            .unwrap();
     }
 }
