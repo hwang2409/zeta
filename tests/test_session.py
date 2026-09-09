@@ -1966,6 +1966,8 @@ def test_model_fallback_persists_and_clears_with_settings(tmp_path):
     manager.record_session_settings(metadata, model="gpt-5.4-mini", provider="codex",
                                     approval_mode="ask", budget=200_000, model_fallback=fallback)
     assert manager.open(metadata.session_id).metadata.model_fallback == fallback
+    assert "model_fallback" not in metadata.to_dict()
+    assert metadata.to_storage_dict()["model_fallback"] == list(fallback)
     stale = manager.open(metadata.session_id).metadata
     manager.record_session_settings(metadata, model=metadata.model, provider=metadata.provider,
                                     approval_mode="ask", budget=metadata.compaction_budget)

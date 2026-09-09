@@ -198,6 +198,7 @@ class CompactionPolicy:
                     )
                     failure = SummaryCompletionError(info.message)
                     failure.code = info.code
+                    failure.status_code = info.status_code
                     raise failure
                 if event.type is StreamEventType.MESSAGE_UPDATE:
                     if event.content is not None:

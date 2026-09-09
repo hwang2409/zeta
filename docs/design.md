@@ -182,14 +182,19 @@ The Claude and Codex adapters have a static model catalog, not an account-specif
 entitlement API. A catalog entry does not prove that the stored credentials can
 use the model. Apply therefore does not issue a completion, including a token-limited
 probe. It saves the previous provider, model, and context budget in session metadata.
-Repeated changes preserve that original fallback until a provider response completes.
+Repeated changes preserve that original fallback until a provider response completes
+or the user returns to that same provider/model, which clears it.
 The fallback survives reconnects, session changes, and server restarts.
 
 On a foreground authentication or model-access error before that first response,
 the server restores the fallback backend, model, context budget, and persisted
 session settings. The error block says which model was restored and retains the
 provider error. Approval mode remains the user's selected value. Transport,
-rate-limit, context-length, and background-agent errors do not revert the model.
+rate-limit, MCP setup, and background-agent errors do not revert the model.
+Classification uses the completion error's code and HTTP status, never message text.
+HTTP 400/401/403/404 and structured authentication/access codes qualify. A 400
+from a newly selected model can also mean invalid input; recovery conservatively
+restores the previous model without trying to interpret provider prose.
 A successful response clears the fallback. This does not retry or resend a message.
 If restoring the fallback fails (for example, its credentials were removed), the
 error explains the failure and directs the user to Settings.
@@ -197,4 +202,7 @@ error explains the failure and directs the user to Settings.
 No new RPC or protocol version is required: `set_settings` remains gated on the
 existing 1.1 session extension. A 1.0 server gets no settings request; its error
 blocks omit the unavailable Settings action. Fake servers keep their sealed
-catalog and do not create entitlement fallbacks.
+catalog and do not create entitlement fallbacks. Fallback metadata stays internal
+and does not appear in session responses at either protocol version. Only 1.1
+clients receive `model_access_error` or `model_reverted` recovery codes; 1.0
+clients retain the original error code and message.

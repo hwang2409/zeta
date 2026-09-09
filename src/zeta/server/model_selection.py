@@ -8,6 +8,7 @@ This uses the existing protocol 1.1 settings RPC and ordinary error events.
 from ..core.approval import ApprovalDecision
 from ..core.slash import resolve_session_budget
 from ..model_catalog import provider_for_model
+from ..types import ErrorInfo
 from .runtime import ServerRuntime
 
 
@@ -44,6 +45,8 @@ def apply(
         and fallback is None
     ):
         fallback = (runtime.provider, previous, previous_budget)
+    if fallback is not None and (provider, model) == fallback[:2]:
+        fallback = None
     try:
         loop.backend = backend
         loop.set_model(model)
@@ -78,30 +81,20 @@ def confirm(runtime: ServerRuntime) -> None:
         )
 
 
-def entitlement_error(error: dict) -> bool:
-    if error["code"] in {"auth_error", "model_not_found", "permission_denied"}:
-        return True
-    message = error["message"].lower()
-    return "model" in message and any(
-        term in message
-        for term in (
-            "not supported",
-            "unsupported",
-            "not available",
-            "unavailable",
-            "not found",
-            "does not exist",
-            "access",
-            "permission",
-            "entitlement",
-            "404",
-        )
+def entitlement_error(error: ErrorInfo) -> bool:
+    return error.provider_error and (
+        error.status_code in {400, 401, 403, 404}
+        or error.code in {"auth_error", "model_not_found", "permission_denied"}
     )
 
 
-def recover(runtime: ServerRuntime, error: dict) -> dict:
+def recover(runtime: ServerRuntime, info: ErrorInfo) -> dict:
+    error = {"code": info.code, "message": info.message}
+    if not entitlement_error(info):
+        return error
+    error["code"] = "model_access_error"
     fallback = runtime.metadata.model_fallback
-    if fallback is None or not entitlement_error(error):
+    if fallback is None:
         return error
     provider, model, _ = fallback
     try:

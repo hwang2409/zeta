@@ -371,19 +371,8 @@ impl AppState {
                 self.streaming = false;
                 self.metrics_boundary = true;
                 self.approvals.clear();
-                let message_lower = error.message.to_ascii_lowercase();
-                let settings_action = error.code == "auth_error"
-                    || error.code == "model_reverted"
-                    || [
-                        "model",
-                        "credential",
-                        "login",
-                        "api key",
-                        "unauthorized",
-                        "authentication",
-                    ]
-                    .iter()
-                    .any(|word| message_lower.contains(word));
+                let settings_action =
+                    matches!(error.code.as_str(), "model_access_error" | "model_reverted");
                 self.transcript.push(TranscriptEntry::Error {
                     message: error.message,
                     settings_action,
@@ -963,6 +952,30 @@ mod tests {
         });
         assert!(!state.streaming);
         assert!(matches!(state.transcript[0], TranscriptEntry::Error { .. }));
+    }
+
+    #[test]
+    fn settings_recovery_uses_codes_not_error_text() {
+        for (code, message, expected) in [
+            ("model_access_error", "Access denied", true),
+            ("model_reverted", "Restored previous selection", true),
+            ("auth_error", "MCP OAuth credentials expired", false),
+            ("backend_error", "MCP OAuth credentials expired", false),
+            ("http_error", "Model not found", false),
+        ] {
+            let mut state = AppState::default();
+            state.apply(ServerEvent::Error {
+                session_id: None,
+                error: EventError {
+                    code: code.into(),
+                    message: message.into(),
+                },
+                data: json!({}),
+            });
+            assert!(matches!(&state.transcript[0], TranscriptEntry::Error {
+                message: text, settings_action,
+            } if text == message && *settings_action == expected));
+        }
     }
 
     #[test]

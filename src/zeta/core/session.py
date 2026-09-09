@@ -299,6 +299,11 @@ class SessionMetadata:
             "plan_mode": self.plan_mode,
             "name": self.name,
             "approval_mode": self.approval_mode,
+        }
+
+    def to_storage_dict(self) -> dict[str, Any]:
+        return {
+            **self.to_dict(),
             "model_fallback": list(self.model_fallback) if self.model_fallback else None,
         }
 
@@ -765,7 +770,7 @@ class SessionManager:
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
             with temporary.open("w") as handle:
-                json.dump(metadata.to_dict(), handle, separators=(",", ":"), sort_keys=True)
+                json.dump(metadata.to_storage_dict(), handle, separators=(",", ":"), sort_keys=True)
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())

@@ -696,7 +696,7 @@ fn error_block_keeps_full_text_wraps_and_opens_settings(cx: &mut TestAppContext)
                     WorkerMessage::Event(ServerEvent::Error {
                         session_id: view.state.active_session.clone(),
                         error: zeta_gui::client::EventError {
-                            code: "http_error".into(),
+                            code: "model_access_error".into(),
                             message: message.clone(),
                         },
                         data: json!({}),
@@ -747,26 +747,32 @@ fn error_block_keeps_full_text_wraps_and_opens_settings(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
-fn legacy_error_block_has_no_unavailable_settings_action(cx: &mut TestAppContext) {
-    let (window, view, _) = setup(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx);
-    visual.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.apply_worker_message(
-                WorkerMessage::Event(ServerEvent::Error {
-                    session_id: view.state.active_session.clone(),
-                    error: zeta_gui::client::EventError {
-                        code: "auth_error".into(),
-                        message: "Login required".into(),
-                    },
-                    data: json!({}),
-                }),
-                window,
-                cx,
-            );
+fn errors_without_settings_recovery_have_no_action(cx: &mut TestAppContext) {
+    for (available, code, message) in [
+        (false, "model_access_error", "Login required"),
+        (true, "auth_error", "MCP OAuth credentials expired"),
+    ] {
+        let (window, view, _) = setup(cx);
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.state.session_view.available = available;
+                view.apply_worker_message(
+                    WorkerMessage::Event(ServerEvent::Error {
+                        session_id: view.state.active_session.clone(),
+                        error: zeta_gui::client::EventError {
+                            code: code.into(),
+                            message: message.into(),
+                        },
+                        data: json!({}),
+                    }),
+                    window,
+                    cx,
+                );
+            });
+            window.draw(cx).clear(cx);
         });
-        window.draw(cx).clear(cx);
-    });
-    assert!(visual.debug_bounds("error-block-0").is_some());
-    assert!(visual.debug_bounds("error-settings-0").is_none());
+        assert!(visual.debug_bounds("error-block-0").is_some());
+        assert!(visual.debug_bounds("error-settings-0").is_none());
+    }
 }

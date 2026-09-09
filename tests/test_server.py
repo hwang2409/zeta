@@ -1735,8 +1735,13 @@ async def test_session_list_includes_single_line_first_message_preview(tmp_path)
 ])
 @pytest.mark.parametrize("restart", [False, True])
 @pytest.mark.parametrize("raise_error", [False, True])
+@pytest.mark.parametrize("status_code,detail", [
+    (400, "Unsupported subscription"),
+    (404, "Resource does not exist"),
+    (403, "Access denied for this account"),
+])
 async def test_unusable_model_reverts_durably_and_next_send_works(
-    tmp_path, start_provider, start_model, restart, raise_error,
+    tmp_path, start_provider, start_model, restart, raise_error, status_code, detail,
 ):
     from zeta.types import ErrorInfo, StreamEvent, StreamEventType
 
@@ -1748,9 +1753,9 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
             if self.model == "gpt-5.4-mini":
                 if raise_error:
                     from zeta.providers.codex_errors import CodexHTTPError
-                    raise CodexHTTPError("Model is not supported with a ChatGPT account", status_code=400)
+                    raise CodexHTTPError(detail, status_code=status_code)
                 yield StreamEvent(StreamEventType.ERROR, error=ErrorInfo(
-                    "http_error", 'Codex HTTP request failed (400): {"detail":"Model is not supported with a ChatGPT account"}',
+                    "http_error", detail, status_code=status_code,
                 ))
             else:
                 async for event in super().complete(messages, tool_schemas):
@@ -1779,7 +1784,8 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
             }))[-1]
             assert "result" in applied
             assert completions == [], "Apply must never run a completion"
-            assert runtime.metadata.model_fallback == (start_provider, start_model, old_budget)
+            expected = None if model == start_model else (start_provider, start_model, old_budget)
+            assert runtime.metadata.model_fallback == expected
         if restart:
             await _close(server, writer)
             server = make_server()
@@ -1791,7 +1797,7 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
         failure = await _event(reader, "error")
         assert failure["error"]["code"] == "model_reverted"
         assert f"Model reverted to {start_model} ({start_provider})" in failure["error"]["message"]
-        assert "ChatGPT account" in failure["error"]["message"]
+        assert detail in failure["error"]["message"]
         await _event(reader, "agent_end")
         metadata = SessionManager(tmp_path).open(sid).metadata
         assert (metadata.provider, metadata.model) == (start_provider, start_model)
@@ -1810,18 +1816,26 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
         await _close(server, writer)
 
 
-@pytest.mark.parametrize("code,message,expected", [
-    ("auth_error", "Invalid token", True),
-    ("http_error", "model: gpt-5.4-mini not found", True),
-    ("http_error", "Anthropic HTTP 404: model: claude-old", True),
-    ("http_error", "You do not have access to this model", True),
-    ("http_error", "Model context length exceeded", False),
-    ("http_error", "Rate limit exceeded", False),
-    ("transport_error", "Connection reset", False),
+@pytest.mark.parametrize("code,status_code,provider_error,expected", [
+    ("auth_error", None, True, True),
+    ("http_error", 400, True, True),
+    ("http_error", 403, True, True),
+    ("http_error", 404, True, True),
+    ("permission_denied", None, True, True),
+    ("model_not_found", None, True, True),
+    ("http_error", 429, True, False),
+    ("http_error", 500, True, False),
+    ("transport_error", None, True, False),
+    ("auth_error", 403, False, False),
+    ("http_error", None, True, False),
 ])
-def test_model_entitlement_error_classification(code, message, expected):
+def test_model_entitlement_error_classification(code, status_code, provider_error, expected):
     from zeta.server.model_selection import entitlement_error
-    assert entitlement_error({"code": code, "message": message}) is expected
+    from zeta.types import ErrorInfo
+
+    # Wording must never determine classification, even when it suggests recovery.
+    error = ErrorInfo(code, "Model unavailable: credentials required", status_code, provider_error)
+    assert entitlement_error(error) is expected
 
 
 @pytest.mark.asyncio
@@ -1846,7 +1860,7 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
         pending = runtime.metadata.model_fallback
         assert pending
         client = server._client
-        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "child login")),
+        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "child login", provider_error=True)),
                             session_id=sid, background=True)
         await _event(reader, "error")
         assert runtime.metadata.model_fallback == pending
@@ -1858,9 +1872,116 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
         await _event(reader, "agent_end")
         assert runtime.metadata.model_fallback is None
         assert SessionManager(tmp_path).open(sid).metadata.model_fallback is None
-        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "expired later")),
+        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "expired later", provider_error=True)),
                             session_id=sid)
         await _event(reader, "error")
         assert runtime.model == "gpt-5.4"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["1.0", "1.1"])
+async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, version):
+    from zeta.server import model_selection
+    from zeta.types import ErrorInfo, StreamEvent, StreamEventType
+
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="claude", model="claude-sonnet-4-6",
+        backend_factory=lambda provider, model, home: (FakeBackend([]), model),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": version})
+        created = (await _request(reader, writer, 2, "new_session"))[-1]["result"]
+        assert "model_fallback" not in created["session"]
+        runtime = server.runtime
+        sid = runtime.session_id
+        model_selection.apply(runtime, "gpt-5.4", "ask")
+        assert runtime.metadata.model_fallback is not None
+        resumed = (await _request(reader, writer, 3, "resume", {"session_id": sid}))[-1]["result"]
+        status = (await _request(reader, writer, 4, "status"))[-1]["result"]
+        listed = (await _request(reader, writer, 5, "list_sessions"))[-1]["result"]
+        for session in [resumed["session"], status["session"], *listed["sessions"]]:
+            assert "model_fallback" not in session
+        assert runtime.metadata.model_fallback is not None
+        info = ErrorInfo("http_error", "Resource absent", status_code=404, provider_error=True)
+        # Event persistence must retain structured information as well.
+        event = StreamEvent.from_dict(StreamEvent(StreamEventType.ERROR, error=info).to_dict())
+        assert event.error == info
+        await server._client._event(event, session_id=sid)
+        failure = (await _event(reader, "error"))["error"]
+        assert set(failure) == {"code", "message"}
+        if version == "1.0":
+            assert failure == {"code": "http_error", "message": "Resource absent"}
+        else:
+            assert failure["code"] == "model_reverted"
+        assert runtime.model == "claude-sonnet-4-6"
+        assert runtime.metadata.model_fallback is None
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_return_to_fallback_does_not_restore_itself(tmp_path):
+    from zeta.providers.codex_errors import CodexHTTPError
+
+    class DeniedBackend(FakeBackend):
+        async def complete(self, messages, tool_schemas):
+            raise CodexHTTPError("Access denied", status_code=403)
+            yield  # pragma: no cover - keep the provider's async iterator contract
+
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex", model="gpt-5.4",
+        backend_factory=lambda provider, model, home: (DeniedBackend([]), model),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        sid = server.runtime.session_id
+        for model in ["gpt-5.4-mini", "gpt-5.4"]:
+            await _request(reader, writer, 3, "set_settings", {
+                "session_id": sid, "model": model, "approval_mode": "ask",
+            })
+        assert server.runtime.metadata.model_fallback is None
+        assert SessionManager(tmp_path).open(sid).metadata.model_fallback is None
+        await _request(reader, writer, 4, "send", {"text": "try returned selection"})
+        failure = (await _event(reader, "error"))["error"]
+        assert failure == {"code": "model_access_error", "message": "Access denied"}
+        await _event(reader, "agent_end")
+        assert server.runtime.model == "gpt-5.4"
+        assert server.runtime.metadata.model_fallback is None
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_mcp_auth_failure_does_not_revert_model(tmp_path, monkeypatch):
+    from zeta.providers.codex_errors import CodexAuthError
+    from zeta.server import model_selection
+
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="claude", model="claude-sonnet-4-6",
+        backend_factory=lambda provider, model, home: (FakeBackend([]), model),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        runtime = server.runtime
+        model_selection.apply(runtime, "gpt-5.4", "ask")
+        fallback = runtime.metadata.model_fallback
+
+        async def fail_mcp_setup():
+            raise CodexAuthError("MCP OAuth credentials expired", status_code=403)
+
+        monkeypatch.setattr(runtime.loop, "_ensure_mcp_servers", fail_mcp_setup)
+        await _request(reader, writer, 3, "send", {"text": "start MCP"})
+        failure = (await _event(reader, "error"))["error"]
+        assert failure == {"code": "auth_error", "message": "MCP OAuth credentials expired"}
+        await _event(reader, "agent_end")
+        assert runtime.model == "gpt-5.4"
+        assert runtime.metadata.model_fallback == fallback
     finally:
         await _close(server, writer)

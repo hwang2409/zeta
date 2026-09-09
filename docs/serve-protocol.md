@@ -404,6 +404,14 @@ receives `-32601` for every extension. Existing notification shapes are unchange
 there are no new event types. Mutation requests reject running turns, outstanding
 tools, approvals, and background agents with `-32004`.
 
+Session fallback metadata is storage-only and never appears in wire responses.
+For foreground provider failures, 1.1 error events use `model_access_error` when
+HTTP 400/401/403/404 or an authentication/access code identifies a rejected
+completion. They use `model_reverted` after restoring a pending model fallback.
+The GUI offers Open Settings for these two codes only. MCP setup and background
+errors retain their original codes. Protocol 1.0 always retains the original
+error code and message. Provider status and origin remain internal.
+
 - `session_tree`: returns `branches`, each with `id` (head entry ID), `label`,
   `depth` (number of divergences), and `current`. The heads come from the core
   `list_branches` seam.

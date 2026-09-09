@@ -501,9 +501,7 @@ class _Client:
             await self._notify(
                 "error",
                 session_id,
-                error=model_selection.recover(
-                    self.server.runtime, {"code": "server_error", "message": str(exc)}
-                ),
+                error={"code": "server_error", "message": str(exc)},
                 data={},
             )
         finally:
@@ -641,11 +639,14 @@ class _Client:
             await self._notify("sub_agent_receipt", session_id, data=dict(event.data))
             return
         if kind is StreamEventType.ERROR:
-            error = event.error.to_dict() if event.error else {
-                "code": "unknown", "message": "unknown error"
-            }
-            if foreground:
-                error = model_selection.recover(self.server.runtime, error)
+            error = (
+                {"code": event.error.code, "message": event.error.message}
+                if event.error else {"code": "unknown", "message": "unknown error"}
+            )
+            if foreground and event.error is not None:
+                recovered = model_selection.recover(self.server.runtime, event.error)
+                if self.protocol_version == "1.1":
+                    error = recovered
             await self._notify(
                 "error", session_id, error=error, data=dict(event.data),
             )
