@@ -159,6 +159,7 @@ the harness-native distillation.
 | ZETA-95 | gpui GUI milestone 3 (arc: gpui GUI): session ergonomics — fork/tree view driving the ZETA-80 seams over the protocol (new serve requests where needed, version-gated), settings surface (model swap, approval mode), image attachments as a protocol extension, and packaging so the GUI launches as a normal Mac app. | ZETA-93, ZETA-80 |
 
 | ZETA-97 | Real models in the GUI (arc: GUI polish): GUI-spawned servers explicitly use Claude and the default Claude model; real sessions list the complete Claude and Codex catalog in provider groups with the current model marked. Idle settings changes rebuild the backend across providers, retain the session and pinned budget, retune unpinned budgets, and report missing logins as RPC errors. Effective fake servers, including plain `zeta serve` without settings, retain their sealed test catalog. | ZETA-95, ZETA-96 |
+| ZETA-98 | Rewrite the core GUI on GPUI Kit (arc: gpui-kit rewrite, M1): Kit semantic themes and embedded JetBrains Mono; virtual session previews and transcript; rich markdown with syntax highlighting; Kit composer, approval dialog, reconnect, abort, and status metrics. Preserve the protocol client and connection actor, including RPC degradation and real/fake isolation. Add optional first-message previews to session listings. M2 = ZETA-99: tree/fork, settings, attachments, packaging. | ZETA-95, ZETA-97 |
 
 ## Deferred / open followups (not yet ticketed)
 

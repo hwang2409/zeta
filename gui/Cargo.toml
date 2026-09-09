@@ -6,14 +6,11 @@ publish = false
 
 [dependencies]
 base64 = "0.22"
-gpui = { git = "https://github.com/zed-industries/zed.git", rev = "20d3cd1d7981ed2076be5b72c817a1febbba3cb9", optional = true }
-gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "20d3cd1d7981ed2076be5b72c817a1febbba3cb9", features = ["font-kit", "wayland", "x11"], optional = true }
+gpui-kit = { version = "0.6", features = ["tree-sitter-rust", "tree-sitter-python", "tree-sitter-bash", "tree-sitter-typescript"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-unicode-segmentation = "1"
-pulldown-cmark = { version = "0.13", default-features = false }
-syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+chrono = "0.4"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -23,10 +20,11 @@ all = "deny"
 
 [features]
 default = ["gui"]
-gui = ["dep:gpui", "dep:gpui_platform"]
-# This feature is useful on hosts without Apple's offline Metal compiler.
-# Release builds keep GPUI's default precompiled shader path.
-runtime-shaders = ["gpui_platform/runtime_shaders"]
+gui = ["dep:gpui-kit"]
+# Compatibility alias: GPUI Kit always enables runtime shaders.
+runtime-shaders = []
+# Native, real-socket smoke driver and renderer capture; excluded from normal builds.
+smoke-test = ["gui", "gpui-kit/test-support"]
 
 [[bin]]
 name = "zeta-gui"
@@ -34,4 +32,4 @@ path = "src/main.rs"
 required-features = ["gui"]
 
 [dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed.git", rev = "20d3cd1d7981ed2076be5b72c817a1febbba3cb9", features = ["test-support"] }
+gpui-kit = { version = "0.6", features = ["test-support"] }

@@ -722,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_frame_fence_stream_never_builds_a_markdown_tree() {
+    fn multi_frame_fence_bounds_stream_then_restores_complete_source() {
         let mut state = AppState::default();
         let mut source = String::new();
         for delta in std::iter::once("```rust\n").chain(std::iter::repeat_n("let x = 1;\n", 2000)) {
@@ -732,9 +732,6 @@ mod tests {
                 delta: delta.into(),
                 kind: "assistant".into(),
             });
-            assert!(
-                matches!(&state.transcript[0], TranscriptEntry::Assistant(doc) if doc.root.is_none())
-            );
         }
         assert!(
             matches!(&state.transcript[0], TranscriptEntry::Assistant(doc) if source.ends_with(doc.source.as_ref()) && doc.preview_truncated)
@@ -744,15 +741,16 @@ mod tests {
             session_id: None,
             message: Message {
                 role: "assistant".into(),
-                content: vec![crate::client::ContentBlock::Text { text: source }],
+                content: vec![crate::client::ContentBlock::Text {
+                    text: source.clone(),
+                }],
             },
         });
         let TranscriptEntry::Assistant(doc) = &state.transcript[0] else {
             panic!("missing assistant")
         };
-        let code = &doc.root.as_ref().unwrap().children[0];
-        assert_eq!(code.kind, crate::markdown::BlockKind::Code("rust".into()));
-        assert!(code.syntax.is_empty());
+        assert_eq!(doc.source.as_ref(), source);
+        assert!(!doc.preview_truncated);
     }
 
     #[test]

@@ -403,10 +403,13 @@ class SessionManager:
                 logger.warning("Skipping session %s: %s", session_path.name, exc)
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
 
-    def list_session_previews(self, *, limit: int = 20) -> list[SessionPreview]:
+    def list_session_previews(
+        self, *, limit: int = 20, sessions: list[SessionMetadata] | None = None
+    ) -> list[SessionPreview]:
         """Return recent sessions with safe, single-line first-message previews."""
 
-        sessions = self.list_sessions()
+        if sessions is None:
+            sessions = self.list_sessions()
         previews: list[SessionPreview] = []
         for metadata in sessions:
             if len(previews) >= limit:
