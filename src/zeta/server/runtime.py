@@ -112,6 +112,7 @@ class ServerRuntime:
         self.cwd = Path(cwd or Path.cwd()).expanduser().resolve()
         self._server_provider = provider
         self._server_model = model
+        self._server_provider = self._config(None, None).provider
         self.backend_factory = backend_factory
         self.manager = SessionManager(self.home)
         self._state: SessionState | None = None

@@ -1374,8 +1374,8 @@ async def test_attachment_failure_removes_entire_batch(tmp_path, monkeypatch, fa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider", ["claude", "codex", None])
-async def test_real_catalog_is_complete_and_fake_requires_explicit_launch(tmp_path, provider):
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_real_catalog_is_complete_for_real_launch(tmp_path, provider):
     from zeta.model_catalog import PROVIDER_MODELS, known_model_names
 
     server = ZetaServer(home=tmp_path, port=0, provider=provider,
@@ -1534,7 +1534,7 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, mo
     [
         ("claude", "fake"),
         ("codex", "fake"),
-        (None, "fake"),
+        (None, "claude"),
         ("fake", "claude"),
         ("fake", "codex"),
     ],
@@ -1626,7 +1626,7 @@ async def test_session_listing_isolates_fake_provider(tmp_path, server_provider)
         expected = {
             sid
             for provider, sid in sessions.items()
-            if (provider == "fake") == (server_provider == "fake")
+            if (provider == "fake") == (server_provider in (None, "fake"))
         }
         assert {s["session_id"] for s in response["sessions"]} == expected
         for sid in expected:
@@ -1636,3 +1636,77 @@ async def test_session_listing_isolates_fake_provider(tmp_path, server_provider)
             assert response["result"]["session"]["session_id"] == sid
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.parametrize("settings_provider", [None, "claude"])
+def test_plain_serve_uses_effective_provider_mode(
+    tmp_path, monkeypatch, settings_provider
+):
+    from zeta import cli
+    from zeta import server as server_module
+    from zeta.model_catalog import PROVIDER_MODELS, known_model_names
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    if settings_provider is not None:
+        (home / "settings.toml").write_text(f'provider = "{settings_provider}"\n')
+    expected_provider = settings_provider or "fake"
+    foreign_provider = "claude" if expected_provider == "fake" else "fake"
+    foreign = (
+        SessionManager(home)
+        .create(
+            provider=foreign_provider,
+            model="claude-sonnet-4-6" if foreign_provider == "claude" else "offline",
+            cwd=tmp_path,
+        )
+        .metadata.session_id
+    )
+
+    async def check_server(server):
+        # Exercise the CLI-created server over a real socket, with no provider flag.
+        server.socket_path = _socket_path(tmp_path)
+        if settings_provider is not None:
+            server.runtime.backend_factory = lambda p, m, h: (
+                FakeBackend([]),
+                m or "claude-sonnet-4-6",
+            )
+        reader, writer = await _connect(server)
+        try:
+            launch_provider = server.runtime.provider
+            await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+            created = (await _request(reader, writer, 2, "new_session"))[-1]["result"][
+                "session"
+            ]
+            assert created["provider"] == expected_provider
+            sid = created["session_id"]
+            catalog = (
+                await _request(reader, writer, 3, "model_catalog", {"session_id": sid})
+            )[-1]["result"]
+            if expected_provider == "fake":
+                assert catalog == {"models": ["faster", "offline"]}
+            else:
+                assert catalog == {
+                    "models": known_model_names(),
+                    "providers": {
+                        m: p for p, models in PROVIDER_MODELS.items() for m in models
+                    },
+                }
+            listed = (await _request(reader, writer, 4, "list_sessions"))[-1]["result"]
+            assert {s["session_id"] for s in listed["sessions"]} == {sid}
+            rejected = (
+                await _request(reader, writer, 5, "resume", {"session_id": foreign})
+            )[-1]
+            assert rejected["error"]["code"] == -32602
+            assert server.runtime.session_id == sid
+            resumed = (
+                await _request(reader, writer, 6, "resume", {"session_id": sid})
+            )[-1]
+            assert resumed["result"]["session"]["session_id"] == sid
+            assert launch_provider == expected_provider
+        finally:
+            await _close(server, writer)
+
+    monkeypatch.setattr(server_module, "run_server", check_server)
+    assert cli.main(["serve"]) == 0
