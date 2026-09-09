@@ -42,6 +42,10 @@ SNAPSHOT_MODE_GIT = "git-shadow"
 SNAPSHOT_MODE_UNAVAILABLE = "unavailable"
 SIZE_NOTICE_THRESHOLD_BYTES = 100 * 1024 * 1024
 DEFAULT_SNAPSHOT_CAP = 50
+SNAPSHOT_CORRUPTION_MESSAGE = (
+    "workspace snapshot state is corrupt; use --force to recover a valid snapshot "
+    "or /checkpoint --reset to archive the corrupt manifest and reset snapshot state"
+)
 
 
 class WorkspaceSnapshotError(RuntimeError):
@@ -442,6 +446,7 @@ class WorkspaceSnapshotStore:
         self._cap = resolved_cap
         self._snapshots: list[WorkspaceSnapshot] = []
         self._current_id: str | None = None
+        self._is_corrupt = False
         self._load()
 
     def _load(self) -> None:
@@ -450,25 +455,38 @@ class WorkspaceSnapshotStore:
         try:
             raw = load_session_json(self.state_path)
         except ConversationIntegrityError:
+            self._is_corrupt = True
             return
         if not isinstance(raw, dict):
+            self._is_corrupt = True
             return
         snapshots = raw.get("snapshots", [])
-        if not isinstance(snapshots, list) or any(
-            not isinstance(entry, dict) for entry in snapshots
-        ):
+        if not isinstance(snapshots, list):
+            self._is_corrupt = True
             return
-        try:
-            self._snapshots = [WorkspaceSnapshot.from_dict(entry) for entry in snapshots]
-        except ConversationIntegrityError:
-            return
+        for entry in snapshots:
+            if not isinstance(entry, dict):
+                self._is_corrupt = True
+                continue
+            try:
+                snapshot = WorkspaceSnapshot.from_dict(entry)
+            except ConversationIntegrityError:
+                self._is_corrupt = True
+                continue
+            self._snapshots.append(snapshot)
         current_id = raw.get("current_id")
         if isinstance(current_id, str) and any(
             snap.id == current_id for snap in self._snapshots
         ):
             self._current_id = current_id
+        elif current_id is not None:
+            self._is_corrupt = True
 
     def _persist(self) -> None:
+        # Forced navigation may update the in-memory cursor, but only explicit
+        # reset may replace a corrupt manifest or discard its invalid rows.
+        if self._is_corrupt:
+            return
         self.session_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "snapshots": [snapshot.to_dict() for snapshot in self._snapshots],
@@ -493,6 +511,26 @@ class WorkspaceSnapshotStore:
         finally:
             if temporary_path is not None and temporary_path.exists():
                 temporary_path.unlink(missing_ok=True)
+
+    @property
+    def is_corrupt(self) -> bool:
+        return self._is_corrupt
+
+    def reset_corruption(self) -> None:
+        """Archive the original manifest, then persist only validated rows."""
+
+        if not self._is_corrupt:
+            return
+        archive = self.state_path.with_name(
+            f"workspace_snapshots.corrupt.{uuid.uuid4().hex}.json"
+        )
+        shutil.copyfile(self.state_path, archive)
+        self._is_corrupt = False
+        try:
+            self._persist()
+        except OSError:
+            self._is_corrupt = True
+            raise
 
     @property
     def snapshots(self) -> tuple[WorkspaceSnapshot, ...]:
@@ -532,6 +570,8 @@ class WorkspaceSnapshotStore:
     ) -> WorkspaceSnapshot:
         """Capture the current working tree as a shadow-git snapshot."""
 
+        if self._is_corrupt:
+            raise WorkspaceSnapshotError(SNAPSHOT_CORRUPTION_MESSAGE)
         self._truncate_tail_from_current()
         repo_root = git_repo_root(cwd)
         snapshot_id = uuid.uuid4().hex
@@ -571,7 +611,11 @@ class WorkspaceSnapshotStore:
         self._persist()
         return snapshot
 
-    def restore(self, snapshot_id: str, cwd: str | Path) -> WorkspaceSnapshot:
+    def restore(
+        self, snapshot_id: str, cwd: str | Path, *, force: bool = False
+    ) -> WorkspaceSnapshot:
+        if self._is_corrupt and not force:
+            raise WorkspaceSnapshotError(SNAPSHOT_CORRUPTION_MESSAGE)
         snapshot = self.by_id(snapshot_id)
         if snapshot is None:
             raise WorkspaceSnapshotError(f"snapshot not found: {snapshot_id}")
@@ -603,6 +647,8 @@ class WorkspaceSnapshotStore:
         the dirty guard.
         """
 
+        if self._is_corrupt:
+            return True
         reference = self.current()
         if reference is None or reference.mode != SNAPSHOT_MODE_GIT:
             reference = next(

@@ -703,7 +703,8 @@ def test_corrupt_snapshot_rows_degrade_in_store_and_tui(
     app = _make_tui(conversation)
     result = app.slash_checkpoint("save")
     assert "checkpoint 'save'" in result
-    assert len(app._snapshots().snapshots) == 1
+    assert "snapshot skipped" in result and "corrupt" in result
+    assert app._snapshots().snapshots == ()
 
 
 def test_checkpoint_reports_snapshot_setup_error(
@@ -750,7 +751,7 @@ def test_incomplete_current_snapshot_cannot_overwrite_dirty_files(
     assert (git_repo / "tracked.txt").read_text() == "unsaved work\n"
     assert "undone" not in result
     snapshots = reopened._snapshots()
-    assert snapshots.snapshots == ()
+    assert [snap.label for snap in snapshots.snapshots] == ["older"]
     assert snapshots.current_id is None
     assert snapshots.is_dirty(git_repo)
     assert _dirty_guard(snapshots, str(git_repo), forced=False) is not None
@@ -758,7 +759,7 @@ def test_incomplete_current_snapshot_cannot_overwrite_dirty_files(
 
 
 @pytest.mark.parametrize("row", [None, [], "invalid", {"id": "invalid"}])
-def test_invalid_snapshot_row_discards_whole_state(
+def test_invalid_snapshot_row_preserves_valid_rows(
     git_repo: Path, tmp_path: Path, row: object
 ) -> None:
     store = WorkspaceSnapshotStore(tmp_path / "session", "session-1")
@@ -767,8 +768,9 @@ def test_invalid_snapshot_row_discards_whole_state(
     state["snapshots"].append(row)
     store.state_path.write_text(json.dumps(state))
     reopened = WorkspaceSnapshotStore(store.session_dir, "session-1")
-    assert reopened.snapshots == ()
-    assert reopened.current_id is None
+    assert [snap.label for snap in reopened.snapshots] == ["valid"]
+    assert reopened.current_id == reopened.snapshots[0].id
+    assert reopened.is_corrupt
     assert reopened.is_dirty(git_repo)
 
 
@@ -797,3 +799,99 @@ def test_failed_dirty_comparison_cannot_overwrite_files(
     result = app.slash_undo("")
     assert (git_repo / "tracked.txt").read_text() == "unsaved work\n"
     assert "--force" in result
+
+
+def test_corrupt_current_snapshot_allows_only_forced_recovery(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    conversation = _make_store(tmp_path / "session", git_repo)
+    app = _make_tui(conversation)
+    app.slash_checkpoint("oldest")
+    (git_repo / "tracked.txt").write_text("older snapshot\n")
+    app.slash_checkpoint("older")
+    (git_repo / "tracked.txt").write_text("current snapshot\n")
+    app.slash_checkpoint("current")
+    path = app._snapshots().state_path
+    state = json.loads(path.read_text())
+    del state["snapshots"][-1]["tree_sha"]
+    path.write_text(json.dumps(state))
+    original = path.read_bytes()
+    (git_repo / "tracked.txt").write_text("unsaved work\n")
+    reopened = _make_tui(conversation)
+
+    result = reopened.slash_undo("")
+    assert "corrupt" in result
+    assert "--force" in result and "/checkpoint --reset" in result
+    assert (git_repo / "tracked.txt").read_text() == "unsaved work\n"
+    assert "workspace restored" in reopened.slash_undo("--force")
+    assert (git_repo / "tracked.txt").read_text() == "older snapshot\n"
+    # Matching a valid tree must not clear the corrupt-state safety guard.
+    assert reopened._snapshots().is_dirty(git_repo)
+    assert "corrupt" in reopened.slash_undo("")
+    assert "workspace restored" in reopened.slash_undo("--force")
+    assert (git_repo / "tracked.txt").read_text() == "initial tracked\n"
+    assert path.read_bytes() == original
+
+
+def test_checkpoint_preserves_corrupt_manifest_and_all_shadow_refs(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    conversation = _make_store(tmp_path / "session", git_repo)
+    app = _make_tui(conversation)
+    for label in ("oldest", "older", "current"):
+        (git_repo / "tracked.txt").write_text(label)
+        app.slash_checkpoint(label)
+    path = app._snapshots().state_path
+    state = json.loads(path.read_text())
+    state["snapshots"][-1]["size_bytes"] = {}
+    path.write_text(json.dumps(state))
+    original = path.read_bytes()
+    shadow = conversation.session_dir / workspace_module.SHADOW_REPO_DIRNAME
+    refs_command = ["git", "--git-dir", str(shadow), "show-ref"]
+    refs_before = subprocess.check_output(refs_command)
+    reopened = _make_tui(conversation)
+    reopened._workspace_snapshot_cap = 1
+
+    result = reopened.slash_checkpoint("after-corruption")
+    assert "snapshot skipped" in result and "corrupt" in result
+    assert path.read_bytes() == original
+    assert subprocess.check_output(refs_command) == refs_before
+    loaded = WorkspaceSnapshotStore(conversation.session_dir, conversation.session_id)
+    assert [snap.label for snap in loaded.snapshots] == ["oldest", "older"]
+
+
+def test_corrupt_snapshot_marker_clears_only_through_explicit_reset(
+    git_repo: Path, tmp_path: Path
+) -> None:
+    conversation = _make_store(tmp_path / "session", git_repo)
+    app = _make_tui(conversation)
+    app.slash_checkpoint("older")
+    app.slash_checkpoint("current")
+    path = app._snapshots().state_path
+    state = json.loads(path.read_text())
+    del state["snapshots"][-1]["tree_sha"]
+    path.write_text(json.dumps(state))
+    original = path.read_bytes()
+    reopened = _make_tui(conversation)
+    snapshots = reopened._snapshots()
+    assert snapshots.is_corrupt
+    older = snapshots.snapshots[0]
+    with pytest.raises(workspace_module.WorkspaceSnapshotError, match="corrupt"):
+        snapshots.restore(older.id, git_repo)
+    snapshots.restore(older.id, git_repo, force=True)
+    snapshots.set_current(older.id)
+    reopened.slash_checkpoint("blocked-write")
+    assert snapshots.is_corrupt
+    assert path.read_bytes() == original
+    assert _make_tui(conversation)._snapshots().is_corrupt
+
+    result = reopened.slash_checkpoint("--reset")
+    assert "snapshot state reset" in result
+    assert not snapshots.is_corrupt
+    backups = list(conversation.session_dir.glob("workspace_snapshots.corrupt.*.json"))
+    assert len(backups) == 1 and backups[0].read_bytes() == original
+    loaded = _make_tui(conversation)._snapshots()
+    assert not loaded.is_corrupt
+    assert loaded.snapshots == (older,)
+    assert not loaded.is_dirty(git_repo)
+    assert "snapshot skipped" not in reopened.slash_checkpoint("after-reset")
