@@ -1074,6 +1074,79 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("block_count,text", [(0, ""), (20, "\x00" * 8000), (130, "x" * 8000)],
+                         ids=["large-tools", "json-escaping", "near-limit-message"])
+async def test_history_pages_large_messages_with_bounded_tool_arguments(tmp_path, block_count, text):
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    # The default asyncio reader limit is only 64 KiB.
+    reader._limit = MAX_FRAME_BYTES
+    try:
+        store = server.runtime.opened.store
+        entries = []
+        for index in range(17):
+            message = Message(MessageRole.ASSISTANT, [
+                *[TextContent(text) for _ in range(block_count)],
+                ToolUseContent(ToolCall(str(index), "write", {"content": "x" * 135_000})),
+            ])
+            if not block_count:
+                assert FrameCodec().response_fits("message", message.to_dict())
+            entries.append(store.append_message(message))
+        offset = 0
+        rows = []
+        page_sizes = []
+        # Control characters exercise the largest legal encoded request id.
+        request_id = "\x00" * MAX_REQUEST_ID_BYTES
+        while offset is not None:
+            response = (await _request(reader, writer, request_id, "session_history", {
+                "session_id": sid, "offset": offset,
+            }))[-1]
+            assert "error" not in response
+            page = response["result"]
+            encoded = FrameCodec().response(request_id, page)
+            assert len(encoded) <= MAX_FRAME_BYTES
+            if block_count == 130:
+                assert len(encoded) > MAX_FRAME_BYTES - 10_000
+            assert page["messages"]
+            page_sizes.append(len(page["messages"]))
+            rows.extend(page["messages"])
+            next_offset = page["next_offset"]
+            assert next_offset is None or next_offset == offset + len(page["messages"])
+            offset = next_offset
+        assert [row["id"] for row in rows] == [entry.id for entry in entries]
+        assert page_sizes == ([8, 8, 1] if not block_count else [1] * 17)
+        for index, row in enumerate(rows):
+            assert row["content"][:-1] == [{"type": "text", "text": text}] * block_count
+            assert row["content"][-1] == {
+                "type": "tool_use", "tool_call": {"id": str(index), "name": "write", "arguments": {}},
+            }
+        assert all(message.content[-1].tool_call.arguments == {"content": "x" * 135_000}
+                   for message in store.messages())
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_history_advances_past_single_oversized_persisted_message(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        store = server.runtime.opened.store
+        oversized = store.append_message(Message(MessageRole.USER, [TextContent("x" * 8000)] * 140))
+        following = store.append_message(Message(MessageRole.USER, [TextContent("after")]))
+        response = (await _request(reader, writer, "history", "session_history", {"session_id": sid}))[-1]
+        assert "error" not in response
+        page = response["result"]
+        assert page["next_offset"] is None
+        assert [row["id"] for row in page["messages"]] == [oversized.id, following.id]
+        assert "truncated" in page["messages"][0]["content"][0]["text"]
+        assert page["messages"][1]["content"] == [{"type": "text", "text": "after"}]
+        assert len(store.messages()[0].content) == 140
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_settings_apply_to_active_session_and_resume(tmp_path):
     server = ZetaServer(home=tmp_path, port=0, provider="fake")
     reader, writer, sid = await _ready_extensions(server)

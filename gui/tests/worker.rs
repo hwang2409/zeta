@@ -1045,6 +1045,66 @@ fn extensions_fetch_switch_fork_apply_settings_and_send_images() {
 }
 
 #[test]
+fn refresh_large_history_follows_variable_page_offsets_without_losing_connection() {
+    use zeta_gui::client::MAX_FRAME_BYTES;
+    let harness = Harness::new(|listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.respond("hello", json!({"protocol_version":"1.1", "server":"zeta"}));
+        peer.respond("list_sessions", json!({"sessions":[session()]}));
+        peer.status(true, "idle", json!([]));
+        peer.respond("session_tree", json!({"branches":[]}));
+        // Short pages are not the end of history. The first message alone is
+        // near the frame limit; tool receipts carry no persisted arguments.
+        for (offset, count, next_offset, blocks) in
+            [(0, 1, Some(1), 130), (1, 3, Some(4), 20), (4, 2, None, 20)]
+        {
+            let messages: Vec<Value> = (offset..offset + count)
+                .map(|index| {
+                    let mut content = vec![json!({"type":"text","text":"x".repeat(8000)}); blocks];
+                    content.push(json!({"type":"tool_use", "tool_call":{
+                        "id":format!("call-{index}"),"name":"write","arguments":{}
+                    }}));
+                    json!({"id":format!("message-{index}"),"role":"assistant","content":content})
+                })
+                .collect();
+            let request = peer.request("session_history");
+            assert_eq!(
+                request["params"],
+                json!({"session_id":"session-1","offset":offset})
+            );
+            let response = json!({"jsonrpc":"2.0","id":request["id"],"result":{
+                "messages":messages,"next_offset":next_offset
+            }});
+            let size = response.to_string().len() + 1;
+            assert!(size <= MAX_FRAME_BYTES);
+            if offset == 0 {
+                assert!(size > MAX_FRAME_BYTES - 10_000);
+            }
+            peer.write(response);
+        }
+        peer.send();
+        peer.wait_for_close();
+    });
+    assert!(matches!(harness.next(), WorkerMessage::Extensions(true)));
+    assert!(matches!(harness.next(), WorkerMessage::Sessions(_)));
+    assert!(matches!(harness.next(), WorkerMessage::Status(_)));
+    assert!(matches!(harness.next(), WorkerMessage::Tree(_)));
+    match harness.next() {
+        WorkerMessage::History(history, true) => {
+            assert_eq!(history.len(), 6);
+            for (index, message) in history.iter().enumerate() {
+                assert_eq!(message.id, format!("message-{index}"));
+            }
+        }
+        other => panic!("expected complete history, got {other:?}"),
+    }
+    assert!(matches!(harness.next(), WorkerMessage::Connected));
+    harness.command(CommandMessage::Send("continue".into()));
+    assert!(matches!(harness.next(), WorkerMessage::Sent(text) if text == "continue"));
+    harness.finish();
+}
+
+#[test]
 fn old_server_disables_extensions_without_sending_new_requests() {
     let harness = Harness::new(|listener| {
         let mut peer = Peer::accept(&listener);

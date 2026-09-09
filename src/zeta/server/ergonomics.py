@@ -18,7 +18,7 @@ from ..types import (
     TextContent,
     image_signature_matches,
 )
-from .protocol import ProtocolError, bounded
+from .protocol import MAX_REQUEST_ID_BYTES, FrameCodec, ProtocolError, bounded
 from .runtime import ServerRuntime
 
 EXTENSION_REQUESTS = [
@@ -90,7 +90,9 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
         entry for entry in runtime.opened.store.replay() if entry.type == "message"
     ]
     rows = []
-    # Page history work; the frame codec also bounds the encoded response.
+    codec = FrameCodec()
+    # Reserve the largest legal JSON-escaped request id, including the envelope.
+    request_id = "\x00" * MAX_REQUEST_ID_BYTES
     for entry in entries[offset : offset + 8]:
         message = entry.data["message"]
         content = []
@@ -106,7 +108,11 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
             elif block.get("type") == "text":
                 content.append({"type": "text", "text": bounded(block["text"], 8000)})
             elif block.get("type") == "tool_use":
-                content.append(block)
+                call = block["tool_call"]
+                content.append({
+                    "type": "tool_use",
+                    "tool_call": {"id": call["id"], "name": call["name"], "arguments": {}},
+                })
         result = message.get("tool_result")
         if result:
             result = {
@@ -115,14 +121,25 @@ def history(runtime: ServerRuntime, params: dict) -> dict:
                 "content_blocks": [],
                 "structured_content": None,
             }
-        rows.append(
-            {
-                "id": entry.id,
-                "role": message["role"],
-                "content": content,
-                "tool_result": result,
-            }
-        )
+        row = {
+            "id": entry.id,
+            "role": message["role"],
+            "content": content,
+            "tool_result": result,
+        }
+        next_offset = offset + len(rows) + 1
+        candidate = {
+            "messages": [*rows, row],
+            "next_offset": next_offset if next_offset < len(entries) else None,
+        }
+        if not codec.response_fits(request_id, candidate):
+            if rows:
+                break
+            # Persisted messages can exceed a frame even after per-block bounds.
+            # Keep their identity and advance the cursor instead of wedging refresh.
+            row["content"] = [{"type": "text", "text": "[message too large for history; truncated]"}]
+            row["tool_result"] = None
+        rows.append(row)
     next_offset = offset + len(rows)
     return {
         "messages": rows,
