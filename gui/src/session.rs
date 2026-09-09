@@ -94,6 +94,8 @@ impl ImageAttachment {
     }
 }
 
+pub const APPROVAL_MODES: [&str; 3] = ["ask", "allow", "deny"];
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionView {
     pub available: bool,
@@ -104,10 +106,14 @@ pub struct SessionView {
     pub models: Vec<String>,
     pub model_providers: std::collections::BTreeMap<String, String>,
     pub current_model: String,
-    pub settings_open: bool,
     pub selected_model: usize,
     pub selected_mode: usize,
-    pub settings_field: usize,
+}
+
+impl SessionView {
+    pub fn approval_mode(&self) -> &'static str {
+        APPROVAL_MODES[self.selected_mode.min(APPROVAL_MODES.len() - 1)]
+    }
 }
 
 #[cfg(test)]

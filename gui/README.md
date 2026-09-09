@@ -39,8 +39,21 @@ Kit semantic themes follow system appearance. JetBrains Mono 2.304 Regular,
 Medium, Bold, and Italic are embedded and registered at startup. Their OFL
 license is in `assets/fonts/OFL.txt`.
 
-Branch trees, settings, and attachments are deferred to ZETA-99. The protocol
-client and actor retain those commands.
+## Session ergonomics
+
+- The sidebar lists branches under the session picker. Click a branch to switch;
+  the current branch is disabled with a `*` marker. A `Settings` control opens a
+  Kit overlay with a grouped Claude/Codex model picker (the current model is
+  labelled `current` and auto-scrolled into view) and an approval-mode selector.
+  Applying a cross-provider swap that fails RPC (missing credentials, model
+  denied) keeps the modal open with an inline error.
+- User messages carry a `Fork here` action that dispatches `fork_message`.
+  Branches and forks are hidden on legacy servers without session extensions.
+- The composer accepts PNG, JPEG, GIF, and WebP images through the `Attach
+  image` button or Cmd-V paste. Attachments render as chips (name + byte count)
+  above the textarea; validation errors show inline. `Send` dispatches
+  `SendImages` and the confirmation records the attachment on the transcript
+  row so replays retain the file listing.
 
 ## Build and targeted checks
 

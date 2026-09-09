@@ -2,7 +2,8 @@ use super::*;
 use gpui::{TestAppContext, VisualTestContext, WindowHandle};
 use serde_json::json;
 use std::sync::mpsc::Receiver;
-use zeta_gui::client::{ServerEvent, SessionMetadata, StatusResult, ToolCall};
+use zeta_gui::client::{ModelCatalog, ServerEvent, SessionMetadata, StatusResult, ToolCall};
+use zeta_gui::session::{Branch, ImageAttachment, SessionSettings};
 
 fn session() -> SessionMetadata {
     serde_json::from_value(
@@ -256,4 +257,367 @@ fn virtual_transcript_and_session_rows_fit_their_viewports(cx: &mut TestAppConte
             }
         });
     }
+}
+
+fn png_bytes() -> Vec<u8> {
+    b"\x89PNG\r\n\x1a\n".to_vec()
+}
+
+#[gpui::test]
+fn branches_render_and_click_dispatches_switch_branch(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.session_view.available = true;
+            view.state.session_view.branches = vec![
+                Branch {
+                    id: "trunk".into(),
+                    label: "main".into(),
+                    depth: 0,
+                    current: true,
+                },
+                Branch {
+                    id: "alt".into(),
+                    label: "alternate".into(),
+                    depth: 1,
+                    current: false,
+                },
+            ];
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let trunk = visual
+        .debug_bounds("branch-row-trunk")
+        .expect("current branch renders");
+    assert!(trunk.size.width <= px(280.));
+    let alt = visual
+        .debug_bounds("branch-row-alt")
+        .expect("alternate branch renders");
+    visual.simulate_click(alt.center(), Default::default());
+    let sent = receiver.try_recv().expect("branch switch dispatched");
+    assert!(matches!(sent, CommandMessage::SwitchBranch(id) if id == "alt"));
+    // An older server without extensions must not surface branches.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.session_view.available = false;
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("branch-row-trunk").is_none());
+    assert!(visual.debug_bounds("branch-row-alt").is_none());
+}
+
+#[gpui::test]
+fn fork_button_appears_on_user_rows_and_dispatches_fork_message(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.session_view.available = true;
+            view.state.transcript = vec![TranscriptEntry::User("a wrapped question".into())];
+            view.state
+                .session_view
+                .message_ids
+                .insert(0, "msg-1".into());
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let fork = visual
+        .debug_bounds("fork-button-0")
+        .expect("fork button renders on user row");
+    visual.simulate_click(fork.center(), Default::default());
+    let sent = receiver.try_recv().expect("fork dispatched");
+    assert!(matches!(sent, CommandMessage::ForkMessage(id) if id == "msg-1"));
+    // Without an id (server never surfaced this message) the button hides.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.session_view.message_ids.clear();
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("fork-button-0").is_none());
+}
+
+#[gpui::test]
+fn refresh_rpc_failure_clears_the_stale_transcript_and_keeps_the_connection(
+    cx: &mut TestAppContext,
+) {
+    // ZETA-96 recovery: when the worker's refresh RPC fails after a branch
+    // switch or fork, it emits a Rejected message followed by a Status with
+    // session=None. The GUI must drop the previous transcript and keep the
+    // connection healthy so the user can create a fresh session.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![
+                TranscriptEntry::User("stale question".into()),
+                TranscriptEntry::User("older question".into()),
+            ];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(2, cx));
+            view.state.session_view.available = true;
+            cx.notify();
+            view.apply_worker_message(
+                WorkerMessage::Rejected("session metadata is missing; refresh failed".into()),
+                window,
+                cx,
+            );
+            view.apply_worker_message(
+                WorkerMessage::Status(StatusResult {
+                    session: None,
+                    state: "idle".into(),
+                    pending_approvals: vec![],
+                    usage: json!({}),
+                    compaction_markers: 0,
+                }),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert!(
+            view.state.transcript.is_empty(),
+            "the stale transcript is dropped when the refresh drops the session"
+        );
+        assert!(view.state.active_session.is_none());
+        assert_eq!(view.state.connection, ConnectionState::Connected);
+        assert!(view
+            .command_error
+            .as_ref()
+            .is_some_and(|error| error.contains("refresh failed")));
+    });
+}
+
+#[gpui::test]
+fn settings_modal_swaps_models_and_credential_errors_keep_it_open(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.session_view.available = true;
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: "claude-sonnet-4-6".into(),
+                        approval_mode: "ask".into(),
+                    },
+                    ModelCatalog {
+                        models: vec![
+                            "claude-sonnet-4-6".into(),
+                            "claude-opus-4-7".into(),
+                            "codex-gpt-5".into(),
+                        ],
+                        providers: [
+                            ("claude-sonnet-4-6".into(), "claude".into()),
+                            ("claude-opus-4-7".into(), "claude".into()),
+                            ("codex-gpt-5".into(), "codex".into()),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    // The overlay renders; grouped models mark the current one.
+    assert!(visual.debug_bounds("settings-overlay").is_some());
+    assert!(visual.debug_bounds("model-row-0").is_some());
+    let codex_row = visual
+        .debug_bounds("model-row-2")
+        .expect("codex row renders");
+    // Selecting a codex model and clicking Apply dispatches SetSettings across
+    // providers with the retained approval mode.
+    visual.simulate_click(codex_row.center(), Default::default());
+    let apply = visual
+        .debug_bounds("settings-apply")
+        .expect("apply button renders");
+    visual.simulate_click(apply.center(), Default::default());
+    let dispatched = receiver.try_recv().expect("settings dispatch");
+    assert!(matches!(
+        &dispatched,
+        CommandMessage::SetSettings(settings)
+            if settings.model == "codex-gpt-5" && settings.approval_mode == "ask"
+    ));
+    // A credential rejection keeps the modal open and surfaces the error inline.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Rejected("codex credentials missing; run zeta login".into()),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("settings-overlay").is_some(),
+        "credential errors do not close the settings modal"
+    );
+    view.read_with(&visual, |view, _| {
+        assert!(view
+            .settings_error
+            .as_ref()
+            .is_some_and(|error| error.contains("codex credentials")));
+    });
+    // Clicking Close dismisses the overlay after an error.
+    let close = visual
+        .debug_bounds("settings-close")
+        .expect("close button renders");
+    visual.simulate_click(close.center(), Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(visual.debug_bounds("settings-overlay").is_none());
+}
+
+#[gpui::test]
+fn settings_selection_scrolls_the_current_model_into_view(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.session_view.available = true;
+            let mut models: Vec<String> = (0..30).map(|index| format!("claude-{index}")).collect();
+            let current = models[24].clone();
+            let providers = models
+                .iter()
+                .map(|model| (model.clone(), "claude".into()))
+                .collect();
+            models.push(current.clone());
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: current,
+                        approval_mode: "ask".into(),
+                    },
+                    ModelCatalog { models, providers },
+                ),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    // A second redraw consumes the scroll target now that child bounds exist.
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    // The current model is the 25th; without a scroll it would sit far below
+    // the list's 280px viewport (25 × ~32 px rows plus headings).
+    let list = visual
+        .debug_bounds("model-list")
+        .expect("model list bounds");
+    let selected = visual
+        .debug_bounds("model-row-24")
+        .expect("selected model row renders");
+    assert!(
+        selected.top() >= list.top() && selected.bottom() <= list.bottom(),
+        "the current model must be scrolled into the visible list bounds"
+    );
+    // Keyboard navigation wraps around the list bounds.
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.move_settings_model(1, cx);
+            view.move_settings_model(-3, cx);
+        });
+    });
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.state.session_view.selected_model, 22);
+    });
+}
+
+#[gpui::test]
+fn attachments_paste_shows_chip_and_send_dispatches_send_images(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Prime the clipboard with a valid PNG stub; the paste hook adds the chip.
+    visual.update(|_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image {
+            format: gpui::ImageFormat::Png,
+            bytes: png_bytes(),
+            id: 42,
+        }))
+    });
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.attach_from_clipboard(cx));
+        });
+    });
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let chip = visual
+        .debug_bounds("composer-chip")
+        .expect("pasted image becomes a chip");
+    assert!(chip.size.width > px(0.));
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.composer_images.len(), 1);
+        assert_eq!(view.composer_images[0].name, "pasted-image.png");
+    });
+    // Click Send dispatches SendImages with the pending attachments.
+    let send = visual
+        .debug_bounds("send-button")
+        .expect("send button renders");
+    visual.simulate_click(send.center(), Default::default());
+    let dispatched = receiver.try_recv().expect("SendImages dispatched");
+    assert!(matches!(
+        &dispatched,
+        CommandMessage::SendImages(text, images)
+            if text.is_empty() && images.len() == 1 && images[0].name == "pasted-image.png"
+    ));
+    // Worker ack clears the chip and records the attachment on the transcript row.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let images = view.composer_images.clone();
+            view.apply_worker_message(WorkerMessage::ImagesSent(String::new(), images), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert!(view.composer_images.is_empty());
+        assert_eq!(
+            view.state.session_view.attachments.get(&0),
+            Some(&vec![("pasted-image.png".to_string(), 8)])
+        );
+    });
+    assert!(visual.debug_bounds("composer-chip").is_none());
+}
+
+#[gpui::test]
+fn attachment_validation_error_renders_and_clears_on_a_good_image(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.add_attached_images(
+                ImageAttachment::from_bytes("bad.png".into(), b"not a real png")
+                    .map(|image| vec![image]),
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert!(view.composer_image_error.is_some());
+        assert!(view.composer_images.is_empty());
+    });
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.add_attached_images(
+                ImageAttachment::from_bytes("good.png".into(), &png_bytes())
+                    .map(|image| vec![image]),
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert!(view.composer_image_error.is_none());
+        assert_eq!(view.composer_images.len(), 1);
+    });
 }

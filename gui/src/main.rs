@@ -15,7 +15,7 @@ use gpui_kit::component::{
     input::{InputEvent, Textarea, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
     text::TextView,
-    ActiveTheme, Disableable, Root, StyledExt, Theme, WindowExt,
+    ActiveTheme, Disableable, Root, Selectable, StyledExt, Theme, WindowExt,
 };
 use std::{
     borrow::Cow,
@@ -27,6 +27,7 @@ use std::{
 };
 use zeta_gui::{
     client::Approval,
+    session::{ImageAttachment, SessionSettings, APPROVAL_MODES},
     state::{AppState, ConnectionState, TranscriptEntry},
     worker::{CommandMessage, ConnectionWorker, WorkerMessage},
 };
@@ -45,10 +46,15 @@ struct ZetaView {
     composer: Entity<TextareaState>,
     transcript: Entity<MessageScrollerState>,
     sidebar_scroll: gpui_kit::component::VirtualListScrollHandle,
+    model_scroll: gpui::ScrollHandle,
     pending_command: bool,
     command_error: Option<String>,
     dialog_request: Option<String>,
     approval_pending: bool,
+    settings_open: bool,
+    settings_error: Option<String>,
+    composer_images: Vec<ImageAttachment>,
+    composer_image_error: Option<String>,
     commands: Sender<CommandMessage>,
     _poll_task: Option<Task<()>>,
 }
@@ -92,10 +98,15 @@ impl ZetaView {
             composer,
             transcript: cx.new(|cx| MessageScrollerState::new(0, cx)),
             sidebar_scroll: gpui_kit::component::VirtualListScrollHandle::new(),
+            model_scroll: gpui::ScrollHandle::new(),
             pending_command: false,
             command_error: None,
             dialog_request: None,
             approval_pending: false,
+            settings_open: false,
+            settings_error: None,
+            composer_images: Vec::new(),
+            composer_image_error: None,
             commands,
             _poll_task: None,
         }
@@ -151,11 +162,53 @@ impl ZetaView {
                 replace = reset;
                 self.pending_command = false;
             }
-            WorkerMessage::Settings(settings, _) | WorkerMessage::SettingsApplied(settings) => {
-                self.state.session_view.current_model = settings.model;
+            WorkerMessage::Settings(settings, catalog) => {
                 self.pending_command = false;
+                self.settings_error = None;
+                self.state
+                    .session_view
+                    .current_model
+                    .clone_from(&settings.model);
+                self.state.session_view.models = catalog.models;
+                self.state.session_view.model_providers = catalog.providers;
+                self.state.session_view.selected_model = self
+                    .state
+                    .session_view
+                    .models
+                    .iter()
+                    .position(|model| model == &settings.model)
+                    .unwrap_or(0);
+                self.state.session_view.selected_mode = APPROVAL_MODES
+                    .iter()
+                    .position(|mode| *mode == settings.approval_mode)
+                    .unwrap_or(0);
+                self.settings_open = true;
+                self.scroll_model_into_view();
             }
-            WorkerMessage::ImagesSent(text, _) | WorkerMessage::Sent(text) => {
+            WorkerMessage::SettingsApplied(settings) => {
+                self.pending_command = false;
+                self.state.session_view.current_model = settings.model;
+                self.settings_error = None;
+                self.settings_open = false;
+            }
+            WorkerMessage::ImagesSent(text, images) => {
+                self.pending_command = false;
+                self.state.streaming = true;
+                let index = self.state.transcript.len();
+                self.state.transcript.push(TranscriptEntry::User(text));
+                self.state.session_view.attachments.insert(
+                    index,
+                    images
+                        .iter()
+                        .map(|item| (item.name.clone(), item.size))
+                        .collect(),
+                );
+                self.composer_images.clear();
+                self.composer_image_error = None;
+                self.composer
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+            }
+            WorkerMessage::Sent(text) => {
                 self.pending_command = false;
                 self.state.streaming = true;
                 self.state.transcript.push(TranscriptEntry::User(text));
@@ -198,7 +251,11 @@ impl ZetaView {
             WorkerMessage::Rejected(error) => {
                 self.pending_command = false;
                 self.approval_pending = false;
-                self.command_error = Some(error);
+                if self.settings_open {
+                    self.settings_error = Some(error);
+                } else {
+                    self.command_error = Some(error);
+                }
             }
             WorkerMessage::Connected => self.state.connection = ConnectionState::Connected,
             WorkerMessage::Event(event) => changed_row = self.state.apply(event),
@@ -262,12 +319,192 @@ impl ZetaView {
             return;
         }
         let text = self.composer.read(cx).value().to_string();
-        if text.trim().is_empty() {
+        let has_images = !self.composer_images.is_empty();
+        if text.trim().is_empty() && !has_images {
             return;
         }
         self.pending_command = true;
-        self.queue(CommandMessage::Send(text));
+        if has_images {
+            self.queue(CommandMessage::SendImages(
+                text,
+                self.composer_images.clone(),
+            ));
+        } else {
+            self.queue(CommandMessage::Send(text));
+        }
         cx.notify();
+    }
+
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.can_change_session()
+            || !self.state.session_view.available
+            || self.state.active_session.is_none()
+            || self.settings_open
+        {
+            return;
+        }
+        self.pending_command = true;
+        self.settings_error = None;
+        self.queue(CommandMessage::LoadSettings);
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.settings_error = None;
+        cx.notify();
+    }
+
+    fn apply_settings(&mut self, cx: &mut Context<Self>) {
+        if self.pending_command {
+            return;
+        }
+        let view = &self.state.session_view;
+        let Some(model) = view.models.get(view.selected_model).cloned() else {
+            return;
+        };
+        let settings = SessionSettings {
+            model,
+            approval_mode: view.approval_mode().to_owned(),
+        };
+        self.pending_command = true;
+        self.settings_error = None;
+        self.queue(CommandMessage::SetSettings(settings));
+        cx.notify();
+    }
+
+    fn select_settings_model(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.state.session_view.models.len() {
+            self.state.session_view.selected_model = index;
+            self.scroll_model_into_view();
+            cx.notify();
+        }
+    }
+
+    fn move_settings_model(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.state.session_view.models.len();
+        if count == 0 {
+            return;
+        }
+        let current = self.state.session_view.selected_model as isize;
+        let next = (current + delta).rem_euclid(count as isize) as usize;
+        self.select_settings_model(next, cx);
+    }
+
+    fn scroll_model_into_view(&self) {
+        let selected = self.state.session_view.selected_model;
+        // ScrollHandle indexes the model rows only; group heading indexes are
+        // added after each row so the first row is always ix 0.
+        self.model_scroll.scroll_to_item(selected);
+    }
+
+    fn fork_message(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.can_change_session() || !self.state.session_view.available {
+            return;
+        }
+        self.pending_command = true;
+        self.queue(CommandMessage::ForkMessage(id));
+        cx.notify();
+    }
+
+    fn switch_branch(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.can_change_session() || !self.state.session_view.available {
+            return;
+        }
+        self.pending_command = true;
+        self.queue(CommandMessage::SwitchBranch(id));
+        cx.notify();
+    }
+
+    fn add_attached_images(
+        &mut self,
+        images: Result<Vec<ImageAttachment>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_change_session() || self.state.active_session.is_none() {
+            return;
+        }
+        match images {
+            Ok(mut new_images) => {
+                let combined = self.composer_images.len() + new_images.len();
+                let total_bytes: usize = self
+                    .composer_images
+                    .iter()
+                    .chain(new_images.iter())
+                    .map(|image| image.size)
+                    .sum();
+                if combined > 4 || total_bytes > zeta_gui::session::MAX_IMAGE_BYTES {
+                    self.composer_image_error =
+                        Some("attach at most 4 images, totaling 512 KiB".into());
+                } else {
+                    self.composer_images.append(&mut new_images);
+                    self.composer_image_error = None;
+                }
+            }
+            Err(error) => self.composer_image_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn remove_attached_image(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.composer_images.len() {
+            self.composer_images.remove(index);
+            self.composer_image_error = None;
+            cx.notify();
+        }
+    }
+
+    fn attach_from_files(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_change_session() || self.state.active_session.is_none() {
+            return;
+        }
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: None,
+        });
+        cx.spawn(async move |view, cx| {
+            let selection = match paths.await {
+                Ok(Ok(Some(paths))) => paths,
+                _ => return,
+            };
+            let images: Result<Vec<ImageAttachment>, String> = selection
+                .iter()
+                .map(|path| ImageAttachment::from_path(path))
+                .collect();
+            let _ = view.update(cx, |view, cx| view.add_attached_images(images, cx));
+        })
+        .detach();
+    }
+
+    fn attach_from_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        for entry in item.entries() {
+            match entry {
+                gpui::ClipboardEntry::Image(image) => {
+                    let name = format!("pasted-image.{}", image.format.extension());
+                    self.add_attached_images(
+                        ImageAttachment::from_bytes(name, image.bytes()).map(|image| vec![image]),
+                        cx,
+                    );
+                    return true;
+                }
+                gpui::ClipboardEntry::ExternalPaths(paths) => {
+                    let images: Result<Vec<ImageAttachment>, String> = paths
+                        .paths()
+                        .iter()
+                        .map(|path| ImageAttachment::from_path(path))
+                        .collect();
+                    self.add_attached_images(images, cx);
+                    return true;
+                }
+                gpui::ClipboardEntry::String(_) => {}
+            }
+        }
+        false
     }
 
     fn reconnect(&mut self, cx: &mut Context<Self>) {
@@ -377,7 +614,203 @@ impl ZetaView {
         }
     }
 
-    fn render_row(&self, index: usize, cx: &App) -> gpui::AnyElement {
+    fn paste_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // Intercept image pastes before the Kit textarea consumes Cmd+V as text.
+        // Text pastes fall through untouched.
+        if event.keystroke.key != "v" {
+            return;
+        }
+        let modifiers = &event.keystroke.modifiers;
+        if !(modifiers.platform || modifiers.control) {
+            return;
+        }
+        if self.attach_from_clipboard(cx) {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn settings_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings_open {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => self.close_settings(cx),
+            "up" => self.move_settings_model(-1, cx),
+            "down" => self.move_settings_model(1, cx),
+            "enter" => self.apply_settings(cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn render_settings_overlay(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let view = &self.state.session_view;
+        let providers = &view.model_providers;
+        let group_of = |model: &str| providers.get(model).cloned().unwrap_or_default();
+        let mut current_group: Option<String> = None;
+        let selected = view.selected_model;
+        // The scrollable container's ScrollHandle indexes ALL of its children,
+        // including group headings. Precompute each model row's child index so
+        // scroll_to_item lands on the selected model regardless of grouping.
+        let mut model_child_indices = Vec::with_capacity(view.models.len());
+        {
+            let mut child_index = 0;
+            let mut group: Option<String> = None;
+            for model in &view.models {
+                let g = group_of(model);
+                if group.as_deref() != Some(g.as_str()) && !g.is_empty() {
+                    group = Some(g);
+                    child_index += 1;
+                }
+                model_child_indices.push(child_index);
+                child_index += 1;
+            }
+        }
+        if let Some(child_ix) = model_child_indices.get(selected).copied() {
+            self.model_scroll.scroll_to_item(child_ix);
+        }
+        let mut list = div()
+            .id("model-list")
+            .debug_selector(|| "model-list".into())
+            .v_flex()
+            .flex_1()
+            .min_h_0()
+            .max_h(px(280.))
+            .overflow_y_scroll()
+            .track_scroll(&self.model_scroll);
+        for (index, model) in view.models.iter().enumerate() {
+            let group = group_of(model);
+            if current_group.as_deref() != Some(group.as_str()) && !group.is_empty() {
+                current_group = Some(group.clone());
+                list = list.child(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .pb_1()
+                        .text_size(px(11.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(group),
+                );
+            }
+            list = list.child(
+                Button::new(("model", index))
+                    .debug_selector(move || format!("model-row-{index}"))
+                    .ghost()
+                    .selected(index == selected)
+                    .w_full()
+                    .h(px(32.))
+                    .child(
+                        div()
+                            .h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(div().flex_1().min_w_0().truncate().child(model.clone()))
+                            .when(model == &view.current_model, |row| {
+                                row.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("current"),
+                                )
+                            }),
+                    )
+                    .on_click(
+                        cx.listener(move |view, _, _, cx| view.select_settings_model(index, cx)),
+                    ),
+            );
+        }
+        let mode_row = div()
+            .h_flex()
+            .gap_2()
+            .children(APPROVAL_MODES.iter().enumerate().map(|(index, mode)| {
+                Button::new(("mode", index))
+                    .debug_selector(|| "mode-row".into())
+                    .ghost()
+                    .selected(view.selected_mode == index)
+                    .label(mode.to_string())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.state.session_view.selected_mode = index;
+                        cx.notify();
+                    }))
+            }));
+        let pending = self.pending_command;
+        let error = self.settings_error.clone();
+        div()
+            .absolute()
+            .inset_0()
+            .debug_selector(|| "settings-overlay".into())
+            .occlude()
+            .bg(gpui::black().opacity(0.55))
+            .h_flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .v_flex()
+                    .w(px(520.))
+                    .max_h(px(560.))
+                    .p_5()
+                    .gap_3()
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_size(px(18.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("Session settings"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Model"),
+                    )
+                    .child(list)
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Approval mode"),
+                    )
+                    .child(mode_row)
+                    .when_some(error, |dialog, error| {
+                        dialog.child(Alert::error("settings-error", error))
+                    })
+                    .child(
+                        div()
+                            .h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("settings-close")
+                                    .debug_selector(|| "settings-close".into())
+                                    .ghost()
+                                    .label("Close")
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.close_settings(cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("settings-apply")
+                                    .debug_selector(|| "settings-apply".into())
+                                    .primary()
+                                    .label(if pending { "Applying…" } else { "Apply" })
+                                    .disabled(pending)
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.apply_settings(cx)),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_row(&self, index: usize, view: gpui::WeakEntity<Self>, cx: &App) -> gpui::AnyElement {
         let row = div()
             .debug_selector(|| "transcript-row".into())
             .w_full()
@@ -385,22 +818,75 @@ impl ZetaView {
             .px_6()
             .py_3();
         match &self.state.transcript[index] {
-            TranscriptEntry::User(text) => row
-                .child(
-                    div()
-                        .mb_2()
-                        .text_size(px(12.))
-                        .text_color(cx.theme().muted_foreground)
-                        .child("you"),
-                )
-                .child(
-                    div()
-                        .pl_3()
-                        .border_l_2()
-                        .border_color(cx.theme().primary)
-                        .child(text.clone()),
-                )
-                .into_any_element(),
+            TranscriptEntry::User(text) => {
+                let fork_id = self
+                    .state
+                    .session_view
+                    .available
+                    .then(|| self.state.session_view.message_ids.get(&index).cloned())
+                    .flatten();
+                let group = format!("user-row-{index}");
+                row.group(group.clone())
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .justify_between()
+                            .mb_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("you"),
+                            )
+                            .when_some(fork_id, |header, id| {
+                                let click_id = id.clone();
+                                let click_view = view.clone();
+                                header.child(
+                                    Button::new(("fork", index))
+                                        .debug_selector(move || format!("fork-button-{index}"))
+                                        .ghost()
+                                        .label("Fork here")
+                                        // Hover-reveal keeps the affordance out of
+                                        // the row's default reading order.
+                                        .opacity(0.)
+                                        .group_hover(group.clone(), |style| style.opacity(1.))
+                                        .on_click(move |_, _, cx| {
+                                            let id = click_id.clone();
+                                            let _ = click_view
+                                                .update(cx, |view, cx| view.fork_message(id, cx));
+                                        }),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .pl_3()
+                            .border_l_2()
+                            .border_color(cx.theme().primary)
+                            .child(text.clone()),
+                    )
+                    .children(
+                        self.state
+                            .session_view
+                            .attachments
+                            .get(&index)
+                            .map(|attachments| {
+                                div().h_flex().flex_wrap().gap_2().mt_2().children(
+                                    attachments.iter().map(|(name, size)| {
+                                        div()
+                                            .debug_selector(|| "attachment-chip".into())
+                                            .px_2()
+                                            .py_1()
+                                            .text_size(px(12.))
+                                            .bg(cx.theme().muted)
+                                            .child(format!("{name} · {size} bytes"))
+                                    }),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            }
             TranscriptEntry::Assistant(doc) => row
                 .child(
                     div()
@@ -442,10 +928,11 @@ impl Render for ZetaView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let can_send = self.can_change_session() && self.state.active_session.is_some();
         let view = cx.entity();
+        let row_view = view.downgrade();
         let transcript = MessageScroller::new(
             "transcript",
             self.transcript.clone(),
-            move |index, _, cx| view.read(cx).render_row(index, cx),
+            move |index, _, cx| view.read(cx).render_row(index, row_view.clone(), cx),
         )
         .with_row_style(gpui::StyleRefinement::default().pb_0())
         .flex_1()
@@ -516,6 +1003,40 @@ impl Render for ZetaView {
                     // The kit emits PressEnter and propagates its action. Consume it
                     // here so native text input cannot insert a newline after submit.
                     .on_action(|_: &gpui_kit::component::input::Enter, _, _| {})
+                    .when(!self.composer_images.is_empty(), |composer| {
+                        composer.child(
+                            div().h_flex().flex_wrap().gap_2().children(
+                                self.composer_images
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, image)| {
+                                        div()
+                                            .h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(cx.theme().muted)
+                                            .text_size(px(12.))
+                                            .debug_selector(|| "composer-chip".into())
+                                            .child(format!("{} · {} bytes", image.name, image.size))
+                                            .child(
+                                                Button::new(("chip-remove", index))
+                                                    .ghost()
+                                                    .label("Remove")
+                                                    .on_click(cx.listener(
+                                                        move |view, _, _, cx| {
+                                                            view.remove_attached_image(index, cx)
+                                                        },
+                                                    )),
+                                            )
+                                    }),
+                            ),
+                        )
+                    })
+                    .when_some(self.composer_image_error.clone(), |composer, error| {
+                        composer.child(Alert::error("image-error", error))
+                    })
                     .child(
                         Textarea::new(&self.composer)
                             .h(px(96.))
@@ -534,12 +1055,33 @@ impl Render for ZetaView {
                                     .child(self.composer_hint()),
                             )
                             .child(
-                                Button::new("send")
-                                    .primary()
-                                    .label("Send")
-                                    .disabled(!can_send)
-                                    .h(px(40.))
-                                    .on_click(cx.listener(|view, _, _, cx| view.send_composer(cx))),
+                                div()
+                                    .h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("attach")
+                                            .debug_selector(|| "attach-button".into())
+                                            .ghost()
+                                            .label("Attach image")
+                                            .disabled(!can_send)
+                                            .h(px(40.))
+                                            .on_click(cx.listener(|view, _, window, cx| {
+                                                view.attach_from_files(window, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("send")
+                                            .debug_selector(|| "send-button".into())
+                                            .primary()
+                                            .label("Send")
+                                            .disabled(!can_send)
+                                            .h(px(40.))
+                                            .on_click(
+                                                cx.listener(|view, _, _, cx| {
+                                                    view.send_composer(cx)
+                                                }),
+                                            ),
+                                    ),
                             ),
                     ),
             )
@@ -565,6 +1107,8 @@ impl Render for ZetaView {
             .font_family("JetBrains Mono")
             .text_size(px(14.))
             .on_key_down(cx.listener(Self::control_key))
+            .capture_key_down(cx.listener(Self::settings_key))
+            .capture_key_down(cx.listener(Self::paste_key))
             .child(
                 div()
                     .h_flex()
@@ -574,6 +1118,9 @@ impl Render for ZetaView {
                     .child(main),
             )
             .child(self.dialogs.clone())
+            .when(self.settings_open, |view| {
+                view.child(self.render_settings_overlay(cx))
+            })
     }
 }
 

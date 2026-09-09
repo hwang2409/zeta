@@ -102,6 +102,9 @@ impl ZetaView {
         .track_scroll(&self.sidebar_scroll)
         .flex_1()
         .min_h_0();
+        let can_open_settings = self.can_change_session()
+            && self.state.session_view.available
+            && self.state.active_session.is_some();
         div()
             .v_flex()
             .w(px(280.))
@@ -114,11 +117,25 @@ impl ZetaView {
             .border_color(cx.theme().border)
             .child(
                 div()
+                    .h_flex()
+                    .items_center()
+                    .justify_between()
                     .px_3()
                     .py_4()
-                    .text_size(px(20.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("zeta"),
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("zeta"),
+                    )
+                    .child(
+                        Button::new("settings")
+                            .debug_selector(|| "settings-button".into())
+                            .ghost()
+                            .label("Settings")
+                            .disabled(!can_open_settings)
+                            .on_click(cx.listener(|view, _, _, cx| view.open_settings(cx))),
+                    ),
             )
             .child(
                 Button::new("new-session")
@@ -143,5 +160,71 @@ impl ZetaView {
                 )
             })
             .child(sessions)
+            .children(self.render_branches(cx))
+    }
+
+    pub fn render_branches(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.state.session_view.available || self.state.session_view.branches.is_empty() {
+            return None;
+        }
+        let can_switch = self.can_change_session();
+        let heading = div()
+            .px_3()
+            .pt_3()
+            .pb_1()
+            .text_size(px(11.))
+            .text_color(cx.theme().muted_foreground)
+            .child("Branches");
+        let mut section = div()
+            .id("branches-list")
+            .v_flex()
+            .flex_shrink_0()
+            .max_h(px(200.))
+            .overflow_y_scroll()
+            .child(heading);
+        for branch in &self.state.session_view.branches {
+            let id = branch.id.clone();
+            let label = branch.label.clone();
+            let current = branch.current;
+            let depth = branch.depth.min(8);
+            section = section.child(
+                Button::new(format!("branch-{id}"))
+                    .debug_selector({
+                        let id = id.clone();
+                        move || format!("branch-row-{id}")
+                    })
+                    .ghost()
+                    .selected(current)
+                    .disabled(!can_switch || current)
+                    .w_full()
+                    .h(px(32.))
+                    .child(
+                        div()
+                            .h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(div().w(px((depth * 12) as f32)).flex_shrink_0())
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(if current {
+                                        cx.theme().primary
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    })
+                                    .child(if current { "*" } else { "-" }),
+                            )
+                            .child(div().flex_1().min_w_0().truncate().child(label)),
+                    )
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        if !current {
+                            view.switch_branch(id.clone(), cx);
+                        }
+                    })),
+            );
+        }
+        Some(section)
     }
 }
