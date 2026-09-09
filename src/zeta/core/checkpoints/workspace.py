@@ -528,14 +528,17 @@ class WorkspaceSnapshotStore:
 
     @property
     def corruption_message(self) -> str:
-        if any(
-            self.resolve_restore_target(snapshot).status == "restorable"
-            for snapshot in self._snapshots
-        ):
-            return SNAPSHOT_CORRUPTION_MESSAGE
+        target = self.undo_target()
+        target_note = ""
+        if target is not None:
+            resolution = self.resolve_restore_target(target)
+            if resolution.status == "restorable":
+                return SNAPSHOT_CORRUPTION_MESSAGE
+            target_note = f"undo target {target.id} is {resolution.status}; "
         return (
-            "workspace snapshot state is corrupt; no valid workspace snapshot "
-            "is available; use /checkpoint --reset to archive the corrupt "
+            f"workspace snapshot state is corrupt; {target_note}"
+            "no valid workspace snapshot is available for undo; "
+            "use /checkpoint --reset to archive the corrupt "
             "manifest and reset snapshot state"
         )
 
@@ -586,7 +589,7 @@ class WorkspaceSnapshotStore:
                 cwd=self.session_dir,
                 env=env,
             )
-        except (WorkspaceSnapshotError, OSError) as exc:
+        except (WorkspaceSnapshotError, OSError, ValueError) as exc:
             return WorkspaceRestoreResolution("damaged", reason=str(exc))
         return WorkspaceRestoreResolution("restorable", repo_root=repo_root, tree_sha=tree)
 
