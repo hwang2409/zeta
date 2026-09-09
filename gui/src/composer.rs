@@ -146,21 +146,26 @@ impl Composer {
         window.show_character_palette();
     }
 
-    fn add_image(
+    fn add_images(
         &mut self,
-        image: Result<zeta_gui::session::ImageAttachment, String>,
+        images: Result<Vec<zeta_gui::session::ImageAttachment>, String>,
         cx: &mut Context<Self>,
     ) {
         if !self.enabled || !self.images_enabled {
             return;
         }
-        match image {
-            Ok(image)
-                if self.images.len() < 4
-                    && self.images.iter().map(|item| item.size).sum::<usize>() + image.size
+        match images {
+            Ok(images)
+                if self.images.len() + images.len() <= 4
+                    && self
+                        .images
+                        .iter()
+                        .chain(&images)
+                        .map(|item| item.size)
+                        .sum::<usize>()
                         <= zeta_gui::session::MAX_IMAGE_BYTES =>
             {
-                self.images.push(image);
+                self.images.extend(images);
                 self.image_error = None;
             }
             Ok(_) => self.image_error = Some("attach at most 4 images, totaling 512 KiB".into()),
@@ -171,9 +176,19 @@ impl Composer {
 
     fn drop_images(&mut self, paths: &gpui::ExternalPaths, _: &mut Window, cx: &mut Context<Self>) {
         if self.enabled && self.images_enabled {
-            for path in &paths.0 {
-                self.add_image(zeta_gui::session::ImageAttachment::from_path(path), cx);
+            if self.images.len() + paths.0.len() > 4 {
+                self.image_error = Some("attach at most 4 images, totaling 512 KiB".into());
+                cx.notify();
+                return;
             }
+            self.add_images(
+                paths
+                    .0
+                    .iter()
+                    .map(|path| zeta_gui::session::ImageAttachment::from_path(path))
+                    .collect(),
+                cx,
+            );
         }
     }
 
@@ -185,11 +200,12 @@ impl Composer {
             for entry in item.entries() {
                 match entry {
                     gpui::ClipboardEntry::Image(image) => {
-                        self.add_image(
+                        self.add_images(
                             zeta_gui::session::ImageAttachment::from_bytes(
-                                "pasted-image.png".into(),
+                                format!("pasted-image.{}", image.format.extension()),
                                 &image.bytes,
-                            ),
+                            )
+                            .map(|image| vec![image]),
                             cx,
                         );
                         return;
@@ -1165,6 +1181,81 @@ mod tests {
 #[cfg(test)]
 mod attachment_tests {
     use super::*;
+
+    #[gpui::test]
+    fn pasted_image_names_follow_clipboard_format(cx: &mut gpui::TestAppContext) {
+        let window = cx.add_window(|_, cx| Composer::new(cx));
+        for (format, bytes, name) in [
+            (
+                gpui::ImageFormat::Png,
+                b"\x89PNG\r\n\x1a\n".as_slice(),
+                "pasted-image.png",
+            ),
+            (
+                gpui::ImageFormat::Jpeg,
+                b"\xff\xd8\xff".as_slice(),
+                "pasted-image.jpg",
+            ),
+            (
+                gpui::ImageFormat::Gif,
+                b"GIF89a".as_slice(),
+                "pasted-image.gif",
+            ),
+            (
+                gpui::ImageFormat::Webp,
+                b"RIFF\x04\x00\x00\x00WEBP".as_slice(),
+                "pasted-image.webp",
+            ),
+        ] {
+            window
+                .update(cx, |composer, window, cx| {
+                    composer.images_enabled = true;
+                    composer.images.clear();
+                    cx.write_to_clipboard(ClipboardItem::new_image(&gpui::Image::from_bytes(
+                        format,
+                        bytes.to_vec(),
+                    )));
+                    composer.paste(&Paste, window, cx);
+                    assert_eq!(composer.images[0].name, name);
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn failed_drop_preserves_the_previous_batch(cx: &mut gpui::TestAppContext) {
+        let directory = std::env::temp_dir().join(format!("zeta-95-batch-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let good = directory.join("good.png");
+        let bad = directory.join("bad.png");
+        std::fs::write(&good, b"\x89PNG\r\n\x1a\n").unwrap();
+        let paths = gpui::ExternalPaths([good.clone(), bad.clone()].into_iter().collect());
+        let window = cx.add_window(|_, cx| Composer::new(cx));
+        window
+            .update(cx, |composer, window, cx| {
+                composer.images_enabled = true;
+                let previous = zeta_gui::session::ImageAttachment::from_path(&good).unwrap();
+                composer.images.push(previous.clone());
+                // A missing second file, then invalid bytes, must preserve the first batch.
+                for contents in [None, Some(b"invalid".as_slice())] {
+                    if let Some(contents) = contents {
+                        std::fs::write(&bad, contents).unwrap();
+                    }
+                    composer.drop_images(&paths, window, cx);
+                    assert_eq!(composer.images, vec![previous.clone()]);
+                    assert!(composer.image_error.is_some());
+                }
+                std::fs::write(&bad, b"\x89PNG\r\n\x1a\n").unwrap();
+                composer.drop_images(&paths, window, cx);
+                assert_eq!(composer.images.len(), 3);
+                assert!(composer.image_error.is_none());
+                composer.drop_images(&paths, window, cx);
+                assert_eq!(composer.images.len(), 3);
+                assert!(composer.image_error.is_some());
+            })
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[gpui::test]
     fn file_drop_obeys_size_limits_and_protocol_gate(cx: &mut gpui::TestAppContext) {

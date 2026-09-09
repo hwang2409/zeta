@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
+import shutil
+import unicodedata
 from pathlib import Path
 from uuid import uuid4
 
@@ -29,7 +32,13 @@ EXTENSION_REQUESTS = [
     "send_images",
 ]
 MAX_IMAGE_BYTES = 512 * 1024
-IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+IMAGE_EXTENSIONS = {
+    "image/png": {".png"},
+    "image/jpeg": {".jpg", ".jpeg"},
+    "image/gif": {".gif"},
+    "image/webp": {".webp"},
+}
+DIRECTION_CONTROLS = "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
 
 
 def active(runtime: ServerRuntime, params: dict):
@@ -152,16 +161,17 @@ def image_message(runtime: ServerRuntime, params: dict) -> Message:
             not isinstance(name, str)
             or not name
             or len(name) > 128
-            or Path(name).name != name
+            or "/" in name
+            or "\\" in name
             or name in {".", ".."}
-            or any(ord(c) < 32 for c in name)
+            or any(unicodedata.category(c) == "Cc" or c in DIRECTION_CONTROLS for c in name)
         ):
             raise ProtocolError(
                 -32602, "image name must be a filename of at most 128 characters"
             )
         if (
             not isinstance(mime, str)
-            or mime not in IMAGE_TYPES
+            or mime not in IMAGE_EXTENSIONS
             or not isinstance(data, str)
         ):
             raise ProtocolError(-32602, "unsupported image type or data")
@@ -176,19 +186,31 @@ def image_message(runtime: ServerRuntime, params: dict) -> Message:
             raise ProtocolError(-32602, "images exceed 512 KiB")
         if not raw or not image_signature_matches(mime, raw):
             raise ProtocolError(-32602, "image signature does not match its type")
+        if Path(name).suffix.lower() not in IMAGE_EXTENSIONS[mime]:
+            raise ProtocolError(-32602, "image extension does not match its type")
         decoded.append((name, mime, data, raw))
     blocks = [TextContent(text)]
-    written = []
+    directories = []
+    attachments = runtime.opened.store.session_dir / "attachments"
+    attachments_existed = attachments.exists()
     try:
         for name, mime, data, raw in decoded:
-            directory = runtime.opened.store.session_dir / "attachments" / uuid4().hex
+            directory = attachments / uuid4().hex
+            directories.append(directory)
             directory.mkdir(parents=True, mode=0o700)
             path = directory / name
-            path.write_bytes(raw)
-            written.append(path)
+            temporary = directory / ".image.tmp"
+            with temporary.open("xb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
             blocks.append(ImageContent(data, mime, str(path), len(raw)))
-    except OSError:
-        for path in written:
-            path.unlink(missing_ok=True)
+    except Exception:
+        for directory in directories:
+            if directory.exists():
+                shutil.rmtree(directory)
+        if not attachments_existed and attachments.exists():
+            attachments.rmdir()
         raise
     return Message(MessageRole.USER, blocks)

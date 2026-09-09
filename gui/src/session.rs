@@ -29,6 +29,17 @@ pub struct ImageAttachment {
 impl ImageAttachment {
     pub fn from_bytes(name: String, bytes: &[u8]) -> Result<Self, String> {
         use base64::Engine;
+        if name.is_empty()
+            || name.chars().count() > 128
+            || name == "."
+            || name == ".."
+            || name.chars().any(|c| {
+                c.is_control()
+                    || matches!(c, '/' | '\\' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            })
+        {
+            return Err("image name must be a filename of at most 128 characters".into());
+        }
         if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
             return Err("images must be between 1 byte and 512 KiB".into());
         }
@@ -43,6 +54,20 @@ impl ImageAttachment {
         } else {
             return Err("choose a PNG, JPEG, GIF, or WebP image".into());
         };
+        let extension = std::path::Path::new(&name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(
+            (mime_type, extension.as_str()),
+            ("image/png", "png")
+                | ("image/jpeg", "jpg" | "jpeg")
+                | ("image/gif", "gif")
+                | ("image/webp", "webp")
+        ) {
+            return Err("image extension does not match its type".into());
+        }
         Ok(Self {
             name,
             mime_type: mime_type.into(),
@@ -81,4 +106,50 @@ pub struct SessionView {
     pub selected_model: usize,
     pub selected_mode: usize,
     pub settings_field: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_names_reject_paths_controls_and_false_extensions() {
+        let png = b"\x89PNG\r\n\x1a\n";
+        for name in [
+            "",
+            ".",
+            "..",
+            "../bad.png",
+            "..\\bad.png",
+            "bad/path.png",
+            "bad\\path.png",
+            "bad.jpg",
+            "bad",
+            "bad.png.exe",
+            "bad\u{7f}.png",
+        ] {
+            assert!(
+                ImageAttachment::from_bytes(name.into(), png).is_err(),
+                "{name:?}"
+            );
+        }
+        for control in "\u{061c}\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}".chars() {
+            assert!(ImageAttachment::from_bytes(format!("bad{control}.png"), png).is_err());
+        }
+        for (bytes, names) in [
+            (png.as_slice(), vec!["safe.PNG", "写真.png"]),
+            (b"\xff\xd8\xff".as_slice(), vec!["safe.jpg", "safe.JPEG"]),
+            (b"GIF89a".as_slice(), vec!["safe.gif"]),
+            (b"RIFF\x04\x00\x00\x00WEBP".as_slice(), vec!["safe.webp"]),
+        ] {
+            for name in names {
+                assert_eq!(
+                    ImageAttachment::from_bytes(name.into(), bytes)
+                        .unwrap()
+                        .name,
+                    name
+                );
+            }
+        }
+    }
 }

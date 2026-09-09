@@ -1130,3 +1130,167 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
         assert SessionManager(tmp_path).open(sid).store.messages()[0] == message
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("failure", [None, "backend", "metadata"])
+async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, failure):
+    from zeta.core.slash import MODEL_CONTEXT_WINDOWS
+
+    monkeypatch.setitem(MODEL_CONTEXT_WINDOWS, "fake", {"offline": 1_050_000, "faster": 400_000})
+    if pinned:
+        (tmp_path / "settings.toml").write_text("token_budget = 123456\n")
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    runtime = server.runtime
+    metadata_before = runtime.metadata.to_dict()
+    old_budget = 123456 if pinned else 1_050_000
+    assert runtime.loop.context_assembler.token_budget == old_budget
+    try:
+        with monkeypatch.context() as patch:
+            if failure == "backend":
+                original = runtime.loop.set_model
+
+                def fail_model(model):
+                    original(model)
+                    if model == "faster":
+                        raise OSError("partial backend change")
+
+                patch.setattr(runtime.loop, "set_model", fail_model)
+            elif failure == "metadata":
+                import zeta.core.session as session_module
+                original = session_module.os.replace
+
+                def fail_metadata(source, destination):
+                    if Path(destination).name == "meta.json":
+                        raise OSError("metadata persistence failed")
+                    return original(source, destination)
+
+                patch.setattr(session_module.os, "replace", fail_metadata)
+            response = (await _request(reader, writer, "settings", "set_settings", {
+                "session_id": sid, "model": "faster", "approval_mode": "deny",
+            }))[-1]
+        if failure:
+            assert response["error"]["code"] == -32000
+            assert runtime.metadata.to_dict() == metadata_before
+            assert runtime.loop.backend.model == "offline"
+            assert runtime.loop.context_assembler.token_budget == old_budget
+            assert runtime.policy.default.value == "ask"
+            assert SessionManager(tmp_path).open(sid).metadata.to_dict() == metadata_before
+        else:
+            assert response["result"] == {"model": "faster", "approval_mode": "deny"}
+            expected_budget = 123456 if pinned else 400_000
+            assert runtime.loop.context_assembler.token_budget == expected_budget
+            assert runtime.metadata.compaction_budget == expected_budget
+            assert runtime.metadata.budget_pinned == pinned
+            assert SessionManager(tmp_path).open(sid).metadata.compaction_budget == expected_budget
+            await _request(reader, writer, "resume", "resume", {"session_id": sid})
+            assert runtime.loop.context_assembler.token_budget == expected_budget
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_image_names_match_verified_types(tmp_path):
+    import base64
+
+    from zeta.server.ergonomics import DIRECTION_CONTROLS, image_message
+    from zeta.server.protocol import ProtocolError
+    from zeta.server.runtime import ServerRuntime
+
+    runtime = ServerRuntime(tmp_path, provider="fake")
+    await runtime.create_session()
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    item = {"name": "safe.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
+    invalid_names = ["../bad.png", "..\\bad.png", "bad/path.png", "bad\\path.png", "bad.jpg", "bad", "bad.png.exe", "bad\x7f.png"]
+    invalid_names += [f"bad{control}.png" for control in DIRECTION_CONTROLS]
+    try:
+        for name in invalid_names:
+            with pytest.raises(ProtocolError):
+                image_message(runtime, {"images": [{**item, "name": name}]})
+        attachments = runtime.opened.store.session_dir / "attachments"
+        assert not attachments.exists()
+        for mime, raw, names in [
+            ("image/png", png, ["safe.PNG", "写真.png"]),
+            ("image/jpeg", b"\xff\xd8\xff\xe0", ["safe.jpg", "safe.JPEG"]),
+            ("image/gif", b"GIF89a\x01\x00\x01\x00", ["safe.gif"]),
+            ("image/webp", b"RIFF" + (22).to_bytes(4, "little") + b"WEBPVP8X" + (10).to_bytes(4, "little") + bytes(10), ["safe.webp"]),
+        ]:
+            for name in names:
+                message = image_message(runtime, {"images": [{"name": name, "mime_type": mime, "data": base64.b64encode(raw).decode()}]})
+                assert Path(message.content[1].path).name == name
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["write", "flush", "replace"])
+@pytest.mark.parametrize("fail_at", [1, 2])
+@pytest.mark.parametrize("existing", [False, True])
+async def test_attachment_failure_removes_entire_batch(tmp_path, monkeypatch, failure, fail_at, existing):
+    import base64
+    from contextlib import contextmanager
+
+    from zeta.server import ergonomics
+    from zeta.server.runtime import ServerRuntime
+
+    runtime = ServerRuntime(tmp_path, provider="fake")
+    await runtime.create_session()
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    item = {"name": "same.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
+    attachments = runtime.opened.store.session_dir / "attachments"
+    if existing:
+        ergonomics.image_message(runtime, {"images": [item]})
+    before = set(attachments.rglob("*"))
+    original_open = Path.open
+    original_replace = ergonomics.os.replace
+    writes = 0
+    replacements = 0
+
+    @contextmanager
+    def failing_open(path, *args, **kwargs):
+        nonlocal writes
+        with original_open(path, *args, **kwargs) as handle:
+            if path.name == ".image.tmp" and args == ("xb",):
+                writes += 1
+                if writes == fail_at:
+                    if failure == "write":
+                        def fail_write(raw):
+                            handle.write(raw[:4])
+                            handle.flush()
+                            raise OSError("mid-write failure")
+                        from unittest.mock import Mock
+                        wrapper = Mock(wraps=handle)
+                        wrapper.write.side_effect = fail_write
+                        yield wrapper
+                        return
+                    if failure == "flush":
+                        from unittest.mock import Mock
+                        wrapper = Mock(wraps=handle)
+                        wrapper.flush.side_effect = OSError("flush failure")
+                        yield wrapper
+                        return
+            yield handle
+
+    def failing_replace(source, destination):
+        nonlocal replacements
+        assert Path(source).read_bytes() == png
+        assert not Path(destination).exists()
+        replacements += 1
+        if failure == "replace" and replacements == fail_at:
+            raise OSError("replace failure")
+        return original_replace(source, destination)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "open", failing_open)
+            patch.setattr(ergonomics.os, "replace", failing_replace)
+            with pytest.raises(OSError):
+                ergonomics.image_message(runtime, {"images": [item, item]})
+        assert attachments.exists() == existing
+        assert set(attachments.rglob("*")) == before
+        assert all(path.read_bytes() == png for path in before if path.is_file())
+        assert runtime.opened.store.messages() == []
+    finally:
+        await runtime.close()

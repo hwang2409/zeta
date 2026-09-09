@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
+from ..core.slash import resolve_session_budget
 from ..types import StreamEvent, StreamEventType, TextContent
 from . import ergonomics
 from .protocol import (
@@ -389,10 +390,21 @@ class _Client:
             if model not in ergonomics.catalog(runtime)["models"] or mode not in {"ask", "allow", "deny"}:
                 raise ProtocolError(-32602, "invalid model or approval mode")
             previous = runtime.model
-            runtime.loop.set_model(model)
+            assembler = runtime.loop.context_assembler
+            previous_budget = assembler.token_budget
+            budget, _ = resolve_session_budget(
+                runtime.metadata.compaction_budget,
+                runtime.metadata.budget_pinned,
+                runtime.provider,
+                model,
+                None,
+            )
             try:
-                runtime.manager.record_session_settings(runtime.metadata, model=model, approval_mode=mode)
+                runtime.loop.set_model(model)
+                assembler.token_budget = budget
+                runtime.manager.record_session_settings(runtime.metadata, model=model, approval_mode=mode, budget=budget)
             except Exception:
+                assembler.token_budget = previous_budget
                 runtime.loop.set_model(previous)
                 raise
             runtime.policy.default = ApprovalDecision(mode)
