@@ -65,6 +65,12 @@ impl Peer {
         self.write(json!({"jsonrpc":"2.0", "method":"event", "params":event}));
     }
 
+    fn boundary(&mut self, event: Value) {
+        let running = event["event"] == "turn_end";
+        self.event(event);
+        self.status(true, if running { "running" } else { "idle" }, json!([]));
+    }
+
     fn hello(&mut self) {
         let request = self.respond("hello", json!({"protocol_version":"1.0", "server":"zeta", "capabilities":{"requests":["list_sessions","new_session","resume","send","steer","approve","deny","abort","status"],"notifications":["event"]}}));
         assert_eq!(request["params"]["protocol_version"], "1.0");
@@ -143,7 +149,18 @@ impl Harness {
 
     fn event(&self) -> ServerEvent {
         match self.next() {
-            WorkerMessage::Event(event) => event,
+            WorkerMessage::Event(event) => {
+                if matches!(
+                    event,
+                    ServerEvent::TurnEnd { .. }
+                        | ServerEvent::AgentEnd { .. }
+                        | ServerEvent::TurnAborted { .. }
+                        | ServerEvent::Error { .. }
+                ) {
+                    assert!(matches!(self.next(), WorkerMessage::Status(_)));
+                }
+                event
+            }
             other => panic!("expected event, got {other:?}"),
         }
     }
@@ -174,7 +191,11 @@ fn tool_turn_then_final_answer_and_terminal_error_preserve_order() {
             json!({"event":"tool_end","tool_call":call("one"),"tool_result":{"tool_call_id":"one","content":"ok","is_error":false},"data":{}}),
             json!({"event":"turn_end","data":{"turn":1,"tool_calls":1}}),
         ] {
-            peer.event(event);
+            if matches!(event["event"].as_str(), Some("turn_end" | "agent_end")) {
+                peer.boundary(event);
+            } else {
+                peer.event(event);
+            }
         }
         wait.recv_timeout(Duration::from_secs(5)).unwrap();
         for event in [
@@ -184,10 +205,14 @@ fn tool_turn_then_final_answer_and_terminal_error_preserve_order() {
             json!({"event":"turn_end","data":{"turn":2,"tool_calls":0}}),
             json!({"event":"agent_end","data":{}}),
         ] {
-            peer.event(event);
+            if matches!(event["event"].as_str(), Some("turn_end" | "agent_end")) {
+                peer.boundary(event);
+            } else {
+                peer.event(event);
+            }
         }
         peer.send();
-        peer.event(json!({"event":"error","error":{"code":"server_error","message":"provider failed"},"data":{}}));
+        peer.boundary(json!({"event":"error","error":{"code":"server_error","message":"provider failed"},"data":{}}));
         peer.respond("new_session", json!({"session":session()}));
         peer.status(true, "idle", json!([]));
         peer.wait_for_close();
@@ -241,7 +266,7 @@ fn tool_turn_then_final_answer_and_terminal_error_preserve_order() {
     }
     assert!(!state.streaming);
     assert!(
-        matches!(state.transcript.last(), Some(TranscriptEntry::Assistant(text)) if text == "final answer")
+        matches!(state.transcript.last(), Some(TranscriptEntry::Assistant(text)) if text.source.as_ref() == "final answer")
     );
     harness.command(CommandMessage::Send("fail".into()));
     assert!(matches!(harness.next(), WorkerMessage::Sent(_)));
@@ -275,6 +300,7 @@ fn live_abort_is_processed_between_continuous_events() {
         // The real server sends turn_aborted before its RPC acknowledgement.
         peer.event(json!({"event":"turn_aborted","data":{}}));
         peer.write(json!({"jsonrpc":"2.0","id":abort["id"],"result":{"aborted":true}}));
+        peer.status(true, "idle", json!([]));
         peer.respond("new_session", json!({"session":session()}));
         peer.status(true, "idle", json!([]));
         peer.wait_for_close();
@@ -340,7 +366,7 @@ fn reconnect_resumes_selected_session_and_restores_pending_approvals() {
         assert_eq!(request["params"]["session_id"], "session-1");
         peer.status(true, "idle", json!([]));
         peer.send();
-        peer.event(json!({"event":"agent_end","data":{}}));
+        peer.boundary(json!({"event":"agent_end","data":{}}));
         peer.wait_for_close();
     });
     harness.connected();
@@ -426,7 +452,7 @@ fn explicit_missing_session_is_rejected_without_losing_the_connection() {
         assert_eq!(request["params"]["session_id"], "missing");
         peer.write(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32602,"message":"session missing was not found"}}));
         peer.send();
-        peer.event(json!({"event":"agent_end","data":{}}));
+        peer.boundary(json!({"event":"agent_end","data":{}}));
         peer.wait_for_close();
     });
     harness.connected();
@@ -506,7 +532,7 @@ fn background_tool_events_do_not_block_a_foreground_send() {
         peer.event(json!({"event":"tool_start","tool_call":call("same-provider-id"),"data":{"agent_instance_id":"child-one"}}));
         peer.event(json!({"event":"tool_end","tool_call":call("same-provider-id"),"tool_result":null,"data":{"agent_instance_id":"child-one"}}));
         peer.send();
-        peer.event(json!({"event":"agent_end","data":{}}));
+        peer.boundary(json!({"event":"agent_end","data":{}}));
         peer.wait_for_close();
     });
     harness.connected();
@@ -548,7 +574,7 @@ fn old_session_events_queued_during_a_switch_do_not_leak_or_block_sends() {
         );
         peer.event(json!({"event":"assistant_delta","delta":"new text","kind":"assistant","session_id":"session-2"}));
         peer.respond("send", json!({"accepted":true,"session_id":"session-2"}));
-        peer.event(json!({"event":"agent_end","data":{},"session_id":"session-2"}));
+        peer.boundary(json!({"event":"agent_end","data":{},"session_id":"session-2"}));
         peer.wait_for_close();
     });
     harness.connected();
@@ -562,7 +588,9 @@ fn old_session_events_queued_during_a_switch_do_not_leak_or_block_sends() {
     state.apply(harness.event());
     assert_eq!(
         state.transcript,
-        vec![TranscriptEntry::Assistant("new text".into())]
+        vec![TranscriptEntry::Assistant(
+            zeta_gui::markdown::Markdown::streaming("new text".into())
+        )]
     );
     assert!(!state.streaming);
     assert!(state.approvals.is_empty());
@@ -593,7 +621,7 @@ fn approval_end_preserves_the_other_delegated_request_with_the_same_raw_id() {
             peer.status(true, "idle", remaining);
         }
         peer.send();
-        peer.event(json!({"event":"agent_end","data":{}}));
+        peer.boundary(json!({"event":"agent_end","data":{}}));
         peer.wait_for_close();
     });
     assert!(matches!(harness.next(), WorkerMessage::Sessions(_)));
@@ -637,7 +665,7 @@ fn oversized_send_is_rejected_without_losing_the_connection() {
         // Neither oversized request may reach this healthy socket.
         let request = peer.respond("send", json!({"accepted":true}));
         assert_eq!(request["params"]["text"], "short message");
-        peer.event(json!({"event":"agent_end","data":{}}));
+        peer.boundary(json!({"event":"agent_end","data":{}}));
         peer.wait_for_close();
     });
     harness.connected();
@@ -657,5 +685,262 @@ fn oversized_send_is_rejected_without_losing_the_connection() {
     harness.command(CommandMessage::Send("short message".into()));
     assert!(matches!(harness.next(), WorkerMessage::Sent(text) if text == "short message"));
     assert!(matches!(harness.event(), ServerEvent::AgentEnd { .. }));
+    harness.finish();
+}
+
+#[test]
+fn delegated_cards_keep_separate_tails_disclosure_and_failures() {
+    let harness = Harness::new(|listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([]));
+        for agent in [Value::Null, json!("child-one"), json!("child-two")] {
+            peer.event(json!({"event":"tool_start","tool_call":call("duplicate"),"data":{"agent_instance_id":agent}}));
+        }
+        for (agent, output, error) in [
+            (json!("child-two"), "failed child\n".repeat(30), true),
+            (Value::Null, "parent output\n".repeat(25), false),
+            (json!("child-one"), "first child output".into(), false),
+        ] {
+            peer.event(json!({"event":"tool_output","tool_call":call("duplicate"),"output":output,"data":{"agent_instance_id":agent}}));
+            peer.event(json!({"event":"tool_end","tool_call":call("duplicate"),"tool_result":{"tool_call_id":"duplicate","content":if agent.is_null() { "parent done" } else { &output },"is_error":error},"data":{"agent_instance_id":agent}}));
+        }
+        peer.wait_for_close();
+    });
+    harness.connected();
+    let mut state = AppState::default();
+    for _ in 0..3 {
+        state.apply(harness.event());
+    }
+    for entry in &state.transcript {
+        assert!(
+            matches!(entry, TranscriptEntry::Tool { complete: false, card, .. } if !card.expanded && card.tail.text.is_empty())
+        );
+    }
+    state.toggle_card(2);
+    for _ in 0..6 {
+        state.apply(harness.event());
+    }
+    for (index, expected, failed) in [
+        (0, "parent output", false),
+        (1, "first child output", false),
+        (2, "failed child", true),
+    ] {
+        let TranscriptEntry::Tool {
+            key,
+            complete,
+            error,
+            card,
+            summary,
+            ..
+        } = &state.transcript[index]
+        else {
+            panic!("missing tool");
+        };
+        assert_eq!(key.tool_call_id, "duplicate");
+        assert!(*complete);
+        assert_eq!(*error, failed);
+        assert!(card.tail.text.contains(expected));
+        assert_eq!(card.expanded, index == 2);
+        assert_eq!(card.agent_label.is_some(), index > 0);
+        if index == 0 {
+            assert_eq!(summary, "parent done");
+            assert!(card.tail.truncated);
+            assert!(card.tail.text.ends_with("parent done"));
+            assert_eq!(card.tail.text.lines().count(), zeta_gui::cards::TAIL_LINES);
+        }
+        if failed {
+            assert_eq!(summary, "failed child");
+            assert!(card.tail.truncated);
+            assert_eq!(card.tail.text.lines().count(), zeta_gui::cards::TAIL_LINES);
+        }
+    }
+    state.toggle_card(2);
+    assert!(matches!(&state.transcript[2], TranscriptEntry::Tool { card, .. } if !card.expanded));
+    harness.finish();
+}
+
+#[test]
+fn status_metrics_bind_only_at_boundaries_and_ignore_streamed_usage() {
+    let harness = Harness::new(|listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([]));
+        peer.send();
+        peer.event(json!({"event":"turn_start","data":{}}));
+        peer.event(json!({"event":"usage","usage":{"input_tokens":999,"output_tokens":999}}));
+        peer.event(json!({"event":"assistant_delta","kind":"assistant","delta":"hello"}));
+        peer.event(json!({"event":"turn_end","data":{}}));
+        // The next request must be status. No request is issued during deltas.
+        peer.respond("status", json!({"session":session(),"state":"running","usage":{"input_tokens":20,"output_tokens":10,"cache_read_input_tokens":60,"cache_creation_input_tokens":20}}));
+        peer.event(json!({"event":"agent_end","data":{}}));
+        peer.status(true, "idle", json!([]));
+        peer.wait_for_close();
+    });
+    assert!(matches!(harness.next(), WorkerMessage::Sessions(_)));
+    let mut state = AppState::default();
+    let WorkerMessage::Status(status) = harness.next() else {
+        panic!("missing status");
+    };
+    state.apply_status(status);
+    assert_eq!(state.metrics.model_label(), "offline");
+    assert_eq!(state.metrics.tokens_label(), "—");
+    assert_eq!(state.metrics.cache_label(), "—");
+    assert!(matches!(harness.next(), WorkerMessage::Connected));
+    harness.command(CommandMessage::Send("question".into()));
+    assert!(matches!(harness.next(), WorkerMessage::Sent(_)));
+    let before = state.metrics.clone();
+    for _ in 0..3 {
+        state.apply(harness.event());
+        assert_eq!(state.metrics, before);
+    }
+    let WorkerMessage::Event(event) = harness.next() else {
+        panic!("missing turn end");
+    };
+    assert!(matches!(event, ServerEvent::TurnEnd { .. }));
+    state.apply(event);
+    let WorkerMessage::Status(status) = harness.next() else {
+        panic!("missing boundary status");
+    };
+    state.apply_status(status);
+    assert_eq!(state.metrics.tokens_label(), "110");
+    assert_eq!(state.metrics.cache_label(), "60.0%");
+    state.apply(harness.event());
+    harness.finish();
+}
+
+// Matches loop.py's next-turn drain and core/store.py's persisted notification.
+fn durable_receipt(child: &str, status: &str, text: &str) -> Value {
+    json!({"event":"sub_agent_receipt","data":{
+        "notification_id":format!("notification-{child}"),
+        "child_instance_id":child,
+        "child_session_path":format!("/tmp/children/{child}.jsonl"),
+        "description":format!("review {child}"),
+        "status":status,
+        "text":text,
+        "stats":{"turns_used":2,"elapsed":1.2,"tool_calls":3,"error":status == "error","canceled":status == "canceled"}
+    }})
+}
+
+#[test]
+fn reconnect_next_turn_drain_creates_a_durable_agent_card_without_tool_events() {
+    let (disconnect, wait) = mpsc::channel();
+    let harness = Harness::new(move |listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([]));
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(peer);
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.respond("resume", json!({"session":session()}));
+        peer.status(true, "idle", json!([]));
+        peer.send();
+        // Completion occurred while disconnected. No tool_start/tool_end replay.
+        peer.event(durable_receipt(
+            "child-one",
+            "completed",
+            &"review passed\n".repeat(30),
+        ));
+        peer.boundary(json!({"event":"agent_end","data":{}}));
+        peer.wait_for_close();
+    });
+    harness.connected();
+    let mut state = AppState::default();
+    state.select_session(Some("session-1".into()));
+    disconnect.send(()).unwrap();
+    let WorkerMessage::Lost(reason) = harness.next() else {
+        panic!("missing disconnect")
+    };
+    state.mark_connection_lost(reason);
+    state.begin_reconnect();
+    harness.command(CommandMessage::Reconnect);
+    assert!(matches!(harness.next(), WorkerMessage::Sessions(_)));
+    let WorkerMessage::Status(status) = harness.next() else {
+        panic!("missing status")
+    };
+    state.apply_status(status);
+    assert!(matches!(harness.next(), WorkerMessage::Connected));
+    harness.command(CommandMessage::Send("next turn".into()));
+    assert!(matches!(harness.next(), WorkerMessage::Sent(_)));
+    let receipt = harness.event();
+    assert!(matches!(receipt, ServerEvent::SubAgentReceipt { .. }));
+    state.apply(receipt.clone());
+    state.toggle_card(0);
+    state.apply(receipt);
+    assert_eq!(state.transcript.len(), 1);
+    assert!(matches!(&state.transcript[0], TranscriptEntry::Tool {
+        complete: true, error: false, summary, card, ..
+    } if summary == "review passed"
+        && card.agent_label.as_deref() == Some("review child-one")
+        && card.child_instance_id.as_deref() == Some("child-one")
+        && card.expanded && card.tail.truncated
+        && card.tail.text.lines().count() == zeta_gui::cards::TAIL_LINES));
+    state.apply(harness.event());
+    harness.finish();
+}
+
+#[test]
+fn durable_receipts_update_launch_cards_with_duplicate_raw_tool_ids() {
+    let harness = Harness::new(|listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.hello();
+        peer.status(true, "idle", json!([]));
+        peer.event(json!({"event":"tool_start","tool_call":call("duplicate"),"data":{}}));
+        for (parent, child) in [("parent-one", "child-one"), ("parent-two", "child-two")] {
+            let call = json!({"id":"duplicate","name":"agent","arguments":{"description":child}});
+            peer.event(
+                json!({"event":"tool_start","tool_call":call,"data":{"agent_instance_id":parent}}),
+            );
+            peer.event(json!({"event":"tool_end","tool_call":call,"tool_result":{
+                "tool_call_id":"duplicate","content":"background agent started","is_error":false,
+                "structured_content":{"status":"running","child_instance_id":child}
+            },"data":{"agent_instance_id":parent}}));
+        }
+        for (child, status, text) in [
+            ("child-two", "error", "review failed\nerror details"),
+            ("child-one", "completed", "review passed\nsummary"),
+            ("child-two", "error", "review failed\nerror details"),
+        ] {
+            peer.event(durable_receipt(child, status, text));
+        }
+        peer.event(durable_receipt(
+            "child-three",
+            "canceled",
+            "background child canceled",
+        ));
+        peer.wait_for_close();
+    });
+    harness.connected();
+    let mut state = AppState::default();
+    for _ in 0..5 {
+        state.apply(harness.event());
+    }
+    state.toggle_card(2);
+    for _ in 0..4 {
+        state.apply(harness.event());
+    }
+    assert_eq!(state.transcript.len(), 4);
+    assert!(
+        matches!(&state.transcript[0], TranscriptEntry::Tool { complete: false, card, .. } if card.child_instance_id.is_none())
+    );
+    for (index, child, summary, error) in [
+        (1, "child-one", "review passed", false),
+        (2, "child-two", "review failed", true),
+        (3, "child-three", "background child canceled", true),
+    ] {
+        assert!(matches!(&state.transcript[index], TranscriptEntry::Tool {
+            complete: true, error: actual_error, summary: actual_summary, card, ..
+        } if *actual_error == error && actual_summary == summary
+            && card.child_instance_id.as_deref() == Some(child)
+            && card.expanded == (index == 2)));
+    }
+    assert!(
+        matches!(&state.transcript[2], TranscriptEntry::Tool { card, .. } if card.tail.text == "review failed\nerror details")
+    );
+    assert_eq!(state.transcript[1].tool_marker(), "[done]");
+    assert_eq!(state.transcript[2].tool_marker(), "[failed]");
+    assert_eq!(state.transcript[3].tool_marker(), "[canceled]");
+    assert!(state.transcript[3].unsuccessful());
     harness.finish();
 }

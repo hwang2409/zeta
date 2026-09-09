@@ -183,7 +183,14 @@ impl ConnectionWorker {
                     if event.session_id() != selected.as_deref() {
                         continue;
                     }
-                    let refresh_approvals = matches!(event, ServerEvent::ApprovalEnd { .. });
+                    let refresh_status = matches!(
+                        event,
+                        ServerEvent::ApprovalEnd { .. }
+                            | ServerEvent::TurnEnd { .. }
+                            | ServerEvent::AgentEnd { .. }
+                            | ServerEvent::TurnAborted { .. }
+                            | ServerEvent::Error { .. }
+                    );
                     match &event {
                         ServerEvent::AgentEnd { .. }
                         | ServerEvent::TurnAborted { .. }
@@ -196,7 +203,7 @@ impl ConnectionWorker {
                         _ => {}
                     }
                     let _ = self.messages.send(WorkerMessage::Event(event));
-                    if refresh_approvals {
+                    if refresh_status {
                         client.set_read_timeout(Some(Duration::from_secs(5)))?;
                         let status = self.status(&mut client)?;
                         busy = status.state != "idle";

@@ -585,6 +585,7 @@ pub fn bind_keys(cx: &mut App) {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = crate::appearance(window).palette();
         let input = cx.entity();
         let display = if self.content.is_empty() {
             self.placeholder.clone()
@@ -607,9 +608,9 @@ impl Render for Composer {
                 len: range[1] - range[0],
                 font: style.font(),
                 color: rgb(if self.content.is_empty() {
-                    0x8a9287
+                    p.muted
                 } else {
-                    0xd8ddd5
+                    p.text
                 })
                 .into(),
                 background_color: self
@@ -634,6 +635,7 @@ impl Render for Composer {
             .id("composer-input")
             .key_context("Composer")
             .track_focus(&self.focus_handle)
+            .tab_index(0)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -666,8 +668,8 @@ impl Render for Composer {
             .line_height(px(22.))
             .p_3()
             .border_1()
-            .border_color(rgb(0x343832))
-            .text_color(rgb(0xd8ddd5))
+            .border_color(rgb(p.border))
+            .text_color(rgb(p.text))
             .child(
                 div().relative().w_full().child(text).child(
                     canvas(
@@ -706,7 +708,7 @@ impl Render for Composer {
                                     {
                                         window.paint_quad(fill(
                                             Bounds::new(cursor, size(px(1.), px(22.))),
-                                            rgb(0xe1a84b),
+                                            rgb(p.accent),
                                         ));
                                     }
                                 }

@@ -1,6 +1,13 @@
+use crate::{
+    cards::{Card, OutputTail},
+    markdown::Markdown,
+};
 use std::collections::HashMap;
 
-use crate::client::{Approval, Message, ServerEvent, SessionMetadata, StatusResult, ToolCall};
+use crate::client::{
+    Approval, Message, ServerEvent, SessionMetadata, StatusResult, SubAgentReceipt, SubAgentStatus,
+    ToolCall,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolReceiptKey {
@@ -22,14 +29,34 @@ impl ToolReceiptKey {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptEntry {
     User(String),
-    Assistant(String),
+    Assistant(Markdown),
     Tool {
         key: ToolReceiptKey,
         name: String,
         summary: String,
         complete: bool,
         error: bool,
+        canceled: bool,
+        card: Card,
     },
+}
+
+impl TranscriptEntry {
+    pub fn tool_marker(&self) -> &'static str {
+        match self {
+            Self::Tool { canceled: true, .. } => "[canceled]",
+            Self::Tool { error: true, .. } => "[failed]",
+            Self::Tool { complete: true, .. } => "[done]",
+            _ => "[working]",
+        }
+    }
+
+    pub fn unsuccessful(&self) -> bool {
+        matches!(
+            self,
+            Self::Tool { error: true, .. } | Self::Tool { canceled: true, .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +76,8 @@ pub struct AppState {
     pub approvals: Vec<Approval>,
     pub connection: ConnectionState,
     pub streaming: bool,
+    pub metrics: StatusMetrics,
+    pub metrics_boundary: bool,
 }
 
 impl Default for AppState {
@@ -62,6 +91,8 @@ impl Default for AppState {
             approvals: Vec::new(),
             connection: ConnectionState::Reconnecting,
             streaming: false,
+            metrics: StatusMetrics::default(),
+            metrics_boundary: true,
         }
     }
 }
@@ -90,49 +121,84 @@ impl AppState {
             .and_then(|id| self.saved_transcripts.remove(id))
             .unwrap_or_default();
         self.active_session = session_id;
+        self.metrics = StatusMetrics::default();
+        self.metrics_boundary = true;
     }
 
     pub fn apply_status(&mut self, status: StatusResult) {
-        self.select_session(status.session.map(|session| session.session_id));
+        self.select_session(
+            status
+                .session
+                .as_ref()
+                .map(|session| session.session_id.clone()),
+        );
+        if self.metrics_boundary || (!self.streaming && status.state == "idle") {
+            self.metrics = StatusMetrics::from_status(&status);
+            self.metrics_boundary = false;
+        }
         self.streaming = status.state != "idle";
         self.approvals = status.pending_approvals;
     }
 
-    pub fn apply(&mut self, event: ServerEvent) {
+    pub fn apply(&mut self, event: ServerEvent) -> Option<usize> {
+        let mut changed = None;
         match event {
-            ServerEvent::TurnStart { .. } => self.streaming = true,
+            ServerEvent::TurnStart { .. } => {
+                self.streaming = true;
+                self.metrics_boundary = false;
+            }
             ServerEvent::AgentEnd { .. } | ServerEvent::TurnAborted { .. } => {
                 self.streaming = false;
+                self.metrics_boundary = true;
                 self.approvals.clear();
             }
-            ServerEvent::TurnEnd { .. } => {}
+            ServerEvent::TurnEnd { .. } => self.metrics_boundary = true,
             ServerEvent::AssistantDelta { delta, kind, .. } if kind == "assistant" => {
                 match self.transcript.last_mut() {
                     Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
-                    _ => self.transcript.push(TranscriptEntry::Assistant(delta)),
+                    _ => self
+                        .transcript
+                        .push(TranscriptEntry::Assistant(Markdown::streaming(delta))),
                 }
+                changed = self.transcript.len().checked_sub(1);
             }
             ServerEvent::AssistantDelta { .. } => {}
-            ServerEvent::AssistantMessage { message, .. } => self.commit_assistant(message),
+            ServerEvent::AssistantMessage { message, .. } => {
+                changed = self.commit_assistant(message)
+            }
             ServerEvent::ToolStart {
                 session_id,
                 tool_call,
                 data,
-            } => self.transcript.push(tool_entry(
-                &tool_call,
-                ToolReceiptKey::new(session_id, &data, &tool_call),
-            )),
+            } => {
+                self.transcript.push(tool_entry(
+                    &tool_call,
+                    ToolReceiptKey::new(session_id, &data, &tool_call),
+                ));
+                changed = self.transcript.len().checked_sub(1);
+            }
             ServerEvent::ToolOutput {
                 session_id,
                 tool_call,
                 output,
                 data,
             } => {
-                if let TranscriptEntry::Tool { summary, .. } = self.tool_receipt(
+                let (index, entry) = self.tool_receipt(
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
-                ) {
-                    *summary = bounded_summary(&format!("{summary}{output}"));
+                );
+                changed = Some(index);
+                if let TranscriptEntry::Tool { summary, card, .. } = entry {
+                    card.tail.append(&output);
+                    if let Some(line) = card
+                        .tail
+                        .text
+                        .lines()
+                        .rev()
+                        .find(|line| !line.trim().is_empty())
+                    {
+                        *summary = bounded_summary(line);
+                    }
                 }
             }
             ServerEvent::ToolEnd {
@@ -141,15 +207,62 @@ impl AppState {
                 session_id,
                 data,
             } => {
-                if let TranscriptEntry::Tool {
-                    complete, error, ..
-                } = self.tool_receipt(
+                let (index, entry) = self.tool_receipt(
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
-                ) {
-                    *complete = true;
+                );
+                changed = Some(index);
+                if let TranscriptEntry::Tool {
+                    complete,
+                    error,
+                    canceled,
+                    summary,
+                    card,
+                    name,
+                    ..
+                } = entry
+                {
+                    if name.eq_ignore_ascii_case("agent") {
+                        if let Some(child) = tool_result
+                            .as_ref()
+                            .and_then(|result| result.structured_content.as_ref())
+                            .and_then(|data| data["child_instance_id"].as_str())
+                        {
+                            card.child_instance_id = Some(child.to_owned());
+                        }
+                    }
+                    *canceled = tool_result
+                        .as_ref()
+                        .is_some_and(|result| result.is_canceled);
+                    *complete = *canceled
+                        || !name.eq_ignore_ascii_case("agent")
+                        || !tool_result
+                            .as_ref()
+                            .and_then(|result| result.structured_content.as_ref())
+                            .is_some_and(|data| data["status"] == "running");
                     *error = tool_result.as_ref().is_some_and(|result| result.is_error);
+                    if let Some(result) = tool_result.filter(|result| !result.content.is_empty()) {
+                        if card.tail.text != result.content {
+                            if !card.tail.text.is_empty() && !card.tail.text.ends_with('\n') {
+                                card.tail.append("\n");
+                            }
+                            card.tail.append(&result.content);
+                        }
+                        *summary = bounded_summary(
+                            result
+                                .content
+                                .lines()
+                                .find(|line| !line.trim().is_empty())
+                                .unwrap_or(""),
+                        );
+                    }
                 }
+            }
+            ServerEvent::SubAgentReceipt {
+                session_id,
+                receipt,
+            } => {
+                changed = Some(self.commit_sub_agent(session_id, receipt));
             }
             ServerEvent::ApprovalRequest { approval, .. } => {
                 if !self
@@ -165,6 +278,7 @@ impl AppState {
             ServerEvent::ApprovalEnd { .. } => {}
             ServerEvent::Error { error, .. } => {
                 self.streaming = false;
+                self.metrics_boundary = true;
                 self.approvals.clear();
                 self.transcript.push(TranscriptEntry::Tool {
                     key: ToolReceiptKey {
@@ -174,15 +288,36 @@ impl AppState {
                     },
                     name: "error".to_owned(),
                     summary: bounded_summary(&error.message),
+                    card: Card {
+                        tail: {
+                            let mut tail = OutputTail::default();
+                            tail.append(&error.message);
+                            tail
+                        },
+                        ..Default::default()
+                    },
                     complete: true,
                     error: true,
+                    canceled: false,
                 });
+                changed = self.transcript.len().checked_sub(1);
             }
             ServerEvent::Other { .. } => {}
         }
+        changed
     }
 
-    fn tool_receipt(&mut self, tool_call: &ToolCall, key: ToolReceiptKey) -> &mut TranscriptEntry {
+    pub fn toggle_card(&mut self, index: usize) {
+        if let Some(TranscriptEntry::Tool { card, .. }) = self.transcript.get_mut(index) {
+            card.toggle();
+        }
+    }
+
+    fn tool_receipt(
+        &mut self,
+        tool_call: &ToolCall,
+        key: ToolReceiptKey,
+    ) -> (usize, &mut TranscriptEntry) {
         let index = self
             .transcript
             .iter()
@@ -193,18 +328,121 @@ impl AppState {
                 self.transcript.push(tool_entry(tool_call, key));
                 self.transcript.len() - 1
             });
-        &mut self.transcript[index]
+        (index, &mut self.transcript[index])
     }
 
-    fn commit_assistant(&mut self, message: Message) {
+    fn commit_sub_agent(&mut self, session_id: Option<String>, receipt: SubAgentReceipt) -> usize {
+        // Durable notifications have no raw tool ID. The launch result supplies
+        // the child identity when we saw it; reconnect drains can create it alone.
+        let index = self
+            .transcript
+            .iter()
+            .position(|entry| {
+                matches!(entry, TranscriptEntry::Tool { key, card, .. }
+                if key.session_id == session_id
+                    && card.child_instance_id.as_deref() == Some(&receipt.child_instance_id))
+            })
+            .unwrap_or_else(|| {
+                self.transcript.push(TranscriptEntry::Tool {
+                    key: ToolReceiptKey {
+                        session_id,
+                        agent_instance_id: Some(receipt.child_instance_id.clone()),
+                        tool_call_id: String::new(),
+                    },
+                    name: "agent".into(),
+                    summary: String::new(),
+                    complete: false,
+                    error: false,
+                    canceled: false,
+                    card: Card {
+                        child_instance_id: Some(receipt.child_instance_id.clone()),
+                        ..Default::default()
+                    },
+                });
+                self.transcript.len() - 1
+            });
+        if let TranscriptEntry::Tool {
+            summary,
+            complete,
+            error,
+            canceled,
+            card,
+            ..
+        } = &mut self.transcript[index]
+        {
+            *complete = true;
+            *error = receipt.status != SubAgentStatus::Completed;
+            *canceled = receipt.status == SubAgentStatus::Canceled;
+            *summary = bounded_summary(
+                receipt
+                    .text
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or(""),
+            );
+            card.agent_label = Some(bounded_summary(&receipt.description));
+            // Replace the authoritative receipt tail so replay is idempotent.
+            card.tail = OutputTail::default();
+            card.tail.append(&receipt.text);
+        }
+        index
+    }
+
+    fn commit_assistant(&mut self, message: Message) -> Option<usize> {
         let text = message.text();
         if text.is_empty() {
-            return;
+            return None;
         }
         match self.transcript.last_mut() {
-            Some(TranscriptEntry::Assistant(current)) => *current = text,
-            _ => self.transcript.push(TranscriptEntry::Assistant(text)),
+            Some(TranscriptEntry::Assistant(current)) => *current = text.into(),
+            _ => self
+                .transcript
+                .push(TranscriptEntry::Assistant(text.into())),
         }
+        self.transcript.len().checked_sub(1)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StatusMetrics {
+    pub model: Option<String>,
+    pub tokens: Option<u64>,
+    pub cache_hit_rate: Option<f64>,
+}
+
+impl StatusMetrics {
+    fn from_status(status: &StatusResult) -> Self {
+        let usage = &status.usage;
+        let input = usage["input_tokens"].as_u64();
+        let output = usage["output_tokens"].as_u64();
+        let read = usage["cache_read_input_tokens"].as_u64();
+        let write = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        let prompt =
+            input.and_then(|input| input.checked_add(read.unwrap_or(0))?.checked_add(write));
+        Self {
+            model: status
+                .session
+                .as_ref()
+                .map(|s| s.model.clone())
+                .filter(|s| !s.is_empty()),
+            tokens: prompt
+                .zip(output)
+                .and_then(|(input, output)| input.checked_add(output)),
+            cache_hit_rate: read
+                .zip(prompt)
+                .filter(|(read, total)| *total > 0 && read <= total)
+                .map(|(read, total)| read as f64 / total as f64 * 100.),
+        }
+    }
+    pub fn model_label(&self) -> &str {
+        self.model.as_deref().unwrap_or("—")
+    }
+    pub fn tokens_label(&self) -> String {
+        self.tokens.map_or_else(|| "—".into(), |n| n.to_string())
+    }
+    pub fn cache_label(&self) -> String {
+        self.cache_hit_rate
+            .map_or_else(|| "—".into(), |n| format!("{n:.1}%"))
     }
 }
 
@@ -218,7 +456,24 @@ fn bounded_summary(text: &str) -> String {
 }
 
 fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey) -> TranscriptEntry {
+    let agent_label = if tool_call.name.eq_ignore_ascii_case("agent") {
+        Some(
+            tool_call
+                .arguments
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("agent")
+                .to_owned(),
+        )
+    } else {
+        key.agent_instance_id.clone()
+    };
+    let agent_label = agent_label.map(|label| bounded_summary(&label));
     TranscriptEntry::Tool {
+        card: Card {
+            agent_label,
+            ..Default::default()
+        },
         key,
         name: tool_call.name.clone(),
         summary: bounded_summary(
@@ -227,6 +482,7 @@ fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey) -> TranscriptEntry {
         ),
         complete: false,
         error: false,
+        canceled: false,
     }
 }
 
@@ -235,6 +491,110 @@ mod tests {
     use super::*;
     use crate::client::{EventError, ToolResult};
     use serde_json::json;
+
+    #[test]
+    fn canceled_server_results_never_show_success() {
+        for is_error in [false, true] {
+            let mut state = AppState::default();
+            // server/server.py forwards ToolResult.to_dict() unchanged. Agent
+            // cancellations use false/true; approval cancellations use true/true.
+            let result = serde_json::from_value(json!({
+                "tool_call_id": "tool-1", "content": "tool execution canceled",
+                "is_error": is_error, "is_canceled": true,
+                "structured_content": {"status": "running"}
+            }))
+            .unwrap();
+            let changed = state.apply(ServerEvent::ToolEnd {
+                session_id: None,
+                tool_call: ToolCall {
+                    name: "agent".into(),
+                    ..call()
+                },
+                tool_result: Some(result),
+                data: json!({}),
+            });
+            assert_eq!(changed, Some(0));
+            let entry = &state.transcript[0];
+            assert_eq!(entry.tool_marker(), "[canceled]");
+            assert!(entry.unsuccessful());
+            assert!(matches!(
+                entry,
+                TranscriptEntry::Tool {
+                    complete: true,
+                    canceled: true,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn metrics_ignore_midstream_status_and_clear_on_session_switch() {
+        let status = |usage| {
+            serde_json::from_value(json!({"session":{"session_id":"one","model":"test"},"state":"running","usage":usage})).unwrap()
+        };
+        let mut state = AppState::default();
+        state.apply_status(status(json!({"input_tokens":10,"output_tokens":4})));
+        assert_eq!(state.metrics.tokens_label(), "14");
+        assert_eq!(state.metrics.cache_label(), "—");
+        state.apply(ServerEvent::TurnStart {
+            session_id: Some("one".into()),
+            data: json!({}),
+        });
+        state.apply_status(status(json!({"input_tokens":900,"output_tokens":100})));
+        assert_eq!(state.metrics.tokens_label(), "14");
+        state.apply(ServerEvent::TurnEnd {
+            session_id: Some("one".into()),
+            data: json!({}),
+        });
+        state.apply_status(status(json!({"input_tokens":900,"output_tokens":100})));
+        assert_eq!(state.metrics.tokens_label(), "1000");
+        state.select_session(Some("two".into()));
+        assert_eq!(state.metrics.model_label(), "—");
+        assert_eq!(state.metrics.tokens_label(), "—");
+    }
+
+    #[test]
+    fn background_agent_receipt_stays_running_until_final_result() {
+        let mut state = AppState::default();
+        let agent = ToolCall {
+            name: "agent".into(),
+            arguments: [("description".into(), json!("review code"))]
+                .into_iter()
+                .collect(),
+            ..call()
+        };
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: agent.clone(),
+            data: json!({}),
+        });
+        for (status, text, complete) in [
+            ("running", "started", false),
+            ("completed", "review passed\nfull summary", true),
+        ] {
+            state.apply(ServerEvent::ToolEnd {
+                session_id: None,
+                tool_call: agent.clone(),
+                data: json!({}),
+                tool_result: Some(ToolResult {
+                    tool_call_id: agent.id.clone(),
+                    content: text.into(),
+                    is_error: false,
+                    is_canceled: false,
+                    content_blocks: vec![],
+                    structured_content: Some(json!({"status":status})),
+                }),
+            });
+            assert!(
+                matches!(&state.transcript[0], TranscriptEntry::Tool { complete: actual, card, .. } if *actual == complete && card.agent_label.as_deref() == Some("review code"))
+            );
+        }
+        assert_eq!(state.transcript.len(), 1);
+        assert!(
+            matches!(&state.transcript[0], TranscriptEntry::Tool { summary, card, .. } if summary == "review passed" && card.tail.text.ends_with("full summary"))
+        );
+    }
 
     fn call() -> ToolCall {
         ToolCall {
@@ -274,8 +634,42 @@ mod tests {
         });
         assert_eq!(
             state.transcript,
-            vec![TranscriptEntry::Assistant("hello".to_owned())]
+            vec![TranscriptEntry::Assistant("hello".into())]
         );
+    }
+
+    #[test]
+    fn multi_frame_fence_stream_never_builds_a_markdown_tree() {
+        let mut state = AppState::default();
+        let mut source = String::new();
+        for delta in std::iter::once("```rust\n").chain(std::iter::repeat_n("let x = 1;\n", 2000)) {
+            source.push_str(delta);
+            state.apply(ServerEvent::AssistantDelta {
+                session_id: None,
+                delta: delta.into(),
+                kind: "assistant".into(),
+            });
+            assert!(
+                matches!(&state.transcript[0], TranscriptEntry::Assistant(doc) if doc.root.is_none())
+            );
+        }
+        assert!(
+            matches!(&state.transcript[0], TranscriptEntry::Assistant(doc) if source.ends_with(doc.source.as_ref()) && doc.preview_truncated)
+        );
+        source.push_str("```\n");
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![crate::client::ContentBlock::Text { text: source }],
+            },
+        });
+        let TranscriptEntry::Assistant(doc) = &state.transcript[0] else {
+            panic!("missing assistant")
+        };
+        let code = &doc.root.as_ref().unwrap().children[0];
+        assert_eq!(code.kind, crate::markdown::BlockKind::Code("rust".into()));
+        assert!(code.syntax.is_empty());
     }
 
     #[test]
@@ -335,7 +729,7 @@ mod tests {
             }
         ));
         assert!(
-            matches!(&state.transcript[0], TranscriptEntry::Tool { summary, .. } if summary.contains("README.md"))
+            matches!(&state.transcript[0], TranscriptEntry::Tool { summary, .. } if summary == "no")
         );
     }
 
@@ -383,7 +777,7 @@ mod tests {
         }
         assert!(
             matches!(&state.transcript[0], TranscriptEntry::Tool { key, summary, complete: true, error: false, .. }
-            if key.tool_call_id == "tool-1" && summary.chars().count() == SUMMARY_CHARS && !summary.contains('\n'))
+            if key.tool_call_id == "tool-1" && summary == "α" && !summary.contains('\n'))
         );
         assert!(
             matches!(&state.transcript[1], TranscriptEntry::Tool { key, summary, complete: true, error: true, .. }
