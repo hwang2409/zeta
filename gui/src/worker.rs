@@ -232,11 +232,10 @@ impl ConnectionWorker {
                                 }
                                 _ => unreachable!(),
                             };
-                            result.and_then(|tree| {
-                                let _ = self.messages.send(WorkerMessage::Tree(tree));
-                                let history = client.history(selected.as_deref().unwrap_or(""))?;
-                                let _ = self.messages.send(WorkerMessage::History(history, true));
-                                self.status(&mut client, selected, None)?;
+                            result.and_then(|_| {
+                                let status = self.status(&mut client, selected, Some(true))?;
+                                busy = status.state != "idle";
+                                pending_approvals = !status.pending_approvals.is_empty();
                                 Ok(())
                             })
                         }

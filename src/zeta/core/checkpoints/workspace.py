@@ -97,6 +97,12 @@ class WorkspaceSnapshot:
                 raise ConversationIntegrityError(
                     f"snapshot {field} must be a string or null"
                 )
+        if value["mode"] == SNAPSHOT_MODE_GIT:
+            for field in ("commit_sha", "tree_sha", "repo_root"):
+                if not value.get(field):
+                    raise ConversationIntegrityError(
+                        f"git snapshot {field} must be a nonempty string"
+                    )
         return cls(
             id=value["id"],
             created_at=value["created_at"],
@@ -448,15 +454,14 @@ class WorkspaceSnapshotStore:
         if not isinstance(raw, dict):
             return
         snapshots = raw.get("snapshots", [])
-        if isinstance(snapshots, list):
-            try:
-                self._snapshots = [
-                    WorkspaceSnapshot.from_dict(entry)
-                    for entry in snapshots
-                    if isinstance(entry, dict)
-                ]
-            except ConversationIntegrityError:
-                return
+        if not isinstance(snapshots, list) or any(
+            not isinstance(entry, dict) for entry in snapshots
+        ):
+            return
+        try:
+            self._snapshots = [WorkspaceSnapshot.from_dict(entry) for entry in snapshots]
+        except ConversationIntegrityError:
+            return
         current_id = raw.get("current_id")
         if isinstance(current_id, str) and any(
             snap.id == current_id for snap in self._snapshots
@@ -591,10 +596,11 @@ class WorkspaceSnapshotStore:
         self._persist()
 
     def is_dirty(self, cwd: str | Path) -> bool:
-        """Return True when the working tree differs from the reference snapshot.
+        """Return True when the working tree differs or cannot be verified clean.
 
         Falls back to the latest git snapshot when ``current_id`` is missing
-        or stale so a corrupt state file cannot silently bypass dirty guards.
+        or stale. An absent reference or failed comparison must not bypass
+        the dirty guard.
         """
 
         reference = self.current()
@@ -608,18 +614,15 @@ class WorkspaceSnapshotStore:
                 None,
             )
         if reference is None or reference.tree_sha is None:
-            return False
+            return True
         repo_root = reference.repo_root or git_repo_root(cwd)
         if repo_root is None:
-            return False
+            return True
         try:
             current_tree = _current_tree_sha(self.session_dir, repo_root)
         except WorkspaceSnapshotError:
-            return False
+            return True
         return current_tree != reference.tree_sha
-
-    def has_restorable_snapshot(self) -> bool:
-        return any(snap.mode == SNAPSHOT_MODE_GIT for snap in self._snapshots)
 
     def undo_target(self) -> WorkspaceSnapshot | None:
         if self._current_id is None:

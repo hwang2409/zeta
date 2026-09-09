@@ -219,9 +219,11 @@ class CheckpointTranscriptMixin:
 
     def _fork_from_checkpoint_label(self, selector: str, forced: bool) -> str:
         snapshots = self._snapshots()
-        dirty_warning = _dirty_guard(snapshots, self.loop.store.bash_cwd, forced)
-        if dirty_warning is not None:
-            return dirty_warning
+        # With no snapshots this fork only changes the conversation.
+        if snapshots.snapshots:
+            dirty_warning = _dirty_guard(snapshots, self.loop.store.bash_cwd, forced)
+            if dirty_warning is not None:
+                return dirty_warning
         try:
             entry = self.loop.store.append_fork(selector)
         except ValueError as exc:
@@ -474,10 +476,6 @@ def _dirty_guard(
     if forced:
         return None
     if git_repo_root(cwd) is None:
-        return None
-    # Gate on "any restorable snapshot exists" so a corrupt or missing
-    # current_id in the state file cannot silently bypass the confirm.
-    if not snapshots.has_restorable_snapshot():
         return None
     if not snapshots.is_dirty(cwd):
         return None

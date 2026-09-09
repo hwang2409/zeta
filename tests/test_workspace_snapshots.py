@@ -722,3 +722,78 @@ def test_checkpoint_reports_snapshot_setup_error(
         "workspace snapshot skipped: cannot initialize snapshot store"
         in app.slash_checkpoint("save")
     )
+
+
+@pytest.mark.parametrize("field", ["tree_sha", "commit_sha", "repo_root"])
+@pytest.mark.parametrize("invalid", ["missing", None, ""])
+def test_incomplete_current_snapshot_cannot_overwrite_dirty_files(
+    git_repo: Path, tmp_path: Path, field: str, invalid: str | None
+) -> None:
+    from zeta.tui.checkpoints import _dirty_guard
+
+    conversation = _make_store(tmp_path / "session", git_repo)
+    app = _make_tui(conversation)
+    app.slash_checkpoint("older")
+    (git_repo / "tracked.txt").write_text("current snapshot\n")
+    app.slash_checkpoint("current")
+    path = conversation.session_dir / "workspace_snapshots.json"
+    state = json.loads(path.read_text())
+    if invalid == "missing":
+        del state["snapshots"][-1][field]
+    else:
+        state["snapshots"][-1][field] = invalid
+    path.write_text(json.dumps(state))
+    (git_repo / "tracked.txt").write_text("unsaved work\n")
+
+    reopened = _make_tui(conversation)
+    result = reopened.slash_undo("")
+    assert (git_repo / "tracked.txt").read_text() == "unsaved work\n"
+    assert "undone" not in result
+    snapshots = reopened._snapshots()
+    assert snapshots.snapshots == ()
+    assert snapshots.current_id is None
+    assert snapshots.is_dirty(git_repo)
+    assert _dirty_guard(snapshots, str(git_repo), forced=False) is not None
+    assert _dirty_guard(snapshots, str(git_repo), forced=True) is None
+
+
+@pytest.mark.parametrize("row", [None, [], "invalid", {"id": "invalid"}])
+def test_invalid_snapshot_row_discards_whole_state(
+    git_repo: Path, tmp_path: Path, row: object
+) -> None:
+    store = WorkspaceSnapshotStore(tmp_path / "session", "session-1")
+    store.take(git_repo, label="valid")
+    state = json.loads(store.state_path.read_text())
+    state["snapshots"].append(row)
+    store.state_path.write_text(json.dumps(state))
+    reopened = WorkspaceSnapshotStore(store.session_dir, "session-1")
+    assert reopened.snapshots == ()
+    assert reopened.current_id is None
+    assert reopened.is_dirty(git_repo)
+
+
+def test_empty_snapshot_store_does_not_report_clean(git_repo: Path, tmp_path: Path) -> None:
+    from zeta.tui.checkpoints import _dirty_guard
+
+    store = WorkspaceSnapshotStore(tmp_path / "session", "session-1")
+    assert store.is_dirty(git_repo)
+    assert _dirty_guard(store, str(git_repo), forced=False) is not None
+
+
+def test_failed_dirty_comparison_cannot_overwrite_files(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conversation = _make_store(tmp_path / "session", git_repo)
+    app = _make_tui(conversation)
+    app.slash_checkpoint("older")
+    (git_repo / "tracked.txt").write_text("current snapshot\n")
+    app.slash_checkpoint("current")
+    (git_repo / "tracked.txt").write_text("unsaved work\n")
+
+    def fail(*args):
+        raise workspace_module.WorkspaceSnapshotError("cannot compare workspace")
+
+    monkeypatch.setattr(workspace_module, "_current_tree_sha", fail)
+    result = app.slash_undo("")
+    assert (git_repo / "tracked.txt").read_text() == "unsaved work\n"
+    assert "--force" in result
