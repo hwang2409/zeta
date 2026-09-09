@@ -516,15 +516,67 @@ class WorkspaceSnapshotStore:
     def is_corrupt(self) -> bool:
         return self._is_corrupt
 
+    @property
+    def corruption_message(self) -> str:
+        if self._restorable_snapshots():
+            return SNAPSHOT_CORRUPTION_MESSAGE
+        return (
+            "workspace snapshot state is corrupt; no valid workspace snapshot "
+            "is available; use /checkpoint --reset to archive the corrupt "
+            "manifest and reset snapshot state"
+        )
+
+    def _validate_restore_target(self, snapshot: WorkspaceSnapshot) -> None:
+        if snapshot.mode != SNAPSHOT_MODE_GIT:
+            raise WorkspaceSnapshotError("snapshot has no restorable workspace tree")
+        env = {"GIT_DIR": str(_shadow_dir(self.session_dir))}
+        ref = f"{SNAPSHOT_REF_NAMESPACE}/{snapshot.id}"
+        try:
+            commit = _run_git(
+                ["rev-parse", "--verify", f"{ref}^{{commit}}"],
+                cwd=self.session_dir,
+                env=env,
+            ).stdout.strip()
+        except WorkspaceSnapshotError as exc:
+            raise WorkspaceSnapshotError(f"invalid snapshot ref {ref}: {exc}") from exc
+        if commit != snapshot.commit_sha:
+            raise WorkspaceSnapshotError(f"snapshot ref {ref} does not match its commit")
+        tree = _run_git(
+            ["rev-parse", "--verify", f"{commit}^{{tree}}"],
+            cwd=self.session_dir,
+            env=env,
+        ).stdout.strip()
+        if tree != snapshot.tree_sha:
+            raise WorkspaceSnapshotError(f"snapshot ref {ref} does not match its tree")
+        _run_git(
+            ["rev-list", "--objects", "--missing=error", commit],
+            cwd=self.session_dir,
+            env=env,
+        )
+
+    def _restorable_snapshots(self) -> list[WorkspaceSnapshot]:
+        valid = []
+        for snapshot in self._snapshots:
+            try:
+                self._validate_restore_target(snapshot)
+            except WorkspaceSnapshotError:
+                continue
+            valid.append(snapshot)
+        return valid
+
     def reset_corruption(self) -> None:
         """Archive the original manifest, then persist only validated rows."""
 
-        if not self._is_corrupt:
+        valid = self._restorable_snapshots()
+        if not self._is_corrupt and valid == self._snapshots:
             return
         archive = self.state_path.with_name(
             f"workspace_snapshots.corrupt.{uuid.uuid4().hex}.json"
         )
         shutil.copyfile(self.state_path, archive)
+        self._snapshots = valid
+        if not any(snapshot.id == self._current_id for snapshot in valid):
+            self._current_id = None
         self._is_corrupt = False
         try:
             self._persist()
@@ -571,7 +623,7 @@ class WorkspaceSnapshotStore:
         """Capture the current working tree as a shadow-git snapshot."""
 
         if self._is_corrupt:
-            raise WorkspaceSnapshotError(SNAPSHOT_CORRUPTION_MESSAGE)
+            raise WorkspaceSnapshotError(self.corruption_message)
         self._truncate_tail_from_current()
         repo_root = git_repo_root(cwd)
         snapshot_id = uuid.uuid4().hex
@@ -615,7 +667,7 @@ class WorkspaceSnapshotStore:
         self, snapshot_id: str, cwd: str | Path, *, force: bool = False
     ) -> WorkspaceSnapshot:
         if self._is_corrupt and not force:
-            raise WorkspaceSnapshotError(SNAPSHOT_CORRUPTION_MESSAGE)
+            raise WorkspaceSnapshotError(self.corruption_message)
         snapshot = self.by_id(snapshot_id)
         if snapshot is None:
             raise WorkspaceSnapshotError(f"snapshot not found: {snapshot_id}")
@@ -623,6 +675,7 @@ class WorkspaceSnapshotStore:
             self._current_id = snapshot.id
             self._persist()
             return snapshot
+        self._validate_restore_target(snapshot)
         repo_root = snapshot.repo_root or git_repo_root(cwd)
         if repo_root is None or snapshot.tree_sha is None:
             raise WorkspaceSnapshotError(

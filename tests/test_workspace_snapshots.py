@@ -401,7 +401,8 @@ def test_slash_undo_soft_fails_on_git_error(
 
     monkeypatch.setattr(workspace_module.subprocess, "run", failing_run)
     result = app.slash_undo("--force")
-    assert "workspace unchanged" in result
+    assert "workspace restore failed" in result
+    assert "undone" not in result
     assert "read-tree boom" in result
     assert "Traceback" not in result
 
@@ -895,3 +896,97 @@ def test_corrupt_snapshot_marker_clears_only_through_explicit_reset(
     assert loaded.snapshots == (older,)
     assert not loaded.is_dirty(git_repo)
     assert "snapshot skipped" not in reopened.slash_checkpoint("after-reset")
+
+
+@pytest.mark.parametrize("damage", ["ref", "pruned", "commit", "tree"])
+@pytest.mark.parametrize("malformed_row", [False, True])
+def test_reset_discards_unrestorable_snapshots(
+    git_repo: Path, tmp_path: Path, damage: str, malformed_row: bool
+) -> None:
+    conversation = _make_store(tmp_path / "session", git_repo)
+    app = _make_tui(conversation)
+    app.slash_checkpoint("valid")
+    (git_repo / "tracked.txt").write_text("damaged snapshot\n")
+    app.slash_checkpoint("damaged")
+    snapshots = app._snapshots()
+    valid, damaged = snapshots.snapshots
+    shadow = conversation.session_dir / "workspace_shadow.git"
+    state = json.loads(snapshots.state_path.read_text())
+    if damage in {"ref", "pruned"}:
+        subprocess.run(
+            ["git", f"--git-dir={shadow}", "update-ref", "-d",
+             f"{SNAPSHOT_REF_NAMESPACE}/{damaged.id}"], check=True,
+        )
+        if damage == "pruned":
+            subprocess.run(
+                ["git", f"--git-dir={shadow}", "prune", "--expire=now"], check=True,
+            )
+    elif damage == "commit":
+        state["snapshots"][-1]["commit_sha"] = valid.commit_sha
+    else:
+        state["snapshots"][-1]["tree_sha"] = valid.tree_sha
+    if malformed_row:
+        state["snapshots"].append({"id": "invalid"})
+    snapshots.state_path.write_text(json.dumps(state))
+    original = snapshots.state_path.read_bytes()
+    (git_repo / "tracked.txt").write_text("unsaved work\n")
+    reopened = _make_tui(conversation)
+
+    assert "snapshot state reset" in reopened.slash_checkpoint("--reset")
+    loaded = _make_tui(conversation)
+    assert loaded._snapshots().snapshots == (valid,)
+    assert loaded._snapshots().current_id is None
+    assert not loaded._snapshots().is_corrupt
+    backups = list(conversation.session_dir.glob("workspace_snapshots.corrupt.*.json"))
+    assert len(backups) == 1 and backups[0].read_bytes() == original
+    assert "undone" in loaded.slash_undo("--force")
+    assert (git_repo / "tracked.txt").read_text() == "initial tracked\n"
+    assert loaded._snapshots().current_id == valid.id
+
+
+@pytest.mark.parametrize("prune", [False, True])
+def test_failed_forced_undo_reports_failure_without_changing_workspace(
+    git_repo: Path, tmp_path: Path, prune: bool
+) -> None:
+    conversation = _make_store(tmp_path / "session", git_repo)
+    app = _make_tui(conversation)
+    app.slash_checkpoint("older")
+    (git_repo / "tracked.txt").write_text("current snapshot\n")
+    app.slash_checkpoint("current")
+    snapshots = app._snapshots()
+    older, current = snapshots.snapshots
+    shadow = conversation.session_dir / "workspace_shadow.git"
+    subprocess.run(
+        ["git", f"--git-dir={shadow}", "update-ref", "-d",
+         f"{SNAPSHOT_REF_NAMESPACE}/{older.id}"], check=True,
+    )
+    if prune:
+        subprocess.run(
+            ["git", f"--git-dir={shadow}", "prune", "--expire=now"], check=True,
+        )
+    (git_repo / "tracked.txt").write_text("unsaved work\n")
+    original = snapshots.state_path.read_bytes()
+
+    result = app.slash_undo("--force")
+
+    assert "restore failed" in result
+    assert "undone" not in result and "workspace restored" not in result
+    assert "rev-parse" in result
+    assert (git_repo / "tracked.txt").read_text() == "unsaved work\n"
+    assert snapshots.current_id == current.id
+    assert snapshots.state_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("args", ["", "--force"])
+def test_all_invalid_history_points_undo_to_reset(tmp_path: Path, args: str) -> None:
+    conversation = _make_store(tmp_path / "session", tmp_path)
+    path = conversation.session_dir / "workspace_snapshots.json"
+    path.write_text(json.dumps({"snapshots": [{"id": "invalid"}], "current_id": "invalid"}))
+    original = path.read_bytes()
+
+    result = _make_tui(conversation).slash_undo(args)
+
+    assert "no valid" in result and "snapshot" in result
+    assert "/checkpoint --reset" in result
+    assert "--force" not in result
+    assert path.read_bytes() == original
