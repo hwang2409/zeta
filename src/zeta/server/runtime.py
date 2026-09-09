@@ -32,6 +32,7 @@ def default_backend(
     *,
     stall_seconds: float | None = None,
     stall_retries: int | None = None,
+    require_credentials: bool = False,
 ) -> tuple[CompletionBackend, str]:
     if provider == "fake":
         selected = model or "offline"
@@ -44,6 +45,7 @@ def default_backend(
         home=home,
         stall_seconds=stall_seconds,
         stall_retries=stall_retries,
+        require_credentials=require_credentials,
     )
 
 
@@ -110,10 +112,27 @@ class ServerRuntime:
         self.cwd = Path(cwd or Path.cwd()).expanduser().resolve()
         self._server_provider = provider
         self._server_model = model
+        self._server_provider = self._config(None, None).provider
         self.backend_factory = backend_factory
         self.manager = SessionManager(self.home)
         self._state: SessionState | None = None
         self._background_event_sink: SessionEventSink | None = None
+
+    @property
+    def fake_catalog(self) -> bool:
+        return self._server_provider == "fake"
+
+    def backend_for_model(self, provider: str, model: str) -> CompletionBackend:
+        config = self._config(provider, model)
+        backend, _ = self._build_backend(
+            provider,
+            model,
+            self.home,
+            stall_seconds=config.stream_stall_seconds,
+            stall_retries=config.stream_stall_retries,
+            require_credentials=True,
+        )
+        return backend
 
     @property
     def opened(self) -> OpenedSession | None:
@@ -156,7 +175,11 @@ class ServerRuntime:
         return self.metadata.session_id
 
     def list_sessions(self) -> list[SessionMetadata]:
-        return self.manager.list_sessions()
+        return [
+            session
+            for session in self.manager.list_sessions()
+            if (session.provider == "fake") == self.fake_catalog
+        ]
 
     def set_background_event_sink(self, sink: SessionEventSink | None) -> None:
         """Attach the current frontend to child-agent progress events."""
@@ -184,6 +207,15 @@ class ServerRuntime:
         return self.metadata
 
     async def resume_session(self, session_id: str) -> SessionMetadata:
+        metadata = self.manager.read_metadata(session_id)
+        if (metadata.provider == "fake") != self.fake_catalog:
+            if metadata.provider == "fake":
+                raise ValueError(
+                    "session uses the offline test provider; open it with --provider fake"
+                )
+            raise ValueError(
+                f"session uses a real provider; open it with --provider {metadata.provider}"
+            )
         opened = self.manager.open(session_id)
         context = ProjectContext(
             opened.metadata.system_prompt,
@@ -240,6 +272,7 @@ class ServerRuntime:
         *,
         stall_seconds: float | None = None,
         stall_retries: int | None = None,
+        require_credentials: bool = False,
     ) -> tuple[CompletionBackend, str]:
         if self.backend_factory is not None:
             return self.backend_factory(provider, model, home)
@@ -249,6 +282,7 @@ class ServerRuntime:
             home,
             stall_seconds=stall_seconds,
             stall_retries=stall_retries,
+            require_credentials=require_credentials,
         )
 
     def _config(self, provider: str | None, model: str | None):

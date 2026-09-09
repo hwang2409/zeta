@@ -17,6 +17,7 @@ from uuid import uuid4
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
 from ..core.slash import resolve_session_budget
+from ..model_catalog import provider_for_model
 from ..types import StreamEvent, StreamEventType, TextContent
 from . import ergonomics
 from .protocol import (
@@ -389,24 +390,34 @@ class _Client:
             mode = _required_string(params, "approval_mode")
             if model not in ergonomics.catalog(runtime)["models"] or mode not in {"ask", "allow", "deny"}:
                 raise ProtocolError(-32602, "invalid model or approval mode")
+            provider = "fake" if runtime.fake_catalog else provider_for_model(model)
             previous = runtime.model
+            previous_backend = runtime.loop.backend
+            backend = (
+                runtime.backend_for_model(provider, model)
+                if provider != runtime.provider else previous_backend
+            )
             assembler = runtime.loop.context_assembler
             previous_budget = assembler.token_budget
             budget, _ = resolve_session_budget(
                 runtime.metadata.compaction_budget,
                 runtime.metadata.budget_pinned,
-                runtime.provider,
+                provider,
                 model,
                 None,
             )
             try:
+                runtime.loop.backend = backend
                 runtime.loop.set_model(model)
                 assembler.token_budget = budget
-                runtime.manager.record_session_settings(runtime.metadata, model=model, approval_mode=mode, budget=budget)
+                runtime.manager.record_session_settings(runtime.metadata, model=model, approval_mode=mode, budget=budget, provider=provider)
             except Exception:
                 assembler.token_budget = previous_budget
+                runtime.loop.backend = previous_backend
                 runtime.loop.set_model(previous)
                 raise
+            assembler.backend = backend
+            assembler.compaction_policy.backend = backend
             runtime.policy.default = ApprovalDecision(mode)
             return ergonomics.settings(runtime)
         if method == "fork_message":

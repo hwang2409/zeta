@@ -153,6 +153,9 @@ impl ZetaView {
                         1
                     };
                     *selected = (*selected + delta) % count;
+                    if view.settings_field == 0 {
+                        self.model_scroll.scroll_to_item(view.selected_model);
+                    }
                 }
             }
             "enter" => self.apply_settings(cx),
@@ -162,33 +165,111 @@ impl ZetaView {
         cx.notify();
     }
 
-    pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_settings(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // ScrollHandle needs one layout before its viewport and overflow are known.
+        if self.model_scroll.bounds().size.height == px(0.) {
+            cx.on_next_frame(window, |view, _, cx| {
+                view.model_scroll
+                    .scroll_to_item(view.state.session_view.selected_model);
+                cx.notify();
+            });
+        }
         let p = self.appearance.palette();
         let view = &self.state.session_view;
         let mut models = div()
             .id("settings-models")
+            .debug_selector(|| "settings-models".into())
             .max_h(px(240.))
-            .overflow_y_scroll();
+            .pr_3()
+            .overflow_y_scroll()
+            .track_scroll(&self.model_scroll);
+        let mut previous_provider = None;
         for (index, model) in view.models.iter().enumerate() {
-            models = models.child(
+            let mut item = div().flex().flex_col();
+            let provider = view.model_providers.get(model);
+            if provider != previous_provider {
+                if let Some(provider) = provider {
+                    let selector = format!("provider-{provider}");
+                    item = item.child(
+                        div()
+                            .debug_selector(move || selector.clone())
+                            .mt_3()
+                            .mb_1()
+                            .px_2()
+                            .text_size(px(12.))
+                            .text_color(gpui::rgb(p.muted))
+                            .child(provider.clone()),
+                    );
+                }
+                previous_provider = provider;
+            }
+            let selector = format!("model-{model}");
+            item = item.child(
                 self.session_button(
                     format!("model-{index}"),
                     model.clone(),
                     cx,
                     move |view, window, cx| {
                         view.state.session_view.selected_model = index;
+                        view.model_scroll.scroll_to_item(index);
                         view.state.session_view.settings_field = 0;
                         window.focus(&view.focus_handle, cx);
                         cx.notify();
                     },
                 )
+                .debug_selector(move || selector.clone())
+                .flex()
+                .items_center()
+                .justify_between()
+                .when(model == &view.current_model, |row| {
+                    row.font_weight(gpui::FontWeight::BOLD).child(
+                        div()
+                            .debug_selector(|| "current-model".into())
+                            .text_size(px(12.))
+                            .text_color(gpui::rgb(p.muted))
+                            .child("current"),
+                    )
+                })
                 .when(index == view.selected_model, |row| {
                     row.bg(gpui::rgb(p.code_chip))
                         .border_l_2()
                         .border_color(gpui::rgb(p.accent))
                 }),
             );
+            models = models.child(item);
         }
+        let scroll = self.model_scroll.clone();
+        let models = div().relative().child(models).child(
+            gpui::canvas(
+                |_, _, _| (),
+                move |bounds, (), window, _| {
+                    let max = scroll.max_offset().y;
+                    if max <= px(0.) {
+                        return;
+                    }
+                    let height = bounds.size.height;
+                    let thumb_height = height * (height / (height + max));
+                    let top = (height - thumb_height) * (-scroll.offset().y / max);
+                    window.paint_quad(gpui::fill(bounds, gpui::rgb(p.border)));
+                    window.paint_quad(gpui::fill(
+                        Bounds::new(
+                            gpui::point(bounds.left(), bounds.top() + top),
+                            gpui::size(bounds.size.width, thumb_height),
+                        ),
+                        gpui::rgb(p.muted),
+                    ));
+                },
+            )
+            .absolute()
+            .right_0()
+            .top_0()
+            .bottom_0()
+            .w(px(4.)),
+        );
         let mut modes = div().flex().gap_2();
         for (index, mode) in MODES.iter().enumerate() {
             modes = modes.child(

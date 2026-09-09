@@ -363,13 +363,18 @@ class SessionManager:
             return self.open(session_id)
         raise SessionError("could not allocate a unique session id")
 
-    def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
+    def read_metadata(self, session_id: str) -> SessionMetadata:
+        """Read validated metadata without opening or repairing the conversation."""
         self._validate_id(session_id)
         metadata = self._read(session_id)
         if metadata.session_id != session_id:
             raise SessionError(
                 f"session metadata id mismatch for {session_id}: {metadata.session_id}"
             )
+        return metadata
+
+    def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
+        metadata = self.read_metadata(session_id)
         session_path = self.sessions_dir / session_id
         conversation_path = session_path / "conversation.jsonl"
         if not conversation_path.exists():
@@ -522,17 +527,23 @@ class SessionManager:
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
-    def record_session_settings(self, metadata: SessionMetadata, *, model: str, approval_mode: str, budget: int) -> None:
+    def record_session_settings(self, metadata: SessionMetadata, *, model: str, approval_mode: str, budget: int, provider: str) -> None:
         """Persist active-session settings together, without changing global config."""
         if approval_mode not in {"ask", "allow", "deny"} or not model.strip() or budget <= 0:
             raise SessionError("invalid session settings")
-        expected = (metadata.model, metadata.approval_mode, metadata.compaction_budget, metadata.budget_pinned)
+        expected = (metadata.provider, metadata.model, metadata.approval_mode, metadata.compaction_budget, metadata.budget_pinned)
 
         def update(item: SessionMetadata) -> SessionMetadata:
-            if (item.model, item.approval_mode, item.compaction_budget, item.budget_pinned) != expected:
+            if (item.provider, item.model, item.approval_mode, item.compaction_budget, item.budget_pinned) != expected:
                 raise SessionError("session settings changed before commit")
-            if item.model != model:
-                item.override_audit.append({"at": _now(), "provider": None, "model": {"from": item.model, "to": model}})
+            if item.model != model or item.provider != provider:
+                item.override_audit.append({
+                    "at": _now(),
+                    "provider": {"from": item.provider, "to": provider}
+                    if item.provider != provider else None,
+                    "model": {"from": item.model, "to": model} if item.model != model else None,
+                })
+            item.provider = provider
             item.model = model
             item.approval_mode = approval_mode
             item.compaction_budget = budget

@@ -58,6 +58,11 @@ Each metadata object has `version`, `session_id`, `created_at`, `updated_at`,
 `override_audit`, `system_prompt`, `context_files`, `vim_mode`, `budget_pinned`,
 `plan_mode`, and `name`.
 
+Server mode uses the effective launch provider after CLI and settings resolution.
+Without either override, `zeta serve` uses fake mode.
+Real-provider servers omit fake-provider sessions. A server whose effective launch
+provider is `fake` lists only fake-provider sessions.
+
 ```json
 {"jsonrpc":"2.0","id":2,"method":"list_sessions","params":{}}
 ```
@@ -87,6 +92,13 @@ all metadata fields.
 
 Params: required `session_id`, a non-empty string. The result has `session`
 with the full session metadata. The session must exist.
+
+Real-provider servers reject fake sessions with RPC error `-32602`:
+`session uses the offline test provider; open it with --provider fake`.
+Fake-mode servers reject real sessions with the same code and a message
+naming the required `--provider`. Both errors preserve the active session and
+leave the rejected session's files untouched. Fake sessions still resume on
+fake-mode servers; real sessions can resume across real providers.
 
 ```json
 {"jsonrpc":"2.0","id":4,"method":"resume","params":{"session_id":"abc123"}}
@@ -407,13 +419,20 @@ tools, approvals, and background agents with `-32004`.
   output previews are bounded to 8,000 bytes. Image content becomes
   `{"type":"attachment","name":"shot.png","size":123}`; base64 stays off this
   response. Tool-use content retains the existing `tool_call` shape.
-- `model_catalog`: returns `models`, sorted names from the built-in provider
-  catalog plus the current model. The fake provider returns `faster`, `offline`.
+- `model_catalog`: returns `models`, sorted names from both built-in real provider
+  catalogs, and `providers`, a model-name-to-provider map (`claude` or `codex`).
+  Only a server whose effective launch provider is `fake` returns `faster` and
+  `offline` instead, without a provider map; real models cannot enter that catalog.
 - `session_settings`: returns `model` and `approval_mode`.
 - `set_settings`: takes `model` from that catalog and `approval_mode` (`ask`,
   `allow`, or `deny`). Both persist atomically in session metadata and apply to
   future completions. Explicit approval tool rules retain precedence. Invalid
-  choices return `-32602`. The response contains the applied settings.
+  choices return `-32602`. Cross-provider choices rebuild the completion and
+  compaction backends while retaining the session, history, usage, and approval
+  rules. Pinned budgets stay fixed; unpinned budgets track the target model.
+  Running turns reject changes with `-32004`. Missing target-provider logins
+  return `-32000` with a login message; failed swaps retain the previous settings.
+  The response contains the applied settings.
 - `send_images`: takes `text` (possibly empty) and `images`, a list of one to four
   objects with `name`, `mime_type`, and base64 `data`. Supported types are
   `image/png`, `image/jpeg`, `image/gif`, and `image/webp`. The combined decoded

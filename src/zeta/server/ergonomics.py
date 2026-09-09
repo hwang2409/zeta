@@ -10,7 +10,7 @@ import unicodedata
 from pathlib import Path
 from uuid import uuid4
 
-from ..model_catalog import PROVIDER_MODELS
+from ..model_catalog import PROVIDER_MODELS, known_model_names
 from ..types import (
     ImageContent,
     Message,
@@ -152,11 +152,16 @@ def settings(runtime: ServerRuntime) -> dict:
 
 
 def catalog(runtime: ServerRuntime) -> dict:
-    models = PROVIDER_MODELS.get(
-        runtime.provider,
-        frozenset({"offline", "faster"}) if runtime.provider == "fake" else frozenset(),
-    )
-    return {"models": sorted(models | {runtime.model})}
+    if runtime.fake_catalog:
+        return {"models": ["faster", "offline"]}
+    return {
+        "models": known_model_names(),
+        "providers": {
+            model: provider
+            for provider, models in PROVIDER_MODELS.items()
+            for model in models
+        },
+    }
 
 
 def image_message(runtime: ServerRuntime, params: dict) -> Message:

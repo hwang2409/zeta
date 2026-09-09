@@ -35,6 +35,7 @@ struct ZetaView {
     state: AppState,
     appearance: Appearance,
     transcript_scroll: ListState,
+    model_scroll: gpui::ScrollHandle,
     composer: gpui::Entity<Composer>,
     pending_command: bool,
     command_error: Option<String>,
@@ -106,6 +107,7 @@ impl ZetaView {
             state: AppState::default(),
             appearance: appearance(window),
             transcript_scroll: transcript_list(),
+            model_scroll: gpui::ScrollHandle::new(),
             composer,
             pending_command: false,
             command_error: None,
@@ -137,7 +139,15 @@ impl ZetaView {
                 }
                 self.pending_command = false;
             }
-            WorkerMessage::Settings(settings, models) => {
+            WorkerMessage::Settings(settings, catalog) => {
+                let mut models = catalog.models;
+                models.sort_by(|a, b| {
+                    catalog
+                        .providers
+                        .get(a)
+                        .cmp(&catalog.providers.get(b))
+                        .then_with(|| a.cmp(b))
+                });
                 let view = &mut self.state.session_view;
                 view.selected_model = models
                     .iter()
@@ -148,7 +158,10 @@ impl ZetaView {
                     .position(|mode| *mode == settings.approval_mode)
                     .unwrap_or(0);
                 view.models = models;
+                view.model_providers = catalog.providers;
+                view.current_model = settings.model;
                 view.settings_open = true;
+                self.model_scroll.scroll_to_item(view.selected_model);
                 self.pending_command = false;
             }
             WorkerMessage::SettingsApplied(settings) => {
@@ -730,7 +743,7 @@ impl ZetaView {
 }
 
 impl Render for ZetaView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.appearance.palette();
         let enabled = !self.pending_command
             && self.state.approvals.is_empty()
@@ -810,7 +823,7 @@ impl Render for ZetaView {
             ),
         };
         if self.state.session_view.settings_open {
-            root = root.child(self.render_settings(cx));
+            root = root.child(self.render_settings(window, cx));
         }
         if let Some(approval) = self.state.approvals.first().cloned() {
             root = root.child(self.render_approval(&approval, cx));
@@ -992,6 +1005,7 @@ mod tests {
             },
             appearance: Appearance::Light,
             transcript_scroll: transcript_list(),
+            model_scroll: gpui::ScrollHandle::new(),
             composer: cx.new(Composer::new),
             pending_command: false,
             command_error: None,
@@ -1052,6 +1066,7 @@ mod tests {
             },
             appearance: Appearance::Light,
             transcript_scroll: handle,
+            model_scroll: gpui::ScrollHandle::new(),
             composer: cx.new(Composer::new),
             pending_command: false,
             command_error: None,
@@ -1144,6 +1159,7 @@ mod tests {
             },
             appearance: Appearance::Light,
             transcript_scroll: transcript_list(),
+            model_scroll: gpui::ScrollHandle::new(),
             composer: cx.new(Composer::new),
             pending_command: false,
             command_error: None,
@@ -1271,6 +1287,7 @@ mod tests {
                 appearance: Appearance::Light,
                 composer,
                 transcript_scroll: transcript_list(),
+                model_scroll: gpui::ScrollHandle::new(),
                 pending_command: false,
                 command_error: None,
                 commands,
@@ -1367,7 +1384,10 @@ mod session_tests {
                         model: "offline".into(),
                         approval_mode: "ask".into(),
                     },
-                    vec!["offline".into(), "faster".into()],
+                    zeta_gui::client::ModelCatalog {
+                        models: vec!["offline".into(), "faster".into()],
+                        providers: Default::default(),
+                    },
                 ),
                 cx,
             );
@@ -1386,6 +1406,115 @@ mod session_tests {
             })
             .unwrap();
         assert!(receiver.try_recv().is_err(), "escape must not abort a turn");
+    }
+
+    #[gpui::test]
+    fn settings_group_real_models_and_dispatch_cross_provider(cx: &mut gpui::TestAppContext) {
+        cx.update(composer::bind_keys);
+        let (commands, receiver) = mpsc::channel();
+        let window = cx.open_window(gpui::size(px(1100.), px(760.)), move |window, cx| {
+            let mut view = ZetaView::new(window, cx, Some("/tmp/zeta-97-no-server.sock".into()));
+            view.commands = commands;
+            view.state.connection = ConnectionState::Connected;
+            view.state.active_session = Some("session".into());
+            view.state.session_view.available = true;
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: "claude-sonnet-4-6".into(),
+                        approval_mode: "ask".into(),
+                    },
+                    serde_json::from_str(include_str!("../tests/fixtures/model_catalog.json"))
+                        .unwrap(),
+                ),
+                cx,
+            );
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            window
+                .update(&mut visual, |view, _, cx| {
+                    view.appearance = appearance;
+                    cx.notify();
+                })
+                .unwrap();
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+            let claude = visual
+                .debug_bounds("provider-claude")
+                .expect("claude heading");
+            let codex = visual
+                .debug_bounds("provider-codex")
+                .expect("codex heading");
+            let first = visual
+                .debug_bounds("model-claude-sonnet-4-6")
+                .expect("claude model");
+            let second = visual.debug_bounds("model-gpt-5.4").expect("codex model");
+            assert!(claude.origin.y < first.origin.y && first.origin.y < codex.origin.y);
+            assert!(codex.origin.y < second.origin.y);
+            assert!(second.size.height >= px(40.));
+            assert!(visual.debug_bounds("current-model").is_some());
+            assert!(visual.debug_bounds("model-offline").is_none());
+            assert!(visual.debug_bounds("model-faster").is_none());
+            let viewport = visual
+                .debug_bounds("settings-models")
+                .expect("model viewport");
+            assert!(
+                first.top() >= viewport.top() && first.bottom() <= viewport.bottom(),
+                "current row must be visible on open: row {first:?} viewport {viewport:?}"
+            );
+        }
+        // Check every move, including wrapping at both ends of the full catalog.
+        for key in ["down", "up"] {
+            for _ in 0..20 {
+                visual.simulate_keystrokes(key);
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+                let model = window
+                    .update(&mut visual, |view, _, _| {
+                        view.state.session_view.models[view.state.session_view.selected_model]
+                            .clone()
+                    })
+                    .unwrap();
+                // GPUI's test selector API requires a static string.
+                let selector = Box::leak(format!("model-{model}").into_boxed_str());
+                let row = visual.debug_bounds(selector).unwrap();
+                let viewport = visual.debug_bounds("settings-models").unwrap();
+                assert!(row.top() >= viewport.top() && row.bottom() <= viewport.bottom(), "selected {model} must be visible after {key}: row {row:?} viewport {viewport:?}");
+            }
+        }
+        // The default is index 9; four moves reach gpt-5.4 at index 13.
+        visual.simulate_keystrokes("down down down down");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let target = visual.debug_bounds("model-gpt-5.4").unwrap();
+        visual.simulate_click(target.center(), Default::default());
+        visual.simulate_keystrokes("enter");
+        assert!(
+            matches!(receiver.try_recv(), Ok(CommandMessage::SetSettings(settings)) if settings.model == "gpt-5.4")
+        );
+        window
+            .update(&mut visual, |view, _, cx| {
+                view.apply_worker_message(
+                    WorkerMessage::Rejected("no Codex OAuth login found; log in first".into()),
+                    cx,
+                );
+                assert!(view.state.session_view.settings_open);
+                assert!(!view.pending_command);
+                assert!(view.command_error.as_ref().unwrap().contains("login"));
+                view.apply_worker_message(
+                    WorkerMessage::SettingsApplied(SessionSettings {
+                        model: "gpt-5.4".into(),
+                        approval_mode: "ask".into(),
+                    }),
+                    cx,
+                );
+                assert!(!view.state.session_view.settings_open);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

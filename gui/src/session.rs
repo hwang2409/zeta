@@ -102,6 +102,8 @@ pub struct SessionView {
     pub attachments: std::collections::HashMap<usize, Vec<(String, usize)>>,
     pub notice: Option<String>,
     pub models: Vec<String>,
+    pub model_providers: std::collections::BTreeMap<String, String>,
+    pub current_model: String,
     pub settings_open: bool,
     pub selected_model: usize,
     pub selected_mode: usize,

@@ -1,6 +1,7 @@
 //! The connection actor owns the socket, session identity, and command ordering.
 use crate::client::{
-    ClientError, ProtocolClient, ServerEvent, SessionList, SessionMetadata, StatusResult,
+    ClientError, ModelCatalog, ProtocolClient, ServerEvent, SessionList, SessionMetadata,
+    StatusResult,
 };
 use crate::client::{HistoryMessage, TreeResult};
 use crate::session::{ImageAttachment, SessionSettings};
@@ -37,7 +38,7 @@ pub enum WorkerMessage {
     Extensions(bool),
     Tree(TreeResult),
     History(Vec<HistoryMessage>, bool),
-    Settings(SessionSettings, Vec<String>),
+    Settings(SessionSettings, ModelCatalog),
     SettingsApplied(SessionSettings),
     ImagesSent(String, Vec<ImageAttachment>),
     Event(ServerEvent),
@@ -242,7 +243,7 @@ impl ConnectionWorker {
                         CommandMessage::LoadSettings => {
                             let id = selected.as_deref().unwrap_or("");
                             client.settings(id).and_then(|settings| {
-                                let models = client.models(id)?.models;
+                                let models = client.models(id)?;
                                 let _ = self
                                     .messages
                                     .send(WorkerMessage::Settings(settings, models));
@@ -343,12 +344,18 @@ fn connect(
 ) -> Result<ProtocolClient, ClientError> {
     let path = socket.clone().unwrap_or_else(default_socket);
     connect_or_spawn(&path, socket.is_none(), process, || {
-        Command::new(zeta_binary())
-            .arg("serve")
-            .arg("--socket")
-            .arg(&path)
-            .spawn()
+        server_command(&path).spawn()
     })
+}
+
+fn server_command(path: &std::path::Path) -> Command {
+    let mut command = Command::new(zeta_binary());
+    command
+        .arg("serve")
+        .args(["--provider", "claude", "--model", "claude-sonnet-4-6"])
+        .arg("--socket")
+        .arg(path);
+    command
 }
 
 fn connect_or_spawn(
@@ -398,6 +405,22 @@ fn default_socket() -> PathBuf {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn gui_server_uses_real_default() {
+        let command = server_command(std::path::Path::new("/tmp/zeta-test.sock"));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert!(args.windows(2).any(|pair| pair == ["--provider", "claude"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--model", "claude-sonnet-4-6"]));
+        assert!(!args
+            .iter()
+            .any(|arg| ["fake", "offline", "faster"].contains(arg)));
+    }
 
     #[test]
     fn session_rpc_errors_keep_commands_alive() {
