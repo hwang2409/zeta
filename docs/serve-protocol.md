@@ -445,3 +445,11 @@ tools, approvals, and background agents with `-32004`.
 
 The generic 1 MiB frame bound applies to all requests and responses. Session
 metadata adds nullable `approval_mode`; absent or null uses configured defaults.
+
+### Session preview metadata
+
+`list_sessions` includes an optional `first_message_preview` string on each
+session. It contains a bounded, control-stripped, single-line preview of the
+first user message. It does not change the persisted session name. Older clients
+ignore it; newer clients fall back when an older server omits it. Provider-mode
+filtering and response-size limits apply before the response is sent.

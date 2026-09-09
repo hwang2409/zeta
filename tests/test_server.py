@@ -1710,3 +1710,19 @@ def test_plain_serve_uses_effective_provider_mode(
 
     monkeypatch.setattr(server_module, "run_server", check_server)
     assert cli.main(["serve"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_session_list_includes_single_line_first_message_preview(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "first\nmessage\tpreview"})
+        await _event(reader, "turn_end")
+        await _request(reader, writer, 4, "send", {"text": "later message"})
+        await _event(reader, "turn_end")
+        result = (await _request(reader, writer, 5, "list_sessions"))[-1]["result"]
+        assert result["sessions"][0]["first_message_preview"] == "first message preview"
+        assert result["sessions"][0]["name"] == ""
+    finally:
+        await _close(server, writer)

@@ -1,0 +1,147 @@
+use super::*;
+use chrono::{DateTime, Utc};
+use gpui_kit::component::{v_virtual_list, Selectable};
+use std::rc::Rc;
+use zeta_gui::client::SessionMetadata;
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn session_label(session: &SessionMetadata, transcript: Option<&[TranscriptEntry]>) -> String {
+    let name = one_line(&session.name);
+    if !name.is_empty() {
+        return name;
+    }
+    let preview = transcript
+        .and_then(|rows| {
+            rows.iter().find_map(|row| match row {
+                TranscriptEntry::User(text) if !text.trim().is_empty() => Some(text.as_str()),
+                _ => None,
+            })
+        })
+        .unwrap_or(&session.first_message_preview);
+    let preview = one_line(preview);
+    if preview.is_empty() {
+        "New conversation".into()
+    } else {
+        preview
+    }
+}
+
+pub fn relative_age(timestamp: &str, now: DateTime<Utc>) -> String {
+    let Ok(time) = DateTime::parse_from_rfc3339(timestamp) else {
+        return String::new();
+    };
+    let seconds = (now - time.with_timezone(&Utc)).num_seconds().max(0);
+    match seconds {
+        0..60 => "now".into(),
+        60..3600 => format!("{}m", seconds / 60),
+        3600..86400 => format!("{}h", seconds / 3600),
+        86400..2592000 => format!("{}d", seconds / 86400),
+        _ => time.format("%b %d").to_string(),
+    }
+}
+
+impl ZetaView {
+    pub fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let sizes = Rc::new(vec![
+            gpui::size(px(264.), px(44.));
+            self.state.sessions.len()
+        ]);
+        let sessions = v_virtual_list(cx.entity(), "sessions", sizes, |view, range, _, cx| {
+            let now = Utc::now();
+            range
+                .map(|index| {
+                    let session = &view.state.sessions[index];
+                    let id = session.session_id.clone();
+                    let active = view.state.active_session.as_ref() == Some(&id);
+                    let rows = if active {
+                        Some(view.state.transcript.as_slice())
+                    } else {
+                        view.state.saved_transcripts.get(&id).map(Vec::as_slice)
+                    };
+                    let label = session_label(session, rows);
+                    let age = relative_age(&session.updated_at, now);
+                    Button::new(format!("session-{id}"))
+                        .ghost()
+                        .selected(active)
+                        .disabled(!view.can_change_session())
+                        .w_full()
+                        .h(px(44.))
+                        .child(
+                            div()
+                                .debug_selector(|| "session-row".into())
+                                .h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .justify_between()
+                                .gap_3()
+                                .child(div().flex_1().min_w_0().truncate().child(label))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(11.))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(age),
+                                ),
+                        )
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            if view.can_change_session()
+                                && view.state.active_session.as_ref() != Some(&id)
+                            {
+                                view.pending_command = true;
+                                view.queue(CommandMessage::Resume(id.clone()));
+                                cx.notify();
+                            }
+                        }))
+                        .into_any_element()
+                })
+                .collect()
+        })
+        .track_scroll(&self.sidebar_scroll)
+        .flex_1()
+        .min_h_0();
+        div()
+            .v_flex()
+            .w(px(280.))
+            .h_full()
+            .flex_shrink_0()
+            .p_2()
+            .gap_2()
+            .bg(cx.theme().sidebar)
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .px_3()
+                    .py_4()
+                    .text_size(px(20.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child("zeta"),
+            )
+            .child(
+                Button::new("new-session")
+                    .label("New session")
+                    .w_full()
+                    .h(px(40.))
+                    .disabled(!self.can_change_session())
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        if view.can_change_session() {
+                            view.pending_command = true;
+                            view.queue(CommandMessage::NewSession);
+                            cx.notify();
+                        }
+                    })),
+            )
+            .when(self.state.sessions_truncated, |sidebar| {
+                sidebar.child(
+                    div()
+                        .p_2()
+                        .text_size(px(12.))
+                        .child("Showing a partial session list"),
+                )
+            })
+            .child(sessions)
+    }
+}

@@ -704,7 +704,17 @@ class _Client:
         await self._write(self.codec.notification(event, session_id, **fields))
 
     def _list_sessions(self, request_id: str | int) -> dict[str, object]:
-        sessions = [item.to_dict() for item in self.server.runtime.list_sessions()]
+        metadata = self.server.runtime.list_sessions()
+        previews = {
+            item.session_id: item.preview
+            for item in self.server.runtime.manager.list_session_previews(
+                limit=len(metadata), sessions=metadata
+            )
+        }
+        sessions = [
+            {**item.to_dict(), "first_message_preview": previews.get(item.session_id, "")}
+            for item in metadata
+        ]
         page: list[dict[str, Any]] = []
         for offset, item in enumerate(sessions):
             candidate = [*page, item]

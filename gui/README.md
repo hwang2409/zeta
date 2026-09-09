@@ -1,83 +1,59 @@
 # zeta gui
 
-the native gui is a separate rust crate. it speaks the version 1.x `zeta serve`
-protocol documented in [`../docs/serve-protocol.md`](../docs/serve-protocol.md).
-
-run it with the default zeta home:
-
-```sh
-cargo run --manifest-path gui/Cargo.toml
-```
-
-connect to an existing server:
+The native GUI uses [GPUI Kit](https://github.com/longbridge/gpui-kit) 0.6.
+The plain Rust protocol client and connection actor speak the existing
+[`zeta serve` protocol](../docs/serve-protocol.md).
 
 ```sh
+make gui
+# Connect to an existing server:
 cargo run --manifest-path gui/Cargo.toml -- --socket /path/to/serve.sock
 ```
 
-set `ZETA_BIN` when the `zeta` executable is not on `PATH`. set `ZETA_HOME` to
-use an isolated home for local verification.
+The GUI starts a real-provider server by default. Set `ZETA_BIN` if `zeta` is
+not on `PATH`. For local tests, set `ZETA_HOME` to a temporary directory.
+A fake server can use `zeta serve --provider fake --socket /tmp/demo.sock`.
 
-shift-enter inserts a newline. enter sends the composer. escape aborts the
-active turn. when an approval modal is open, enter approves and escape denies.
+## Core chat loop
 
-assistant messages render headings, lists, emphasis, inline code, and syntax-colored
-code fences. user messages remain plain text. long code lines scroll inside their
-fence; syntax themes never paint a background.
+- Create a session or select one from the virtual sidebar. Rows show its name
+  or first-message preview and relative age. An empty session shows
+  `New conversation`; an older server without previews gets the same fallback.
+- Enter sends; Shift-Enter inserts a newline. Rejected sends retain the draft.
+  The composer explains why sending is disabled.
+- Assistant messages use Kit rich text: headings, lists, emphasis, code fences,
+  selection, and syntax colors for Rust, Python, Bash, JSON, and TypeScript.
+  Streaming previews retain the latest 8 KiB / 40 lines until the committed
+  message restores the complete source.
+- Kit's virtual message scroller follows the tail. Scrolling up pauses follow;
+  `Jump to latest` restores it. Tool receipts are collapsed status lines.
+- Approval dialogs use Enter to approve and Escape to deny. The dialog stays
+  until the server confirms the decision. Escape or Ctrl-C aborts an active turn.
+- Connection loss shows a reconnect button. Session RPC errors show an error
+  without changing the connection state.
+- The status bar shows the model, token count, and cache rate at turn boundaries.
+  Missing values show an em dash. Tokens include input, cache reads, cache writes,
+  and output. Cache rate divides cache reads by all input tokens.
 
-tool receipts start collapsed. click a receipt, or focus it with tab and press
-enter, to show its last 20 output lines. tails also have a 16,000-character cap;
-cut output has an `output truncated` header. delegated receipts keep their agent
-identity and use an indented border. background agents stay marked working until
-their terminal receipt arrives.
+Kit semantic themes follow system appearance. JetBrains Mono 2.304 Regular,
+Medium, Bold, and Italic are embedded and registered at startup. Their OFL
+license is in `assets/fonts/OFL.txt`.
 
-the bottom bar shows the model, token count, and cache hit rate from `status`.
-it refreshes at turn boundaries, after aborts, and when selecting a session.
-usage notifications do not change displayed metrics during streaming. missing
-values show an em dash. token counts include input, cache reads, cache writes,
-and output; cache rate divides reads by all input tokens.
+Branch trees, settings, and attachments are deferred to ZETA-99. The protocol
+client and actor retain those commands.
 
-the window follows system light/dark appearance, including the composer and code
-colors. body and syntax text meet AA contrast against their surfaces. no motion
-is needed to operate disclosures.
+## Build and targeted checks
 
-local validation on hosts without the offline Metal compiler:
+GPUI Kit brings matching published `gpui-pre` crates (locked at 0.3.4), replacing
+the previous Zed git revision. Kit always enables runtime shaders, so Command
+Line Tools hosts need no offline Metal compiler. `runtime-shaders` remains an
+empty compatibility feature for existing commands.
 
 ```sh
-cargo fmt --manifest-path gui/Cargo.toml --all -- --check
-cargo clippy --manifest-path gui/Cargo.toml --features 'gui runtime-shaders' --all-targets -- -D warnings
-cargo test --manifest-path gui/Cargo.toml --features runtime-shaders
+cargo fmt --manifest-path gui/Cargo.toml -- --check
+cargo clippy --manifest-path gui/Cargo.toml --all-targets -- -D warnings
+ZETA_HOME="$(mktemp -d)" cargo test --manifest-path gui/Cargo.toml
 ```
-
-appearance tests force both palettes. GPUI's platform appearance simulator is
-private, so those tests do not simulate macOS appearance notifications.
-
-
-## Session tools (protocol 1.1)
-
-The sidebar lists branch heads, with indentation at each divergence and a blue
-rule on the current branch. Labels stay on one line; hover to read the label.
-Click a branch to switch. `fork here` on a user message forks at that message.
-These actions use the core conversation tree. They do not restore workspace
-snapshots. Resume and branch switches load the persisted transcript.
-
-Settings apply only to the active session and persist with it. The model list
-comes from the server's built-in provider catalog, including the current model.
-Approval mode changes the default decision (`ask`, `allow`, or `deny`); explicit
-tool rules still apply. In settings, tab selects the field, arrows select its
-value, enter applies, and escape closes. Settings and branch changes wait until
-foreground turns, pending approvals, and background agents finish.
-
-Paste an image with cmd-v or drop image files onto the composer. PNG, JPEG, GIF,
-and WebP are supported, with at most four images totaling 512 KiB per message.
-Click a draft chip to remove it. The server saves each image under the session
-directory and sends it through the existing provider image path. The transcript
-shows the filename and byte count, without an image preview. Rejected sends
-retain the draft and show the error.
-
-The GUI starts with a 1.0 hello and advertises `client_version: "1.1"`. A 1.0
-server ignores that field; the GUI hides session tools and image input. A 1.1
-server returns the negotiated version. Old clients receive 1.0 and keep working.
 
 ## Developer Mac app
 
@@ -86,19 +62,26 @@ make gui-app
 open dist/Zeta.app
 ```
 
-This builds `dist/Zeta.app` with runtime shaders, even on hosts without Apple's
-Metal compiler. The unsigned bundle contains the GUI and a server launcher tied
-to this checkout and the current `uv` executable. Keep this checkout in place.
-The launcher honors `ZETA_BIN`, `ZETA_HOME`, and `--socket`; it does not package a
-Python runtime. It is intended for the local development loop.
+The unsigned bundle contains the GUI and a server launcher tied to this checkout
+and the current `uv` executable. Keep this checkout in place. Packaging changes
+and distribution signing are outside this milestone.
 
-For isolated verification against an existing server:
+## Native smoke capture
+
+The optional `smoke-test` feature adds a driver that clicks New session, enters
+text, sends it, approves the scripted tool, and captures native renderer pixels.
+It uses the real connection actor and server. It exits after capture and fails
+if the turn does not complete within 30 seconds. Normal builds omit this driver.
+
+In one terminal:
 
 ```sh
-ZETA_HOME=/path/to/isolated-home dist/Zeta.app/Contents/MacOS/zeta --socket /path/to/isolated.sock
+ZETA_HOME="$(mktemp -d)" uv run python gui/tests/smoke_server.py --socket /tmp/zeta-smoke.sock
 ```
 
-The release/default-shader build path requires full Xcode with the Metal
-compiler. A distributable build would package the Python server first, then sign
-nested executables and the finished app bundle before notarization. This target
-does not sign, notarize, or add CI packaging jobs.
+In another:
+
+```sh
+ZETA_HOME="$(mktemp -d)" ZETA_GUI_SMOKE_IMAGE=/tmp/zeta-smoke.png \
+  cargo run --manifest-path gui/Cargo.toml --features smoke-test -- --socket /tmp/zeta-smoke.sock
+```
