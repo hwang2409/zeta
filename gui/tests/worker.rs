@@ -1127,6 +1127,10 @@ fn old_server_disables_extensions_without_sending_new_requests() {
         CommandMessage::SwitchBranch("head".into()),
         CommandMessage::ForkMessage("message".into()),
         CommandMessage::LoadSettings,
+        CommandMessage::SetSettings(zeta_gui::session::SessionSettings {
+            model: "gpt-5.4-mini".into(),
+            approval_mode: "ask".into(),
+        }),
     ] {
         harness.command(command);
         assert!(

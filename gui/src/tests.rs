@@ -19,6 +19,11 @@ fn setup(
     Entity<ZetaView>,
     Receiver<CommandMessage>,
 ) {
+    static ENVIRONMENT: std::sync::Once = std::sync::Once::new();
+    ENVIRONMENT.call_once(|| {
+        env::set_var("TERM", "dumb");
+        env::set_var("COLORTERM", "");
+    });
     cx.update(init);
     let (commands, receiver) = mpsc::channel();
     let mut view = None;
@@ -620,4 +625,148 @@ fn attachment_validation_error_renders_and_clears_on_a_good_image(cx: &mut TestA
         assert!(view.composer_image_error.is_none());
         assert_eq!(view.composer_images.len(), 1);
     });
+}
+
+#[gpui::test]
+fn tool_receipts_expand_collapse_and_show_failures(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for failed in [false, true] {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.state.transcript.clear();
+                view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
+                view.apply_worker_message(
+                    WorkerMessage::Event(ServerEvent::ToolEnd {
+                        session_id: view.state.active_session.clone(),
+                        tool_call: ToolCall {
+                            id: "receipt".into(),
+                            name: "bash".into(),
+                            arguments: Default::default(),
+                        },
+                        tool_result: Some(zeta_gui::client::ToolResult {
+                            tool_call_id: "receipt".into(),
+                            content: "first line\nsecond line\nlast line".into(),
+                            is_error: failed,
+                            is_canceled: false,
+                            structured_content: None,
+                            content_blocks: Vec::new(),
+                        }),
+                        data: json!({}),
+                    }),
+                    window,
+                    cx,
+                );
+            });
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(visual.debug_bounds("tool-output-0").is_some(), failed);
+        for expanded in [!failed, failed] {
+            let bounds = visual.debug_bounds("tool-receipt-0").unwrap();
+            // Click the header, which remains at the top when output expands.
+            visual.simulate_click(
+                bounds.origin + gpui::point(px(50.), px(20.)),
+                Default::default(),
+            );
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(visual.debug_bounds("tool-output-0").is_some(), expanded);
+            if expanded {
+                assert!(visual.debug_bounds("tool-output-0").unwrap().size.height > px(40.));
+            }
+            view.read_with(&visual, |view, _| {
+                assert!(
+                    matches!(&view.state.transcript[0], TranscriptEntry::Tool {card, ..}
+                    if card.expanded == expanded && card.tail.text.ends_with("last line"))
+                );
+            });
+        }
+    }
+}
+
+#[gpui::test]
+fn error_block_keeps_full_text_wraps_and_opens_settings(cx: &mut TestAppContext) {
+    for detail in ["provider detail ".repeat(80), "x".repeat(1200)] {
+        let (window, view, receiver) = setup(cx);
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let message = format!("Model not supported: {}\nlast error line", detail);
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.state.session_view.available = true;
+                view.apply_worker_message(
+                    WorkerMessage::Event(ServerEvent::Error {
+                        session_id: view.state.active_session.clone(),
+                        error: zeta_gui::client::EventError {
+                            code: "http_error".into(),
+                            message: message.clone(),
+                        },
+                        data: json!({}),
+                    }),
+                    window,
+                    cx,
+                );
+            });
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        view.read_with(&visual, |view, _| {
+        assert!(matches!(&view.state.transcript[0], TranscriptEntry::Error { message: text, settings_action: true } if *text == message));
+    });
+        let text_bounds = visual
+            .debug_bounds("error-message-0")
+            .expect("full error text block");
+        assert!(
+            text_bounds.size.height > px(60.),
+            "long error must wrap across several lines"
+        );
+        let button = visual.debug_bounds("error-settings-0").unwrap();
+        visual.simulate_click(button.center(), Default::default());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(CommandMessage::LoadSettings)
+        ));
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_worker_message(
+                    WorkerMessage::Settings(
+                        SessionSettings {
+                            model: "working".into(),
+                            approval_mode: "ask".into(),
+                        },
+                        ModelCatalog {
+                            models: vec!["working".into()],
+                            providers: Default::default(),
+                        },
+                    ),
+                    window,
+                    cx,
+                )
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(visual.debug_bounds("settings-overlay").is_some());
+    }
+}
+
+#[gpui::test]
+fn legacy_error_block_has_no_unavailable_settings_action(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::Error {
+                    session_id: view.state.active_session.clone(),
+                    error: zeta_gui::client::EventError {
+                        code: "auth_error".into(),
+                        message: "Login required".into(),
+                    },
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("error-block-0").is_some());
+    assert!(visual.debug_bounds("error-settings-0").is_none());
 }

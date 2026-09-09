@@ -1957,3 +1957,32 @@ def test_model_command_leaves_a_pinned_budget_alone(
         "(model catalog unavailable for claude — using anyway)"
     )
     assert app.loop.context_assembler.token_budget == 9000
+
+
+def test_model_fallback_persists_and_clears_with_settings(tmp_path):
+    manager = SessionManager(tmp_path)
+    metadata = manager.create(provider="claude", model="claude-sonnet-4-6").metadata
+    fallback = (metadata.provider, metadata.model, metadata.compaction_budget)
+    manager.record_session_settings(metadata, model="gpt-5.4-mini", provider="codex",
+                                    approval_mode="ask", budget=200_000, model_fallback=fallback)
+    assert manager.open(metadata.session_id).metadata.model_fallback == fallback
+    stale = manager.open(metadata.session_id).metadata
+    manager.record_session_settings(metadata, model=metadata.model, provider=metadata.provider,
+                                    approval_mode="ask", budget=metadata.compaction_budget)
+    assert manager.open(metadata.session_id).metadata.model_fallback is None
+    with pytest.raises(SessionError, match="changed before commit"):
+        manager.record_session_settings(stale, model=stale.model, provider=stale.provider,
+                                        approval_mode="ask", budget=stale.compaction_budget)
+
+
+@pytest.mark.parametrize("fallback", ["bad", [], [[], "model", 5], ["fake", "model", 5],
+                                       ["codex", "", 5], ["codex", "model", True],
+                                       ["codex", "model", -1]])
+def test_invalid_model_fallback_metadata_fails_closed(tmp_path, fallback):
+    from zeta.core.session import SessionMetadata
+    manager = SessionManager(tmp_path)
+    metadata = manager.create(provider="claude", model="claude-sonnet-4-6").metadata
+    data = metadata.to_dict()
+    data["model_fallback"] = fallback
+    with pytest.raises(SessionError, match="model fallback is invalid"):
+        SessionMetadata.from_dict(data, path=tmp_path / "meta.json")

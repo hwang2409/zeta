@@ -30,6 +30,10 @@ impl ToolReceiptKey {
 pub enum TranscriptEntry {
     User(String),
     Assistant(Markdown),
+    Error {
+        message: String,
+        settings_action: bool,
+    },
     Tool {
         key: ToolReceiptKey,
         name: String,
@@ -323,7 +327,11 @@ impl AppState {
                             .as_ref()
                             .and_then(|result| result.structured_content.as_ref())
                             .is_some_and(|data| data["status"] == "running");
-                    *error = tool_result.as_ref().is_some_and(|result| result.is_error);
+                    let failed = tool_result.as_ref().is_some_and(|result| result.is_error);
+                    if failed && !*error {
+                        card.expanded = true;
+                    }
+                    *error = failed;
                     if let Some(result) = tool_result.filter(|result| !result.content.is_empty()) {
                         if card.tail.text != result.content {
                             if !card.tail.text.is_empty() && !card.tail.text.ends_with('\n') {
@@ -363,25 +371,22 @@ impl AppState {
                 self.streaming = false;
                 self.metrics_boundary = true;
                 self.approvals.clear();
-                self.transcript.push(TranscriptEntry::Tool {
-                    key: ToolReceiptKey {
-                        session_id: None,
-                        agent_instance_id: None,
-                        tool_call_id: String::new(),
-                    },
-                    name: "error".to_owned(),
-                    summary: bounded_summary(&error.message),
-                    card: Card {
-                        tail: {
-                            let mut tail = OutputTail::default();
-                            tail.append(&error.message);
-                            tail
-                        },
-                        ..Default::default()
-                    },
-                    complete: true,
-                    error: true,
-                    canceled: false,
+                let message_lower = error.message.to_ascii_lowercase();
+                let settings_action = error.code == "auth_error"
+                    || error.code == "model_reverted"
+                    || [
+                        "model",
+                        "credential",
+                        "login",
+                        "api key",
+                        "unauthorized",
+                        "authentication",
+                    ]
+                    .iter()
+                    .any(|word| message_lower.contains(word));
+                self.transcript.push(TranscriptEntry::Error {
+                    message: error.message,
+                    settings_action,
                 });
                 changed = self.transcript.len().checked_sub(1);
             }
@@ -454,7 +459,11 @@ impl AppState {
         } = &mut self.transcript[index]
         {
             *complete = true;
-            *error = receipt.status != SubAgentStatus::Completed;
+            let failed = receipt.status != SubAgentStatus::Completed;
+            if failed && receipt.status != SubAgentStatus::Canceled && !*error {
+                card.expanded = true;
+            }
+            *error = failed;
             *canceled = receipt.status == SubAgentStatus::Canceled;
             *summary = bounded_summary(
                 receipt
@@ -939,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn errors_stop_streaming_and_render_as_distinct_receipt() {
+    fn errors_stop_streaming_and_render_as_distinct_block() {
         let mut state = AppState {
             streaming: true,
             ..Default::default()
@@ -953,10 +962,7 @@ mod tests {
             data: json!({}),
         });
         assert!(!state.streaming);
-        assert!(matches!(
-            state.transcript[0],
-            TranscriptEntry::Tool { error: true, .. }
-        ));
+        assert!(matches!(state.transcript[0], TranscriptEntry::Error { .. }));
     }
 
     #[test]

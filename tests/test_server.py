@@ -1163,6 +1163,7 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
             assert (await rpc("set_settings", model=model, approval_mode=mode))["error"]["code"] == -32602
         settings = {"model": "faster", "approval_mode": "deny"}
         assert (await rpc("set_settings", **settings))["result"] == settings
+        assert server.runtime.metadata.model_fallback is None
         assert server.runtime.loop.backend.model == "faster"
         assert server.runtime.policy.default.value == "deny"
         await _request(reader, writer, "new", "new_session", {"provider": "fake"})
@@ -1724,5 +1725,142 @@ async def test_session_list_includes_single_line_first_message_preview(tmp_path)
         result = (await _request(reader, writer, 5, "list_sessions"))[-1]["result"]
         assert result["sessions"][0]["first_message_preview"] == "first message preview"
         assert result["sessions"][0]["name"] == ""
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_provider,start_model", [
+    ("codex", "gpt-5.4"), ("claude", "claude-sonnet-4-6"),
+])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("raise_error", [False, True])
+async def test_unusable_model_reverts_durably_and_next_send_works(
+    tmp_path, start_provider, start_model, restart, raise_error,
+):
+    from zeta.types import ErrorInfo, StreamEvent, StreamEventType
+
+    completions = []
+
+    class AccountBackend(FakeBackend):
+        async def complete(self, messages, tool_schemas):
+            completions.append(self.model)
+            if self.model == "gpt-5.4-mini":
+                if raise_error:
+                    from zeta.providers.codex_errors import CodexHTTPError
+                    raise CodexHTTPError("Model is not supported with a ChatGPT account", status_code=400)
+                yield StreamEvent(StreamEventType.ERROR, error=ErrorInfo(
+                    "http_error", 'Codex HTTP request failed (400): {"detail":"Model is not supported with a ChatGPT account"}',
+                ))
+            else:
+                async for event in super().complete(messages, tool_schemas):
+                    yield event
+
+    def build(provider, model, home):
+        backend = AccountBackend([ScriptedTurn([TextContent("usable model")])])
+        backend.model = model
+        return backend, model
+
+    def make_server():
+        return ZetaServer(home=tmp_path, port=0, provider=start_provider,
+                          model=start_model, backend_factory=build)
+
+    server = make_server()
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        runtime = server.runtime
+        sid = runtime.session_id
+        old_budget = runtime.metadata.compaction_budget
+        for model in ["gpt-5.4-mini", "gpt-5.4", "gpt-5.4-mini"]:
+            applied = (await _request(reader, writer, 3, "set_settings", {
+                "session_id": sid, "model": model, "approval_mode": "deny",
+            }))[-1]
+            assert "result" in applied
+            assert completions == [], "Apply must never run a completion"
+            assert runtime.metadata.model_fallback == (start_provider, start_model, old_budget)
+        if restart:
+            await _close(server, writer)
+            server = make_server()
+            reader, writer = await _connect(server)
+            await _request(reader, writer, 4, "hello", {"protocol_version": "1.1"})
+            await _request(reader, writer, 5, "resume", {"session_id": sid})
+            runtime = server.runtime
+        await _request(reader, writer, 6, "send", {"text": "first request"})
+        failure = await _event(reader, "error")
+        assert failure["error"]["code"] == "model_reverted"
+        assert f"Model reverted to {start_model} ({start_provider})" in failure["error"]["message"]
+        assert "ChatGPT account" in failure["error"]["message"]
+        await _event(reader, "agent_end")
+        metadata = SessionManager(tmp_path).open(sid).metadata
+        assert (metadata.provider, metadata.model) == (start_provider, start_model)
+        assert metadata.model_fallback is None
+        assert metadata.compaction_budget == old_budget
+        assert runtime.loop.context_assembler.token_budget == old_budget
+        assert runtime.loop.backend is runtime.loop.context_assembler.backend
+        assert runtime.loop.backend is runtime.loop.context_assembler.compaction_policy.backend
+        assert runtime.policy.default.value == "deny"
+        await _request(reader, writer, 7, "send", {"text": "next request"})
+        message = await _event(reader, "assistant_message")
+        assert message["message"]["content"][0]["text"] == "usable model"
+        await _event(reader, "agent_end")
+        assert completions == ["gpt-5.4-mini", start_model]
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.parametrize("code,message,expected", [
+    ("auth_error", "Invalid token", True),
+    ("http_error", "model: gpt-5.4-mini not found", True),
+    ("http_error", "Anthropic HTTP 404: model: claude-old", True),
+    ("http_error", "You do not have access to this model", True),
+    ("http_error", "Model context length exceeded", False),
+    ("http_error", "Rate limit exceeded", False),
+    ("transport_error", "Connection reset", False),
+])
+def test_model_entitlement_error_classification(code, message, expected):
+    from zeta.server.model_selection import entitlement_error
+    assert entitlement_error({"code": code, "message": message}) is expected
+
+
+@pytest.mark.asyncio
+async def test_successful_selection_clears_fallback_and_background_errors_do_not_revert(tmp_path):
+    from zeta.types import ErrorInfo, StreamEvent, StreamEventType
+
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="claude", model="claude-sonnet-4-6",
+        backend_factory=lambda provider, model, home: (
+            FakeBackend([ScriptedTurn([TextContent("success")])]), model,
+        ),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "new_session")
+        runtime = server.runtime
+        sid = runtime.session_id
+        await _request(reader, writer, 3, "set_settings", {
+            "session_id": sid, "model": "gpt-5.4", "approval_mode": "ask",
+        })
+        pending = runtime.metadata.model_fallback
+        assert pending
+        client = server._client
+        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "child login")),
+                            session_id=sid, background=True)
+        await _event(reader, "error")
+        assert runtime.metadata.model_fallback == pending
+        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("transport_error", "connection reset")),
+                            session_id=sid)
+        await _event(reader, "error")
+        assert runtime.metadata.model_fallback == pending
+        await _request(reader, writer, 4, "send", {"text": "confirm selection"})
+        await _event(reader, "agent_end")
+        assert runtime.metadata.model_fallback is None
+        assert SessionManager(tmp_path).open(sid).metadata.model_fallback is None
+        await client._event(StreamEvent(StreamEventType.ERROR, error=ErrorInfo("auth_error", "expired later")),
+                            session_id=sid)
+        await _event(reader, "error")
+        assert runtime.model == "gpt-5.4"
     finally:
         await _close(server, writer)
