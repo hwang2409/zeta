@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import errno
 import fcntl
 import json
+import logging
 import os
 import re
 import unicodedata
@@ -14,12 +16,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Mapping
 
 from rich.cells import cell_len
 
 from .store import ConversationStore
 
+
+logger = logging.getLogger(__name__)
 
 META_VERSION = 1
 
@@ -318,9 +323,7 @@ class SessionManager:
         for _ in range(8):
             session_id = uuid.uuid4().hex
             session_dir = self.sessions_dir / session_id
-            try:
-                session_dir.mkdir()
-            except FileExistsError:
+            if session_dir.exists():
                 continue
             metadata = SessionMetadata.new(
                 session_id=session_id,
@@ -335,13 +338,23 @@ class SessionManager:
                 budget_pinned=budget_pinned,
                 name=name,
             )
-            store = ConversationStore(
-                self.sessions_dir,
-                session_id=session_id,
-                cwd=resolved_cwd,
-            )
-            self._write(metadata)
-            return OpenedSession(metadata, store)
+            # Stage beside sessions, on the same filesystem, so discovery only
+            # sees complete sessions even if the process dies during a write.
+            with TemporaryDirectory(prefix=".session-", dir=self.home) as temporary:
+                staged = SessionManager(temporary)
+                ConversationStore(
+                    staged.sessions_dir,
+                    session_id=session_id,
+                    cwd=resolved_cwd,
+                )
+                staged._write(metadata)
+                try:
+                    (staged.sessions_dir / session_id).rename(session_dir)
+                except OSError as exc:
+                    if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+                        continue
+                    raise
+            return self.open(session_id)
         raise SessionError("could not allocate a unique session id")
 
     def open(self, session_id: str) -> OpenedSession:
@@ -370,8 +383,11 @@ class SessionManager:
         for session_path in self.sessions_dir.iterdir():
             if not session_path.is_dir():
                 continue
-            self._validate_id(session_path.name)
-            sessions.append(self._read(session_path.name))
+            try:
+                self._validate_id(session_path.name)
+                sessions.append(self._read(session_path.name))
+            except SessionError as exc:
+                logger.warning("Skipping session %s: %s", session_path.name, exc)
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
 
     def list_session_previews(self, *, limit: int = 20) -> list[SessionPreview]:
@@ -381,7 +397,11 @@ class SessionManager:
         sessions = sessions[:limit]
         previews: list[SessionPreview] = []
         for metadata in sessions:
-            opened = self.open(metadata.session_id)
+            try:
+                opened = self.open(metadata.session_id)
+            except SessionError as exc:
+                logger.warning("Skipping session preview %s: %s", metadata.session_id, exc)
+                continue
             first_message = ""
             for entry in opened.store.replay():
                 if entry.type != "message":
@@ -684,12 +704,14 @@ class SessionManager:
 
     def _read(self, session_id: str) -> SessionMetadata:
         path = self.sessions_dir / session_id / "meta.json"
-        if not path.exists():
-            raise SessionError(f"session {session_id} was not found")
         try:
             with path.open() as handle:
                 value = json.load(handle)
-        except (OSError, json.JSONDecodeError) as exc:
+        except FileNotFoundError as exc:
+            if path.parent.is_dir():
+                raise SessionError(f"session {session_id} has no meta.json") from exc
+            raise SessionError(f"session {session_id} was not found") from exc
+        except (OSError, ValueError) as exc:
             raise SessionError(f"session metadata could not be read: {path}") from exc
         if not isinstance(value, Mapping):
             raise SessionError(f"session metadata is not an object: {path}")
