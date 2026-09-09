@@ -174,7 +174,11 @@ class ServerRuntime:
         return self.metadata.session_id
 
     def list_sessions(self) -> list[SessionMetadata]:
-        return self.manager.list_sessions()
+        return [
+            session
+            for session in self.manager.list_sessions()
+            if (session.provider == "fake") == self.fake_catalog
+        ]
 
     def set_background_event_sink(self, sink: SessionEventSink | None) -> None:
         """Attach the current frontend to child-agent progress events."""
@@ -202,6 +206,15 @@ class ServerRuntime:
         return self.metadata
 
     async def resume_session(self, session_id: str) -> SessionMetadata:
+        metadata = self.manager.read_metadata(session_id)
+        if (metadata.provider == "fake") != self.fake_catalog:
+            if metadata.provider == "fake":
+                raise ValueError(
+                    "session uses the offline test provider; open it with --provider fake"
+                )
+            raise ValueError(
+                f"session uses a real provider; open it with --provider {metadata.provider}"
+            )
         opened = self.manager.open(session_id)
         context = ProjectContext(
             opened.metadata.system_prompt,

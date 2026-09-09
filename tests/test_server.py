@@ -213,6 +213,7 @@ async def test_resumed_approval_finishes_idle_after_terminal_event(tmp_path: Pat
     backend = FakeBackend([])
     server = ZetaServer(
         home=tmp_path,
+        provider="fake",
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
@@ -698,6 +699,7 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
     )
     server = ZetaServer(
         home=tmp_path,
+        provider="fake",
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
@@ -1522,5 +1524,115 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(tmp_path, mo
         assert runtime.provider == target
         assert runtime.loop.backend is not backend
         assert isinstance(runtime.loop.backend.token_store, credential_type)
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_provider, session_provider",
+    [
+        ("claude", "fake"),
+        ("codex", "fake"),
+        (None, "fake"),
+        ("fake", "claude"),
+        ("fake", "codex"),
+    ],
+)
+async def test_cross_mode_resume_rejected_without_session_mutation(
+    tmp_path, server_provider, session_provider
+):
+    opened = SessionManager(tmp_path).create(
+        provider=session_provider,
+        model={"fake": "offline", "claude": "claude-sonnet-4-6", "codex": "gpt-5.4"}[
+            session_provider
+        ],
+        cwd=tmp_path,
+    )
+    # Rejection must not repair even a recoverable torn conversation tail.
+    with opened.store.path.open("ab") as stream:
+        stream.write(b'{"type":')
+    before_files = {
+        p: p.read_bytes() for p in opened.store.session_dir.rglob("*") if p.is_file()
+    }
+    builds = []
+
+    def build(provider, model, home):
+        builds.append(provider)
+        return FakeBackend(
+            [ScriptedTurn([TextContent("still here")])]
+        ), model or "default"
+
+    server = ZetaServer(
+        home=tmp_path, port=0, provider=server_provider, backend_factory=build
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        # Reject both before and after an active session exists.
+        for request_id in [2, 4]:
+            state = server.runtime.state
+            before_builds = list(builds)
+            response = (
+                await _request(
+                    reader,
+                    writer,
+                    request_id,
+                    "resume",
+                    {"session_id": opened.metadata.session_id},
+                )
+            )[-1]
+            assert response["error"] == {
+                "code": -32602,
+                "message": "session uses the offline test provider; open it with --provider fake"
+                if session_provider == "fake"
+                else f"session uses a real provider; open it with --provider {session_provider}",
+            }
+            assert server.runtime.state is state
+            assert builds == before_builds
+            assert {p: p.read_bytes() for p in before_files} == before_files
+            if state is None:
+                await _request(reader, writer, 3, "new_session")
+        assert (await _request(reader, writer, 5, "send", {"text": "still here"}))[-1][
+            "result"
+        ]["accepted"]
+        await _event(reader, "turn_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_provider", ["claude", "codex", None, "fake"])
+async def test_session_listing_isolates_fake_provider(tmp_path, server_provider):
+    manager = SessionManager(tmp_path)
+    sessions = {
+        p: manager.create(provider=p, model=m, cwd=tmp_path).metadata.session_id
+        for p, m in [
+            ("fake", "offline"),
+            ("claude", "claude-sonnet-4-6"),
+            ("codex", "gpt-5.4"),
+        ]
+    }
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider=server_provider,
+        backend_factory=lambda p, m, h: (FakeBackend([]), m),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        response = (await _request(reader, writer, 2, "list_sessions"))[-1]["result"]
+        expected = {
+            sid
+            for provider, sid in sessions.items()
+            if (provider == "fake") == (server_provider == "fake")
+        }
+        assert {s["session_id"] for s in response["sessions"]} == expected
+        for sid in expected:
+            response = (
+                await _request(reader, writer, 3, "resume", {"session_id": sid})
+            )[-1]
+            assert response["result"]["session"]["session_id"] == sid
     finally:
         await _close(server, writer)

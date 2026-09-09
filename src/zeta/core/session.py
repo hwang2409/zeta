@@ -363,13 +363,18 @@ class SessionManager:
             return self.open(session_id)
         raise SessionError("could not allocate a unique session id")
 
-    def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
+    def read_metadata(self, session_id: str) -> SessionMetadata:
+        """Read validated metadata without opening or repairing the conversation."""
         self._validate_id(session_id)
         metadata = self._read(session_id)
         if metadata.session_id != session_id:
             raise SessionError(
                 f"session metadata id mismatch for {session_id}: {metadata.session_id}"
             )
+        return metadata
+
+    def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
+        metadata = self.read_metadata(session_id)
         session_path = self.sessions_dir / session_id
         conversation_path = session_path / "conversation.jsonl"
         if not conversation_path.exists():

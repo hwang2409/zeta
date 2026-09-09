@@ -35,6 +35,7 @@ struct ZetaView {
     state: AppState,
     appearance: Appearance,
     transcript_scroll: ListState,
+    model_scroll: gpui::ScrollHandle,
     composer: gpui::Entity<Composer>,
     pending_command: bool,
     command_error: Option<String>,
@@ -106,6 +107,7 @@ impl ZetaView {
             state: AppState::default(),
             appearance: appearance(window),
             transcript_scroll: transcript_list(),
+            model_scroll: gpui::ScrollHandle::new(),
             composer,
             pending_command: false,
             command_error: None,
@@ -159,6 +161,7 @@ impl ZetaView {
                 view.model_providers = catalog.providers;
                 view.current_model = settings.model;
                 view.settings_open = true;
+                self.model_scroll.scroll_to_item(view.selected_model);
                 self.pending_command = false;
             }
             WorkerMessage::SettingsApplied(settings) => {
@@ -740,7 +743,7 @@ impl ZetaView {
 }
 
 impl Render for ZetaView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.appearance.palette();
         let enabled = !self.pending_command
             && self.state.approvals.is_empty()
@@ -820,7 +823,7 @@ impl Render for ZetaView {
             ),
         };
         if self.state.session_view.settings_open {
-            root = root.child(self.render_settings(cx));
+            root = root.child(self.render_settings(window, cx));
         }
         if let Some(approval) = self.state.approvals.first().cloned() {
             root = root.child(self.render_approval(&approval, cx));
@@ -1002,6 +1005,7 @@ mod tests {
             },
             appearance: Appearance::Light,
             transcript_scroll: transcript_list(),
+            model_scroll: gpui::ScrollHandle::new(),
             composer: cx.new(Composer::new),
             pending_command: false,
             command_error: None,
@@ -1062,6 +1066,7 @@ mod tests {
             },
             appearance: Appearance::Light,
             transcript_scroll: handle,
+            model_scroll: gpui::ScrollHandle::new(),
             composer: cx.new(Composer::new),
             pending_command: false,
             command_error: None,
@@ -1154,6 +1159,7 @@ mod tests {
             },
             appearance: Appearance::Light,
             transcript_scroll: transcript_list(),
+            model_scroll: gpui::ScrollHandle::new(),
             composer: cx.new(Composer::new),
             pending_command: false,
             command_error: None,
@@ -1281,6 +1287,7 @@ mod tests {
                 appearance: Appearance::Light,
                 composer,
                 transcript_scroll: transcript_list(),
+                model_scroll: gpui::ScrollHandle::new(),
                 pending_command: false,
                 command_error: None,
                 commands,
@@ -1417,11 +1424,8 @@ mod session_tests {
                         model: "claude-sonnet-4-6".into(),
                         approval_mode: "ask".into(),
                     },
-                    serde_json::from_value(serde_json::json!({
-                        "models": ["claude-sonnet-4-6", "gpt-5.4"],
-                        "providers": {"claude-sonnet-4-6": "claude", "gpt-5.4": "codex"}
-                    }))
-                    .unwrap(),
+                    serde_json::from_str(include_str!("../tests/fixtures/model_catalog.json"))
+                        .unwrap(),
                 ),
                 cx,
             );
@@ -1437,6 +1441,10 @@ mod session_tests {
                 })
                 .unwrap();
             visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
             let claude = visual
                 .debug_bounds("provider-claude")
                 .expect("claude heading");
@@ -1453,7 +1461,35 @@ mod session_tests {
             assert!(visual.debug_bounds("current-model").is_some());
             assert!(visual.debug_bounds("model-offline").is_none());
             assert!(visual.debug_bounds("model-faster").is_none());
+            let viewport = visual
+                .debug_bounds("settings-models")
+                .expect("model viewport");
+            assert!(
+                first.top() >= viewport.top() && first.bottom() <= viewport.bottom(),
+                "current row must be visible on open: row {first:?} viewport {viewport:?}"
+            );
         }
+        // Check every move, including wrapping at both ends of the full catalog.
+        for key in ["down", "up"] {
+            for _ in 0..20 {
+                visual.simulate_keystrokes(key);
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+                let model = window
+                    .update(&mut visual, |view, _, _| {
+                        view.state.session_view.models[view.state.session_view.selected_model]
+                            .clone()
+                    })
+                    .unwrap();
+                // GPUI's test selector API requires a static string.
+                let selector = Box::leak(format!("model-{model}").into_boxed_str());
+                let row = visual.debug_bounds(selector).unwrap();
+                let viewport = visual.debug_bounds("settings-models").unwrap();
+                assert!(row.top() >= viewport.top() && row.bottom() <= viewport.bottom(), "selected {model} must be visible after {key}: row {row:?} viewport {viewport:?}");
+            }
+        }
+        // The default is index 9; four moves reach gpt-5.4 at index 13.
+        visual.simulate_keystrokes("down down down down");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         let target = visual.debug_bounds("model-gpt-5.4").unwrap();
         visual.simulate_click(target.center(), Default::default());
         visual.simulate_keystrokes("enter");

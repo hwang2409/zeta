@@ -58,6 +58,9 @@ Each metadata object has `version`, `session_id`, `created_at`, `updated_at`,
 `override_audit`, `system_prompt`, `context_files`, `vim_mode`, `budget_pinned`,
 `plan_mode`, and `name`.
 
+Real-provider servers omit fake-provider sessions. A server explicitly launched
+with `--provider fake` lists only fake-provider sessions.
+
 ```json
 {"jsonrpc":"2.0","id":2,"method":"list_sessions","params":{}}
 ```
@@ -87,6 +90,13 @@ all metadata fields.
 
 Params: required `session_id`, a non-empty string. The result has `session`
 with the full session metadata. The session must exist.
+
+Real-provider servers reject fake sessions with RPC error `-32602`:
+`session uses the offline test provider; open it with --provider fake`.
+Explicit fake servers reject real sessions with the same code and a message
+naming the required `--provider`. Both errors preserve the active session and
+leave the rejected session's files untouched. Fake sessions still resume on
+explicit fake servers; real sessions can resume across real providers.
 
 ```json
 {"jsonrpc":"2.0","id":4,"method":"resume","params":{"session_id":"abc123"}}
