@@ -550,11 +550,7 @@ fn attachments_paste_shows_chip_and_send_dispatches_send_images(cx: &mut TestApp
             id: 42,
         }))
     });
-    visual.update(|_, cx| {
-        view.update(cx, |view, cx| {
-            assert!(view.attach_from_clipboard(cx));
-        });
-    });
+    visual.simulate_keystrokes("cmd-v");
     visual.update(|window, cx| window.draw(cx).clear(cx));
     let chip = visual
         .debug_bounds("composer-chip")
@@ -906,4 +902,481 @@ fn legacy_login_controls_stay_hidden_and_disconnect_clears_pending(cx: &mut Test
     });
     assert!(visual.debug_bounds("first-login-claude-start").is_none());
     assert!(visual.debug_bounds("login-progress-claude-start").is_none());
+}
+
+#[gpui::test]
+fn settings_trap_typing_editing_paste_and_shortcuts(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_keystrokes("d r a f t");
+    visual.update(|window, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("pasted".into()));
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: "one".into(),
+                        approval_mode: "ask".into(),
+                    },
+                    ModelCatalog {
+                        models: vec!["one".into(), "two".into()],
+                        providers: Default::default(),
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    for selector in ["mode-row-ask", "mode-row-allow", "mode-row-deny"] {
+        assert!(visual.debug_bounds(selector).is_some());
+    }
+    visual.simulate_keystrokes("x backspace cmd-a cmd-v shift-enter tab cmd-n down");
+    view.read_with(&visual, |view, cx| {
+        assert_eq!(view.composer.read(cx).value().as_ref(), "draft");
+        assert!(view.composer_images.is_empty());
+        assert_eq!(view.state.session_view.selected_model, 1);
+    });
+    assert!(receiver.try_recv().is_err());
+    visual.simulate_keystrokes("escape x");
+    view.read_with(&visual, |view, cx| {
+        assert!(!view.settings_open);
+        assert_eq!(view.composer.read(cx).value().as_ref(), "draftx");
+    });
+}
+
+#[gpui::test]
+fn session_changes_clear_ui_state_but_same_session_status_preserves_it(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for via_status in [false, true] {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let current = view.state.active_session.clone().unwrap();
+                let metadata = SessionMetadata {
+                    session_id: current,
+                    ..session()
+                };
+                view.composer_images =
+                    vec![ImageAttachment::from_bytes("test.png".into(), &png_bytes()).unwrap()];
+                view.composer_image_error = Some("old image error".into());
+                view.settings_open = true;
+                view.settings_error = Some("old settings error".into());
+                let status = StatusResult {
+                    session: Some(metadata.clone()),
+                    state: "idle".into(),
+                    pending_approvals: vec![],
+                    usage: json!({}),
+                    compaction_markers: 0,
+                };
+                view.apply_worker_message(WorkerMessage::Status(status.clone()), window, cx);
+                assert_eq!(view.composer_images.len(), 1);
+                assert!(view.settings_open);
+                let next = SessionMetadata {
+                    session_id: format!("next-{via_status}"),
+                    ..metadata
+                };
+                let change = if via_status {
+                    WorkerMessage::Status(StatusResult {
+                        session: Some(next),
+                        ..status
+                    })
+                } else {
+                    WorkerMessage::Session(next)
+                };
+                view.apply_worker_message(change, window, cx);
+                assert!(view.composer_images.is_empty());
+                assert!(view.composer_image_error.is_none());
+                assert!(!view.settings_open);
+                assert!(view.settings_error.is_none());
+            });
+        });
+    }
+}
+
+#[gpui::test]
+fn image_paste_is_claimed_only_when_an_image_is_accepted(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            png_bytes(),
+        )));
+        view.update(cx, |view, cx| {
+            view.state.active_session = None;
+            assert!(!view.attach_from_clipboard(cx));
+            view.state.active_session = Some(session().session_id);
+            view.state.streaming = true;
+            assert!(!view.attach_from_clipboard(cx));
+            view.state.streaming = false;
+            view.pending_command = true;
+            assert!(!view.attach_from_clipboard(cx));
+            view.pending_command = false;
+            for _ in 0..4 {
+                assert!(view.attach_from_clipboard(cx));
+            }
+            assert!(!view.attach_from_clipboard(cx));
+            assert_eq!(view.composer_images.len(), 4);
+            assert!(view.composer_image_error.is_some());
+            view.composer_images.clear();
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            b"invalid".to_vec(),
+        )));
+        view.update(cx, |view, cx| assert!(!view.attach_from_clipboard(cx)));
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("normal paste".into()));
+        view.update(cx, |view, cx| assert!(!view.attach_from_clipboard(cx)));
+    });
+    visual.simulate_keystrokes("cmd-v");
+    view.read_with(&visual, |view, cx| {
+        assert_eq!(view.composer.read(cx).value().as_ref(), "normal paste")
+    });
+}
+
+#[gpui::test]
+fn thinking_feedback_stops_on_text_and_turn_boundaries(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let start = ServerEvent::TurnStart {
+                session_id: None,
+                data: json!({}),
+            };
+            let thinking = ServerEvent::AssistantDelta {
+                session_id: None,
+                delta: "private reasoning".into(),
+                kind: "thinking".into(),
+            };
+            view.apply_worker_message(WorkerMessage::Event(start.clone()), window, cx);
+            view.apply_worker_message(WorkerMessage::Event(thinking.clone()), window, cx);
+            assert_eq!(
+                view.composer_hint(),
+                "zeta is thinking… · Esc stops the turn"
+            );
+            assert!(view.state.transcript.is_empty());
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantDelta {
+                    session_id: None,
+                    delta: String::new(),
+                    kind: "assistant".into(),
+                }),
+                window,
+                cx,
+            );
+            assert!(view.state.thinking);
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantDelta {
+                    session_id: None,
+                    delta: "hello".into(),
+                    kind: "assistant".into(),
+                }),
+                window,
+                cx,
+            );
+            assert!(!view.state.thinking);
+            view.apply_worker_message(WorkerMessage::Event(thinking.clone()), window, cx);
+            assert!(!view.state.thinking);
+            for end in [
+                ServerEvent::TurnEnd {
+                    session_id: None,
+                    data: json!({}),
+                },
+                ServerEvent::AgentEnd {
+                    session_id: None,
+                    data: json!({}),
+                },
+                ServerEvent::TurnAborted {
+                    session_id: None,
+                    data: json!({}),
+                },
+            ] {
+                view.apply_worker_message(WorkerMessage::Event(start.clone()), window, cx);
+                view.apply_worker_message(WorkerMessage::Event(thinking.clone()), window, cx);
+                assert!(view.state.thinking);
+                view.apply_worker_message(WorkerMessage::Event(end), window, cx);
+                assert!(!view.state.thinking);
+            }
+            view.apply_worker_message(WorkerMessage::Event(start), window, cx);
+            view.apply_worker_message(WorkerMessage::Event(thinking), window, cx);
+            view.apply_worker_message(WorkerMessage::Lost("disconnected".into()), window, cx);
+            assert!(!view.state.thinking);
+            assert!(!format!("{:?}", view.state.transcript).contains("private reasoning"));
+        });
+    });
+}
+
+#[gpui::test]
+fn whitespace_send_shows_hint_until_the_draft_changes(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |input, cx| input.set_value(" \n\t", window, cx))
+        });
+    });
+    visual.simulate_keystrokes("enter");
+    assert!(receiver.try_recv().is_err());
+    view.read_with(&visual, |view, _| {
+        assert_eq!(
+            view.composer_hint(),
+            "Type a message or attach an image to send"
+        )
+    });
+    visual.simulate_keystrokes("h");
+    view.read_with(&visual, |view, _| {
+        assert_eq!(
+            view.composer_hint(),
+            "Enter sends · Shift-Enter adds a line"
+        )
+    });
+    visual.simulate_keystrokes("enter");
+    assert!(matches!(receiver.try_recv(), Ok(CommandMessage::Send(_))));
+}
+
+#[gpui::test]
+fn new_session_action_uses_the_same_busy_gate_as_the_button(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_keystrokes("cmd-n cmd-n");
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(CommandMessage::NewSession)
+    ));
+    assert!(receiver.try_recv().is_err());
+    view.read_with(&visual, |view, _| assert!(view.pending_command));
+}
+
+#[test]
+fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
+    assert_eq!(
+        polish::status_label(&Default::default()),
+        "Usage appears after the first turn"
+    );
+    let metrics = zeta_gui::state::StatusMetrics {
+        model: Some("model".into()),
+        tokens: Some(12),
+        cache_hit_rate: Some(50.),
+    };
+    assert_eq!(
+        polish::status_label(&metrics),
+        "model · 12 tokens · 50.0% cache"
+    );
+    let mut state = AppState::default();
+    let mut status = StatusResult {
+        session: Some(SessionMetadata {
+            model: "model".into(),
+            ..session()
+        }),
+        state: "idle".into(),
+        pending_approvals: vec![],
+        usage: json!({}),
+        compaction_markers: 0,
+    };
+    state.apply_status(status.clone());
+    assert_eq!(
+        polish::status_label(&state.metrics),
+        "model · Usage appears after the first turn"
+    );
+    status.usage = json!({
+        "input_tokens": 4, "output_tokens": 4, "cache_read_input_tokens": 4
+    });
+    state.apply_status(status);
+    assert_eq!(
+        polish::status_label(&state.metrics),
+        "model · 12 tokens · 50.0% cache"
+    );
+    for (name, args, expected) in [
+        (
+            "bash",
+            json!({"command":"echo one\necho two"}),
+            Some("echo one echo two"),
+        ),
+        (
+            "bash",
+            json!({"cmd":"echo legacy\npwd"}),
+            Some("echo legacy pwd"),
+        ),
+        (
+            "bash",
+            json!({"command":"echo current", "cmd":"echo legacy"}),
+            Some("echo current"),
+        ),
+        ("read", json!({"path":"/tmp/test"}), Some("/tmp/test")),
+        ("custom", json!({"path":"/tmp/test"}), None),
+    ] {
+        let call = ToolCall {
+            id: "tool".into(),
+            name: name.into(),
+            arguments: args.as_object().unwrap().clone(),
+        };
+        assert_eq!(polish::approval_summary(&call).as_deref(), expected);
+    }
+}
+
+fn thumbnail_attachment(width: u32, height: u32, color: u8) -> ImageAttachment {
+    let pixels = image::RgbaImage::from_pixel(width, height, image::Rgba([color, 0, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    pixels
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    ImageAttachment::from_bytes("pixel.png".into(), bytes.get_ref()).unwrap()
+}
+
+#[test]
+fn thumbnails_downscale_large_images_and_reject_decode_failures() {
+    for (width, height, expected) in [(1024, 768, (128, 96)), (768, 1024, (72, 96))] {
+        let attachment = thumbnail_attachment(width, height, 1);
+        let thumbnail = polish::image_source(&attachment).unwrap();
+        let decoded = image::load_from_memory(thumbnail.bytes()).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), expected);
+        assert!(thumbnail.bytes().len() < attachment.size);
+    }
+    let invalid = ImageAttachment::from_bytes("broken.png".into(), &png_bytes()).unwrap();
+    assert!(polish::image_source(&invalid).is_none());
+}
+
+#[gpui::test]
+fn sent_image_thumbnail_survives_history_refresh_and_clears_on_switch(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let image = thumbnail_attachment(16, 12, 1);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::ImagesSent("image".into(), vec![image.clone()]),
+                window,
+                cx,
+            );
+            let history = serde_json::from_value(json!([{
+                "id":"message", "role":"user", "content":[
+                    {"type":"text", "text":"image"},
+                    {"type":"attachment", "name":"pixel.png", "size":image.size}
+                ]
+            }]))
+            .unwrap();
+            view.apply_worker_message(WorkerMessage::History(history, false), window, cx);
+            assert!(view.sent_images.contains_key(&(0, 0)));
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("attachment-thumbnail").is_some());
+    assert!(visual.debug_bounds("attachment-chip").is_some());
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let thumbnail = view.sent_images[&(0, 0)].clone();
+            assert!(thumbnail.is_asset_cached(cx));
+            view.apply_worker_message(
+                WorkerMessage::Session(SessionMetadata {
+                    session_id: "other".into(),
+                    ..session()
+                }),
+                window,
+                cx,
+            );
+            assert!(view.sent_images.is_empty());
+            assert!(!thumbnail.is_asset_cached(cx));
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("attachment-thumbnail").is_none());
+}
+
+#[gpui::test]
+fn sent_thumbnail_cache_evicts_old_assets_and_reset_releases_remaining_assets(
+    cx: &mut TestAppContext,
+) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut sent = Vec::new();
+            for index in 0..polish::SENT_IMAGE_LIMIT * 3 {
+                view.apply_worker_message(
+                    WorkerMessage::ImagesSent(
+                        "image".into(),
+                        vec![thumbnail_attachment(16, 12, index as u8)],
+                    ),
+                    window,
+                    cx,
+                );
+                let thumbnail = view.sent_images[&(index, 0)].clone();
+                thumbnail.clone().get_render_image(window, cx);
+                sent.push(thumbnail);
+                assert_eq!(
+                    view.sent_images.len(),
+                    (index + 1).min(polish::SENT_IMAGE_LIMIT)
+                );
+                let first_retained = (index + 1).saturating_sub(polish::SENT_IMAGE_LIMIT);
+                for (index, thumbnail) in sent.iter().enumerate() {
+                    assert_eq!(thumbnail.is_asset_cached(cx), index >= first_retained);
+                }
+            }
+            view.apply_worker_message(WorkerMessage::History(vec![], true), window, cx);
+            assert!(view.sent_images.is_empty());
+            assert!(sent.iter().all(|image| !image.is_asset_cached(cx)));
+        });
+    });
+}
+
+#[gpui::test]
+fn sent_image_decode_failure_keeps_attachment_text(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::ImagesSent(
+                    "image".into(),
+                    vec![ImageAttachment::from_bytes("broken.png".into(), &png_bytes()).unwrap()],
+                ),
+                window,
+                cx,
+            );
+            assert!(view.sent_images.is_empty());
+            assert_eq!(
+                view.state.session_view.attachments[&0],
+                vec![("broken.png".into(), 8)]
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("attachment-chip").is_some());
+    assert!(visual.debug_bounds("attachment-thumbnail").is_none());
+}
+
+#[gpui::test]
+fn refused_image_paste_falls_through_to_clipboard_text(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem {
+            entries: vec![
+                gpui::ClipboardEntry::Image(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    png_bytes(),
+                )),
+                gpui::ClipboardEntry::String(gpui::ClipboardString::new("fallback text".into())),
+            ],
+        });
+    });
+    visual.simulate_keystrokes("cmd-v");
+    view.read_with(&visual, |view, cx| {
+        assert_eq!(view.composer_images.len(), 1);
+        assert!(view.composer.read(cx).value().is_empty());
+    });
+    visual.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.composer_images = vec![view.composer_images[0].clone(); 4]
+        });
+    });
+    visual.simulate_keystrokes("cmd-v");
+    view.read_with(&visual, |view, cx| {
+        assert_eq!(view.composer_images.len(), 4);
+        assert_eq!(view.composer.read(cx).value().as_ref(), "fallback text");
+    });
 }

@@ -1,5 +1,6 @@
 extern crate gpui_kit as gpui;
 
+mod polish;
 mod sidebar;
 #[cfg(feature = "smoke-test")]
 mod smoke;
@@ -53,10 +54,13 @@ struct ZetaView {
     dialog_request: Option<String>,
     approval_pending: bool,
     settings_open: bool,
+    settings_focus: gpui::FocusHandle,
     login_providers: Vec<LoginProvider>,
     settings_error: Option<String>,
     composer_images: Vec<ImageAttachment>,
     composer_image_error: Option<String>,
+    composer_empty_hint: bool,
+    sent_images: std::collections::BTreeMap<(usize, usize), std::sync::Arc<gpui::Image>>,
     commands: Sender<CommandMessage>,
     _poll_task: Option<Task<()>>,
 }
@@ -82,6 +86,10 @@ impl ZetaView {
                 .submit_on_enter(true)
         });
         cx.subscribe_in(&composer, window, |view, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                view.composer_empty_hint = false;
+                cx.notify();
+            }
             if matches!(
                 event,
                 InputEvent::PressEnter {
@@ -106,10 +114,13 @@ impl ZetaView {
             dialog_request: None,
             approval_pending: false,
             settings_open: false,
+            settings_focus: cx.focus_handle(),
             login_providers: Vec::new(),
             settings_error: None,
             composer_images: Vec::new(),
             composer_image_error: None,
+            composer_empty_hint: false,
+            sent_images: Default::default(),
             commands,
             _poll_task: None,
         }
@@ -208,13 +219,12 @@ impl ZetaView {
                     .position(|mode| *mode == settings.approval_mode)
                     .unwrap_or(0);
                 self.settings_open = true;
-                self.scroll_model_into_view();
+                window.focus(&self.settings_focus, cx);
             }
             WorkerMessage::SettingsApplied(settings) => {
                 self.pending_command = false;
                 self.state.session_view.current_model = settings.model;
-                self.settings_error = None;
-                self.settings_open = false;
+                self.close_settings(window, cx);
             }
             WorkerMessage::ImagesSent(text, images) => {
                 self.pending_command = false;
@@ -228,6 +238,16 @@ impl ZetaView {
                         .map(|item| (item.name.clone(), item.size))
                         .collect(),
                 );
+                for (attachment_index, image) in images.iter().enumerate() {
+                    if let Some(image) = polish::image_source(image) {
+                        self.sent_images.insert((index, attachment_index), image);
+                        if self.sent_images.len() > polish::SENT_IMAGE_LIMIT {
+                            if let Some((_, image)) = self.sent_images.pop_first() {
+                                image.remove_asset(cx);
+                            }
+                        }
+                    }
+                }
                 self.composer_images.clear();
                 self.composer_image_error = None;
                 self.composer
@@ -297,7 +317,21 @@ impl ZetaView {
                 self.state.mark_connection_lost(error);
             }
         }
-        replace |= self.state.active_session != previous_session;
+        if self.state.active_session != previous_session {
+            self.composer_images.clear();
+            self.composer_image_error = None;
+            self.composer_empty_hint = false;
+            if self.settings_open {
+                self.close_settings(window, cx);
+            }
+            self.settings_error = None;
+            replace = true;
+        }
+        if replace {
+            for image in std::mem::take(&mut self.sent_images).into_values() {
+                image.remove_asset(cx);
+            }
+        }
         let count = self.state.transcript.len();
         self.transcript.update(cx, |scroll, cx| {
             if replace {
@@ -335,8 +369,12 @@ impl ZetaView {
             ConnectionState::Reconnecting => "Connecting to zeta…",
             _ if !self.state.approvals.is_empty() => "Approve or deny the tool request to continue",
             _ if self.pending_command => "Waiting for the server…",
-            _ if self.state.streaming => "Responding… Esc stops the turn",
+            _ if self.state.streaming && self.state.thinking => {
+                "zeta is thinking… · Esc stops the turn"
+            }
+            _ if self.state.streaming => "Responding… · Esc stops the turn",
             _ if self.state.active_session.is_none() => "Create or select a session to begin",
+            _ if self.composer_empty_hint => "Type a message or attach an image to send",
             _ => "Enter sends · Shift-Enter adds a line",
         }
     }
@@ -356,8 +394,11 @@ impl ZetaView {
         let text = self.composer.read(cx).value().to_string();
         let has_images = !self.composer_images.is_empty();
         if text.trim().is_empty() && !has_images {
+            self.composer_empty_hint = true;
+            cx.notify();
             return;
         }
+        self.composer_empty_hint = false;
         self.pending_command = true;
         if has_images {
             self.queue(CommandMessage::SendImages(
@@ -494,6 +535,14 @@ impl ZetaView {
             .into_any_element()
     }
 
+    fn new_session(&mut self, cx: &mut Context<Self>) {
+        if self.can_change_session() && !self.settings_open {
+            self.pending_command = true;
+            self.queue(CommandMessage::NewSession);
+            cx.notify();
+        }
+    }
+
     fn open_settings(&mut self, cx: &mut Context<Self>) {
         if !self.can_change_session()
             || !self.state.session_view.available
@@ -508,9 +557,10 @@ impl ZetaView {
         cx.notify();
     }
 
-    fn close_settings(&mut self, cx: &mut Context<Self>) {
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = false;
         self.settings_error = None;
+        window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -535,7 +585,6 @@ impl ZetaView {
     fn select_settings_model(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.state.session_view.models.len() {
             self.state.session_view.selected_model = index;
-            self.scroll_model_into_view();
             cx.notify();
         }
     }
@@ -548,13 +597,6 @@ impl ZetaView {
         let current = self.state.session_view.selected_model as isize;
         let next = (current + delta).rem_euclid(count as isize) as usize;
         self.select_settings_model(next, cx);
-    }
-
-    fn scroll_model_into_view(&self) {
-        let selected = self.state.session_view.selected_model;
-        // ScrollHandle indexes the model rows only; group heading indexes are
-        // added after each row so the first row is always ix 0.
-        self.model_scroll.scroll_to_item(selected);
     }
 
     fn fork_message(&mut self, id: String, cx: &mut Context<Self>) {
@@ -579,10 +621,11 @@ impl ZetaView {
         &mut self,
         images: Result<Vec<ImageAttachment>, String>,
         cx: &mut Context<Self>,
-    ) {
-        if !self.can_change_session() || self.state.active_session.is_none() {
-            return;
+    ) -> bool {
+        if !self.can_change_session() || self.state.active_session.is_none() || self.settings_open {
+            return false;
         }
+        let previous_count = self.composer_images.len();
         match images {
             Ok(mut new_images) => {
                 let combined = self.composer_images.len() + new_images.len();
@@ -598,11 +641,13 @@ impl ZetaView {
                 } else {
                     self.composer_images.append(&mut new_images);
                     self.composer_image_error = None;
+                    self.composer_empty_hint = false;
                 }
             }
             Err(error) => self.composer_image_error = Some(error),
         }
         cx.notify();
+        self.composer_images.len() > previous_count
     }
 
     fn remove_attached_image(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -617,6 +662,7 @@ impl ZetaView {
         if !self.can_change_session() || self.state.active_session.is_none() {
             return;
         }
+        let session = self.state.active_session.clone();
         let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
@@ -632,7 +678,11 @@ impl ZetaView {
                 .iter()
                 .map(|path| ImageAttachment::from_path(path))
                 .collect();
-            let _ = view.update(cx, |view, cx| view.add_attached_images(images, cx));
+            let _ = view.update(cx, |view, cx| {
+                if view.state.active_session == session {
+                    view.add_attached_images(images, cx);
+                }
+            });
         })
         .detach();
     }
@@ -645,11 +695,10 @@ impl ZetaView {
             match entry {
                 gpui::ClipboardEntry::Image(image) => {
                     let name = format!("pasted-image.{}", image.format.extension());
-                    self.add_attached_images(
+                    return self.add_attached_images(
                         ImageAttachment::from_bytes(name, image.bytes()).map(|image| vec![image]),
                         cx,
                     );
-                    return true;
                 }
                 gpui::ClipboardEntry::ExternalPaths(paths) => {
                     let images: Result<Vec<ImageAttachment>, String> = paths
@@ -657,8 +706,7 @@ impl ZetaView {
                         .iter()
                         .map(|path| ImageAttachment::from_path(path))
                         .collect();
-                    self.add_attached_images(images, cx);
-                    return true;
+                    return self.add_attached_images(images, cx);
                 }
                 gpui::ClipboardEntry::String(_) => {}
             }
@@ -722,6 +770,14 @@ impl ZetaView {
                 let deny_id = request_id.clone();
                 dialog
                     .title(format!("Allow {}?", tool_call.name))
+                    .when_some(polish::approval_summary(&tool_call), |dialog, summary| {
+                        dialog.child(
+                            div()
+                                .debug_selector(|| "approval-summary".into())
+                                .truncate()
+                                .child(summary),
+                        )
+                    })
                     .child(
                         div()
                             .id("approval-arguments")
@@ -773,33 +829,38 @@ impl ZetaView {
         }
     }
 
-    fn paste_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        // Intercept image pastes before the Kit textarea consumes Cmd+V as text.
-        // Text pastes fall through untouched.
-        if event.keystroke.key != "v" {
-            return;
-        }
-        let modifiers = &event.keystroke.modifiers;
-        if !(modifiers.platform || modifiers.control) {
-            return;
-        }
-        if self.attach_from_clipboard(cx) {
+    fn paste_image(
+        &mut self,
+        _: &gpui_kit::component::input::Paste,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // GPUI resolves key bindings before key-down handlers. Capture Paste
+        // itself so image acceptance precedes the textarea's text paste.
+        if self.settings_open {
+            cx.stop_propagation();
+        } else if self.state.approvals.is_empty() && self.attach_from_clipboard(cx) {
             cx.stop_propagation();
             cx.notify();
+        } else {
+            cx.propagate();
         }
     }
 
-    fn settings_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn settings_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.settings_open {
             return;
         }
-        match event.keystroke.key.as_str() {
-            "escape" => self.close_settings(cx),
-            "up" => self.move_settings_model(-1, cx),
-            "down" => self.move_settings_model(1, cx),
-            "enter" => self.apply_settings(cx),
-            _ => return,
+        if !event.keystroke.modifiers.modified() {
+            match event.keystroke.key.as_str() {
+                "escape" => self.close_settings(window, cx),
+                "up" => self.move_settings_model(-1, cx),
+                "down" => self.move_settings_model(1, cx),
+                "enter" => self.apply_settings(cx),
+                _ => {}
+            }
         }
+        window.prevent_default();
         cx.stop_propagation();
         cx.notify();
     }
@@ -887,7 +948,7 @@ impl ZetaView {
             .gap_2()
             .children(APPROVAL_MODES.iter().enumerate().map(|(index, mode)| {
                 Button::new(("mode", index))
-                    .debug_selector(|| "mode-row".into())
+                    .debug_selector(move || format!("mode-row-{mode}"))
                     .ghost()
                     .selected(view.selected_mode == index)
                     .label(mode.to_string())
@@ -902,6 +963,7 @@ impl ZetaView {
             .absolute()
             .inset_0()
             .debug_selector(|| "settings-overlay".into())
+            .track_focus(&self.settings_focus)
             .occlude()
             .bg(gpui::black().opacity(0.55))
             .h_flex()
@@ -958,9 +1020,9 @@ impl ZetaView {
                                     .debug_selector(|| "settings-close".into())
                                     .ghost()
                                     .label("Close")
-                                    .on_click(
-                                        cx.listener(|view, _, _, cx| view.close_settings(cx)),
-                                    ),
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.close_settings(window, cx)
+                                    })),
                             )
                             .child(
                                 Button::new("settings-apply")
@@ -1040,15 +1102,28 @@ impl ZetaView {
                             .get(&index)
                             .map(|attachments| {
                                 div().h_flex().flex_wrap().gap_2().mt_2().children(
-                                    attachments.iter().map(|(name, size)| {
-                                        div()
-                                            .debug_selector(|| "attachment-chip".into())
-                                            .px_2()
-                                            .py_1()
-                                            .text_size(px(12.))
-                                            .bg(cx.theme().muted)
-                                            .child(format!("{name} · {size} bytes"))
-                                    }),
+                                    attachments.iter().enumerate().map(
+                                        |(attachment_index, (name, size))| {
+                                            div()
+                                                .debug_selector(|| "attachment-chip".into())
+                                                .px_2()
+                                                .py_1()
+                                                .text_size(px(12.))
+                                                .bg(cx.theme().muted)
+                                                .h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .when_some(
+                                                    self.sent_images
+                                                        .get(&(index, attachment_index))
+                                                        .cloned(),
+                                                    |chip, image| {
+                                                        chip.child(polish::thumbnail(image, cx))
+                                                    },
+                                                )
+                                                .child(format!("{name} · {size} bytes"))
+                                        },
+                                    ),
                                 )
                             }),
                     )
@@ -1277,8 +1352,10 @@ impl Render for ZetaView {
                                 .gap_3()
                                 .child(if needs_login {
                                     "Log in with a provider to start a conversation"
+                                } else if self.state.active_session.is_some() {
+                                    "Send a message to start a conversation"
                                 } else {
-                                    "Start a conversation"
+                                    "Create a session, then send a message"
                                 })
                                 .children(
                                     self.login_providers
@@ -1361,6 +1438,7 @@ impl Render for ZetaView {
                                 div()
                                     .text_size(px(12.))
                                     .text_color(cx.theme().muted_foreground)
+                                    .debug_selector(|| "composer-hint".into())
                                     .child(self.composer_hint()),
                             )
                             .child(
@@ -1404,9 +1482,8 @@ impl Render for ZetaView {
                     .py_2()
                     .text_size(px(12.))
                     .text_color(cx.theme().muted_foreground)
-                    .child(self.state.metrics.model_label().to_owned())
-                    .child(format!("{} tokens", self.state.metrics.tokens_label()))
-                    .child(format!("{} cache", self.state.metrics.cache_label())),
+                    .debug_selector(|| "status-bar".into())
+                    .child(polish::status_label(&self.state.metrics)),
             );
         div()
             .size_full()
@@ -1415,9 +1492,19 @@ impl Render for ZetaView {
             .text_color(cx.theme().foreground)
             .font_family("JetBrains Mono")
             .text_size(px(14.))
+            .on_action(cx.listener(|view, _: &polish::NewSession, _, cx| view.new_session(cx)))
+            .on_action(|_: &polish::About, window, cx| {
+                drop(window.prompt(
+                    gpui::PromptLevel::Info,
+                    "zeta",
+                    Some(concat!("Version ", env!("CARGO_PKG_VERSION"))),
+                    &["OK"],
+                    cx,
+                ));
+            })
             .on_key_down(cx.listener(Self::control_key))
             .capture_key_down(cx.listener(Self::settings_key))
-            .capture_key_down(cx.listener(Self::paste_key))
+            .capture_action(cx.listener(Self::paste_image))
             .child(
                 div()
                     .h_flex()
@@ -1448,6 +1535,7 @@ fn init(cx: &mut App) {
         )
         .expect("register JetBrains Mono");
     gpui_kit::init(cx);
+    polish::init_menus(cx);
 }
 
 fn main() {

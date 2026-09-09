@@ -53,5 +53,3 @@ def build_login_provider(provider: str, home: Path) -> LoginProvider[OAuthTokens
             token_handle=lambda tokens: extract_account_id(tokens.access_token),
         )
     raise ValueError(f"unsupported login provider: {provider}")
-
-
