@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import weakref
 from collections import deque
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -38,6 +39,7 @@ from ..core.slash import (
 from ..loop import AgentLoop
 from ..persistence import DraftPersistence, history_for
 from ..providers.factory import build_backend as build_network_backend
+from ..runtime.cleanup import close_session
 from ..settings import (
     load_settings,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_settings
 )
@@ -159,14 +161,15 @@ class TUIApp(
         on_name_change: Callable[[str], None] | None = None,
         key_remap: Any | None = None,
     ) -> None:
+        app = weakref.proxy(self)
         self.loop = loop
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
-            lambda message: background_notice(self, message)
+            lambda message: background_notice(app, message)
         )
         self._hooks = loop.hooks
         if self._hooks is not None:
-            self._hooks.notice_sink = self._print_hook_notice
+            self._hooks.notice_sink = lambda message: app._print_hook_notice(message)
         self.provider = provider
         self.model = model
         self.verbose = verbose
@@ -225,9 +228,9 @@ class TUIApp(
         )
         self._slash_commands = create_slash_registry(zeta_home=self._zeta_home, project_dir=discover_repo_root(Path(self.loop.store.cwd)))
         self.loop.set_mcp_prompt_refresh(
-            lambda mount: self._slash_commands.set_mcp_prompts(mount.prompt_entries)
+            lambda mount: app._slash_commands.set_mcp_prompts(mount.prompt_entries)
         )
-        self._submissions = SubmissionPipeline(self)
+        self._submissions = SubmissionPipeline(app)
         self._compaction_shown = False
         self._turn_had_visible_output = False
         self._failed_turn: tuple[str, Message] | None = None
@@ -238,11 +241,11 @@ class TUIApp(
         self._presenter = TranscriptPresenter(
             self._transcript,
             self.console,
-            self._full_screen_active,
-            lambda renderable: self._print(renderable),
+            lambda: app._full_screen_active(),
+            lambda renderable: app._print(renderable),
         )
-        self.loop.set_background_event_sink(self._handle_background_event)
-        self.loop.set_mcp_notice_sink(lambda message: background_notice(self, message))
+        self.loop.set_background_event_sink(lambda event: app._handle_background_event(event))
+        self.loop.set_mcp_notice_sink(lambda message: background_notice(app, message))
         self._fork_rebuilt = False
         self._startup_notices: tuple[str, ...] = tuple(startup_notices)
         self._startup_warnings: tuple[str, ...] = tuple(startup_warnings)
@@ -450,17 +453,18 @@ class TUIApp(
         return style
 
     def _make_session(self) -> PromptSession[str]:
+        app = weakref.proxy(self)
         if self._history is None:
             self._history = history_for(self._history_path)
         bindings = build_key_bindings(
-            on_interrupt=self.abort_active,
-            on_exit=self.request_exit,
-            on_submit=self._submit_input,
-            on_paste=self._paste_from_keybinding,
+            on_interrupt=lambda: app.abort_active(),
+            on_exit=lambda: app.request_exit(),
+            on_submit=lambda value: app._submit_input(value),
+            on_paste=lambda event: app._paste_from_keybinding(event),
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_search_start=self._transcript.begin_search,
-            search_active=lambda: self._transcript.search_active,
+            search_active=lambda: app._transcript.search_active,
             on_search_input=self._transcript.update_search,
             on_search_backspace=self._transcript.search_backspace,
             on_search_next=self._transcript.next_search_match,
@@ -469,14 +473,14 @@ class TUIApp(
             on_previous_user=self._transcript.previous_user_message,
             on_next_user=self._transcript.next_user_message,
             on_toggle_agent=self._transcript.toggle_latest_agent,
-            on_retry=self.retry_failed_turn,
-            retry_available=self.retry_available,
-            on_undo=self.undo_sent_turn,
+            on_retry=lambda: app.retry_failed_turn(),
+            retry_available=lambda: app.retry_available(),
+            on_undo=lambda: app.undo_sent_turn(),
             append_history=False,
-            on_approve=lambda: self._answer_first_pending("approve"),
-            on_deny=lambda: self._answer_first_pending("deny"),
-            approval_active=lambda: bool(self.pending_approvals),
-            on_plan_toggle=self.toggle_plan_mode,
+            on_approve=lambda: app._answer_first_pending("approve"),
+            on_deny=lambda: app._answer_first_pending("deny"),
+            approval_active=lambda: bool(app.pending_approvals),
+            on_plan_toggle=lambda: app.toggle_plan_mode(),
             on_scroll_up=self._transcript.scroll_up,
             on_scroll_down=self._transcript.scroll_down,
             key_remap=self._key_remap,
@@ -491,10 +495,10 @@ class TUIApp(
             multiline=True,
             mouse_support=True,
             editing_mode=EditingMode.VI if self.vim_mode else EditingMode.EMACS,
-            bottom_toolbar=self._status_toolbar,
+            bottom_toolbar=lambda: app._status_toolbar(),
             erase_when_done=True,
             show_frame=True,
-            style=DynamicStyle(self._prompt_style),
+            style=DynamicStyle(lambda: app._prompt_style()),
         )
         self._attach_draft(session)
         return session
@@ -830,17 +834,19 @@ class TUIApp(
             self._flush_pending_stream()
 
     async def _read_prompt(self, session: PromptSession[str]) -> str | None:
+        app = weakref.proxy(self)
+
         def insert_pending_tokens() -> None:
-            if self._composer_insertions:
+            if app._composer_insertions:
                 session.app.current_buffer.insert_text(
-                    "".join(self._composer_insertions)
+                    "".join(app._composer_insertions)
                 )
-                self._composer_insertions.clear()
+                app._composer_insertions.clear()
 
         try:
             value = await session.prompt_async(
                 [("class:prompt", " > ")],
-                bottom_toolbar=self._status_toolbar,
+                bottom_toolbar=lambda: app._status_toolbar(),
                 placeholder=[("class:placeholder", "type a message...")],
                 pre_run=insert_pending_tokens,
             )
@@ -883,59 +889,81 @@ class TUIApp(
     async def run(self, session: PromptSession[str] | None = None) -> None:
         """Run the alternate-screen app until Ctrl-D or an exit request."""
 
-        await self.loop.activate()
-        session = session or self._session or self._make_session()
-        self._active_session = session
-        self._attach_draft(session)
-        if isinstance(session, FullScreenPromptSession):
-            self._install_full_screen_layout(session)
-        self._rebuild_transcript()
-        await self.loop.ensure_mcp_servers()
-        for warning in self._startup_warnings:
-            self._print_unit(Text(warning, style=theme.ERROR))
-        # After the MCP mount so argument-scoped rules dropped for a
-        # just-mounted subject-less tool are reported too (ZETA-86).
-        if self._approval_policy is not None:
-            for notice in self._approval_policy.notices:
-                self._print_unit(Text(notice, style=theme.ERROR))
-        for alert in self._startup_alerts:
-            self._print_unit(Text(alert, style=theme.COMMAND))
-        for notice in self._startup_notices:
-            self._print_unit(Text(notice, style=theme.DIM))
-        for notice in self._slash_commands.notices:
-            style = theme.COMMAND if notice in self._slash_commands.warning_notices else theme.DIM
-            self._print_unit(Text(f"command · {notice}", style=style))
-        self._present_pending_approvals()
-        prompt_task: asyncio.Task[str | None] | None = None
         try:
+            await self.loop.activate()
+            session = session or self._session or self._make_session()
+            self._active_session = session
+            self._attach_draft(session)
             if isinstance(session, FullScreenPromptSession):
-                await self._run_full_screen(session)
-                return
-            prompt_task = asyncio.create_task(self._read_prompt(session))
-            self._input_loop_active = True
-            while prompt_task is not None and not self._exit_requested:
-                value = await prompt_task
-                if value is None:
-                    break
-                if not await self._handle_approval_input(value):
-                    self._submit_input(value)
-                if self._exit_requested:
-                    break
+                self._install_full_screen_layout(session)
+            self._rebuild_transcript()
+            await self.loop.ensure_mcp_servers()
+            for warning in self._startup_warnings:
+                self._print_unit(Text(warning, style=theme.ERROR))
+            # After the MCP mount so argument-scoped rules dropped for a
+            # just-mounted subject-less tool are reported too (ZETA-86).
+            if self._approval_policy is not None:
+                for notice in self._approval_policy.notices:
+                    self._print_unit(Text(notice, style=theme.ERROR))
+            for alert in self._startup_alerts:
+                self._print_unit(Text(alert, style=theme.COMMAND))
+            for notice in self._startup_notices:
+                self._print_unit(Text(notice, style=theme.DIM))
+            for notice in self._slash_commands.notices:
+                style = theme.COMMAND if notice in self._slash_commands.warning_notices else theme.DIM
+                self._print_unit(Text(f"command · {notice}", style=style))
+            self._present_pending_approvals()
+            prompt_task: asyncio.Task[str | None] | None = None
+            try:
+                if isinstance(session, FullScreenPromptSession):
+                    await self._run_full_screen(session)
+                    return
                 prompt_task = asyncio.create_task(self._read_prompt(session))
+                self._input_loop_active = True
+                while prompt_task is not None and not self._exit_requested:
+                    value = await prompt_task
+                    if value is None:
+                        break
+                    if not await self._handle_approval_input(value):
+                        self._submit_input(value)
+                    if self._exit_requested:
+                        break
+                    prompt_task = asyncio.create_task(self._read_prompt(session))
+            finally:
+                self._input_loop_active = False
+                if prompt_task is not None and not prompt_task.done():
+                    prompt_task.cancel()
+                    await asyncio.gather(prompt_task, return_exceptions=True)
+                if self._active_task is not None and not self._active_task.done():
+                    self._active_task.cancel()
+                    await asyncio.gather(self._active_task, return_exceptions=True)
+                if isinstance(session, FullScreenPromptSession):
+                    session.restore_terminal()
         finally:
-            self._input_loop_active = False
-            self._draft.flush()
-            if prompt_task is not None and not prompt_task.done():
-                prompt_task.cancel()
-                await asyncio.gather(prompt_task, return_exceptions=True)
-            if self._active_task is not None and not self._active_task.done():
-                self._active_task.cancel()
-                await asyncio.gather(self._active_task, return_exceptions=True)
+            await self.close()
+
+    async def close(self) -> None:
+        """Own shutdown for the TUI and headless frontends."""
+        try:
             await self._submissions.close()
-            if isinstance(session, FullScreenPromptSession):
-                session.restore_terminal()
-            await self.loop.close()
-            self._active_session = None
+        finally:
+            try:
+                try:
+                    self._draft.detach()
+                finally:
+                    await close_session(self.loop, self._workspace_snapshot_store)
+            finally:
+                self._workspace_snapshot_store = None
+                self.loop.set_background_event_sink(None)
+                self.loop.set_mcp_notice_sink(None)
+                self.loop.set_mcp_prompt_refresh(None)
+                self.loop.tool_registry.background_tasks.set_notice_sink(None)
+                if self._hooks is not None:
+                    self._hooks.notice_sink = None
+                self._active_session = None
+                self._draft_session = None
+                self._session = None
+
 
 
 from .bootstrap import create_app, format_picker_row

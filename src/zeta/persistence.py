@@ -109,6 +109,8 @@ class DraftPersistence:
         self._persisted_revision: int | None = None
         self._scheduled: asyncio.TimerHandle | None = None
         self._state_provider: Callable[[], tuple[Mapping[str, Path], int]] | None = None
+        self._buffer: Buffer | None = None
+        self._changed: Callable[[Buffer], None] | None = None
         self._pending_attachment_tokens: tuple[tuple[str, str], ...] = ()
         self._pending_next_image_token = 1
 
@@ -254,6 +256,7 @@ class DraftPersistence:
         *,
         state_provider: Callable[[], tuple[Mapping[str, Path], int]] | None = None,
     ) -> None:
+        self.detach()
         self._state_provider = state_provider
         draft = self.load_state()
         if draft.text:
@@ -264,7 +267,20 @@ class DraftPersistence:
         def changed(_buffer: Buffer) -> None:
             self.schedule(buffer.text)
 
+        self._buffer = buffer
+        self._changed = changed
         buffer.on_text_changed += changed
+
+    def detach(self) -> None:
+        """Stop observing the composer before its session storage closes."""
+        try:
+            self.flush()
+        finally:
+            if self._buffer is not None and self._changed is not None:
+                self._buffer.on_text_changed -= self._changed
+            self._buffer = None
+            self._changed = None
+            self._state_provider = None
 
 
 @dataclass(frozen=True, slots=True)

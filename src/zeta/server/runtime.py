@@ -16,6 +16,7 @@ from ..core.project_context import (
 from ..core.session import OpenedSession, SessionManager, SessionMetadata
 from ..loop import AgentLoop
 from ..runtime import RuntimeComposition, compose_runtime
+from ..runtime.cleanup import close_session
 from ..settings import load_settings
 from ..settings import resolve as resolve_settings
 from ..types import CompletionBackend, StreamEvent
@@ -238,13 +239,7 @@ class ServerRuntime:
 
     @staticmethod
     async def _close_state(state: SessionState) -> None:
-        try:
-            await state.loop.close()
-        finally:
-            try:
-                await state.loop.tool_registry.background_tasks.close()
-            finally:
-                state.opened.store.close()
+        await close_session(state.loop)
 
     async def close(self) -> None:
         state, self._state = self._state, None

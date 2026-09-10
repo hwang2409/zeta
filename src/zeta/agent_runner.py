@@ -422,11 +422,11 @@ async def run_agent_tool(
     stored_agent_type = None if preset.name == GENERAL_PRESET.name else preset.name
     child_number = loop.store.allocate_agent_index()
     agents_root = loop.store.session_dir / "agents"
-    child_store = ConversationStore(
+    child_store = loop._background_owner.store_leases.enter_context(ConversationStore(
         agents_root,
         session_id=str(child_number),
         cwd=loop.store.cwd,
-    )
+    ))
     child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
     child_path = str(child_store.session_dir)
     child_instance_id = (
@@ -470,6 +470,9 @@ async def run_agent_tool(
         child_registry = loop.tool_registry.clone_for_session(
             child_store,
             exclude_names=excluded_names,
+        )
+        loop._background_owner.store_leases.callback(
+            child_registry.background_tasks.release_directory
         )
         parent_policy = loop.tool_registry.approval_policy
         child_policy: ChildApprovalPolicy | None = None

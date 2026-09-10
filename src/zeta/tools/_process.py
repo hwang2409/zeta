@@ -111,8 +111,7 @@ class BackgroundTaskRegistry:
         try:
             self._load_previous()
         except BaseException:
-            self._release_directory()
-            self._directory_fd = None
+            self.release_directory()
             raise
 
     def open_log(self, path: str | Path) -> IO[bytes]:
@@ -245,9 +244,13 @@ class BackgroundTaskRegistry:
                 self._notice("background tasks killed on session exit: " + ", ".join(killed))
             return tuple(killed)
         finally:
-            if self._directory_fd is not None:
-                self._release_directory()
-                self._directory_fd = None
+            self.release_directory()
+
+    def release_directory(self) -> None:
+        """Release storage after shutdown or before activation on setup failure."""
+        if self._directory_fd is not None:
+            self._release_directory()
+            self._directory_fd = None
 
     async def _monitor(self, record: _BackgroundRecord, log_handle: Any | None = None) -> None:
         process = record.process

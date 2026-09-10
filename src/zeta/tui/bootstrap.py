@@ -4,6 +4,7 @@ that module under the per-file line cap (see tests/test_module_limits.py)."""
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -50,7 +51,10 @@ def create_app(args: argparse.Namespace) -> TUIApp:
 
         ephemeral_root = Path(tempfile.mkdtemp(prefix="zeta-ephemeral-"))
     try:
-        return _create_app_with_root(args, home, ephemeral_root)
+        with ExitStack() as cleanup:
+            app = _create_app_with_root(args, home, ephemeral_root, cleanup)
+            cleanup.pop_all()
+            return app
     except BaseException:
         if ephemeral_root is not None:
             import shutil
@@ -63,6 +67,7 @@ def _create_app_with_root(
     args: argparse.Namespace,
     home: Path,
     ephemeral_root: Path | None,
+    cleanup: ExitStack,
 ) -> TUIApp:
     # Resolve monkey-patch surface at call time so tests that patch
     # ``zeta.tui.app.<name>`` continue to intercept these lookups.
@@ -125,6 +130,7 @@ def _create_app_with_root(
         else:
             recent = manager.find_most_recent(cwd=Path.cwd())
             opened = manager.open(recent.session_id)
+        cleanup.enter_context(opened.store)
         metadata = opened.metadata
         cli_provider = getattr(args, "provider", None)
         cli_model = getattr(args, "model", None)
@@ -232,9 +238,12 @@ def _create_app_with_root(
         on_plan_mode_change=plan_mode_changed,
         max_turns=max_turns_override,
     )
+    if opened is None:
+        cleanup.enter_context(composition.opened.store)
     opened = composition.opened
     metadata = opened.metadata
     loop = composition.loop
+    cleanup.callback(loop.tool_registry.background_tasks.release_directory)
     approval_policy = composition.policy
     selected_model = composition.model
     external_tools = composition.external_tools

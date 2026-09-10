@@ -48,13 +48,13 @@ def send_to_run(
     deadline = time.monotonic() + AGENT_SEND_COMMIT_TIMEOUT_SECONDS
     try:
         child_path = Path(str(marker["child_session_path"]))
-        child_store = ConversationStore(
+        with ConversationStore(
             child_path.parent,
             session_id=child_path.name,
             cwd=parent_store.cwd,
             _lock_deadline=deadline,
-        )
-        child_store.pending_prompt_queue.append(message, deadline=deadline)
+        ) as child_store:
+            child_store.pending_prompt_queue.append(message, deadline=deadline)
     except PendingPromptCommitTimeoutError:
         return "pending prompt commit timed out before the queue could be changed"
     except PendingPromptsClosedError:

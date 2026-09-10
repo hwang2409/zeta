@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -47,6 +48,9 @@ class BackgroundAgentOwner:
 
     def __init__(self, notification_store: ConversationStore) -> None:
         self.notification_store = notification_store
+        # Receipts and adopted descendants can outlive their immediate loop.
+        # The tree owns child leases until root shutdown joins all watchers.
+        self.store_leases = ExitStack()
         self._cancellers: dict[str, Callable[[], None]] = {}
         self._watchers: dict[str, asyncio.Task[Any]] = {}
         self._parent_stores: dict[str, ConversationStore] = {}
@@ -259,118 +263,119 @@ def _recover_nested_children(
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
         child_store = _open_child_store(store, child_path)
-        if child_store is not None:
-            _recover_nested_children(child_store, notification_store)
-        existing_result = _existing_tool_result(store, tool_call.id)
-        notification_status: str | None = None
-        notification_text: str | None = None
-        notification_stats: dict[str, object] | None = None
-        if marker.get("background"):
-            child_instance_id = marker.get(
-                "child_instance_id", f"{store.session_id}:{child_path.name}"
-            )
-            existing = _agent_notification(notification_store, child_instance_id)
-            if existing is None and notification_store is not store:
-                existing = _agent_notification(store, child_instance_id)
-            if existing is None:
-                lifecycle = (
-                    child_store.agent_lifecycle() if child_store is not None else None
+        with child_store if child_store is not None else nullcontext():
+            if child_store is not None:
+                _recover_nested_children(child_store, notification_store)
+            existing_result = _existing_tool_result(store, tool_call.id)
+            notification_status: str | None = None
+            notification_text: str | None = None
+            notification_stats: dict[str, object] | None = None
+            if marker.get("background"):
+                child_instance_id = marker.get(
+                    "child_instance_id", f"{store.session_id}:{child_path.name}"
                 )
-                lifecycle_state = lifecycle.get("state") if lifecycle else None
-                lifecycle_text = lifecycle.get("final_result") if lifecycle else None
-                notification_status = {
-                    "completed": "completed",
-                    "failed": "error",
-                    "canceled": "canceled",
-                }.get(lifecycle_state, "canceled")
-                notification_text = (
-                    lifecycle_text
-                    if type(lifecycle_text) is str and lifecycle_text
-                    else "background child canceled when the parent session exited"
+                existing = _agent_notification(notification_store, child_instance_id)
+                if existing is None and notification_store is not store:
+                    existing = _agent_notification(store, child_instance_id)
+                if existing is None:
+                    lifecycle = (
+                        child_store.agent_lifecycle() if child_store is not None else None
+                    )
+                    lifecycle_state = lifecycle.get("state") if lifecycle else None
+                    lifecycle_text = lifecycle.get("final_result") if lifecycle else None
+                    notification_status = {
+                        "completed": "completed",
+                        "failed": "error",
+                        "canceled": "canceled",
+                    }.get(lifecycle_state, "canceled")
+                    notification_text = (
+                        lifecycle_text
+                        if type(lifecycle_text) is str and lifecycle_text
+                        else "background child canceled when the parent session exited"
+                    )
+                    notification_state: TerminalState = (
+                        "completed"
+                        if notification_status == "completed"
+                        else "canceled"
+                        if notification_status == "canceled"
+                        else "failed"
+                    )
+                    notification_stats = agent_stats(
+                        lifecycle,
+                        status=notification_status,
+                        turns_used=marker.get("turns_used", 0),
+                    )
+                    notification_result = build_agent_receipt(
+                        notification_state,
+                        notification_text,
+                        notification_stats,
+                    )
+                    notification_text = notification_result["content"][0]["text"]
+                    notification_store.append_agent_notification(
+                        child_instance_id,
+                        child_session_path=str(child_path),
+                        description=marker["description"],
+                        status=notification_status,
+                        text=notification_text,
+                        stats=notification_stats,
+                    )
+                else:
+                    notification_status = existing.data["status"]
+                    notification_text = existing.data["text"]
+                    existing_stats = existing.data.get("stats")
+                    if type(existing_stats) is dict:
+                        notification_stats = existing_stats
+                if (
+                    notification_store is not store
+                    and _agent_notification(store, child_instance_id) is None
+                ):
+                    store.append_agent_notification(
+                        child_instance_id,
+                        child_session_path=str(child_path),
+                        description=marker["description"],
+                        status=notification_status,
+                        text=notification_text,
+                        stats=notification_stats,
+                    )
+            elif not existing_result:
+                lifecycle_result = (
+                    _lifecycle_tool_result(tool_call, child_store, child_path)
+                    if child_store is not None
+                    else None
                 )
-                notification_state: TerminalState = (
-                    "completed"
-                    if notification_status == "completed"
-                    else "canceled"
-                    if notification_status == "canceled"
-                    else "failed"
-                )
-                notification_stats = agent_stats(
-                    lifecycle,
-                    status=notification_status,
-                    turns_used=marker.get("turns_used", 0),
-                )
-                notification_result = build_agent_receipt(
-                    notification_state,
-                    notification_text,
-                    notification_stats,
-                )
-                notification_text = notification_result["content"][0]["text"]
-                notification_store.append_agent_notification(
-                    child_instance_id,
-                    child_session_path=str(child_path),
-                    description=marker["description"],
-                    status=notification_status,
-                    text=notification_text,
-                    stats=notification_stats,
-                )
-            else:
-                notification_status = existing.data["status"]
-                notification_text = existing.data["text"]
-                existing_stats = existing.data.get("stats")
-                if type(existing_stats) is dict:
-                    notification_stats = existing_stats
-            if (
-                notification_store is not store
-                and _agent_notification(store, child_instance_id) is None
-            ):
-                store.append_agent_notification(
-                    child_instance_id,
-                    child_session_path=str(child_path),
-                    description=marker["description"],
-                    status=notification_status,
-                    text=notification_text,
-                    stats=notification_stats,
-                )
-        elif not existing_result:
-            lifecycle_result = (
-                _lifecycle_tool_result(tool_call, child_store, child_path)
-                if child_store is not None
-                else None
-            )
-            if lifecycle_result is not None:
+                if lifecycle_result is not None:
+                    store.append_message(
+                        Message(
+                            MessageRole.TOOL_RESULT,
+                            [TextContent(lifecycle_result.content)],
+                            tool_result=lifecycle_result,
+                        )
+                    )
+                    child_store.finish_agent_parent()
+                    store.finish_agent_child(marker_key)
+                    continue
                 store.append_message(
                     Message(
                         MessageRole.TOOL_RESULT,
-                        [TextContent(lifecycle_result.content)],
-                        tool_result=lifecycle_result,
+                        [TextContent("tool execution canceled")],
+                        tool_result=_nested_canceled_result(marker),
                     )
                 )
-                child_store.finish_agent_parent()
-                store.finish_agent_child(marker_key)
-                continue
-            store.append_message(
-                Message(
-                    MessageRole.TOOL_RESULT,
-                    [TextContent("tool execution canceled")],
-                    tool_result=_nested_canceled_result(marker),
-                )
-            )
-        if child_store is not None:
-            if marker.get("background") and notification_status == "canceled":
-                child_store.mark_agent_canceled(tool_call.id)
-            elif existing_result or notification_status is not None:
-                if child_store.agent_lifecycle() is not None:
-                    child_store.finish_agent_lifecycle(
-                        "completed" if notification_status != "error" else "failed",
-                        final_result=(
-                            notification_text or "background child completed"
-                        ),
-                    )
-                child_store.finish_agent_parent()
-            else:
-                child_store.mark_agent_canceled(tool_call.id)
-        store.finish_agent_child(marker_key)
+            if child_store is not None:
+                if marker.get("background") and notification_status == "canceled":
+                    child_store.mark_agent_canceled(tool_call.id)
+                elif existing_result or notification_status is not None:
+                    if child_store.agent_lifecycle() is not None:
+                        child_store.finish_agent_lifecycle(
+                            "completed" if notification_status != "error" else "failed",
+                            final_result=(
+                                notification_text or "background child completed"
+                            ),
+                        )
+                    child_store.finish_agent_parent()
+                else:
+                    child_store.mark_agent_canceled(tool_call.id)
+            store.finish_agent_child(marker_key)
 
 
 def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
@@ -381,68 +386,60 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
         child_path = Path(marker["child_session_path"])
         agents_root = loop.store.session_dir / "agents"
         child_store = _open_child_store(loop.store, child_path)
-        if child_store is not None:
-            _recover_nested_children(
-                child_store,
-                loop._background_owner.notification_store,
-            )
-        if marker.get("background"):
-            child_instance_id = marker.get(
-                "child_instance_id", f"{loop.store.session_id}:{child_path.name}"
-            )
-            notification = _agent_notification(
-                loop._background_owner.notification_store,
-                child_instance_id,
-            )
-            if (
-                notification is None
-                and loop._background_owner.notification_store is not loop.store
-            ):
-                notification = _agent_notification(loop.store, child_instance_id)
-            if notification is None:
-                lifecycle = (
-                    child_store.agent_lifecycle() if child_store is not None else None
+        with child_store if child_store is not None else nullcontext():
+            if child_store is not None:
+                _recover_nested_children(
+                    child_store,
+                    loop._background_owner.notification_store,
                 )
-                terminal_state = lifecycle.get("state") if lifecycle else None
-                terminal_text = lifecycle.get("final_result") if lifecycle else None
-                recovered_status = {
-                    "completed": "completed",
-                    "failed": "error",
-                    "canceled": "canceled",
-                }.get(terminal_state, "canceled")
-                recovered_text = (
-                    terminal_text
-                    if type(terminal_text) is str and terminal_text
-                    else "background child canceled when the parent session exited"
+            if marker.get("background"):
+                child_instance_id = marker.get(
+                    "child_instance_id", f"{loop.store.session_id}:{child_path.name}"
                 )
-                recovered_state: TerminalState = (
-                    "completed"
-                    if recovered_status == "completed"
-                    else "canceled"
-                    if recovered_status == "canceled"
-                    else "failed"
-                )
-                recovered_stats = agent_stats(
-                    lifecycle,
-                    status=recovered_status,
-                    turns_used=marker.get("turns_used", 0),
-                )
-                recovered_result = build_agent_receipt(
-                    recovered_state,
-                    recovered_text,
-                    recovered_stats,
-                )
-                recovered_text = recovered_result["content"][0]["text"]
-                loop._background_owner.notification_store.append_agent_notification(
+                notification = _agent_notification(
+                    loop._background_owner.notification_store,
                     child_instance_id,
-                    child_session_path=marker["child_session_path"],
-                    description=marker["description"],
-                    status=recovered_status,
-                    text=recovered_text,
-                    stats=recovered_stats,
                 )
-                if loop._background_owner.notification_store is not loop.store:
-                    loop.store.append_agent_notification(
+                if (
+                    notification is None
+                    and loop._background_owner.notification_store is not loop.store
+                ):
+                    notification = _agent_notification(loop.store, child_instance_id)
+                if notification is None:
+                    lifecycle = (
+                        child_store.agent_lifecycle() if child_store is not None else None
+                    )
+                    terminal_state = lifecycle.get("state") if lifecycle else None
+                    terminal_text = lifecycle.get("final_result") if lifecycle else None
+                    recovered_status = {
+                        "completed": "completed",
+                        "failed": "error",
+                        "canceled": "canceled",
+                    }.get(terminal_state, "canceled")
+                    recovered_text = (
+                        terminal_text
+                        if type(terminal_text) is str and terminal_text
+                        else "background child canceled when the parent session exited"
+                    )
+                    recovered_state: TerminalState = (
+                        "completed"
+                        if recovered_status == "completed"
+                        else "canceled"
+                        if recovered_status == "canceled"
+                        else "failed"
+                    )
+                    recovered_stats = agent_stats(
+                        lifecycle,
+                        status=recovered_status,
+                        turns_used=marker.get("turns_used", 0),
+                    )
+                    recovered_result = build_agent_receipt(
+                        recovered_state,
+                        recovered_text,
+                        recovered_stats,
+                    )
+                    recovered_text = recovered_result["content"][0]["text"]
+                    loop._background_owner.notification_store.append_agent_notification(
                         child_instance_id,
                         child_session_path=marker["child_session_path"],
                         description=marker["description"],
@@ -450,61 +447,70 @@ def recover_agent_children(loop: _AgentLoopForRecovery) -> None:
                         text=recovered_text,
                         stats=recovered_stats,
                     )
-                if child_store is not None:
-                    if recovered_status == "canceled" and terminal_state != "canceled":
+                    if loop._background_owner.notification_store is not loop.store:
+                        loop.store.append_agent_notification(
+                            child_instance_id,
+                            child_session_path=marker["child_session_path"],
+                            description=marker["description"],
+                            status=recovered_status,
+                            text=recovered_text,
+                            stats=recovered_stats,
+                        )
+                    if child_store is not None:
+                        if recovered_status == "canceled" and terminal_state != "canceled":
+                            child_store.mark_agent_canceled(tool_call.id)
+                        else:
+                            child_store.finish_agent_parent()
+                elif child_store is not None:
+                    if notification.data["status"] == "canceled":
                         child_store.mark_agent_canceled(tool_call.id)
                     else:
+                        if child_store.agent_lifecycle() is not None:
+                            child_store.finish_agent_lifecycle(
+                                "completed"
+                                if notification.data["status"] == "completed"
+                                else "failed",
+                                final_result=str(notification.data["text"]),
+                            )
                         child_store.finish_agent_parent()
-            elif child_store is not None:
-                if notification.data["status"] == "canceled":
+                loop.store.finish_agent_child(marker_key)
+                continue
+            existing_result = loop._existing_tool_result(tool_call.id)
+            recovered_result = (
+                _lifecycle_tool_result(tool_call, child_store, child_path)
+                if child_store is not None
+                else None
+            )
+            if existing_result is None:
+                loop.store.append_message(
+                    Message(
+                        MessageRole.TOOL_RESULT,
+                        [
+                            TextContent(
+                                recovered_result.content
+                                if recovered_result
+                                else "tool execution canceled"
+                            )
+                        ],
+                        tool_result=recovered_result
+                        or loop._canceled_agent_result(
+                            tool_call.id,
+                            child_session_path=marker["child_session_path"],
+                            turns_used=marker.get("turns_used", 0),
+                            agent_type=marker.get("agent_type"),
+                            child_instance_id=marker.get(
+                                "child_instance_id",
+                                f"{loop.store.session_id}:{child_path.name}",
+                            ),
+                        ),
+                    )
+                )
+            if child_path.parent == agents_root and child_path.name.isdigit():
+                if existing_result is None and recovered_result is None:
                     child_store.mark_agent_canceled(tool_call.id)
-                else:
-                    if child_store.agent_lifecycle() is not None:
-                        child_store.finish_agent_lifecycle(
-                            "completed"
-                            if notification.data["status"] == "completed"
-                            else "failed",
-                            final_result=str(notification.data["text"]),
-                        )
+                elif recovered_result is not None or existing_result is not None:
                     child_store.finish_agent_parent()
             loop.store.finish_agent_child(marker_key)
-            continue
-        existing_result = loop._existing_tool_result(tool_call.id)
-        recovered_result = (
-            _lifecycle_tool_result(tool_call, child_store, child_path)
-            if child_store is not None
-            else None
-        )
-        if existing_result is None:
-            loop.store.append_message(
-                Message(
-                    MessageRole.TOOL_RESULT,
-                    [
-                        TextContent(
-                            recovered_result.content
-                            if recovered_result
-                            else "tool execution canceled"
-                        )
-                    ],
-                    tool_result=recovered_result
-                    or loop._canceled_agent_result(
-                        tool_call.id,
-                        child_session_path=marker["child_session_path"],
-                        turns_used=marker.get("turns_used", 0),
-                        agent_type=marker.get("agent_type"),
-                        child_instance_id=marker.get(
-                            "child_instance_id",
-                            f"{loop.store.session_id}:{child_path.name}",
-                        ),
-                    ),
-                )
-            )
-        if child_path.parent == agents_root and child_path.name.isdigit():
-            if existing_result is None and recovered_result is None:
-                child_store.mark_agent_canceled(tool_call.id)
-            elif recovered_result is not None or existing_result is not None:
-                child_store.finish_agent_parent()
-        loop.store.finish_agent_child(marker_key)
 
 
 BuildResult = Callable[[str, bool, str, dict[str, object]], dict[str, object]]
