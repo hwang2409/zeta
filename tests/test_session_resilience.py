@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -159,30 +160,23 @@ def test_create_preserves_directory_created_at_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = SessionManager(tmp_path)
-    original_mkdir = Path.mkdir
-    original_rename = Path.rename
+    manager.sessions_dir.mkdir()
+    root_inode = manager.sessions_dir.stat().st_ino
+    original_mkdir = os.mkdir
     collision = None
     inode = None
 
-    def collide(target):
+    def racing_mkdir(path, mode=0o777, *, dir_fd=None):
         nonlocal collision, inode
-        if collision is None and target.parent == manager.sessions_dir:
-            original_mkdir(target)
-            collision = target
-            inode = target.stat().st_ino
-
-    def racing_mkdir(self, *args, **kwargs):
         # Inject a non-cooperating creator immediately before the atomic claim.
-        collide(self)
-        return original_mkdir(self, *args, **kwargs)
+        if (collision is None and dir_fd is not None
+                and os.fstat(dir_fd).st_ino == root_inode):
+            original_mkdir(path, mode, dir_fd=dir_fd)
+            collision = manager.sessions_dir / path
+            inode = collision.stat().st_ino
+        return original_mkdir(path, mode, dir_fd=dir_fd)
 
-    def racing_rename(self, target):
-        # Exercise the old directory-rename publication at the same boundary.
-        collide(Path(target))
-        return original_rename(self, target)
-
-    monkeypatch.setattr(Path, "mkdir", racing_mkdir)
-    monkeypatch.setattr(Path, "rename", racing_rename)
+    monkeypatch.setattr(os, "mkdir", racing_mkdir)
     opened = manager.create(provider="fake", model="offline")
 
     assert collision is not None
@@ -196,21 +190,23 @@ def test_interrupted_publication_is_not_discoverable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = SessionManager(tmp_path)
-    original = Path.rename
+    original = os.replace
     interrupted = None
 
-    def interrupted_rename(self, target):
+    def interrupted_replace(source, target, **kwargs):
         nonlocal interrupted
-        target = Path(target)
-        if target.name == "meta.json" and target.parent.parent == manager.sessions_dir:
-            interrupted = target.parent
-            assert (interrupted / "conversation.jsonl").is_file()
-            assert manager.list_sessions() == []
-            assert manager.list_session_previews() == []
-            raise OSError("interrupted publication")
-        return original(self, target)
+        if target == "meta.json":
+            destination = os.fstat(kwargs["dst_dir_fd"])
+            interrupted = next((path for path in manager.sessions_dir.iterdir()
+                                if path.stat().st_ino == destination.st_ino), None)
+            if interrupted is not None:
+                assert (interrupted / "conversation.jsonl").is_file()
+                assert manager.list_sessions() == []
+                assert manager.list_session_previews() == []
+                raise OSError("interrupted publication")
+        return original(source, target, **kwargs)
 
-    monkeypatch.setattr(Path, "rename", interrupted_rename)
+    monkeypatch.setattr(os, "replace", interrupted_replace)
     with pytest.raises(OSError, match="interrupted publication"):
         manager.create(provider="fake", model="offline")
 

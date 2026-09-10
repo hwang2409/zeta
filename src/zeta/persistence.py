@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import fcntl
 import json
 import os
@@ -17,6 +17,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
 
 from .core.checkpoints import ConversationIntegrityError, load_session_json
+from .core.session_files import read_session_file, session_root, write_session_json
 
 HISTORY_LIMIT = 1000
 DRAFT_WRITE_DELAY = 0.2
@@ -98,8 +99,9 @@ class BoundedFileHistory(FileHistory):
 class DraftPersistence:
     """Persist the current composer text after a short idle delay."""
 
-    def __init__(self, path: str | Path, *, delay: float = DRAFT_WRITE_DELAY) -> None:
+    def __init__(self, path: str | Path, *, delay: float = DRAFT_WRITE_DELAY, directory_fd: int | None = None) -> None:
         self.path = Path(path)
+        self.directory_fd = directory_fd
         self.delay = delay
         self._pending_text: str | None = None
         self._pending_revision: int | None = None
@@ -107,6 +109,8 @@ class DraftPersistence:
         self._persisted_revision: int | None = None
         self._scheduled: asyncio.TimerHandle | None = None
         self._state_provider: Callable[[], tuple[Mapping[str, Path], int]] | None = None
+        self._buffer: Buffer | None = None
+        self._changed: Callable[[Buffer], None] | None = None
         self._pending_attachment_tokens: tuple[tuple[str, str], ...] = ()
         self._pending_next_image_token = 1
 
@@ -115,8 +119,9 @@ class DraftPersistence:
 
     def load_state(self) -> DraftState:
         try:
-            raw = self.path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
+            with self._directory() as directory_fd:
+                raw = read_session_file(directory_fd, self.path.name).decode("utf-8")
+        except (OSError, ValueError):
             return DraftState("")
         try:
             payload = load_session_json(raw.encode("utf-8"))
@@ -185,36 +190,29 @@ class DraftPersistence:
         if text is None:
             return
         if not text:
-            self.path.unlink(missing_ok=True)
+            self._unlink()
             self._persisted_revision = revision
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path: str | None = None
+        with self._directory(create=True) as directory_fd:
+            write_session_json(directory_fd, self.path.name, {
+                "text": text,
+                "attachment_tokens": dict(attachment_tokens),
+                "next_image_token": next_image_token,
+            })
+        self._persisted_revision = revision
+
+    def _directory(self, *, create: bool = False):
+        # The app lends its store descriptor for the full composer lifetime.
+        if self.directory_fd is not None:
+            return nullcontext(self.directory_fd)
+        return session_root(self.path.parent, create=create)
+
+    def _unlink(self) -> None:
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=self.path.parent,
-                prefix=f".{self.path.name}.",
-                delete=False,
-            ) as handle:
-                temporary_path = handle.name
-                json.dump(
-                    {
-                        "text": text,
-                        "attachment_tokens": dict(attachment_tokens),
-                        "next_image_token": next_image_token,
-                    },
-                    handle,
-                )
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, self.path)
-            temporary_path = None
-            self._persisted_revision = revision
-        finally:
-            if temporary_path is not None:
-                Path(temporary_path).unlink(missing_ok=True)
+            with self._directory() as directory_fd:
+                os.unlink(self.path.name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
 
     def clear(self) -> None:
         self._pending_text = None
@@ -224,7 +222,7 @@ class DraftPersistence:
         if self._scheduled is not None:
             self._scheduled.cancel()
             self._scheduled = None
-        self.path.unlink(missing_ok=True)
+        self._unlink()
         self._persisted_revision = None
 
     def mark_submitted(self) -> int:
@@ -248,7 +246,7 @@ class DraftPersistence:
             self._persisted_revision is not None
             and self._persisted_revision <= submitted_revision
         ):
-            self.path.unlink(missing_ok=True)
+            self._unlink()
             self._persisted_revision = None
         return True
 
@@ -258,6 +256,7 @@ class DraftPersistence:
         *,
         state_provider: Callable[[], tuple[Mapping[str, Path], int]] | None = None,
     ) -> None:
+        self.detach()
         self._state_provider = state_provider
         draft = self.load_state()
         if draft.text:
@@ -268,7 +267,20 @@ class DraftPersistence:
         def changed(_buffer: Buffer) -> None:
             self.schedule(buffer.text)
 
+        self._buffer = buffer
+        self._changed = changed
         buffer.on_text_changed += changed
+
+    def detach(self) -> None:
+        """Stop observing the composer before its session storage closes."""
+        try:
+            self.flush()
+        finally:
+            if self._buffer is not None and self._changed is not None:
+                self._buffer.on_text_changed -= self._changed
+            self._buffer = None
+            self._changed = None
+            self._state_provider = None
 
 
 @dataclass(frozen=True, slots=True)

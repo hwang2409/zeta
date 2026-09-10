@@ -10,6 +10,7 @@ import unicodedata
 from pathlib import Path
 from uuid import uuid4
 
+from ..core.session_files import child_directory, write_session_file
 from ..model_catalog import PROVIDER_MODELS, known_model_names
 from ..types import (
     ImageContent,
@@ -22,6 +23,8 @@ from .protocol import MAX_REQUEST_ID_BYTES, FrameCodec, ProtocolError, bounded
 from .runtime import ServerRuntime
 
 EXTENSION_REQUESTS = [
+    "rename_session",
+    "delete_session",
     "session_tree",
     "session_history",
     "switch_branch",
@@ -212,27 +215,23 @@ def image_message(runtime: ServerRuntime, params: dict) -> Message:
             raise ProtocolError(-32602, "image extension does not match its type")
         decoded.append((name, mime, data, raw))
     blocks = [TextContent(text)]
-    directories = []
-    attachments = runtime.opened.store.session_dir / "attachments"
-    attachments_existed = attachments.exists()
-    try:
-        for name, mime, data, raw in decoded:
-            directory = attachments / uuid4().hex
-            directories.append(directory)
-            directory.mkdir(parents=True, mode=0o700)
-            path = directory / name
-            temporary = directory / ".image.tmp"
-            with temporary.open("xb") as handle:
-                handle.write(raw)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            blocks.append(ImageContent(data, mime, str(path), len(raw)))
-    except Exception:
-        for directory in directories:
-            if directory.exists():
-                shutil.rmtree(directory)
-        if not attachments_existed and attachments.exists():
-            attachments.rmdir()
-        raise
+    store = runtime.opened.store
+    attachments_existed = "attachments" in os.listdir(store.directory_fd)
+    with child_directory(store.directory_fd, "attachments", create=True) as attachments_fd:
+        directories = []
+        try:
+            for name, mime, data, raw in decoded:
+                directory = uuid4().hex
+                os.mkdir(directory, mode=0o700, dir_fd=attachments_fd)
+                directories.append(directory)
+                with child_directory(attachments_fd, directory) as directory_fd:
+                    write_session_file(directory_fd, name, raw)
+                path = store.session_dir / "attachments" / directory / name
+                blocks.append(ImageContent(data, mime, str(path), len(raw)))
+        except BaseException:
+            for directory in directories:
+                shutil.rmtree(directory, dir_fd=attachments_fd)
+            if not attachments_existed:
+                os.rmdir("attachments", dir_fd=store.directory_fd)
+            raise
     return Message(MessageRole.USER, blocks)

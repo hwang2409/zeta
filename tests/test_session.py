@@ -1776,16 +1776,10 @@ def test_session_id_collision_retries(
     manager = SessionManager(tmp_path / "zeta-home")
     collision = uuid.UUID("00000000000000000000000000000001")
     unique = uuid.UUID("00000000000000000000000000000002")
-    calls = iter(
-        [
-            collision,
-            uuid.UUID("00000000000000000000000000000003"),
-            collision,
-            unique,
-            uuid.UUID("00000000000000000000000000000004"),
-        ]
-    )
-    monkeypatch.setattr("zeta.core.session.uuid.uuid4", lambda: next(calls))
+    from types import SimpleNamespace
+
+    calls = iter([collision, collision, unique])
+    monkeypatch.setattr("zeta.core.session.uuid", SimpleNamespace(uuid4=lambda: next(calls)))
     manager.create(provider="fake", model="offline", cwd=tmp_path)
     created = manager.create(provider="fake", model="offline", cwd=tmp_path)
 
@@ -1988,3 +1982,59 @@ def test_invalid_model_fallback_metadata_fails_closed(tmp_path, fallback):
     data["model_fallback"] = fallback
     with pytest.raises(SessionError, match="model fallback is invalid"):
         SessionMetadata.from_dict(data, path=tmp_path / "meta.json")
+
+
+def test_session_rename_cli_persists_and_clears(tmp_path, monkeypatch):
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    manager = SessionManager(tmp_path)
+    session = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    sid = session.metadata.session_id
+    assert main(["session", "rename", sid[:8], "  useful   name "]) == 0
+    assert SessionManager(tmp_path).open(sid).metadata.name == "useful name"
+    assert main(["session", "rename", sid, "  "]) == 0
+    assert manager.open(sid).metadata.name == ""
+    assert main(["session", "rename", "missing", "name"]) == 1
+
+
+@pytest.mark.parametrize("link_location", ["session", "lock", "nested", "root"])
+def test_session_delete_does_not_follow_links(tmp_path, link_location):
+    manager = SessionManager(tmp_path / "home")
+    root = manager.sessions_dir
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep"
+    sentinel.write_text("keep")
+    session = root / "session"
+    if link_location == "root":
+        root.rmdir()
+        root.symlink_to(outside, target_is_directory=True)
+        (outside / "session").mkdir()
+    elif link_location == "session":
+        session.symlink_to(outside, target_is_directory=True)
+    else:
+        session.mkdir()
+        (session / (".lock" if link_location == "lock" else "nested")).symlink_to(sentinel if link_location == "lock" else outside)
+    if link_location == "nested":
+        manager.delete("session")
+        assert not session.exists()
+    else:
+        with pytest.raises(SessionError, match="could not be deleted"):
+            manager.delete("session")
+    assert sentinel.read_text() == "keep"
+
+
+@pytest.mark.parametrize("corruption", ["missing_metadata", "bad_metadata", "bad_conversation"])
+def test_session_delete_does_not_read_corrupt_data(tmp_path, corruption):
+    manager = SessionManager(tmp_path)
+    session = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    sid = session.metadata.session_id
+    directory = manager.sessions_dir / sid
+    if corruption == "missing_metadata":
+        (directory / "meta.json").unlink()
+    else:
+        (directory / ("meta.json" if corruption == "bad_metadata" else "conversation.jsonl")).write_bytes(b"\xff")
+    session.store.close()
+    manager.delete(sid)
+    assert not directory.exists()
+    assert manager.list_sessions() == []

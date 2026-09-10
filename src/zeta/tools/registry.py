@@ -452,6 +452,7 @@ class ToolRegistry:
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
         self.background_tasks = BackgroundTaskRegistry(
             session_dir=session_store.session_dir if session_store is not None else None,
+            directory_fd=session_store.directory_fd if session_store is not None else None,
         )
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
@@ -577,6 +578,7 @@ class ToolRegistry:
         clone._todo_store = self._todo_store or store
         clone.background_tasks = BackgroundTaskRegistry(
             session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
         )
         clone.bash_cwd = store.bash_cwd
         clone.abort_signal = clone._abort_registry.new_generation()
@@ -601,7 +603,7 @@ class ToolRegistry:
         self._session_store = store
         if self._todo_store is None:
             self._todo_store = store
-        self.background_tasks.bind_session_dir(store.session_dir)
+        self.background_tasks.bind_session_dir(store.session_dir, store.directory_fd)
         self.bash_cwd = store.bash_cwd
 
     @property

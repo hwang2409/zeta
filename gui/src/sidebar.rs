@@ -1,5 +1,6 @@
 use super::*;
 use chrono::{DateTime, Utc};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{v_virtual_list, Selectable};
 use std::rc::Rc;
 use zeta_gui::client::SessionMetadata;
@@ -63,7 +64,8 @@ impl ZetaView {
                     };
                     let label = session_label(session, rows);
                     let age = relative_age(&session.updated_at, now);
-                    Button::new(format!("session-{id}"))
+                    let menu_id = id.clone();
+                    let row = Button::new(format!("session-{id}"))
                         .ghost()
                         .selected(active)
                         .disabled(!view.can_change_session())
@@ -95,6 +97,68 @@ impl ZetaView {
                                 cx.notify();
                             }
                         }))
+                        .into_any_element();
+                    if !view.session_management {
+                        return row;
+                    }
+                    let entity = cx.entity().downgrade();
+                    div()
+                        .h_flex()
+                        .w_full()
+                        .items_center()
+                        .child(div().flex_1().min_w_0().child(row))
+                        .child(
+                            Button::new(format!("session-menu-{menu_id}"))
+                                .debug_selector(|| "session-menu".into())
+                                .ghost()
+                                .icon(IconName::Ellipsis)
+                                .tooltip("Session actions")
+                                .w(px(40.))
+                                .h(px(40.))
+                                .flex_shrink_0()
+                                .disabled(!view.can_rename_session())
+                                .dropdown_menu(move |menu, _, cx| {
+                                    let delete_enabled = entity
+                                        .upgrade()
+                                        .is_some_and(|view| view.read(cx).can_change_session());
+                                    let rename_enabled = entity
+                                        .upgrade()
+                                        .is_some_and(|view| view.read(cx).can_rename_session());
+                                    let rename_view = entity.clone();
+                                    let delete_view = entity.clone();
+                                    let rename_id = menu_id.clone();
+                                    let delete_id = menu_id.clone();
+                                    menu.item(
+                                        PopupMenuItem::new("Rename")
+                                            .disabled(!rename_enabled)
+                                            .on_click(move |_, window, cx| {
+                                                let _ = rename_view.update(cx, |view, cx| {
+                                                    view.open_session_edit(
+                                                        rename_id.clone(),
+                                                        true,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                });
+                                            }),
+                                    )
+                                    .separator()
+                                    .item(
+                                        PopupMenuItem::new("Delete")
+                                            .disabled(!delete_enabled)
+                                            .on_click(move |_, window, cx| {
+                                                let _ = delete_view.update(cx, |view, cx| {
+                                                    view.open_session_edit(
+                                                        delete_id.clone(),
+                                                        false,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                });
+                                            }),
+                                    )
+                                }),
+                        )
                         .into_any_element()
                 })
                 .collect()

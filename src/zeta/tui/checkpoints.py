@@ -76,10 +76,13 @@ def _format_size(size_bytes: int) -> str:
 class CheckpointTranscriptMixin:
     """Add checkpoint commands and active-branch transcript rebuilding."""
 
+    _closed: bool = False
     _workspace_snapshot_store: WorkspaceSnapshotStore | None = None
     _workspace_snapshot_cap: int | None = None
 
     def _snapshots(self) -> WorkspaceSnapshotStore:
+        if self._closed:
+            raise WorkspaceSnapshotError("app is closed")
         if self._workspace_snapshot_store is None:
             self._workspace_snapshot_store = WorkspaceSnapshotStore(
                 self.loop.store.session_dir,

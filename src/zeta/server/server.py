@@ -95,20 +95,26 @@ class ZetaServer:
             await self._server.serve_forever()
 
     async def close(self) -> None:
-        if self._client is not None:
-            await self._client.close()
+        try:
+            if self._client is not None:
+                await self._client.close()
+        finally:
             self._client = None
-        self._client_active = False
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
-        await self.runtime.close()
-        if self.port is None and self._socket_created:
-            with contextlib.suppress(FileNotFoundError):
-                if stat.S_ISSOCK(self.socket_path.stat().st_mode):
-                    self.socket_path.unlink()
-            self._socket_created = False
+            self._client_active = False
+            try:
+                if self._server is not None:
+                    self._server.close()
+                    await self._server.wait_closed()
+            finally:
+                self._server = None
+                try:
+                    await self.runtime.close()
+                finally:
+                    if self.port is None and self._socket_created:
+                        with contextlib.suppress(FileNotFoundError):
+                            if stat.S_ISSOCK(self.socket_path.stat().st_mode):
+                                self.socket_path.unlink()
+                        self._socket_created = False
 
     def _prepare_socket_path(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -375,6 +381,21 @@ class _Client:
 
     async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
         runtime = self.server.runtime
+        if method in {"rename_session", "delete_session"}:
+            session_id = runtime.manager.resolve_id(_required_string(params, "session_id"))
+            if method == "delete_session":
+                await self._require_idle()
+                if runtime.opened is not None and session_id == runtime.session_id:
+                    raise ProtocolError(-32005, "select another session before deleting this session", {"code": "active_session"})
+                runtime.manager.delete(session_id)
+                return {"session_id": session_id}
+            name = params.get("name")
+            if not isinstance(name, str):
+                raise ProtocolError(-32602, "name must be a string")
+            metadata = runtime.manager.rename(session_id, name)
+            if runtime.opened is not None and session_id == runtime.session_id:
+                runtime.manager._copy_metadata(runtime.metadata, metadata)
+            return {"session": metadata.to_dict()}
         store = ergonomics.active(runtime, params)
         if method == "session_tree":
             return ergonomics.tree(runtime)
@@ -700,6 +721,9 @@ class _Client:
             {**item.to_dict(), "first_message_preview": previews.get(item.session_id, "")}
             for item in metadata
         ]
+        if self.protocol_version != "1.1":
+            for item in sessions:
+                item.pop("name", None)
         page: list[dict[str, Any]] = []
         for offset, item in enumerate(sessions):
             candidate = [*page, item]

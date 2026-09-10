@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from collections import deque
@@ -19,6 +20,7 @@ from ..agent_receipt import (
     terminal_state,
 )
 from ..core.checkpoints import ConversationIntegrityError, load_session_json
+from ..core.session_files import SessionError, open_session_file, session_directory
 from ..tools.agent import send_to_run
 from ..tools.agent_presets import GENERAL_PRESET, get_agent_preset
 from ..types import StreamEvent, StreamEventType, ToolCall
@@ -184,7 +186,7 @@ class AgentCard:
         path = Path(child_session_path) / "conversation.jsonl"
         lines: deque[str] = deque(maxlen=limit)
         try:
-            with path.open("rb") as handle:
+            with session_directory(path.parent.parent, path.parent.name) as (_, directory_fd), os.fdopen(open_session_file(directory_fd, path.name, os.O_RDONLY), "rb") as handle:
                 for raw_line in handle:
                     try:
                         row = load_session_json(raw_line)
@@ -231,7 +233,7 @@ class AgentCard:
                             seen,
                         )
                         lines.extend(f"  {line}" for line in nested_tail)
-        except OSError:
+        except (OSError, SessionError):
             return []
         return list(lines)
 

@@ -1380,3 +1380,288 @@ fn refused_image_paste_falls_through_to_clipboard_text(cx: &mut TestAppContext) 
         assert_eq!(view.composer.read(cx).value().as_ref(), "fallback text");
     });
 }
+
+#[gpui::test]
+fn session_menu_requires_management_capabilities(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_session_edit(session().session_id, true, window, cx);
+            assert!(view.session_edit.is_none());
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("session-menu").is_none());
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::SessionManagement(true), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    let row = visual.debug_bounds("session-menu").unwrap();
+    visual.simulate_click(row.center(), Default::default());
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    visual.simulate_keystrokes("down enter");
+    visual.run_until_parked();
+    assert!(view.read_with(&visual, |view, _| matches!(
+        view.session_edit,
+        Some(session_management::SessionEdit::Rename { .. })
+    )));
+    visual.simulate_keystrokes("n enter");
+    assert!(
+        matches!(receiver.try_recv(), Ok(CommandMessage::RenameSession(_, name)) if name == "n")
+    );
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::Renamed(session()), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    visual.run_until_parked();
+}
+
+#[gpui::test]
+fn session_rename_keyboard_cancel_commit_clear_and_error(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.session_management = true;
+            view.open_session_edit(session().session_id, true, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    visual.simulate_keystrokes("n a m e escape");
+    assert!(receiver.try_recv().is_err());
+    assert!(view.read_with(&visual, |view, _| view.session_edit.is_none()));
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_session_edit(session().session_id, true, window, cx)
+        });
+    });
+    visual.simulate_keystrokes("n a m e enter enter");
+    let command = receiver.try_recv().unwrap();
+    assert!(
+        matches!(command, CommandMessage::RenameSession(id, name) if id == session().session_id && name == "name")
+    );
+    assert!(receiver.try_recv().is_err());
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Rejected("name could not be saved".into()),
+                window,
+                cx,
+            );
+            assert!(!view.pending_command);
+            let Some(session_management::SessionEdit::Rename { input, .. }) = &view.session_edit
+            else {
+                panic!("rename stays open");
+            };
+            assert_eq!(input.read(cx).value().as_ref(), "name");
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("session-edit-error").is_some());
+    visual.simulate_keystrokes("enter");
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(CommandMessage::RenameSession(..))
+    ));
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut renamed = session();
+            renamed.name = "name".into();
+            view.apply_worker_message(WorkerMessage::Renamed(renamed), window, cx);
+            assert!(view.session_edit.is_none());
+            assert!(!view.pending_command);
+            assert_eq!(
+                sidebar::session_label(&view.state.sessions[0], None),
+                "name"
+            );
+            view.open_session_edit(session().session_id, true, window, cx);
+            let Some(session_management::SessionEdit::Rename { input, .. }) = &view.session_edit
+            else {
+                panic!();
+            };
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        });
+    });
+    visual.simulate_keystrokes("enter");
+    assert!(
+        matches!(receiver.try_recv(), Ok(CommandMessage::RenameSession(_, name)) if name.is_empty())
+    );
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::Renamed(session()), window, cx);
+            assert_eq!(
+                sidebar::session_label(&view.state.sessions[0], None),
+                "New conversation"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+fn session_delete_confirmation_error_and_success_preserve_active_transcript(
+    cx: &mut TestAppContext,
+) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.session_management = true;
+            view.state
+                .transcript
+                .push(TranscriptEntry::User("keep this".into()));
+            view.open_session_edit(session().session_id, false, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(receiver.try_recv().is_err());
+    visual.simulate_keystrokes("escape");
+    assert!(receiver.try_recv().is_err());
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.open_session_edit(session().session_id, false, window, cx)
+        });
+        window.draw(cx).clear(cx);
+    });
+    let confirm = visual.debug_bounds("session-edit-confirm").unwrap();
+    visual.simulate_click(confirm.center(), Default::default());
+    assert!(
+        matches!(receiver.try_recv(), Ok(CommandMessage::DeleteSession(id)) if id == session().session_id)
+    );
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Rejected(
+                    "select another session before deleting this session".into(),
+                ),
+                window,
+                cx,
+            );
+            assert!(!view.pending_command);
+            assert_eq!(view.state.active_session, Some(session().session_id));
+            assert_eq!(
+                view.state.transcript,
+                [TranscriptEntry::User("keep this".into())]
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("session-edit-error").is_some());
+    visual.simulate_keystrokes("escape");
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut other = session();
+            other.session_id = "other".into();
+            view.state.sessions.push(other);
+            view.state.saved_transcripts.insert(
+                "other".into(),
+                vec![TranscriptEntry::User("remove this".into())],
+            );
+            view.open_session_edit("other".into(), false, window, cx);
+        });
+    });
+    visual.simulate_keystrokes("enter enter");
+    assert!(matches!(receiver.try_recv(), Ok(CommandMessage::DeleteSession(id)) if id == "other"));
+    assert!(receiver.try_recv().is_err());
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::Deleted("other".into()), window, cx);
+            assert!(!view.pending_command);
+            assert!(view.session_edit.is_none());
+            assert_eq!(view.state.sessions.len(), 1);
+            assert!(!view.state.saved_transcripts.contains_key("other"));
+            assert_eq!(view.state.active_session, Some(session().session_id));
+            assert_eq!(
+                view.state.transcript,
+                [TranscriptEntry::User("keep this".into())]
+            );
+        });
+    });
+}
+
+#[gpui::test]
+fn session_rename_during_slow_stream_keeps_delete_disabled(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.session_management = true;
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::TurnStart {
+                    session_id: None,
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantDelta {
+                    session_id: None,
+                    delta: "first chunk".into(),
+                    kind: "assistant".into(),
+                }),
+                window,
+                cx,
+            );
+            assert!(view.state.streaming);
+            view.open_session_edit(session().session_id, false, window, cx);
+            assert!(view.session_edit.is_none());
+        });
+        window.draw(cx).clear(cx);
+    });
+    // Pause the event stream between chunks while the user renames through the menu.
+    let menu = visual.debug_bounds("session-menu").unwrap();
+    visual.simulate_click(menu.center(), Default::default());
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    visual.simulate_keystrokes("down enter");
+    visual.run_until_parked();
+    assert!(view.read_with(&visual, |view, _| matches!(
+        view.session_edit,
+        Some(session_management::SessionEdit::Rename { .. })
+    )));
+    visual.simulate_keystrokes("n e w enter");
+    assert!(
+        matches!(receiver.try_recv(), Ok(CommandMessage::RenameSession(_, name)) if name == "new")
+    );
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut renamed = session();
+            renamed.name = "new".into();
+            view.apply_worker_message(WorkerMessage::Renamed(renamed), window, cx);
+            assert!(view.state.streaming);
+            view.open_session_edit(session().session_id, false, window, cx);
+            assert!(view.session_edit.is_none());
+            // A delete overlay opened before the turn must also refuse commit.
+            view.session_edit = Some(session_management::SessionEdit::Delete {
+                id: session().session_id,
+                label: "new".into(),
+            });
+            view.commit_session_edit(cx);
+            assert!(!view.pending_command);
+            view.session_edit = None;
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantDelta {
+                    session_id: None,
+                    delta: " next chunk".into(),
+                    kind: "assistant".into(),
+                }),
+                window,
+                cx,
+            );
+            assert_eq!(view.state.sessions[0].name, "new");
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(receiver.try_recv().is_err());
+    visual.run_until_parked();
+}

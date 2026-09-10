@@ -676,34 +676,40 @@ class AgentLoop:
     async def close(self, *, cancel_background: bool = True) -> None:
         """Close session-owned transports and background processes."""
 
-        if cancel_background and self.agent_depth == 0:
-            self._background_owner.cancel_all()
-        elif cancel_background:
-            for cancel in tuple(self._background_child_cancellers.values()):
-                cancel()
-        watchers = tuple(self._background_child_watchers.values())
-        if cancel_background and watchers:
-            await asyncio.gather(*watchers, return_exceptions=True)
-        if cancel_background and self.agent_depth == 0:
-            await self._background_owner.wait()
-        tracked_tasks = tuple(
-            task
-            for task in self._tracked_tasks
-            if cancel_background or task not in self._background_child_watchers.values()
-        )
-        for task in tracked_tasks:
-            task.cancel()
-        await asyncio.gather(*tracked_tasks, return_exceptions=True)
-        if self.hooks is not None:
-            self.hooks.stop()
-            await self.hooks.close()
-        if self._mcp_mount is not None:
-            await self._mcp_mount.close()
-            self._mcp_mount = None
-        if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
-            self._mcp_mount_task.cancel()
-            await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
-        await self.tool_registry.background_tasks.close()
+        try:
+            if cancel_background and self.agent_depth == 0:
+                self._background_owner.cancel_all()
+            elif cancel_background:
+                for cancel in tuple(self._background_child_cancellers.values()):
+                    cancel()
+            watchers = tuple(self._background_child_watchers.values())
+            if cancel_background and watchers:
+                await asyncio.gather(*watchers, return_exceptions=True)
+            if cancel_background and self.agent_depth == 0:
+                await self._background_owner.wait()
+            tracked_tasks = tuple(
+                task
+                for task in self._tracked_tasks
+                if cancel_background or task not in self._background_child_watchers.values()
+            )
+            for task in tracked_tasks:
+                task.cancel()
+            await asyncio.gather(*tracked_tasks, return_exceptions=True)
+            if self.hooks is not None:
+                self.hooks.stop()
+                await self.hooks.close()
+            if self._mcp_mount is not None:
+                await self._mcp_mount.close()
+                self._mcp_mount = None
+            if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
+                self._mcp_mount_task.cancel()
+                await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
+        finally:
+            try:
+                await self.tool_registry.background_tasks.close()
+            finally:
+                if self.agent_depth == 0:
+                    self._background_owner.store_leases.close()
 
     def session_start(self) -> None:
         if self.hooks is not None:

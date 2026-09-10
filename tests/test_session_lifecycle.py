@@ -217,6 +217,8 @@ def test_session_delete_confirms_unless_forced(
     assert exit_code == 1
     assert (home / "sessions" / session_id).exists()
 
+    asyncio.run(app.loop.close())
+    app.loop.store.close()
     monkeypatch.setattr("builtins.input", lambda prompt: "y")
     exit_code = main(["session", "delete", session_id])
     assert exit_code == 0
@@ -224,6 +226,8 @@ def test_session_delete_confirms_unless_forced(
 
     other = create_app(_args())
     other_id = other.loop.store.session_id
+    asyncio.run(other.loop.close())
+    other.loop.store.close()
     assert main(["session", "delete", other_id, "--force"]) == 0
     assert not (home / "sessions" / other_id).exists()
 
@@ -404,15 +408,20 @@ def test_session_delete_refuses_when_locked(
     session_id = app.loop.store.session_id
     lock_path = home / "sessions" / session_id / ".lock"
     assert lock_path.exists()
+    asyncio.run(app.loop.close())
+    app.loop.store.close()
 
     with lock_path.open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         exit_code = main(["session", "delete", session_id, "--force"])
 
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "currently open" in captured.err
     assert (home / "sessions" / session_id).exists()
+    # Releasing only the append lock must make deletion possible.
+    assert main(["session", "delete", session_id, "--force"]) == 0
+    assert not (home / "sessions" / session_id).exists()
 
 
 def test_session_delete_removes_corrupt_session(
@@ -428,6 +437,8 @@ def test_session_delete_removes_corrupt_session(
     session_id = app.loop.store.session_id
     session_dir = home / "sessions" / session_id
     (session_dir / "conversation.jsonl").unlink()
+    asyncio.run(app.loop.close())
+    app.loop.store.close()
 
     exit_code = main(["session", "delete", session_id, "--force"])
     captured = capsys.readouterr()
@@ -448,6 +459,8 @@ def test_session_delete_resolves_unique_prefix(
     app = create_app(_args())
     session_id = app.loop.store.session_id
 
+    asyncio.run(app.loop.close())
+    app.loop.store.close()
     exit_code = main(["session", "delete", session_id[:8], "--force"])
     captured = capsys.readouterr()
 

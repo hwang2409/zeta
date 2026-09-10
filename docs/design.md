@@ -164,6 +164,7 @@ the harness-native distillation.
 | ZETA-100 | Surface tool output and model errors (arc: GUI consumer pass): clickable receipts disclose their stored output tail; failed tools expand by default. Provider errors get a full wrapped block with an Open Settings action. Model changes keep a durable previous provider/model/budget until the first successful provider response; entitlement errors restore that choice and explain the revert. Existing protocol 1.1 settings gating and the sealed fake catalog remain intact. | ZETA-99 |
 | ZETA-101 | Add in-app login (arc: GUI consumer pass): settings, credential error blocks, and the first-run empty state share browser OAuth login for Claude and ChatGPT. Reuse the CLI PKCE listener and credential stores; show pending, cancel, success, and typed failures. Advertised protocol 1.1 login RPCs exclude legacy and fake servers. | ZETA-100 |
 | ZETA-102 | Polish the GUI consumer experience (arc: GUI consumer pass): isolate settings input and session drafts; preserve text paste; show sent-image thumbnails, thinking feedback, readable status, tool approval summaries, and first-session guidance. Add native menus and fork guidance without new RPCs. | ZETA-99, ZETA-100, ZETA-101 |
+| ZETA-103 | Add session rename and delete (arc: GUI consumer pass): gated protocol 1.1 RPCs persist display names, clear names to the derived first-message preview, and delete inactive sessions including corrupt directories. Kit sidebar action menus open rename and delete-confirmation overlays with keyboard controls and visible errors. Active-session deletion returns `active_session` and keeps the transcript intact; select another session first. CLI session rename joins existing list/delete/export commands. | ZETA-100, ZETA-102 |
 | ZETA-104 | Mouse selection over the transcript (arc: TUI debugging QoL; the full-screen transcript sits on the alternate screen with mouse reporting on, so a drag never reaches the terminal as a selection, a modifier-drag grabs card borders and margins, and provider errors ellipsized at the card edge so the failing payload could not even be read): mouse reporting adds button-event tracking (`?1002h`, motion only while a button is held; still no `?1003` pointer stream), the transcript widget turns left-button down/drag/up into a selection whose ends are pinned to content (unit key + line text offset, the scroll anchor's identity, with a row fallback for blank separators) and re-resolved to rows on every paint, so the highlight rides along while a reply streams and selecting mid-reply works; it paints the covered cells with the palette's search background and on release copies the covered text (trailing spaces trimmed, blank edge lines dropped) to the system clipboard via pbcopy / wl-copy / xclip / xsel and to prompt-toolkit's in-app clipboard, reporting `copied N lines` in the footer. A plain click clears; only an end whose unit leaves the transcript drops it. Painting is made incremental so this feels live: the fragment lines and the location table are cached per unit, validated by the identity of the unit's cached render string, so a streamed token re-parses one unit instead of the whole transcript (measured 35 ms → 0.4 ms per token at 1.1k lines, 740 ms → 27 ms at 23k lines); the whole-string path remains only while a search highlight is active, and the empty-query search path no longer flattens the transcript. Error cards now wrap the reason instead of cutting it at the edge. Tests: selection geometry and extraction, anchor resolution, fragment highlighting, per-unit cache equivalence against the whole-string parse and the previous location algorithm, single-unit reparse on a streamed token, cache eviction, widget drag/click/scroll flow, survival across streaming appends and a growing unit above, blank-row starts, drop on unit removal, mouse-mode escape sequences, footer notice and clipboards through the app, clipboard tool selection per platform and subprocess failure. | ZETA-20, ZETA-29 |
 
 ## Deferred / open followups (not yet ticketed)
@@ -241,3 +242,19 @@ Foreground provider authentication errors carry `data.login_provider` on the
 1.1 wire. The server captures the failed provider before existing model recovery
 runs. MCP, transport, and background-agent errors do not offer provider login.
 Success permits a manual retry; it never resends a message automatically.
+
+### Session management (ZETA-103)
+
+Protocol 1.1 advertises `rename_session` and `delete_session`. Both accept
+`session_id` (an exact ID or unique prefix); rename also accepts a string `name`.
+Whitespace clears the stored name. Names follow the existing 60-cell limit.
+Listings expose `name` only to 1.1 clients and keep `first_message_preview`
+independent of the display name. The GUI requires both advertised requests.
+
+Rename remains available while a turn streams. Deletion requires an idle
+server. Deleting the active session returns RPC
+`-32005` with `data.code = "active_session"`; select another session first.
+Deletion does not read metadata or conversation data, so corrupt directories
+remain removable by ID. It refuses root/session/lock symlinks, respects the
+session lock, and uses fd-based recursive deletion without following nested
+links. `zeta session rename ID NAME` also accepts an empty name to clear it.

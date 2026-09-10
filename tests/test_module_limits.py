@@ -7,7 +7,8 @@ MAX_FILE_LINES = 1250
 # Built-in todo state and tool modules keep their layer-specific boundaries.
 # Bumped on 2026-08-27 for the dedicated TUI agent-card seam and again on
 # 2026-09-06 for the ZETA-77 external tool discovery seam.
-MAX_FILES_PER_DIRECTORY = 16
+# Bumped on 2026-09-10 for the ZETA-103 fd-anchored session-file safety seam.
+MAX_FILES_PER_DIRECTORY = 17
 
 
 def test_module_limits() -> None:

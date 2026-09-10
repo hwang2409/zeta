@@ -1,6 +1,7 @@
 extern crate gpui_kit as gpui;
 
 mod polish;
+mod session_management;
 mod sidebar;
 #[cfg(feature = "smoke-test")]
 mod smoke;
@@ -54,6 +55,9 @@ struct ZetaView {
     dialog_request: Option<String>,
     approval_pending: bool,
     settings_open: bool,
+    session_management: bool,
+    session_edit: Option<session_management::SessionEdit>,
+    session_edit_focus: gpui::FocusHandle,
     settings_focus: gpui::FocusHandle,
     login_providers: Vec<LoginProvider>,
     settings_error: Option<String>,
@@ -114,6 +118,9 @@ impl ZetaView {
             dialog_request: None,
             approval_pending: false,
             settings_open: false,
+            session_management: false,
+            session_edit: None,
+            session_edit_focus: cx.focus_handle(),
             settings_focus: cx.focus_handle(),
             login_providers: Vec::new(),
             settings_error: None,
@@ -264,6 +271,26 @@ impl ZetaView {
                 self.state.sessions = list.sessions;
                 self.state.sessions_truncated = list.truncated;
             }
+            WorkerMessage::SessionManagement(available) => self.session_management = available,
+            WorkerMessage::Renamed(session) => {
+                self.pending_command = false;
+                if let Some(row) = self
+                    .state
+                    .sessions
+                    .iter_mut()
+                    .find(|row| row.session_id == session.session_id)
+                {
+                    row.name = session.name;
+                    row.updated_at = session.updated_at;
+                }
+                self.close_session_edit(window, cx);
+            }
+            WorkerMessage::Deleted(id) => {
+                self.pending_command = false;
+                self.state.sessions.retain(|row| row.session_id != id);
+                self.state.saved_transcripts.remove(&id);
+                self.close_session_edit(window, cx);
+            }
             WorkerMessage::Session(session) => {
                 self.pending_command = false;
                 self.state.select_session(Some(session.session_id.clone()));
@@ -305,6 +332,9 @@ impl ZetaView {
             WorkerMessage::Connected => self.state.connection = ConnectionState::Connected,
             WorkerMessage::Event(event) => changed_row = self.state.apply(event),
             WorkerMessage::Lost(error) => {
+                if self.session_edit.is_some() {
+                    self.command_error = Some(error.clone());
+                }
                 self.pending_command = false;
                 self.approval_pending = false;
                 for row in &mut self.login_providers {
@@ -361,6 +391,7 @@ impl ZetaView {
             && !self.state.streaming
             && self.state.approvals.is_empty()
             && !self.pending_command
+            && self.session_edit.is_none()
     }
 
     fn composer_hint(&self) -> &'static str {
@@ -837,7 +868,9 @@ impl ZetaView {
     ) {
         // GPUI resolves key bindings before key-down handlers. Capture Paste
         // itself so image acceptance precedes the textarea's text paste.
-        if self.settings_open {
+        if self.session_edit.is_some() {
+            cx.propagate();
+        } else if self.settings_open {
             cx.stop_propagation();
         } else if self.state.approvals.is_empty() && self.attach_from_clipboard(cx) {
             cx.stop_propagation();
@@ -848,6 +881,16 @@ impl ZetaView {
     }
 
     fn settings_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_edit.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" => self.close_session_edit(window, cx),
+                "enter" => self.commit_session_edit(cx),
+                _ => return,
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if !self.settings_open {
             return;
         }
@@ -1504,6 +1547,26 @@ impl Render for ZetaView {
             })
             .on_key_down(cx.listener(Self::control_key))
             .capture_key_down(cx.listener(Self::settings_key))
+            .capture_action(
+                cx.listener(|view, _: &gpui_kit::component::input::Enter, _, cx| {
+                    if view.session_edit.is_some() {
+                        view.commit_session_edit(cx);
+                        cx.stop_propagation();
+                    } else {
+                        cx.propagate();
+                    }
+                }),
+            )
+            .capture_action(cx.listener(
+                |view, _: &gpui_kit::component::input::Escape, window, cx| {
+                    if view.session_edit.is_some() {
+                        view.close_session_edit(window, cx);
+                        cx.stop_propagation();
+                    } else {
+                        cx.propagate();
+                    }
+                },
+            ))
             .capture_action(cx.listener(Self::paste_image))
             .child(
                 div()
@@ -1514,6 +1577,9 @@ impl Render for ZetaView {
                     .child(main),
             )
             .child(self.dialogs.clone())
+            .when(self.session_edit.is_some(), |view| {
+                view.child(self.render_session_edit(cx))
+            })
             .when(self.settings_open, |view| {
                 view.child(self.render_settings_overlay(cx))
             })
