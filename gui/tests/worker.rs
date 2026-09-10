@@ -947,10 +947,15 @@ fn durable_receipts_update_launch_cards_with_duplicate_raw_tool_ids() {
     assert!(
         matches!(&state.transcript[2], TranscriptEntry::Tool { card, .. } if card.tail.text == "review failed\nerror details")
     );
-    assert_eq!(state.transcript[1].tool_marker(), "[done]");
-    assert_eq!(state.transcript[2].tool_marker(), "[failed]");
-    assert_eq!(state.transcript[3].tool_marker(), "[canceled]");
+    use zeta_gui::state::ToolState;
+    assert_eq!(state.transcript[1].tool_state(), ToolState::Done);
+    assert_eq!(state.transcript[2].tool_state(), ToolState::Failed);
+    assert_eq!(state.transcript[3].tool_state(), ToolState::Failed);
     assert!(state.transcript[3].unsuccessful());
+    assert!(matches!(
+        &state.transcript[3],
+        TranscriptEntry::Tool { canceled: true, .. }
+    ));
     harness.finish();
 }
 

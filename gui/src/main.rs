@@ -237,6 +237,10 @@ impl ZetaView {
             }
             WorkerMessage::ImagesSent(text, images) => {
                 self.pending_command = false;
+                // Both Sent and ImagesSent land the real user turn in the
+                // transcript; the queued strip must clear here too or an
+                // image-only send leaves a phantom dashed row beside it.
+                self.pending_user_turn = None;
                 self.state.streaming = true;
                 let index = self.state.transcript.len();
                 self.state.transcript.push(TranscriptEntry::User(text));
@@ -1151,8 +1155,8 @@ impl ZetaView {
             TranscriptEntry::User(text) => self.render_user_row(index, text, view, cx),
             TranscriptEntry::Assistant(doc) => self.render_assistant_row(index, doc, cx),
             entry @ TranscriptEntry::Tool { .. } => self.render_tool_row(index, entry, view, cx),
-            TranscriptEntry::Thinking { duration_ms } => {
-                self.render_thinking_row(index, *duration_ms, cx)
+            entry @ TranscriptEntry::Thinking { .. } => {
+                self.render_thinking_row(index, entry, view, cx)
             }
             TranscriptEntry::Error {
                 message,
@@ -1172,24 +1176,78 @@ impl ZetaView {
     fn render_thinking_row(
         &self,
         index: usize,
-        duration_ms: Option<u64>,
+        entry: &TranscriptEntry,
+        view: gpui::WeakEntity<Self>,
         cx: &App,
     ) -> gpui::AnyElement {
-        // Display-safe: the server hides the reasoning content, so this row is
-        // header-only. No body, no expand affordance — leaking would require
-        // storing the thinking text, and we deliberately do not.
-        let mut header = String::from("+ Thought");
-        if let Some(ms) = duration_ms {
-            header.push_str(&format!(" · {ms}ms"));
-        }
+        let TranscriptEntry::Thinking {
+            duration_ms,
+            title,
+            body,
+            expanded,
+        } = entry
+        else {
+            unreachable!("render_thinking_row invoked on non-Thinking entry");
+        };
+        // Header: `+ Thought[: <title>][ · <duration>]` at muted-foreground.
+        // Deltas were discarded on the way in; `title`/`body` are populated
+        // only by the finalized `Thinking` block on the server-committed
+        // AssistantMessage — the wiki's display-safe path.
+        let expanded = *expanded;
+        let prefix = if expanded { "-" } else { "+" };
+        let has_title = !title.is_empty();
+        let duration_label = duration_ms.map(|ms| format!("{ms}ms"));
         div()
+            .id(("thinking-row", index))
             .debug_selector(move || format!("thinking-row-{index}"))
             .w_full()
             .min_w_0()
             .py(px(2.))
-            .opacity(0.6)
             .text_color(cx.theme().muted_foreground)
-            .child(header)
+            .cursor_pointer()
+            .when(expanded, |row| row.opacity(0.6))
+            .on_click(move |_, _, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    view.state.toggle_card(index);
+                    view.transcript.update(cx, |scroll, cx| {
+                        scroll.remeasure_items(index..index + 1, cx);
+                    });
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .debug_selector(move || format!("thinking-header-{index}"))
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(prefix)
+                    .child(if has_title {
+                        format!("Thought: {title}")
+                    } else {
+                        String::from("Thought")
+                    })
+                    .when_some(duration_label, |header, label| {
+                        header.child(
+                            div()
+                                .debug_selector(move || format!("thinking-duration-{index}"))
+                                .child(format!("· {label}")),
+                        )
+                    }),
+            )
+            .when(expanded && !body.is_empty(), |row| {
+                row.child(
+                    div()
+                        .debug_selector(move || format!("thinking-body-{index}"))
+                        // 2ch left margin — moves the body's box, not just its
+                        // text — so paint bounds land at the indented position
+                        // instead of the parent's inner-left with hidden padding.
+                        .ml(theme::THINKING_BODY_INDENT)
+                        .whitespace_normal()
+                        .line_height(gpui::rems(1.6))
+                        .child(body.to_owned()),
+                )
+            })
             .into_any_element()
     }
 
@@ -1341,17 +1399,12 @@ impl ZetaView {
         else {
             unreachable!("render_tool_row invoked on non-Tool entry");
         };
-        // State is signalled by COLOR ONLY. `running` sits at normal text tier;
-        // `done` fades to muted; `failed`/`canceled` land on danger. No textual
-        // "[working]/[done]/[failed]" marker — that duplicated what color says.
-        let complete = matches!(entry, TranscriptEntry::Tool { complete: true, .. });
-        let state_color = if entry.unsuccessful() {
-            cx.theme().danger
-        } else if complete {
-            cx.theme().muted_foreground
-        } else {
-            cx.theme().foreground
-        };
+        // State is signalled by COLOR ONLY. Running sits at normal text tier;
+        // done fades to muted; failed/canceled land on danger. Contract line 83
+        // forbids any textual "[working]/[done]/[failed]" marker — the color
+        // helper hands us the token, the render below applies it as text_color
+        // on the actual verb and detail spans (not on a hidden canary quad).
+        let state_color = tool_state_color(entry.tool_state(), cx);
         let verb = name.clone();
         let detail = summary.to_owned();
         let group = format!("tool-row-{index}");
@@ -1365,21 +1418,6 @@ impl ZetaView {
             .w_full()
             .min_w_0()
             .cursor_pointer()
-            // 1x1 state-color pip at the row's top-left corner. Reinforces
-            // the color-only state signal AND lets the test assert the
-            // painted color per state independently of the (untestable) text
-            // color that the row wrapper applies. Non-load-bearing pixel; a
-            // color regression trips the receipt-color test.
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .w(px(1.))
-                    .h(px(1.))
-                    .bg(state_color)
-                    .debug_selector(move || format!("tool-state-canary-{index}")),
-            )
             .hover(|style| style.bg(cx.theme().list_hover))
             .on_click(move |_, _, cx| {
                 let _ = view.update(cx, |view, cx| {
@@ -1396,26 +1434,34 @@ impl ZetaView {
                     .gap_2()
                     .items_center()
                     .min_h(px(20.))
-                    .text_color(state_color)
                     .child(
                         Icon::new(if card.expanded {
                             IconName::ChevronDown
                         } else {
                             IconName::ChevronRight
                         })
-                        .size(px(12.)),
+                        .size(px(12.))
+                        .text_color(state_color),
                     )
                     .child(
+                        // Verb + detail carry the state color as their OWN
+                        // text_color refinement so the paint pipeline reads the
+                        // same token the design contract prescribes — not
+                        // inheritance from a parent that a refactor could break.
                         div()
+                            .debug_selector(move || format!("tool-verb-{index}"))
                             .flex_shrink_0()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(state_color)
                             .child(verb),
                     )
                     .child(
                         div()
+                            .debug_selector(move || format!("tool-detail-{index}"))
                             .min_w_0()
                             .flex_1()
                             .truncate()
+                            .text_color(state_color)
                             .opacity(0.78)
                             .child(detail),
                     )
@@ -1583,7 +1629,10 @@ impl ZetaView {
                         .py_2()
                         .px_3()
                         .bg(cx.theme().muted)
-                        .border_l(theme::RAIL_WIDTH_THICK)
+                        // Contract line 85 pins the queued strip to a 1px dashed
+                        // rail. A thick rail here would read as an active user
+                        // turn, not a waiting-for-echo signal.
+                        .border_l(theme::RAIL_WIDTH_THIN)
                         .border_dashed()
                         .border_color(rail_color)
                         .opacity(opacity)
@@ -1616,23 +1665,11 @@ impl ZetaView {
             roles.fill_rest
         };
         // Enabled send: inverted — text color on canvas, hover fades to muted.
-        // Disabled send: outline — transparent fill, active-border ring, faint
-        // label at 0.55 opacity. Kit's default disabled fill on top of the
-        // inverted variant reads as a "translucent chip" instead of a clearly
-        // unavailable outline, so we swap the whole variant here.
-        let send_variant = if can_send {
-            ButtonCustomVariant::new(cx)
-                .color(cx.theme().foreground)
-                .foreground(cx.theme().background)
-                .hover(cx.theme().muted_foreground)
-                .active(cx.theme().muted_foreground)
-        } else {
-            ButtonCustomVariant::new(cx)
-                .color(gpui::transparent_black())
-                .foreground(roles.send_disabled_outline)
-                .hover(gpui::transparent_black())
-                .active(gpui::transparent_black())
-        };
+        let send_variant = ButtonCustomVariant::new(cx)
+            .color(cx.theme().foreground)
+            .foreground(cx.theme().background)
+            .hover(cx.theme().muted_foreground)
+            .active(cx.theme().muted_foreground);
         let model_target = self
             .state
             .metrics
@@ -1736,20 +1773,40 @@ impl ZetaView {
                                 view.attach_from_files(window, cx)
                             })),
                     )
-                    .child(
+                    .child(if can_send {
                         Button::new("send")
                             .debug_selector(|| "send-button".into())
                             .custom(send_variant)
                             .label("Send")
-                            .disabled(!can_send)
                             .h(theme::SEND_BUTTON_HEIGHT)
                             .min_w(theme::SEND_BUTTON_MIN_WIDTH)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            // Disabled paints an active-border outline at
-                            // reduced opacity — never a translucent fill.
-                            .when(!can_send, |btn| btn.outline().opacity(0.55))
-                            .on_click(cx.listener(|view, _, _, cx| view.send_composer(cx))),
-                    ),
+                            .on_click(cx.listener(|view, _, _, cx| view.send_composer(cx)))
+                            .into_any_element()
+                    } else {
+                        // Disabled: paint the outline ourselves. Kit's Custom
+                        // variant derives the border color from the fill color
+                        // (button.rs:1011), so a transparent fill kills the
+                        // border too. A plain div sets fill and border
+                        // independently, with the whole presentation dimmed to
+                        // 0.55 opacity per contract line 85.
+                        div()
+                            .debug_selector(|| "send-button".into())
+                            .h_flex()
+                            .items_center()
+                            .justify_center()
+                            .h(theme::SEND_BUTTON_HEIGHT)
+                            .min_w(theme::SEND_BUTTON_MIN_WIDTH)
+                            .px_3()
+                            .bg(gpui::transparent_black())
+                            .border_1()
+                            .border_color(roles.send_disabled_outline)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(roles.send_disabled_outline)
+                            .opacity(0.55)
+                            .child("Send")
+                            .into_any_element()
+                    }),
             )
             .into_any_element()
     }
@@ -1804,6 +1861,20 @@ impl ZetaView {
                     .child(self.composer_hint()),
             )
             .into_any_element()
+    }
+}
+
+/// Map a tool row's semantic state onto the wiki contract's color-only
+/// signal: running=foreground, done=muted_foreground, failed=danger. Kept as
+/// a free helper so the render layer and the guard test can only ever read
+/// the same mapping.
+pub(crate) fn tool_state_color(state: zeta_gui::state::ToolState, cx: &App) -> gpui::Hsla {
+    use zeta_gui::state::ToolState;
+    let theme = cx.theme();
+    match state {
+        ToolState::Running => theme.foreground,
+        ToolState::Done => theme.muted_foreground,
+        ToolState::Failed => theme.danger,
     }
 }
 

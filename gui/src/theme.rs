@@ -52,6 +52,11 @@ pub const STREAM_DOT_SIZE: Pixels = px(7.);
 /// textarea. Kept tight so the 64px composer floor stays honest.
 pub const COMPOSER_TARGET_HEIGHT: Pixels = px(16.);
 
+/// Left indent for the expanded thinking body. The wiki spec calls for a 2ch
+/// indent under the header; JetBrains Mono's "0" advance at the 15px base
+/// size lands at ~9px, so 18px approximates 2ch without adding chrome.
+pub const THINKING_BODY_INDENT: Pixels = px(18.);
+
 /// Semantic composer color roles. The composer paints its rail, fill, and
 /// target-line label from these — never from `palette::*` directly — so the
 /// call sites read as "composer at rest / composer focused" rather than

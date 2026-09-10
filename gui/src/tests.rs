@@ -264,7 +264,12 @@ fn virtual_transcript_and_session_rows_fit_their_viewports(cx: &mut TestAppConte
                 })
                 .collect();
             assert!(!quads.is_empty(), "user message borders were painted");
-            assert!(quads.len() < 40, "the virtual list paints only nearby rows");
+            // The 760px window minus header, banner, composer, and footer
+            // leaves ≲520px of transcript viewport. With the 22px row rhythm
+            // that fits ~24 rows; a healthy virtual list over-renders a small
+            // buffer above and below. Anything past that means the list is
+            // materialising off-screen work.
+            assert!(quads.len() < 20, "the virtual list paints only nearby rows");
             for quad in quads {
                 assert!(
                     quad.content_mask.bounds.top() >= viewport.top()
@@ -402,20 +407,16 @@ fn assistant_row_is_naked_and_carries_no_bg_or_rail(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut TestAppContext) {
-    // The wiki contract encodes tool state through COLOR ONLY: running paints
-    // at foreground, done fades to muted, failed lands on danger. Textual
-    // "[working]/[done]/[failed]/[canceled]" markers must not render — a
-    // regression that reintroduces them shows up here as a textual marker
-    // and/or a canary painted at the wrong color.
-    #[derive(Clone, Copy)]
-    enum StateCase {
-        Running,
-        Done,
-        Failed,
-    }
+    // The wiki contract encodes tool state through COLOR ONLY on the actual
+    // verb and detail text: running paints at foreground, done fades to
+    // muted, failed lands on danger. No textual "[working]/[done]/[failed]"
+    // marker may reach the row, and no synthetic canary quad substitutes for
+    // the real text. This guard drives real tool rows through the state
+    // layer, then verifies the semantic mapping tuple that main.rs consumes.
+    use zeta_gui::state::ToolState;
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    for case in [StateCase::Running, StateCase::Done, StateCase::Failed] {
+    for case in [ToolState::Running, ToolState::Done, ToolState::Failed] {
         visual.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.state.transcript.clear();
@@ -434,8 +435,8 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
                     window,
                     cx,
                 );
-                if !matches!(case, StateCase::Running) {
-                    let is_error = matches!(case, StateCase::Failed);
+                if !matches!(case, ToolState::Running) {
+                    let is_error = matches!(case, ToolState::Failed);
                     view.apply_worker_message(
                         WorkerMessage::Event(ServerEvent::ToolEnd {
                             session_id: view.state.active_session.clone(),
@@ -454,7 +455,7 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
                         cx,
                     );
                     // Expand collapsed successful rows so the indent-rail body paints.
-                    if matches!(case, StateCase::Done) {
+                    if matches!(case, ToolState::Done) {
                         view.state.toggle_card(0);
                         cx.notify();
                     }
@@ -462,56 +463,73 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
             });
             window.draw(cx).clear(cx);
         });
-        let canary_bounds = visual
-            .debug_bounds("tool-state-canary-0")
-            .expect("tool row paints a state-color canary");
-        visual.update(|window, cx| {
+        // State classification lands on the wiki contract's palette map.
+        // main.rs::tool_state_color reads the SAME helper, so a regression on
+        // either side fails this assertion.
+        visual.update(|_, cx| {
             let theme = cx.theme();
-            let expected_color = match case {
-                StateCase::Running => theme.foreground,
-                StateCase::Done => theme.muted_foreground,
-                StateCase::Failed => theme.danger,
+            let expected = match case {
+                ToolState::Running => theme.foreground,
+                ToolState::Done => theme.muted_foreground,
+                ToolState::Failed => theme.danger,
             };
-            let scaled = canary_bounds.scale(window.scale_factor());
-            let canary = window
-                .painted_quads()
-                .into_iter()
-                .find(|quad| {
-                    quad.bounds.top() >= scaled.top()
-                        && quad.bounds.bottom() <= scaled.bottom()
-                        && quad.bounds.left() >= scaled.left()
-                        && quad.bounds.right() <= scaled.right()
-                        && quad.background == expected_color.into()
-                })
-                .expect("state-color canary must paint at the expected color");
+            let entry_state = view.read(cx).state.transcript[0].tool_state();
+            assert_eq!(entry_state, case, "state classification regressed");
             assert_eq!(
-                canary.background,
-                expected_color.into(),
-                "tool row state color regressed off the expected token"
+                super::tool_state_color(entry_state, cx),
+                expected,
+                "tool row state color regressed off the contract token"
             );
-            let _ = canary;
         });
-        // Absence of textual "[working]"/"[done]"/"[failed]"/"[canceled]"
-        // markers: the render path no longer wires `tool_marker()` through,
-        // and the debug tree exposes no marker-tagged element. A regression
-        // that reintroduces one would add a debug_selector by name (the
-        // pattern this codebase uses for every user-visible chip), which
-        // would then trip on the assertion below.
-        for marker_selector in ["tool-state-label-0", "tool-state-marker-0", "tool-marker-0"] {
+        // The verb and detail carry the state color as their own text_color
+        // refinement. Their presence proves the row was painted (a shape
+        // regression that dropped the verb would leave no bounds to find).
+        assert!(
+            visual.debug_bounds("tool-verb-0").is_some(),
+            "verb element must paint for state {case:?}"
+        );
+        assert!(
+            visual.debug_bounds("tool-detail-0").is_some(),
+            "detail element must paint for state {case:?}"
+        );
+        // Canary is gone: a hidden 1x1 quad would trivialise the color test.
+        // Any regression that reintroduced one — under this or the earlier
+        // marker names — would trip here.
+        for stale in [
+            "tool-state-canary-0",
+            "tool-state-label-0",
+            "tool-state-marker-0",
+            "tool-marker-0",
+        ] {
             assert!(
-                visual.debug_bounds(marker_selector).is_none(),
-                "textual tool state marker {marker_selector} must not render"
+                visual.debug_bounds(stale).is_none(),
+                "removed state chrome resurfaced under selector {stale}"
             );
         }
-        // The state-color canary is 1x1: verify it stays at that size, so a
-        // future regression that leaks a full-width state fill also trips
-        // this test.
-        assert!(canary_bounds.size.width <= px(1.5));
-        assert!(canary_bounds.size.height <= px(1.5));
+        // No textual state marker in any visible tool row content — the
+        // transcript entry's rendered fields (name + summary) come from the
+        // server, and neither must contain "[working]/[done]/[failed]/
+        // [canceled]" because the display layer no longer synthesises them.
+        view.read_with(&visual, |view, _| {
+            if let TranscriptEntry::Tool { name, summary, .. } = &view.state.transcript[0] {
+                for marker in ["[working]", "[done]", "[failed]", "[canceled]"] {
+                    assert!(
+                        !name.contains(marker),
+                        "tool name must not carry state marker {marker}"
+                    );
+                    assert!(
+                        !summary.contains(marker),
+                        "tool summary must not carry state marker {marker}"
+                    );
+                }
+            } else {
+                panic!("expected a Tool entry for state {case:?}");
+            }
+        });
         // Failed tool bodies auto-expand (see state::ServerEvent::ToolEnd),
         // so the indent-rail assertion still runs for that case. The Done
         // case toggles above; Running has no expanded body.
-        if matches!(case, StateCase::Done | StateCase::Failed) {
+        if matches!(case, ToolState::Done | ToolState::Failed) {
             let body = visual
                 .debug_bounds("tool-output-0")
                 .expect("expanded tool body renders");
@@ -540,7 +558,7 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
                     .iter()
                     .filter(|quad| quad.border_color == theme.border)
                     .count();
-                if matches!(case, StateCase::Failed) {
+                if matches!(case, ToolState::Failed) {
                     assert!(
                         danger_count > 0,
                         "failed tool body must paint its rail in danger"
@@ -1066,8 +1084,16 @@ fn attachments_paste_shows_chip_and_send_dispatches_send_images(cx: &mut TestApp
             view.state.session_view.attachments.get(&0),
             Some(&vec![("pasted-image.png".to_string(), 8)])
         );
+        // ImagesSent clears the queued-strip state alongside Sent — otherwise
+        // an image-only send leaves a phantom dashed strip beside the solid
+        // transcript turn.
+        assert!(
+            view.pending_user_turn.is_none(),
+            "ImagesSent must clear the queued strip"
+        );
     });
     assert!(visual.debug_bounds("composer-chip").is_none());
+    assert!(visual.debug_bounds("composer-pending").is_none());
 }
 
 #[gpui::test]
@@ -1543,7 +1569,7 @@ fn thinking_feedback_stops_on_text_and_turn_boundaries(cx: &mut TestAppContext) 
             // still guards against below.
             assert!(matches!(
                 view.state.transcript.as_slice(),
-                [TranscriptEntry::Thinking { .. }]
+                [TranscriptEntry::Thinking { title, body, .. }] if title.is_empty() && body.is_empty()
             ));
             view.apply_worker_message(
                 WorkerMessage::Event(ServerEvent::AssistantDelta {
@@ -1593,6 +1619,223 @@ fn thinking_feedback_stops_on_text_and_turn_boundaries(cx: &mut TestAppContext) 
             assert!(!view.state.thinking);
             assert!(!format!("{:?}", view.state.transcript).contains("private reasoning"));
         });
+    });
+}
+
+#[gpui::test]
+fn thinking_row_renders_display_safe_summary_and_hides_private_deltas(cx: &mut TestAppContext) {
+    // Guard for contract line 83's thinking chrome. Private streamed deltas
+    // must never surface in the row's title/body; only the finalized
+    // Thinking block from the server's AssistantMessage supplies displayable
+    // content. Once populated, the header shows `+ Thought: <title>` plus a
+    // `· <duration>` segment when known, and the expanded body indents 2ch
+    // with no bg/border chrome around it.
+    use zeta_gui::client::{ContentBlock, Message};
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let secret = "SECRET-PRIVATE-DELTA-NEVER-DISPLAY";
+    let displayable = "Chose read over grep\nBecause the file is small";
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::TurnStart {
+                    session_id: None,
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantDelta {
+                    session_id: None,
+                    delta: secret.into(),
+                    kind: "thinking".into(),
+                }),
+                window,
+                cx,
+            );
+            // Deltas seed only the placeholder — title/body remain empty so
+            // the private text never reaches the display state.
+            assert!(matches!(
+                &view.state.transcript[0],
+                TranscriptEntry::Thinking { title, body, .. }
+                    if title.is_empty() && body.is_empty()
+            ));
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantMessage {
+                    session_id: None,
+                    message: Message {
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::Thinking {
+                            text: displayable.into(),
+                        }],
+                    },
+                }),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    // Finalized message populated title/body from the displayable source.
+    view.read_with(&visual, |view, _| {
+        let TranscriptEntry::Thinking {
+            title,
+            body,
+            expanded,
+            ..
+        } = &view.state.transcript[0]
+        else {
+            panic!("thinking entry missing after AssistantMessage");
+        };
+        assert_eq!(title, "Chose read over grep");
+        assert_eq!(body, displayable);
+        assert!(!*expanded, "thinking rows start collapsed");
+        // The private delta must never appear in visible fields.
+        assert!(!title.contains(secret));
+        assert!(!body.contains(secret));
+        assert!(!format!("{:?}", view.state.transcript).contains(secret));
+    });
+    // Collapsed: header paints, body does not. Duration segment is absent
+    // when duration_ms is None.
+    assert!(visual.debug_bounds("thinking-header-0").is_some());
+    assert!(visual.debug_bounds("thinking-body-0").is_none());
+    assert!(visual.debug_bounds("thinking-duration-0").is_none());
+    // Expand + set a duration; header now includes the duration span and the
+    // body renders indented at 2ch (≈ THINKING_BODY_INDENT) with no chrome.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            if let Some(TranscriptEntry::Thinking {
+                expanded,
+                duration_ms,
+                ..
+            }) = view.state.transcript.get_mut(0)
+            {
+                *expanded = true;
+                *duration_ms = Some(463);
+            }
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("thinking-duration-0").is_some());
+    let header = visual.debug_bounds("thinking-header-0").unwrap();
+    let body = visual
+        .debug_bounds("thinking-body-0")
+        .expect("expanded thinking body renders");
+    // Body sits BELOW the header (stacked) and is INDENTED — its left edge
+    // starts to the right of the header's left edge by the 2ch indent
+    // (allow a small paint tolerance).
+    assert!(
+        body.top() >= header.bottom() - px(0.5),
+        "body must sit below the header"
+    );
+    let indent = body.left() - header.left();
+    assert!(
+        indent >= theme::THINKING_BODY_INDENT - px(1.5)
+            && indent <= theme::THINKING_BODY_INDENT + px(1.5),
+        "expanded body indent {indent:?} must land on 2ch ({:?})",
+        theme::THINKING_BODY_INDENT
+    );
+    // The expanded body must carry no bg/border chrome — the header sits
+    // muted, the body is the only content — so any framing quad inside the
+    // body's bounds is a regression.
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled_body = body.scale(window.scale_factor());
+        let framed: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                let in_body = quad.bounds.top() >= scaled_body.top()
+                    && quad.bounds.bottom() <= scaled_body.bottom()
+                    && quad.bounds.left() >= scaled_body.left()
+                    && quad.bounds.right() <= scaled_body.right();
+                let has_border = quad.border_widths.left > gpui::ScaledPixels::default()
+                    || quad.border_widths.top > gpui::ScaledPixels::default()
+                    || quad.border_widths.right > gpui::ScaledPixels::default()
+                    || quad.border_widths.bottom > gpui::ScaledPixels::default();
+                let has_fill = quad.background == theme.muted.into()
+                    || quad.background == theme.sidebar.into();
+                in_body && (has_border || has_fill)
+            })
+            .collect();
+        assert!(
+            framed.is_empty(),
+            "expanded thinking body must have no chrome (got {} framing quads)",
+            framed.len()
+        );
+    });
+}
+
+#[gpui::test]
+fn disabled_send_button_paints_transparent_fill_and_semantic_outline(cx: &mut TestAppContext) {
+    // Guard for contract line 85. Kit's Custom variant derives its border
+    // color FROM the fill color, so a naive `.color(transparent)` on the
+    // variant kills the outline too. The disabled state paints its outline
+    // through a plain div instead: transparent fill AND an explicit semantic
+    // border color, with the whole presentation dimmed to 0.55 opacity.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Force disable by clearing the active session so `can_send` flips false
+    // — the composer keeps rendering, the send button falls into the
+    // disabled branch.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.active_session = None;
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let send = visual
+        .debug_bounds("send-button")
+        .expect("send button paints when disabled");
+    let outline_token = theme::palette::border_active();
+    visual.update(|window, _| {
+        let scaled = send.scale(window.scale_factor());
+        let button_quads: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.bounds.top() >= scaled.top() - gpui::ScaledPixels::from(0.5)
+                    && quad.bounds.bottom() <= scaled.bottom() + gpui::ScaledPixels::from(0.5)
+                    && quad.bounds.left() >= scaled.left() - gpui::ScaledPixels::from(0.5)
+                    && quad.bounds.right() <= scaled.right() + gpui::ScaledPixels::from(0.5)
+            })
+            .collect();
+        // Locate the outline quad by border color — asserting on the ACTUAL
+        // painted border color, not on a theme constant we chose ourselves.
+        let outline = button_quads
+            .iter()
+            .find(|quad| {
+                let color = quad.border_color;
+                color.h == outline_token.h
+                    && color.s == outline_token.s
+                    && color.l == outline_token.l
+                    && quad.border_widths.top > gpui::ScaledPixels::default()
+            })
+            .expect("disabled send button paints a semantic outline");
+        // Complete presentation at 0.55 opacity: element opacity multiplies
+        // into every painted color's alpha, so the outline alpha lands near
+        // outline_token.a * 0.55.
+        let expected_alpha = outline_token.a * 0.55;
+        assert!(
+            (outline.border_color.a - expected_alpha).abs() < 0.02,
+            "outline alpha {} must land near 0.55 * token ({expected_alpha})",
+            outline.border_color.a
+        );
+        // No fill quad — background is transparent. The outline quad itself
+        // may carry `background = transparent`; a REGRESSION would paint a
+        // separate quad with a non-transparent background inside the button
+        // bounds. Assert no such quad has visible alpha.
+        for quad in &button_quads {
+            let bg_alpha = quad.background.as_solid().map_or(0.0, |color| color.a);
+            assert!(
+                bg_alpha < 0.02,
+                "disabled send button must not paint a fill (got alpha {bg_alpha})"
+            );
+        }
     });
 }
 
