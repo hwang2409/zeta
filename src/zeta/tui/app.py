@@ -73,6 +73,7 @@ from .fake_backend import FakeInteractiveBackend
 from .layout import (
     CONTENT_MARGIN,
     content_width,
+    detach_completion_menus,
     full_screen_content,
 )
 from .models import MODEL_CATALOGS
@@ -86,6 +87,7 @@ from .render import (
 )
 from .slash_handlers import SlashHandlerMixin
 from .slash_handlers.command_runtime import CommandRuntimeMixin
+from .slash_handlers.model_picker import ModelPicker
 from .theme import RICH_THEME
 from .todo import TodoWidget
 from .transcript import TranscriptWidget, stream_key
@@ -221,6 +223,8 @@ class TUIApp(
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
         self._model_catalog_task: asyncio.Task[None] | None = None
+        self._model_picker: ModelPicker | None = None
+        self._model_picker_unit: Any = None
         self._zeta_home: Path | None = (
             Path(zeta_home).resolve() if zeta_home is not None else None
         )
@@ -337,6 +341,7 @@ class TUIApp(
         finally:
             self._model_catalog_loaded = True
             self._model_catalog_task = None
+            self.refresh_model_picker()
 
     def _present_pending_approvals(self) -> None:
         for index, request in enumerate(self.pending_approvals):
@@ -446,6 +451,21 @@ class TUIApp(
                     ),
                     "text-area": f"fg:{theme.BODY}",
                     "text-area.prompt": f"fg:{theme.ACCENT} bold",
+                    # The slash-command menu: prompt-toolkit's default is gray
+                    # on gray, unreadable on a dark terminal. Rows sit on the
+                    # palette's highlight background; the current row takes
+                    # the accent so the pick is unmistakable.
+                    "completion-menu": f"bg:{theme.MENU_BG} fg:{theme.BODY}",
+                    "completion-menu.completion": f"bg:{theme.MENU_BG} fg:{theme.BODY}",
+                    "completion-menu.completion.current": (
+                        f"bg:{theme.ACCENT} fg:{theme.ON_ACCENT} bold"
+                    ),
+                    "completion-menu.meta.completion": f"bg:{theme.MENU_BG} fg:{theme.DIM}",
+                    "completion-menu.meta.completion.current": (
+                        f"bg:{theme.ACCENT} fg:{theme.ON_ACCENT}"
+                    ),
+                    "scrollbar.background": f"bg:{theme.MENU_BG}",
+                    "scrollbar.button": f"bg:{theme.DIM}",
                 }
             )
             self._prompt_styles[focused] = style
@@ -481,6 +501,10 @@ class TUIApp(
             on_plan_toggle=self.toggle_plan_mode,
             on_scroll_up=self._transcript.scroll_up,
             on_scroll_down=self._transcript.scroll_down,
+            on_picker_move=self.model_picker_move,
+            on_picker_select=self.model_picker_select,
+            on_picker_cancel=self.model_picker_cancel,
+            picker_active=lambda: self.model_picker_active,
             key_remap=self._key_remap,
         )
         session = FullScreenPromptSession(
@@ -488,7 +512,11 @@ class TUIApp(
             placeholder=[("class:placeholder", "type a message...")],
             history=self._history,
             key_bindings=bindings,
-            completer=SlashCompleter(self._slash_commands),
+            completer=SlashCompleter(
+                self._slash_commands,
+                model_choices=self.model_choices,
+                current_model=lambda: self.model,
+            ),
             reserve_space_for_menu=0,
             multiline=True,
             mouse_support=True,
@@ -885,6 +913,10 @@ class TUIApp(
         root = session.layout.container
         composer_rows = list(root.children)
         footer = composer_rows.pop()
+        # The command menu leaves the composer's own float container so it
+        # can open upward over the transcript with room for a dozen rows.
+        for row in composer_rows:
+            detach_completion_menus(row)
         root.children[:] = [
             full_screen_content(
                 self._transcript.window(),

@@ -5640,7 +5640,11 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
 
     root = session.layout.container
     assert len(root.children) == 1
-    padded = root.children[0]
+    # The command menu floats over the whole screen; the padded content sits
+    # inside that float container.
+    float_container = root.children[0]
+    assert float_container.__class__.__name__ == "FloatContainer"
+    padded = float_container.content
     assert padded.__class__.__name__ == "VSplit"
     assert padded.children[0].__class__.__name__ == "Window"
     content = padded.children[1]

@@ -10,7 +10,7 @@ import platform
 import re
 import shutil
 import subprocess
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -45,6 +45,7 @@ from .key_bindings import (
     VimCursorShapeConfig,
     build_key_bindings,
 )
+from .models import match_models
 from .render import is_retryable_error, render_event
 
 ATTACHMENT_MAX_TEXT_BYTES = 200 * 1024
@@ -214,19 +215,28 @@ class AttachmentError(ValueError):
 
 
 class SlashCompleter(Completer):
-    """Complete slash commands with descriptions and custom-source badges."""
+    """Complete slash commands, and model names after ``/model``."""
 
-    def __init__(self, registry: SlashCommandRegistry) -> None:
+    def __init__(
+        self,
+        registry: SlashCommandRegistry,
+        *,
+        model_choices: Callable[[], Sequence[str]] | None = None,
+        current_model: Callable[[], str] | None = None,
+    ) -> None:
         self.registry = registry
+        self._model_choices = model_choices
+        self._current_model = current_model
 
     def get_completions(
         self, document: Document, complete_event: CompleteEvent
     ) -> Iterator[Completion]:
         del complete_event
         before_cursor = document.text_before_cursor
-        if not before_cursor.startswith("/") or any(
-            character.isspace() for character in before_cursor
-        ):
+        if not before_cursor.startswith("/"):
+            return
+        if any(character.isspace() for character in before_cursor):
+            yield from self._model_completions(before_cursor)
             return
         prefix = before_cursor[1:]
         for name, description, source in self.registry.completion_entries:
@@ -240,6 +250,24 @@ class SlashCompleter(Completer):
                 start_position=-len(prefix),
                 display=f"/{name}",
                 display_meta=meta,
+            )
+
+    def _model_completions(self, before_cursor: str) -> Iterator[Completion]:
+        """Offer provider models while the argument to ``/model`` is being typed."""
+
+        if self._model_choices is None or "\n" in before_cursor:
+            return
+        parts = before_cursor[1:].split(maxsplit=1)
+        argument = parts[1] if len(parts) == 2 else ""
+        if parts[0] != "model" or any(character.isspace() for character in argument):
+            return
+        current = self._current_model() if self._current_model is not None else None
+        for name in match_models(argument, self._model_choices()):
+            yield Completion(
+                name,
+                start_position=-len(argument),
+                display=name,
+                display_meta="current" if name == current else "",
             )
 
 
@@ -849,6 +877,9 @@ class SubmissionMixin:
         return await self.loop.slash_mcp_prompt(name, arguments)
 
     def _submit_input(self, value: str) -> None:
+        # Any submission retires an open model picker: its card would otherwise
+        # linger with keys that no longer do anything.
+        self._dismiss_model_picker()
         if (
             self._submissions._approval_action_for(value) is not None
             and not self._submissions.active
