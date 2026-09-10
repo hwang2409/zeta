@@ -317,6 +317,7 @@ class CheckpointTranscriptMixin:
     def _rebuild_transcript(self) -> None:
         """Re-render the visible transcript from the active durable branch."""
 
+        self._dismiss_model_picker()
         self._presenter.clear()
         self._failed_turn = None
         tool_calls: dict[str, ToolCall] = {}

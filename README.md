@@ -35,6 +35,18 @@ references to one resolved path produce one attachment block.
 - `ctrl+x ctrl+o` expands or collapses the newest child card.
 - `ctrl+o` keeps its native prompt-toolkit behavior in the composer.
 
+## picking a model
+
+`/model` opens a picker card listing the models the current provider serves:
+the built-in table plus the live catalog once it loads, with the current
+model marked. `↑`/`↓` move, `enter` selects, and `esc` cancels; the keys only
+act while the composer is empty. `/model <text>` switches directly when the
+text names a known model or matches exactly one, and otherwise narrows the
+picker to the matches, so `/model opus` shows the opus family instead of
+sending `opus` to the provider. Text that matches nothing is still sent as
+typed, so a brand-new id keeps working. Typing after `/model ` also completes
+model names inline.
+
 ## exec macro example
 
 Create `~/.zeta/commands/rebuild.md` for a local `/rebuild` macro:

@@ -221,9 +221,14 @@ class TranscriptWidget(UIControl):
         self._bump_revision()
         return unit
 
-    def remove(self, unit: _TranscriptUnit) -> None:
+    def remove(self, unit: _TranscriptUnit, *, leading_blank: bool = False) -> None:
         if unit not in self._units:
             return
+        if leading_blank:
+            index = self._units.index(unit)
+            previous = self._units[index - 1] if index > 0 else None
+            if previous is not None and previous.value is None:
+                self.remove(previous)
         self._units.remove(unit)
         if self._anchor is not None and self._anchor[0] is unit:
             self._anchor = None

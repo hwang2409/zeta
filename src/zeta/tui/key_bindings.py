@@ -268,6 +268,10 @@ def build_key_bindings(
     on_plan_toggle: Callable[[], None] | None = None,
     on_scroll_up: Callable[[], None] | None = None,
     on_scroll_down: Callable[[], None] | None = None,
+    on_picker_move: Callable[[int], None] | None = None,
+    on_picker_select: Callable[[], None] | None = None,
+    on_picker_cancel: Callable[[], None] | None = None,
+    picker_active: Callable[[], bool] | None = None,
     key_remap: Mapping[str, str] | None = None,
 ) -> KeyBindings:
     """Build the small key map used by the full-screen composer."""
@@ -594,6 +598,46 @@ def build_key_bindings(
         def deny(event: KeyPressEvent) -> None:
             del event
             on_deny()
+
+    if (
+        on_picker_move is not None
+        and on_picker_select is not None
+        and on_picker_cancel is not None
+    ):
+
+        @Condition
+        def picker_open() -> bool:
+            # Only while the composer is empty: a typed message or a full
+            # "/model <name>" keeps its own enter and arrow keys.
+            return (
+                picker_active is not None
+                and picker_active()
+                and not get_app().current_buffer.text
+            )
+
+        picking = (
+            picker_open & ~transcript_search_mode & ~is_searching & ~has_completions
+        )
+
+        @bindings.add("up", filter=picking, eager=True)
+        def picker_up(event: KeyPressEvent) -> None:
+            del event
+            on_picker_move(-1)
+
+        @bindings.add("down", filter=picking, eager=True)
+        def picker_down(event: KeyPressEvent) -> None:
+            del event
+            on_picker_move(1)
+
+        @bindings.add("enter", filter=picking, eager=True)
+        def picker_select(event: KeyPressEvent) -> None:
+            del event
+            on_picker_select()
+
+        @bindings.add(Keys.Escape, filter=picking, eager=True)
+        def picker_cancel(event: KeyPressEvent) -> None:
+            del event
+            on_picker_cancel()
 
     @bindings.add(*resolved_keys["open-editor"], eager=True)
     def open_external_editor(event: KeyPressEvent) -> None:
