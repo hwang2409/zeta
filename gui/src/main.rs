@@ -5,6 +5,7 @@ mod session_management;
 mod sidebar;
 #[cfg(feature = "smoke-test")]
 mod smoke;
+mod theme;
 
 use gpui::{
     div, prelude::*, px, App, Bounds, Context, Entity, Focusable, KeyDownEvent, Render, Task,
@@ -17,7 +18,7 @@ use gpui_kit::component::{
     input::{InputEvent, Textarea, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
     text::TextView,
-    ActiveTheme, Disableable, Icon, IconName, Root, Selectable, StyledExt, Theme, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, Root, Selectable, StyledExt, WindowExt,
 };
 use std::{
     borrow::Cow,
@@ -69,21 +70,9 @@ struct ZetaView {
     _poll_task: Option<Task<()>>,
 }
 
-fn sync_theme(window: &mut Window, cx: &mut App) {
-    Theme::sync_system_appearance(Some(window), cx);
-    let theme = Theme::global_mut(cx);
-    theme.font_family = "JetBrains Mono".into();
-    theme.mono_font_family = "JetBrains Mono".into();
-    theme.font_size = px(14.);
-    theme.mono_font_size = px(13.);
-    Theme::sync_base(cx);
-}
-
 impl ZetaView {
     fn new(window: &mut Window, cx: &mut Context<Self>, commands: Sender<CommandMessage>) -> Self {
-        sync_theme(window, cx);
-        cx.observe_window_appearance(window, |_, window, cx| sync_theme(window, cx))
-            .detach();
+        theme::apply(cx);
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("Message zeta")
@@ -1008,7 +997,7 @@ impl ZetaView {
             .debug_selector(|| "settings-overlay".into())
             .track_focus(&self.settings_focus)
             .occlude()
-            .bg(gpui::black().opacity(0.55))
+            .bg(cx.theme().overlay)
             .h_flex()
             .items_center()
             .justify_center()
@@ -1534,7 +1523,7 @@ impl Render for ZetaView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .font_family("JetBrains Mono")
-            .text_size(px(14.))
+            .text_size(theme::FONT_SIZE)
             .on_action(cx.listener(|view, _: &polish::NewSession, _, cx| view.new_session(cx)))
             .on_action(|_: &polish::About, window, cx| {
                 drop(window.prompt(

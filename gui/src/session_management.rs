@@ -105,7 +105,7 @@ impl ZetaView {
             .debug_selector(|| "session-edit".into())
             .track_focus(&self.session_edit_focus)
             .occlude()
-            .bg(gpui::black().opacity(0.55))
+            .bg(cx.theme().overlay)
             .h_flex()
             .items_center()
             .justify_center()

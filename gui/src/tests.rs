@@ -1,5 +1,6 @@
 use super::*;
 use gpui::{TestAppContext, VisualTestContext, WindowHandle};
+use gpui_kit::component::Theme;
 use serde_json::json;
 use std::sync::mpsc::Receiver;
 use zeta_gui::client::{ModelCatalog, ServerEvent, SessionMetadata, StatusResult, ToolCall};
