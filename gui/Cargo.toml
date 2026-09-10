@@ -19,6 +19,9 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = "deny"
 
+[profile.release]
+strip = "symbols"
+
 [features]
 default = ["gui"]
 gui = ["dep:gpui-kit", "dep:image"]
