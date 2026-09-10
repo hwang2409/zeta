@@ -57,6 +57,7 @@ from . import theme
 from .agent_card import AgentRunCommandMixin
 from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
+    ClipboardError,
     ComposerAttachmentMixin,
     FullScreenPromptSession,
     SlashCompleter,
@@ -64,6 +65,7 @@ from .composer import (
     TurnConsumerMixin,
     UndoCandidate,
     build_key_bindings,
+    copy_to_clipboard,
     status_formatted_text,
     vim_state_label,
 )
@@ -237,6 +239,7 @@ class TUIApp(
         self._active_session: PromptSession[str] | None = None
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
+        self._transcript.set_copy_handler(self._copy_selection)
         self._todo_widget = TodoWidget(self.loop.store)
         self._presenter = TranscriptPresenter(
             self._transcript,
@@ -565,6 +568,20 @@ class TUIApp(
         if self._approval_policy is not None:
             self._approval_policy.abort(request_id)
 
+    def _copy_selection(self, text: str) -> str:
+        """Put a finished mouse selection on both clipboards; describe the outcome."""
+
+        lines = text.count("\n") + 1
+        noun = "line" if lines == 1 else "lines"
+        # prompt-toolkit's own clipboard so vi `p` can paste into the composer
+        # even when no system clipboard tool exists.
+        get_app().clipboard.set_text(text)
+        try:
+            copy_to_clipboard(text)
+        except ClipboardError as exc:
+            return f"copy failed: {exc}"
+        return f"copied {lines} {noun}"
+
     def _answer_first_pending(self, verb: str) -> None:
         """Answer the request the y/n shortcuts point at, if it is still there."""
 
@@ -615,6 +632,7 @@ class TUIApp(
             ),
             transcript_match=self._transcript.search_status(),
             transcript_position=self._transcript.position_indicator(),
+            copy_notice=self._transcript.copy_notice,
         )
         fragments = status_formatted_text(status)
         return fragments

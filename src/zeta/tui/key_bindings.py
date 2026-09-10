@@ -170,18 +170,20 @@ SHIFT_ENTER_SEQUENCES = frozenset(
 
 # Mouse reporting modes prompt-toolkit turns on, cleared again by hand so a
 # hard exit cannot leave the shell swallowing clicks and selections.
-MOUSE_OFF = b"\x1b[?1000l\x1b[?1003l\x1b[?1015l\x1b[?1006l"
+MOUSE_OFF = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l"
 
 
 def _enable_wheel_reporting(output: Output) -> None:
-    """Report clicks and wheel ticks, but not every pointer move.
+    """Report clicks, drags, and wheel ticks, but not every pointer move.
 
     prompt-toolkit's own `enable_mouse_support` also turns on ?1003h, which
     streams an event for every step of pointer motion across the terminal.
-    The transcript only needs the wheel, so that traffic is pure overhead.
+    The transcript needs the wheel and, for text selection, motion while a
+    button is held (?1002h); the idle pointer stream is pure overhead.
     """
 
     output.write_raw("\x1b[?1000h")  # click and wheel reporting
+    output.write_raw("\x1b[?1002h")  # motion while a button is held (drag)
     output.write_raw("\x1b[?1015h")  # urxvt extended coordinates
     output.write_raw("\x1b[?1006h")  # SGR extended coordinates
 
