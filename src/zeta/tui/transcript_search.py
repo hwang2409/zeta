@@ -1,9 +1,11 @@
-"""Search and highlight helpers for the transcript widget."""
+"""Search, selection, and highlight helpers for the transcript widget."""
 
 from __future__ import annotations
 
 import re
 from bisect import bisect_right
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from io import StringIO
 
 from rich.console import Console
@@ -11,6 +13,89 @@ from rich.text import Text
 
 from . import theme
 from .theme import RICH_THEME
+
+Cell = tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class Selection:
+    """A mouse drag over transcript cells, ``anchor`` to ``extent`` inclusive.
+
+    Cells are ``(line, column)`` in transcript line coordinates. ``dragging``
+    stays true until the button is released; the highlight then persists
+    until the next click or the next transcript change.
+    """
+
+    anchor: Cell
+    extent: Cell
+    dragging: bool = True
+
+    @property
+    def start(self) -> Cell:
+        return min(self.anchor, self.extent)
+
+    @property
+    def end(self) -> Cell:
+        return max(self.anchor, self.extent)
+
+    @property
+    def is_click(self) -> bool:
+        return self.anchor == self.extent
+
+    def extend(self, cell: Cell) -> Selection:
+        return replace(self, extent=cell)
+
+    def released(self, cell: Cell) -> Selection:
+        return replace(self, extent=cell, dragging=False)
+
+    def line_span(self, line: int, length: int) -> tuple[int, int] | None:
+        """Return the selected ``[first, last)`` columns on ``line``, or None."""
+
+        (start_line, start_col), (end_line, end_col) = self.start, self.end
+        if line < start_line or line > end_line:
+            return None
+        first = start_col if line == start_line else 0
+        last = min(end_col + 1 if line == end_line else length, length)
+        if last <= first:
+            return None
+        return first, last
+
+    def text(self, line_text: Callable[[int], str | None]) -> str:
+        """Join the covered text line by line, trimming trailing spaces."""
+
+        parts: list[str] = []
+        for line in range(self.start[0], self.end[0] + 1):
+            plain = line_text(line)
+            if plain is None:
+                continue
+            span = self.line_span(line, len(plain))
+            parts.append(plain[span[0] : span[1]].rstrip() if span else "")
+        return "\n".join(parts).strip("\n")
+
+
+def highlight_fragments(
+    fragments: Sequence[tuple], span: tuple[int, int], style: str
+) -> list[tuple[str, str]]:
+    """Append ``style`` to the fragments covering ``[first, last)`` characters."""
+
+    first, last = span
+    result: list[tuple[str, str]] = []
+    position = 0
+    for fragment in fragments:
+        fragment_style, text = fragment[0], fragment[1]
+        end = position + len(text)
+        if end <= first or position >= last:
+            result.append((fragment_style, text))
+        else:
+            cut_start = max(first, position) - position
+            cut_end = min(last, end) - position
+            if cut_start:
+                result.append((fragment_style, text[:cut_start]))
+            result.append((f"{fragment_style} {style}".strip(), text[cut_start:cut_end]))
+            if cut_end < len(text):
+                result.append((fragment_style, text[cut_end:]))
+        position = end
+    return result
 
 
 class SearchMatch:

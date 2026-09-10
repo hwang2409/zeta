@@ -20,7 +20,6 @@ from ...mcp.prompt_commands import SlashModelInput
 from ...tools._user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import validate_model_name
-from . import transcript_export
 
 
 def _validate_model_name(provider: str, model: str) -> None:
@@ -267,33 +266,6 @@ class SlashHandlerMixin:
             return f"session name unchanged: {exc}"
         self._session_name = label
         return f"session name: {label}"
-
-    def slash_copy(self, args: str) -> str:
-        """Copy the visible chat as border-free plain text for pasting elsewhere."""
-
-        requested = args.strip().lower()
-        if requested not in {"", "last"}:
-            return "copy unchanged: use /copy or /copy last"
-        last_turn = requested == "last"
-        header = (
-            f"zeta · {self.provider} · {self.model} · "
-            f"session {self.loop.store.session_id[:8]}"
-        )
-        text = transcript_export.plain_transcript(
-            self._transcript.export_entries(), header=header, last_turn=last_turn
-        )
-        if not text:
-            return "copy: nothing to copy yet"
-        scope = "last turn" if last_turn else "chat"
-        lines = text.count("\n")
-        try:
-            tool = transcript_export.copy_to_clipboard(text)
-        except transcript_export.ClipboardError as exc:
-            path = transcript_export.write_transcript_file(
-                self.loop.store.session_dir, text
-            )
-            return f"copied {scope}: {lines} lines to {path} ({exc})"
-        return f"copied {scope}: {lines} lines to the clipboard via {tool}"
 
     def slash_theme(self, args: str) -> str:
         """Show, list, or switch the active TUI theme."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import OrderedDict
+from collections.abc import Callable
 from io import StringIO
 
 from prompt_toolkit.data_structures import Point
@@ -12,7 +13,7 @@ from prompt_toolkit.formatted_text.utils import split_lines
 from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.layout.dimension import AnyDimension, Dimension
-from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from rich.console import Console, RenderableType
 from rich.text import Text
 
@@ -23,10 +24,17 @@ from ..types import (
     ThinkingContent,
     ToolCall,
 )
+from . import theme
 from .agent_card import AgentCard
 from .render import render_tool_progress
 from .theme import RICH_THEME
-from .transcript_search import HighlightCache, SearchMatch, find_matches
+from .transcript_search import (
+    HighlightCache,
+    SearchMatch,
+    Selection,
+    find_matches,
+    highlight_fragments,
+)
 
 
 MAX_TOOL_TAIL_CHARS = 4_096
@@ -169,21 +177,14 @@ class TranscriptWidget(UIControl):
             tuple[int, int, str], list[SearchMatch]
         ] = OrderedDict()
         self._highlight_cache: tuple[tuple[int, int, str], HighlightCache] | None = None
+        self._selection: Selection | None = None
+        self._prefix_lines = 0
+        self._copy_handler: Callable[[str], str | None] | None = None
+        self.copy_notice: str | None = None
 
     @property
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
         return tuple(unit.value if unit is not None else None for unit in self._units)
-
-    def export_entries(
-        self,
-    ) -> tuple[tuple[RenderableType | None | _ToolUnit, bool], ...]:
-        """Pair each logical unit with whether it is a user message, for /copy."""
-
-        user_keys = {unit.key for unit in self._user_units}
-        return tuple(
-            (unit.value, unit.key in user_keys) if unit is not None else (None, False)
-            for unit in self._units
-        )
 
     @property
     def has_active_agent(self) -> bool:
@@ -205,6 +206,9 @@ class TranscriptWidget(UIControl):
         self._locations_cache.clear()
         self._search_cache.clear()
         self._highlight_cache = None
+        # Line indexes move when content changes, so a selection would drift.
+        self._selection = None
+        self.copy_notice = None
 
     def _append_unit(self, value: RenderableType | _ToolUnit | None) -> _TranscriptUnit:
         unit = _TranscriptUnit(self._next_key, value)
@@ -261,6 +265,8 @@ class TranscriptWidget(UIControl):
         self._user_units.clear()
         self._search_cache.clear()
         self._highlight_cache = None
+        self._selection = None
+        self.copy_notice = None
         self._scroll_offset = 0
         self._follow_tail = True
         self._bump_revision()
@@ -727,10 +733,24 @@ class TranscriptWidget(UIControl):
         self._line_locations = locations
         self._locations_revision = self._revision
         prefix_lines = max(0, self._viewport_height - len(lines))
+        self._prefix_lines = prefix_lines
         visible_lines = ([[] for _ in range(prefix_lines)] + lines)
         cursor_y = min(prefix_lines + self._scroll_offset, len(visible_lines) - 1)
+        selection = self._selection
+        selection_style = f"bg:{theme.active_palette().search_bg}"
+
+        def get_line(index: int) -> list[tuple[str, str]]:
+            line = visible_lines[index]
+            if selection is None:
+                return line
+            length = sum(len(fragment[1]) for fragment in line)
+            span = selection.line_span(index - prefix_lines, length)
+            if span is None:
+                return line
+            return highlight_fragments(line, span, selection_style)
+
         return UIContent(
-            get_line=lambda index: visible_lines[index],
+            get_line=get_line,
             line_count=len(visible_lines),
             cursor_position=Point(x=0, y=cursor_y),
             show_cursor=False,
@@ -740,14 +760,72 @@ class TranscriptWidget(UIControl):
         del window
         return self._scroll_offset
 
+    def set_copy_handler(self, handler: Callable[[str], str | None] | None) -> None:
+        """Receive the text of each finished drag; return a footer notice."""
+
+        self._copy_handler = handler
+
+    @property
+    def selection(self) -> Selection | None:
+        return self._selection
+
+    def clear_selection(self) -> None:
+        self._selection = None
+        self.copy_notice = None
+
+    def selection_text(self) -> str:
+        """Return the text under the current selection, empty when there is none."""
+
+        if self._selection is None:
+            return ""
+        lines = self._parsed_lines(self._content_width)
+
+        def line_text(index: int) -> str | None:
+            if index < 0 or index >= len(lines):
+                return None
+            return "".join(fragment[1] for fragment in lines[index])
+
+        return self._selection.text(line_text)
+
     def mouse_handler(self, mouse_event: MouseEvent):
-        if mouse_event.event_type is MouseEventType.SCROLL_UP:
+        """Scroll on the wheel; turn a left-button drag into a copied selection.
+
+        The terminal reports drags because the session turns on button-event
+        tracking; positions arrive in content coordinates, so the blank rows
+        padded above a short transcript are subtracted before mapping to lines.
+        """
+
+        event_type = mouse_event.event_type
+        if event_type is MouseEventType.SCROLL_UP:
             self.scroll_up()
-        elif mouse_event.event_type is MouseEventType.SCROLL_DOWN:
+            return None
+        if event_type is MouseEventType.SCROLL_DOWN:
             self.scroll_down()
-        else:
+            return None
+        cell = (mouse_event.position.y - self._prefix_lines, mouse_event.position.x)
+        if event_type is MouseEventType.MOUSE_DOWN:
+            if mouse_event.button is not MouseButton.LEFT:
+                return NotImplemented
+            self._selection = Selection(cell, cell)
+            self.copy_notice = None
+            return None
+        selection = self._selection
+        if selection is None or not selection.dragging:
             return NotImplemented
-        return None
+        if event_type is MouseEventType.MOUSE_MOVE:
+            self._selection = selection.extend(cell)
+            return None
+        if event_type is MouseEventType.MOUSE_UP:
+            released = selection.released(cell)
+            if released.is_click:
+                self._selection = None
+                return None
+            self._selection = released
+            text = self.selection_text()
+            if text and self._copy_handler is not None:
+                self.copy_notice = self._copy_handler(text)
+            return None
+        return NotImplemented
 
     def window(self, *, height: AnyDimension | None = None) -> Window:
         return Window(

@@ -35,16 +35,16 @@ references to one resolved path produce one attachment block.
 - `ctrl+x ctrl+o` expands or collapses the newest child card.
 - `ctrl+o` keeps its native prompt-toolkit behavior in the composer.
 
-## copying the chat
+## selecting and copying text
 
-The transcript sits on the alternate screen with mouse reporting on, so a
-plain drag-select scrolls instead of selecting, and a modifier-drag grabs card
-borders and margins. `/copy` puts the whole chat on the system clipboard as
-border-free plain text: user lines are quoted with `> `, assistant markdown is
-kept as source, and provider errors appear untruncated. `/copy last` copies
-only the newest user message and everything after it. Without a clipboard
-tool (`pbcopy`, `wl-copy`, `xclip`, or `xsel`) the text is written to
-`transcript-<stamp>.txt` in the session directory and the path is shown.
+The transcript lives on the alternate screen with mouse reporting on, so the
+terminal never sees a drag as a selection. Drag over the transcript instead:
+the covered text highlights as you go, and releasing the button copies it to
+the system clipboard (`pbcopy`, `wl-copy`, `xclip`, or `xsel`) and to the
+composer's own clipboard. The status bar reports `copied N lines`. A plain
+click clears the highlight, the wheel still scrolls, and any transcript
+change drops the selection so highlights never drift. Provider errors now
+wrap their full reason instead of cutting it off at the card edge.
 
 ## exec macro example
 
