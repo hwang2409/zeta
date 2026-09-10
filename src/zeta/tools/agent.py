@@ -7,6 +7,7 @@ import json
 import os
 import time
 from collections.abc import Mapping
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from ..core.checkpoints import (
     ConversationIntegrityError,
     load_session_json,
 )
+from ..core.session_files import child_directory, read_session_file
 from ..core.store import ConversationStore
 from ..model_catalog import known_model_names
 from ..types import (
@@ -269,8 +271,8 @@ def _canonical_child_path(session_dir: Path, value: object) -> Path | None:
     if type(value) is not str or not value:
         return None
     try:
-        session_root = session_dir.resolve()
-        child_path = Path(value).resolve()
+        session_root = session_dir.absolute()
+        child_path = Path(value).absolute()
         relative = child_path.relative_to(session_root)
     except (OSError, RuntimeError, ValueError):
         return None
@@ -420,6 +422,14 @@ def _agent_output_page(
     return result if len(encode_json(result)) <= max_bytes else None
 
 
+def _read_child_file(store: ConversationStore, child_path: Path, name: str) -> bytes:
+    with ExitStack() as cleanup:
+        directory_fd = store.directory_fd
+        for component in child_path.relative_to(store.session_dir.absolute()).parts:
+            directory_fd = cleanup.enter_context(child_directory(directory_fd, component))
+        return read_session_file(directory_fd, name)
+
+
 def _read_agent_output(
     store: object,
     *,
@@ -433,9 +443,7 @@ def _read_agent_output(
     if child_path is None:
         raise ValueError("unknown child handle")
     try:
-        if not child_path.is_dir() or not (child_path / "conversation.jsonl").is_file():
-            raise OSError("child transcript is missing")
-        raw = (child_path / "conversation.jsonl").read_bytes()
+        raw = _read_child_file(store, child_path, "conversation.jsonl")
         rows = raw.splitlines(keepends=True)
         entries: list[ConversationEntry] = []
         for index, line in enumerate(rows):
@@ -511,8 +519,8 @@ def _read_agent_status(
             continue
         lifecycle_path = child_path / "agent_lifecycle.json"
         try:
-            lifecycle = load_session_json(lifecycle_path)
-        except ConversationIntegrityError as exc:
+            lifecycle = load_session_json(_read_child_file(store, child_path, "agent_lifecycle.json"))
+        except (OSError, ValueError) as exc:
             raise ValueError(f"could not read child state: {lifecycle_path}") from exc
         if type(lifecycle) is not dict:
             continue

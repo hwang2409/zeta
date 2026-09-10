@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import codecs
-import json
 import os
 import signal
 import uuid
+import weakref
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
-from ..core.checkpoints import ConversationIntegrityError, load_session_json
+from ..core.checkpoints import load_session_json
 from ..core.process_env import subprocess_env
+from ..core.session_files import (
+    open_session_file,
+    read_session_file,
+    session_root,
+    write_session_json,
+)
 
 
 def tool_subprocess_env() -> dict[str, str]:
@@ -42,7 +49,6 @@ class _BackgroundRecord:
     exit_code: int | None = None
     note: str | None = None
     monitor: asyncio.Task[None] | None = None
-    log_path: Path | None = None
 
 
 class BackgroundTaskRegistry:
@@ -52,6 +58,7 @@ class BackgroundTaskRegistry:
         self,
         *,
         session_dir: str | Path | None = None,
+        directory_fd: int | None = None,
         max_tasks: int = BACKGROUND_TASK_LIMIT,
         output_limit: int = BACKGROUND_OUTPUT_LIMIT,
         call_limit: int = BACKGROUND_OUTPUT_CALL_LIMIT,
@@ -72,14 +79,13 @@ class BackgroundTaskRegistry:
         self.term_grace = term_grace
         self._notice_sink = notice_sink
         self._records: dict[str, _BackgroundRecord] = {}
-        self._session_dir = Path(session_dir) if session_dir is not None else None
-        self._state_path = (
-            self._session_dir / "background_tasks.json"
-            if self._session_dir is not None
-            else None
-        )
+        self._session_dir: Path | None = None
+        self._directory_fd: int | None = None
         self._closed = False
-        self._load_previous()
+        if session_dir is not None:
+            if directory_fd is None:
+                raise ValueError("session directory descriptor is required")
+            self.bind_session_dir(session_dir, directory_fd)
 
     @property
     def running_count(self) -> int:
@@ -92,14 +98,39 @@ class BackgroundTaskRegistry:
     def set_notice_sink(self, sink: Callable[[str], None] | None) -> None:
         self._notice_sink = sink
 
-    def bind_session_dir(self, session_dir: str | Path) -> None:
-        if self._session_dir is not None:
-            if self._session_dir != Path(session_dir):
+    def bind_session_dir(self, session_dir: str | Path, directory_fd: int) -> None:
+        if self._closed:
+            raise RuntimeError("background task registry is closed")
+        if self._directory_fd is not None:
+            if not os.path.samestat(os.fstat(self._directory_fd), os.fstat(directory_fd)):
                 raise ValueError("background task registry is already bound")
             return
         self._session_dir = Path(session_dir)
-        self._state_path = self._session_dir / "background_tasks.json"
-        self._load_previous()
+        self._directory_fd = os.dup(directory_fd)
+        self._release_directory = weakref.finalize(self, os.close, self._directory_fd)
+        try:
+            self._load_previous()
+        except BaseException:
+            self._release_directory()
+            self._directory_fd = None
+            raise
+
+    def open_log(self, path: str | Path) -> IO[bytes]:
+        if self._closed:
+            raise RuntimeError("background task registry is closed")
+        path = Path(path)
+        if self._directory_fd is not None and path.parent != self._session_dir:
+            raise ValueError("log must belong to the bound session")
+        directory = (
+            nullcontext(self._directory_fd)
+            if self._directory_fd is not None
+            else session_root(path.parent, create=True)
+        )
+        with directory as directory_fd:
+            fd = open_session_file(
+                directory_fd, path.name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            )
+        return os.fdopen(fd, "wb")
 
     async def start(
         self,
@@ -112,17 +143,24 @@ class BackgroundTaskRegistry:
             raise RuntimeError("background task registry is closed")
         if self.running_count >= self.max_tasks:
             raise ValueError(f"background task limit reached ({self.max_tasks})")
-        try:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                cwd=cwd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,
-                env=tool_subprocess_env(),
+        with ExitStack() as cleanup:
+            log_handle = (
+                cleanup.enter_context(self.open_log(log_path))
+                if log_path is not None else None
             )
-        except OSError as exc:
-            raise ValueError(f"could not execute command: {exc}") from exc
+            try:
+                process = await asyncio.create_subprocess_shell(
+                    command,
+                    cwd=cwd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    start_new_session=True,
+                    env=tool_subprocess_env(),
+                )
+            except OSError as exc:
+                raise ValueError(f"could not execute command: {exc}") from exc
+            # The monitor owns the log after the process starts.
+            cleanup.pop_all()
         task_id = f"task-{uuid.uuid4().hex[:12]}"
         record = _BackgroundRecord(
             task_id=task_id,
@@ -130,10 +168,9 @@ class BackgroundTaskRegistry:
             pid=process.pid,
             process=process,
             output=bytearray(),
-            log_path=Path(log_path) if log_path is not None else None,
         )
         self._records[task_id] = record
-        record.monitor = asyncio.create_task(self._monitor(record))
+        record.monitor = asyncio.create_task(self._monitor(record, log_handle))
         self._notice(f"background task {task_id} started: {_command_headline(command)}")
         self._persist()
         return task_id, process.pid
@@ -198,23 +235,24 @@ class BackgroundTaskRegistry:
             return ()
         self._closed = True
         killed: list[str] = []
-        for record in tuple(self._records.values()):
-            if record.running and record.process is not None:
-                killed.append(record.task_id)
-                await self._terminate(record, reason="task killed on session exit")
-        self._persist()
-        if killed:
-            self._notice("background tasks killed on session exit: " + ", ".join(killed))
-        return tuple(killed)
+        try:
+            for record in tuple(self._records.values()):
+                if record.running and record.process is not None:
+                    killed.append(record.task_id)
+                    await self._terminate(record, reason="task killed on session exit")
+            self._persist()
+            if killed:
+                self._notice("background tasks killed on session exit: " + ", ".join(killed))
+            return tuple(killed)
+        finally:
+            if self._directory_fd is not None:
+                self._release_directory()
+                self._directory_fd = None
 
-    async def _monitor(self, record: _BackgroundRecord) -> None:
+    async def _monitor(self, record: _BackgroundRecord, log_handle: Any | None = None) -> None:
         process = record.process
         if process is None or process.stdout is None:
             return
-        log_handle = None
-        if record.log_path is not None:
-            record.log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_handle = await asyncio.to_thread(record.log_path.open, "wb")
         reader = asyncio.create_task(
             self._read_output(record, process.stdout, log_handle)
         )
@@ -317,11 +355,11 @@ class BackgroundTaskRegistry:
             self._notice_sink(message)
 
     def _load_previous(self) -> None:
-        if self._state_path is None or not self._state_path.exists():
+        if self._directory_fd is None:
             return
         try:
-            rows = load_session_json(self._state_path)
-        except ConversationIntegrityError:
+            rows = load_session_json(read_session_file(self._directory_fd, "background_tasks.json"))
+        except (OSError, ValueError):
             return
         if type(rows) is not list:
             return
@@ -347,12 +385,8 @@ class BackgroundTaskRegistry:
             )
 
     def _persist(self) -> None:
-        if self._state_path is None:
+        if self._directory_fd is None:
             return
-        session_dir = self._session_dir
-        if session_dir is None:
-            return
-        session_dir.mkdir(parents=True, exist_ok=True)
         rows = [
             {
                 "task_id": record.task_id,
@@ -363,12 +397,7 @@ class BackgroundTaskRegistry:
             }
             for record in self._records.values()
         ]
-        temporary = self._state_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(rows, separators=(",", ":")) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary, self._state_path)
+        write_session_json(self._directory_fd, "background_tasks.json", rows)
 
 
 def _command_headline(command: str, limit: int = 80) -> str:

@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import platform
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Iterator, Mapping
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -27,7 +30,14 @@ from rich.text import Text
 from ..core.abort import AbortSignal
 from ..core.approval import ApprovalRequest
 from ..core.process_env import subprocess_env
+from ..core.session_files import (
+    child_directory,
+    open_session_file,
+    session_root,
+    write_session_file,
+)
 from ..core.slash import SlashCommandRegistry
+from ..core.store import ConversationStore
 from ..types import (
     ErrorInfo,
     ImageContent,
@@ -263,7 +273,7 @@ class UndoCandidate:
     ) -> UndoCandidate:
         paths = tuple(
             dict.fromkeys(
-                Path(block.path).resolve()
+                _attachment_path(Path(block.path))
                 for block in message.content
                 if isinstance(block, (TextContent, ImageContent))
                 and block.path is not None
@@ -271,9 +281,9 @@ class UndoCandidate:
         )
         path_set = set(paths)
         tokens = tuple(
-            (token, path.resolve())
+            (token, _attachment_path(path))
             for token, path in attachment_tokens.items()
-            if path.resolve() in path_set
+            if _attachment_path(path) in path_set
         )
         return cls(text, paths, tokens, next_image_token, submission_id)
 
@@ -305,7 +315,7 @@ def attachment_refs(value: str, base_dir: str | Path) -> tuple[AttachmentRef, ..
         path = Path(raw_path).expanduser()
         if not path.is_absolute():
             path = base / path
-        refs.append(AttachmentRef(match.group(0), path.resolve()))
+        refs.append(AttachmentRef(match.group(0), _attachment_path(path)))
     return tuple(refs)
 
 
@@ -328,36 +338,53 @@ def _image_media_type(data: bytes) -> str | None:
     return None
 
 
-def _read_attachment(path: Path) -> TextContent | ImageContent:
-    if not path.exists():
-        raise AttachmentError(f"file does not exist: {path}")
-    if not path.is_file():
-        raise AttachmentError(f"directory attachments are not supported: {path}")
+def _attachment_path(path: Path) -> Path:
+    # Preserve session components so link validation happens at descriptor opens.
+    return path.absolute() if "sessions" in path.parts else path.resolve()
+
+
+def _read_attachment(path: Path, session_store: ConversationStore | None = None) -> TextContent | ImageContent:
     try:
-        size = path.stat().st_size
-        with path.open("rb") as handle:
+        with ExitStack() as cleanup:
+            if session_store is not None and path.is_relative_to(session_store.session_dir):
+                directory_fd = session_store.directory_fd
+                for component in path.parent.relative_to(session_store.session_dir).parts:
+                    directory_fd = cleanup.enter_context(child_directory(directory_fd, component))
+                handle = cleanup.enter_context(os.fdopen(open_session_file(directory_fd, path.name, os.O_RDONLY), "rb"))
+            elif "sessions" in path.parts:
+                directory_fd = cleanup.enter_context(session_root(path.parent))
+                handle = cleanup.enter_context(os.fdopen(open_session_file(directory_fd, path.name, os.O_RDONLY), "rb"))
+            else:
+                if not path.exists():
+                    raise AttachmentError(f"file does not exist: {path}")
+                if not path.is_file():
+                    raise AttachmentError(f"directory attachments are not supported: {path}")
+                handle = cleanup.enter_context(path.open("rb"))
+            size = os.fstat(handle.fileno()).st_size
             prefix = handle.read(64)
-    except OSError as exc:
+            if _image_media_type(prefix) is None and size > ATTACHMENT_MAX_TEXT_BYTES:
+                raise AttachmentError(
+                    f"text file is {size} bytes; limit is {ATTACHMENT_MAX_TEXT_BYTES} bytes: {path}"
+                )
+            data = prefix + handle.read()
+    except FileNotFoundError as exc:
+        raise AttachmentError(f"file does not exist: {path}") from exc
+    except IsADirectoryError as exc:
+        raise AttachmentError(f"directory attachments are not supported: {path}") from exc
+    except AttachmentError:
+        raise
+    except (OSError, ValueError) as exc:
         raise AttachmentError(f"cannot read {path}: {exc}") from exc
     media_type = _image_media_type(prefix)
-    try:
-        if media_type is not None:
-            data = path.read_bytes()
-            if not image_signature_matches(media_type, data):
-                raise AttachmentError(f"binary file is not an image: {path}")
-            return ImageContent(
-                base64.b64encode(data).decode("ascii"),
-                media_type,
-                str(path),
-                size,
-            )
-        if size > ATTACHMENT_MAX_TEXT_BYTES:
-            raise AttachmentError(
-                f"text file is {size} bytes; limit is {ATTACHMENT_MAX_TEXT_BYTES} bytes: {path}"
-            )
-        data = path.read_bytes()
-    except OSError as exc:
-        raise AttachmentError(f"cannot read {path}: {exc}") from exc
+    if media_type is not None:
+        if not image_signature_matches(media_type, data):
+            raise AttachmentError(f"binary file is not an image: {path}")
+        return ImageContent(
+            base64.b64encode(data).decode("ascii"),
+            media_type,
+            str(path),
+            size,
+        )
     if b"\x00" in data:
         raise AttachmentError(f"binary file is not an image: {path}")
     try:
@@ -374,6 +401,7 @@ def build_user_message(
     pending_paths: tuple[Path, ...] = (),
     *,
     attachment_value: str | None = None,
+    session_store: ConversationStore | None = None,
 ) -> Message:
     """Resolve references into one message, deduplicating resolved paths."""
 
@@ -383,30 +411,31 @@ def build_user_message(
         if ref.path not in paths:
             paths.append(ref.path)
     for path in pending_paths:
-        resolved = path.resolve()
+        resolved = _attachment_path(path)
         if resolved not in paths:
             paths.append(resolved)
     blocks = [TextContent(value)]
-    blocks.extend(_read_attachment(path) for path in paths)
+    blocks.extend(_read_attachment(path, session_store) for path in paths)
     return Message(MessageRole.USER, blocks)
 
 
-def paste_image(session_dir: str | Path) -> Path:
+def paste_image(session_dir: str | Path, *, directory_fd: int | None = None) -> Path:
     """Save a macOS clipboard image in the session directory."""
 
     if platform.system() != "Darwin":
         raise AttachmentError("image paste is only available on macOS")
-    destination = Path(session_dir) / f"clipboard-{uuid4().hex}.png"
-    pngpaste = shutil.which("pngpaste")
-    if pngpaste is not None:
-        result = subprocess.run(
-            [pngpaste, str(destination)],
-            capture_output=True,
-            check=False,
-            env=subprocess_env(),
-        )
-    else:
-        script = """
+    with tempfile.TemporaryDirectory(prefix="zeta-clipboard-") as temporary:
+        destination = Path(temporary) / "clipboard.png"
+        pngpaste = shutil.which("pngpaste")
+        if pngpaste is not None:
+            result = subprocess.run(
+                [pngpaste, str(destination)],
+                capture_output=True,
+                check=False,
+                env=subprocess_env(),
+            )
+        else:
+            script = """
 use framework "AppKit"
 on run argv
     set destination to item 1 of argv
@@ -416,22 +445,28 @@ on run argv
     return "ok"
 end run
 """
-        result = subprocess.run(
-            ["osascript", "-e", script, str(destination)],
-            capture_output=True,
-            check=False,
-            env=subprocess_env(),
-        )
-    if result.returncode != 0 or not destination.is_file():
-        destination.unlink(missing_ok=True)
-        raise AttachmentError("clipboard does not contain an image")
-    try:
-        if not destination.read_bytes():
+            result = subprocess.run(
+                ["osascript", "-e", script, str(destination)],
+                capture_output=True,
+                check=False,
+                env=subprocess_env(),
+            )
+        if result.returncode != 0 or not destination.is_file():
             raise AttachmentError("clipboard does not contain an image")
-    except OSError as exc:
-        destination.unlink(missing_ok=True)
-        raise AttachmentError(f"cannot read clipboard image: {exc}") from exc
-    return destination
+        try:
+            data = destination.read_bytes()
+        except OSError as exc:
+            raise AttachmentError(f"cannot read clipboard image: {exc}") from exc
+        if not data:
+            raise AttachmentError("clipboard does not contain an image")
+    name = f"clipboard-{uuid4().hex}.png"
+    directory = nullcontext(directory_fd) if directory_fd is not None else session_root(Path(session_dir))
+    try:
+        with directory as pinned_fd:
+            write_session_file(pinned_fd, name, data)
+    except (OSError, ValueError) as exc:
+        raise AttachmentError(f"cannot save clipboard image: {exc}") from exc
+    return Path(session_dir) / name
 
 
 class ComposerAttachmentMixin:
@@ -460,7 +495,7 @@ class ComposerAttachmentMixin:
 
     def _restore_draft_state(self, draft: Any) -> None:
         self._pending_attachment_tokens = {
-            token: path.resolve() for token, path in draft.attachment_tokens
+            token: _attachment_path(path) for token, path in draft.attachment_tokens
         }
         self._pending_attachments[:] = list(
             dict.fromkeys(self._pending_attachment_tokens.values())
@@ -515,9 +550,9 @@ class ComposerAttachmentMixin:
         if args.strip():
             return "paste unavailable: /paste does not take arguments"
         try:
-            path = paste_image(self.loop.store.session_dir)
+            path = paste_image(self.loop.store.session_dir, directory_fd=self.loop.store.directory_fd)
             attachment = build_user_message(
-                "paste", self.loop.store.cwd, (path,)
+                "paste", self.loop.store.cwd, (path,), session_store=self.loop.store
             ).content[1]
         except AttachmentError as exc:
             return f"paste unavailable: {exc}"
@@ -535,7 +570,10 @@ class ComposerAttachmentMixin:
             and path.name.startswith("clipboard-")
             and path.suffix == ".png"
         ):
-            path.unlink(missing_ok=True)
+            try:
+                os.unlink(path.name, dir_fd=self.loop.store.directory_fd)
+            except FileNotFoundError:
+                pass
 
     def _pending_paths_for(
         self,
@@ -598,6 +636,7 @@ class ComposerAttachmentMixin:
                 value,
                 self.loop.store.cwd,
                 attachment_value=source,
+                session_store=self.loop.store,
             )
         except AttachmentError as exc:
             self._print_system(f"attachment rejected: {exc}")
@@ -615,6 +654,7 @@ class ComposerAttachmentMixin:
                     self.loop.store.cwd,
                     (path,),
                     attachment_value=source,
+                    session_store=self.loop.store,
                 )
             except AttachmentError as exc:
                 self._print_system(f"pending attachment dropped: {exc}")
@@ -633,6 +673,7 @@ class ComposerAttachmentMixin:
             self.loop.store.cwd,
             tuple(valid_pending),
             attachment_value=source,
+            session_store=self.loop.store,
         )
 
     def _clear_pending_attachments(self) -> None:

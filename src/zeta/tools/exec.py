@@ -217,7 +217,7 @@ async def _exec(
             },
         )
     log_handle = (
-        await asyncio.to_thread(Path(log_path).open, "wb")
+        registry.background_tasks.open_log(log_path)
         if log_path is not None
         else None
     )
@@ -366,7 +366,6 @@ async def run_exec_macro(
 ) -> ToolResult:
     """Run an approved macro without persisting tool conversation entries."""
 
-    Path(log_path).touch()
     scope_signal = abort_signal or registry.abort_signal.registry.new_generation()
     try:
         raw_result = await registry.execute(

@@ -241,7 +241,10 @@ class ServerRuntime:
         try:
             await state.loop.close()
         finally:
-            state.opened.store.close()
+            try:
+                await state.loop.tool_registry.background_tasks.close()
+            finally:
+                state.opened.store.close()
 
     async def close(self) -> None:
         state, self._state = self._state, None
