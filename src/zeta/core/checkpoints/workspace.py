@@ -18,23 +18,34 @@ partial state and the pre-restore blobs recoverable from shadow refs.
 
 from __future__ import annotations
 
-import json
+import fcntl
 import os
 import shutil
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Iterable
+import weakref
+from collections.abc import Callable, Iterable
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from ..process_env import subprocess_env
+from ..session_files import (
+    child_directory,
+    copy_session_tree,
+    open_session_file,
+    read_session_file,
+    session_directory,
+    session_root,
+    write_session_file,
+    write_session_json,
+)
 from . import ConversationIntegrityError, load_session_json
 
 SNAPSHOT_STATE_FILE = "workspace_snapshots.json"
-SNAPSHOT_STATE_TMP_PREFIX = ".workspace_snapshots."
 SNAPSHOT_REF_NAMESPACE = "refs/zeta/checkpoints"
 SNAPSHOT_SAFETY_REF_NAMESPACE = "refs/zeta/safety"
 SHADOW_REPO_DIRNAME = "workspace_shadow.git"
@@ -135,17 +146,15 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _shadow_dir(session_dir: Path) -> Path:
-    return session_dir / SHADOW_REPO_DIRNAME
+def _shadow_dir(scratch_dir: Path) -> Path:
+    return scratch_dir / SHADOW_REPO_DIRNAME
 
 
-def _ensure_shadow_repo(session_dir: Path) -> Path:
+def _ensure_shadow_repo(scratch_dir: Path) -> Path:
     """Initialise the per-session bare repo that pins shadow objects and refs."""
 
-    shadow = _shadow_dir(session_dir)
+    shadow = _shadow_dir(scratch_dir)
     if not (shadow / "HEAD").exists():
-        session_dir.mkdir(parents=True, exist_ok=True)
-        shadow.parent.mkdir(parents=True, exist_ok=True)
         try:
             subprocess.run(
                 ["git", "init", "--bare", "--quiet", str(shadow)],
@@ -164,33 +173,32 @@ def _ensure_shadow_repo(session_dir: Path) -> Path:
     return shadow
 
 
-def _shadow_env(session_dir: Path, repo_root: str | Path) -> dict[str, str]:
+def _shadow_env(scratch_dir: Path, repo_root: str | Path) -> dict[str, str]:
     """Env that routes objects, refs, and work-tree lookups to the shadow repo."""
 
-    shadow = _ensure_shadow_repo(session_dir)
+    shadow = _ensure_shadow_repo(scratch_dir)
     return {
         "GIT_DIR": str(shadow),
         "GIT_WORK_TREE": str(repo_root),
     }
 
 
-def _shadow_ref_env(session_dir: Path) -> dict[str, str]:
+def _shadow_ref_env(scratch_dir: Path) -> dict[str, str]:
     """Env for ref-only operations against the shadow bare repo."""
 
-    shadow = _ensure_shadow_repo(session_dir)
+    shadow = _ensure_shadow_repo(scratch_dir)
     return {"GIT_DIR": str(shadow)}
 
 
-def _reserve_shadow_index_path(session_dir: Path) -> Path:
+def _reserve_shadow_index_path(scratch_dir: Path) -> Path:
     """Reserve a unique path for a shadow git index, without creating the file.
 
     git refuses an empty index file, so we create-and-delete atomically to
     hold a name in the session dir without leaving a zero-byte index behind.
     """
 
-    session_dir.mkdir(parents=True, exist_ok=True)
     handle, name = tempfile.mkstemp(
-        dir=str(session_dir), prefix=".shadow-index.", suffix=".idx"
+        dir=str(scratch_dir), prefix=".shadow-index.", suffix=".idx"
     )
     os.close(handle)
     path = Path(name)
@@ -266,11 +274,11 @@ def _tracked_and_untracked(repo_root: str) -> list[str]:
     return [entry for entry in result.stdout.split("\x00") if entry]
 
 
-def _tree_files(session_dir: Path, repo_root: str, tree_sha: str) -> list[str]:
+def _tree_files(scratch_dir: Path, repo_root: str, tree_sha: str) -> list[str]:
     result = _run_git(
         ["ls-tree", "-r", "--name-only", "-z", tree_sha],
         cwd=repo_root,
-        env=_shadow_ref_env(session_dir),
+        env=_shadow_ref_env(scratch_dir),
     )
     if not result.stdout:
         return []
@@ -278,7 +286,7 @@ def _tree_files(session_dir: Path, repo_root: str, tree_sha: str) -> list[str]:
 
 
 def _write_shadow_commit(
-    session_dir: Path,
+    scratch_dir: Path,
     repo_root: str,
     label: str,
 ) -> tuple[str, str, int, int]:
@@ -289,7 +297,7 @@ def _write_shadow_commit(
     the shadow repo's own gc will not reap it.
     """
 
-    _ensure_shadow_repo(session_dir)
+    _ensure_shadow_repo(scratch_dir)
     entries = _tracked_and_untracked(repo_root)
     total_size = 0
     for entry in entries:
@@ -300,22 +308,22 @@ def _write_shadow_commit(
             continue
 
     commit_sha, tree_sha = _write_current_shadow_commit(
-        session_dir, repo_root, message=f"zeta shadow checkpoint: {label}"
+        scratch_dir, repo_root, message=f"zeta shadow checkpoint: {label}"
     )
     return commit_sha, tree_sha, total_size, len(entries)
 
 
 def _write_current_shadow_commit(
-    session_dir: Path,
+    scratch_dir: Path,
     repo_root: str,
     *,
     message: str,
 ) -> tuple[str, str]:
     """Snapshot the working tree into a shadow commit; return (commit, tree)."""
 
-    index_path = _reserve_shadow_index_path(session_dir)
+    index_path = _reserve_shadow_index_path(scratch_dir)
     try:
-        env = {**_shadow_env(session_dir, repo_root), "GIT_INDEX_FILE": str(index_path)}
+        env = {**_shadow_env(scratch_dir, repo_root), "GIT_INDEX_FILE": str(index_path)}
         _run_git(["add", "--all"], cwd=repo_root, env=env)
         tree_result = _run_git(["write-tree"], cwd=repo_root, env=env)
         tree_sha = tree_result.stdout.strip()
@@ -332,33 +340,34 @@ def _write_current_shadow_commit(
     return commit_sha, tree_sha
 
 
-def _update_shadow_ref(session_dir: Path, ref: str, commit_sha: str) -> None:
+def _update_shadow_ref(scratch_dir: Path, ref: str, commit_sha: str) -> None:
     _run_git(
         ["update-ref", ref, commit_sha],
-        cwd=session_dir,
-        env=_shadow_ref_env(session_dir),
+        cwd=scratch_dir,
+        env=_shadow_ref_env(scratch_dir),
     )
 
 
-def _delete_shadow_ref(session_dir: Path, ref: str) -> None:
+def _delete_shadow_ref(scratch_dir: Path, ref: str) -> None:
     _run_git(
         ["update-ref", "-d", ref],
-        cwd=session_dir,
-        env=_shadow_ref_env(session_dir),
+        cwd=scratch_dir,
+        env=_shadow_ref_env(scratch_dir),
         check=False,
     )
 
 
-def _pin_ref(session_dir: Path, snapshot_id: str, commit_sha: str) -> None:
+def _pin_ref(scratch_dir: Path, snapshot_id: str, commit_sha: str) -> None:
     _update_shadow_ref(
-        session_dir, f"{SNAPSHOT_REF_NAMESPACE}/{snapshot_id}", commit_sha
+        scratch_dir, f"{SNAPSHOT_REF_NAMESPACE}/{snapshot_id}", commit_sha
     )
 
 
 def _restore_from_tree(
-    session_dir: Path,
+    scratch_dir: Path,
     repo_root: str,
     tree_sha: str,
+    persist_safety: Callable[[], None],
 ) -> None:
     """Restore the working tree to ``tree_sha`` without losing pre-restore blobs.
 
@@ -371,23 +380,24 @@ def _restore_from_tree(
 
     safety_ref = f"{SNAPSHOT_SAFETY_REF_NAMESPACE}/{uuid.uuid4().hex}"
     safety_commit, _safety_tree = _write_current_shadow_commit(
-        session_dir, repo_root, message="zeta pre-restore safety"
+        scratch_dir, repo_root, message="zeta pre-restore safety"
     )
-    _update_shadow_ref(session_dir, safety_ref, safety_commit)
+    _update_shadow_ref(scratch_dir, safety_ref, safety_commit)
+    persist_safety()
     committed = False
     try:
-        _materialise_tree(session_dir, repo_root, tree_sha)
-        _prune_stale_entries(session_dir, repo_root, tree_sha)
+        _materialise_tree(scratch_dir, repo_root, tree_sha)
+        _prune_stale_entries(scratch_dir, repo_root, tree_sha)
         committed = True
     finally:
         if committed:
-            _delete_shadow_ref(session_dir, safety_ref)
+            _delete_shadow_ref(scratch_dir, safety_ref)
 
 
-def _materialise_tree(session_dir: Path, repo_root: str, tree_sha: str) -> None:
-    index_path = _reserve_shadow_index_path(session_dir)
+def _materialise_tree(scratch_dir: Path, repo_root: str, tree_sha: str) -> None:
+    index_path = _reserve_shadow_index_path(scratch_dir)
     try:
-        env = {**_shadow_env(session_dir, repo_root), "GIT_INDEX_FILE": str(index_path)}
+        env = {**_shadow_env(scratch_dir, repo_root), "GIT_INDEX_FILE": str(index_path)}
         _run_git(["read-tree", tree_sha], cwd=repo_root, env=env)
         _run_git(
             ["checkout-index", "--all", "--force", f"--prefix={repo_root}/"],
@@ -398,9 +408,9 @@ def _materialise_tree(session_dir: Path, repo_root: str, tree_sha: str) -> None:
         index_path.unlink(missing_ok=True)
 
 
-def _prune_stale_entries(session_dir: Path, repo_root: str, tree_sha: str) -> None:
+def _prune_stale_entries(scratch_dir: Path, repo_root: str, tree_sha: str) -> None:
     current_entries = set(_tracked_and_untracked(repo_root))
-    target_entries = set(_tree_files(session_dir, repo_root, tree_sha))
+    target_entries = set(_tree_files(scratch_dir, repo_root, tree_sha))
     stale = current_entries - target_entries
     for entry in stale:
         target = Path(repo_root) / entry
@@ -426,10 +436,10 @@ def _prune_empty_parents(repo_root: Path, entries: Iterable[str]) -> None:
             parent = parent.parent
 
 
-def _current_tree_sha(session_dir: Path, repo_root: str) -> str:
-    index_path = _reserve_shadow_index_path(session_dir)
+def _current_tree_sha(scratch_dir: Path, repo_root: str) -> str:
+    index_path = _reserve_shadow_index_path(scratch_dir)
     try:
-        env = {**_shadow_env(session_dir, repo_root), "GIT_INDEX_FILE": str(index_path)}
+        env = {**_shadow_env(scratch_dir, repo_root), "GIT_INDEX_FILE": str(index_path)}
         _run_git(["add", "--all"], cwd=repo_root, env=env)
         tree_result = _run_git(["write-tree"], cwd=repo_root, env=env)
     finally:
@@ -457,13 +467,20 @@ class WorkspaceSnapshotStore:
         self._snapshots: list[WorkspaceSnapshot] = []
         self._current_id: str | None = None
         self._is_corrupt = False
-        self._load()
+        with session_root(self.session_dir.parent, create=True) as root_fd, child_directory(root_fd, self.session_dir.name, create=True):
+            pass
+        with ExitStack() as lease:
+            _, self.directory_fd = lease.enter_context(
+                session_directory(self.session_dir.parent, self.session_dir.name)
+            )
+            self._load()
+            self._release_lease = weakref.finalize(self, lease.pop_all().close)
 
     def _load(self) -> None:
-        if not self.state_path.exists():
-            return
         try:
-            raw = load_session_json(self.state_path)
+            raw = load_session_json(read_session_file(self.directory_fd, SNAPSHOT_STATE_FILE))
+        except FileNotFoundError:
+            return
         except ConversationIntegrityError:
             self._is_corrupt = True
             return
@@ -497,30 +514,38 @@ class WorkspaceSnapshotStore:
         # reset may replace a corrupt manifest or discard its invalid rows.
         if self._is_corrupt:
             return
-        self.session_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "snapshots": [snapshot.to_dict() for snapshot in self._snapshots],
             "current_id": self._current_id,
         }
-        temporary_path: Path | None = None
+        write_session_json(self.directory_fd, SNAPSHOT_STATE_FILE, payload)
+
+    def close(self) -> None:
+        self._release_lease()
+
+    @contextmanager
+    def _shadow_workspace(self, *, write: bool = False):
+        """Keep Git's path-based IO outside sessions; import/export via safe FDs."""
+        lock_fd = open_session_file(self.directory_fd, ".workspace.lock", os.O_RDWR | os.O_CREAT)
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=self.session_dir,
-                prefix=SNAPSHOT_STATE_TMP_PREFIX,
-                suffix=".tmp",
-                delete=False,
-            ) as temporary:
-                temporary_path = Path(temporary.name)
-                json.dump(payload, temporary, separators=(",", ":"), sort_keys=True)
-                temporary.write("\n")
-                temporary.flush()
-                os.fsync(temporary.fileno())
-            os.replace(temporary_path, self.state_path)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            with tempfile.TemporaryDirectory(prefix="zeta-shadow-") as temporary:
+                scratch = Path(temporary)
+                with session_root(scratch) as scratch_fd:
+                    if SHADOW_REPO_DIRNAME in os.listdir(self.directory_fd):
+                        with child_directory(self.directory_fd, SHADOW_REPO_DIRNAME) as source_fd, child_directory(scratch_fd, SHADOW_REPO_DIRNAME, create=True) as destination_fd:
+                            copy_session_tree(source_fd, destination_fd)
+                    try:
+                        yield scratch
+                    finally:
+                        if write and SHADOW_REPO_DIRNAME in os.listdir(scratch_fd):
+                            self._publish_shadow(scratch)
         finally:
-            if temporary_path is not None and temporary_path.exists():
-                temporary_path.unlink(missing_ok=True)
+            os.close(lock_fd)
+
+    def _publish_shadow(self, scratch: Path) -> None:
+        with session_root(scratch) as scratch_fd, child_directory(scratch_fd, SHADOW_REPO_DIRNAME) as source_fd, child_directory(self.directory_fd, SHADOW_REPO_DIRNAME, create=True) as destination_fd:
+            copy_session_tree(source_fd, destination_fd)
 
     @property
     def is_corrupt(self) -> bool:
@@ -564,31 +589,32 @@ class WorkspaceSnapshotStore:
                 raise WorkspaceSnapshotError(
                     "snapshot restore root is not a Git working tree"
                 )
-            env = {"GIT_DIR": str(_shadow_dir(self.session_dir))}
-            ref = f"{SNAPSHOT_REF_NAMESPACE}/{snapshot.id}"
-            commit = _run_git(
-                ["rev-parse", "--verify", f"{ref}^{{commit}}"],
-                cwd=self.session_dir,
-                env=env,
-            ).stdout.strip()
-            if commit != snapshot.commit_sha:
-                raise WorkspaceSnapshotError(
-                    f"snapshot ref {ref} does not match its commit"
+            with self._shadow_workspace() as scratch:
+                env = {"GIT_DIR": str(_shadow_dir(scratch))}
+                ref = f"{SNAPSHOT_REF_NAMESPACE}/{snapshot.id}"
+                commit = _run_git(
+                    ["rev-parse", "--verify", f"{ref}^{{commit}}"],
+                    cwd=scratch,
+                    env=env,
+                ).stdout.strip()
+                if commit != snapshot.commit_sha:
+                    raise WorkspaceSnapshotError(
+                        f"snapshot ref {ref} does not match its commit"
+                    )
+                tree = _run_git(
+                    ["rev-parse", "--verify", f"{commit}^{{tree}}"],
+                    cwd=scratch,
+                    env=env,
+                ).stdout.strip()
+                if tree != snapshot.tree_sha:
+                    raise WorkspaceSnapshotError(
+                        f"snapshot ref {ref} does not match its tree"
+                    )
+                _run_git(
+                    ["rev-list", "--objects", "--missing=error", commit],
+                    cwd=scratch,
+                    env=env,
                 )
-            tree = _run_git(
-                ["rev-parse", "--verify", f"{commit}^{{tree}}"],
-                cwd=self.session_dir,
-                env=env,
-            ).stdout.strip()
-            if tree != snapshot.tree_sha:
-                raise WorkspaceSnapshotError(
-                    f"snapshot ref {ref} does not match its tree"
-                )
-            _run_git(
-                ["rev-list", "--objects", "--missing=error", commit],
-                cwd=self.session_dir,
-                env=env,
-            )
         except (WorkspaceSnapshotError, OSError, ValueError) as exc:
             return WorkspaceRestoreResolution("damaged", reason=str(exc))
         return WorkspaceRestoreResolution("restorable", repo_root=repo_root, tree_sha=tree)
@@ -603,10 +629,8 @@ class WorkspaceSnapshotStore:
         ]
         if not self._is_corrupt and valid == self._snapshots:
             return
-        archive = self.state_path.with_name(
-            f"workspace_snapshots.corrupt.{uuid.uuid4().hex}.json"
-        )
-        shutil.copyfile(self.state_path, archive)
+        archive = f"workspace_snapshots.corrupt.{uuid.uuid4().hex}.json"
+        write_session_file(self.directory_fd, archive, read_session_file(self.directory_fd, SNAPSHOT_STATE_FILE))
         self._snapshots = valid
         if not any(snapshot.id == self._current_id for snapshot in valid):
             self._current_id = None
@@ -674,10 +698,11 @@ class WorkspaceSnapshotStore:
                 checkpoint_entry_id=checkpoint_entry_id,
             )
         else:
-            commit_sha, tree_sha, size_bytes, file_count = _write_shadow_commit(
-                self.session_dir, repo_root, label
-            )
-            _pin_ref(self.session_dir, snapshot_id, commit_sha)
+            with self._shadow_workspace(write=True) as scratch:
+                commit_sha, tree_sha, size_bytes, file_count = _write_shadow_commit(
+                    scratch, repo_root, label
+                )
+                _pin_ref(scratch, snapshot_id, commit_sha)
             snapshot = WorkspaceSnapshot(
                 id=snapshot_id,
                 created_at=_now(),
@@ -709,9 +734,8 @@ class WorkspaceSnapshotStore:
             raise WorkspaceSnapshotError(resolution.reason)
         if resolution.status == "restorable":
             assert resolution.repo_root is not None and resolution.tree_sha is not None
-            _restore_from_tree(
-                self.session_dir, resolution.repo_root, resolution.tree_sha
-            )
+            with self._shadow_workspace(write=True) as scratch:
+                _restore_from_tree(scratch, resolution.repo_root, resolution.tree_sha, lambda: self._publish_shadow(scratch))
         self._current_id = snapshot.id
         self._persist()
         return snapshot
@@ -748,7 +772,8 @@ class WorkspaceSnapshotStore:
         if repo_root is None:
             return True
         try:
-            current_tree = _current_tree_sha(self.session_dir, repo_root)
+            with self._shadow_workspace(write=True) as scratch:
+                current_tree = _current_tree_sha(scratch, repo_root)
         except WorkspaceSnapshotError:
             return True
         return current_tree != reference.tree_sha
@@ -823,6 +848,5 @@ class WorkspaceSnapshotStore:
     def _delete_snapshot_ref(self, snapshot: WorkspaceSnapshot) -> None:
         if snapshot.mode != SNAPSHOT_MODE_GIT:
             return
-        _delete_shadow_ref(
-            self.session_dir, f"{SNAPSHOT_REF_NAMESPACE}/{snapshot.id}"
-        )
+        with self._shadow_workspace(write=True) as scratch:
+            _delete_shadow_ref(scratch, f"{SNAPSHOT_REF_NAMESPACE}/{snapshot.id}")

@@ -116,18 +116,22 @@ impl ZetaView {
                                 .w(px(40.))
                                 .h(px(40.))
                                 .flex_shrink_0()
-                                .disabled(!view.can_change_session())
+                                .disabled(!view.can_rename_session())
                                 .dropdown_menu(move |menu, _, cx| {
-                                    let enabled = entity
+                                    let delete_enabled = entity
                                         .upgrade()
                                         .is_some_and(|view| view.read(cx).can_change_session());
+                                    let rename_enabled = entity
+                                        .upgrade()
+                                        .is_some_and(|view| view.read(cx).can_rename_session());
                                     let rename_view = entity.clone();
                                     let delete_view = entity.clone();
                                     let rename_id = menu_id.clone();
                                     let delete_id = menu_id.clone();
                                     menu.item(
-                                        PopupMenuItem::new("Rename").disabled(!enabled).on_click(
-                                            move |_, window, cx| {
+                                        PopupMenuItem::new("Rename")
+                                            .disabled(!rename_enabled)
+                                            .on_click(move |_, window, cx| {
                                                 let _ = rename_view.update(cx, |view, cx| {
                                                     view.open_session_edit(
                                                         rename_id.clone(),
@@ -136,13 +140,13 @@ impl ZetaView {
                                                         cx,
                                                     )
                                                 });
-                                            },
-                                        ),
+                                            }),
                                     )
                                     .separator()
                                     .item(
-                                        PopupMenuItem::new("Delete").disabled(!enabled).on_click(
-                                            move |_, window, cx| {
+                                        PopupMenuItem::new("Delete")
+                                            .disabled(!delete_enabled)
+                                            .on_click(move |_, window, cx| {
                                                 let _ = delete_view.update(cx, |view, cx| {
                                                     view.open_session_edit(
                                                         delete_id.clone(),
@@ -151,8 +155,7 @@ impl ZetaView {
                                                         cx,
                                                     )
                                                 });
-                                            },
-                                        ),
+                                            }),
                                     )
                                 }),
                         )

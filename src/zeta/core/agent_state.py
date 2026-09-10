@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import copy
-import json
 import os
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +11,7 @@ from typing import Any
 
 from ..types import ToolCall
 from .checkpoints import ConversationIntegrityError, _now
+from .session_files import child_directory, write_session_json
 
 _AGENT_STATES = {"running", "completed", "canceled", "failed"}
 
@@ -181,10 +180,10 @@ class AgentStateMixin:
         with self._append_lock():
             self._load()
             self._load_session_state()
-            agents_root = self.session_dir / "agents"
-            agents_root.mkdir(parents=True, exist_ok=True)
+            with child_directory(self.directory_fd, "agents", create=True) as agents_fd:
+                occupied = set(os.listdir(agents_fd))
             candidate = self._agent_counter + 1
-            while (agents_root / str(candidate)).exists():
+            while str(candidate) in occupied:
                 candidate += 1
             self._agent_counter = candidate
             self._write_session_state(self.bash_cwd, self._todo_items)
@@ -451,20 +450,4 @@ class AgentStateMixin:
     def _write_agent_lifecycle(self) -> None:
         """Atomically write lifecycle data without changing session state bytes."""
 
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=self.session_dir,
-            prefix=".agent_lifecycle.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            try:
-                json.dump(self._agent_lifecycle, temporary, separators=(",", ":"))
-                temporary.write("\n")
-                temporary.flush()
-                os.fsync(temporary.fileno())
-                os.replace(temporary_path, self.agent_lifecycle_path)
-            finally:
-                temporary_path.unlink(missing_ok=True)
+        write_session_json(self.directory_fd, "agent_lifecycle.json", self._agent_lifecycle)

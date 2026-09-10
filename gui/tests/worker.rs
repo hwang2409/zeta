@@ -1269,3 +1269,60 @@ fn fork_history_transport_failure_loses_connection() {
         false,
     );
 }
+
+#[test]
+fn rename_crosses_socket_during_stream_while_delete_stays_blocked() {
+    let (release, paused) = mpsc::channel();
+    let harness = Harness::new(move |listener| {
+        let mut peer = Peer::accept(&listener);
+        peer.respond("hello", json!({"protocol_version":"1.1","server":"zeta","capabilities":{"requests":["rename_session","delete_session"]}}));
+        peer.respond("list_sessions", json!({"sessions":[session()]}));
+        peer.status(true, "idle", json!([]));
+        peer.respond("session_tree", json!({"branches":[]}));
+        peer.respond("session_history", json!({"messages":[],"has_more":false}));
+        peer.send();
+        peer.event(json!({"event":"turn_start","data":{}}));
+        peer.event(json!({"event":"assistant_delta","delta":"first chunk","kind":"assistant"}));
+        // The next chunk waits for the test to check both management commands.
+        let request = peer.respond(
+            "rename_session",
+            json!({"session":{"session_id":"session-1","name":"during stream"}}),
+        );
+        assert_eq!(request["params"]["name"], "during stream");
+        paused.recv_timeout(Duration::from_secs(5)).unwrap();
+        peer.event(json!({"event":"assistant_delta","delta":" next chunk","kind":"assistant"}));
+        peer.wait_for_close();
+    });
+    assert!(matches!(harness.next(), WorkerMessage::Extensions(true)));
+    assert!(matches!(
+        harness.next(),
+        WorkerMessage::SessionManagement(true)
+    ));
+    assert!(matches!(harness.next(), WorkerMessage::Sessions(_)));
+    assert!(matches!(harness.next(), WorkerMessage::Status(_)));
+    assert!(matches!(harness.next(), WorkerMessage::Tree(_)));
+    assert!(matches!(harness.next(), WorkerMessage::History(_, true)));
+    assert!(matches!(harness.next(), WorkerMessage::Connected));
+    harness.command(CommandMessage::Send("slow stream".into()));
+    assert!(matches!(harness.next(), WorkerMessage::Sent(_)));
+    assert!(matches!(harness.event(), ServerEvent::TurnStart { .. }));
+    assert!(matches!(
+        harness.event(),
+        ServerEvent::AssistantDelta { .. }
+    ));
+    harness.command(CommandMessage::RenameSession(
+        "session-1".into(),
+        "during stream".into(),
+    ));
+    assert!(
+        matches!(harness.next(), WorkerMessage::Renamed(session) if session.name == "during stream")
+    );
+    harness.command(CommandMessage::DeleteSession("session-1".into()));
+    assert!(matches!(harness.next(), WorkerMessage::Rejected(_)));
+    release.send(()).unwrap();
+    assert!(matches!(
+        harness.event(),
+        ServerEvent::AssistantDelta { .. }
+    ));
+    harness.finish();
+}

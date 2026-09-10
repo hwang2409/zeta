@@ -219,7 +219,6 @@ impl ConnectionWorker {
                     let result = match command {
                         CommandMessage::NewSession
                         | CommandMessage::Resume(_)
-                        | CommandMessage::RenameSession(..)
                         | CommandMessage::DeleteSession(_)
                         | CommandMessage::Send(_)
                         | CommandMessage::SendImages(..)

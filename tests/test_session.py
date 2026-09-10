@@ -1776,16 +1776,10 @@ def test_session_id_collision_retries(
     manager = SessionManager(tmp_path / "zeta-home")
     collision = uuid.UUID("00000000000000000000000000000001")
     unique = uuid.UUID("00000000000000000000000000000002")
-    calls = iter(
-        [
-            collision,
-            uuid.UUID("00000000000000000000000000000003"),
-            collision,
-            unique,
-            uuid.UUID("00000000000000000000000000000004"),
-        ]
-    )
-    monkeypatch.setattr("zeta.core.session.uuid.uuid4", lambda: next(calls))
+    from types import SimpleNamespace
+
+    calls = iter([collision, collision, unique])
+    monkeypatch.setattr("zeta.core.session.uuid", SimpleNamespace(uuid4=lambda: next(calls)))
     manager.create(provider="fake", model="offline", cwd=tmp_path)
     created = manager.create(provider="fake", model="offline", cwd=tmp_path)
 

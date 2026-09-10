@@ -250,7 +250,8 @@ Whitespace clears the stored name. Names follow the existing 60-cell limit.
 Listings expose `name` only to 1.1 clients and keep `first_message_preview`
 independent of the display name. The GUI requires both advertised requests.
 
-Management requires an idle server. Deleting the active session returns RPC
+Rename remains available while a turn streams. Deletion requires an idle
+server. Deleting the active session returns RPC
 `-32005` with `data.code = "active_session"`; select another session first.
 Deletion does not read metadata or conversation data, so corrupt directories
 remain removable by ID. It refuses root/session/lock symlinks, respects the

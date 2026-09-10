@@ -22,7 +22,7 @@ from rich.cells import cell_len
 
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .store import ConversationStore
-from .session_files import SessionError, SessionInUseError, open_session_file, session_directory
+from .session_files import SessionError, SessionInUseError, open_session_file, session_directory, session_root, child_directory, write_session_json
 
 
 logger = logging.getLogger(__name__)
@@ -333,12 +333,10 @@ class SessionManager:
         name: str = "",
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        with session_root(self.sessions_dir, create=True):
+            pass
         for _ in range(8):
             session_id = uuid.uuid4().hex
-            session_dir = self.sessions_dir / session_id
-            if session_dir.exists():
-                continue
             metadata = SessionMetadata.new(
                 session_id=session_id,
                 provider=provider,
@@ -363,17 +361,16 @@ class SessionManager:
                 staged._write(metadata)
                 # mkdir atomically claims the ID without replacing any existing
                 # path, including a non-cooperating creator's empty directory.
-                try:
-                    session_dir.mkdir()
-                except FileExistsError:
-                    continue
-                staged_dir = staged.sessions_dir / session_id
-                for path in staged_dir.iterdir():
-                    if path.name != "meta.json":
-                        path.rename(session_dir / path.name)
-                # Publish metadata last: a crash before this leaves an incomplete
-                # directory that discovery skips and future creators preserve.
-                (staged_dir / "meta.json").rename(session_dir / "meta.json")
+                with session_root(self.sessions_dir) as root_fd:
+                    try:
+                        os.mkdir(session_id, mode=0o700, dir_fd=root_fd)
+                    except FileExistsError:
+                        continue
+                    with child_directory(root_fd, session_id) as destination_fd, session_directory(staged.sessions_dir, session_id) as (_, source_fd):
+                        names = os.listdir(source_fd)
+                        # Publish metadata last so discovery skips incomplete sessions.
+                        for filename in sorted(names, key=lambda item: item == "meta.json"):
+                            os.replace(filename, filename, src_dir_fd=source_fd, dst_dir_fd=destination_fd)
             return self.open(session_id)
         raise SessionError("could not allocate a unique session id")
 
@@ -384,10 +381,6 @@ class SessionManager:
 
     def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
         metadata = self.read_metadata(session_id)
-        session_path = self.sessions_dir / session_id
-        conversation_path = session_path / "conversation.jsonl"
-        if not conversation_path.exists():
-            raise SessionError(f"session {session_id} has no conversation.jsonl")
         try:
             store = ConversationStore(
                 self.sessions_dir, session_id=session_id, _read_only=_read_only,
@@ -401,18 +394,19 @@ class SessionManager:
         return OpenedSession(metadata, store)
 
     def list_sessions(self) -> list[SessionMetadata]:
-        if not self.sessions_dir.exists():
+        try:
+            with session_root(self.sessions_dir) as root_fd:
+                names = os.listdir(root_fd)
+        except FileNotFoundError:
             return []
         sessions: list[SessionMetadata] = []
-        for session_path in self.sessions_dir.iterdir():
+        for name in names:
             try:
-                if not session_path.is_dir():
-                    continue
-                opened = self.open(session_path.name, _read_only=True)
+                opened = self.open(name, _read_only=True)
                 opened.store.close()
                 sessions.append(opened.metadata)
             except (SessionError, ConversationIntegrityError) as exc:
-                logger.warning("Skipping session %s: %s", session_path.name, exc)
+                logger.warning("Skipping session %s: %s", name, exc)
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
 
     def list_session_previews(
@@ -632,18 +626,14 @@ class SessionManager:
 
         self._validate_id(session_id)
         try:
-            root_fd = os.open(self.sessions_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                with os.scandir(root_fd) as entries:
-                    candidates = [
-                        entry.name for entry in entries
-                        if entry.is_dir(follow_symlinks=False) or entry.is_symlink()
-                    ]
-                if session_id in candidates:
-                    return session_id
-                matches = sorted(name for name in candidates if name.startswith(session_id))
-            finally:
-                os.close(root_fd)
+            with session_root(self.sessions_dir) as root_fd, os.scandir(root_fd) as entries:
+                candidates = [
+                    entry.name for entry in entries
+                    if entry.is_dir(follow_symlinks=False) or entry.is_symlink()
+                ]
+            if session_id in candidates:
+                return session_id
+            matches = sorted(name for name in candidates if name.startswith(session_id))
         except FileNotFoundError as exc:
             raise SessionError(f"session {session_id} was not found") from exc
         except OSError as exc:
@@ -686,13 +676,10 @@ class SessionManager:
 
         full_id = self.resolve_id(session_id)
         metadata = self._read(full_id)
-        conversation_path = self.sessions_dir / full_id / "conversation.jsonl"
-        if not conversation_path.exists():
-            raise SessionError(f"session {full_id} has no conversation.jsonl")
         header = {"type": "session_export", "metadata": metadata.to_dict()}
         lines = [json.dumps(header, separators=(",", ":"), sort_keys=True)]
         try:
-            with conversation_path.open("rb") as handle:
+            with session_directory(self.sessions_dir, full_id) as (_, directory_fd), os.fdopen(open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb") as handle:
                 for line in handle:
                     if line.strip():
                         row = load_session_json(line)
@@ -786,26 +773,16 @@ class SessionManager:
             self._write_unlocked(metadata, directory_fd=directory_fd)
 
     def _write_unlocked(self, metadata: SessionMetadata, *, directory_fd: int) -> None:
-        temporary = f".meta.json.{uuid.uuid4().hex}.tmp"
-        fd = open_session_file(directory_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-        try:
-            with os.fdopen(fd, "w") as handle:
-                json.dump(metadata.to_storage_dict(), handle, separators=(",", ":"), sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, "meta.json", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-        finally:
-            try:
-                os.unlink(temporary, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
+        write_session_json(directory_fd, "meta.json", metadata.to_storage_dict())
 
     @contextmanager
     def _metadata_lock(self, session_id: str):
         self._validate_id(session_id)
         with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
-            lock_fd = open_session_file(directory_fd, ".meta.lock", os.O_RDWR | os.O_CREAT)
+            try:
+                lock_fd = open_session_file(directory_fd, ".meta.lock", os.O_RDWR | os.O_CREAT)
+            except OSError as exc:
+                raise SessionError("session metadata lock could not be opened") from exc
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 yield directory_fd

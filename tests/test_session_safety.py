@@ -215,3 +215,231 @@ def test_discarded_store_releases_lease(tmp_path):
     gc.collect()
     manager.delete(sid)
     assert not (manager.sessions_dir / sid).exists()
+
+
+@pytest.mark.parametrize("name", [".lock", "conversation.jsonl", "session_state.json", "agent_lifecycle.json"])
+def test_store_open_refuses_symlinks_without_creating_external_targets(tmp_path, name):
+    manager, sid = closed_session(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    path = manager.sessions_dir / sid / name
+    path.unlink(missing_ok=True)
+    path.symlink_to(outside / "must-not-create")
+    with pytest.raises(SessionError):
+        manager.open(sid)
+    assert list(outside.iterdir()) == []
+    # A failed open also releases its directory lease.
+    path.unlink()
+    manager.delete(sid)
+
+
+def test_export_refuses_external_conversation_symlink(tmp_path):
+    manager, sid = closed_session(tmp_path)
+    sentinel = tmp_path / "external.jsonl"
+    sentinel.write_bytes(b'{"secret":"outside"}\n')
+    path = manager.sessions_dir / sid / "conversation.jsonl"
+    path.unlink()
+    path.symlink_to(sentinel)
+    with pytest.raises(SessionError):
+        manager.export(sid)
+    assert sentinel.read_bytes() == b'{"secret":"outside"}\n'
+
+
+@pytest.mark.parametrize("operation", ["append", "repair", "state", "lifecycle", "agents"])
+def test_store_uses_lifetime_descriptor_after_directory_swap(tmp_path, operation):
+    manager, sid = closed_session(tmp_path)
+    store = manager.open(sid).store
+    original = store.session_dir
+    pinned = manager.sessions_dir / "pinned"
+    original.rename(pinned)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original.symlink_to(outside, target_is_directory=True)
+    try:
+        if operation == "append":
+            store.append_message(Message(MessageRole.USER, [TextContent("saved")]))
+            assert b"saved" in (pinned / "conversation.jsonl").read_bytes()
+        elif operation == "repair":
+            with (pinned / "conversation.jsonl").open("ab") as handle:
+                handle.write(b'{"torn')
+            with pytest.warns(RuntimeWarning, match="torn"):
+                store.append_message(Message(MessageRole.USER, [TextContent("saved")]))
+            assert b'"torn' not in (pinned / "conversation.jsonl").read_bytes()
+        elif operation == "state":
+            store.set_bash_cwd("/saved")
+            assert b"/saved" in (pinned / "session_state.json").read_bytes()
+        elif operation == "lifecycle":
+            store._agent_lifecycle = {"state": "completed"}
+            store._write_agent_lifecycle()
+            store._load_session_state()
+            assert store._agent_lifecycle == {"state": "completed"}
+            assert (pinned / "agent_lifecycle.json").is_file()
+        else:
+            assert store.allocate_agent_index() == 1
+            assert (pinned / "agents").is_dir()
+        assert list(outside.iterdir()) == []
+    finally:
+        store.close()
+
+
+def test_child_store_rejects_symlink_in_nested_sessions_root(tmp_path):
+    manager, sid = closed_session(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (manager.sessions_dir / sid / "agents").symlink_to(outside, target_is_directory=True)
+    with pytest.raises((SessionError, OSError)):
+        ConversationStore(manager.sessions_dir / sid / "agents", session_id="1")
+    with manager.open(sid).store as store, pytest.raises((SessionError, OSError)):
+        store.allocate_agent_index()
+    assert list(outside.iterdir()) == []
+
+
+def test_session_file_helper_rejects_path_components(tmp_path):
+    from zeta.core.session_files import open_session_file
+
+    manager, sid = closed_session(tmp_path)
+    with manager.open(sid).store as store:
+        for name in ("../escaped", str(tmp_path / "escaped"), "sub/file"):
+            with pytest.raises(SessionError):
+                open_session_file(store.directory_fd, name, os.O_WRONLY | os.O_CREAT)
+    assert not (tmp_path / "escaped").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", ["rename-first", "delete-first"])
+async def test_server_rename_and_cli_delete_serialize_across_processes(tmp_path, order):
+    import asyncio
+    import json
+
+    manager, sid = closed_session(tmp_path)
+    script = """
+import asyncio, sys
+from zeta.server import ZetaServer
+async def main():
+    server = ZetaServer(home=sys.argv[1], port=0, provider='fake')
+    manager = server.runtime.manager
+    method = '_write_unlocked' if sys.argv[2] == 'rename-first' else 'record_name'
+    original = getattr(manager, method)
+    def paused(*args, **kwargs):
+        print('barrier', flush=True)
+        assert sys.stdin.readline().strip() == 'continue'
+        return original(*args, **kwargs)
+    setattr(manager, method, paused)
+    await server.start()
+    print(server.port, flush=True)
+    await asyncio.Event().wait()
+asyncio.run(main())
+"""
+    env = {**os.environ, "ZETA_HOME": str(manager.home)}
+    server = await asyncio.create_subprocess_exec(
+        sys.executable, "-u", "-c", script, str(manager.home), order,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, env=env,
+    )
+    writer = None
+    try:
+        port = int(await asyncio.wait_for(server.stdout.readline(), 10))
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        async def request(request_id, method, params):
+            writer.write((json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}) + "\n").encode())
+            await writer.drain()
+        await request(1, "hello", {"protocol_version": "1.1"})
+        assert "result" in json.loads(await asyncio.wait_for(reader.readline(), 10))
+        await request(2, "rename_session", {"session_id": sid, "name": "saved"})
+        assert await asyncio.wait_for(server.stdout.readline(), 10) == b"barrier\n"
+
+        async def delete_cli():
+            cli = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", "from zeta.cli import main; raise SystemExit(main())", "session", "delete", sid, "--force",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(cli.communicate(), 10)
+            return cli.returncode, stdout + stderr
+
+        code, output = await delete_cli()
+        if order == "rename-first":
+            assert code == 1, output
+            assert b"in use" in output
+        else:
+            assert code == 0, output
+        server.stdin.write(b"continue\n")
+        await server.stdin.drain()
+        response = json.loads(await asyncio.wait_for(reader.readline(), 10))
+        if order == "rename-first":
+            assert response["result"]["session"]["name"] == "saved"
+            code, output = await delete_cli()
+            assert code == 0, output
+        else:
+            assert "error" in response
+        assert not (manager.sessions_dir / sid).exists()
+    finally:
+        if writer is not None:
+            writer.close()
+            await writer.wait_closed()
+        if server.returncode is None:
+            server.kill()
+        await asyncio.wait_for(server.communicate(), 10)
+
+
+def test_storage_operations_never_pass_full_session_paths_to_os(tmp_path, monkeypatch):
+    import io
+    from functools import wraps
+
+    manager = SessionManager(tmp_path / "home")
+    root = str(manager.sessions_dir)
+
+    def checked(function):
+        @wraps(function)
+        def call(*args, **kwargs):
+            for argument in args[:2]:
+                if isinstance(argument, (str, bytes, os.PathLike)):
+                    value = os.fsdecode(argument)
+                    assert value != root and not value.startswith(root + "/"), (function.__name__, value)
+            return function(*args, **kwargs)
+        return call
+
+    with monkeypatch.context() as patch:
+        for name in ("open", "replace", "rename", "unlink", "stat", "lstat", "mkdir", "rmdir", "scandir", "listdir"):
+            patch.setattr(os, name, checked(getattr(os, name)))
+        patch.setattr(io, "open", checked(io.open))
+        opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+        sid = opened.metadata.session_id
+        store = opened.store
+        store.append_message(Message(MessageRole.USER, [TextContent("saved")]))
+        store.set_bash_cwd(str(tmp_path))
+        store.allocate_agent_index()
+        store._agent_lifecycle = {"state": "completed"}
+        store._write_agent_lifecycle()
+        store._load_session_state()
+        assert manager.rename(sid, "renamed").name == "renamed"
+        assert "saved" in manager.export(sid)
+        assert [item.session_id for item in manager.list_sessions()] == [sid]
+        store.close()
+        manager.delete(sid)
+    assert not (manager.sessions_dir / sid).exists()
+
+
+def test_json_path_reader_rejects_symlink(tmp_path):
+    from zeta.core.checkpoints import ConversationIntegrityError, load_session_json
+
+    manager, sid = closed_session(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"secret": "outside"}')
+    path = manager.sessions_dir / sid / "agent_lifecycle.json"
+    path.symlink_to(outside)
+    with pytest.raises(ConversationIntegrityError):
+        load_session_json(path)
+    assert outside.read_text() == '{"secret": "outside"}'
+
+
+def test_safe_open_rejects_hardlink_before_truncation(tmp_path):
+    from zeta.core.session_files import open_session_file
+
+    manager, sid = closed_session(tmp_path)
+    outside = tmp_path / "keep"
+    outside.write_text("keep")
+    with manager.open(sid).store as store:
+        os.link(outside, store.session_dir / "hardlink")
+        with pytest.raises(SessionError):
+            open_session_file(store.directory_fd, "hardlink", os.O_WRONLY | os.O_TRUNC)
+    assert outside.read_text() == "keep"

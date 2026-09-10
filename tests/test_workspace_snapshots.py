@@ -1192,3 +1192,97 @@ def test_restore_resolver_classifies_nul_root_as_damaged(
 
     assert resolution.status == "damaged"
     assert resolution.reason
+
+
+@pytest.mark.parametrize("location", ["workspace_snapshots.json", ".workspace.lock", "workspace_shadow.git", "workspace_shadow.git/HEAD"])
+def test_snapshot_files_reject_symlinks_without_external_writes(git_repo, tmp_path, location):
+    from zeta.core.session_files import SessionError
+
+    session_dir = tmp_path / "home" / "sessions" / "safe"
+    store = WorkspaceSnapshotStore(session_dir, "safe")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = session_dir / location
+    if "/" in location:
+        target.parent.mkdir()
+    target.symlink_to(outside / "must-not-create")
+    try:
+        with pytest.raises((SessionError, OSError)):
+            if location == "workspace_snapshots.json":
+                store._load()
+            else:
+                store.take(git_repo, label="unsafe")
+        assert list(outside.iterdir()) == []
+    finally:
+        store.close()
+
+
+def test_snapshot_manifest_and_archive_use_pinned_directory(tmp_path):
+    directory = tmp_path / "home" / "sessions" / "safe"
+    store = WorkspaceSnapshotStore(directory, "safe")
+    pinned = directory.with_name("pinned")
+    directory.rename(pinned)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    directory.symlink_to(outside, target_is_directory=True)
+    try:
+        store.take(tmp_path, label="conversation only")
+        assert (pinned / "workspace_snapshots.json").is_file()
+        (pinned / "workspace_snapshots.json").write_bytes(b"corrupt")
+        store._load()
+        store.reset_corruption()
+        archives = list(pinned.glob("workspace_snapshots.corrupt.*.json"))
+        assert len(archives) == 1
+        assert archives[0].read_bytes() == b"corrupt"
+        assert list(outside.iterdir()) == []
+    finally:
+        store.close()
+
+
+def test_shadow_git_uses_pinned_directory_after_path_swap(git_repo, tmp_path):
+    directory = tmp_path / "home" / "sessions" / "safe"
+    store = WorkspaceSnapshotStore(directory, "safe")
+    first = store.take(git_repo, label="first")
+    pinned = directory.with_name("pinned")
+    directory.rename(pinned)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    directory.symlink_to(outside, target_is_directory=True)
+    try:
+        (git_repo / "tracked.txt").write_text("changed")
+        second = store.take(git_repo, label="second")
+        assert second.tree_sha != first.tree_sha
+        store.restore(first.id, git_repo)
+        assert (git_repo / "tracked.txt").read_text() == "initial tracked\n"
+        assert list(outside.iterdir()) == []
+        assert (pinned / "workspace_shadow.git" / "HEAD").is_file()
+    finally:
+        store.close()
+
+
+def test_restore_persists_safety_ref_before_workspace_changes(git_repo, tmp_path, monkeypatch):
+    from zeta.core.checkpoints import workspace
+
+    store = WorkspaceSnapshotStore(tmp_path / "sessions" / "safe", "safe")
+    snapshot = store.take(git_repo, label="initial")
+    (git_repo / "tracked.txt").write_text("save before restore")
+    materialise = workspace._materialise_tree
+
+    def checked_materialise(*args):
+        # Inspect durable storage while the scratch transaction is still open.
+        refs = list((store.session_dir / "workspace_shadow.git" / "refs" / "zeta" / "safety").iterdir())
+        assert len(refs) == 1
+        commit = refs[0].read_text().strip()
+        saved = subprocess.check_output(
+            ["git", "--git-dir", str(store.session_dir / "workspace_shadow.git"), "show", f"{commit}:tracked.txt"],
+            text=True,
+        )
+        assert saved == "save before restore"
+        materialise(*args)
+
+    monkeypatch.setattr(workspace, "_materialise_tree", checked_materialise)
+    try:
+        store.restore(snapshot.id, git_repo)
+        assert (git_repo / "tracked.txt").read_text() == "initial tracked\n"
+    finally:
+        store.close()

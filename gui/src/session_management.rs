@@ -12,6 +12,12 @@ pub enum SessionEdit {
 }
 
 impl ZetaView {
+    pub fn can_rename_session(&self) -> bool {
+        self.state.connection == ConnectionState::Connected
+            && !self.pending_command
+            && self.session_edit.is_none()
+    }
+
     pub fn open_session_edit(
         &mut self,
         id: String,
@@ -19,7 +25,12 @@ impl ZetaView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.session_management || !self.can_change_session() || self.settings_open {
+        let enabled = if rename {
+            self.can_rename_session()
+        } else {
+            self.can_change_session()
+        };
+        if !self.session_management || !enabled || self.settings_open {
             return;
         }
         let Some(session) = self.state.sessions.iter().find(|row| row.session_id == id) else {
@@ -57,8 +68,8 @@ impl ZetaView {
     pub fn commit_session_edit(&mut self, cx: &mut Context<Self>) {
         if self.pending_command
             || self.state.connection != ConnectionState::Connected
-            || self.state.streaming
-            || !self.state.approvals.is_empty()
+            || (matches!(self.session_edit, Some(SessionEdit::Delete { .. }))
+                && (self.state.streaming || !self.state.approvals.is_empty()))
         {
             return;
         }

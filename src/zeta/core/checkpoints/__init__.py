@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ...types import Message, MessageRole, TextContent, ToolUseContent
+from ..session_files import read_session_file, session_directory
 
 
 def _now() -> str:
@@ -27,7 +28,11 @@ def load_session_json(source: Path | bytes) -> Any:
     """Decode a session file or JSONL row with a bounded container depth."""
 
     try:
-        value = json.loads(source.read_bytes() if isinstance(source, Path) else source)
+        if isinstance(source, Path):
+            path = source.absolute()
+            with session_directory(path.parent.parent, path.parent.name) as (_, directory_fd):
+                source = read_session_file(directory_fd, path.name)
+        value = json.loads(source)
         pending = [(value, 0)]
         while pending:
             item, depth = pending.pop()

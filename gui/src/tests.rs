@@ -1585,3 +1585,83 @@ fn session_delete_confirmation_error_and_success_preserve_active_transcript(
         });
     });
 }
+
+#[gpui::test]
+fn session_rename_during_slow_stream_keeps_delete_disabled(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.session_management = true;
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::TurnStart {
+                    session_id: None,
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantDelta {
+                    session_id: None,
+                    delta: "first chunk".into(),
+                    kind: "assistant".into(),
+                }),
+                window,
+                cx,
+            );
+            assert!(view.state.streaming);
+            view.open_session_edit(session().session_id, false, window, cx);
+            assert!(view.session_edit.is_none());
+        });
+        window.draw(cx).clear(cx);
+    });
+    // Pause the event stream between chunks while the user renames through the menu.
+    let menu = visual.debug_bounds("session-menu").unwrap();
+    visual.simulate_click(menu.center(), Default::default());
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    visual.simulate_keystrokes("down enter");
+    visual.run_until_parked();
+    assert!(view.read_with(&visual, |view, _| matches!(
+        view.session_edit,
+        Some(session_management::SessionEdit::Rename { .. })
+    )));
+    visual.simulate_keystrokes("n e w enter");
+    assert!(
+        matches!(receiver.try_recv(), Ok(CommandMessage::RenameSession(_, name)) if name == "new")
+    );
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut renamed = session();
+            renamed.name = "new".into();
+            view.apply_worker_message(WorkerMessage::Renamed(renamed), window, cx);
+            assert!(view.state.streaming);
+            view.open_session_edit(session().session_id, false, window, cx);
+            assert!(view.session_edit.is_none());
+            // A delete overlay opened before the turn must also refuse commit.
+            view.session_edit = Some(session_management::SessionEdit::Delete {
+                id: session().session_id,
+                label: "new".into(),
+            });
+            view.commit_session_edit(cx);
+            assert!(!view.pending_command);
+            view.session_edit = None;
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantDelta {
+                    session_id: None,
+                    delta: " next chunk".into(),
+                    kind: "assistant".into(),
+                }),
+                window,
+                cx,
+            );
+            assert_eq!(view.state.sessions[0].name, "new");
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(receiver.try_recv().is_err());
+    visual.run_until_parked();
+}

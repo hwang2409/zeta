@@ -217,37 +217,48 @@ class ServerRuntime:
                 f"session uses a real provider; open it with --provider {metadata.provider}"
             )
         opened = self.manager.open(session_id)
-        context = ProjectContext(
-            opened.metadata.system_prompt,
-            tuple(Path(path) for path in opened.metadata.context_files),
-        )
-        config = self._config(opened.metadata.provider, opened.metadata.model)
-        composition = self._compose(
-            config=config,
-            provider=opened.metadata.provider,
-            model=opened.metadata.model,
-            project_context=context,
-            opened=opened,
-        )
+        try:
+            context = ProjectContext(
+                opened.metadata.system_prompt,
+                tuple(Path(path) for path in opened.metadata.context_files),
+            )
+            config = self._config(opened.metadata.provider, opened.metadata.model)
+            composition = self._compose(
+                config=config,
+                provider=opened.metadata.provider,
+                model=opened.metadata.model,
+                project_context=context,
+                opened=opened,
+            )
+        except BaseException:
+            opened.store.close()
+            raise
         await self._replace(composition)
         return self.metadata
 
-    async def close(self) -> None:
-        state = self._state
-        if state is not None:
+    @staticmethod
+    async def _close_state(state: SessionState) -> None:
+        try:
             await state.loop.close()
+        finally:
             state.opened.store.close()
-            self._state = None
+
+    async def close(self) -> None:
+        state, self._state = self._state, None
+        if state is not None:
+            await self._close_state(state)
 
     async def _replace(self, composition: RuntimeComposition) -> None:
-        old_state = self._state
-        if old_state is not None:
-            await old_state.loop.close()
-            old_state.opened.store.close()
         state = SessionState.from_composition(composition)
-        self._state = state
-        self._bind_background_event_sink(state)
-        await state.loop.activate()
+        try:
+            await self.close()
+            self._state = state
+            self._bind_background_event_sink(state)
+            await state.loop.activate()
+        except BaseException:
+            self._state = None
+            await self._close_state(state)
+            raise
 
     def _bind_background_event_sink(self, state: SessionState) -> None:
         sink = self._background_event_sink

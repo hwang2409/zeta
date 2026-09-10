@@ -1240,10 +1240,10 @@ async def test_settings_retune_budget_atomically(tmp_path, monkeypatch, pinned, 
                 import zeta.core.session as session_module
                 original = session_module.os.replace
 
-                def fail_metadata(source, destination):
+                def fail_metadata(source, destination, **kwargs):
                     if Path(destination).name == "meta.json":
                         raise OSError("metadata persistence failed")
-                    return original(source, destination)
+                    return original(source, destination, **kwargs)
 
                 patch.setattr(session_module.os, "replace", fail_metadata)
             response = (await _request(reader, writer, "settings", "set_settings", {
@@ -1321,48 +1321,47 @@ async def test_attachment_failure_removes_entire_batch(tmp_path, monkeypatch, fa
     if existing:
         ergonomics.image_message(runtime, {"images": [item]})
     before = set(attachments.rglob("*"))
-    original_open = Path.open
+    original_open = os.fdopen
     original_replace = ergonomics.os.replace
     writes = 0
     replacements = 0
 
     @contextmanager
-    def failing_open(path, *args, **kwargs):
+    def failing_open(fd, *args, **kwargs):
         nonlocal writes
-        with original_open(path, *args, **kwargs) as handle:
-            if path.name == ".image.tmp" and args == ("xb",):
+        with original_open(fd, *args, **kwargs) as handle:
+            if args == ("wb",):
                 writes += 1
                 if writes == fail_at:
+                    from unittest.mock import Mock
+                    wrapper = Mock(wraps=handle)
                     if failure == "write":
                         def fail_write(raw):
                             handle.write(raw[:4])
                             handle.flush()
                             raise OSError("mid-write failure")
-                        from unittest.mock import Mock
-                        wrapper = Mock(wraps=handle)
                         wrapper.write.side_effect = fail_write
                         yield wrapper
                         return
                     if failure == "flush":
-                        from unittest.mock import Mock
-                        wrapper = Mock(wraps=handle)
                         wrapper.flush.side_effect = OSError("flush failure")
                         yield wrapper
                         return
             yield handle
 
-    def failing_replace(source, destination):
+    def failing_replace(source, destination, **kwargs):
         nonlocal replacements
-        assert Path(source).read_bytes() == png
-        assert not Path(destination).exists()
+        from zeta.core.session_files import read_session_file
+        assert read_session_file(kwargs["src_dir_fd"], source) == png
+        assert destination not in os.listdir(kwargs["dst_dir_fd"])
         replacements += 1
         if failure == "replace" and replacements == fail_at:
             raise OSError("replace failure")
-        return original_replace(source, destination)
+        return original_replace(source, destination, **kwargs)
 
     try:
         with monkeypatch.context() as patch:
-            patch.setattr(Path, "open", failing_open)
+            patch.setattr(os, "fdopen", failing_open)
             patch.setattr(ergonomics.os, "replace", failing_replace)
             with pytest.raises(OSError):
                 ergonomics.image_message(runtime, {"images": [item, item]})
@@ -2227,3 +2226,122 @@ async def test_session_delete_rpc_rejects_unsafe_ids(tmp_path, session_id):
         assert result["error"]["code"] == -32602
     finally:
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["close", "replace-close", "activate", "resume-compose"])
+async def test_runtime_failure_releases_all_session_leases(tmp_path, monkeypatch, failure):
+    from zeta.server.runtime import ServerRuntime
+
+    runtime = ServerRuntime(tmp_path, cwd=tmp_path, provider="fake")
+    await runtime.create_session()
+    old_id = runtime.session_id
+    old_store = runtime.opened.store
+    incoming = []
+    compose = runtime._compose
+
+    def retain_composition(**kwargs):
+        composition = compose(**kwargs)
+        incoming.append(composition)
+        return composition
+
+    monkeypatch.setattr(runtime, "_compose", retain_composition)
+
+    async def fail_close():
+        raise RuntimeError("close failed")
+
+    async def fail_activate(_self):
+        raise RuntimeError("activation failed")
+
+    try:
+        if failure in {"close", "replace-close"}:
+            monkeypatch.setattr(runtime.loop, "close", fail_close)
+        if failure == "activate":
+            monkeypatch.setattr(type(runtime.loop), "activate", fail_activate)
+        if failure == "resume-compose":
+            await runtime.close()
+            def fail_compose(**_kwargs):
+                raise RuntimeError("composition failed")
+            monkeypatch.setattr(runtime, "_compose", fail_compose)
+            operation = runtime.resume_session(old_id)
+        elif failure == "close":
+            operation = runtime.close()
+        else:
+            operation = runtime.create_session()
+        with pytest.raises(RuntimeError, match="failed"):
+            await operation
+        assert runtime.state is None
+        assert old_store._closed
+        assert all(composition.opened.store._closed for composition in incoming)
+        # Keep the runtime and exception-producing store alive while deleting.
+        sessions = runtime.manager.list_sessions()
+        assert len(sessions) == (2 if failure in {"replace-close", "activate"} else 1)
+        for metadata in sessions:
+            runtime.manager.delete(metadata.session_id)
+        assert runtime.manager.list_sessions() == []
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
+    from zeta.server.fake_backend import ServerFakeBackend
+    from zeta.types import StreamEventType
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class PausedBackend(ServerFakeBackend):
+        async def complete(self, messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas):
+                yield event
+                if event.type == StreamEventType.MESSAGE_UPDATE:
+                    started.set()
+                    await release.wait()
+
+    server = ZetaServer(
+        home=tmp_path, cwd=tmp_path, port=0, provider="fake",
+        backend_factory=lambda *_args: (PausedBackend(delay=0), "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        sid = (await _request(reader, writer, 2, "new_session"))[-1]["result"]["session"]["session_id"]
+        # Also check an inactive target so the streaming guard, not the active guard, decides deletion.
+        other = server.runtime.manager.create(provider="fake", model="offline", cwd=tmp_path)
+        other.store.close()
+        await _request(reader, writer, 3, "send", {"text": "slow response"})
+        await asyncio.wait_for(started.wait(), TIMEOUT)
+        result = (await _request(reader, writer, 4, "rename_session", {"session_id": sid, "name": "mid-stream"}))[-1]
+        assert result["result"]["session"]["name"] == "mid-stream"
+        assert server.runtime.state.status == "running"
+        error = (await _request(reader, writer, 5, "delete_session", {"session_id": other.metadata.session_id}))[-1]["error"]
+        assert error["code"] == -32004
+        release.set()
+        await _event(reader, "turn_end")
+        assert server.runtime.manager.read_metadata(sid).name == "mid-stream"
+        assert "result" in (await _request(reader, writer, 6, "delete_session", {"session_id": other.metadata.session_id}))[-1]
+    finally:
+        release.set()
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_attachment_symlink_cannot_write_outside_session(tmp_path):
+    import base64
+
+    from zeta.server.ergonomics import image_message
+    from zeta.server.runtime import ServerRuntime
+
+    runtime = ServerRuntime(tmp_path / "home", cwd=tmp_path, provider="fake")
+    await runtime.create_session()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (runtime.opened.store.session_dir / "attachments").symlink_to(outside, target_is_directory=True)
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    try:
+        with pytest.raises(OSError):
+            image_message(runtime, {"images": [{"name": "x.png", "mime_type": "image/png", "data": base64.b64encode(png).decode()}]})
+        assert list(outside.iterdir()) == []
+    finally:
+        await runtime.close()

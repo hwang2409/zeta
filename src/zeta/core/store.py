@@ -7,7 +7,6 @@ import fcntl
 import json
 import math
 import os
-import tempfile
 import time
 import uuid
 import warnings
@@ -27,7 +26,14 @@ from .checkpoints import (
     _now,
     load_session_json,
 )
-from .session_files import session_directory
+from .session_files import (
+    child_directory,
+    open_session_file,
+    read_session_file,
+    session_directory,
+    session_root,
+    write_session_json,
+)
 from .todo import TodoItem, parse_todo_items
 
 SCHEMA = "zeta.conversation.v1"
@@ -172,9 +178,11 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             )
         self.session_dir = self.root_dir / self.session_id
         self._read_only = _read_only
+        self._must_exist = _must_exist
         self._closed = False
         if not _read_only and not _must_exist:
-            self.session_dir.mkdir(parents=True, exist_ok=True)
+            with session_root(self.root_dir, create=True) as root_fd, child_directory(root_fd, self.session_id, create=True):
+                pass
         self.path = self.session_dir / "conversation.jsonl"
         self.state_path = self.session_dir / "session_state.json"
         self.agent_lifecycle_path = self.session_dir / "agent_lifecycle.json"
@@ -193,7 +201,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._write_deadline: float | None = None
         self.pending_prompt_queue = PendingPromptQueue(self)
         with ExitStack() as lease:
-            lease.enter_context(session_directory(self.root_dir, self.session_id))
+            _, self.directory_fd = lease.enter_context(session_directory(self.root_dir, self.session_id))
             # Discovery validates without creating locks/state or repairing the log.
             with nullcontext() if _read_only else self._append_lock(deadline=_lock_deadline):
                 self._load()
@@ -212,8 +220,10 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self.close()
 
     def _load(self) -> None:
-        if not self.path.exists():
-            if self._read_only:
+        try:
+            raw = read_session_file(self.directory_fd, "conversation.jsonl")
+        except FileNotFoundError:
+            if self._read_only or self._must_exist:
                 raise ConversationIntegrityError(f"conversation file is missing: {self.path}")
             self._entries = []
             header = {
@@ -225,7 +235,6 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             self._write_line({"type": "header", "data": header})
             return
 
-        raw = self.path.read_bytes()
         lines = raw.splitlines(keepends=True)
         valid_rows: list[dict[str, Any]] = []
         torn_offset: int | None = None
@@ -300,7 +309,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 self._validate_fork_entry(entry)
 
         if torn_offset is not None:
-            with self.path.open("r+b") as handle:
+            with os.fdopen(open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDWR), "r+b") as handle:
                 handle.truncate(torn_offset)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -314,10 +323,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
                 stacklevel=2,
             )
         elif not self._read_only and not raw.endswith(b"\n"):
-            with self.path.open("ab") as handle:
-                handle.write(b"\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            self._write_bytes(b"\n")
 
     def set_bash_cwd(self, cwd: str | Path) -> None:
         """Persist the shell's current directory outside the append-only log."""
@@ -367,9 +373,9 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             self._write_session_state(self.bash_cwd, normalized)
 
     def _load_session_state(self) -> None:
-        if self.state_path.exists():
-            value = load_session_json(self.state_path)
-        else:
+        try:
+            value = load_session_json(read_session_file(self.directory_fd, "session_state.json"))
+        except FileNotFoundError:
             if not self._read_only:
                 self._write_session_state(self.cwd, ())
             value = {"bash_cwd": self.cwd}
@@ -398,8 +404,11 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._agent_parent = agent_state["agent_parent"]
         self._agent_canceled = agent_state["agent_canceled"]
         self._agent_lifecycle = None
-        if self.agent_lifecycle_path.exists():
-            lifecycle = load_session_json(self.agent_lifecycle_path)
+        try:
+            lifecycle = load_session_json(read_session_file(self.directory_fd, "agent_lifecycle.json"))
+        except FileNotFoundError:
+            pass
+        else:
             if type(lifecycle) is not dict:
                 raise ConversationIntegrityError(
                     f"agent lifecycle is invalid: {self.agent_lifecycle_path}"
@@ -422,25 +431,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             agent_parent=self._agent_parent,
             agent_canceled=self._agent_canceled,
         )
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=self.session_dir,
-                prefix=".session_state.",
-                suffix=".tmp",
-                delete=False,
-            ) as temporary:
-                temporary_path = Path(temporary.name)
-                json.dump(state, temporary, separators=(",", ":"))
-                temporary.write("\n")
-                temporary.flush()
-                os.fsync(temporary.fileno())
-            os.replace(temporary_path, self.state_path)
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+        write_session_json(self.directory_fd, "session_state.json", state)
 
     def _validate_entries(self) -> None:
         ids: set[str] = set()
@@ -683,7 +674,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._write_bytes(encoded)
 
     def _write_bytes(self, line: bytes) -> None:
-        with self.path.open("ab") as handle:
+        with os.fdopen(open_session_file(self.directory_fd, "conversation.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT), "ab") as handle:
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
@@ -692,7 +683,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
     def _append_lock(self, *, deadline: float | None = None) -> Iterator[None]:
         if self._closed:
             raise ValueError("session store is closed")
-        with self.lock_path.open("a+") as handle:
+        with os.fdopen(open_session_file(self.directory_fd, ".lock", os.O_RDWR | os.O_CREAT), "r+") as handle:
             if deadline is None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             else:
