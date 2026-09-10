@@ -35,6 +35,17 @@ references to one resolved path produce one attachment block.
 - `ctrl+x ctrl+o` expands or collapses the newest child card.
 - `ctrl+o` keeps its native prompt-toolkit behavior in the composer.
 
+## copying the chat
+
+The transcript sits on the alternate screen with mouse reporting on, so a
+plain drag-select scrolls instead of selecting, and a modifier-drag grabs card
+borders and margins. `/copy` puts the whole chat on the system clipboard as
+border-free plain text: user lines are quoted with `> `, assistant markdown is
+kept as source, and provider errors appear untruncated. `/copy last` copies
+only the newest user message and everything after it. Without a clipboard
+tool (`pbcopy`, `wl-copy`, `xclip`, or `xsel`) the text is written to
+`transcript-<stamp>.txt` in the session directory and the path is shown.
+
 ## exec macro example
 
 Create `~/.zeta/commands/rebuild.md` for a local `/rebuild` macro:

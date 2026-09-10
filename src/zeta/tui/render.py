@@ -187,13 +187,27 @@ def _strip_terminal_controls(value: str) -> str:
     )
 
 
-def _safe_text(value: str, *, style: str) -> Text:
+def _safe_text(value: str, *, style: str, wrap: bool = False) -> Text:
     return Text.from_ansi(
         _strip_terminal_controls(value),
         style=style,
-        overflow="ellipsis",
-        no_wrap=True,
+        overflow="fold" if wrap else "ellipsis",
+        no_wrap=not wrap,
     )
+
+
+class ErrorCard(Panel):
+    """Error panel that also keeps its untruncated text for ``/copy``.
+
+    The screen bounds the reason so one bad response cannot flood the
+    transcript, but a debugging paste needs the whole provider message.
+    """
+
+    def __init__(
+        self, renderable: RenderableType, *, plain_export: str, **kwargs: Any
+    ) -> None:
+        super().__init__(renderable, **kwargs)
+        self.plain_export = plain_export
 
 
 def render_error_card(event: StreamEvent) -> Panel:
@@ -202,18 +216,19 @@ def render_error_card(event: StreamEvent) -> Panel:
     error = event.error
     code = error.code if error is not None and error.code else "backend_error"
     raw_reason = error.message if error is not None else "unknown error"
-    reason = _strip_terminal_controls(raw_reason).strip()
-    reason = reason or "unknown error"
+    full_reason = _strip_terminal_controls(raw_reason).strip() or "unknown error"
     try:
-        is_json_payload = json.loads(reason) is not None
+        is_json_payload = json.loads(full_reason) is not None
     except (json.JSONDecodeError, TypeError):
         is_json_payload = False
-    reason = _truncate(reason, MAX_ERROR_REASON)
+    reason = _truncate(full_reason, MAX_ERROR_REASON)
     retryable = is_retryable_error(error)
     title = "provider failure" if retryable else "error"
-    content: list[RenderableType] = [Text(f"{title} · {code}", style=theme.ERROR)]
+    heading = f"{title} · {code}"
+    content: list[RenderableType] = [Text(heading, style=theme.ERROR)]
     if not is_json_payload:
-        content.append(_safe_text(f"reason: {reason}", style=theme.BODY))
+        content.append(_safe_text(f"reason: {reason}", style=theme.BODY, wrap=True))
+        plain_export = f"{heading}\nreason: {full_reason}"
     else:
         content.extend(
             (
@@ -227,10 +242,12 @@ def render_error_card(event: StreamEvent) -> Panel:
                 ),
             )
         )
+        plain_export = f"{heading}\npayload · json\n{full_reason}"
     if retryable:
         content.append(Text("retry: ctrl+y", style=theme.AFFORDANCE))
-    return Panel(
+    return ErrorCard(
         Group(*content),
+        plain_export=plain_export,
         border_style=theme.ERROR,
         style=theme.CARD_BG,
         padding=(0, 1),

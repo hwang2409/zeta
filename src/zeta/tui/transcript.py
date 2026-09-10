@@ -174,6 +174,17 @@ class TranscriptWidget(UIControl):
     def units(self) -> tuple[RenderableType | None | _ToolUnit, ...]:
         return tuple(unit.value if unit is not None else None for unit in self._units)
 
+    def export_entries(
+        self,
+    ) -> tuple[tuple[RenderableType | None | _ToolUnit, bool], ...]:
+        """Pair each logical unit with whether it is a user message, for /copy."""
+
+        user_keys = {unit.key for unit in self._user_units}
+        return tuple(
+            (unit.value, unit.key in user_keys) if unit is not None else (None, False)
+            for unit in self._units
+        )
+
     @property
     def has_active_agent(self) -> bool:
         return any(unit.active_card for unit in self._tools.values())
