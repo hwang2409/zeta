@@ -180,6 +180,12 @@ class TranscriptWidget(UIControl):
             tuple[int, int, str], list[SearchMatch]
         ] = OrderedDict()
         self._highlight_cache: tuple[tuple[int, int, str], HighlightCache] | None = None
+        # Per-unit paint caches, validated by the identity of the unit's cached
+        # render string: a streaming token re-renders one unit, so only that
+        # unit is re-parsed and re-mapped instead of the whole transcript.
+        self._unit_lines_cache: dict[int, tuple[str, list[list[tuple[str, str]]]]] = {}
+        self._unit_locations_cache: dict[int, tuple[str, list[str], list[int]]] = {}
+        self._keyed_cache: tuple[int, int, list[tuple[int | None, int]]] | None = None
         self._selection: AnchoredSelection | None = None
         self._prefix_lines = 0
         self._copy_handler: Callable[[str], str | None] | None = None
@@ -245,6 +251,8 @@ class TranscriptWidget(UIControl):
         if unit in self._user_units:
             self._user_units.remove(unit)
         self._render_cache.pop(unit.key, None)
+        self._unit_lines_cache.pop(unit.key, None)
+        self._unit_locations_cache.pop(unit.key, None)
         self._bump_revision()
 
     def append_blank(self) -> None:
@@ -259,6 +267,9 @@ class TranscriptWidget(UIControl):
         self._card_units.clear()
         self._render_cache.clear()
         self._parsed_cache.clear()
+        self._unit_lines_cache.clear()
+        self._unit_locations_cache.clear()
+        self._keyed_cache = None
         self._line_locations.clear()
         self._locations_cache.clear()
         self._anchor = None
@@ -454,6 +465,10 @@ class TranscriptWidget(UIControl):
         return "\n".join(lines)
 
     def _search_matches(self, width: int | None = None) -> list[SearchMatch]:
+        if not self._search_query:
+            # No query means no matches; skip flattening the whole transcript.
+            self._search_index = 0
+            return []
         actual_width = width or self._content_width
         cache_key = (actual_width, self._revision, self._search_query)
         matches = self._search_cache.get(cache_key)
@@ -605,13 +620,45 @@ class TranscriptWidget(UIControl):
     def lines(self, width: int) -> list[str]:
         return self.render(width).splitlines()
 
+    def _unit_parsed_lines(
+        self, unit: _TranscriptUnit, width: int
+    ) -> list[list[tuple[str, str]]]:
+        """Parse one unit's render into fragment lines, reusing it while unchanged."""
+
+        rendered = self._render_unit(unit, width)
+        cached = self._unit_lines_cache.get(unit.key)
+        if cached is not None and cached[0] is rendered:
+            return cached[1]
+        lines = list(split_lines(to_formatted_text(ANSI(rendered)))) if rendered else [[]]
+        self._unit_lines_cache[unit.key] = (rendered, lines)
+        return lines
+
+    def _assembled_lines(self, width: int) -> list[list[tuple[str, str]]]:
+        """Concatenate per-unit fragment lines; mirrors ``_base_render`` trimming."""
+
+        lines: list[list[tuple[str, str]]] = []
+        for unit in self._units:
+            if unit is None:
+                lines.append([])
+            else:
+                lines.extend(self._unit_parsed_lines(unit, width))
+        while lines and not lines[-1]:
+            lines.pop()
+        while lines and not "".join(fragment[1] for fragment in lines[0]).strip():
+            lines.pop(0)
+        return lines or [[]]
+
     def _parsed_lines(self, width: int) -> list[list[tuple[str, str]]]:
         cached = self._parsed_cache.get(width)
         if cached is not None:
             self._parsed_cache.move_to_end(width)
             return cached
-        fragments = to_formatted_text(ANSI(self.render(width)))
-        lines = list(split_lines(fragments)) or [[]]
+        if self._search_active and self._search_query:
+            # Search highlights restyle matched lines across the whole render.
+            fragments = to_formatted_text(ANSI(self.render(width)))
+            lines = list(split_lines(fragments)) or [[]]
+        else:
+            lines = self._assembled_lines(width)
         self._parsed_cache[width] = lines
         self._parsed_cache.move_to_end(width)
         while len(self._parsed_cache) > 3:
@@ -630,38 +677,54 @@ class TranscriptWidget(UIControl):
             self._locations_cache.popitem(last=False)
         return locations
 
+    def _unit_locations(
+        self, unit: _TranscriptUnit, width: int
+    ) -> tuple[list[str], list[int]]:
+        """Map one unit's rendered lines to source offsets, reusing while unchanged."""
+
+        rendered = self._render_unit(unit, width)
+        cached = self._unit_locations_cache.get(unit.key)
+        if cached is not None and cached[0] is rendered:
+            return cached[1], cached[2]
+        rendered_lines = self._plain_lines(rendered)
+        renderable = (
+            unit.value.renderable
+            if isinstance(unit.value, _ToolUnit)
+            else unit.value
+        )
+        source = getattr(renderable, "plain", None)
+        if not isinstance(source, str):
+            source = "\n".join(
+                self._strip_padding(line) for line in rendered_lines
+            )
+        offsets: list[int] = []
+        source_offset = 0
+        for line in rendered_lines:
+            content = self._strip_padding(line)
+            offset = source.find(content, source_offset)
+            matched_length = len(content)
+            if offset < 0:
+                match = re.search(r"[\w]+(?:[-'][\w]+)*", content)
+                if match is not None:
+                    offset = source.find(match.group(), source_offset)
+                    matched_length = len(match.group())
+                if offset < 0:
+                    offset = source_offset
+            offsets.append(offset)
+            source_offset = offset + matched_length
+        self._unit_locations_cache[unit.key] = (rendered, rendered_lines, offsets)
+        return rendered_lines, offsets
+
     def _compute_locations(self, width: int) -> list[tuple[_TranscriptUnit | None, int]]:
         raw_lines: list[tuple[str, _TranscriptUnit | None, int]] = []
         for unit in self._units:
             if unit is None:
                 raw_lines.append(("", None, 0))
                 continue
-            rendered = self._render_unit(unit, width)
-            rendered_lines = self._plain_lines(rendered)
-            renderable = (
-                unit.value.renderable
-                if isinstance(unit.value, _ToolUnit)
-                else unit.value
+            rendered_lines, offsets = self._unit_locations(unit, width)
+            raw_lines.extend(
+                (line, unit, offset) for line, offset in zip(rendered_lines, offsets)
             )
-            source = getattr(renderable, "plain", None)
-            if not isinstance(source, str):
-                source = "\n".join(
-                    self._strip_padding(line) for line in rendered_lines
-                )
-            source_offset = 0
-            for line in rendered_lines:
-                content = self._strip_padding(line)
-                offset = source.find(content, source_offset)
-                matched_length = len(content)
-                if offset < 0:
-                    match = re.search(r"[\w]+(?:[-'][\w]+)*", content)
-                    if match is not None:
-                        offset = source.find(match.group(), source_offset)
-                        matched_length = len(match.group())
-                    if offset < 0:
-                        offset = source_offset
-                raw_lines.append((line, unit, offset))
-                source_offset = offset + matched_length
         while raw_lines and not raw_lines[0][0].strip():
             raw_lines.pop(0)
         return [(unit, text_offset) for _, unit, text_offset in raw_lines]
@@ -775,13 +838,19 @@ class TranscriptWidget(UIControl):
         self._selection = None
         self.copy_notice = None
 
-    @staticmethod
-    def _keyed(
-        locations: list[tuple[_TranscriptUnit | None, int]],
-    ) -> list[tuple[int | None, int]]:
-        return [
-            (unit.key if unit is not None else None, offset) for unit, offset in locations
+    def _keyed_locations(self) -> list[tuple[int | None, int]]:
+        """Locations as ``(unit key, offset)`` pairs, cached per width and revision."""
+
+        width = self._content_width
+        cached = self._keyed_cache
+        if cached is not None and cached[0] == width and cached[1] == self._revision:
+            return cached[2]
+        keyed = [
+            (unit.key if unit is not None else None, offset)
+            for unit, offset in self._locations(width)
         ]
+        self._keyed_cache = (width, self._revision, keyed)
+        return keyed
 
     def _anchor_for(self, cell: Cell) -> SelectionAnchor:
         """Pin a row/column to the unit and text offset rendered there."""
@@ -803,12 +872,11 @@ class TranscriptWidget(UIControl):
         Only an end whose unit left the transcript (a fork or rebuild) drops it.
         """
 
+        del locations  # the keyed view is cached per width and revision
         anchored = self._selection
         if anchored is None:
             return None
-        if locations is None:
-            locations = self._locations(self._content_width)
-        resolved = anchored.resolve(self._keyed(locations))
+        resolved = anchored.resolve(self._keyed_locations())
         if resolved is None:
             self._selection = None
         return resolved
@@ -859,7 +927,7 @@ class TranscriptWidget(UIControl):
             return None
         if event_type is MouseEventType.MOUSE_UP:
             released = selection.released(self._anchor_for(cell))
-            resolved = released.resolve(self._keyed(self._locations(self._content_width)))
+            resolved = released.resolve(self._keyed_locations())
             if resolved is None or resolved.is_click:
                 self._selection = None
                 return None
