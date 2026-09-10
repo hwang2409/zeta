@@ -496,11 +496,39 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
     # session_root pins the trusted home, then opens "sessions" relative to it.
     # No absolute open of a session child belongs in this allowlist.
     root_pinning_opens = {(str(home), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)}
-    path_arguments = {"open": (0,), "os.rename": (0, 1), "os.remove": (0,), "os.mkdir": (0,)}
+    path_arguments = {
+        "open": (0,), "os.rename": (0, 1), "os.remove": (0,), "os.mkdir": (0,),
+        "os.rmdir": (0,), "os.scandir": (0,), "os.listdir": (0,),
+        "os.stat": (0,), "os.lstat": (0,),
+    }
 
     def audit(event, args):
         if recording and event in path_arguments:
             events.append((event, args))
+
+    # CPython emits no stat/lstat audit events. Wrap their Python entry points
+    # as well, covering Path.stat/lstat/exists/is_file and descriptor-safe calls.
+    def checked_stat(function):
+        def call(path, *args, **kwargs):
+            audit("os." + function.__name__, (path,))
+            return function(path, *args, **kwargs)
+        return call
+
+    for name in ("stat", "lstat"):
+        monkeypatch.setattr(os, name, checked_stat(getattr(os, name)))
+
+    def violations():
+        found = []
+        for event, args in events:
+            if event == "open" and (args[0], args[2]) in root_pinning_opens:
+                continue
+            for index in path_arguments[event]:
+                path = args[index]
+                if isinstance(path, (str, bytes, os.PathLike)):
+                    path = Path(os.fsdecode(path))
+                    if path.is_absolute() and path.is_relative_to(sessions):
+                        found.append((event, path))
+        return found
 
     sys.addaudithook(audit)
     runtime = None
@@ -541,19 +569,30 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
         if runtime is not None:
             await runtime.close()
         recording = False
-    assert set(path_arguments) <= {event for event, _ in events}
+    assert {"open", "os.rename", "os.remove", "os.mkdir"} <= {event for event, _ in events}
     assert any(event == "open" and (args[0], args[2]) in root_pinning_opens for event, args in events)
-    violations = []
-    for event, args in events:
-        if event == "open" and (args[0], args[2]) in root_pinning_opens:
-            continue
-        for index in path_arguments[event]:
-            path = args[index]
-            if isinstance(path, (str, bytes)):
-                path = Path(os.fsdecode(path))
-                if path.is_absolute() and path.is_relative_to(sessions):
-                    violations.append((event, args))
-    assert not violations
+    assert not violations()
+
+    # Each negative control uses the same listener and predicate as the runtime.
+    # Prepare the fixture while recording is off, then isolate each operation.
+    probe = sessions / "audit-probe"
+    probe.mkdir()
+    try:
+        for event, operation in (
+            ("os.scandir", lambda: os.scandir(probe).close()),
+            ("os.listdir", lambda: os.listdir(probe)),
+            ("os.stat", probe.stat),
+            ("os.stat", probe.lstat),
+            ("os.lstat", lambda: os.lstat(probe)),
+            ("os.rmdir", probe.rmdir),
+        ):
+            events.clear()
+            recording = True
+            operation()
+            recording = False
+            assert (event, probe) in violations()
+    finally:
+        recording = False
 
 
 async def test_background_descriptor_keeps_lease_until_registry_close(tmp_path):
