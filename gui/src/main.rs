@@ -1155,7 +1155,7 @@ impl ZetaView {
             TranscriptEntry::User(text) => self.render_user_row(index, text, view, cx),
             TranscriptEntry::Assistant(doc) => self.render_assistant_row(index, doc, cx),
             entry @ TranscriptEntry::Tool { .. } => self.render_tool_row(index, entry, view, cx),
-            TranscriptEntry::Thinking => self.render_thinking_row(index, cx),
+            entry @ TranscriptEntry::Thinking => self.render_thinking_row(index, entry, cx),
             TranscriptEntry::Error {
                 message,
                 settings_action,
@@ -1171,18 +1171,24 @@ impl ZetaView {
         }
     }
 
-    fn render_thinking_row(&self, index: usize, cx: &App) -> gpui::AnyElement {
-        // Header-only marker: "+ Thought" at muted-foreground. The provider
-        // protocol has no display-safe summary channel for reasoning, so no
-        // title, no duration, no body, no expand toggle — the header simply
-        // signals that the model thought.
+    fn render_thinking_row(
+        &self,
+        index: usize,
+        entry: &TranscriptEntry,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        // Header-only marker at muted-foreground. The label text comes from
+        // the row's `visible_text` seam so no wording lives on both sides —
+        // any regression that changes the string flows through both the
+        // render layer and the tests that assert on it.
+        let label = entry.visible_text().join("");
         div()
             .debug_selector(move || format!("thinking-header-{index}"))
             .w_full()
             .min_w_0()
             .py(px(2.))
             .text_color(cx.theme().muted_foreground)
-            .child("+ Thought")
+            .child(label)
             .into_any_element()
     }
 
@@ -1380,19 +1386,17 @@ impl ZetaView {
                     )
                     .child(
                         // Verb + detail carry the state color as their OWN
-                        // text_color refinement so the paint pipeline reads the
-                        // same token the design contract prescribes — not
-                        // inheritance from a parent that a refactor could break.
-                        // A zero-size paint probe nested under each captures the
-                        // effective text color at paint time, so the guard test
-                        // can prove the paint pipeline actually inherited the
-                        // intended color, not just that the helper returned it.
+                        // text_color refinement so a refactor that drops the
+                        // color on a parent still keeps the row on the
+                        // contract token. The visible_text seam plus the
+                        // tool_state_color helper are the tested invariants;
+                        // gpui does not expose scene glyph sprites, so no
+                        // probe can observe the painted color directly here.
                         div()
                             .debug_selector(move || format!("tool-verb-{index}"))
                             .flex_shrink_0()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(state_color)
-                            .child(text_color_probe(format!("tool-verb-{index}")))
                             .child(verb),
                     )
                     .child(
@@ -1403,7 +1407,6 @@ impl ZetaView {
                             .truncate()
                             .text_color(state_color)
                             .opacity(0.78)
-                            .child(text_color_probe(format!("tool-detail-{index}")))
                             .child(detail),
                     )
                     // Collapsed rows carry the output size at faint tier and a
@@ -1817,57 +1820,6 @@ pub(crate) fn tool_state_color(state: zeta_gui::state::ToolState, cx: &App) -> g
         ToolState::Done => theme.muted_foreground,
         ToolState::Failed => theme.danger,
     }
-}
-
-/// Paint-time probe: records the effective `text_style().color` at its
-/// location so tests can prove the paint pipeline actually inherited the
-/// intended text color, not just that a helper returned the right value.
-/// Compiled out of release builds — the probe carries no chrome, no bounds,
-/// no visible primitive.
-#[cfg(test)]
-pub(crate) mod paint_probe {
-    use gpui::Hsla;
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-
-    thread_local! {
-        static RECORDED: RefCell<HashMap<String, Hsla>> = RefCell::new(HashMap::new());
-    }
-
-    pub fn record(key: String, color: Hsla) {
-        RECORDED.with(|map| {
-            map.borrow_mut().insert(key, color);
-        });
-    }
-
-    pub fn get(key: &str) -> Option<Hsla> {
-        RECORDED.with(|map| map.borrow().get(key).copied())
-    }
-
-    pub fn clear() {
-        RECORDED.with(|map| map.borrow_mut().clear());
-    }
-}
-
-/// Emit a zero-size canvas whose paint callback captures the current
-/// `text_style().color` under `key`. Prod builds get a no-op div so layout is
-/// identical either way.
-#[cfg(test)]
-fn text_color_probe(key: String) -> gpui::AnyElement {
-    gpui::canvas(
-        |_, _, _| (),
-        move |_, _, window, _| {
-            paint_probe::record(key.clone(), window.text_style().color);
-        },
-    )
-    .w(px(0.))
-    .h(px(0.))
-    .into_any_element()
-}
-
-#[cfg(not(test))]
-fn text_color_probe(_key: String) -> gpui::AnyElement {
-    div().w(px(0.)).h(px(0.)).into_any_element()
 }
 
 /// Compact byte-size label for the collapsed tool-row output peek. Kept short

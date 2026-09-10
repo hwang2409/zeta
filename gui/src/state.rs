@@ -72,7 +72,43 @@ impl TranscriptEntry {
             ToolState::Running
         }
     }
+
+    /// Ordered visible strings the render layer paints for this row.
+    /// Single seam: any string that reaches the user through the row's own
+    /// text elements (not framing chrome like a chevron icon or a hover hint)
+    /// flows through this collection. Tests read this to prove that no
+    /// synthetic state marker ("[working]/[done]/[failed]/[canceled]") ever
+    /// reaches a visible row and that a `Thinking` payload carrying a
+    /// sentinel contributes nothing containing the sentinel to any row.
+    pub fn visible_text(&self) -> Vec<String> {
+        match self {
+            Self::User(text) => vec![text.clone()],
+            Self::Assistant(doc) => vec![doc.source.to_string()],
+            Self::Error { message, .. } => vec!["Error".to_owned(), message.clone()],
+            Self::Thinking => vec![THINKING_HEADER_LABEL.to_owned()],
+            Self::Tool {
+                name,
+                summary,
+                card,
+                ..
+            } => {
+                let mut strings = vec![name.clone(), summary.clone()];
+                if card.expanded {
+                    if card.tail.truncated {
+                        strings.push("Earlier output omitted".to_owned());
+                    }
+                    strings.push(card.tail.text.clone());
+                }
+                strings
+            }
+        }
+    }
 }
+
+/// Single source of truth for the thinking marker text. Both `visible_text`
+/// and the render layer read this constant so no wording lives on both sides
+/// of the seam.
+pub const THINKING_HEADER_LABEL: &str = "+ Thought";
 
 /// Semantic tool row state; the render layer maps each variant to a theme
 /// token per the wiki contract (running=foreground, done=muted_foreground,
@@ -541,22 +577,49 @@ impl AppState {
                 assistant_text.push_str(text);
             }
         }
+        // Reconcile against the active turn: streamed deltas may already have
+        // emitted a Thinking marker and/or an Assistant row for this same turn.
+        // The active turn is every entry after the last user or error row —
+        // those are the only entries that separate one turn from the next.
+        // `last()` alone is not enough: with mixed content, streaming yields
+        // [Thinking, Assistant], and matching only against the tail would
+        // duplicate both when the final mixed AssistantMessage arrives.
+        let turn_start = self
+            .transcript
+            .iter()
+            .rposition(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::User(_) | TranscriptEntry::Error { .. }
+                )
+            })
+            .map_or(0, |index| index + 1);
+        let has_thinking_marker = self.transcript[turn_start..]
+            .iter()
+            .any(|entry| matches!(entry, TranscriptEntry::Thinking));
         let mut changed = None;
         // Thinking body text is never retained — the provider protocol mixes
         // raw reasoning with any summary, so we only guarantee that a
         // header-only marker exists when the turn thought at all.
-        if has_thinking && !matches!(self.transcript.last(), Some(TranscriptEntry::Thinking)) {
+        if has_thinking && !has_thinking_marker {
             self.transcript.push(TranscriptEntry::Thinking);
             changed = self.transcript.len().checked_sub(1);
         }
         if !assistant_text.is_empty() {
-            match self.transcript.last_mut() {
-                Some(TranscriptEntry::Assistant(current)) => *current = assistant_text.into(),
-                _ => self
-                    .transcript
-                    .push(TranscriptEntry::Assistant(assistant_text.into())),
+            let existing = self.transcript[turn_start..]
+                .iter()
+                .rposition(|entry| matches!(entry, TranscriptEntry::Assistant(_)))
+                .map(|offset| turn_start + offset);
+            if let Some(index) = existing {
+                if let TranscriptEntry::Assistant(current) = &mut self.transcript[index] {
+                    *current = assistant_text.into();
+                }
+                changed = Some(index);
+            } else {
+                self.transcript
+                    .push(TranscriptEntry::Assistant(assistant_text.into()));
+                changed = self.transcript.len().checked_sub(1);
             }
-            changed = self.transcript.len().checked_sub(1);
         }
         changed
     }
@@ -794,6 +857,51 @@ mod tests {
         assert_eq!(
             state.transcript,
             vec![TranscriptEntry::Assistant("hello".into())]
+        );
+    }
+
+    #[test]
+    fn streamed_mixed_turn_reconciles_without_duplicating_rows() {
+        // Regression: with mixed content, the stream emits a thinking delta
+        // (which pushes the Thinking marker) and a text delta (which pushes the
+        // Assistant row). The final AssistantMessage carries BOTH blocks. The
+        // old reconciler only checked `last()`, so it saw the Assistant on top
+        // and pushed a second Thinking, then found the second Thinking on top
+        // and pushed a second Assistant — [Thinking, Assistant, Thinking,
+        // Assistant]. Reconciliation must update the existing rows in place.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "reasoning trace".into(),
+            kind: "thinking".into(),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "hello".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![
+                    crate::client::ContentBlock::Thinking {
+                        text: "reasoning trace".into(),
+                    },
+                    crate::client::ContentBlock::Text {
+                        text: "hello".into(),
+                    },
+                ],
+            },
+        });
+        assert_eq!(state.transcript.len(), 2, "no rows should duplicate");
+        assert!(matches!(state.transcript[0], TranscriptEntry::Thinking));
+        assert!(
+            matches!(&state.transcript[1], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "hello")
         );
     }
 
