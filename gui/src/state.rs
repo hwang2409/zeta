@@ -92,11 +92,12 @@ impl TranscriptEntry {
                 card,
                 ..
             } => {
+                // Dynamic body text only: name at 0, summary at 1, and the
+                // expanded output tail at 2 when the card is open. Fixed
+                // chrome (headings, hints, unit suffixes) lives in the
+                // render-layer chrome module — one home per literal.
                 let mut strings = vec![name.clone(), summary.clone()];
                 if card.expanded {
-                    if card.tail.truncated {
-                        strings.push("Earlier output omitted".to_owned());
-                    }
                     strings.push(card.tail.text.clone());
                 }
                 strings
@@ -140,6 +141,12 @@ pub struct AppState {
     pub streaming: bool,
     pub thinking: bool,
     assistant_started: bool,
+    /// Index into `transcript` where the current server turn began. Set to
+    /// `transcript.len()` on every `TurnStart`, and to 0 at construction /
+    /// session switch / history replay. `commit_assistant` reconciles only
+    /// against rows at or after this index, so a spontaneous second turn (no
+    /// user row of its own) never merges into the previous turn's rows.
+    turn_start: usize,
     pub metrics: StatusMetrics,
     pub metrics_boundary: bool,
 }
@@ -158,6 +165,7 @@ impl Default for AppState {
             streaming: false,
             thinking: false,
             assistant_started: false,
+            turn_start: 0,
             metrics: StatusMetrics::default(),
             metrics_boundary: true,
         }
@@ -169,6 +177,7 @@ impl AppState {
         use crate::client::HistoryContent;
         if replace {
             self.transcript.clear();
+            self.turn_start = 0;
         }
         self.session_view.message_ids.clear();
         self.session_view.attachments.clear();
@@ -268,6 +277,7 @@ impl AppState {
         self.active_session = session_id;
         self.thinking = false;
         self.assistant_started = false;
+        self.turn_start = self.transcript.len();
         self.session_view = crate::session::SessionView {
             available: self.session_view.available,
             ..Default::default()
@@ -302,6 +312,10 @@ impl AppState {
                 self.thinking = false;
                 self.assistant_started = false;
                 self.metrics_boundary = false;
+                // Anchor reconciliation for this turn to the current tail so
+                // streamed rows and the final AssistantMessage merge here
+                // without folding into the previous turn's rows.
+                self.turn_start = self.transcript.len();
             }
             ServerEvent::AgentEnd { .. } | ServerEvent::TurnAborted { .. } => {
                 self.streaming = false;
@@ -577,23 +591,13 @@ impl AppState {
                 assistant_text.push_str(text);
             }
         }
-        // Reconcile against the active turn: streamed deltas may already have
-        // emitted a Thinking marker and/or an Assistant row for this same turn.
-        // The active turn is every entry after the last user or error row —
-        // those are the only entries that separate one turn from the next.
-        // `last()` alone is not enough: with mixed content, streaming yields
-        // [Thinking, Assistant], and matching only against the tail would
-        // duplicate both when the final mixed AssistantMessage arrives.
-        let turn_start = self
-            .transcript
-            .iter()
-            .rposition(|entry| {
-                matches!(
-                    entry,
-                    TranscriptEntry::User(_) | TranscriptEntry::Error { .. }
-                )
-            })
-            .map_or(0, |index| index + 1);
+        // Reconcile against the active turn only. `self.turn_start` is set to
+        // `transcript.len()` on every `TurnStart`, so streamed rows plus the
+        // final `AssistantMessage` in the SAME turn merge here — while a
+        // spontaneous second turn (no fresh user row) never folds into the
+        // previous turn's Thinking or Assistant rows. Clamped defensively in
+        // case a mutation trimmed the transcript after the last TurnStart.
+        let turn_start = self.turn_start.min(self.transcript.len());
         let has_thinking_marker = self.transcript[turn_start..]
             .iter()
             .any(|entry| matches!(entry, TranscriptEntry::Thinking));
@@ -1162,6 +1166,198 @@ mod tests {
                 message: text, settings_action, ..
             } if text == message && *settings_action == expected));
         }
+    }
+
+    /// Assemble a stream: TurnStart, one or more AssistantDelta chunks, then
+    /// the final `AssistantMessage`. Returns the resulting transcript so the
+    /// test can compare live and replay shapes byte for byte.
+    fn stream_turn(state: &mut AppState, deltas: &[(&str, &str)], final_blocks: Vec<ContentBlock>) {
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        for (kind, delta) in deltas {
+            state.apply(ServerEvent::AssistantDelta {
+                session_id: None,
+                delta: (*delta).into(),
+                kind: (*kind).into(),
+            });
+        }
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: final_blocks,
+            },
+        });
+        state.apply(ServerEvent::TurnEnd {
+            session_id: None,
+            data: json!({}),
+        });
+    }
+
+    #[test]
+    fn final_only_second_turn_appends_without_editing_the_first_turn() {
+        // Turn 1 leaves an Assistant row on the transcript. Turn 2 emits no
+        // user prompt and no streamed deltas — only a final AssistantMessage.
+        // The old User/Error boundary scan treated the previous turn's row as
+        // inside the current turn and overwrote it. Reconciliation must anchor
+        // on the TurnStart index so Turn 2's text lands on a NEW row.
+        let mut state = AppState::default();
+        stream_turn(
+            &mut state,
+            &[],
+            vec![ContentBlock::Text {
+                text: "first turn".into(),
+            }],
+        );
+        stream_turn(
+            &mut state,
+            &[],
+            vec![ContentBlock::Text {
+                text: "second turn".into(),
+            }],
+        );
+        assert_eq!(state.transcript.len(), 2, "second turn must append");
+        assert!(
+            matches!(&state.transcript[0], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "first turn")
+        );
+        assert!(
+            matches!(&state.transcript[1], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "second turn")
+        );
+    }
+
+    #[test]
+    fn thinking_only_second_turn_emits_its_own_marker_not_the_previous_one() {
+        // A pure-thinking turn following an assistant turn must push its own
+        // marker rather than reuse the earlier turn's Thinking row (which is
+        // what happens if reconciliation scans without a turn boundary).
+        let mut state = AppState::default();
+        stream_turn(
+            &mut state,
+            &[("thinking", "reasoning"), ("assistant", "hello")],
+            vec![
+                ContentBlock::Thinking {
+                    text: "reasoning".into(),
+                },
+                ContentBlock::Text {
+                    text: "hello".into(),
+                },
+            ],
+        );
+        stream_turn(
+            &mut state,
+            &[],
+            vec![ContentBlock::Thinking {
+                text: "silent turn".into(),
+            }],
+        );
+        assert_eq!(
+            state.transcript.len(),
+            3,
+            "third row is a new Thinking marker, not a merge into the first turn's marker"
+        );
+        assert!(matches!(state.transcript[0], TranscriptEntry::Thinking));
+        assert!(
+            matches!(&state.transcript[1], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "hello")
+        );
+        assert!(matches!(state.transcript[2], TranscriptEntry::Thinking));
+    }
+
+    #[test]
+    fn text_only_final_message_carries_over_one_row() {
+        // Baseline: a turn with no thinking and no streamed deltas produces a
+        // single Assistant row.
+        let mut state = AppState::default();
+        stream_turn(
+            &mut state,
+            &[],
+            vec![ContentBlock::Text {
+                text: "answer".into(),
+            }],
+        );
+        assert_eq!(state.transcript.len(), 1);
+        assert!(
+            matches!(&state.transcript[0], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "answer")
+        );
+    }
+
+    #[test]
+    fn mixed_streamed_then_final_matches_replay_of_the_same_event_sequence() {
+        // Two-turn conversation with mixed content in turn one and a
+        // final-only reply in turn two. The same event sequence must produce
+        // the same transcript whether played live or replayed after a
+        // session switch — proving replay is idempotent under the new
+        // turn-boundary reconciliation.
+        let events = |session: &str| {
+            vec![
+                ServerEvent::TurnStart {
+                    session_id: Some(session.to_owned()),
+                    data: json!({}),
+                },
+                ServerEvent::AssistantDelta {
+                    session_id: Some(session.to_owned()),
+                    delta: "trace".into(),
+                    kind: "thinking".into(),
+                },
+                ServerEvent::AssistantDelta {
+                    session_id: Some(session.to_owned()),
+                    delta: "hi".into(),
+                    kind: "assistant".into(),
+                },
+                ServerEvent::AssistantMessage {
+                    session_id: Some(session.to_owned()),
+                    message: Message {
+                        role: "assistant".into(),
+                        content: vec![
+                            ContentBlock::Thinking {
+                                text: "trace".into(),
+                            },
+                            ContentBlock::Text { text: "hi".into() },
+                        ],
+                    },
+                },
+                ServerEvent::TurnEnd {
+                    session_id: Some(session.to_owned()),
+                    data: json!({}),
+                },
+                ServerEvent::TurnStart {
+                    session_id: Some(session.to_owned()),
+                    data: json!({}),
+                },
+                ServerEvent::AssistantMessage {
+                    session_id: Some(session.to_owned()),
+                    message: Message {
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::Text {
+                            text: "followup".into(),
+                        }],
+                    },
+                },
+                ServerEvent::TurnEnd {
+                    session_id: Some(session.to_owned()),
+                    data: json!({}),
+                },
+            ]
+        };
+        let mut live = AppState::default();
+        for event in events("live") {
+            live.apply(event);
+        }
+        assert_eq!(live.transcript.len(), 3);
+        assert!(matches!(live.transcript[0], TranscriptEntry::Thinking));
+        assert!(
+            matches!(&live.transcript[1], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "hi")
+        );
+        assert!(
+            matches!(&live.transcript[2], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "followup")
+        );
+        // Replay in a fresh state produces the same shape.
+        let mut replay = AppState::default();
+        for event in events("replay") {
+            replay.apply(event);
+        }
+        assert_eq!(replay.transcript, live.transcript);
     }
 
     #[test]

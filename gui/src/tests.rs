@@ -411,17 +411,19 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
     // verb and detail text: running paints at foreground, done fades to
     // muted, failed lands on danger. No textual "[working]/[done]/[failed]"
     // marker may reach the row. This guard drives real tool rows through the
-    // state layer and asserts on the visible_text seam (no bracketed marker)
-    // plus the tool_state_color helper (contract token per state). gpui does
-    // not expose scene glyph sprites through its test-support surface, so
-    // there is no way to inspect the painted text color directly — the seam
-    // guarantees the row's TEXT carries no state marker, and the helper +
-    // the render layer's `.text_color(state_color)` refinement carry the
-    // color end-to-end.
+    // state layer and asserts on: (a) the `visible_text` seam (no bracketed
+    // marker), (b) the `tool_state_color` helper (contract token per state),
+    // and (c) the paint-probe (the ACTUAL color the render layer applied via
+    // `.text_color(state_color)`). Since gpui's public test surface exposes
+    // painted quads but not the scene's glyph sprites, the probe binds the
+    // renderer's applied color to the assertion; a regression that
+    // hard-codes a wrong token instead of routing through the helper is
+    // caught because it either records the wrong color or records nothing.
     use zeta_gui::state::ToolState;
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     for case in [ToolState::Running, ToolState::Done, ToolState::Failed] {
+        super::paint_probe::clear();
         visual.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.state.transcript.clear();
@@ -484,6 +486,28 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
                 expected,
                 "tool row state color regressed off the contract token"
             );
+            // Paint-probe: exactly one Tool sample for row 0 must land with
+            // the expected color. Recorded inside `render_tool_row` right
+            // where the SAME `state_color` value flows into `.text_color`
+            // on the verb, detail, and chevron icon — so a divergence
+            // between the helper and the applied color is caught.
+            let samples = super::paint_probe::samples();
+            let tool_samples: Vec<_> = samples
+                .iter()
+                .filter(|sample| {
+                    matches!(sample.row, super::paint_probe::Row::Tool) && sample.index == 0
+                })
+                .collect();
+            assert!(
+                !tool_samples.is_empty(),
+                "render_tool_row must record a paint-probe sample for {case:?}"
+            );
+            for sample in &tool_samples {
+                assert_eq!(
+                    sample.color, expected,
+                    "tool row {case:?} painted its glyphs at the wrong color"
+                );
+            }
         });
         // The verb and detail elements paint their bounds — the color check
         // above proves the contract token is on the entry; this pins the
@@ -564,6 +588,49 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
             });
         }
     }
+}
+
+#[test]
+fn every_row_text_flows_through_the_visible_seam_or_chrome_module() {
+    // No renderer may sneak dynamic body text past `visible_text` and no
+    // chrome literal may sneak past the `chrome` module. Iterating both and
+    // asserting on the joined string catches a regression that adds a
+    // bracketed state marker anywhere the user can read it.
+    let markers = ["[working]", "[done]", "[failed]", "[canceled]"];
+    let entries = [
+        TranscriptEntry::User("hi".into()),
+        TranscriptEntry::Assistant("hello".into()),
+        TranscriptEntry::Thinking,
+        TranscriptEntry::Error {
+            message: "boom".into(),
+            settings_action: false,
+            login_provider: None,
+        },
+    ];
+    for entry in &entries {
+        for text in entry.visible_text() {
+            for marker in markers {
+                assert!(
+                    !text.contains(marker),
+                    "visible_text carried {marker} in {text:?}"
+                );
+            }
+        }
+    }
+    for literal in super::chrome::ALL {
+        for marker in markers {
+            assert!(
+                !literal.contains(marker),
+                "chrome literal {literal:?} carried state marker {marker}"
+            );
+        }
+    }
+    // Thinking's visible text is exactly the generic header — no wording
+    // duplication between state.rs and the render layer.
+    assert_eq!(
+        TranscriptEntry::Thinking.visible_text(),
+        vec![zeta_gui::state::THINKING_HEADER_LABEL.to_owned()]
+    );
 }
 
 #[gpui::test]
@@ -1617,6 +1684,7 @@ fn thinking_row_paints_a_generic_header_and_never_leaks_private_reasoning(cx: &m
     // through both paths and asserts the sentinel never surfaces in state or
     // in painted text, and that the generic "+ Thought" header renders.
     use zeta_gui::client::{ContentBlock, Message};
+    super::paint_probe::clear();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let sentinel = "SECRET-PRIVATE-REASONING-NEVER-DISPLAY";
@@ -1693,6 +1761,28 @@ fn thinking_row_paints_a_generic_header_and_never_leaks_private_reasoning(cx: &m
         header_bounds.size.width > px(0.),
         "header bounds must have non-zero width so glyphs paint"
     );
+    // Paint-probe: `render_thinking_row` records the exact color it applied
+    // through `.text_color(...)`. The thinking header sits at
+    // `muted_foreground`; a regression that repaints it at accent or danger
+    // fails here.
+    visual.update(|_, cx| {
+        let expected = cx.theme().muted_foreground;
+        let samples = super::paint_probe::samples();
+        let thinking_samples: Vec<_> = samples
+            .iter()
+            .filter(|sample| matches!(sample.row, super::paint_probe::Row::Thinking))
+            .collect();
+        assert!(
+            !thinking_samples.is_empty(),
+            "render_thinking_row must record a paint-probe sample"
+        );
+        for sample in &thinking_samples {
+            assert_eq!(
+                sample.color, expected,
+                "thinking header painted off the muted-foreground token"
+            );
+        }
+    });
     // Row-level fields the previous chrome would have exposed (title,
     // duration, body) must not paint under any selector.
     for stale in ["thinking-title-0", "thinking-duration-0", "thinking-body-0"] {
