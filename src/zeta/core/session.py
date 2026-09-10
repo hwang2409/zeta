@@ -11,7 +11,7 @@ import re
 import unicodedata
 import uuid
 from collections.abc import Callable
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,15 +22,12 @@ from rich.cells import cell_len
 
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .store import ConversationStore
+from .session_files import SessionError, SessionInUseError, open_session_file, session_directory
 
 
 logger = logging.getLogger(__name__)
 
 META_VERSION = 1
-
-
-class SessionError(ValueError):
-    """Raised when a session cannot be created or resumed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,7 +359,7 @@ class SessionManager:
                     staged.sessions_dir,
                     session_id=session_id,
                     cwd=resolved_cwd,
-                )
+                ).close()
                 staged._write(metadata)
                 # mkdir atomically claims the ID without replacing any existing
                 # path, including a non-cooperating creator's empty directory.
@@ -383,12 +380,7 @@ class SessionManager:
     def read_metadata(self, session_id: str) -> SessionMetadata:
         """Read validated metadata without opening or repairing the conversation."""
         self._validate_id(session_id)
-        metadata = self._read(session_id)
-        if metadata.session_id != session_id:
-            raise SessionError(
-                f"session metadata id mismatch for {session_id}: {metadata.session_id}"
-            )
-        return metadata
+        return self._read(session_id)
 
     def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
         metadata = self.read_metadata(session_id)
@@ -398,11 +390,13 @@ class SessionManager:
             raise SessionError(f"session {session_id} has no conversation.jsonl")
         try:
             store = ConversationStore(
-                self.sessions_dir, session_id=session_id, _read_only=_read_only
+                self.sessions_dir, session_id=session_id, _read_only=_read_only,
+                _must_exist=True,
             )
         except (OSError, ValueError) as exc:
             raise SessionError(f"session {session_id} could not be opened") from exc
         if store.cwd != metadata.cwd:
+            store.close()
             raise SessionError(f"session {session_id} cwd does not match its metadata")
         return OpenedSession(metadata, store)
 
@@ -415,6 +409,7 @@ class SessionManager:
                 if not session_path.is_dir():
                     continue
                 opened = self.open(session_path.name, _read_only=True)
+                opened.store.close()
                 sessions.append(opened.metadata)
             except (SessionError, ConversationIntegrityError) as exc:
                 logger.warning("Skipping session %s: %s", session_path.name, exc)
@@ -433,8 +428,10 @@ class SessionManager:
                 break
             try:
                 opened = self.open(metadata.session_id, _read_only=True)
+                with opened.store:
+                    entries = opened.store.replay()
                 first_message = ""
-                for entry in opened.store.replay():
+                for entry in entries:
                     if entry.type != "message":
                         continue
                     message = entry.data.get("message")
@@ -626,8 +623,6 @@ class SessionManager:
     def rename(self, session_id: str, name: str) -> SessionMetadata:
         """Set a display name; whitespace clears it to the derived preview."""
         full_id = self.resolve_id(session_id)
-        if (self.sessions_dir / full_id).is_symlink():
-            raise SessionError("session directory must not be a symbolic link")
         metadata = self.read_metadata(full_id)
         self.record_name(metadata, name=normalize_session_name(name) if name.strip() else "")
         return metadata
@@ -636,15 +631,23 @@ class SessionManager:
         """Return the full id for an exact match or unambiguous prefix."""
 
         self._validate_id(session_id)
-        if (self.sessions_dir / session_id).is_dir():
-            return session_id
-        if not self.sessions_dir.exists():
-            raise SessionError(f"session {session_id} was not found")
-        matches = sorted(
-            entry.name
-            for entry in self.sessions_dir.iterdir()
-            if entry.is_dir() and entry.name.startswith(session_id)
-        )
+        try:
+            root_fd = os.open(self.sessions_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                with os.scandir(root_fd) as entries:
+                    candidates = [
+                        entry.name for entry in entries
+                        if entry.is_dir(follow_symlinks=False) or entry.is_symlink()
+                    ]
+                if session_id in candidates:
+                    return session_id
+                matches = sorted(name for name in candidates if name.startswith(session_id))
+            finally:
+                os.close(root_fd)
+        except FileNotFoundError as exc:
+            raise SessionError(f"session {session_id} was not found") from exc
+        except OSError as exc:
+            raise SessionError(f"session {session_id} could not be resolved: {exc.strerror}") from exc
         if not matches:
             raise SessionError(f"session {session_id} was not found")
         if len(matches) > 1:
@@ -659,24 +662,24 @@ class SessionManager:
 
         import shutil
 
-        full_id = self.resolve_id(session_id)
-        # Pin the root and refuse links, including a corrupt lock-file link.
-        # rmtree's fd-based traversal unlinks nested links without following them.
+        full_id = session_id
         try:
-            with ExitStack() as cleanup:
-                root_fd = os.open(self.sessions_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-                cleanup.callback(os.close, root_fd)
-                session_fd = os.open(full_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
-                cleanup.callback(os.close, session_fd)
-                lock_fd = os.open(".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=session_fd)
-                cleanup.callback(os.close, lock_fd)
+            full_id = self.resolve_id(session_id)
+            with session_directory(self.sessions_dir, full_id, exclusive=True) as (root_fd, session_fd):
+                lock_fd = open_session_file(session_fd, ".lock", os.O_RDWR | os.O_CREAT)
                 try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError as exc:
-                    raise SessionError("session is currently open in another process") from exc
-                shutil.rmtree(full_id, dir_fd=root_fd)
-        except OSError as exc:
-            raise SessionError(f"session {full_id} could not be deleted: {exc.strerror}") from exc
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError as exc:
+                        raise SessionInUseError("session is currently open or in use") from exc
+                    # fd-based rmtree unlinks nested symlinks without following them.
+                    shutil.rmtree(full_id, dir_fd=root_fd)
+                finally:
+                    os.close(lock_fd)
+        except SessionInUseError:
+            raise
+        except (OSError, SessionError) as exc:
+            raise SessionError(f"session {full_id} could not be deleted: {exc}") from exc
 
     def export(self, session_id: str) -> str:
         """Return the session as portable JSONL (metadata header + entries)."""
@@ -732,10 +735,10 @@ class SessionManager:
         session_id: str,
         update: Callable[[SessionMetadata], SessionMetadata],
     ) -> SessionMetadata:
-        with self._metadata_lock(session_id):
-            current = self._read(session_id)
+        with self._metadata_lock(session_id) as directory_fd:
+            current = self._read(session_id, directory_fd=directory_fd)
             updated = update(current)
-            self._write_unlocked(updated)
+            self._write_unlocked(updated, directory_fd=directory_fd)
             return updated
 
     @staticmethod
@@ -759,48 +762,55 @@ class SessionManager:
         target.approval_mode = source.approval_mode
         target.model_fallback = source.model_fallback
 
-    def _read(self, session_id: str) -> SessionMetadata:
+    def _read(self, session_id: str, *, directory_fd: int | None = None) -> SessionMetadata:
+        if directory_fd is None:
+            with session_directory(self.sessions_dir, session_id) as (_, opened_fd):
+                return self._read(session_id, directory_fd=opened_fd)
         path = self.sessions_dir / session_id / "meta.json"
         try:
-            value = load_session_json(path)
-        except ConversationIntegrityError as exc:
-            if isinstance(exc.__cause__, FileNotFoundError):
-                if path.parent.is_dir():
-                    raise SessionError(f"session {session_id} has no meta.json") from exc
-                raise SessionError(f"session {session_id} was not found") from exc
+            with os.fdopen(open_session_file(directory_fd, "meta.json", os.O_RDONLY), "rb") as handle:
+                value = load_session_json(handle.read())
+        except FileNotFoundError as exc:
+            raise SessionError(f"session {session_id} has no meta.json") from exc
+        except (ConversationIntegrityError, OSError) as exc:
             raise SessionError(f"session metadata could not be read: {path}") from exc
         if not isinstance(value, Mapping):
             raise SessionError(f"session metadata is not an object: {path}")
-        return SessionMetadata.from_dict(value, path=path)
+        metadata = SessionMetadata.from_dict(value, path=path)
+        if metadata.session_id != session_id:
+            raise SessionError(f"session metadata id mismatch for {session_id}: {metadata.session_id}")
+        return metadata
 
     def _write(self, metadata: SessionMetadata) -> None:
-        with self._metadata_lock(metadata.session_id):
-            self._write_unlocked(metadata)
+        with self._metadata_lock(metadata.session_id) as directory_fd:
+            self._write_unlocked(metadata, directory_fd=directory_fd)
 
-    def _write_unlocked(self, metadata: SessionMetadata) -> None:
-        path = self.sessions_dir / metadata.session_id / "meta.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    def _write_unlocked(self, metadata: SessionMetadata, *, directory_fd: int) -> None:
+        temporary = f".meta.json.{uuid.uuid4().hex}.tmp"
+        fd = open_session_file(directory_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
         try:
-            with temporary.open("w") as handle:
+            with os.fdopen(fd, "w") as handle:
                 json.dump(metadata.to_storage_dict(), handle, separators=(",", ":"), sort_keys=True)
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, path)
+            os.replace(temporary, "meta.json", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
         finally:
-            temporary.unlink(missing_ok=True)
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
 
     @contextmanager
     def _metadata_lock(self, session_id: str):
-        session_dir = self.sessions_dir / session_id
-        session_dir.mkdir(parents=True, exist_ok=True)
-        with (session_dir / ".meta.lock").open("a+") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        self._validate_id(session_id)
+        with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
+            lock_fd = open_session_file(directory_fd, ".meta.lock", os.O_RDWR | os.O_CREAT)
             try:
-                yield
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                yield directory_fd
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                os.close(lock_fd)
 
     @staticmethod
     def _validate_id(session_id: str) -> None:
@@ -820,6 +830,7 @@ __all__ = [
     "SESSION_NAME_MAX_LENGTH",
     "OpenedSession",
     "SessionError",
+    "SessionInUseError",
     "SessionManager",
     "SessionMetadata",
     "SessionPreview",

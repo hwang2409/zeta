@@ -2155,9 +2155,11 @@ async def test_session_management_lifecycle_and_active_delete(tmp_path):
         assert error["data"]["code"] == "active_session"
         assert server.runtime.session_id == sid
         assert (tmp_path / "sessions" / sid).exists()
-        await _request(reader, writer, 7, "new_session")
+        second = (await _request(reader, writer, 7, "new_session"))[-1]["result"]["session"]
         resumed = (await _request(reader, writer, 8, "resume", {"session_id": sid}))[-1]["result"]["session"]
         assert resumed["name"] == "Project notes"
+        # Switching away closes the prior store and releases its lifetime lease.
+        assert "result" in (await _request(reader, writer, 9, "delete_session", {"session_id": second["session_id"]}))[-1]
     finally:
         await _close(server, writer)
 
@@ -2174,6 +2176,11 @@ async def test_session_management_lifecycle_and_active_delete(tmp_path):
         row = next(row for row in (await _request(reader, writer, 4, "list_sessions"))[-1]["result"]["sessions"] if row["session_id"] == sid)
         assert row["name"] == ""
         assert row["first_message_preview"] == "original preview"
+        # An external open store blocks RPC deletion even with no active server session.
+        with SessionManager(tmp_path).open(sid).store:
+            error = (await _request(reader, writer, 5, "delete_session", {"session_id": sid}))[-1]["error"]
+            assert "in use" in error["message"]
+            assert (tmp_path / "sessions" / sid).exists()
         assert (await _request(reader, writer, 5, "delete_session", {"session_id": sid}))[-1]["result"] == {"session_id": sid}
         assert not (tmp_path / "sessions" / sid).exists()
         assert all(row["session_id"] != sid for row in (await _request(reader, writer, 6, "list_sessions"))[-1]["result"]["sessions"])

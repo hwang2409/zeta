@@ -11,10 +11,11 @@ import tempfile
 import time
 import uuid
 import warnings
+import weakref
 from collections.abc import Iterable, Iterator, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from ..agent_receipt import encode_json
 from ..types import Message, MessageRole, ToolCall, ToolUseContent
@@ -26,6 +27,7 @@ from .checkpoints import (
     _now,
     load_session_json,
 )
+from .session_files import session_directory
 from .todo import TodoItem, parse_todo_items
 
 SCHEMA = "zeta.conversation.v1"
@@ -45,7 +47,7 @@ class PendingPromptQueue:
     """Own every durable append, acknowledgement, close, and timeout decision."""
 
     def __init__(self, store: ConversationStore) -> None:
-        self._store = store
+        self._store = weakref.proxy(store)
 
     @staticmethod
     def _check_deadline(deadline: float | None) -> None:
@@ -152,6 +154,7 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         bash_cwd: str | Path | None = None,
         _lock_deadline: float | None = None,
         _read_only: bool = False,
+        _must_exist: bool = False,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -169,7 +172,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
             )
         self.session_dir = self.root_dir / self.session_id
         self._read_only = _read_only
-        if not _read_only:
+        self._closed = False
+        if not _read_only and not _must_exist:
             self.session_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.session_dir / "conversation.jsonl"
         self.state_path = self.session_dir / "session_state.json"
@@ -188,10 +192,24 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
         self._agent_lifecycle: dict[str, Any] | None = None
         self._write_deadline: float | None = None
         self.pending_prompt_queue = PendingPromptQueue(self)
-        # Discovery validates without creating locks/state or repairing the log.
-        with nullcontext() if _read_only else self._append_lock(deadline=_lock_deadline):
-            self._load()
-            self._load_session_state()
+        with ExitStack() as lease:
+            lease.enter_context(session_directory(self.root_dir, self.session_id))
+            # Discovery validates without creating locks/state or repairing the log.
+            with nullcontext() if _read_only else self._append_lock(deadline=_lock_deadline):
+                self._load()
+                self._load_session_state()
+            self._release_lease = weakref.finalize(self, lease.pop_all().close)
+
+    def close(self) -> None:
+        """Release the activity lease after the caller stops using this store."""
+        self._closed = True
+        self._release_lease()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
     def _load(self) -> None:
         if not self.path.exists():
@@ -672,6 +690,8 @@ class ConversationStore(AgentStateMixin, CheckpointForkMixin):
 
     @contextmanager
     def _append_lock(self, *, deadline: float | None = None) -> Iterator[None]:
+        if self._closed:
+            raise ValueError("session store is closed")
         with self.lock_path.open("a+") as handle:
             if deadline is None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)

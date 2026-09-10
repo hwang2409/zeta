@@ -236,12 +236,14 @@ class ServerRuntime:
         state = self._state
         if state is not None:
             await state.loop.close()
+            state.opened.store.close()
             self._state = None
 
     async def _replace(self, composition: RuntimeComposition) -> None:
         old_state = self._state
         if old_state is not None:
             await old_state.loop.close()
+            old_state.opened.store.close()
         state = SessionState.from_composition(composition)
         self._state = state
         self._bind_background_event_sink(state)

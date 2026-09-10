@@ -2040,6 +2040,7 @@ def test_session_delete_does_not_read_corrupt_data(tmp_path, corruption):
         (directory / "meta.json").unlink()
     else:
         (directory / ("meta.json" if corruption == "bad_metadata" else "conversation.jsonl")).write_bytes(b"\xff")
+    session.store.close()
     manager.delete(sid)
     assert not directory.exists()
     assert manager.list_sessions() == []
