@@ -5,5 +5,5 @@ gui:
 
 .PHONY: gui-app
 gui-app:
-	cargo build --manifest-path gui/Cargo.toml
+	RUSTFLAGS="$(RUSTFLAGS) --remap-path-prefix=$(CURDIR)=." cargo build --release --manifest-path gui/Cargo.toml
 	python3 gui/package_app.py

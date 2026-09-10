@@ -126,7 +126,7 @@ def package_app(repo: Path) -> Path:
     resources = bundle / "Contents/Resources"
     macos.mkdir(parents=True)
     resources.mkdir()
-    shutil.copy2(repo / "gui/target/debug/zeta-gui", macos / "zeta-gui")
+    shutil.copy2(repo / "gui/target/release/zeta-gui", macos / "zeta-gui")
     bundle_server(repo, resources)
     bundle_icon(repo, resources)
     launcher = macos / "zeta"

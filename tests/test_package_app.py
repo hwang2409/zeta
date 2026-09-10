@@ -53,6 +53,20 @@ def test_bundle_layout_and_launchers(bundle: Path) -> None:
             assert link.resolve().is_relative_to(bundle.resolve()), link
 
 
+def test_bundle_has_no_build_worktree_paths(bundle: Path) -> None:
+    build_worktree = str(REPO).encode()
+    leaks = [
+        path.relative_to(bundle)
+        for path in bundle.rglob("*")
+        if path.is_file() and build_worktree in path.read_bytes()
+    ]
+    assert not leaks
+    commands = subprocess.check_output(
+        ["otool", "-l", str(bundle / "Contents/MacOS/zeta-gui")], text=True
+    )
+    assert "segname __DWARF" not in commands
+
+
 def test_native_libraries_use_bundle_or_system_paths(bundle: Path) -> None:
     native = [bundle / "Contents/MacOS/zeta-gui"]
     native.extend((bundle / "Contents/Resources/python/bin").glob("python3.*"))
@@ -154,5 +168,3 @@ print(json.dumps({
     original_runtime = bundle / "Contents/Resources/python"
     bytecode = list(original_runtime.rglob("*.pyc"))
     assert bytecode
-    build_worktree = str(REPO).encode()
-    assert not any(build_worktree in path.read_bytes() for path in bytecode)
