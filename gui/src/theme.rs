@@ -19,6 +19,35 @@ pub const FONT_SIZE: Pixels = px(15.);
 /// look.
 pub const RADIUS: Pixels = px(2.);
 
+/// Readable-column ceiling for the transcript. Wiki caps its agent-run column
+/// at 1024px so long assistant lines break at a scannable measure.
+pub const TRANSCRIPT_MAX_WIDTH: Pixels = px(1024.);
+
+/// Vertical rhythm between transcript rows. Consecutive tool rows collapse
+/// this gap to zero so a run of receipts reads as one column.
+pub const TRANSCRIPT_ROW_GAP: Pixels = px(14.);
+
+/// Baseline padding for the composer strip (padding 8 x 10 from the contract).
+pub const COMPOSER_PADDING_Y: Pixels = px(8.);
+pub const COMPOSER_PADDING_X: Pixels = px(10.);
+
+/// Composer minimum height (contract: min-height 64px).
+pub const COMPOSER_MIN_HEIGHT: Pixels = px(64.);
+
+/// Send button minimum width. Kept square, mono 600, and just wide enough for
+/// the word "Send" plus breathing room per the contract.
+pub const SEND_BUTTON_MIN_WIDTH: Pixels = px(82.);
+pub const SEND_BUTTON_HEIGHT: Pixels = px(40.);
+
+/// Width of the coloured left rail used on user turns and the composer.
+pub const RAIL_WIDTH_THICK: Pixels = px(3.);
+
+/// Width of the thin rail used on expanded tool bodies.
+pub const RAIL_WIDTH_THIN: Pixels = px(1.);
+
+/// Small streaming indicator dot size — wiki uses 7px.
+pub const STREAM_DOT_SIZE: Pixels = px(7.);
+
 /// Convert a 24-bit `0xRRGGBB` literal to Hsla.
 fn hex(rgb: u32) -> Hsla {
     Hsla::from(gpui::rgb(rgb))
@@ -101,6 +130,16 @@ pub mod palette {
     }
     pub fn scrollbar_thumb_hover() -> Hsla {
         hex(0x4c4a3a)
+    }
+    /// Composer rail at rest — accent at ~62% opacity. Focus promotes it back
+    /// to the full accent so the rail is the composer's focus signal.
+    pub fn accent_rail_dim() -> Hsla {
+        hex_a(0xb18b_f49e)
+    }
+    /// Fill the composer takes when the input receives focus — one tint step
+    /// lighter than the element surface so focus stays visible without a ring.
+    pub fn composer_focus_fill() -> Hsla {
+        hex(0x333326)
     }
 }
 
@@ -664,6 +703,42 @@ mod tests {
                 .expect("editor background is set");
             assert_eq!(editor_bg, palette::canvas());
         });
+    }
+
+    #[test]
+    fn transcript_and_composer_tokens_land_on_the_wiki_contract() {
+        // Guards against a silent number drift when a later ticket bumps
+        // spacing or rethinks the readable-column measure.
+        assert_eq!(TRANSCRIPT_MAX_WIDTH, px(1024.));
+        assert_eq!(TRANSCRIPT_ROW_GAP, px(14.));
+        assert_eq!(COMPOSER_MIN_HEIGHT, px(64.));
+        assert_eq!(COMPOSER_PADDING_Y, px(8.));
+        assert_eq!(COMPOSER_PADDING_X, px(10.));
+        assert_eq!(SEND_BUTTON_MIN_WIDTH, px(82.));
+        assert_eq!(RAIL_WIDTH_THICK, px(3.));
+        assert_eq!(RAIL_WIDTH_THIN, px(1.));
+        assert_eq!(STREAM_DOT_SIZE, px(7.));
+
+        // Composer rail at rest sits between muted and full accent so a
+        // future palette shuffle keeps the focus contrast well-defined.
+        let rail = palette::accent_rail_dim();
+        let accent = palette::accent();
+        assert!(
+            rail.a < accent.a,
+            "rail must dim the accent it borrows from"
+        );
+        assert!(
+            rail.a > 0.4,
+            "rail must stay visible on the element surface"
+        );
+        assert_eq!(rail.h, accent.h);
+        assert_eq!(rail.s, accent.s);
+        assert_eq!(rail.l, accent.l);
+
+        // Focus fill is one tint step lighter than the element surface — a
+        // regression that dropped it back onto the element loses the focus
+        // signal entirely (the rail alone reads as ambient chrome).
+        assert!(palette::composer_focus_fill().l > palette::element().l);
     }
 
     #[gpui::test]

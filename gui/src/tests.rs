@@ -244,20 +244,24 @@ fn virtual_transcript_and_session_rows_fit_their_viewports(cx: &mut TestAppConte
         assert!(session.size.width <= px(280.));
         assert!(transcript.size.height > px(300.));
         visual.update(|window, cx| {
+            let viewport = transcript.scale(window.scale_factor());
+            // Filter by content_mask so the composer's focused rail — which
+            // also paints in the primary color — cannot smuggle itself into
+            // an assertion about virtual-list clipping. Anything whose mask
+            // lies inside the transcript viewport IS a transcript row.
             let quads: Vec<_> = window
                 .painted_quads()
                 .into_iter()
                 .filter(|quad| {
                     quad.border_color == cx.theme().primary
                         && quad.border_widths.left > gpui::ScaledPixels::default()
+                        && quad.content_mask.bounds.top() >= viewport.top()
+                        && quad.content_mask.bounds.bottom() <= viewport.bottom()
                 })
                 .collect();
             assert!(!quads.is_empty(), "user message borders were painted");
             assert!(quads.len() < 20, "the virtual list paints only nearby rows");
-            let viewport = transcript.scale(window.scale_factor());
             for quad in quads {
-                assert!(quad.content_mask.bounds.top() >= viewport.top());
-                assert!(quad.content_mask.bounds.bottom() <= viewport.bottom());
                 assert!(quad.content_mask.bounds.left() >= viewport.left());
                 assert!(quad.content_mask.bounds.right() <= viewport.right());
             }
@@ -267,6 +271,282 @@ fn virtual_transcript_and_session_rows_fit_their_viewports(cx: &mut TestAppConte
 
 fn png_bytes() -> Vec<u8> {
     b"\x89PNG\r\n\x1a\n".to_vec()
+}
+
+#[gpui::test]
+fn transcript_column_caps_at_wiki_readable_measure_and_centers(cx: &mut TestAppContext) {
+    // Wiki agent-run column pins at 1024px centered. Long user prose must
+    // wrap at that measure, not fill the viewport.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::User("wide user turn ".repeat(500))];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let row = visual.debug_bounds("transcript-row").unwrap();
+    let transcript = visual.debug_bounds("transcript-viewport").unwrap();
+    // The row spans the viewport, but the inner column stays within 1024px.
+    assert!(row.size.width <= transcript.size.width);
+    visual.update(|window, cx| {
+        let scale = window.scale_factor();
+        let scaled_viewport = transcript.scale(scale);
+        let scaled_row = row.scale(scale);
+        let scaled_column_cap = px(f32::from(theme::TRANSCRIPT_MAX_WIDTH)).scale(scale);
+        let user_quads: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.border_color == cx.theme().primary
+                    && quad.border_widths.left > gpui::ScaledPixels::default()
+                    && quad.content_mask.bounds.top() >= scaled_row.top()
+                    && quad.content_mask.bounds.bottom() <= scaled_row.bottom()
+            })
+            .collect();
+        assert!(!user_quads.is_empty(), "user rail was painted");
+        for quad in user_quads {
+            // A raw-terminal look would let the user block fill the viewport.
+            assert!(
+                quad.bounds.size.width <= scaled_column_cap,
+                "user rectangle width {:?} exceeds 1024px column cap {:?}",
+                quad.bounds.size.width,
+                scaled_column_cap,
+            );
+            // Optical centering: once the viewport is wider than the column,
+            // the block sits symmetric within a tolerance.
+            if scaled_viewport.size.width > scaled_column_cap {
+                let left_gap = quad.bounds.left() - scaled_viewport.left();
+                let right_gap = scaled_viewport.right() - quad.bounds.right();
+                let asymmetry = if left_gap > right_gap {
+                    left_gap - right_gap
+                } else {
+                    right_gap - left_gap
+                };
+                let tolerance = scaled_viewport.size.width * 0.15;
+                assert!(
+                    asymmetry < tolerance,
+                    "column not centered: left {left_gap:?}, right {right_gap:?}"
+                );
+            }
+        }
+    });
+}
+
+#[gpui::test]
+fn assistant_row_is_naked_and_carries_no_bg_or_rail(cx: &mut TestAppContext) {
+    // The wiki assistant turn has NO frame — 2px vertical breath, no bg, no
+    // border, no rail. Regressing to a card style would fight the mono prose.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::Assistant("plain answer".into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let row = visual.debug_bounds("transcript-row").unwrap();
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled_row = row.scale(window.scale_factor());
+        let framed: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                let in_row = quad.content_mask.bounds.top() >= scaled_row.top()
+                    && quad.content_mask.bounds.bottom() <= scaled_row.bottom();
+                let has_left_rail = quad.border_widths.left > gpui::ScaledPixels::default();
+                let element_fill = quad.background == theme.muted.into()
+                    || quad.background == theme.sidebar.into();
+                in_row && (has_left_rail || element_fill)
+            })
+            .collect();
+        assert!(
+            framed.is_empty(),
+            "naked assistant row painted framing chrome: {} quads",
+            framed.len()
+        );
+    });
+}
+
+#[gpui::test]
+fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut TestAppContext) {
+    // The wiki contract encodes tool state through COLOR ONLY:
+    // running -> foreground, done -> muted, failed -> danger. The expanded
+    // body rail flips to danger when the tool reports an error.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for make_error in [false, true] {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.state.transcript.clear();
+                view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
+                view.apply_worker_message(
+                    WorkerMessage::Event(ServerEvent::ToolEnd {
+                        session_id: view.state.active_session.clone(),
+                        tool_call: ToolCall {
+                            id: "receipt".into(),
+                            name: "bash".into(),
+                            arguments: Default::default(),
+                        },
+                        tool_result: Some(zeta_gui::client::ToolResult {
+                            tool_call_id: "receipt".into(),
+                            content: "line".into(),
+                            is_error: make_error,
+                            is_canceled: false,
+                            structured_content: None,
+                            content_blocks: Vec::new(),
+                        }),
+                        data: json!({}),
+                    }),
+                    window,
+                    cx,
+                );
+                // Expand collapsed successful rows so the indent-rail body paints.
+                if !make_error {
+                    view.state.toggle_card(0);
+                    cx.notify();
+                }
+            });
+            window.draw(cx).clear(cx);
+        });
+        let body = visual
+            .debug_bounds("tool-output-0")
+            .expect("expanded tool body renders");
+        visual.update(|window, cx| {
+            let theme = cx.theme();
+            let scaled_body = body.scale(window.scale_factor());
+            // The body's rail is the wiki 1px thin rail. Filter out any
+            // ancestor's 3px rail so the assertion is about THIS row's rail
+            // and not the user turn above it.
+            let thin_rail = px(f32::from(theme::RAIL_WIDTH_THIN)).scale(window.scale_factor());
+            let thick_rail = px(f32::from(theme::RAIL_WIDTH_THICK)).scale(window.scale_factor());
+            let rails: Vec<_> = window
+                .painted_quads()
+                .into_iter()
+                .filter(|quad| {
+                    let in_body = quad.bounds.top() >= scaled_body.top()
+                        && quad.bounds.bottom() <= scaled_body.bottom();
+                    let is_thin_rail = quad.border_widths.left >= thin_rail
+                        && quad.border_widths.left < thick_rail;
+                    in_body && is_thin_rail
+                })
+                .collect();
+            let neutral: Vec<_> = rails
+                .iter()
+                .filter(|quad| quad.border_color == theme.border)
+                .collect();
+            let danger: Vec<_> = rails
+                .iter()
+                .filter(|quad| quad.border_color == theme.danger)
+                .collect();
+            if make_error {
+                assert!(
+                    !danger.is_empty(),
+                    "failed tool body must paint its rail in danger"
+                );
+                assert!(
+                    neutral.is_empty(),
+                    "failed tool body rail must not paint in the neutral border color"
+                );
+            } else {
+                assert!(
+                    !neutral.is_empty(),
+                    "successful tool body must paint its rail in the neutral border color"
+                );
+                assert!(
+                    danger.is_empty(),
+                    "successful tool body rail must not paint in danger"
+                );
+            }
+        });
+    }
+}
+
+#[gpui::test]
+fn composer_focus_promotes_the_rail_and_lightens_the_fill(cx: &mut TestAppContext) {
+    // Focus is the ONLY chrome cue on the composer: rail promotes to full
+    // accent, fill lightens one step. Regressing to a border ring would fail
+    // the wiki contract without failing this test — so we assert both.
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let composer = visual.debug_bounds("composer").unwrap();
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        // Focused composer paints a 3px accent left rail at the composer's
+        // top edge — this is the single focus cue. Anything else in the same
+        // region is either the fork rail (user rows) or a bug.
+        let scaled = composer.scale(window.scale_factor());
+        let rail_width_scaled = px(f32::from(theme::RAIL_WIDTH_THICK)).scale(window.scale_factor());
+        let rail = window
+            .painted_quads()
+            .into_iter()
+            .find(|quad| {
+                quad.border_color == theme.primary
+                    && quad.border_widths.left >= rail_width_scaled
+                    && quad.bounds.top() >= scaled.top()
+                    && quad.bounds.bottom() <= scaled.bottom()
+            })
+            .expect("focused composer paints a full-accent left rail at the wiki 3px width");
+        // The rail must live at the composer's left edge, not inside a child.
+        assert!(rail.bounds.left() <= scaled.left() + gpui::ScaledPixels::from(1.0));
+        // Focused fill must be lighter than the ambient element surface — the
+        // fill lightening is what makes the composer feel "engaged" without
+        // adding a ring.
+        assert!(theme::palette::composer_focus_fill().l > theme::palette::element().l);
+        // Dim rail alpha is strictly less than the full accent — that is the
+        // structural difference between "at rest" and "focused".
+        assert!(theme::palette::accent_rail_dim().a < theme.primary.a);
+    });
+}
+
+#[gpui::test]
+fn adjacent_tool_rows_have_zero_gap_between_them(cx: &mut TestAppContext) {
+    // A run of tool receipts is visually a single column in the wiki. Non-tool
+    // neighbours reintroduce the 14px rhythm on both sides so a mixed sequence
+    // still breathes.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let tool = |id: &str| TranscriptEntry::Tool {
+        key: zeta_gui::state::ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: id.into(),
+        },
+        name: "bash".into(),
+        summary: id.into(),
+        complete: true,
+        error: false,
+        canceled: false,
+        card: zeta_gui::cards::Card::default(),
+    };
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![
+                TranscriptEntry::User("q".into()),
+                tool("a"),
+                tool("b"),
+                tool("c"),
+                TranscriptEntry::Assistant("plain answer".into()),
+            ];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(5, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let tool_a = visual.debug_bounds("tool-receipt-1").unwrap();
+    let tool_b = visual.debug_bounds("tool-receipt-2").unwrap();
+    let tool_c = visual.debug_bounds("tool-receipt-3").unwrap();
+    // Zero gap between adjacent tools; the receipts stack immediately.
+    let gap_ab = tool_b.top() - tool_a.bottom();
+    let gap_bc = tool_c.top() - tool_b.bottom();
+    assert!(gap_ab <= px(2.), "adjacent tool rows must sit flush");
+    assert!(gap_bc <= px(2.));
 }
 
 #[gpui::test]
