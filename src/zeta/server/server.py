@@ -95,20 +95,26 @@ class ZetaServer:
             await self._server.serve_forever()
 
     async def close(self) -> None:
-        if self._client is not None:
-            await self._client.close()
+        try:
+            if self._client is not None:
+                await self._client.close()
+        finally:
             self._client = None
-        self._client_active = False
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
-        await self.runtime.close()
-        if self.port is None and self._socket_created:
-            with contextlib.suppress(FileNotFoundError):
-                if stat.S_ISSOCK(self.socket_path.stat().st_mode):
-                    self.socket_path.unlink()
-            self._socket_created = False
+            self._client_active = False
+            try:
+                if self._server is not None:
+                    self._server.close()
+                    await self._server.wait_closed()
+            finally:
+                self._server = None
+                try:
+                    await self.runtime.close()
+                finally:
+                    if self.port is None and self._socket_created:
+                        with contextlib.suppress(FileNotFoundError):
+                            if stat.S_ISSOCK(self.socket_path.stat().st_mode):
+                                self.socket_path.unlink()
+                        self._socket_created = False
 
     def _prepare_socket_path(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

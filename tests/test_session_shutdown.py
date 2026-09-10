@@ -6,6 +6,7 @@ import asyncio
 import gc
 from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from prompt_toolkit import PromptSession
@@ -13,11 +14,15 @@ from prompt_toolkit.input import DummyInput
 from prompt_toolkit.output import DummyOutput
 
 from zeta.cli import build_parser, main
-from zeta.core.checkpoints.workspace import WorkspaceSnapshotStore
+from zeta.core.checkpoints.workspace import (
+    WorkspaceSnapshotError,
+    WorkspaceSnapshotStore,
+)
 from zeta.core.session import SessionInUseError, SessionManager
 from zeta.core.store import ConversationStore
 from zeta.headless import run_headless
 from zeta.loop import AgentLoop
+from zeta.server import ZetaServer
 from zeta.server.runtime import ServerRuntime
 from zeta.tui.app import TUIApp, create_app
 
@@ -106,12 +111,13 @@ def test_entrypoint_shutdown_releases_every_lease(
     args = build_parser().parse_args(["--provider", "fake"])
 
     async def server():
-        runtime = ServerRuntime(home, cwd=tmp_path, provider="fake")
-        monkeypatch.setattr(runtime, "_bind_background_event_sink", startup)
+        server = ZetaServer(home=home, cwd=tmp_path, provider="fake", port=0)
+        monkeypatch.setattr(server.runtime, "_bind_background_event_sink", startup)
         try:
-            await runtime.create_session()
+            await server.start()
+            await server.runtime.create_session()
         finally:
-            await runtime.close()
+            await server.close()
 
     expected = pytest.raises(RuntimeError, match="injected") if failure else nullcontext()
     with expected:
@@ -135,6 +141,70 @@ def test_entrypoint_shutdown_releases_every_lease(
         assert app.loop._background_event_sink is None
         assert app.loop._mcp_notice_sink is None
         assert app.loop._mcp_prompt_refresh is None
+
+
+@pytest.mark.usefixtures("no_gc")
+@pytest.mark.parametrize("opened_snapshots", [False, True])
+async def test_closed_app_rejects_snapshot_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opened_snapshots: bool,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    app = create_app(build_parser().parse_args(["--provider", "fake"]))
+    if opened_snapshots:
+        app._snapshots()
+    await app.close()
+    with pytest.raises(WorkspaceSnapshotError, match="closed"):
+        app._snapshots()
+    SessionManager(home).delete(app.loop.store.session_id)
+    assert not app.loop.store.session_dir.exists()
+
+
+@pytest.mark.usefixtures("no_gc")
+@pytest.mark.parametrize("failure", [None, "client", "server", "wait_closed"])
+async def test_server_cleanup_continues_after_close_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    server = ZetaServer(home=home, cwd=tmp_path, provider="fake", port=0)
+    await server.start()
+    await server.runtime.create_session()
+    loop = server.runtime.loop
+    assert loop is not None
+    listener = server._server
+    assert listener is not None
+    client = AsyncMock()
+    server._client = client
+    original_close = listener.close
+    original_wait_closed = listener.wait_closed
+
+    def fail_close():
+        original_close()
+        raise RuntimeError("injected server cleanup")
+
+    async def fail_wait_closed():
+        await original_wait_closed()
+        raise RuntimeError("injected wait_closed cleanup")
+
+    if failure == "client":
+        client.close.side_effect = RuntimeError("injected client cleanup")
+    elif failure == "server":
+        monkeypatch.setattr(listener, "close", fail_close)
+    elif failure == "wait_closed":
+        monkeypatch.setattr(listener, "wait_closed", fail_wait_closed)
+    expected = pytest.raises(RuntimeError, match="injected") if failure else nullcontext()
+    try:
+        with expected:
+            await server.close()
+        assert not loop.store._release_lease.alive
+        SessionManager(home).delete(loop.store.session_id)
+        assert not loop.store.session_dir.exists()
+    finally:
+        original_close()
+        await original_wait_closed()
+        await server.runtime.close()
 
 
 @pytest.mark.usefixtures("no_gc")
@@ -235,6 +305,8 @@ async def test_tui_cleanup_continues_after_close_error(
         monkeypatch.setattr(snapshots, "close", fail_sync)
     with pytest.raises(RuntimeError, match="injected cleanup"):
         await app.close()
+    with pytest.raises(WorkspaceSnapshotError, match="closed"):
+        app._snapshots()
     SessionManager(home).delete(app.loop.store.session_id)
 
 
