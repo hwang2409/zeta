@@ -59,6 +59,7 @@ from .render import is_retryable_error, render_event
 ATTACHMENT_MAX_TEXT_BYTES = 200 * 1024
 ATTACHMENT_TOKEN_RE = re.compile(r'(?<!\S)@(?:"([^"\n]+)"|([^\s]+))')
 SPINNER_INTERVAL = 0.2
+CLIPBOARD_TIMEOUT = 5.0
 
 __all__ = [
     "FullScreenPromptSession",
@@ -467,6 +468,57 @@ end run
     except (OSError, ValueError) as exc:
         raise AttachmentError(f"cannot save clipboard image: {exc}") from exc
     return Path(session_dir) / name
+
+
+class ClipboardError(Exception):
+    """Raised when no clipboard tool is available or the copy fails."""
+
+
+def _which(tool: str, *arguments: str) -> list[str] | None:
+    path = shutil.which(tool)
+    return [path, *arguments] if path else None
+
+
+def clipboard_command() -> list[str] | None:
+    """Return the argv of the local clipboard writer, or None when there is none."""
+
+    system = platform.system()
+    if system == "Darwin":
+        return _which("pbcopy")
+    if system == "Windows":
+        return _which("clip")
+    if os.environ.get("WAYLAND_DISPLAY"):
+        found = _which("wl-copy")
+        if found is not None:
+            return found
+    return _which("xclip", "-selection", "clipboard", "-in") or _which(
+        "xsel", "--clipboard", "--input"
+    )
+
+
+def copy_to_clipboard(text: str) -> str:
+    """Put ``text`` on the system clipboard and return the tool that did it."""
+
+    command = clipboard_command()
+    if command is None:
+        raise ClipboardError("no clipboard tool found: pbcopy, wl-copy, xclip, or xsel")
+    name = Path(command[0]).name
+    try:
+        result = subprocess.run(
+            command,
+            input=text.encode("utf-8"),
+            capture_output=True,
+            check=False,
+            timeout=CLIPBOARD_TIMEOUT,
+            env=subprocess_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ClipboardError(f"{name} failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        suffix = f": {detail}" if detail else ""
+        raise ClipboardError(f"{name} exited {result.returncode}{suffix}")
+    return name
 
 
 class ComposerAttachmentMixin:
