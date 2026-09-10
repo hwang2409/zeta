@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from ..core.session import env_home
+from ..model_catalog import PROVIDER_MODELS
 from ..providers.anthropic import AnthropicCredentialStore
 
 
@@ -27,6 +29,26 @@ def validate_model_name(provider: str, model: str) -> None:
         raise ValueError("model must be one nonempty word")
     if model.startswith(_WRONG_PROVIDER_PREFIXES.get(provider, ())):
         raise ValueError(f"model {model!r} has a wrong-provider prefix for {provider}")
+
+
+def known_models(provider: str, catalog: Iterable[str] | None = None) -> tuple[str, ...]:
+    """Return the provider's static table merged with a loaded catalog, sorted.
+
+    The static table answers instantly; the live catalog (network for claude,
+    the CLI cache for codex) is folded in whenever it has arrived.
+    """
+
+    names = set(PROVIDER_MODELS.get(provider, ()))
+    names.update(MODEL_CATALOGS.get(provider, ()))
+    names.update(catalog or ())
+    return tuple(sorted(names))
+
+
+def match_models(query: str, choices: Iterable[str]) -> tuple[str, ...]:
+    """Return the choices containing ``query`` case-insensitively, in order."""
+
+    needle = query.strip().lower()
+    return tuple(name for name in choices if needle in name.lower())
 
 
 def _model_names_from_payload(payload: Any) -> frozenset[str] | None:

@@ -951,7 +951,9 @@ def create_slash_registry(
             "inspect or approve automation drafts",
         )
     )
-    registry.register(SlashCommand("model", _run_model, "show or change the model"))
+    registry.register(
+        SlashCommand("model", _run_model, "pick a model or switch to one: /model [name]")
+    )
     registry.register(SlashCommand("vim", _run_vim, "show or change vim mode"))
     registry.register(
         SlashCommand("plan", _run_plan, "show or change plan mode")
