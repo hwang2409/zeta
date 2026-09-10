@@ -295,11 +295,15 @@ pub fn apply(cx: &mut App) {
     // surface with a slightly darker head; hover and active states borrow
     // the sidebar/list vocabulary so a table row in a list feels like the
     // list rows around it.
+    // Head and foot foregrounds carry table labels and summary cells; the
+    // wiki markdown table paints both with normal body text so they land on
+    // WCAG AA (>= 4.5:1) against panel/element. `text_faint` here drops the
+    // pair below 3.1:1 and the head becomes hard to read.
     colors.table = palette::panel();
     colors.table_head = palette::element();
-    colors.table_head_foreground = palette::text_faint();
+    colors.table_head_foreground = palette::text();
     colors.table_foot = palette::panel();
-    colors.table_foot_foreground = palette::text_faint();
+    colors.table_foot_foreground = palette::text();
     colors.table_even = palette::panel();
     colors.table_hover = palette::hover();
     colors.table_active = palette::active();
@@ -400,6 +404,27 @@ mod tests {
     /// default happens to share hue with the opencode palette.
     fn poison() -> Hsla {
         hex(0xff00ff)
+    }
+
+    /// WCAG 2.x relative luminance of an sRGB color.
+    fn relative_luminance(color: Hsla) -> f32 {
+        let rgba = color.to_rgb();
+        let channel = |c: f32| {
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(rgba.r) + 0.7152 * channel(rgba.g) + 0.0722 * channel(rgba.b)
+    }
+
+    /// WCAG 2.x contrast ratio between two sRGB colors, in [1, 21].
+    fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
+        let la = relative_luminance(a);
+        let lb = relative_luminance(b);
+        let (lmax, lmin) = if la >= lb { (la, lb) } else { (lb, la) };
+        (lmax + 0.05) / (lmin + 0.05)
     }
 
     #[gpui::test]
@@ -561,17 +586,53 @@ mod tests {
             assert_eq!(theme.button_primary_foreground, palette::canvas());
             assert_eq!(theme.table, palette::panel());
             assert_eq!(theme.table_head, palette::element());
-            assert_eq!(theme.table_head_foreground, palette::text_faint());
+            assert_eq!(theme.table_head_foreground, palette::text());
+            assert_eq!(theme.table_foot_foreground, palette::text());
+        });
+    }
+
+    #[gpui::test]
+    fn table_label_pairs_clear_wcag_aa_contrast(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(apply);
+
+        cx.update(|cx| {
+            let theme = cx.theme();
+            // Body-text minimum, per WCAG 2.1 AA. Table head/foot cells carry
+            // labels and summary rows, so they read as normal text and cannot
+            // fall back onto the 3:1 large-text tier.
+            let head = contrast_ratio(theme.table_head_foreground, theme.table_head);
+            let foot = contrast_ratio(theme.table_foot_foreground, theme.table_foot);
+            assert!(
+                head >= 4.5,
+                "table head foreground/background contrast {head:.2}:1 fails WCAG AA (4.5:1)"
+            );
+            assert!(
+                foot >= 4.5,
+                "table foot foreground/background contrast {foot:.2}:1 fails WCAG AA (4.5:1)"
+            );
         });
     }
 
     #[gpui::test]
     fn highlight_theme_paints_code_fences_in_palette(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
+        // Poison the highlight theme BEFORE apply so a future refactor that
+        // drops the `theme.highlight_theme = opencode_highlight_theme()` line
+        // is caught: without the write, the sentinel would still be here
+        // after apply and the assertions below would fail.
+        cx.update(|cx| {
+            Theme::global_mut(cx).highlight_theme = Arc::new(HighlightTheme {
+                name: "Zeta Poison".to_string(),
+                appearance: ThemeMode::Light,
+                style: Default::default(),
+            });
+        });
         cx.update(apply);
 
         cx.update(|cx| {
             let highlight = &cx.theme().highlight_theme;
+            assert_eq!(highlight.name, "Opencode Zeta");
             assert_eq!(highlight.appearance, ThemeMode::Dark);
 
             // Keyword must land on the violet accent, not the light
@@ -628,6 +689,15 @@ mod tests {
     #[gpui::test]
     fn semantic_tokens_project_the_flat_radius_and_no_elevation(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
+        // Poison the Base global's tokens BEFORE apply. `Theme::sync_base`
+        // is what pushes the styled tokens down to the Base layer where the
+        // scrollbar and resize-handle paint from; without that call this
+        // radius stays at the light default and scrollbars keep their pill.
+        cx.update(|cx| {
+            let base = gpui_kit::base::Theme::global_mut(cx);
+            base.tokens.radius.md = px(999.);
+            base.tokens.colors.accent_foreground = poison();
+        });
         cx.update(apply);
 
         cx.update(|cx| {
@@ -639,6 +709,15 @@ mod tests {
             // canvas — anything else would surface as low-contrast text
             // on any Base-consumer that reads accent_foreground.
             assert_eq!(semantic.colors.accent_foreground, palette::canvas());
+
+            // And the Base global itself has to carry those same tokens —
+            // otherwise sync_base was skipped and Base-layer consumers keep
+            // painting with the shadcn defaults.
+            let base = gpui_kit::base::Theme::global(cx);
+            assert_eq!(base.tokens.radius.md, RADIUS);
+            assert!(base.tokens.shadow.md.is_empty());
+            assert!(base.tokens.shadow.lg.is_empty());
+            assert_eq!(base.tokens.colors.accent_foreground, palette::canvas());
         });
     }
 }
