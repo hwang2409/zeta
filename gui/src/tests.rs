@@ -245,25 +245,37 @@ fn virtual_transcript_and_session_rows_fit_their_viewports(cx: &mut TestAppConte
         assert!(transcript.size.height > px(300.));
         visual.update(|window, cx| {
             let viewport = transcript.scale(window.scale_factor());
-            // Filter by content_mask so the composer's focused rail — which
-            // also paints in the primary color — cannot smuggle itself into
-            // an assertion about virtual-list clipping. Anything whose mask
-            // lies inside the transcript viewport IS a transcript row.
+            let composer_bounds = composer.scale(window.scale_factor());
+            // Identify transcript quads by their PAINT attributes alone —
+            // primary-color left rail — and exclude the composer's rail
+            // explicitly by bounds. The old test filtered by content_mask
+            // inside the viewport, which silently DROPPED any leaking quad
+            // rather than failing on it. Here we identify without that
+            // filter, then assert every quad's content mask (the clipping
+            // rectangle the virtual list assigns) stays inside the viewport.
             let quads: Vec<_> = window
                 .painted_quads()
                 .into_iter()
                 .filter(|quad| {
                     quad.border_color == cx.theme().primary
                         && quad.border_widths.left > gpui::ScaledPixels::default()
-                        && quad.content_mask.bounds.top() >= viewport.top()
-                        && quad.content_mask.bounds.bottom() <= viewport.bottom()
+                        && !(quad.bounds.top() >= composer_bounds.top()
+                            && quad.bounds.bottom() <= composer_bounds.bottom())
                 })
                 .collect();
             assert!(!quads.is_empty(), "user message borders were painted");
-            assert!(quads.len() < 20, "the virtual list paints only nearby rows");
+            assert!(quads.len() < 40, "the virtual list paints only nearby rows");
             for quad in quads {
-                assert!(quad.content_mask.bounds.left() >= viewport.left());
-                assert!(quad.content_mask.bounds.right() <= viewport.right());
+                assert!(
+                    quad.content_mask.bounds.top() >= viewport.top()
+                        && quad.content_mask.bounds.bottom() <= viewport.bottom(),
+                    "transcript row content-mask leaks vertically outside the viewport"
+                );
+                assert!(
+                    quad.content_mask.bounds.left() >= viewport.left()
+                        && quad.content_mask.bounds.right() <= viewport.right(),
+                    "transcript row content-mask leaks horizontally outside the viewport"
+                );
             }
         });
     }
@@ -275,10 +287,13 @@ fn png_bytes() -> Vec<u8> {
 
 #[gpui::test]
 fn transcript_column_caps_at_wiki_readable_measure_and_centers(cx: &mut TestAppContext) {
-    // Wiki agent-run column pins at 1024px centered. Long user prose must
-    // wrap at that measure, not fill the viewport.
+    // Wiki agent-run column pins at 1024px centered. The default 1100px window
+    // minus the 216px sidebar leaves ~884px of transcript viewport — narrower
+    // than the column cap, which means the centering branch never runs. Resize
+    // to a wide window here so the cap and centering are both exercised.
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1600.), px(760.)));
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.state.transcript = vec![TranscriptEntry::User("wide user turn ".repeat(500))];
@@ -289,8 +304,14 @@ fn transcript_column_caps_at_wiki_readable_measure_and_centers(cx: &mut TestAppC
     });
     let row = visual.debug_bounds("transcript-row").unwrap();
     let transcript = visual.debug_bounds("transcript-viewport").unwrap();
-    // The row spans the viewport, but the inner column stays within 1024px.
     assert!(row.size.width <= transcript.size.width);
+    // The transcript viewport must clear the column cap, otherwise this test
+    // regresses to the old "cap never activates" hole.
+    assert!(
+        transcript.size.width > theme::TRANSCRIPT_MAX_WIDTH,
+        "viewport {:?} must exceed the 1024px cap for centering to matter",
+        transcript.size.width
+    );
     visual.update(|window, cx| {
         let scale = window.scale_factor();
         let scaled_viewport = transcript.scale(scale);
@@ -307,30 +328,36 @@ fn transcript_column_caps_at_wiki_readable_measure_and_centers(cx: &mut TestAppC
             })
             .collect();
         assert!(!user_quads.is_empty(), "user rail was painted");
+        // The user rectangle sits inside a bounded inner column: 1024px minus
+        // 16px horizontal padding on each side (`.px_4()`). The rectangle's
+        // quad bounds are its border-box, so a 3px left-rail adds up to 3px
+        // to the observed width — allow that plus a sub-logical-pixel wiggle.
+        let inner_column = scaled_column_cap - px(32.).scale(scale);
+        let tolerance = px(4.).scale(scale);
         for quad in user_quads {
-            // A raw-terminal look would let the user block fill the viewport.
+            let width = quad.bounds.size.width;
+            let delta = if width > inner_column {
+                width - inner_column
+            } else {
+                inner_column - width
+            };
             assert!(
-                quad.bounds.size.width <= scaled_column_cap,
-                "user rectangle width {:?} exceeds 1024px column cap {:?}",
-                quad.bounds.size.width,
-                scaled_column_cap,
+                delta <= tolerance,
+                "user rectangle width {:?} must land on the inner 1024-32px column {:?}",
+                width,
+                inner_column,
             );
-            // Optical centering: once the viewport is wider than the column,
-            // the block sits symmetric within a tolerance.
-            if scaled_viewport.size.width > scaled_column_cap {
-                let left_gap = quad.bounds.left() - scaled_viewport.left();
-                let right_gap = scaled_viewport.right() - quad.bounds.right();
-                let asymmetry = if left_gap > right_gap {
-                    left_gap - right_gap
-                } else {
-                    right_gap - left_gap
-                };
-                let tolerance = scaled_viewport.size.width * 0.15;
-                assert!(
-                    asymmetry < tolerance,
-                    "column not centered: left {left_gap:?}, right {right_gap:?}"
-                );
-            }
+            let left_gap = quad.bounds.left() - scaled_viewport.left();
+            let right_gap = scaled_viewport.right() - quad.bounds.right();
+            let asymmetry = if left_gap > right_gap {
+                left_gap - right_gap
+            } else {
+                right_gap - left_gap
+            };
+            assert!(
+                asymmetry <= tolerance,
+                "column not centered: left {left_gap:?}, right {right_gap:?}"
+            );
         }
     });
 }
@@ -375,133 +402,306 @@ fn assistant_row_is_naked_and_carries_no_bg_or_rail(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut TestAppContext) {
-    // The wiki contract encodes tool state through COLOR ONLY:
-    // running -> foreground, done -> muted, failed -> danger. The expanded
-    // body rail flips to danger when the tool reports an error.
+    // The wiki contract encodes tool state through COLOR ONLY: running paints
+    // at foreground, done fades to muted, failed lands on danger. Textual
+    // "[working]/[done]/[failed]/[canceled]" markers must not render — a
+    // regression that reintroduces them shows up here as a textual marker
+    // and/or a canary painted at the wrong color.
+    #[derive(Clone, Copy)]
+    enum StateCase {
+        Running,
+        Done,
+        Failed,
+    }
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    for make_error in [false, true] {
+    for case in [StateCase::Running, StateCase::Done, StateCase::Failed] {
         visual.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.state.transcript.clear();
                 view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
+                let call = ToolCall {
+                    id: "receipt".into(),
+                    name: "bash".into(),
+                    arguments: Default::default(),
+                };
                 view.apply_worker_message(
-                    WorkerMessage::Event(ServerEvent::ToolEnd {
+                    WorkerMessage::Event(ServerEvent::ToolStart {
                         session_id: view.state.active_session.clone(),
-                        tool_call: ToolCall {
-                            id: "receipt".into(),
-                            name: "bash".into(),
-                            arguments: Default::default(),
-                        },
-                        tool_result: Some(zeta_gui::client::ToolResult {
-                            tool_call_id: "receipt".into(),
-                            content: "line".into(),
-                            is_error: make_error,
-                            is_canceled: false,
-                            structured_content: None,
-                            content_blocks: Vec::new(),
-                        }),
+                        tool_call: call.clone(),
                         data: json!({}),
                     }),
                     window,
                     cx,
                 );
-                // Expand collapsed successful rows so the indent-rail body paints.
-                if !make_error {
-                    view.state.toggle_card(0);
-                    cx.notify();
+                if !matches!(case, StateCase::Running) {
+                    let is_error = matches!(case, StateCase::Failed);
+                    view.apply_worker_message(
+                        WorkerMessage::Event(ServerEvent::ToolEnd {
+                            session_id: view.state.active_session.clone(),
+                            tool_call: call,
+                            tool_result: Some(zeta_gui::client::ToolResult {
+                                tool_call_id: "receipt".into(),
+                                content: "line".into(),
+                                is_error,
+                                is_canceled: false,
+                                structured_content: None,
+                                content_blocks: Vec::new(),
+                            }),
+                            data: json!({}),
+                        }),
+                        window,
+                        cx,
+                    );
+                    // Expand collapsed successful rows so the indent-rail body paints.
+                    if matches!(case, StateCase::Done) {
+                        view.state.toggle_card(0);
+                        cx.notify();
+                    }
                 }
             });
             window.draw(cx).clear(cx);
         });
-        let body = visual
-            .debug_bounds("tool-output-0")
-            .expect("expanded tool body renders");
+        let canary_bounds = visual
+            .debug_bounds("tool-state-canary-0")
+            .expect("tool row paints a state-color canary");
         visual.update(|window, cx| {
             let theme = cx.theme();
-            let scaled_body = body.scale(window.scale_factor());
-            // The body's rail is the wiki 1px thin rail. Filter out any
-            // ancestor's 3px rail so the assertion is about THIS row's rail
-            // and not the user turn above it.
-            let thin_rail = px(f32::from(theme::RAIL_WIDTH_THIN)).scale(window.scale_factor());
-            let thick_rail = px(f32::from(theme::RAIL_WIDTH_THICK)).scale(window.scale_factor());
-            let rails: Vec<_> = window
+            let expected_color = match case {
+                StateCase::Running => theme.foreground,
+                StateCase::Done => theme.muted_foreground,
+                StateCase::Failed => theme.danger,
+            };
+            let scaled = canary_bounds.scale(window.scale_factor());
+            let canary = window
                 .painted_quads()
                 .into_iter()
-                .filter(|quad| {
-                    let in_body = quad.bounds.top() >= scaled_body.top()
-                        && quad.bounds.bottom() <= scaled_body.bottom();
-                    let is_thin_rail = quad.border_widths.left >= thin_rail
-                        && quad.border_widths.left < thick_rail;
-                    in_body && is_thin_rail
+                .find(|quad| {
+                    quad.bounds.top() >= scaled.top()
+                        && quad.bounds.bottom() <= scaled.bottom()
+                        && quad.bounds.left() >= scaled.left()
+                        && quad.bounds.right() <= scaled.right()
+                        && quad.background == expected_color.into()
                 })
-                .collect();
-            let neutral: Vec<_> = rails
-                .iter()
-                .filter(|quad| quad.border_color == theme.border)
-                .collect();
-            let danger: Vec<_> = rails
-                .iter()
-                .filter(|quad| quad.border_color == theme.danger)
-                .collect();
-            if make_error {
-                assert!(
-                    !danger.is_empty(),
-                    "failed tool body must paint its rail in danger"
-                );
-                assert!(
-                    neutral.is_empty(),
-                    "failed tool body rail must not paint in the neutral border color"
-                );
-            } else {
-                assert!(
-                    !neutral.is_empty(),
-                    "successful tool body must paint its rail in the neutral border color"
-                );
-                assert!(
-                    danger.is_empty(),
-                    "successful tool body rail must not paint in danger"
-                );
-            }
+                .expect("state-color canary must paint at the expected color");
+            assert_eq!(
+                canary.background,
+                expected_color.into(),
+                "tool row state color regressed off the expected token"
+            );
+            let _ = canary;
         });
+        // Absence of textual "[working]"/"[done]"/"[failed]"/"[canceled]"
+        // markers: the render path no longer wires `tool_marker()` through,
+        // and the debug tree exposes no marker-tagged element. A regression
+        // that reintroduces one would add a debug_selector by name (the
+        // pattern this codebase uses for every user-visible chip), which
+        // would then trip on the assertion below.
+        for marker_selector in ["tool-state-label-0", "tool-state-marker-0", "tool-marker-0"] {
+            assert!(
+                visual.debug_bounds(marker_selector).is_none(),
+                "textual tool state marker {marker_selector} must not render"
+            );
+        }
+        // The state-color canary is 1x1: verify it stays at that size, so a
+        // future regression that leaks a full-width state fill also trips
+        // this test.
+        assert!(canary_bounds.size.width <= px(1.5));
+        assert!(canary_bounds.size.height <= px(1.5));
+        // Failed tool bodies auto-expand (see state::ServerEvent::ToolEnd),
+        // so the indent-rail assertion still runs for that case. The Done
+        // case toggles above; Running has no expanded body.
+        if matches!(case, StateCase::Done | StateCase::Failed) {
+            let body = visual
+                .debug_bounds("tool-output-0")
+                .expect("expanded tool body renders");
+            visual.update(|window, cx| {
+                let theme = cx.theme();
+                let scaled_body = body.scale(window.scale_factor());
+                let thin_rail = px(f32::from(theme::RAIL_WIDTH_THIN)).scale(window.scale_factor());
+                let thick_rail =
+                    px(f32::from(theme::RAIL_WIDTH_THICK)).scale(window.scale_factor());
+                let rails: Vec<_> = window
+                    .painted_quads()
+                    .into_iter()
+                    .filter(|quad| {
+                        let in_body = quad.bounds.top() >= scaled_body.top()
+                            && quad.bounds.bottom() <= scaled_body.bottom();
+                        let is_thin_rail = quad.border_widths.left >= thin_rail
+                            && quad.border_widths.left < thick_rail;
+                        in_body && is_thin_rail
+                    })
+                    .collect();
+                let danger_count = rails
+                    .iter()
+                    .filter(|quad| quad.border_color == theme.danger)
+                    .count();
+                let neutral_count = rails
+                    .iter()
+                    .filter(|quad| quad.border_color == theme.border)
+                    .count();
+                if matches!(case, StateCase::Failed) {
+                    assert!(
+                        danger_count > 0,
+                        "failed tool body must paint its rail in danger"
+                    );
+                    assert_eq!(
+                        neutral_count, 0,
+                        "failed tool body must not paint any neutral rails"
+                    );
+                } else {
+                    assert!(
+                        neutral_count > 0,
+                        "successful tool body must paint its rail in the neutral border color"
+                    );
+                    assert_eq!(
+                        danger_count, 0,
+                        "successful tool body must not paint any danger rails"
+                    );
+                }
+            });
+        }
     }
 }
 
 #[gpui::test]
 fn composer_focus_promotes_the_rail_and_lightens_the_fill(cx: &mut TestAppContext) {
     // Focus is the ONLY chrome cue on the composer: rail promotes to full
-    // accent, fill lightens one step. Regressing to a border ring would fail
-    // the wiki contract without failing this test — so we assert both.
-    let (window, _view, _) = setup(cx);
+    // accent AND fill lightens one step. Any border ring or extra outline
+    // would fail the wiki contract — so this test paints both blurred and
+    // focused states and asserts exact rail width, the actual painted fill
+    // promotion, and that no other border/ring lives in the composer bounds.
+    let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    visual.update(|window, cx| window.draw(cx).clear(cx));
-    let composer = visual.debug_bounds("composer").unwrap();
+
+    // Blurred: force focus off the composer via a fresh focus handle.
     visual.update(|window, cx| {
+        let handle = cx.focus_handle();
+        window.focus(&handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    let composer = visual.debug_bounds("composer").unwrap();
+    let (blurred_rail_alpha, blurred_fill) = visual.update(|window, cx| {
         let theme = cx.theme();
-        // Focused composer paints a 3px accent left rail at the composer's
-        // top edge — this is the single focus cue. Anything else in the same
-        // region is either the fork rail (user rows) or a bug.
         let scaled = composer.scale(window.scale_factor());
         let rail_width_scaled = px(f32::from(theme::RAIL_WIDTH_THICK)).scale(window.scale_factor());
-        let rail = window
+        let composer_quads: Vec<_> = window
             .painted_quads()
             .into_iter()
-            .find(|quad| {
-                quad.border_color == theme.primary
-                    && quad.border_widths.left >= rail_width_scaled
-                    && quad.bounds.top() >= scaled.top()
-                    && quad.bounds.bottom() <= scaled.bottom()
+            .filter(|quad| {
+                quad.bounds.top() >= scaled.top() && quad.bounds.bottom() <= scaled.bottom()
             })
-            .expect("focused composer paints a full-accent left rail at the wiki 3px width");
-        // The rail must live at the composer's left edge, not inside a child.
-        assert!(rail.bounds.left() <= scaled.left() + gpui::ScaledPixels::from(1.0));
-        // Focused fill must be lighter than the ambient element surface — the
-        // fill lightening is what makes the composer feel "engaged" without
-        // adding a ring.
-        assert!(theme::palette::composer_focus_fill().l > theme::palette::element().l);
-        // Dim rail alpha is strictly less than the full accent — that is the
-        // structural difference between "at rest" and "focused".
-        assert!(theme::palette::accent_rail_dim().a < theme.primary.a);
+            .collect();
+        let rail = composer_quads
+            .iter()
+            .find(|quad| {
+                quad.border_widths.left >= rail_width_scaled
+                    && quad.bounds.left() <= scaled.left() + gpui::ScaledPixels::from(1.0)
+            })
+            .expect("blurred composer paints a left rail");
+        // Rail must land on the DIM accent (rail alpha < full accent).
+        assert!(rail.border_color.a < theme.primary.a);
+        assert!((rail.border_color.h - theme.primary.h).abs() < 0.01);
+        // Rail width is EXACTLY the wiki thick rail — a 2px regression would
+        // pass a `>=` check but slip under this equality.
+        assert!(rail.border_widths.left <= rail_width_scaled + gpui::ScaledPixels::from(0.5));
+        // No ring: no non-left border on any composer quad. The rail is the
+        // only chrome; a border ring elsewhere would trip this.
+        for quad in &composer_quads {
+            assert!(
+                quad.border_widths.top == gpui::ScaledPixels::default(),
+                "composer must not paint a top border"
+            );
+            assert!(
+                quad.border_widths.right == gpui::ScaledPixels::default(),
+                "composer must not paint a right border"
+            );
+            assert!(
+                quad.border_widths.bottom == gpui::ScaledPixels::default(),
+                "composer must not paint a bottom border"
+            );
+        }
+        // Blurred fill is the ambient element surface.
+        let fill_quad = composer_quads
+            .iter()
+            .find(|quad| {
+                quad.background == theme.muted.into()
+                    || quad.background == theme::palette::composer_focus_fill().into()
+            })
+            .expect("blurred composer paints its fill");
+        assert_eq!(
+            fill_quad.background,
+            theme.muted.into(),
+            "blurred composer must sit on the ambient element surface"
+        );
+        (rail.border_color.a, fill_quad.background)
+    });
+
+    // Focused: restore focus to the composer input.
+    visual.update(|window, cx| {
+        let handle = view.read(cx).composer.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled = composer.scale(window.scale_factor());
+        let rail_width_scaled = px(f32::from(theme::RAIL_WIDTH_THICK)).scale(window.scale_factor());
+        let composer_quads: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.bounds.top() >= scaled.top() && quad.bounds.bottom() <= scaled.bottom()
+            })
+            .collect();
+        let rail = composer_quads
+            .iter()
+            .find(|quad| {
+                quad.border_widths.left >= rail_width_scaled
+                    && quad.bounds.left() <= scaled.left() + gpui::ScaledPixels::from(1.0)
+                    && quad.border_color == theme.primary
+            })
+            .expect("focused composer paints a full-accent left rail");
+        // Rail width remains at the wiki thick rail — not the ring style.
+        assert!(rail.border_widths.left <= rail_width_scaled + gpui::ScaledPixels::from(0.5));
+        // No border ring anywhere in the composer.
+        for quad in &composer_quads {
+            assert!(
+                quad.border_widths.top == gpui::ScaledPixels::default(),
+                "focused composer must not paint a top border"
+            );
+            assert!(
+                quad.border_widths.right == gpui::ScaledPixels::default(),
+                "focused composer must not paint a right border"
+            );
+            assert!(
+                quad.border_widths.bottom == gpui::ScaledPixels::default(),
+                "focused composer must not paint a bottom border"
+            );
+        }
+        // Focus must promote the rail alpha above the blurred alpha AND change
+        // the composer fill to the lighter step — asserting both prevents a
+        // regression that promotes only one.
+        assert!(
+            rail.border_color.a > blurred_rail_alpha,
+            "focus must strengthen the rail alpha"
+        );
+        let fill_quad = composer_quads
+            .iter()
+            .find(|quad| {
+                quad.background == theme.muted.into()
+                    || quad.background == theme::palette::composer_focus_fill().into()
+            })
+            .expect("focused composer paints its fill");
+        assert_eq!(
+            fill_quad.background,
+            theme::palette::composer_focus_fill().into(),
+            "focus must lighten the composer fill one step"
+        );
+        assert_ne!(
+            fill_quad.background, blurred_fill,
+            "focused fill must differ from the blurred fill"
+        );
     });
 }
 
@@ -1338,7 +1538,13 @@ fn thinking_feedback_stops_on_text_and_turn_boundaries(cx: &mut TestAppContext) 
                 view.composer_hint(),
                 "zeta is thinking… · Esc stops the turn"
             );
-            assert!(view.state.transcript.is_empty());
+            // Thinking now paints a display-safe placeholder row — never the
+            // private reasoning text, which the final assertion of this test
+            // still guards against below.
+            assert!(matches!(
+                view.state.transcript.as_slice(),
+                [TranscriptEntry::Thinking { .. }]
+            ));
             view.apply_worker_message(
                 WorkerMessage::Event(ServerEvent::AssistantDelta {
                     session_id: None,

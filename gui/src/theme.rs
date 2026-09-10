@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use gpui::{px, App, Hsla, Pixels};
-use gpui_kit::component::{highlighter::HighlightTheme, Theme, ThemeMode};
+use gpui_kit::component::{highlighter::HighlightTheme, ActiveTheme, Theme, ThemeMode};
 
 /// Base UI type size — the "one size drives everything" pin from the wiki
 /// run-UI extraction.
@@ -47,6 +47,41 @@ pub const RAIL_WIDTH_THIN: Pixels = px(1.);
 
 /// Small streaming indicator dot size — wiki uses 7px.
 pub const STREAM_DOT_SIZE: Pixels = px(7.);
+
+/// Composer target-line row height — the muted "→ model" label above the
+/// textarea. Kept tight so the 64px composer floor stays honest.
+pub const COMPOSER_TARGET_HEIGHT: Pixels = px(16.);
+
+/// Semantic composer color roles. The composer paints its rail, fill, and
+/// target-line label from these — never from `palette::*` directly — so the
+/// call sites read as "composer at rest / composer focused" rather than
+/// "some palette function looks composer-shaped."
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ComposerRoles {
+    pub rail_rest: Hsla,
+    pub rail_focus: Hsla,
+    pub fill_rest: Hsla,
+    pub fill_focus: Hsla,
+    pub target_label: Hsla,
+    pub target_value: Hsla,
+    pub send_disabled_outline: Hsla,
+}
+
+/// Semantic composer tokens routed through `cx.theme()`. Consumers read here
+/// instead of touching `palette::*` — a future theme refactor changes tokens
+/// in one place, and every composer state moves with it.
+pub fn composer_roles(cx: &App) -> ComposerRoles {
+    let theme = cx.theme();
+    ComposerRoles {
+        rail_rest: palette::accent_rail_dim(),
+        rail_focus: theme.primary,
+        fill_rest: theme.muted,
+        fill_focus: palette::composer_focus_fill(),
+        target_label: theme.muted_foreground,
+        target_value: theme.primary,
+        send_disabled_outline: palette::border_active(),
+    }
+}
 
 /// Convert a 24-bit `0xRRGGBB` literal to Hsla.
 fn hex(rgb: u32) -> Hsla {

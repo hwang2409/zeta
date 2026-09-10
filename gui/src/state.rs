@@ -44,6 +44,14 @@ pub enum TranscriptEntry {
         canceled: bool,
         card: Card,
     },
+    /// Display-safe placeholder for a thinking span. The server exposes the
+    /// reasoning content as private, so this entry carries the fact that
+    /// thinking occurred plus a duration if one is known — never the words
+    /// themselves. Rendering leans on this to draw the muted "+ Thought"
+    /// header without leaking the underlying reasoning.
+    Thinking {
+        duration_ms: Option<u64>,
+    },
 }
 
 impl TranscriptEntry {
@@ -274,6 +282,19 @@ impl AppState {
                 if kind == "thinking" && !delta.is_empty() =>
             {
                 self.thinking = !self.assistant_started;
+                // Emit a display-safe thinking placeholder the first time we
+                // see thinking in this turn — we never store the reasoning
+                // text, so the entry is header-only.
+                if self.thinking
+                    && !matches!(
+                        self.transcript.last(),
+                        Some(TranscriptEntry::Thinking { .. })
+                    )
+                {
+                    self.transcript
+                        .push(TranscriptEntry::Thinking { duration_ms: None });
+                    changed = self.transcript.len().checked_sub(1);
+                }
             }
             ServerEvent::AssistantDelta { .. } => {}
             ServerEvent::AssistantMessage { message, .. } => {

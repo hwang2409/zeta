@@ -44,6 +44,17 @@ impl Render for DialogLayer {
     }
 }
 
+/// Local queued state for a user turn that has been submitted but not yet
+/// echoed by the server. Rendered as a dashed strip between the transcript
+/// and the composer so users see the message is on its way, and the strip
+/// promotes to a solid user turn on `Sent` or flips its rail to danger on
+/// `Rejected`.
+#[derive(Debug, Clone, PartialEq)]
+struct PendingUserTurn {
+    text: String,
+    failed: bool,
+}
+
 struct ZetaView {
     state: AppState,
     dialogs: Entity<DialogLayer>,
@@ -52,6 +63,7 @@ struct ZetaView {
     sidebar_scroll: gpui_kit::component::VirtualListScrollHandle,
     model_scroll: gpui::ScrollHandle,
     pending_command: bool,
+    pending_user_turn: Option<PendingUserTurn>,
     command_error: Option<String>,
     dialog_request: Option<String>,
     approval_pending: bool,
@@ -103,6 +115,7 @@ impl ZetaView {
             sidebar_scroll: gpui_kit::component::VirtualListScrollHandle::new(),
             model_scroll: gpui::ScrollHandle::new(),
             pending_command: false,
+            pending_user_turn: None,
             command_error: None,
             dialog_request: None,
             approval_pending: false,
@@ -251,6 +264,7 @@ impl ZetaView {
             }
             WorkerMessage::Sent(text) => {
                 self.pending_command = false;
+                self.pending_user_turn = None;
                 self.state.streaming = true;
                 self.state.transcript.push(TranscriptEntry::User(text));
                 self.composer
@@ -312,6 +326,9 @@ impl ZetaView {
             WorkerMessage::Rejected(error) => {
                 self.pending_command = false;
                 self.approval_pending = false;
+                if let Some(pending) = &mut self.pending_user_turn {
+                    pending.failed = true;
+                }
                 if self.settings_open {
                     self.settings_error = Some(error);
                 } else {
@@ -326,6 +343,9 @@ impl ZetaView {
                 }
                 self.pending_command = false;
                 self.approval_pending = false;
+                if let Some(pending) = &mut self.pending_user_turn {
+                    pending.failed = true;
+                }
                 for row in &mut self.login_providers {
                     if row.progress.busy() {
                         row.progress = LoginProgress::failed(
@@ -420,6 +440,13 @@ impl ZetaView {
         }
         self.composer_empty_hint = false;
         self.pending_command = true;
+        // Record the queued text so a dashed strip renders under the composer
+        // while the server has not yet echoed the turn. `WorkerMessage::Sent`
+        // clears it; `Rejected` flips `failed` for the danger rail.
+        self.pending_user_turn = Some(PendingUserTurn {
+            text: text.clone(),
+            failed: false,
+        });
         if has_images {
             self.queue(CommandMessage::SendImages(
                 text,
@@ -1124,6 +1151,9 @@ impl ZetaView {
             TranscriptEntry::User(text) => self.render_user_row(index, text, view, cx),
             TranscriptEntry::Assistant(doc) => self.render_assistant_row(index, doc, cx),
             entry @ TranscriptEntry::Tool { .. } => self.render_tool_row(index, entry, view, cx),
+            TranscriptEntry::Thinking { duration_ms } => {
+                self.render_thinking_row(index, *duration_ms, cx)
+            }
             TranscriptEntry::Error {
                 message,
                 settings_action,
@@ -1137,6 +1167,30 @@ impl ZetaView {
                 cx,
             ),
         }
+    }
+
+    fn render_thinking_row(
+        &self,
+        index: usize,
+        duration_ms: Option<u64>,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        // Display-safe: the server hides the reasoning content, so this row is
+        // header-only. No body, no expand affordance — leaking would require
+        // storing the thinking text, and we deliberately do not.
+        let mut header = String::from("+ Thought");
+        if let Some(ms) = duration_ms {
+            header.push_str(&format!(" · {ms}ms"));
+        }
+        div()
+            .debug_selector(move || format!("thinking-row-{index}"))
+            .w_full()
+            .min_w_0()
+            .py(px(2.))
+            .opacity(0.6)
+            .text_color(cx.theme().muted_foreground)
+            .child(header)
+            .into_any_element()
     }
 
     fn render_user_row(
@@ -1156,49 +1210,58 @@ impl ZetaView {
         div()
             .group(group.clone())
             .v_flex()
-            .gap_1()
             .child(
-                // The user's rectangle: mono, element fill, 3px accent rail —
-                // one flat block, no shadow, no rounded chrome.
+                // Rectangle + hover-reveal fork button live in the SAME layout
+                // cell (relative parent, absolute button). The invisible button
+                // no longer reserves a phantom row that breaks the 14px rhythm.
                 div()
+                    .relative()
                     .w_full()
                     .min_w_0()
-                    .py_2()
-                    .px_3()
-                    .bg(cx.theme().muted)
-                    .border_l(theme::RAIL_WIDTH_THICK)
-                    .border_color(cx.theme().primary)
-                    .whitespace_normal()
-                    .child(text.to_owned()),
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .py_2()
+                            .px_3()
+                            .bg(cx.theme().muted)
+                            .border_l(theme::RAIL_WIDTH_THICK)
+                            .border_color(cx.theme().primary)
+                            .whitespace_normal()
+                            .child(text.to_owned()),
+                    )
+                    .when_some(fork_id, |row, id| {
+                        let click_id = id.clone();
+                        let click_view = view.clone();
+                        row.child(
+                            div()
+                                .absolute()
+                                .top_1()
+                                .right_1()
+                                .opacity(0.)
+                                .group_hover(group.clone(), |style| style.opacity(1.))
+                                .child(
+                                    Button::new(("fork", index))
+                                        .debug_selector(move || format!("fork-button-{index}"))
+                                        .ghost()
+                                        .compact()
+                                        .label("Fork here")
+                                        .on_click(move |_, _, cx| {
+                                            let id = click_id.clone();
+                                            let _ = click_view
+                                                .update(cx, |view, cx| view.fork_message(id, cx));
+                                        }),
+                                ),
+                        )
+                    }),
             )
-            .when_some(fork_id, |row, id| {
-                let click_id = id.clone();
-                let click_view = view.clone();
-                row.child(
-                    div().h_flex().justify_end().child(
-                        Button::new(("fork", index))
-                            .debug_selector(move || format!("fork-button-{index}"))
-                            .ghost()
-                            .compact()
-                            .label("Fork here")
-                            // Hover-reveal keeps the affordance out of the row's
-                            // default reading order (mirrors the wiki pattern).
-                            .opacity(0.)
-                            .group_hover(group.clone(), |style| style.opacity(1.))
-                            .on_click(move |_, _, cx| {
-                                let id = click_id.clone();
-                                let _ = click_view.update(cx, |view, cx| view.fork_message(id, cx));
-                            }),
-                    ),
-                )
-            })
             .children(
                 self.state
                     .session_view
                     .attachments
                     .get(&index)
                     .map(|attachments| {
-                        div().h_flex().flex_wrap().gap_2().children(
+                        div().mt_1().h_flex().flex_wrap().gap_2().children(
                             attachments.iter().enumerate().map(
                                 |(attachment_index, (name, size))| {
                                     div()
@@ -1229,21 +1292,35 @@ impl ZetaView {
         &self,
         index: usize,
         doc: &zeta_gui::markdown::Markdown,
-        _: &App,
+        cx: &App,
     ) -> gpui::AnyElement {
         // Naked assistant turn: 2px vertical breath, no bg, no border, no rail.
         // Hierarchy is carried by weight + color tier + rails on OTHER row types,
-        // not by framing the assistant.
+        // not by framing the assistant. Prose sits at 1.65 line-height for the
+        // wiki reading rhythm; code fences carry 12x16 padding, a 1px border,
+        // and soft-wrap so long lines never introduce a horizontal scroll.
+        let code_block = gpui::StyleRefinement::default()
+            .py(px(12.))
+            .px(px(16.))
+            .border_1()
+            .border_color(cx.theme().border)
+            .whitespace_normal();
+        let text_style = gpui_kit::component::text::TextViewStyle {
+            code_block,
+            ..Default::default()
+        };
         div()
             .py(px(2.))
             .w_full()
             .min_w_0()
+            .line_height(gpui::rems(1.65))
             .when(doc.preview_truncated, |row| {
                 row.child("Showing the latest streamed text…")
             })
             .child(
                 TextView::markdown(format!("message-{index}"), doc.source.to_string())
-                    .selectable(true),
+                    .selectable(true)
+                    .style(text_style),
             )
             .into_any_element()
     }
@@ -1265,7 +1342,8 @@ impl ZetaView {
             unreachable!("render_tool_row invoked on non-Tool entry");
         };
         // State is signalled by COLOR ONLY. `running` sits at normal text tier;
-        // `done` fades to muted; `failed`/`canceled` land on danger.
+        // `done` fades to muted; `failed`/`canceled` land on danger. No textual
+        // "[working]/[done]/[failed]" marker — that duplicated what color says.
         let complete = matches!(entry, TranscriptEntry::Tool { complete: true, .. });
         let state_color = if entry.unsuccessful() {
             cx.theme().danger
@@ -1274,17 +1352,34 @@ impl ZetaView {
         } else {
             cx.theme().foreground
         };
-        // Every verb ("read", "bash", …) reads at weight 600 so the grammar
-        // "[state] verb detail" is scannable in a run of many receipts.
-        let verb = format!("{} {name}", entry.tool_marker());
+        let verb = name.clone();
         let detail = summary.to_owned();
+        let group = format!("tool-row-{index}");
+        let output_size = card.tail.text.len();
 
         div()
+            .group(group.clone())
             .id(("tool-receipt", index))
             .debug_selector(move || format!("tool-receipt-{index}"))
+            .relative()
             .w_full()
             .min_w_0()
             .cursor_pointer()
+            // 1x1 state-color pip at the row's top-left corner. Reinforces
+            // the color-only state signal AND lets the test assert the
+            // painted color per state independently of the (untestable) text
+            // color that the row wrapper applies. Non-load-bearing pixel; a
+            // color regression trips the receipt-color test.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(1.))
+                    .h(px(1.))
+                    .bg(state_color)
+                    .debug_selector(move || format!("tool-state-canary-{index}")),
+            )
             .hover(|style| style.bg(cx.theme().list_hover))
             .on_click(move |_, _, cx| {
                 let _ = view.update(cx, |view, cx| {
@@ -1323,7 +1418,29 @@ impl ZetaView {
                             .truncate()
                             .opacity(0.78)
                             .child(detail),
-                    ),
+                    )
+                    // Collapsed rows carry the output size at faint tier and a
+                    // hover-fade "show output" hint — the visible affordance for
+                    // the click-to-expand behaviour.
+                    .when(!card.expanded && output_size > 0, |row| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(cx.theme().muted_foreground)
+                                .opacity(0.78)
+                                .text_size(px(12.))
+                                .child(format_output_size(output_size)),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(cx.theme().muted_foreground)
+                                .opacity(0.)
+                                .group_hover(group.clone(), |style| style.opacity(0.78))
+                                .text_size(px(12.))
+                                .child("show output"),
+                        )
+                    }),
             )
             .when(card.expanded, |row| {
                 let is_error = entry.unsuccessful();
@@ -1332,11 +1449,12 @@ impl ZetaView {
                         .debug_selector(move || format!("tool-output-{index}"))
                         // Indent rail: margin 3/0/5, padding-left 8, 1px rail,
                         // panel fill — reads as a subordinate body without
-                        // fighting the row's leading verb.
+                        // fighting the row's leading verb. Vertical padding sits
+                        // at 2px per the wiki contract, not the 4px `.py_1()`.
                         .mt(px(3.))
                         .mb(px(5.))
                         .pl_2()
-                        .py_1()
+                        .py(px(2.))
                         .border_l(theme::RAIL_WIDTH_THIN)
                         .border_color(if is_error {
                             cx.theme().danger
@@ -1428,13 +1546,52 @@ impl ZetaView {
         }
     }
 
-    fn footer_mode_color(&self, cx: &App) -> gpui::Hsla {
-        match &self.state.connection {
-            ConnectionState::Lost(_) => cx.theme().danger,
-            ConnectionState::Reconnecting => cx.theme().warning,
-            _ if !self.state.approvals.is_empty() => cx.theme().warning,
-            _ => cx.theme().primary,
-        }
+    fn footer_mode_color(cx: &App) -> gpui::Hsla {
+        // The mode word always paints in the accent tier — the one load-bearing
+        // color on this strip. Off-nominal states signal through the mode WORD
+        // ("offline"/"connecting"/"approve") plus the streaming dot's presence,
+        // never by recoloring the label — that would leak the alarm elsewhere.
+        cx.theme().primary
+    }
+
+    fn render_pending_user_turn(&self, cx: &App) -> Option<gpui::AnyElement> {
+        // Queued strip: user turn dashed while awaiting the server's echo;
+        // flips to danger rail on `Rejected`/`Lost` so the user sees the send
+        // failed without a modal or toast. Clears the moment `Sent` arrives —
+        // that same instant the real user turn appears in the transcript.
+        let pending = self.pending_user_turn.as_ref()?;
+        let (rail_color, opacity) = if pending.failed {
+            (cx.theme().danger, 0.85)
+        } else {
+            (cx.theme().primary, 0.6)
+        };
+        Some(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .px_4()
+                .pb_2()
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .max_w(theme::TRANSCRIPT_MAX_WIDTH)
+                        .debug_selector(|| "composer-pending".into())
+                        .py_2()
+                        .px_3()
+                        .bg(cx.theme().muted)
+                        .border_l(theme::RAIL_WIDTH_THICK)
+                        .border_dashed()
+                        .border_color(rail_color)
+                        .opacity(opacity)
+                        .whitespace_normal()
+                        .child(pending.text.clone()),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_composer(
@@ -1444,43 +1601,60 @@ impl ZetaView {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let focused = self.composer.focus_handle(cx).is_focused(window);
-        // Focus is the ONLY chrome cue on the composer: rail promotes from the
-        // dim tint to full accent, and the fill lightens one step. No border,
-        // no ring, no outline.
+        // Composer paints its state from the semantic tokens, not from raw
+        // palette values — a future theme rethink moves the tokens in one place
+        // and every state stays coherent.
+        let roles = theme::composer_roles(cx);
         let rail_color = if focused {
-            cx.theme().primary
+            roles.rail_focus
         } else {
-            theme::palette::accent_rail_dim()
+            roles.rail_rest
         };
         let fill_color = if focused {
-            theme::palette::composer_focus_fill()
+            roles.fill_focus
         } else {
-            cx.theme().muted
+            roles.fill_rest
         };
-        let send_variant = ButtonCustomVariant::new(cx)
-            .color(cx.theme().foreground)
-            .foreground(cx.theme().background)
-            .hover(cx.theme().muted_foreground)
-            .active(cx.theme().muted_foreground);
+        // Enabled send: inverted — text color on canvas, hover fades to muted.
+        // Disabled send: outline — transparent fill, active-border ring, faint
+        // label at 0.55 opacity. Kit's default disabled fill on top of the
+        // inverted variant reads as a "translucent chip" instead of a clearly
+        // unavailable outline, so we swap the whole variant here.
+        let send_variant = if can_send {
+            ButtonCustomVariant::new(cx)
+                .color(cx.theme().foreground)
+                .foreground(cx.theme().background)
+                .hover(cx.theme().muted_foreground)
+                .active(cx.theme().muted_foreground)
+        } else {
+            ButtonCustomVariant::new(cx)
+                .color(gpui::transparent_black())
+                .foreground(roles.send_disabled_outline)
+                .hover(gpui::transparent_black())
+                .active(gpui::transparent_black())
+        };
+        let model_target = self
+            .state
+            .metrics
+            .model
+            .clone()
+            .unwrap_or_else(|| "no model".to_owned());
 
         div()
             .id("composer")
             .debug_selector(|| "composer".into())
             .v_flex()
             .flex_shrink_0()
-            .gap_2()
             .py(theme::COMPOSER_PADDING_Y)
             .px(theme::COMPOSER_PADDING_X)
             .min_h(theme::COMPOSER_MIN_HEIGHT)
             .bg(fill_color)
             .border_l(theme::RAIL_WIDTH_THICK)
             .border_color(rail_color)
-            // The kit emits PressEnter and propagates its action. Consume it
-            // here so native text input cannot insert a newline after submit.
             .on_action(|_: &gpui_kit::component::input::Enter, _, _| {})
             .when(!self.composer_images.is_empty(), |composer| {
                 composer.child(
-                    div().h_flex().flex_wrap().gap_2().children(
+                    div().mb_1().h_flex().flex_wrap().gap_2().children(
                         self.composer_images
                             .iter()
                             .enumerate()
@@ -1509,28 +1683,47 @@ impl ZetaView {
                 )
             })
             .when_some(self.composer_image_error.clone(), |composer, error| {
-                composer.child(Alert::error("image-error", error))
+                composer.child(div().mb_1().child(Alert::error("image-error", error)))
             })
-            .child(
-                // Textarea sits transparent on the composer's fill so the rail
-                // + fill is the only visible frame. `appearance(false)` drops
-                // Kit's default chrome + focus ring; `bordered(false)` removes
-                // the ambient border. The composer div carries the rail alone.
-                div().w_full().child(
-                    Textarea::new(&self.composer)
-                        .h(px(56.))
-                        .appearance(false)
-                        .bordered(false)
-                        .disabled(!can_send)
-                        .aria_label("Message zeta"),
-                ),
-            )
+            // Target line above the input: mono muted with the model name in
+            // the accent tier. Reads as "which target this composer is pointed
+            // at" — the same role wiki's composer target-line plays.
             .child(
                 div()
                     .h_flex()
                     .items_center()
-                    .justify_end()
+                    .gap_1()
+                    .h(theme::COMPOSER_TARGET_HEIGHT)
+                    .text_size(px(12.))
+                    .debug_selector(|| "composer-target".into())
+                    .child(div().text_color(roles.target_label).child("→"))
+                    .child(
+                        div()
+                            .text_color(roles.target_value)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .debug_selector(|| "composer-target-name".into())
+                            .child(model_target),
+                    ),
+            )
+            // Inline row: textarea flows, action buttons sit inline — a compact
+            // 64px grid rather than a 120px v_flex stack. min-height 44px keeps
+            // the textarea legible without inflating the composer floor.
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
                     .gap_2()
+                    .w_full()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Textarea::new(&self.composer)
+                                .h(px(44.))
+                                .appearance(false)
+                                .bordered(false)
+                                .disabled(!can_send)
+                                .aria_label("Message zeta"),
+                        ),
+                    )
                     .child(
                         Button::new("attach")
                             .debug_selector(|| "attach-button".into())
@@ -1552,6 +1745,9 @@ impl ZetaView {
                             .h(theme::SEND_BUTTON_HEIGHT)
                             .min_w(theme::SEND_BUTTON_MIN_WIDTH)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
+                            // Disabled paints an active-border outline at
+                            // reduced opacity — never a translucent fill.
+                            .when(!can_send, |btn| btn.outline().opacity(0.55))
                             .on_click(cx.listener(|view, _, _, cx| view.send_composer(cx))),
                     ),
             )
@@ -1560,8 +1756,10 @@ impl ZetaView {
 
     fn render_footer(&self, cx: &App) -> gpui::AnyElement {
         // Mode word carries the single load-bearing color on this strip.
-        // Metrics and hints stay faint so the mode word wins the eye.
-        let mode_color = self.footer_mode_color(cx);
+        // Metrics and hints sit at the FAINT tier (not muted) so the mode word
+        // wins the eye by a wide margin — a hint at muted-tier reads as ambient
+        // text and eats the mode word's accent-scarcity budget.
+        let mode_color = Self::footer_mode_color(cx);
         let show_streaming_dot = self.state.streaming || self.state.thinking;
         div()
             .id("status-bar")
@@ -1572,7 +1770,7 @@ impl ZetaView {
             .px_4()
             .py_2()
             .text_size(px(12.))
-            .text_color(cx.theme().muted_foreground)
+            .text_color(theme::palette::text_faint())
             .debug_selector(|| "status-bar".into())
             .child(
                 div()
@@ -1601,12 +1799,23 @@ impl ZetaView {
             .child(
                 div()
                     .flex_shrink_0()
-                    .text_color(cx.theme().muted_foreground)
-                    .opacity(0.9)
+                    .text_color(theme::palette::text_faint())
                     .debug_selector(|| "footer-hints".into())
                     .child(self.composer_hint()),
             )
             .into_any_element()
+    }
+}
+
+/// Compact byte-size label for the collapsed tool-row output peek. Kept short
+/// so the receipt still fits on one line at the wiki 1024px column.
+fn format_output_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -1745,6 +1954,7 @@ impl Render for ZetaView {
                     })
                     .child(transcript),
             )
+            .children(self.render_pending_user_turn(cx))
             .child(self.render_composer(can_send, window, cx))
             .child(self.render_footer(cx));
         div()
