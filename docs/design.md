@@ -178,6 +178,7 @@ the harness-native distillation.
 - **Sub-agents, slash-command DSL**: skills half is now ticketed as ZETA-26; sub-agents landed via ZETA-37..49; the slash-command DSL is now ticketed as ZETA-53..55 (macro DSL arc).
 - **MCP**: OAuth / token-refresh auth flows and resources-as-attachments deferred; QoL arc (observability, config ergonomics, resilience, prompts) ticketed as ZETA-56..59.
 - **Rejected (not planned)**: third providers beyond Anthropic + Codex; thinking-mode / reasoning-effort controls in the assistant; sandbox for `exec`/`bash` (LLM is trusted; user retains approval policy for consequential ops).
+- **Display-safe thinking summaries**: zeta's provider protocol has no display-safe reasoning channel — `ContentBlock::Thinking` currently mixes raw reasoning with any model-emitted summary (see the Thinking assembly in `src/zeta/providers/codex.py`; Anthropic raw thinking arrives the same way). Until the server exposes a separate summary channel distinct from raw reasoning, the GUI must render only a header-only "+ Thought" marker; expanded thinking bodies, per-turn duration, and titled headers stay blocked on that server-side work.
 
 Gate: `uv run pytest -q`. Review flow: same luna implementer -> sol reviewer
 loop as the wiki repo; merges by the orchestrator after a clean pass.

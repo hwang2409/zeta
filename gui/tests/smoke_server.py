@@ -7,7 +7,7 @@ from pathlib import Path
 
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.server import ZetaServer
-from zeta.types import TextContent, ToolCall
+from zeta.types import TextContent, ThinkingContent, ToolCall
 
 
 async def main():
@@ -18,7 +18,13 @@ async def main():
     home = Path(os.environ["ZETA_HOME"])
     turns = [
         ScriptedTurn(
-            content=[TextContent("I will inspect the project before changing it.")],
+            content=[
+                # A Thinking block seeds the header-only "+ Thought" marker in
+                # the transcript. The GUI never renders this text — it is
+                # captured only so the marker row paints in the screenshot.
+                ThinkingContent("consider the project layout"),
+                TextContent("I will inspect the project before changing it."),
+            ],
             tool_calls=[ToolCall("demo-read", "bash", {"command": "pwd"})],
         ),
         ScriptedTurn(

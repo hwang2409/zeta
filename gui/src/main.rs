@@ -1155,9 +1155,7 @@ impl ZetaView {
             TranscriptEntry::User(text) => self.render_user_row(index, text, view, cx),
             TranscriptEntry::Assistant(doc) => self.render_assistant_row(index, doc, cx),
             entry @ TranscriptEntry::Tool { .. } => self.render_tool_row(index, entry, view, cx),
-            entry @ TranscriptEntry::Thinking { .. } => {
-                self.render_thinking_row(index, entry, view, cx)
-            }
+            TranscriptEntry::Thinking => self.render_thinking_row(index, cx),
             TranscriptEntry::Error {
                 message,
                 settings_action,
@@ -1173,81 +1171,18 @@ impl ZetaView {
         }
     }
 
-    fn render_thinking_row(
-        &self,
-        index: usize,
-        entry: &TranscriptEntry,
-        view: gpui::WeakEntity<Self>,
-        cx: &App,
-    ) -> gpui::AnyElement {
-        let TranscriptEntry::Thinking {
-            duration_ms,
-            title,
-            body,
-            expanded,
-        } = entry
-        else {
-            unreachable!("render_thinking_row invoked on non-Thinking entry");
-        };
-        // Header: `+ Thought[: <title>][ · <duration>]` at muted-foreground.
-        // Deltas were discarded on the way in; `title`/`body` are populated
-        // only by the finalized `Thinking` block on the server-committed
-        // AssistantMessage — the wiki's display-safe path.
-        let expanded = *expanded;
-        let prefix = if expanded { "-" } else { "+" };
-        let has_title = !title.is_empty();
-        let duration_label = duration_ms.map(|ms| format!("{ms}ms"));
+    fn render_thinking_row(&self, index: usize, cx: &App) -> gpui::AnyElement {
+        // Header-only marker: "+ Thought" at muted-foreground. The provider
+        // protocol has no display-safe summary channel for reasoning, so no
+        // title, no duration, no body, no expand toggle — the header simply
+        // signals that the model thought.
         div()
-            .id(("thinking-row", index))
-            .debug_selector(move || format!("thinking-row-{index}"))
+            .debug_selector(move || format!("thinking-header-{index}"))
             .w_full()
             .min_w_0()
             .py(px(2.))
             .text_color(cx.theme().muted_foreground)
-            .cursor_pointer()
-            .when(expanded, |row| row.opacity(0.6))
-            .on_click(move |_, _, cx| {
-                let _ = view.update(cx, |view, cx| {
-                    view.state.toggle_card(index);
-                    view.transcript.update(cx, |scroll, cx| {
-                        scroll.remeasure_items(index..index + 1, cx);
-                    });
-                    cx.notify();
-                });
-            })
-            .child(
-                div()
-                    .debug_selector(move || format!("thinking-header-{index}"))
-                    .h_flex()
-                    .items_center()
-                    .gap_1()
-                    .child(prefix)
-                    .child(if has_title {
-                        format!("Thought: {title}")
-                    } else {
-                        String::from("Thought")
-                    })
-                    .when_some(duration_label, |header, label| {
-                        header.child(
-                            div()
-                                .debug_selector(move || format!("thinking-duration-{index}"))
-                                .child(format!("· {label}")),
-                        )
-                    }),
-            )
-            .when(expanded && !body.is_empty(), |row| {
-                row.child(
-                    div()
-                        .debug_selector(move || format!("thinking-body-{index}"))
-                        // 2ch left margin — moves the body's box, not just its
-                        // text — so paint bounds land at the indented position
-                        // instead of the parent's inner-left with hidden padding.
-                        .ml(theme::THINKING_BODY_INDENT)
-                        .whitespace_normal()
-                        .line_height(gpui::rems(1.6))
-                        .child(body.to_owned()),
-                )
-            })
+            .child("+ Thought")
             .into_any_element()
     }
 
@@ -1448,11 +1383,16 @@ impl ZetaView {
                         // text_color refinement so the paint pipeline reads the
                         // same token the design contract prescribes — not
                         // inheritance from a parent that a refactor could break.
+                        // A zero-size paint probe nested under each captures the
+                        // effective text color at paint time, so the guard test
+                        // can prove the paint pipeline actually inherited the
+                        // intended color, not just that the helper returned it.
                         div()
                             .debug_selector(move || format!("tool-verb-{index}"))
                             .flex_shrink_0()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(state_color)
+                            .child(text_color_probe(format!("tool-verb-{index}")))
                             .child(verb),
                     )
                     .child(
@@ -1463,6 +1403,7 @@ impl ZetaView {
                             .truncate()
                             .text_color(state_color)
                             .opacity(0.78)
+                            .child(text_color_probe(format!("tool-detail-{index}")))
                             .child(detail),
                     )
                     // Collapsed rows carry the output size at faint tier and a
@@ -1876,6 +1817,57 @@ pub(crate) fn tool_state_color(state: zeta_gui::state::ToolState, cx: &App) -> g
         ToolState::Done => theme.muted_foreground,
         ToolState::Failed => theme.danger,
     }
+}
+
+/// Paint-time probe: records the effective `text_style().color` at its
+/// location so tests can prove the paint pipeline actually inherited the
+/// intended text color, not just that a helper returned the right value.
+/// Compiled out of release builds — the probe carries no chrome, no bounds,
+/// no visible primitive.
+#[cfg(test)]
+pub(crate) mod paint_probe {
+    use gpui::Hsla;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static RECORDED: RefCell<HashMap<String, Hsla>> = RefCell::new(HashMap::new());
+    }
+
+    pub fn record(key: String, color: Hsla) {
+        RECORDED.with(|map| {
+            map.borrow_mut().insert(key, color);
+        });
+    }
+
+    pub fn get(key: &str) -> Option<Hsla> {
+        RECORDED.with(|map| map.borrow().get(key).copied())
+    }
+
+    pub fn clear() {
+        RECORDED.with(|map| map.borrow_mut().clear());
+    }
+}
+
+/// Emit a zero-size canvas whose paint callback captures the current
+/// `text_style().color` under `key`. Prod builds get a no-op div so layout is
+/// identical either way.
+#[cfg(test)]
+fn text_color_probe(key: String) -> gpui::AnyElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            paint_probe::record(key.clone(), window.text_style().color);
+        },
+    )
+    .w(px(0.))
+    .h(px(0.))
+    .into_any_element()
+}
+
+#[cfg(not(test))]
+fn text_color_probe(_key: String) -> gpui::AnyElement {
+    div().w(px(0.)).h(px(0.)).into_any_element()
 }
 
 /// Compact byte-size label for the collapsed tool-row output peek. Kept short

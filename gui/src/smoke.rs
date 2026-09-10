@@ -16,7 +16,7 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                 let finished = cx
                     .update(|window, cx| {
                         let entity = view.upgrade().expect("smoke view remains alive");
-                        let (ready, active, idle, answered, approval) = {
+                        let (ready, active, idle, approval) = {
                             let view = entity.read(cx);
                             if let Some(error) = &view.command_error {
                                 panic!("smoke command failed: {error}");
@@ -25,10 +25,6 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                 view.state.connection == ConnectionState::Connected,
                                 view.state.active_session.is_some(),
                                 !view.state.streaming && !view.pending_command,
-                                view.state
-                                    .transcript
-                                    .iter()
-                                    .any(|row| matches!(row, TranscriptEntry::Assistant(_))),
                                 !view.state.approvals.is_empty(),
                             )
                         };
@@ -46,11 +42,13 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                 window.press("enter", cx);
                                 phase = 2;
                             }
-                            2 if approval => window.press("enter", cx),
-                            2 if answered && idle => {
-                                phase = 3;
-                            }
-                            3 => {
+                            // Capture at the approval prompt: the transcript
+                            // already carries the header-only "+ Thought"
+                            // marker, the assistant preamble, and the tool
+                            // receipt; the pending approval flips can_send to
+                            // false so the send button paints its disabled
+                            // outline. One image, both states.
+                            2 if approval => {
                                 window
                                     .render_to_image()
                                     .expect("native renderer capture")

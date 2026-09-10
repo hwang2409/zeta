@@ -9,10 +9,6 @@ use crate::client::{
     SubAgentStatus, ToolCall,
 };
 
-/// Character budget for the first-line thinking title. Matches the wiki's
-/// ThinkingRow preview cap so the header stays scannable.
-const THINKING_TITLE_CHARS: usize = 120;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolReceiptKey {
     pub session_id: Option<String>,
@@ -48,18 +44,12 @@ pub enum TranscriptEntry {
         canceled: bool,
         card: Card,
     },
-    /// Display-safe thinking span. Streaming deltas from the server arrive as
-    /// private text and are discarded on the way in — only the finalized
-    /// summary from the `AssistantMessage` `Thinking` block ever lands in
-    /// `title`/`body`, matching the wiki's ThinkingRow contract. `title` is the
-    /// first non-empty line (capped for the header); `body` is the full
-    /// displayable text used when the row is expanded.
-    Thinking {
-        duration_ms: Option<u64>,
-        title: String,
-        body: String,
-        expanded: bool,
-    },
+    /// Generic thinking marker. Zeta's provider protocol has no display-safe
+    /// summary channel — `ContentBlock::Thinking` mixes raw reasoning with any
+    /// model-emitted summary — so the GUI never renders body text. The entry is
+    /// purely a header ("+ Thought"), signalling that the model thought without
+    /// leaking what.
+    Thinking,
 }
 
 impl TranscriptEntry {
@@ -92,21 +82,6 @@ pub enum ToolState {
     Running,
     Done,
     Failed,
-}
-
-/// Split a display-safe thinking payload into `(title, body)`. The title is
-/// the first non-empty line, bounded so it fits the single-line header; the
-/// body is the full text used when the row is expanded.
-pub fn thinking_summary(text: &str) -> (String, String) {
-    let title: String = text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("")
-        .chars()
-        .take(THINKING_TITLE_CHARS)
-        .collect();
-    (title, text.to_owned())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -319,21 +294,14 @@ impl AppState {
                 if kind == "thinking" && !delta.is_empty() =>
             {
                 self.thinking = !self.assistant_started;
-                // Emit a display-safe thinking placeholder the first time we
-                // see thinking in this turn — we never store the reasoning
-                // text, so the entry is header-only.
+                // Emit the header-only thinking marker the first time we see
+                // thinking in this turn. The reasoning delta itself is never
+                // stored — the provider protocol has no display-safe summary
+                // channel, so the row carries no body.
                 if self.thinking
-                    && !matches!(
-                        self.transcript.last(),
-                        Some(TranscriptEntry::Thinking { .. })
-                    )
+                    && !matches!(self.transcript.last(), Some(TranscriptEntry::Thinking))
                 {
-                    self.transcript.push(TranscriptEntry::Thinking {
-                        duration_ms: None,
-                        title: String::new(),
-                        body: String::new(),
-                        expanded: false,
-                    });
+                    self.transcript.push(TranscriptEntry::Thinking);
                     changed = self.transcript.len().checked_sub(1);
                 }
             }
@@ -478,10 +446,8 @@ impl AppState {
     }
 
     pub fn toggle_card(&mut self, index: usize) {
-        match self.transcript.get_mut(index) {
-            Some(TranscriptEntry::Tool { card, .. }) => card.toggle(),
-            Some(TranscriptEntry::Thinking { expanded, .. }) => *expanded = !*expanded,
-            _ => {}
+        if let Some(TranscriptEntry::Tool { card, .. }) = self.transcript.get_mut(index) {
+            card.toggle();
         }
     }
 
@@ -565,43 +531,23 @@ impl AppState {
     }
 
     fn commit_assistant(&mut self, message: Message) -> Option<usize> {
-        let mut thinking_text = String::new();
+        let has_thinking = message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Thinking { .. }));
         let mut assistant_text = String::new();
         for block in &message.content {
-            match block {
-                ContentBlock::Thinking { text } => thinking_text.push_str(text),
-                ContentBlock::Text { text } => assistant_text.push_str(text),
-                _ => {}
+            if let ContentBlock::Text { text } = block {
+                assistant_text.push_str(text);
             }
         }
         let mut changed = None;
-        if !thinking_text.is_empty() {
-            let (title, body) = thinking_summary(&thinking_text);
-            let idx = self
-                .transcript
-                .iter()
-                .rposition(|entry| matches!(entry, TranscriptEntry::Thinking { .. }));
-            match idx {
-                Some(i) => {
-                    if let TranscriptEntry::Thinking {
-                        title: t, body: b, ..
-                    } = &mut self.transcript[i]
-                    {
-                        *t = title;
-                        *b = body;
-                    }
-                    changed = Some(i);
-                }
-                None => {
-                    self.transcript.push(TranscriptEntry::Thinking {
-                        duration_ms: None,
-                        title,
-                        body,
-                        expanded: false,
-                    });
-                    changed = self.transcript.len().checked_sub(1);
-                }
-            }
+        // Thinking body text is never retained — the provider protocol mixes
+        // raw reasoning with any summary, so we only guarantee that a
+        // header-only marker exists when the turn thought at all.
+        if has_thinking && !matches!(self.transcript.last(), Some(TranscriptEntry::Thinking)) {
+            self.transcript.push(TranscriptEntry::Thinking);
+            changed = self.transcript.len().checked_sub(1);
         }
         if !assistant_text.is_empty() {
             match self.transcript.last_mut() {
