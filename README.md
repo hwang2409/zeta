@@ -47,6 +47,10 @@ sending `opus` to the provider. Text that matches nothing is still sent as
 typed, so a brand-new id keeps working. Typing after `/model ` also completes
 model names inline.
 
+Typing `/` opens the command menu above the composer in the theme's colors,
+with the highlighted row on the accent and up to twelve entries visible.
+Arrow keys move, `tab` or `enter` accepts, and a mouse click picks an entry.
+
 ## exec macro example
 
 Create `~/.zeta/commands/rebuild.md` for a local `/rebuild` macro:

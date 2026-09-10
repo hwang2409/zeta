@@ -43,6 +43,8 @@ class Palette:
     surface: str = ""
     tint: str = ""
     code_bg: str = "default"
+    # Text drawn on top of the accent colour (menu and search highlights).
+    on_accent: str = "#000000"
 
 
 DARK = Palette(
@@ -71,6 +73,7 @@ LIGHT = Palette(
     composer_border="#c4c8c0",
     search_bg="#fff2b0",
     code_theme="friendly",
+    on_accent="#ffffff",
 )
 
 
@@ -105,6 +108,8 @@ AFFORDANCE: str
 USER_ROLE: str
 SEARCH_MATCH: str
 SEARCH_CURRENT: str
+MENU_BG: str
+ON_ACCENT: str
 
 
 # Single Rich Theme instance whose ``styles`` dict is mutated in place so
@@ -131,7 +136,7 @@ def set_active_palette(palette: Palette) -> None:
     global _ACTIVE, SURFACE, TINT, ACCENT, DIM, BODY, ERROR, CODE_BG, CODE_THEME
     global CHROME, CARD_BG, CARD_BORDER, COMPOSER_BORDER, COMPOSER_FOCUS
     global VIM_STATE, PLAN_STATE, COMMAND, RECEIPT, THOUGHT, AFFORDANCE
-    global USER_ROLE, SEARCH_MATCH, SEARCH_CURRENT
+    global USER_ROLE, SEARCH_MATCH, SEARCH_CURRENT, MENU_BG, ON_ACCENT
     _ACTIVE = palette
     SURFACE = palette.surface
     TINT = palette.tint
@@ -155,6 +160,8 @@ def set_active_palette(palette: Palette) -> None:
     USER_ROLE = ACCENT
     SEARCH_MATCH = f"{BODY} on {palette.search_bg}"
     SEARCH_CURRENT = f"black on {ACCENT}"
+    MENU_BG = palette.search_bg
+    ON_ACCENT = palette.on_accent
     _refresh_rich_theme()
 
 
@@ -283,6 +290,7 @@ _PALETTE_KEYS: frozenset[str] = frozenset(
         "surface",
         "tint",
         "code_bg",
+        "on_accent",
     }
 )
 
@@ -311,6 +319,7 @@ def _palette_from_dict(
             surface=data.get("surface", DARK.surface),
             tint=data.get("tint", DARK.tint),
             code_bg=data.get("code_bg", DARK.code_bg),
+            on_accent=data.get("on_accent", DARK.on_accent),
         ),
         None,
     )

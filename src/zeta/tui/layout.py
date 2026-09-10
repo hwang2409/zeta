@@ -4,17 +4,21 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
-from prompt_toolkit.filters import Condition
+from prompt_toolkit.enums import DEFAULT_BUFFER
+from prompt_toolkit.filters import Condition, has_focus
 from prompt_toolkit.layout import Dimension
 from prompt_toolkit.layout.containers import (
     AnyContainer,
     ConditionalContainer,
     Container,
+    Float,
+    FloatContainer,
     HSplit,
     VSplit,
     Window,
     to_container,
 )
+from prompt_toolkit.layout.menus import CompletionsMenu, MultiColumnCompletionsMenu
 from prompt_toolkit.layout.mouse_handlers import MouseHandler, MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
@@ -25,6 +29,67 @@ from .todo import TodoWidget
 
 
 CONTENT_MARGIN = 2
+COMMAND_MENU_ROWS = 12
+
+
+def detach_completion_menus(container: Container) -> None:
+    """Strip prompt-toolkit's default completion floats from a layout subtree.
+
+    PromptSession pins its menus inside the input's own FloatContainer, so in
+    the full-screen layout they can only draw within the composer box, where
+    a handful of rows squeeze the command list. :func:`command_menu_float`
+    re-homes the menu on a container that spans the screen.
+    """
+
+    if isinstance(container, FloatContainer):
+        container.floats[:] = [
+            float_
+            for float_ in container.floats
+            if not isinstance(
+                float_.content, (CompletionsMenu, MultiColumnCompletionsMenu)
+            )
+        ]
+    for child in container.get_children():
+        detach_completion_menus(child)
+
+
+class CommandMenuFloat(Float):
+    """Completion menu pinned to the rows directly above the composer chrome.
+
+    prompt-toolkit's cursor-anchored float opens below the cursor whenever
+    the rows fit, which here means over the composer and footer. Anchoring
+    the float's bottom edge to the chrome's live height keeps the menu above
+    the composer however many rows it needs, still aligned to the cursor
+    column so it grows out of the `/` that opened it.
+    """
+
+    def __init__(self, chrome_height: Callable[[], int], **kwargs: object) -> None:
+        self._chrome_height = chrome_height
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+
+    @property
+    def bottom(self) -> int:
+        return self._chrome_height()
+
+    @bottom.setter
+    def bottom(self, value: int | None) -> None:
+        # Float.__init__ stores its argument here; the live height wins.
+        del value
+
+
+def command_menu_float(chrome_height: Callable[[], int]) -> Float:
+    """The slash-command menu, free to cover the transcript above the composer."""
+
+    return CommandMenuFloat(
+        chrome_height,
+        xcursor=True,
+        transparent=True,
+        content=CompletionsMenu(
+            max_height=COMMAND_MENU_ROWS,
+            scroll_offset=1,
+            extra_filter=has_focus(DEFAULT_BUFFER),
+        ),
+    )
 
 
 def content_width(terminal_width: int) -> int:
@@ -56,6 +121,9 @@ class WheelRouter(Container):
         self.content = to_container(content)
         self._on_scroll_up = on_scroll_up
         self._on_scroll_down = on_scroll_down
+        # Rows the chrome took on the last paint; the command menu floats
+        # directly above it.
+        self.height = 0
 
     def reset(self) -> None:
         self.content.reset()
@@ -75,6 +143,7 @@ class WheelRouter(Container):
         erase_bg: bool,
         z_index: int | None,
     ) -> None:
+        self.height = write_position.height
         self.content.write_to_screen(
             screen, mouse_handlers, write_position, parent_style, erase_bg, z_index
         )
@@ -126,7 +195,9 @@ def full_screen_content(
     *,
     on_scroll_up: Callable[[], None],
     on_scroll_down: Callable[[], None],
-) -> VSplit:
+) -> FloatContainer:
+    """Transcript over composer chrome, with the command menu floating above it."""
+
     todo_panel = ConditionalContainer(
         Window(content=todo_widget, height=Dimension(min=0, max=7)),
         Condition(lambda: todo_widget.visible),
@@ -137,10 +208,11 @@ def full_screen_content(
         on_scroll_down=on_scroll_down,
     )
     content = HSplit([transcript, bottom])
-    return VSplit(
+    padded = VSplit(
         [
             Window(width=CONTENT_MARGIN, char=" "),
             content,
             Window(width=CONTENT_MARGIN, char=" "),
         ]
     )
+    return FloatContainer(padded, floats=[command_menu_float(lambda: bottom.height)])
