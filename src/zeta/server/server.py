@@ -375,6 +375,21 @@ class _Client:
 
     async def _ergonomics(self, method: str, params: dict[str, Any]) -> object:
         runtime = self.server.runtime
+        if method in {"rename_session", "delete_session"}:
+            await self._require_idle()
+            session_id = runtime.manager.resolve_id(_required_string(params, "session_id"))
+            if method == "delete_session":
+                if runtime.opened is not None and session_id == runtime.session_id:
+                    raise ProtocolError(-32005, "select another session before deleting this session", {"code": "active_session"})
+                runtime.manager.delete(session_id)
+                return {"session_id": session_id}
+            name = params.get("name")
+            if not isinstance(name, str):
+                raise ProtocolError(-32602, "name must be a string")
+            metadata = runtime.manager.rename(session_id, name)
+            if runtime.opened is not None and session_id == runtime.session_id:
+                runtime.manager._copy_metadata(runtime.metadata, metadata)
+            return {"session": metadata.to_dict()}
         store = ergonomics.active(runtime, params)
         if method == "session_tree":
             return ergonomics.tree(runtime)
@@ -700,6 +715,9 @@ class _Client:
             {**item.to_dict(), "first_message_preview": previews.get(item.session_id, "")}
             for item in metadata
         ]
+        if self.protocol_version != "1.1":
+            for item in sessions:
+                item.pop("name", None)
         page: list[dict[str, Any]] = []
         for offset, item in enumerate(sessions):
             candidate = [*page, item]

@@ -164,6 +164,7 @@ the harness-native distillation.
 | ZETA-100 | Surface tool output and model errors (arc: GUI consumer pass): clickable receipts disclose their stored output tail; failed tools expand by default. Provider errors get a full wrapped block with an Open Settings action. Model changes keep a durable previous provider/model/budget until the first successful provider response; entitlement errors restore that choice and explain the revert. Existing protocol 1.1 settings gating and the sealed fake catalog remain intact. | ZETA-99 |
 | ZETA-101 | Add in-app login (arc: GUI consumer pass): settings, credential error blocks, and the first-run empty state share browser OAuth login for Claude and ChatGPT. Reuse the CLI PKCE listener and credential stores; show pending, cancel, success, and typed failures. Advertised protocol 1.1 login RPCs exclude legacy and fake servers. | ZETA-100 |
 | ZETA-102 | Polish the GUI consumer experience (arc: GUI consumer pass): isolate settings input and session drafts; preserve text paste; show sent-image thumbnails, thinking feedback, readable status, tool approval summaries, and first-session guidance. Add native menus and fork guidance without new RPCs. | ZETA-99, ZETA-100, ZETA-101 |
+| ZETA-103 | Add session rename and delete (arc: GUI consumer pass): gated protocol 1.1 RPCs persist display names, clear names to the derived first-message preview, and delete inactive sessions including corrupt directories. Kit sidebar action menus open rename and delete-confirmation overlays with keyboard controls and visible errors. Active-session deletion returns `active_session` and keeps the transcript intact; select another session first. CLI session rename joins existing list/delete/export commands. | ZETA-100, ZETA-102 |
 
 ## Deferred / open followups (not yet ticketed)
 
@@ -240,3 +241,18 @@ Foreground provider authentication errors carry `data.login_provider` on the
 1.1 wire. The server captures the failed provider before existing model recovery
 runs. MCP, transport, and background-agent errors do not offer provider login.
 Success permits a manual retry; it never resends a message automatically.
+
+### Session management (ZETA-103)
+
+Protocol 1.1 advertises `rename_session` and `delete_session`. Both accept
+`session_id` (an exact ID or unique prefix); rename also accepts a string `name`.
+Whitespace clears the stored name. Names follow the existing 60-cell limit.
+Listings expose `name` only to 1.1 clients and keep `first_message_preview`
+independent of the display name. The GUI requires both advertised requests.
+
+Management requires an idle server. Deleting the active session returns RPC
+`-32005` with `data.code = "active_session"`; select another session first.
+Deletion does not read metadata or conversation data, so corrupt directories
+remain removable by ID. It refuses root/session/lock symlinks, respects the
+session lock, and uses fd-based recursive deletion without following nested
+links. `zeta session rename ID NAME` also accepts an empty name to clear it.

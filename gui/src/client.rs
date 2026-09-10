@@ -449,6 +449,7 @@ pub struct ProtocolClient {
     events: VecDeque<ServerEvent>,
     next_id: u64,
     pub session_extensions: bool,
+    pub session_management: bool,
     pub login_extensions: bool,
 }
 
@@ -481,6 +482,7 @@ impl ProtocolClient {
             events: VecDeque::new(),
             next_id: 1,
             session_extensions: false,
+            session_management: false,
             login_extensions: false,
         })
     }
@@ -506,6 +508,16 @@ impl ProtocolClient {
             });
         }
         self.session_extensions = hello.protocol_version == "1.1";
+        self.session_management = self.session_extensions
+            && ["rename_session", "delete_session"].iter().all(|method| {
+                hello.capabilities["requests"]
+                    .as_array()
+                    .is_some_and(|requests| {
+                        requests
+                            .iter()
+                            .any(|request| request.as_str() == Some(method))
+                    })
+            });
         self.login_extensions = self.session_extensions
             && [
                 "login_start",
@@ -551,6 +563,32 @@ impl ProtocolClient {
             });
         }
         self.request(method, params)
+    }
+
+    pub fn rename_session(&mut self, id: &str, name: &str) -> Result<SessionMetadata, ClientError> {
+        self.require_session_management()?;
+        self.request_session(
+            "rename_session",
+            serde_json::json!({"session_id": id, "name": name}),
+        )
+    }
+
+    pub fn delete_session(&mut self, id: &str) -> Result<(), ClientError> {
+        self.require_session_management()?;
+        let _: Value = self.extension("delete_session", serde_json::json!({"session_id": id}))?;
+        Ok(())
+    }
+
+    fn require_session_management(&self) -> Result<(), ClientError> {
+        if self.session_management {
+            Ok(())
+        } else {
+            Err(ClientError::Rpc {
+                code: -32601,
+                message: "session management unavailable".into(),
+                data: None,
+            })
+        }
     }
 
     pub fn list_sessions(&mut self) -> Result<SessionList, ClientError> {
@@ -1013,6 +1051,42 @@ mod tests {
             if !expected {
                 assert!(matches!(
                     client.login("login_start", "claude"),
+                    Err(ClientError::Rpc { code: -32601, .. })
+                ));
+            }
+            server.join().unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn session_management_requires_version_and_both_requests() {
+        for (index, (version, methods, expected)) in [
+            ("1.0", vec!["rename_session", "delete_session"], false),
+            ("1.1", vec![], false),
+            ("1.1", vec!["rename_session"], false),
+            ("1.1", vec!["rename_session", "delete_session"], true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = std::env::temp_dir()
+                .join(format!("zg-management-gate-{}-{index}", std::process::id()));
+            let server = fake_server(
+                &path,
+                serde_json::json!({"id":1,"result":{"protocol_version":version,"server":"zeta","capabilities":{"requests":methods}}}),
+                None,
+            );
+            let mut client = ProtocolClient::connect_socket(&path).unwrap();
+            client.handshake().unwrap();
+            assert_eq!(client.session_management, expected);
+            if !expected {
+                assert!(matches!(
+                    client.rename_session("id", "name"),
+                    Err(ClientError::Rpc { code: -32601, .. })
+                ));
+                assert!(matches!(
+                    client.delete_session("id"),
                     Err(ClientError::Rpc { code: -32601, .. })
                 ));
             }

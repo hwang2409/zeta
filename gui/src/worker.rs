@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 pub enum CommandMessage {
     NewSession,
     Resume(String),
+    RenameSession(String, String),
+    DeleteSession(String),
     Send(String),
     SendImages(String, Vec<ImageAttachment>),
     SwitchBranch(String),
@@ -39,6 +41,9 @@ pub enum WorkerMessage {
     Sent(String),
     Connected,
     Extensions(bool),
+    SessionManagement(bool),
+    Renamed(SessionMetadata),
+    Deleted(String),
     LoginProviders(Vec<LoginProvider>),
     Login(String, LoginProgress),
     Tree(TreeResult),
@@ -172,6 +177,9 @@ impl ConnectionWorker {
         let _ = self
             .messages
             .send(WorkerMessage::Extensions(client.session_extensions));
+        let _ = self
+            .messages
+            .send(WorkerMessage::SessionManagement(client.session_management));
         if client.login_extensions {
             let providers = client.login_providers()?.providers;
             let _ = self.messages.send(WorkerMessage::LoginProviders(providers));
@@ -211,6 +219,8 @@ impl ConnectionWorker {
                     let result = match command {
                         CommandMessage::NewSession
                         | CommandMessage::Resume(_)
+                        | CommandMessage::RenameSession(..)
+                        | CommandMessage::DeleteSession(_)
                         | CommandMessage::Send(_)
                         | CommandMessage::SendImages(..)
                         | CommandMessage::SwitchBranch(_)
@@ -247,6 +257,14 @@ impl ConnectionWorker {
                                 Ok(())
                             })
                         }
+                        CommandMessage::RenameSession(id, name) => {
+                            client.rename_session(&id, &name).map(|session| {
+                                let _ = self.messages.send(WorkerMessage::Renamed(session));
+                            })
+                        }
+                        CommandMessage::DeleteSession(id) => client.delete_session(&id).map(|()| {
+                            let _ = self.messages.send(WorkerMessage::Deleted(id));
+                        }),
                         CommandMessage::Send(text) => client.send(&text).map(|accepted| {
                             if accepted {
                                 busy = true;
@@ -602,6 +620,105 @@ mod tests {
             server.join().unwrap();
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn session_management_actor_renames_clears_and_recovers_from_delete_error() {
+        use serde_json::{json, Value};
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::mpsc;
+        let path =
+            env::temp_dir().join(format!("zg-management-worker-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut mutations = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let result = match method {
+                    "hello" => {
+                        json!({"protocol_version":"1.1","server":"zeta","capabilities":{"requests":["rename_session","delete_session"]}})
+                    }
+                    "list_sessions" => json!({"sessions":[{"session_id":"stored"}]}),
+                    "status" => json!({"session":null,"state":"idle"}),
+                    "rename_session" => {
+                        assert_eq!(request["params"]["session_id"], "stored");
+                        assert_eq!(
+                            request["params"]["name"],
+                            if mutations == 0 { "name" } else { "" }
+                        );
+                        mutations += 1;
+                        json!({"session":{"session_id":"stored","name":request["params"]["name"]}})
+                    }
+                    "delete_session" => {
+                        mutations += 1;
+                        if mutations == 3 {
+                            writeln!(socket, "{}", json!({"id":request["id"],"error":{"code":-32005,"message":"session is open"}})).unwrap();
+                            continue;
+                        }
+                        assert_eq!(request["params"]["session_id"], "stored");
+                        json!({"session_id":"stored"})
+                    }
+                    other => panic!("unexpected request: {other}"),
+                };
+                writeln!(socket, "{}", json!({"id":request["id"],"result":result})).unwrap();
+            }
+            assert_eq!(mutations, 4);
+        });
+        let (commands, receiver) = mpsc::channel();
+        let (sender, messages) = mpsc::channel();
+        let worker_path = path.clone();
+        let worker = thread::spawn(move || {
+            ConnectionWorker {
+                commands: receiver,
+                messages: sender,
+                socket: Some(worker_path),
+            }
+            .run()
+        });
+        let mut available = false;
+        loop {
+            match messages.recv_timeout(Duration::from_secs(5)).unwrap() {
+                WorkerMessage::SessionManagement(enabled) => available = enabled,
+                WorkerMessage::Connected => break,
+                WorkerMessage::Lost(error) | WorkerMessage::Rejected(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert!(available);
+        for name in ["name", ""] {
+            commands
+                .send(CommandMessage::RenameSession("stored".into(), name.into()))
+                .unwrap();
+            assert!(
+                matches!(messages.recv_timeout(Duration::from_secs(5)).unwrap(), WorkerMessage::Renamed(session) if session.name == name)
+            );
+        }
+        commands
+            .send(CommandMessage::DeleteSession("stored".into()))
+            .unwrap();
+        assert!(
+            matches!(messages.recv_timeout(Duration::from_secs(5)).unwrap(), WorkerMessage::Rejected(error) if error.contains("session is open"))
+        );
+        commands
+            .send(CommandMessage::DeleteSession("stored".into()))
+            .unwrap();
+        assert!(
+            matches!(messages.recv_timeout(Duration::from_secs(5)).unwrap(), WorkerMessage::Deleted(id) if id == "stored")
+        );
+        drop(commands);
+        worker.join().unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

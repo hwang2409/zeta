@@ -1,4 +1,4 @@
-"""``zeta session`` subcommands: list, delete, export."""
+"""``zeta session`` subcommands: list, rename, delete, export."""
 
 from __future__ import annotations
 
@@ -21,6 +21,9 @@ def add_subcommand(commands: argparse._SubParsersAction) -> None:
     parser = commands.add_parser("session", help="manage stored zeta sessions")
     verbs = parser.add_subparsers(dest="session_verb", required=True)
     verbs.add_parser("list", help="list stored sessions (id, name, age, preview)")
+    rename = verbs.add_parser("rename", help="set a session name (empty clears it)")
+    rename.add_argument("session_id", help="session id or unique prefix")
+    rename.add_argument("name", help="display name; pass an empty string to clear")
     delete = verbs.add_parser("delete", help="delete a stored session by id")
     delete.add_argument("session_id", help="session id to delete")
     delete.add_argument(
@@ -53,6 +56,14 @@ def run(
     verb = args.session_verb
     if verb == "list":
         return _run_list(manager, out)
+    if verb == "rename":
+        try:
+            metadata = manager.rename(args.session_id, args.name)
+        except SessionError as exc:
+            print(f"zeta: {exc}", file=err)
+            return 1
+        print(f"renamed {metadata.session_id}", file=out)
+        return 0
     if verb == "delete":
         return _run_delete(manager, args, out, err, reader)
     if verb == "export":

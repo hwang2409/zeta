@@ -136,7 +136,10 @@ impl Harness {
             .messages
             .recv_timeout(Duration::from_secs(5))
             .expect("worker must make progress");
-        if matches!(message, WorkerMessage::Extensions(false)) {
+        if matches!(
+            message,
+            WorkerMessage::Extensions(false) | WorkerMessage::SessionManagement(false)
+        ) {
             self.next()
         } else {
             message
@@ -1124,6 +1127,8 @@ fn old_server_disables_extensions_without_sending_new_requests() {
     ));
     harness.connected();
     for command in [
+        CommandMessage::RenameSession("session-1".into(), "name".into()),
+        CommandMessage::DeleteSession("session-1".into()),
         CommandMessage::SwitchBranch("head".into()),
         CommandMessage::ForkMessage("message".into()),
         CommandMessage::LoadSettings,

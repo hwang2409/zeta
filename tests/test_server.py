@@ -1724,7 +1724,7 @@ async def test_session_list_includes_single_line_first_message_preview(tmp_path)
         await _event(reader, "turn_end")
         result = (await _request(reader, writer, 5, "list_sessions"))[-1]["result"]
         assert result["sessions"][0]["first_message_preview"] == "first message preview"
-        assert result["sessions"][0]["name"] == ""
+        assert "name" not in result["sessions"][0]
     finally:
         await _close(server, writer)
 
@@ -2132,3 +2132,91 @@ async def test_stream_access_recovery_does_not_depend_on_message(
     # Reuse the round-3 wire scenario without changing its assertions:
     # dedicated code, durable restoration, and a successful next send.
     await test_stream_access_error_restores_model_over_wire(tmp_path, provider, events)
+
+
+@pytest.mark.asyncio
+async def test_session_management_lifecycle_and_active_delete(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer = await _connect(server)
+    try:
+        hello = (await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"}))[-1]["result"]
+        assert {"rename_session", "delete_session"} <= set(hello["capabilities"]["requests"])
+        created = (await _request(reader, writer, 2, "new_session"))[-1]["result"]["session"]
+        sid = created["session_id"]
+        await _request(reader, writer, 3, "send", {"text": "original preview"})
+        await _event(reader, "turn_end")
+        renamed = (await _request(reader, writer, 4, "rename_session", {"session_id": sid, "name": "  Project   notes  "}))[-1]["result"]["session"]
+        assert renamed["name"] == "Project notes"
+        assert server.runtime.metadata.name == "Project notes"
+        row = (await _request(reader, writer, 5, "list_sessions"))[-1]["result"]["sessions"][0]
+        assert row["name"] == "Project notes"
+        assert row["first_message_preview"] == "original preview"
+        error = (await _request(reader, writer, 6, "delete_session", {"session_id": sid[:8]}))[-1]["error"]
+        assert error["data"]["code"] == "active_session"
+        assert server.runtime.session_id == sid
+        assert (tmp_path / "sessions" / sid).exists()
+        await _request(reader, writer, 7, "new_session")
+        resumed = (await _request(reader, writer, 8, "resume", {"session_id": sid}))[-1]["result"]["session"]
+        assert resumed["name"] == "Project notes"
+    finally:
+        await _close(server, writer)
+
+    # A fresh server reads the saved name; management needs no active session.
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        assert SessionManager(tmp_path).read_metadata(sid).name == "Project notes"
+        for invalid in (None, 42, [], "x" * 61):
+            result = (await _request(reader, writer, 2, "rename_session", {"session_id": sid, "name": invalid}))[-1]
+            assert result["error"]["code"] == -32602
+        await _request(reader, writer, 3, "rename_session", {"session_id": sid, "name": " \t\n "})
+        row = next(row for row in (await _request(reader, writer, 4, "list_sessions"))[-1]["result"]["sessions"] if row["session_id"] == sid)
+        assert row["name"] == ""
+        assert row["first_message_preview"] == "original preview"
+        assert (await _request(reader, writer, 5, "delete_session", {"session_id": sid}))[-1]["result"] == {"session_id": sid}
+        assert not (tmp_path / "sessions" / sid).exists()
+        assert all(row["session_id"] != sid for row in (await _request(reader, writer, 6, "list_sessions"))[-1]["result"]["sessions"])
+        corrupt = tmp_path / "sessions" / "corrupt"
+        corrupt.mkdir()
+        (corrupt / "meta.json").write_bytes(b"\xff")
+        assert "result" in (await _request(reader, writer, 7, "delete_session", {"session_id": "corrupt"}))[-1]
+        assert not corrupt.exists()
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_management_legacy_gate_and_preview(tmp_path):
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer = await _ready(server)
+    try:
+        sid = server.runtime.session_id
+        server.runtime.manager.rename(sid, "private display name")
+        for method, params in (("rename_session", {"name": "changed"}), ("delete_session", {})):
+            result = (await _request(reader, writer, 3, method, {"session_id": sid, **params}))[-1]
+            assert result["error"]["code"] == -32601
+        row = (await _request(reader, writer, 4, "list_sessions"))[-1]["result"]["sessions"][0]
+        assert "name" not in row
+        expected = server.runtime.metadata.to_dict()
+        expected.pop("name")
+        # The only gated field is name; all original metadata and preview remain.
+        row.pop("first_message_preview")
+        expected["updated_at"] = row["updated_at"]
+        assert row == expected
+        assert SessionManager(tmp_path).read_metadata(sid).name == "private display name"
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_id", ["../outside", "/tmp/outside", ".", "..", "", "bad\x00id"])
+async def test_session_delete_rpc_rejects_unsafe_ids(tmp_path, session_id):
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        result = (await _request(reader, writer, 2, "delete_session", {"session_id": session_id}))[-1]
+        assert result["error"]["code"] == -32602
+    finally:
+        await _close(server, writer)

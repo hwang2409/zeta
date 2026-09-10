@@ -11,7 +11,7 @@ import re
 import unicodedata
 import uuid
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -623,6 +623,15 @@ class SessionManager:
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
+    def rename(self, session_id: str, name: str) -> SessionMetadata:
+        """Set a display name; whitespace clears it to the derived preview."""
+        full_id = self.resolve_id(session_id)
+        if (self.sessions_dir / full_id).is_symlink():
+            raise SessionError("session directory must not be a symbolic link")
+        metadata = self.read_metadata(full_id)
+        self.record_name(metadata, name=normalize_session_name(name) if name.strip() else "")
+        return metadata
+
     def resolve_id(self, session_id: str) -> str:
         """Return the full id for an exact match or unambiguous prefix."""
 
@@ -648,22 +657,26 @@ class SessionManager:
     def delete(self, session_id: str) -> None:
         """Remove a session directory and its contents."""
 
-        full_id = self.resolve_id(session_id)
-        session_dir = self.sessions_dir / full_id
         import shutil
 
-        lock_path = session_dir / ".lock"
-        if lock_path.exists():
-            with lock_path.open("a+") as handle:
+        full_id = self.resolve_id(session_id)
+        # Pin the root and refuse links, including a corrupt lock-file link.
+        # rmtree's fd-based traversal unlinks nested links without following them.
+        try:
+            with ExitStack() as cleanup:
+                root_fd = os.open(self.sessions_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                cleanup.callback(os.close, root_fd)
+                session_fd = os.open(full_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+                cleanup.callback(os.close, session_fd)
+                lock_fd = os.open(".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=session_fd)
+                cleanup.callback(os.close, lock_fd)
                 try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError as exc:
-                    raise SessionError(
-                        "session is currently open in another process"
-                    ) from exc
-                shutil.rmtree(session_dir)
-        else:
-            shutil.rmtree(session_dir)
+                    raise SessionError("session is currently open in another process") from exc
+                shutil.rmtree(full_id, dir_fd=root_fd)
+        except OSError as exc:
+            raise SessionError(f"session {full_id} could not be deleted: {exc.strerror}") from exc
 
     def export(self, session_id: str) -> str:
         """Return the session as portable JSONL (metadata header + entries)."""

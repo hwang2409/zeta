@@ -22,6 +22,8 @@ from .protocol import MAX_REQUEST_ID_BYTES, FrameCodec, ProtocolError, bounded
 from .runtime import ServerRuntime
 
 EXTENSION_REQUESTS = [
+    "rename_session",
+    "delete_session",
     "session_tree",
     "session_history",
     "switch_branch",
