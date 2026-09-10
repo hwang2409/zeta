@@ -19,8 +19,9 @@ REPO = Path(__file__).resolve().parent.parent
 @pytest.fixture(scope="module")
 def bundle() -> Path:
     app = REPO / "dist/Zeta.app"
-    if sys.platform != "darwin" or not app.exists():
-        pytest.skip("requires macOS and make gui-app")
+    if sys.platform != "darwin":
+        pytest.skip("requires macOS")
+    assert app.exists(), "run make gui-app before the packaging tests"
     return app
 
 
@@ -44,6 +45,9 @@ def test_bundle_layout_and_launchers(bundle: Path) -> None:
     runtime = contents / "Resources/python"
     assert list(runtime.glob("bin/python3.*"))
     assert list(runtime.glob("lib/python*/site-packages/zeta/cli.py"))
+    assert subprocess.check_output(
+        ["lipo", "-archs", str(contents / "MacOS/zeta-gui")], text=True
+    ).split() == ["arm64"]
     for link in bundle.rglob("*"):
         if link.is_symlink():
             assert link.resolve().is_relative_to(bundle.resolve()), link
@@ -116,3 +120,39 @@ def test_relocated_server_without_checkout_or_uv(bundle: Path) -> None:
             finally:
                 process.terminate()
                 process.wait(timeout=10)
+
+
+def test_relocated_python_metadata_and_bytecode(bundle: Path) -> None:
+    with TemporaryDirectory(prefix="zeta-package-", dir="/tmp") as temporary:
+        moved = Path(temporary) / "Moved app/Zeta.app"
+        shutil.copytree(bundle, moved, symlinks=True)
+        runtime = moved / "Contents/Resources/python"
+        output = subprocess.check_output(
+            [str(runtime / "bin/python3.12"), "-I", "-c", """
+import json
+import sys
+import sysconfig
+
+print(json.dumps({
+    "base_prefix": sys.base_prefix,
+    "prefix": sys.prefix,
+    "paths": sysconfig.get_paths(),
+    "config_paths": {
+        name: sysconfig.get_config_var(name)
+        for name in ("BINDIR", "INCLUDEDIR", "LIBDIR", "LIBPL", "prefix")
+    },
+}))
+"""],
+            text=True,
+        )
+        metadata = json.loads(output)
+        resolved_runtime = runtime.resolve()
+        assert metadata["base_prefix"] == str(resolved_runtime)
+        assert metadata["prefix"] == str(resolved_runtime)
+        for path in (*metadata["paths"].values(), *metadata["config_paths"].values()):
+            assert Path(path).is_relative_to(resolved_runtime), path
+    original_runtime = bundle / "Contents/Resources/python"
+    bytecode = list(original_runtime.rglob("*.pyc"))
+    assert bytecode
+    build_worktree = str(REPO).encode()
+    assert not any(build_worktree in path.read_bytes() for path in bytecode)

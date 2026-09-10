@@ -11,6 +11,25 @@ from tempfile import TemporaryDirectory
 PYTHON_VERSION = "3.12.13"
 
 
+def relocate_sysconfig(runtime: Path, source_root: Path) -> None:
+    """Make the standalone interpreter report its current bundle prefix."""
+    sysconfig_data, = (runtime / "lib").glob("python*/_sysconfigdata_*.py")
+    source_prefix = str(source_root)
+    data = sysconfig_data.read_text()
+    if source_prefix not in data:
+        raise RuntimeError(f"missing Python install prefix in {sysconfig_data}")
+    data = data.replace(source_prefix, "__ZETA_RUNTIME_PREFIX__")
+    sysconfig_data.write_text(
+        "import sys\n\n"
+        + data
+        + "\nfor key, value in build_time_vars.items():\n"
+        + "    if isinstance(value, str):\n"
+        + "        build_time_vars[key] = value.replace(\n"
+        + "            '__ZETA_RUNTIME_PREFIX__', sys.base_prefix\n"
+        + "        )\n"
+    )
+
+
 def bundle_server(repo: Path, resources: Path) -> None:
     # A venv's interpreter/stdlib can point outside it. Copy the complete uv
     # standalone distribution instead, then install only locked runtime wheels.
@@ -21,8 +40,9 @@ def bundle_server(repo: Path, resources: Path) -> None:
     source_python = Path(subprocess.check_output(
         ["uv", "python", "find", "--managed-python", PYTHON_VERSION], env=env, text=True
     ).strip()).resolve()
+    source_root = source_python.parent.parent
     runtime = resources / "python"
-    shutil.copytree(source_python.parent.parent, runtime, symlinks=True)
+    shutil.copytree(source_root, runtime, symlinks=True)
     python = runtime / "bin" / source_python.name
     # PEP 668 marker blocks uv (and pip) from installing here. We built this
     # copy specifically to install into, so drop the marker for this build.
@@ -53,6 +73,7 @@ def bundle_server(repo: Path, resources: Path) -> None:
     for executable in (runtime / "bin").iterdir():
         if executable != python:
             executable.unlink()
+    relocate_sysconfig(runtime, source_root)
     # python-build-standalone leaves libpython3.12.dylib's install_name as an
     # absolute build path, and Tcl's optional dylibs use bare filenames. Rewrite
     # each to @rpath so a moved bundle stays relocatable.
@@ -61,9 +82,12 @@ def bundle_server(repo: Path, resources: Path) -> None:
             ["install_name_tool", "-id", f"@rpath/{dylib.name}", str(dylib)],
             check=True, stderr=subprocess.DEVNULL,
         )
-    subprocess.run(
-        [str(python), "-I", "-m", "compileall", "-q", str(runtime / "lib")], check=True
-    )
+    for bytecode in runtime.rglob("*.pyc"):
+        bytecode.unlink()
+    subprocess.run([
+        str(python), "-I", "-m", "compileall", "-q", "-f",
+        "-s", str(runtime), "-p", ".", str(runtime / "lib"),
+    ], check=True)
     server = resources / "zeta-server"
     server.write_text(f'''#!/bin/sh
 APP_RESOURCES=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

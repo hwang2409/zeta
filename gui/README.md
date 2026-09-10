@@ -80,6 +80,7 @@ installed zeta wheel and locked runtime dependencies, and a generated app icon.
 Move `Zeta.app` anywhere; launching it requires neither this checkout nor `uv`.
 The bundled launcher always uses its own server. `make gui` keeps using the
 checkout and supports `ZETA_BIN` overrides.
+The bundle is arm64-only and runs on Apple Silicon Macs.
 
 Building requires macOS, the Xcode command line tools (including Swift and
 `iconutil`), Rust, and `uv`. The first build downloads Python and any missing
@@ -89,8 +90,9 @@ Python and all dependencies are installed and byte-compiled at build time.
 Distribution signing and notarization remain separate work.
 
 After building, run `uv run pytest tests/test_package_app.py` to check the bundle
-layout, native library paths, and server startup after moving a copy to a new
-path with no development tools in `PATH`. These tests skip without a built app.
+layout, arm64 architecture, native library paths, Python metadata and bytecode
+after relocation, and server startup with no development tools in `PATH`. These
+tests fail on macOS without a built app and skip on other platforms.
 
 ## Native smoke capture
 
