@@ -187,12 +187,12 @@ def _strip_terminal_controls(value: str) -> str:
     )
 
 
-def _safe_text(value: str, *, style: str) -> Text:
+def _safe_text(value: str, *, style: str, wrap: bool = False) -> Text:
     return Text.from_ansi(
         _strip_terminal_controls(value),
         style=style,
-        overflow="ellipsis",
-        no_wrap=True,
+        overflow="fold" if wrap else "ellipsis",
+        no_wrap=not wrap,
     )
 
 
@@ -213,7 +213,9 @@ def render_error_card(event: StreamEvent) -> Panel:
     title = "provider failure" if retryable else "error"
     content: list[RenderableType] = [Text(f"{title} · {code}", style=theme.ERROR)]
     if not is_json_payload:
-        content.append(_safe_text(f"reason: {reason}", style=theme.BODY))
+        # Wrap rather than ellipsize: a debugging read needs the whole reason,
+        # and MAX_ERROR_REASON already bounds the card.
+        content.append(_safe_text(f"reason: {reason}", style=theme.BODY, wrap=True))
     else:
         content.extend(
             (
@@ -1045,6 +1047,7 @@ def format_status(
     transcript_search: str | None = None,
     transcript_match: tuple[int, int] | None = None,
     transcript_position: str | None = None,
+    copy_notice: str | None = None,
 ) -> Text:
     """Format the compact status bar shown below the composer."""
 
@@ -1085,6 +1088,8 @@ def format_status(
         left_segments.append(f"bg {background_count}")
     if transcript_position:
         left_segments.append(transcript_position)
+    if copy_notice:
+        left_segments.append(copy_notice)
     if transcript_search is not None:
         current, total = transcript_match or (0, 0)
         left_segments.insert(

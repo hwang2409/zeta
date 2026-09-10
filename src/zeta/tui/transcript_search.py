@@ -1,9 +1,11 @@
-"""Search and highlight helpers for the transcript widget."""
+"""Search, selection, and highlight helpers for the transcript widget."""
 
 from __future__ import annotations
 
 import re
 from bisect import bisect_right
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from io import StringIO
 
 from rich.console import Console
@@ -11,6 +13,155 @@ from rich.text import Text
 
 from . import theme
 from .theme import RICH_THEME
+
+Cell = tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class Selection:
+    """A mouse drag over transcript cells, ``anchor`` to ``extent`` inclusive.
+
+    Cells are ``(line, column)`` in transcript line coordinates. ``dragging``
+    stays true until the button is released; the highlight then persists
+    until the next click or the next transcript change.
+    """
+
+    anchor: Cell
+    extent: Cell
+    dragging: bool = True
+
+    @property
+    def start(self) -> Cell:
+        return min(self.anchor, self.extent)
+
+    @property
+    def end(self) -> Cell:
+        return max(self.anchor, self.extent)
+
+    @property
+    def is_click(self) -> bool:
+        return self.anchor == self.extent
+
+    def extend(self, cell: Cell) -> Selection:
+        return replace(self, extent=cell)
+
+    def released(self, cell: Cell) -> Selection:
+        return replace(self, extent=cell, dragging=False)
+
+    def line_span(self, line: int, length: int) -> tuple[int, int] | None:
+        """Return the selected ``[first, last)`` columns on ``line``, or None."""
+
+        (start_line, start_col), (end_line, end_col) = self.start, self.end
+        if line < start_line or line > end_line:
+            return None
+        first = start_col if line == start_line else 0
+        last = min(end_col + 1 if line == end_line else length, length)
+        if last <= first:
+            return None
+        return first, last
+
+    def text(self, line_text: Callable[[int], str | None]) -> str:
+        """Join the covered text line by line, trimming trailing spaces."""
+
+        parts: list[str] = []
+        for line in range(self.start[0], self.end[0] + 1):
+            plain = line_text(line)
+            if plain is None:
+                continue
+            span = self.line_span(line, len(plain))
+            parts.append(plain[span[0] : span[1]].rstrip() if span else "")
+        return "\n".join(parts).strip("\n")
+
+
+@dataclass(frozen=True, slots=True)
+class SelectionAnchor:
+    """One end of a selection, pinned to content rather than to a row.
+
+    Rows shift while a reply streams in, so an end remembers the unit and the
+    text offset of its line (the identity the scroll anchor uses too) and is
+    re-resolved to a row on every paint. ``line`` is the row it was captured
+    on: the fallback for blank separator lines, which carry no unit, and the
+    tie-breaker when several rows share one offset.
+    """
+
+    unit_key: int | None
+    text_offset: int
+    line: int
+    column: int
+
+
+def resolve_anchor(
+    anchor: SelectionAnchor, locations: Sequence[tuple[int | None, int]]
+) -> Cell | None:
+    """Map an anchor back to a ``(line, column)`` cell against fresh locations.
+
+    ``locations`` holds one ``(unit key, text offset)`` per rendered line.
+    Returns None when the anchored unit has left the transcript.
+    """
+
+    if not locations:
+        return None
+    if anchor.unit_key is None:
+        return (min(anchor.line, len(locations) - 1), anchor.column)
+    candidates = [
+        index for index, (key, _) in enumerate(locations) if key == anchor.unit_key
+    ]
+    if not candidates:
+        return None
+    exact = [index for index in candidates if locations[index][1] == anchor.text_offset]
+    if exact:
+        return (min(exact, key=lambda index: abs(index - anchor.line)), anchor.column)
+    preceding = [
+        index for index in candidates if locations[index][1] <= anchor.text_offset
+    ]
+    return ((preceding[-1] if preceding else candidates[0]), anchor.column)
+
+
+@dataclass(frozen=True, slots=True)
+class AnchoredSelection:
+    """A drag between two content anchors; resolve to a :class:`Selection` to paint."""
+
+    anchor: SelectionAnchor
+    extent: SelectionAnchor
+    dragging: bool = True
+
+    def extend(self, extent: SelectionAnchor) -> AnchoredSelection:
+        return replace(self, extent=extent)
+
+    def released(self, extent: SelectionAnchor) -> AnchoredSelection:
+        return replace(self, extent=extent, dragging=False)
+
+    def resolve(self, locations: Sequence[tuple[int | None, int]]) -> Selection | None:
+        start = resolve_anchor(self.anchor, locations)
+        end = resolve_anchor(self.extent, locations)
+        if start is None or end is None:
+            return None
+        return Selection(start, end, self.dragging)
+
+
+def highlight_fragments(
+    fragments: Sequence[tuple], span: tuple[int, int], style: str
+) -> list[tuple[str, str]]:
+    """Append ``style`` to the fragments covering ``[first, last)`` characters."""
+
+    first, last = span
+    result: list[tuple[str, str]] = []
+    position = 0
+    for fragment in fragments:
+        fragment_style, text = fragment[0], fragment[1]
+        end = position + len(text)
+        if end <= first or position >= last:
+            result.append((fragment_style, text))
+        else:
+            cut_start = max(first, position) - position
+            cut_end = min(last, end) - position
+            if cut_start:
+                result.append((fragment_style, text[:cut_start]))
+            result.append((f"{fragment_style} {style}".strip(), text[cut_start:cut_end]))
+            if cut_end < len(text):
+                result.append((fragment_style, text[cut_end:]))
+        position = end
+    return result
 
 
 class SearchMatch:

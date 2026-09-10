@@ -35,6 +35,20 @@ references to one resolved path produce one attachment block.
 - `ctrl+x ctrl+o` expands or collapses the newest child card.
 - `ctrl+o` keeps its native prompt-toolkit behavior in the composer.
 
+## selecting and copying text
+
+The transcript lives on the alternate screen with mouse reporting on, so the
+terminal never sees a drag as a selection. Drag over the transcript instead:
+the covered text highlights as you go, and releasing the button copies it to
+the system clipboard (`pbcopy`, `wl-copy`, `xclip`, or `xsel`) and to the
+composer's own clipboard. The status bar reports `copied N lines`. The
+selection is pinned to the text it covers, so it stays put while a reply is
+still streaming in; you can select and copy mid-reply. Each streamed token
+repaints only the message it landed in rather than re-parsing the whole
+transcript, so long sessions stay responsive under the pointer. A plain click
+clears the highlight and the wheel still scrolls. Provider errors now wrap
+their full reason instead of cutting it off at the card edge.
+
 ## exec macro example
 
 Create `~/.zeta/commands/rebuild.md` for a local `/rebuild` macro:
