@@ -73,6 +73,72 @@ class Selection:
         return "\n".join(parts).strip("\n")
 
 
+@dataclass(frozen=True, slots=True)
+class SelectionAnchor:
+    """One end of a selection, pinned to content rather than to a row.
+
+    Rows shift while a reply streams in, so an end remembers the unit and the
+    text offset of its line (the identity the scroll anchor uses too) and is
+    re-resolved to a row on every paint. ``line`` is the row it was captured
+    on: the fallback for blank separator lines, which carry no unit, and the
+    tie-breaker when several rows share one offset.
+    """
+
+    unit_key: int | None
+    text_offset: int
+    line: int
+    column: int
+
+
+def resolve_anchor(
+    anchor: SelectionAnchor, locations: Sequence[tuple[int | None, int]]
+) -> Cell | None:
+    """Map an anchor back to a ``(line, column)`` cell against fresh locations.
+
+    ``locations`` holds one ``(unit key, text offset)`` per rendered line.
+    Returns None when the anchored unit has left the transcript.
+    """
+
+    if not locations:
+        return None
+    if anchor.unit_key is None:
+        return (min(anchor.line, len(locations) - 1), anchor.column)
+    candidates = [
+        index for index, (key, _) in enumerate(locations) if key == anchor.unit_key
+    ]
+    if not candidates:
+        return None
+    exact = [index for index in candidates if locations[index][1] == anchor.text_offset]
+    if exact:
+        return (min(exact, key=lambda index: abs(index - anchor.line)), anchor.column)
+    preceding = [
+        index for index in candidates if locations[index][1] <= anchor.text_offset
+    ]
+    return ((preceding[-1] if preceding else candidates[0]), anchor.column)
+
+
+@dataclass(frozen=True, slots=True)
+class AnchoredSelection:
+    """A drag between two content anchors; resolve to a :class:`Selection` to paint."""
+
+    anchor: SelectionAnchor
+    extent: SelectionAnchor
+    dragging: bool = True
+
+    def extend(self, extent: SelectionAnchor) -> AnchoredSelection:
+        return replace(self, extent=extent)
+
+    def released(self, extent: SelectionAnchor) -> AnchoredSelection:
+        return replace(self, extent=extent, dragging=False)
+
+    def resolve(self, locations: Sequence[tuple[int | None, int]]) -> Selection | None:
+        start = resolve_anchor(self.anchor, locations)
+        end = resolve_anchor(self.extent, locations)
+        if start is None or end is None:
+            return None
+        return Selection(start, end, self.dragging)
+
+
 def highlight_fragments(
     fragments: Sequence[tuple], span: tuple[int, int], style: str
 ) -> list[tuple[str, str]]:

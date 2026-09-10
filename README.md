@@ -41,10 +41,11 @@ The transcript lives on the alternate screen with mouse reporting on, so the
 terminal never sees a drag as a selection. Drag over the transcript instead:
 the covered text highlights as you go, and releasing the button copies it to
 the system clipboard (`pbcopy`, `wl-copy`, `xclip`, or `xsel`) and to the
-composer's own clipboard. The status bar reports `copied N lines`. A plain
-click clears the highlight, the wheel still scrolls, and any transcript
-change drops the selection so highlights never drift. Provider errors now
-wrap their full reason instead of cutting it off at the card edge.
+composer's own clipboard. The status bar reports `copied N lines`. The
+selection is pinned to the text it covers, so it stays put while a reply is
+still streaming in; you can select and copy mid-reply. A plain click clears
+the highlight and the wheel still scrolls. Provider errors now wrap their
+full reason instead of cutting it off at the card edge.
 
 ## exec macro example
 

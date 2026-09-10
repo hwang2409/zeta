@@ -29,9 +29,12 @@ from .agent_card import AgentCard
 from .render import render_tool_progress
 from .theme import RICH_THEME
 from .transcript_search import (
+    AnchoredSelection,
+    Cell,
     HighlightCache,
     SearchMatch,
     Selection,
+    SelectionAnchor,
     find_matches,
     highlight_fragments,
 )
@@ -177,7 +180,7 @@ class TranscriptWidget(UIControl):
             tuple[int, int, str], list[SearchMatch]
         ] = OrderedDict()
         self._highlight_cache: tuple[tuple[int, int, str], HighlightCache] | None = None
-        self._selection: Selection | None = None
+        self._selection: AnchoredSelection | None = None
         self._prefix_lines = 0
         self._copy_handler: Callable[[str], str | None] | None = None
         self.copy_notice: str | None = None
@@ -206,9 +209,6 @@ class TranscriptWidget(UIControl):
         self._locations_cache.clear()
         self._search_cache.clear()
         self._highlight_cache = None
-        # Line indexes move when content changes, so a selection would drift.
-        self._selection = None
-        self.copy_notice = None
 
     def _append_unit(self, value: RenderableType | _ToolUnit | None) -> _TranscriptUnit:
         unit = _TranscriptUnit(self._next_key, value)
@@ -736,7 +736,7 @@ class TranscriptWidget(UIControl):
         self._prefix_lines = prefix_lines
         visible_lines = ([[] for _ in range(prefix_lines)] + lines)
         cursor_y = min(prefix_lines + self._scroll_offset, len(visible_lines) - 1)
-        selection = self._selection
+        selection = self._resolved_selection(locations)
         selection_style = f"bg:{theme.active_palette().search_bg}"
 
         def get_line(index: int) -> list[tuple[str, str]]:
@@ -767,16 +767,57 @@ class TranscriptWidget(UIControl):
 
     @property
     def selection(self) -> Selection | None:
-        return self._selection
+        """The current selection resolved to rows, or None when there is none."""
+
+        return self._resolved_selection()
 
     def clear_selection(self) -> None:
         self._selection = None
         self.copy_notice = None
 
+    @staticmethod
+    def _keyed(
+        locations: list[tuple[_TranscriptUnit | None, int]],
+    ) -> list[tuple[int | None, int]]:
+        return [
+            (unit.key if unit is not None else None, offset) for unit, offset in locations
+        ]
+
+    def _anchor_for(self, cell: Cell) -> SelectionAnchor:
+        """Pin a row/column to the unit and text offset rendered there."""
+
+        line, column = cell
+        locations = self._locations(self._content_width)
+        if 0 <= line < len(locations) and locations[line][0] is not None:
+            unit, offset = locations[line]
+            return SelectionAnchor(unit.key, offset, line, column)
+        return SelectionAnchor(None, 0, line, column)
+
+    def _resolved_selection(
+        self, locations: list[tuple[_TranscriptUnit | None, int]] | None = None
+    ) -> Selection | None:
+        """Re-resolve the anchored selection against the current rows.
+
+        Content pins survive streaming: new text appended below or inside the
+        tail unit moves rows, and the highlight moves with the text it covers.
+        Only an end whose unit left the transcript (a fork or rebuild) drops it.
+        """
+
+        anchored = self._selection
+        if anchored is None:
+            return None
+        if locations is None:
+            locations = self._locations(self._content_width)
+        resolved = anchored.resolve(self._keyed(locations))
+        if resolved is None:
+            self._selection = None
+        return resolved
+
     def selection_text(self) -> str:
         """Return the text under the current selection, empty when there is none."""
 
-        if self._selection is None:
+        selection = self._resolved_selection()
+        if selection is None:
             return ""
         lines = self._parsed_lines(self._content_width)
 
@@ -785,7 +826,7 @@ class TranscriptWidget(UIControl):
                 return None
             return "".join(fragment[1] for fragment in lines[index])
 
-        return self._selection.text(line_text)
+        return selection.text(line_text)
 
     def mouse_handler(self, mouse_event: MouseEvent):
         """Scroll on the wheel; turn a left-button drag into a copied selection.
@@ -806,18 +847,20 @@ class TranscriptWidget(UIControl):
         if event_type is MouseEventType.MOUSE_DOWN:
             if mouse_event.button is not MouseButton.LEFT:
                 return NotImplemented
-            self._selection = Selection(cell, cell)
+            anchor = self._anchor_for(cell)
+            self._selection = AnchoredSelection(anchor, anchor)
             self.copy_notice = None
             return None
         selection = self._selection
         if selection is None or not selection.dragging:
             return NotImplemented
         if event_type is MouseEventType.MOUSE_MOVE:
-            self._selection = selection.extend(cell)
+            self._selection = selection.extend(self._anchor_for(cell))
             return None
         if event_type is MouseEventType.MOUSE_UP:
-            released = selection.released(cell)
-            if released.is_click:
+            released = selection.released(self._anchor_for(cell))
+            resolved = released.resolve(self._keyed(self._locations(self._content_width)))
+            if resolved is None or resolved.is_click:
                 self._selection = None
                 return None
             self._selection = released

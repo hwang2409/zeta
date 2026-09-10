@@ -147,16 +147,81 @@ def test_click_without_drag_clears_and_copies_nothing() -> None:
     assert transcript.copy_notice is None
 
 
-def test_transcript_change_drops_the_selection() -> None:
-    transcript, prefix = _transcript("line 0", "line 1")
+def test_selection_rides_along_while_the_tail_streams() -> None:
+    transcript = TranscriptWidget()
+    transcript.append(Text("alpha"))
+    streaming = transcript.append(Text("beta"))
+    transcript.create_content(40, 10)
+    prefix = transcript._prefix_lines
+    copied: list[str] = []
+    transcript.set_copy_handler(lambda text: copied.append(text) or "copied 2 lines")
+    _drag(transcript, (1, prefix), (2, prefix + 1))
+    assert copied == ["lpha\nbet"]
+
+    # Tokens keep arriving in the tail unit and new units follow it; the
+    # highlight stays on the text it covered and the notice stays up.
+    transcript.replace(streaming, Text("beta gamma\ndelta"))
+    transcript.append(Text("epsilon"))
+    content = transcript.create_content(40, 10)
+    prefix = transcript._prefix_lines
+
+    assert transcript.selection_text() == "lpha\nbet"
+    assert transcript.copy_notice == "copied 2 lines"
+    assert _selected(content.get_line(prefix)) == "lpha"
+    assert _selected(content.get_line(prefix + 1)) == "bet"
+    assert _selected(content.get_line(prefix + 2)) == ""
+
+
+def test_selection_follows_its_rows_when_a_unit_above_grows() -> None:
+    transcript = TranscriptWidget()
+    tool = transcript.append(Text("running"))
+    transcript.append(Text("beta"))
+    transcript.append(Text("gamma"))
+    transcript.create_content(40, 10)
+    prefix = transcript._prefix_lines
+    transcript.set_copy_handler(lambda text: "copied")
+    _drag(transcript, (1, prefix + 1), (2, prefix + 2))
+    assert transcript.selection_text() == "eta\ngam"
+
+    transcript.replace(tool, Text("running\nline one\nline two"))
+    content = transcript.create_content(40, 10)
+    prefix = transcript._prefix_lines
+
+    assert transcript.selection_text() == "eta\ngam"
+    assert _selected(content.get_line(prefix + 3)) == "eta"
+    assert _selected(content.get_line(prefix + 4)) == "gam"
+    assert _selected(content.get_line(prefix)) == ""
+
+
+def test_selection_can_start_on_a_blank_separator_row() -> None:
+    transcript = TranscriptWidget()
+    transcript.append(Text("alpha"))
+    transcript.append_blank()
+    transcript.append(Text("beta"))
+    transcript.create_content(40, 10)
+    prefix = transcript._prefix_lines
+    copied: list[str] = []
+    transcript.set_copy_handler(lambda text: copied.append(text) or "copied 1 line")
+
+    _drag(transcript, (0, prefix + 1), (2, prefix + 2))
+
+    assert copied == ["bet"]
+
+
+def test_selection_is_dropped_only_when_its_unit_leaves() -> None:
+    transcript = TranscriptWidget()
+    transcript.append(Text("alpha"))
+    gone = transcript.append(Text("beta"))
+    transcript.create_content(40, 10)
+    prefix = transcript._prefix_lines
     transcript.set_copy_handler(lambda text: "copied 1 line")
-    _drag(transcript, (0, prefix), (3, prefix))
+    _drag(transcript, (0, prefix + 1), (3, prefix + 1))
     assert transcript.selection is not None
 
-    transcript.append(Text("line 2"))
+    transcript.remove(gone)
 
     assert transcript.selection is None
-    assert transcript.copy_notice is None
+    assert transcript.selection_text() == ""
     # A move or release with nothing in flight is not ours to handle.
     assert transcript.mouse_handler(_event(MouseEventType.MOUSE_MOVE, 1, 1)) is NotImplemented
     assert transcript.mouse_handler(_event(MouseEventType.MOUSE_UP, 1, 1)) is NotImplemented
