@@ -68,16 +68,29 @@ cargo clippy --manifest-path gui/Cargo.toml --all-targets -- -D warnings
 ZETA_HOME="$(mktemp -d)" cargo test --manifest-path gui/Cargo.toml
 ```
 
-## Developer Mac app
+## Self-contained Mac app
 
 ```sh
 make gui-app
 open dist/Zeta.app
 ```
 
-The unsigned bundle contains the GUI and a server launcher tied to this checkout
-and the current `uv` executable. Keep this checkout in place. Packaging changes
-and distribution signing are outside this milestone.
+The unsigned bundle includes the GUI, a standalone Python 3.12.13 runtime, the
+installed zeta wheel and locked runtime dependencies, and a generated app icon.
+Move `Zeta.app` anywhere; launching it requires neither this checkout nor `uv`.
+The bundled launcher always uses its own server. `make gui` keeps using the
+checkout and supports `ZETA_BIN` overrides.
+
+Building requires macOS, the Xcode command line tools (including Swift and
+`iconutil`), Rust, and `uv`. The first build downloads Python and any missing
+wheels. Later builds can run offline with `UV_OFFLINE=1 CARGO_NET_OFFLINE=true
+make gui-app`, provided `dist/build-python` and the uv/Cargo caches remain.
+Python and all dependencies are installed and byte-compiled at build time.
+Distribution signing and notarization remain separate work.
+
+After building, run `uv run pytest tests/test_package_app.py` to check the bundle
+layout, native library paths, and server startup after moving a copy to a new
+path with no development tools in `PATH`. These tests skip without a built app.
 
 ## Native smoke capture
 
