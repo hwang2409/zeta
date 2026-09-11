@@ -3967,3 +3967,226 @@ fn scrollbar_thumb_lands_on_the_wiki_8px_and_text_alpha_mix(cx: &mut TestAppCont
         );
     });
 }
+
+#[gpui::test]
+fn sidebar_row_focus_handles_are_real_tab_stops_reached_via_focus_next(cx: &mut TestAppContext) {
+    // Round-4 a11y guard. `cx.focus_handle()` defaults to `tab_stop=false`,
+    // and the div's `.tab_index(0)` does NOT propagate to a tracked focus
+    // handle. Without setting `tab_stop(true)` on the handle itself,
+    // `window.focus_next` walks past every sidebar row. The prior row-3
+    // guard only exercised `window.focus(&handle)` directly, so a missing
+    // tab-stop flag never showed. This test uses `focus_next` and MUST
+    // fail if the handle is not registered as a tab stop.
+    let (window, view, _receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let session_target = "cd34beef1234";
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut other = session();
+            other.session_id = session_target.into();
+            other.name = "other".into();
+            view.state.sessions.push(other);
+            view.state.session_view.available = true;
+            view.state.session_view.branches = vec![
+                Branch {
+                    id: "trunk".into(),
+                    label: "main".into(),
+                    depth: 0,
+                    current: true,
+                },
+                Branch {
+                    id: "alt".into(),
+                    label: "alt".into(),
+                    depth: 1,
+                    current: false,
+                },
+            ];
+            view.apply_worker_message(WorkerMessage::Connected, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+
+    let session_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get(session_target)
+                .cloned()
+        })
+        .expect("sidebar row focus handle exists after render");
+    let branch_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get("branch:alt")
+                .cloned()
+        })
+        .expect("branch row focus handle exists after render");
+    // Blur so `focus_next` starts from the beginning of the tab order —
+    // sequence becomes deterministic regardless of what the composer or
+    // any kit control grabbed at construction time.
+    visual.update(|window, cx| window.blur(cx));
+
+    // Bound the walk. `focus_next` wraps around, so we cap at a very
+    // generous ceiling to defend against a runaway loop while still
+    // proving reachability.
+    let max_steps = 512;
+    let mut saw_session_at = None;
+    let mut saw_branch_at = None;
+    for step in 0..max_steps {
+        visual.update(|window, cx| window.focus_next(cx));
+        let focused = visual.update(|window, cx| window.focused(cx));
+        if focused.as_ref() == Some(&session_handle) && saw_session_at.is_none() {
+            saw_session_at = Some(step);
+        }
+        if focused.as_ref() == Some(&branch_handle) && saw_branch_at.is_none() {
+            saw_branch_at = Some(step);
+        }
+        if saw_session_at.is_some() && saw_branch_at.is_some() {
+            break;
+        }
+    }
+
+    let session_step = saw_session_at.expect(
+        "focus_next must land on a session row — proves the row focus handle \
+         is registered as a real tab stop, not just a tracked handle with \
+         tab_stop=false",
+    );
+    let branch_step = saw_branch_at.expect(
+        "focus_next must land on a branch row — proves the branch row focus \
+         handle is registered as a real tab stop",
+    );
+    assert!(
+        session_step < branch_step,
+        "session rows paint before branch rows and must be reached first via \
+         focus_next (session at step {session_step}, branch at step {branch_step})"
+    );
+}
+
+#[gpui::test]
+fn sidebar_row_focus_map_prunes_removed_rows_and_keeps_survivors(cx: &mut TestAppContext) {
+    // Round-4 leak guard. Every new branch head mints a fresh UUID, so an
+    // insert-only handle map grows for the app's lifetime. `render_sidebar`
+    // prunes to the live key set on every paint. This test renders once
+    // with a set of rows, mutates the state (drop one session, replace
+    // one branch head, keep one of each), renders again, and asserts:
+    //   1. stale keys are gone from `sidebar_row_focus`,
+    //   2. surviving keys retain the SAME handle instance so tab focus
+    //      does not drift across redraws.
+    let (window, view, _receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let keep_session = "cd34beef1234";
+    let drop_session = "aa11aa11aa11";
+    let keep_branch = "trunk";
+    let old_branch = "old-branch-head";
+    let new_branch = "new-branch-head";
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut a = session();
+            a.session_id = keep_session.into();
+            let mut b = session();
+            b.session_id = drop_session.into();
+            view.state.sessions.push(a);
+            view.state.sessions.push(b);
+            view.state.session_view.available = true;
+            view.state.session_view.branches = vec![
+                Branch {
+                    id: keep_branch.into(),
+                    label: "main".into(),
+                    depth: 0,
+                    current: true,
+                },
+                Branch {
+                    id: old_branch.into(),
+                    label: "old".into(),
+                    depth: 1,
+                    current: false,
+                },
+            ];
+            view.apply_worker_message(WorkerMessage::Connected, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+
+    let (keep_session_before, keep_branch_before, drop_session_before, old_branch_before) = visual
+        .update(|_, cx| {
+            let map = view.read(cx).sidebar_row_focus.borrow();
+            (
+                map.get(keep_session).cloned(),
+                map.get(&format!("branch:{keep_branch}")).cloned(),
+                map.get(drop_session).cloned(),
+                map.get(&format!("branch:{old_branch}")).cloned(),
+            )
+        });
+    assert!(
+        keep_session_before.is_some() && drop_session_before.is_some(),
+        "both session rows must register a focus handle on first render"
+    );
+    assert!(
+        keep_branch_before.is_some() && old_branch_before.is_some(),
+        "both branch rows must register a focus handle on first render"
+    );
+
+    // Mutate: drop the second session, replace the second branch head
+    // with a fresh UUID (the real bug — branch heads churn UUIDs on
+    // every turn). Keep the first of each.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state
+                .sessions
+                .retain(|s| s.session_id.as_str() == keep_session);
+            view.state.session_view.branches = vec![
+                Branch {
+                    id: keep_branch.into(),
+                    label: "main".into(),
+                    depth: 0,
+                    current: true,
+                },
+                Branch {
+                    id: new_branch.into(),
+                    label: "new".into(),
+                    depth: 1,
+                    current: false,
+                },
+            ];
+            view.apply_worker_message(WorkerMessage::Connected, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+
+    visual.update(|_, cx| {
+        let map = view.read(cx).sidebar_row_focus.borrow();
+        assert!(
+            !map.contains_key(drop_session),
+            "dropped session must be pruned from the focus map"
+        );
+        assert!(
+            !map.contains_key(&format!("branch:{old_branch}")),
+            "replaced branch head must be pruned from the focus map"
+        );
+        assert!(
+            map.contains_key(keep_session),
+            "surviving session must remain in the focus map"
+        );
+        assert!(
+            map.contains_key(&format!("branch:{keep_branch}")),
+            "surviving branch must remain in the focus map"
+        );
+        assert!(
+            map.contains_key(&format!("branch:{new_branch}")),
+            "new branch head must be registered on the second render"
+        );
+        assert_eq!(
+            map.get(keep_session),
+            keep_session_before.as_ref(),
+            "surviving session must keep the same focus handle across redraws"
+        );
+        assert_eq!(
+            map.get(&format!("branch:{keep_branch}")),
+            keep_branch_before.as_ref(),
+            "surviving branch must keep the same focus handle across redraws"
+        );
+    });
+}

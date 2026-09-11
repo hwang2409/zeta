@@ -50,18 +50,31 @@ pub fn relative_age(timestamp: &str, now: DateTime<Utc>) -> String {
 /// tests can look it up by the same key the renderer uses — `window`'s keyed
 /// state pool only reads at layout/paint time and would panic outside those.
 /// `id` is unique per row (session id / branch id).
+///
+/// The handle is created as a real tab stop with `tab_index(0)`. `cx.focus_handle()`
+/// defaults `tab_stop=false`, and `.tab_index(0)` on the div only touches its own
+/// `Interactivity` — it does NOT push through to a `tracked_focus_handle` (see
+/// gpui `elements/div.rs`, `paint_state`: the sync only fires when there is no
+/// tracked handle). Without setting the flag here, `window.focus_next` would
+/// skip every sidebar row even though `tab_stops` contains their handles.
 fn row_focus_handle(view: &ZetaView, cx: &mut App, id: &str) -> FocusHandle {
     let mut map = view.sidebar_row_focus.borrow_mut();
     if let Some(handle) = map.get(id) {
         return handle.clone();
     }
-    let handle = cx.focus_handle();
+    let handle = cx.focus_handle().tab_stop(true).tab_index(0);
     map.insert(id.to_owned(), handle.clone());
     handle
 }
 
 impl ZetaView {
     pub fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Prune stale focus handles keyed by session id / branch id. Each new
+        // branch head is a fresh UUID, so without this the map grows for the
+        // app's lifetime. Retain only entries whose key is still live in the
+        // current render; surviving rows keep their handle identity across
+        // redraws so tab focus does not jump when unrelated rows change.
+        self.prune_sidebar_focus_handles();
         // Sidebar rows sit in a virtual list. Every row lands on the
         // SIDEBAR_ROW_HEIGHT floor so the wiki-run column reads as an even
         // rhythm regardless of session name length.
@@ -144,6 +157,31 @@ impl ZetaView {
                 },
             )
             .children(self.render_branches(window, cx))
+    }
+
+    /// Drop focus handles whose key (session id / `branch:<id>`) is no longer
+    /// live. Called at the top of every `render_sidebar`. Without this the
+    /// handle map is insert-only and grows unbounded — normal branch churn
+    /// mints fresh UUIDs, and stale entries would pin a `FocusHandle` (and
+    /// its entry in the window focus map) for the app's lifetime.
+    fn prune_sidebar_focus_handles(&self) {
+        let branches_live = self.state.session_view.available;
+        self.sidebar_row_focus.borrow_mut().retain(|key, _| {
+            if let Some(branch_id) = key.strip_prefix("branch:") {
+                branches_live
+                    && self
+                        .state
+                        .session_view
+                        .branches
+                        .iter()
+                        .any(|branch| branch.id == branch_id)
+            } else {
+                self.state
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_id.as_str() == key)
+            }
+        });
     }
 
     fn render_sidebar_header(
