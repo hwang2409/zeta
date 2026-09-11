@@ -85,38 +85,50 @@ impl ZetaView {
         cx.notify();
     }
 
-    pub fn render_session_edit(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub fn render_session_edit(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let Some(edit) = &self.session_edit else {
             return div().into_any_element();
         };
         let rename = matches!(edit, SessionEdit::Rename { .. });
         // Inputs paint no box — border-bottom only, focus promotes the
-        // underline. Kit's Textarea gets `appearance(false).bordered(false)`
-        // so we control the box treatment; a wrapper div carries the 1px
-        // bottom rail with the same border color the composer uses at rest.
+        // underline to the ring color. Kit's Textarea gets
+        // `appearance(false).bordered(false)` so we control the box
+        // treatment; the wrapper div carries the 1px bottom rail whose
+        // color flips from `border` at rest to `ring` on focus.
         let content = match edit {
-            SessionEdit::Rename { input, .. } => div()
-                .v_flex()
-                .gap_3()
-                .child(
-                    div()
-                        .debug_selector(|| "session-edit-input-frame".into())
-                        .w_full()
-                        .border_b_1()
-                        .border_color(cx.theme().border)
-                        .child(
-                            Textarea::new(input)
-                                .h(px(44.))
-                                .appearance(false)
-                                .bordered(false),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Leave empty to use the first message."),
-                ),
+            SessionEdit::Rename { input, .. } => {
+                let input_focused = input.read(cx).focus_handle(cx).is_focused(window);
+                let underline_color = if input_focused {
+                    cx.theme().ring
+                } else {
+                    cx.theme().border
+                };
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .debug_selector(|| "session-edit-input-frame".into())
+                            .w_full()
+                            .border_b_1()
+                            .border_color(underline_color)
+                            .child(
+                                Textarea::new(input)
+                                    .h(px(44.))
+                                    .appearance(false)
+                                    .bordered(false),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Leave empty to use the first message."),
+                    )
+            }
             SessionEdit::Delete { label, id } => div().v_flex().gap_3()
                 .child(div().truncate().child(label.clone()))
                 .child(div().text_color(cx.theme().muted_foreground).child("Delete this conversation and its stored files? This cannot be undone."))
@@ -147,7 +159,10 @@ impl ZetaView {
             .bg(cx.theme().overlay)
             .v_flex()
             .items_center()
-            .pt(gpui::relative(theme::MODAL_TOP_FRACTION))
+            // 25% of viewport HEIGHT — pixels, not `relative(0.25)`, which
+            // in gpui is a CSS-quirk fraction of parent WIDTH. Contract
+            // line 91.
+            .pt(window.viewport_size().height * theme::MODAL_TOP_FRACTION)
             .px(px(16.))
             .child(
                 div()

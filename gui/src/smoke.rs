@@ -52,13 +52,65 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                 window.press("enter", cx);
                                 phase = 2;
                             }
-                            // Capture mid-stream: the transcript carries the
-                            // generic "+ Thought" marker AND the assistant
-                            // preamble, and `state.streaming` flips can_send
-                            // to false so the Send button paints its disabled
-                            // outline. No approval modal is used here, so the
-                            // transcript is fully visible.
+                            // Once the transcript carries the "+ Thought"
+                            // marker AND the assistant preamble, seed the
+                            // extra chrome the after-screenshot must show:
+                            // a branch row, a connection-lost banner (so
+                            // the danger-rail attention lights up), and a
+                            // popup modal. Sequence matters — draw once so
+                            // the branch tree lands before the settings
+                            // overlay occludes the transcript.
                             2 if ready_to_capture => {
+                                entity.update(cx, |view, cx| {
+                                    view.state.session_view.available = true;
+                                    view.state.session_view.branches = vec![
+                                        zeta_gui::session::Branch {
+                                            id: "main".into(),
+                                            label: "main".into(),
+                                            current: true,
+                                            depth: 0,
+                                        },
+                                        zeta_gui::session::Branch {
+                                            id: "review".into(),
+                                            label: "review".into(),
+                                            current: false,
+                                            depth: 1,
+                                        },
+                                    ];
+                                    view.state.session_view.message_ids.insert(0, "m1".into());
+                                    view.state.mark_connection_lost("socket closed");
+                                    cx.notify();
+                                });
+                                window.render_frame(cx);
+                                phase = 3;
+                            }
+                            3 => {
+                                entity.update(cx, |view, cx| {
+                                    view.state.connection = ConnectionState::Connected;
+                                    view.settings_open = true;
+                                    view.state.session_view.models = vec![
+                                        "claude-opus-4-7".into(),
+                                        "claude-fable-5".into(),
+                                    ];
+                                    view.state.session_view.current_model =
+                                        "claude-opus-4-7".into();
+                                    view.state.session_view.selected_model = 0;
+                                    view.state.session_view.selected_mode = 0;
+                                    view.state.session_view.model_providers.insert(
+                                        "claude-opus-4-7".into(),
+                                        "claude".into(),
+                                    );
+                                    view.state.session_view.model_providers.insert(
+                                        "claude-fable-5".into(),
+                                        "claude".into(),
+                                    );
+                                    // Restore the lost-connection banner so
+                                    // the shot carries every piece of chrome
+                                    // the reviewer named.
+                                    view.state.mark_connection_lost("socket closed");
+                                    cx.notify();
+                                });
+                                window.render_frame(cx);
                                 window
                                     .render_to_image()
                                     .expect("native renderer capture")
