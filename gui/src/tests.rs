@@ -657,42 +657,38 @@ fn pending_user_rail_paints_a_single_one_pixel_rail(cx: &mut TestAppContext) {
 }
 
 #[test]
-fn scroll_sync_splices_a_middle_removal_at_its_exact_index() {
-    // Round-9 regression: `commit_assistant` can drop an assistant row from
-    // the MIDDLE of the transcript when the final message is a prefix of the
-    // streamed fragments bracketed by tools. The virtual-list sync used to
-    // derive its splice range from the count delta alone, which points at
-    // the TAIL. The surviving rows past the removed index kept stale cached
-    // heights and scroll offsets tied to their pre-removal positions.
-    //
-    // The change signal now carries the exact removed index and the sync
-    // helper turns it into `Splice(index..index+1, 0)` — a tail-only splice
-    // fails this test.
+fn scroll_sync_translates_every_edit_in_order() {
+    // Round-10 structural pin. `apply` returns an ordered edit list; the
+    // view MUST apply every edit as its own scroller op, in order. A
+    // mutation that drops all but one edit (the round-9 shape) or reverts
+    // any removal to a tail splice fails these assertions.
+    use zeta_gui::state::TranscriptEdit;
+    assert_eq!(
+        scroll_sync(6, &[TranscriptEdit::Remove(4)], false),
+        vec![ScrollSync::Splice(4..5, 0)],
+    );
+    assert_eq!(
+        scroll_sync(4, &[TranscriptEdit::Insert(3)], false),
+        vec![ScrollSync::Splice(3..3, 1)],
+    );
+    assert_eq!(
+        scroll_sync(5, &[TranscriptEdit::Remeasure(2)], false),
+        vec![ScrollSync::Remeasure(2)],
+    );
+    assert_eq!(scroll_sync(5, &[], false), Vec::<ScrollSync>::new());
+    // Replace (history swap / session switch) resets regardless of edits.
+    assert_eq!(scroll_sync(8, &[], true), vec![ScrollSync::Reset(8)],);
+    // Compound edit: append a Thinking row AND remove a middle assistant
+    // row in ONE reconcile. The view must splice BOTH operations — a
+    // one-action signal collapses to a single op and desyncs the list.
     assert_eq!(
         scroll_sync(
-            7,
-            6,
-            Some(zeta_gui::state::TranscriptChange::Removed(4)),
-            false
+            5,
+            &[TranscriptEdit::Insert(4), TranscriptEdit::Remove(2)],
+            false,
         ),
-        ScrollSync::Splice(4..5, 0),
+        vec![ScrollSync::Splice(4..4, 1), ScrollSync::Splice(2..3, 0)],
     );
-    // A plain append still routes through the count-delta branch — the tail
-    // splice is correct there, and this pin catches an accidental collapse
-    // of the append path into the removal branch.
-    assert_eq!(
-        scroll_sync(3, 4, Some(zeta_gui::state::TranscriptChange::Row(3)), false),
-        ScrollSync::Splice(3..3, 1),
-    );
-    // A modify-in-place with no count change must only remeasure — a splice
-    // here would wipe the cache for a row whose content is still valid.
-    assert_eq!(
-        scroll_sync(5, 5, Some(zeta_gui::state::TranscriptChange::Row(2)), false),
-        ScrollSync::Remeasure(2),
-    );
-    assert_eq!(scroll_sync(5, 5, None, false), ScrollSync::None);
-    // Replace (history swap / session switch) resets regardless of change.
-    assert_eq!(scroll_sync(5, 8, None, true), ScrollSync::Reset(8));
 }
 
 #[gpui::test]
@@ -802,6 +798,295 @@ fn middle_row_removal_syncs_the_virtual_list_at_the_exact_index(cx: &mut TestApp
     assert!(
         gap < px(8.),
         "adjacent tool rows must sit at zero gap (measured gap={gap:?})"
+    );
+}
+
+#[gpui::test]
+fn compound_reconcile_syncs_the_virtual_list_row_for_row(cx: &mut TestAppContext) {
+    // Round-10 mutation gate. A single AssistantMessage can append a
+    // Thinking marker AND drop a middle assistant row in the same
+    // reconcile. `apply` returns BOTH edits in order and the view must
+    // splice each — a mutation that keeps only one edit leaves the
+    // virtual list off by one item from the transcript. This end-to-end
+    // pin fails any such collapse (name: compound-edit desync).
+    use zeta_gui::client::{ContentBlock, Message};
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let session_id = view.read_with(&visual, |view, _| view.state.active_session.clone());
+    let stream_events = vec![
+        ServerEvent::TurnStart {
+            session_id: session_id.clone(),
+            data: json!({}),
+        },
+        ServerEvent::AssistantDelta {
+            session_id: session_id.clone(),
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        },
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-a".into(),
+                name: "read".into(),
+                arguments: serde_json::from_value(json!({"path": "README.md"})).unwrap(),
+            },
+            data: json!({}),
+        },
+        ServerEvent::AssistantDelta {
+            session_id: session_id.clone(),
+            delta: "post".into(),
+            kind: "assistant".into(),
+        },
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-b".into(),
+                name: "list".into(),
+                arguments: serde_json::from_value(json!({"path": "gui/src"})).unwrap(),
+            },
+            data: json!({}),
+        },
+    ];
+    for event in stream_events {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_worker_message(WorkerMessage::Event(event), window, cx);
+            });
+        });
+    }
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.state.transcript.len(), 4);
+            assert_eq!(view.transcript.read(cx).item_count(), 4);
+        });
+    });
+    // Final "pre" with a Thinking block: append Thinking AND drop the
+    // middle Assistant("post"). Transcript ends at four items — the
+    // scroller item count MUST equal that; the compound reconcile is
+    // exactly the shape that the round-9 single-action signal missed.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantMessage {
+                    session_id,
+                    message: Message {
+                        role: "assistant".into(),
+                        content: vec![
+                            ContentBlock::Thinking {
+                                text: "hidden".into(),
+                            },
+                            ContentBlock::Text { text: "pre".into() },
+                        ],
+                    },
+                }),
+                window,
+                cx,
+            );
+        });
+    });
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.state.transcript.len(), 4);
+            assert_eq!(
+                view.transcript.read(cx).item_count(),
+                4,
+                "compound reconcile MUST leave the virtual list aligned to \
+                 the transcript — a dropped edit desyncs the counts"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut TestAppContext) {
+    // Round-10 stability pin. Build several rows of DIFFERENT painted
+    // heights after the removed slot, scroll AWAY from the tail so the
+    // splice cannot rely on tail follow-mode, then drop a middle row.
+    // Every surviving row past the removal must sit at exactly its
+    // pre-removal top MINUS the removed row's height — otherwise the
+    // splice landed on the wrong slot and the survivors carry stale
+    // metadata. A tail-splice mutation shifts these numbers.
+    use zeta_gui::client::{ContentBlock, Message};
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let session_id = view.read_with(&visual, |view, _| view.state.active_session.clone());
+    let bulk = "line ".repeat(60);
+    let stream_events = vec![
+        ServerEvent::TurnStart {
+            session_id: session_id.clone(),
+            data: json!({}),
+        },
+        // Row 0: short assistant fragment (streamed).
+        ServerEvent::AssistantDelta {
+            session_id: session_id.clone(),
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        },
+        // Row 1: first tool receipt.
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-a".into(),
+                name: "read".into(),
+                arguments: serde_json::from_value(json!({"path": "README.md"})).unwrap(),
+            },
+            data: json!({}),
+        },
+        // Row 2: streamed assistant fragment that will be dropped.
+        ServerEvent::AssistantDelta {
+            session_id: session_id.clone(),
+            delta: "post".into(),
+            kind: "assistant".into(),
+        },
+        // Row 3: second tool receipt with a large output (different height).
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-b".into(),
+                name: "list".into(),
+                arguments: serde_json::from_value(json!({"path": "gui/src"})).unwrap(),
+            },
+            data: json!({}),
+        },
+        ServerEvent::ToolOutput {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-b".into(),
+                name: "list".into(),
+                arguments: serde_json::from_value(json!({"path": "gui/src"})).unwrap(),
+            },
+            output: bulk.clone(),
+            data: json!({}),
+        },
+        // Row 4: third tool receipt (short again).
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-c".into(),
+                name: "read".into(),
+                arguments: serde_json::from_value(json!({"path": "Cargo.toml"})).unwrap(),
+            },
+            data: json!({}),
+        },
+    ];
+    for event in stream_events {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_worker_message(WorkerMessage::Event(event), window, cx);
+            });
+        });
+    }
+    // Expand the tall tool receipt so its painted height differs from
+    // the short ones — the point of the test is heights that are NOT
+    // uniform.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.toggle_card(3);
+            view.transcript.update(cx, |scroll, cx| {
+                scroll.remeasure_items(3..4, cx);
+            });
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    // Scroll away from the tail. `is_scrolled_up()` is truthy only when
+    // the user has left tail-follow — assert the split before mutating.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.transcript.update(cx, |scroll, cx| {
+                scroll.scroll_to_item(0, cx);
+            });
+        });
+        window.draw(cx).clear(cx);
+    });
+    visual.update(|_, cx| {
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.state.transcript.len(), 5);
+            assert_eq!(view.transcript.read(cx).item_count(), 5);
+        });
+    });
+    let tool_b_top_before = visual
+        .debug_bounds("tool-receipt-3")
+        .expect("tall tool row must paint")
+        .top();
+    let tool_c_top_before = visual
+        .debug_bounds("tool-receipt-4")
+        .expect("trailing short tool row must paint")
+        .top();
+    // Reconcile: final "pre" drops Assistant("post") at slot 2. Every
+    // surviving row past the removal must shift up by the SAME amount —
+    // the height of the dropped row. A tail-splice mutation would leave
+    // the tall Tb anchored to Assistant("post")'s stale cached height,
+    // so Tb and Tc would end up at inconsistent shifts.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantMessage {
+                    session_id,
+                    message: Message {
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::Text { text: "pre".into() }],
+                    },
+                }),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    visual.update(|_, cx| {
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.state.transcript.len(), 4);
+            assert_eq!(
+                view.transcript.read(cx).item_count(),
+                4,
+                "middle removal MUST keep scroller count aligned to \
+                 the transcript"
+            );
+        });
+    });
+    let tool_b_top_after = visual
+        .debug_bounds("tool-receipt-2")
+        .expect("tall tool row must still paint after removal")
+        .top();
+    let tool_c_top_after = visual
+        .debug_bounds("tool-receipt-3")
+        .expect("trailing tool row must still paint after removal")
+        .top();
+    let tolerance = px(1.);
+    let tall_shift = tool_b_top_before - tool_b_top_after;
+    let tail_shift = tool_c_top_before - tool_c_top_after;
+    assert!(
+        tall_shift > px(0.),
+        "tall tool row must shift up after the middle removal \
+         (shift={tall_shift:?})"
+    );
+    assert!(
+        tail_shift > px(0.),
+        "trailing tool row must shift up after the middle removal \
+         (shift={tail_shift:?})"
+    );
+    assert!(
+        (tall_shift - tail_shift).abs() <= tolerance,
+        "surviving rows past the removal MUST shift up by an equal \
+         amount — differing shifts (tall={tall_shift:?}, \
+         tail={tail_shift:?}) mean the splice landed on the wrong slot \
+         and the cache under one survivor is stale"
+    );
+    // Additional invariant: adjacent tool rows sit at zero row-gap per
+    // the wiki contract. A wrong-slot splice leaves the second tool
+    // anchored below the removed row's cached height, opening a gap.
+    let tool_a_after = visual
+        .debug_bounds("tool-receipt-1")
+        .expect("first tool row must paint")
+        .bottom();
+    let gap = tool_b_top_after - tool_a_after;
+    assert!(
+        gap < px(8.),
+        "adjacent tool rows must sit at zero gap after middle removal \
+         (measured gap={gap:?})"
     );
 }
 

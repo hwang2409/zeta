@@ -32,7 +32,7 @@ use zeta_gui::{
     client::Approval,
     login::{LoginProgress, LoginProvider},
     session::{ImageAttachment, SessionSettings, APPROVAL_MODES},
-    state::{AppState, ConnectionState, TranscriptChange, TranscriptEntry},
+    state::{AppState, ConnectionState, TranscriptEdit, TranscriptEntry},
     worker::{CommandMessage, ConnectionWorker, WorkerMessage},
 };
 
@@ -55,43 +55,41 @@ struct PendingUserTurn {
     failed: bool,
 }
 
-/// How the transcript virtual list must follow an `AppState` change. Extracted
-/// as a pure function so a mutation that reverts to the old tail-splice
-/// heuristic is caught by a unit test — the visual sync path only observes the
-/// bug when off-viewport rows drift, which is impractical to reproduce here.
+/// Ordered virtual-list operations that mirror the ordered edit list from
+/// `AppState::apply`. Extracted as a pure function so a mutation that
+/// collapses the compound-edit case to a tail splice (or drops all but one
+/// edit) is caught by a unit test — the visual sync path only observes the
+/// bug when off-viewport rows drift or the item count desyncs, which is
+/// impractical to reproduce here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScrollSync {
     Reset(usize),
     Splice(std::ops::Range<usize>, usize),
     Remeasure(usize),
-    None,
 }
 
-fn scroll_sync(
-    previous_count: usize,
-    new_count: usize,
-    change: Option<TranscriptChange>,
-    replace: bool,
-) -> ScrollSync {
+fn scroll_sync(new_count: usize, edits: &[TranscriptEdit], replace: bool) -> Vec<ScrollSync> {
+    // A session switch or history swap replaces the transcript wholesale.
+    // The edit list from any concurrent apply cannot describe the new state,
+    // so reset is authoritative — the view drops its cache and rebuilds from
+    // the new item count.
     if replace {
-        return ScrollSync::Reset(new_count);
+        return vec![ScrollSync::Reset(new_count)];
     }
-    // A removal carries its exact index so the metadata splice lands at that
-    // slot. A count-delta-only heuristic would splice the TAIL, dropping the
-    // last row's cache while the shifted middle rows kept stale heights.
-    if let Some(TranscriptChange::Removed(index)) = change {
-        return ScrollSync::Splice(index..index + 1, 0);
-    }
-    if new_count != previous_count {
-        return ScrollSync::Splice(
-            previous_count.min(new_count)..previous_count,
-            new_count.saturating_sub(previous_count),
-        );
-    }
-    if let Some(TranscriptChange::Row(index)) = change {
-        return ScrollSync::Remeasure(index);
-    }
-    ScrollSync::None
+    // One-to-one translation of the ordered edits — each edit describes an
+    // operation against the transcript state the view currently holds, so
+    // applying them in the same order keeps the virtual-list metadata cache
+    // aligned to the transcript row-for-row, whether the reconcile is a
+    // single append, a middle removal, or a compound append + remove +
+    // remeasure.
+    edits
+        .iter()
+        .map(|edit| match *edit {
+            TranscriptEdit::Insert(index) => ScrollSync::Splice(index..index, 1),
+            TranscriptEdit::Remove(index) => ScrollSync::Splice(index..index + 1, 0),
+            TranscriptEdit::Remeasure(index) => ScrollSync::Remeasure(index),
+        })
+        .collect()
 }
 
 struct ZetaView {
@@ -220,8 +218,7 @@ impl ZetaView {
                 | WorkerMessage::Lost(_)
         );
         let previous_session = self.state.active_session.clone();
-        let previous_count = self.state.transcript.len();
-        let mut changed_row = None;
+        let mut edits: Vec<TranscriptEdit> = Vec::new();
         let mut replace = false;
         match message {
             WorkerMessage::LoginProviders(providers) => self.login_providers = providers,
@@ -283,6 +280,7 @@ impl ZetaView {
                 self.state.streaming = true;
                 let index = self.state.transcript.len();
                 self.state.transcript.push(TranscriptEntry::User(text));
+                edits.push(TranscriptEdit::Insert(index));
                 self.state.session_view.attachments.insert(
                     index,
                     images
@@ -309,7 +307,9 @@ impl ZetaView {
                 self.pending_command = false;
                 self.pending_user_turn = None;
                 self.state.streaming = true;
+                let index = self.state.transcript.len();
                 self.state.transcript.push(TranscriptEntry::User(text));
+                edits.push(TranscriptEdit::Insert(index));
                 self.composer
                     .update(cx, |input, cx| input.set_value("", window, cx));
             }
@@ -379,7 +379,7 @@ impl ZetaView {
                 }
             }
             WorkerMessage::Connected => self.state.connection = ConnectionState::Connected,
-            WorkerMessage::Event(event) => changed_row = self.state.apply(event),
+            WorkerMessage::Event(event) => edits = self.state.apply(event),
             WorkerMessage::Lost(error) => {
                 if self.session_edit.is_some() {
                     self.command_error = Some(error.clone());
@@ -416,15 +416,16 @@ impl ZetaView {
         }
         let count = self.state.transcript.len();
         self.transcript.update(cx, |scroll, cx| {
-            match scroll_sync(previous_count, count, changed_row, replace) {
-                ScrollSync::Reset(new_count) => scroll.reset(new_count, cx),
-                ScrollSync::Splice(range, insert) => {
-                    scroll.splice(range, insert, cx);
+            for op in scroll_sync(count, &edits, replace) {
+                match op {
+                    ScrollSync::Reset(new_count) => scroll.reset(new_count, cx),
+                    ScrollSync::Splice(range, insert) => {
+                        scroll.splice(range, insert, cx);
+                    }
+                    ScrollSync::Remeasure(index) => {
+                        scroll.remeasure_items(index..index + 1, cx);
+                    }
                 }
-                ScrollSync::Remeasure(index) => {
-                    scroll.remeasure_items(index..index + 1, cx);
-                }
-                ScrollSync::None => {}
             }
         });
         if login_changed {
@@ -1188,13 +1189,14 @@ impl ZetaView {
     //
     // The seam is documentary: the shipping guard is the
     // `every_row_text_flows_through_the_visible_seam_or_chrome_module`
-    // check, which scans `TranscriptEntry::visible_text` for every kind
-    // and the `chrome::ALL` literal set for the bracketed state markers
-    // `[working]/[done]/[failed]/[canceled]`, plus the render_log samples
-    // that pin the state colour per row-id for tool/thinking rows. The
-    // guard does NOT walk this file for new inline literals — an
-    // exhaustive typed row-text model with a matching renderer-literal
-    // fence is captured as the ZETA-107 follow-up in docs/design.md.
+    // check, which scans a KNOWN FIXTURE set of `TranscriptEntry` values
+    // (User, Assistant, Thinking, Error — Tool is not fixtured in this
+    // test) plus the `chrome::ALL` literal set for the four bracketed
+    // state markers `[working]/[done]/[failed]/[canceled]`. It does NOT
+    // walk this file for new inline literals and does NOT exhaustively
+    // iterate every `TranscriptEntry` variant — an exhaustive typed
+    // row-text model with a matching renderer-literal fence is captured
+    // as the ZETA-107 follow-up in docs/design.md.
     fn render_row_inner(
         &self,
         index: usize,
@@ -1901,10 +1903,11 @@ pub(crate) fn tool_state_color(state: zeta_gui::state::ToolState, cx: &App) -> g
 /// text elements — but does NOT belong to `visible_text` (dynamic body
 /// text) — lives here so the seam has one home per literal. The
 /// `every_row_text_flows_through_the_visible_seam_or_chrome_module` check
-/// asserts none of these literals nor any `visible_text` string carries a
-/// bracketed state marker (`[working]/[done]/[failed]/[canceled]`); the
-/// deferred renderer-literal fence tracked in docs/design.md is what
-/// would statically catch a NEW action label added inline.
+/// scans this literal set and a KNOWN FIXTURE set of `TranscriptEntry`
+/// values for the four bracketed state markers
+/// `[working]/[done]/[failed]/[canceled]` — nothing more. The deferred
+/// renderer-literal fence tracked in docs/design.md is what would
+/// statically catch a NEW action label added inline.
 pub(crate) mod chrome {
     pub(crate) const ASSISTANT_TRUNCATED: &str = "Showing the latest streamed text…";
     pub(crate) const TOOL_HOVER_HINT: &str = "show output";

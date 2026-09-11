@@ -124,20 +124,29 @@ pub enum ToolState {
     Failed,
 }
 
-/// What `AppState::apply` did to the transcript, for the view to splice the
-/// virtual-list metadata cache in step. A bare count delta cannot say WHERE
-/// a row was removed, so the tail-splice branch would drop the cache entry
-/// for the last row while the surviving rows kept stale heights and scroll
-/// offsets from their pre-removal positions.
+/// One primitive edit performed on the transcript. `AppState::apply` returns
+/// the ORDERED list of edits that describe a reconcile completely — a single
+/// event may append a row AND drop another row AND remeasure a third, and
+/// the view applies each edit in order to keep its virtual-list metadata
+/// cache aligned to the transcript. A one-action signal cannot describe a
+/// compound reconcile (append Thinking + remove middle assistant), so the
+/// view would splice only one operation and drift out of sync.
+///
+/// Every index is expressed against the transcript state the view holds at
+/// the moment that edit is applied — earlier edits in the same batch have
+/// already been applied. State.rs emits removals in descending order so an
+/// earlier `Remove(hi)` never invalidates a later `Remove(lo)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TranscriptChange {
-    /// Row at this index was appended or mutated in place. The view remeasures
-    /// exactly that row.
-    Row(usize),
-    /// Row at this index was removed from the transcript. The view splices
-    /// `index..index + 1` out of its metadata cache so the shifted rows keep
-    /// their measured heights aligned to their new positions.
-    Removed(usize),
+pub enum TranscriptEdit {
+    /// A new row was inserted at `index`. The view splices `index..index`
+    /// with one new row, growing the list by one.
+    Insert(usize),
+    /// The row at `index` was removed. The view splices `index..index + 1`
+    /// out, shrinking the list by one; downstream rows shift left.
+    Remove(usize),
+    /// The row at `index` was mutated in place. The view remeasures exactly
+    /// that row; count is unchanged.
+    Remeasure(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -336,8 +345,8 @@ impl AppState {
         self.approvals = status.pending_approvals;
     }
 
-    pub fn apply(&mut self, event: ServerEvent) -> Option<TranscriptChange> {
-        let mut changed: Option<TranscriptChange> = None;
+    pub fn apply(&mut self, event: ServerEvent) -> Vec<TranscriptEdit> {
+        let mut edits: Vec<TranscriptEdit> = Vec::new();
         match event {
             ServerEvent::TurnStart { .. } => {
                 self.streaming = true;
@@ -364,17 +373,24 @@ impl AppState {
             {
                 self.thinking = false;
                 self.assistant_started = true;
-                match self.transcript.last_mut() {
-                    Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
-                    _ => self
-                        .transcript
-                        .push(TranscriptEntry::Assistant(Markdown::streaming(delta))),
+                let appended = match self.transcript.last_mut() {
+                    Some(TranscriptEntry::Assistant(text)) => {
+                        text.push_str(&delta);
+                        false
+                    }
+                    _ => {
+                        self.transcript
+                            .push(TranscriptEntry::Assistant(Markdown::streaming(delta)));
+                        true
+                    }
+                };
+                if let Some(index) = self.transcript.len().checked_sub(1) {
+                    edits.push(if appended {
+                        TranscriptEdit::Insert(index)
+                    } else {
+                        TranscriptEdit::Remeasure(index)
+                    });
                 }
-                changed = self
-                    .transcript
-                    .len()
-                    .checked_sub(1)
-                    .map(TranscriptChange::Row);
             }
             ServerEvent::AssistantDelta { kind, delta, .. }
                 if kind == "thinking" && !delta.is_empty() =>
@@ -388,18 +404,16 @@ impl AppState {
                     && !matches!(self.transcript.last(), Some(TranscriptEntry::Thinking))
                 {
                     self.transcript.push(TranscriptEntry::Thinking);
-                    changed = self
-                        .transcript
-                        .len()
-                        .checked_sub(1)
-                        .map(TranscriptChange::Row);
+                    if let Some(index) = self.transcript.len().checked_sub(1) {
+                        edits.push(TranscriptEdit::Insert(index));
+                    }
                 }
             }
             ServerEvent::AssistantDelta { .. } => {}
             ServerEvent::AssistantMessage { message, .. } => {
                 self.thinking = false;
                 self.assistant_started |= !message.text().is_empty();
-                changed = self.commit_assistant(message);
+                edits.extend(self.commit_assistant(message));
             }
             ServerEvent::ToolStart {
                 session_id,
@@ -411,11 +425,9 @@ impl AppState {
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
                 ));
-                changed = self
-                    .transcript
-                    .len()
-                    .checked_sub(1)
-                    .map(TranscriptChange::Row);
+                if let Some(index) = self.transcript.len().checked_sub(1) {
+                    edits.push(TranscriptEdit::Insert(index));
+                }
             }
             ServerEvent::ToolOutput {
                 session_id,
@@ -423,11 +435,15 @@ impl AppState {
                 output,
                 data,
             } => {
-                let (index, entry) = self.tool_receipt(
+                let (index, inserted, entry) = self.tool_receipt(
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
                 );
-                changed = Some(TranscriptChange::Row(index));
+                edits.push(if inserted {
+                    TranscriptEdit::Insert(index)
+                } else {
+                    TranscriptEdit::Remeasure(index)
+                });
                 if let TranscriptEntry::Tool { summary, card, .. } = entry {
                     card.tail.append(&output);
                     if let Some(line) = card
@@ -447,11 +463,15 @@ impl AppState {
                 session_id,
                 data,
             } => {
-                let (index, entry) = self.tool_receipt(
+                let (index, inserted, entry) = self.tool_receipt(
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
                 );
-                changed = Some(TranscriptChange::Row(index));
+                edits.push(if inserted {
+                    TranscriptEdit::Insert(index)
+                } else {
+                    TranscriptEdit::Remeasure(index)
+                });
                 if let TranscriptEntry::Tool {
                     complete,
                     error,
@@ -506,9 +526,7 @@ impl AppState {
                 session_id,
                 receipt,
             } => {
-                changed = Some(TranscriptChange::Row(
-                    self.commit_sub_agent(session_id, receipt),
-                ));
+                edits.push(self.commit_sub_agent(session_id, receipt));
             }
             ServerEvent::ApprovalRequest { approval, .. } => {
                 if !self
@@ -534,15 +552,13 @@ impl AppState {
                     settings_action,
                     login_provider: data["login_provider"].as_str().map(str::to_owned),
                 });
-                changed = self
-                    .transcript
-                    .len()
-                    .checked_sub(1)
-                    .map(TranscriptChange::Row);
+                if let Some(index) = self.transcript.len().checked_sub(1) {
+                    edits.push(TranscriptEdit::Insert(index));
+                }
             }
             ServerEvent::Other { .. } => {}
         }
-        changed
+        edits
     }
 
     pub fn toggle_card(&mut self, index: usize) {
@@ -555,32 +571,35 @@ impl AppState {
         &mut self,
         tool_call: &ToolCall,
         key: ToolReceiptKey,
-    ) -> (usize, &mut TranscriptEntry) {
-        let index = self
-            .transcript
-            .iter()
-            .position(
-                |entry| matches!(entry, TranscriptEntry::Tool { key: existing, .. } if existing == &key),
-            )
-            .unwrap_or_else(|| {
+    ) -> (usize, bool, &mut TranscriptEntry) {
+        let existing = self.transcript.iter().position(
+            |entry| matches!(entry, TranscriptEntry::Tool { key: found, .. } if found == &key),
+        );
+        let (index, inserted) = match existing {
+            Some(index) => (index, false),
+            None => {
                 self.transcript.push(tool_entry(tool_call, key));
-                self.transcript.len() - 1
-            });
-        (index, &mut self.transcript[index])
+                (self.transcript.len() - 1, true)
+            }
+        };
+        (index, inserted, &mut self.transcript[index])
     }
 
-    fn commit_sub_agent(&mut self, session_id: Option<String>, receipt: SubAgentReceipt) -> usize {
+    fn commit_sub_agent(
+        &mut self,
+        session_id: Option<String>,
+        receipt: SubAgentReceipt,
+    ) -> TranscriptEdit {
         // Durable notifications have no raw tool ID. The launch result supplies
         // the child identity when we saw it; reconnect drains can create it alone.
-        let index = self
-            .transcript
-            .iter()
-            .position(|entry| {
-                matches!(entry, TranscriptEntry::Tool { key, card, .. }
+        let existing = self.transcript.iter().position(|entry| {
+            matches!(entry, TranscriptEntry::Tool { key, card, .. }
                 if key.session_id == session_id
                     && card.child_instance_id.as_deref() == Some(&receipt.child_instance_id))
-            })
-            .unwrap_or_else(|| {
+        });
+        let (index, inserted) = match existing {
+            Some(index) => (index, false),
+            None => {
                 self.transcript.push(TranscriptEntry::Tool {
                     key: ToolReceiptKey {
                         session_id,
@@ -597,8 +616,9 @@ impl AppState {
                         ..Default::default()
                     },
                 });
-                self.transcript.len() - 1
-            });
+                (self.transcript.len() - 1, true)
+            }
+        };
         if let TranscriptEntry::Tool {
             summary,
             complete,
@@ -627,10 +647,14 @@ impl AppState {
             card.tail = OutputTail::default();
             card.tail.append(&receipt.text);
         }
-        index
+        if inserted {
+            TranscriptEdit::Insert(index)
+        } else {
+            TranscriptEdit::Remeasure(index)
+        }
     }
 
-    fn commit_assistant(&mut self, message: Message) -> Option<TranscriptChange> {
+    fn commit_assistant(&mut self, message: Message) -> Vec<TranscriptEdit> {
         let has_thinking = message
             .content
             .iter()
@@ -651,17 +675,19 @@ impl AppState {
         let has_thinking_marker = self.transcript[turn_start..]
             .iter()
             .any(|entry| matches!(entry, TranscriptEntry::Thinking));
-        let mut changed: Option<TranscriptChange> = None;
+        let mut edits: Vec<TranscriptEdit> = Vec::new();
         // Thinking body text is never retained — the provider protocol mixes
         // raw reasoning with any summary, so we only guarantee that a
-        // header-only marker exists when the turn thought at all.
+        // header-only marker exists when the turn thought at all. A compound
+        // reconcile (Thinking marker append + trailing assistant row drop)
+        // MUST emit both edits — the view applies them in order so the
+        // virtual-list count and cached heights end aligned to the
+        // transcript. A one-action signal would splice only one operation.
         if has_thinking && !has_thinking_marker {
             self.transcript.push(TranscriptEntry::Thinking);
-            changed = self
-                .transcript
-                .len()
-                .checked_sub(1)
-                .map(TranscriptChange::Row);
+            if let Some(index) = self.transcript.len().checked_sub(1) {
+                edits.push(TranscriptEdit::Insert(index));
+            }
         }
         if !assistant_text.is_empty() {
             // Every assistant row in the current turn, in transcript order.
@@ -687,11 +713,9 @@ impl AppState {
             if assistant_indices.is_empty() {
                 self.transcript
                     .push(TranscriptEntry::Assistant(assistant_text.into()));
-                changed = self
-                    .transcript
-                    .len()
-                    .checked_sub(1)
-                    .map(TranscriptChange::Row);
+                if let Some(index) = self.transcript.len().checked_sub(1) {
+                    edits.push(TranscriptEdit::Insert(index));
+                }
             } else {
                 let leading = &assistant_indices[..assistant_indices.len() - 1];
                 let mut cursor = 0usize;
@@ -715,22 +739,26 @@ impl AppState {
                     // final text — a shorter-than-streamed final or a final
                     // equal to a mid-tool prefix would otherwise leave an
                     // empty assistant row that still consumes transcript
-                    // rhythm. Drop the trailing row instead of blanking it,
-                    // and report the exact removed index so the view splices
-                    // metadata at that position rather than at the tail.
+                    // rhythm. Drop the trailing row instead of blanking it.
                     if tail.is_empty() {
                         self.transcript.remove(last_idx);
-                        changed = Some(TranscriptChange::Removed(last_idx));
+                        edits.push(TranscriptEdit::Remove(last_idx));
                     } else {
                         if let TranscriptEntry::Assistant(current) = &mut self.transcript[last_idx]
                         {
                             *current = tail.into();
                         }
-                        changed = Some(TranscriptChange::Row(last_idx));
+                        edits.push(TranscriptEdit::Remeasure(last_idx));
                     }
                 } else {
+                    // Divergent prefix — remove leading rows in DESCENDING
+                    // index order so an earlier `Remove(hi)` never invalidates
+                    // a later `Remove(lo)`. The view applies each edit in
+                    // sequence: after Remove(hi), the row previously at `lo`
+                    // is still at `lo`, so the next Remove is well-formed.
                     for &idx in leading.iter().rev() {
                         self.transcript.remove(idx);
+                        edits.push(TranscriptEdit::Remove(idx));
                     }
                     let last_idx = self.transcript[turn_start..]
                         .iter()
@@ -740,11 +768,11 @@ impl AppState {
                     if let TranscriptEntry::Assistant(current) = &mut self.transcript[last_idx] {
                         *current = assistant_text.into();
                     }
-                    changed = Some(TranscriptChange::Row(last_idx));
+                    edits.push(TranscriptEdit::Remeasure(last_idx));
                 }
             }
         }
-        changed
+        edits
     }
 }
 
@@ -858,7 +886,7 @@ mod tests {
                 tool_result: Some(result),
                 data: json!({}),
             });
-            assert_eq!(changed, Some(TranscriptChange::Row(0)));
+            assert_eq!(changed, vec![TranscriptEdit::Insert(0)]);
             let entry = &state.transcript[0];
             assert!(entry.unsuccessful());
             assert!(matches!(
@@ -1766,7 +1794,7 @@ mod tests {
         });
         assert_eq!(
             change,
-            Some(TranscriptChange::Removed(2)),
+            vec![TranscriptEdit::Remove(2)],
             "the exact removed index must reach the view — the tail delta alone would splice the wrong slot"
         );
         assert_eq!(
@@ -1775,6 +1803,144 @@ mod tests {
                 r#"Assistant("pre")"#.to_owned(),
                 r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
                 r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn compound_reconcile_emits_thinking_insert_and_middle_removal_in_order() {
+        // A single AssistantMessage can both (a) append a Thinking marker
+        // AND (b) drop a middle assistant row when the final text is a
+        // prefix of the streamed fragments bracketed by tools. `apply` MUST
+        // return BOTH edits, in order — a single-action signal would splice
+        // only one operation and the virtual list would desync from the
+        // transcript. This test fails any mutation that collapses
+        // `commit_assistant` to a one-edit return.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "post".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        // Transcript: [Assistant("pre"), Tool, Assistant("post"), Tool].
+        // The final message brings a Thinking block AND text that matches
+        // only the first fragment, so Thinking appends at index 4 and
+        // Assistant("post") at index 2 is dropped.
+        let edits = state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![
+                    ContentBlock::Thinking {
+                        text: "hidden".into(),
+                    },
+                    ContentBlock::Text { text: "pre".into() },
+                ],
+            },
+        });
+        assert_eq!(
+            edits,
+            vec![TranscriptEdit::Insert(4), TranscriptEdit::Remove(2)],
+            "compound reconcile MUST emit every edit in order — one-edit \
+             collapses would desync the virtual list from the transcript"
+        );
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("pre")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                "Thinking".to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn divergent_prefix_emits_leading_removals_in_descending_index_order() {
+        // When the streamed fragments are NOT a prefix of the final text,
+        // `commit_assistant` collapses the leading assistant rows into
+        // the last one. The emitted edits MUST list every removal (in
+        // descending index order so an earlier `Remove(hi)` never
+        // invalidates a later `Remove(lo)`) and a final `Remeasure` for
+        // the surviving row. A mutation that returns only the final
+        // `Remeasure` leaves the leading rows still occupying scroller
+        // slots — this test fails it.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "alpha".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "beta".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "gamma".into(),
+            kind: "assistant".into(),
+        });
+        // Transcript: [Assistant("alpha"), Tool, Assistant("beta"), Tool,
+        //   Assistant("gamma")]. Final text "zzz" is NOT a prefix of any
+        // streamed fragment — the reconciler removes the two leading
+        // assistant rows and rewrites the tail assistant row.
+        let edits = state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text { text: "zzz".into() }],
+            },
+        });
+        assert_eq!(
+            edits,
+            vec![
+                TranscriptEdit::Remove(2),
+                TranscriptEdit::Remove(0),
+                TranscriptEdit::Remeasure(2),
+            ],
+            "divergent-prefix collapse MUST report every leading-row \
+             removal (in descending order) plus the surviving-row remeasure"
+        );
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                r#"Assistant("zzz")"#.to_owned(),
             ],
         );
     }
