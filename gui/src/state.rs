@@ -76,16 +76,15 @@ impl TranscriptEntry {
     /// Ordered visible strings the render layer paints for this row.
     /// Single seam: any string that reaches the user through the row's own
     /// text elements (not framing chrome like a chevron icon or a hover hint)
-    /// flows through this collection. Tests read this to prove that no
-    /// synthetic state marker ("[working]/[done]/[failed]/[canceled]") ever
-    /// reaches a visible row and that a `Thinking` payload carrying a
-    /// sentinel contributes nothing containing the sentinel to any row.
-    pub fn visible_text(&self) -> Vec<String> {
+    /// flows through this collection. Borrowed so a full-transcript pass
+    /// does not clone every source string on every draw — renderers convert
+    /// to owned SharedStrings only at the leaf gpui element that needs them.
+    pub fn visible_text(&self) -> Vec<&str> {
         match self {
-            Self::User(text) => vec![text.clone()],
-            Self::Assistant(doc) => vec![doc.source.to_string()],
-            Self::Error { message, .. } => vec!["Error".to_owned(), message.clone()],
-            Self::Thinking => vec![THINKING_HEADER_LABEL.to_owned()],
+            Self::User(text) => vec![text.as_str()],
+            Self::Assistant(doc) => vec![doc.source.as_ref()],
+            Self::Error { message, .. } => vec![ERROR_HEADER_LABEL, message.as_str()],
+            Self::Thinking => vec![THINKING_HEADER_LABEL],
             Self::Tool {
                 name,
                 summary,
@@ -96,9 +95,9 @@ impl TranscriptEntry {
                 // expanded output tail at 2 when the card is open. Fixed
                 // chrome (headings, hints, unit suffixes) lives in the
                 // render-layer chrome module — one home per literal.
-                let mut strings = vec![name.clone(), summary.clone()];
+                let mut strings = vec![name.as_str(), summary.as_str()];
                 if card.expanded {
-                    strings.push(card.tail.text.clone());
+                    strings.push(card.tail.text.as_str());
                 }
                 strings
             }
@@ -110,6 +109,10 @@ impl TranscriptEntry {
 /// and the render layer read this constant so no wording lives on both sides
 /// of the seam.
 pub const THINKING_HEADER_LABEL: &str = "+ Thought";
+
+/// Single source of truth for the error row header text. Kept alongside the
+/// thinking label so both sides of the seam read one constant.
+pub const ERROR_HEADER_LABEL: &str = "Error";
 
 /// Semantic tool row state; the render layer maps each variant to a theme
 /// token per the wiki contract (running=foreground, done=muted_foreground,
@@ -177,6 +180,9 @@ impl AppState {
         use crate::client::HistoryContent;
         if replace {
             self.transcript.clear();
+            // Reset temporarily; the rebuilt tail becomes the anchor at the
+            // end of this method so a resumed in-flight `AssistantMessage`
+            // never folds into a pre-history row.
             self.turn_start = 0;
         }
         self.session_view.message_ids.clear();
@@ -248,6 +254,14 @@ impl AppState {
                     }
                 }
             }
+        }
+        if replace {
+            // Anchor the next turn's reconciliation to the rebuilt tail. A
+            // resumed in-flight `AssistantMessage` following history replay
+            // would otherwise scan from index 0 and replace an old assistant
+            // row from the restored history. Regression test:
+            // `resumed_stream_after_history_replay_does_not_edit_older_rows`.
+            self.turn_start = self.transcript.len();
         }
     }
 
@@ -610,19 +624,67 @@ impl AppState {
             changed = self.transcript.len().checked_sub(1);
         }
         if !assistant_text.is_empty() {
-            let existing = self.transcript[turn_start..]
+            // Every assistant row in the current turn, in transcript order.
+            // An interleaved stream — AssistantDelta("pre"), ToolStart,
+            // AssistantDelta("post") — leaves TWO assistant rows around the
+            // tool row. Reconciling only the last row (the old `rposition`
+            // path) replaced it with the full final "prepost" and left "pre"
+            // in the earlier row, duplicating the prefix on screen.
+            //
+            // The correct behaviour preserves row order around tools: keep
+            // the leading assistant rows exactly as streamed and put the
+            // trailing remainder in the last row so the concatenation
+            // equals the final text. If the streamed rows are not a real
+            // prefix of the final (a rare drop/reorder), collapse the
+            // earlier ones into the last row rather than paint stale text.
+            let assistant_indices: Vec<usize> = self.transcript[turn_start..]
                 .iter()
-                .rposition(|entry| matches!(entry, TranscriptEntry::Assistant(_)))
-                .map(|offset| turn_start + offset);
-            if let Some(index) = existing {
-                if let TranscriptEntry::Assistant(current) = &mut self.transcript[index] {
-                    *current = assistant_text.into();
-                }
-                changed = Some(index);
-            } else {
+                .enumerate()
+                .filter_map(|(offset, entry)| {
+                    matches!(entry, TranscriptEntry::Assistant(_)).then_some(turn_start + offset)
+                })
+                .collect();
+            if assistant_indices.is_empty() {
                 self.transcript
                     .push(TranscriptEntry::Assistant(assistant_text.into()));
                 changed = self.transcript.len().checked_sub(1);
+            } else {
+                let leading = &assistant_indices[..assistant_indices.len() - 1];
+                let mut cursor = 0usize;
+                let mut prefix_ok = true;
+                for &idx in leading {
+                    let TranscriptEntry::Assistant(doc) = &self.transcript[idx] else {
+                        unreachable!("assistant_indices filter matched this row")
+                    };
+                    let src = doc.source.as_ref();
+                    if assistant_text[cursor..].starts_with(src) {
+                        cursor += src.len();
+                    } else {
+                        prefix_ok = false;
+                        break;
+                    }
+                }
+                if prefix_ok {
+                    let last_idx = *assistant_indices.last().unwrap();
+                    let tail = assistant_text[cursor..].to_owned();
+                    if let TranscriptEntry::Assistant(current) = &mut self.transcript[last_idx] {
+                        *current = tail.into();
+                    }
+                    changed = Some(last_idx);
+                } else {
+                    for &idx in leading.iter().rev() {
+                        self.transcript.remove(idx);
+                    }
+                    let last_idx = self.transcript[turn_start..]
+                        .iter()
+                        .rposition(|entry| matches!(entry, TranscriptEntry::Assistant(_)))
+                        .map(|offset| turn_start + offset)
+                        .expect("collapsed assistant row still present");
+                    if let TranscriptEntry::Assistant(current) = &mut self.transcript[last_idx] {
+                        *current = assistant_text.into();
+                    }
+                    changed = Some(last_idx);
+                }
             }
         }
         changed
@@ -859,8 +921,8 @@ mod tests {
             },
         });
         assert_eq!(
-            state.transcript,
-            vec![TranscriptEntry::Assistant("hello".into())]
+            describe_transcript(&state.transcript),
+            vec![r#"Assistant("hello")"#.to_owned()]
         );
     }
 
@@ -902,10 +964,9 @@ mod tests {
                 ],
             },
         });
-        assert_eq!(state.transcript.len(), 2, "no rows should duplicate");
-        assert!(matches!(state.transcript[0], TranscriptEntry::Thinking));
-        assert!(
-            matches!(&state.transcript[1], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "hello")
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec!["Thinking".to_owned(), r#"Assistant("hello")"#.to_owned(),]
         );
     }
 
@@ -1218,12 +1279,12 @@ mod tests {
                 text: "second turn".into(),
             }],
         );
-        assert_eq!(state.transcript.len(), 2, "second turn must append");
-        assert!(
-            matches!(&state.transcript[0], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "first turn")
-        );
-        assert!(
-            matches!(&state.transcript[1], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "second turn")
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("first turn")"#.to_owned(),
+                r#"Assistant("second turn")"#.to_owned(),
+            ]
         );
     }
 
@@ -1253,15 +1314,14 @@ mod tests {
             }],
         );
         assert_eq!(
-            state.transcript.len(),
-            3,
-            "third row is a new Thinking marker, not a merge into the first turn's marker"
+            describe_transcript(&state.transcript),
+            vec![
+                "Thinking".to_owned(),
+                r#"Assistant("hello")"#.to_owned(),
+                "Thinking".to_owned(),
+            ],
+            "third row is a fresh Thinking marker, not a merge into the first turn's marker"
         );
-        assert!(matches!(state.transcript[0], TranscriptEntry::Thinking));
-        assert!(
-            matches!(&state.transcript[1], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "hello")
-        );
-        assert!(matches!(state.transcript[2], TranscriptEntry::Thinking));
     }
 
     #[test]
@@ -1276,88 +1336,289 @@ mod tests {
                 text: "answer".into(),
             }],
         );
-        assert_eq!(state.transcript.len(), 1);
-        assert!(
-            matches!(&state.transcript[0], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "answer")
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![r#"Assistant("answer")"#.to_owned()]
         );
     }
 
     #[test]
-    fn mixed_streamed_then_final_matches_replay_of_the_same_event_sequence() {
-        // Two-turn conversation with mixed content in turn one and a
-        // final-only reply in turn two. The same event sequence must produce
-        // the same transcript whether played live or replayed after a
-        // session switch — proving replay is idempotent under the new
-        // turn-boundary reconciliation.
-        let events = |session: &str| {
-            vec![
-                ServerEvent::TurnStart {
-                    session_id: Some(session.to_owned()),
-                    data: json!({}),
+    fn mixed_streamed_then_final_matches_replay_of_committed_events_only() {
+        // The live state receives EVERY event — TurnStart, streamed deltas,
+        // the final AssistantMessage, TurnEnd. The replay state receives
+        // ONLY the committed events (TurnStart / AssistantMessage / TurnEnd)
+        // that history playback carries. If both produce the same
+        // transcript, reconciliation is idempotent under history replay —
+        // this is the round-6 bug the earlier test hid by feeding identical
+        // event streams to both states.
+        let session = "session";
+        let live_events = vec![
+            ServerEvent::TurnStart {
+                session_id: Some(session.to_owned()),
+                data: json!({}),
+            },
+            ServerEvent::AssistantDelta {
+                session_id: Some(session.to_owned()),
+                delta: "trace".into(),
+                kind: "thinking".into(),
+            },
+            ServerEvent::AssistantDelta {
+                session_id: Some(session.to_owned()),
+                delta: "hi".into(),
+                kind: "assistant".into(),
+            },
+            ServerEvent::AssistantMessage {
+                session_id: Some(session.to_owned()),
+                message: Message {
+                    role: "assistant".into(),
+                    content: vec![
+                        ContentBlock::Thinking {
+                            text: "trace".into(),
+                        },
+                        ContentBlock::Text { text: "hi".into() },
+                    ],
                 },
-                ServerEvent::AssistantDelta {
-                    session_id: Some(session.to_owned()),
-                    delta: "trace".into(),
-                    kind: "thinking".into(),
+            },
+            ServerEvent::TurnEnd {
+                session_id: Some(session.to_owned()),
+                data: json!({}),
+            },
+            ServerEvent::TurnStart {
+                session_id: Some(session.to_owned()),
+                data: json!({}),
+            },
+            ServerEvent::AssistantMessage {
+                session_id: Some(session.to_owned()),
+                message: Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "followup".into(),
+                    }],
                 },
-                ServerEvent::AssistantDelta {
-                    session_id: Some(session.to_owned()),
-                    delta: "hi".into(),
-                    kind: "assistant".into(),
-                },
-                ServerEvent::AssistantMessage {
-                    session_id: Some(session.to_owned()),
-                    message: Message {
-                        role: "assistant".into(),
-                        content: vec![
-                            ContentBlock::Thinking {
-                                text: "trace".into(),
-                            },
-                            ContentBlock::Text { text: "hi".into() },
-                        ],
-                    },
-                },
-                ServerEvent::TurnEnd {
-                    session_id: Some(session.to_owned()),
-                    data: json!({}),
-                },
-                ServerEvent::TurnStart {
-                    session_id: Some(session.to_owned()),
-                    data: json!({}),
-                },
-                ServerEvent::AssistantMessage {
-                    session_id: Some(session.to_owned()),
-                    message: Message {
-                        role: "assistant".into(),
-                        content: vec![ContentBlock::Text {
-                            text: "followup".into(),
-                        }],
-                    },
-                },
-                ServerEvent::TurnEnd {
-                    session_id: Some(session.to_owned()),
-                    data: json!({}),
-                },
-            ]
-        };
+            },
+            ServerEvent::TurnEnd {
+                session_id: Some(session.to_owned()),
+                data: json!({}),
+            },
+        ];
+        // Replay drops the streamed deltas — a rebuilt session hydrates
+        // through the committed messages only, then this event stream fires.
+        let replay_events: Vec<ServerEvent> = live_events
+            .iter()
+            .filter(|event| !matches!(event, ServerEvent::AssistantDelta { .. }))
+            .cloned()
+            .collect();
         let mut live = AppState::default();
-        for event in events("live") {
+        for event in live_events {
             live.apply(event);
         }
-        assert_eq!(live.transcript.len(), 3);
-        assert!(matches!(live.transcript[0], TranscriptEntry::Thinking));
-        assert!(
-            matches!(&live.transcript[1], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "hi")
-        );
-        assert!(
-            matches!(&live.transcript[2], TranscriptEntry::Assistant(doc) if doc.source.as_ref() == "followup")
-        );
-        // Replay in a fresh state produces the same shape.
         let mut replay = AppState::default();
-        for event in events("replay") {
+        for event in replay_events {
             replay.apply(event);
         }
-        assert_eq!(replay.transcript, live.transcript);
+        let live_shape = describe_transcript(&live.transcript);
+        let replay_shape = describe_transcript(&replay.transcript);
+        assert_eq!(
+            live_shape,
+            vec![
+                "Thinking".to_owned(),
+                r#"Assistant("hi")"#.to_owned(),
+                r#"Assistant("followup")"#.to_owned(),
+            ],
+            "live transcript regressed: {live_shape:?}"
+        );
+        assert_eq!(
+            live_shape, replay_shape,
+            "live vs replay diverge — reconciliation is not idempotent"
+        );
+    }
+
+    /// Compact per-row descriptor: kind + the row's own dynamic text. The
+    /// five reconciliation tests below compare full vectors of descriptors
+    /// so a regression that flips a row kind OR a body string fails with a
+    /// readable diff, not a `matches!` slot check.
+    #[cfg(test)]
+    fn describe_transcript(rows: &[TranscriptEntry]) -> Vec<String> {
+        rows.iter()
+            .map(|entry| match entry {
+                TranscriptEntry::User(text) => format!("User({text:?})"),
+                TranscriptEntry::Assistant(doc) => {
+                    format!("Assistant({:?})", doc.source.as_ref())
+                }
+                TranscriptEntry::Thinking => "Thinking".to_owned(),
+                TranscriptEntry::Tool { name, summary, .. } => {
+                    format!("Tool({name:?}, {summary:?})")
+                }
+                TranscriptEntry::Error { message, .. } => format!("Error({message:?})"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn interleaved_assistant_and_tool_row_reconcile_without_duplicating_prefix() {
+        // ROUND-7 regression: streamed sequence AssistantDelta("pre"),
+        // ToolStart, AssistantDelta("post"), then the final AssistantMessage
+        // carries "prepost". The old `rposition` reconciler replaced the
+        // LAST assistant row with the full "prepost" and left the earlier
+        // "pre" row untouched — "pre" appeared twice on screen. The new
+        // reconciler preserves row order around tools and puts the
+        // remainder in the trailing row so their concatenation matches.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "post".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "prepost".into(),
+                }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("pre")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                r#"Assistant("post")"#.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resumed_stream_after_history_replay_does_not_edit_older_rows() {
+        // ROUND-7 regression: `apply_history(replace=true)` used to leave
+        // `turn_start` at 0. A resumed in-flight AssistantMessage arriving
+        // just after history replay would then scan from index 0 and
+        // overwrite an OLD assistant row from the restored history. Anchor
+        // must move to the rebuilt tail so the resumed message appends.
+        use crate::client::{HistoryContent, HistoryMessage};
+        let mut state = AppState::default();
+        let history = vec![
+            HistoryMessage {
+                id: "u1".into(),
+                role: "user".into(),
+                content: vec![HistoryContent::Text {
+                    text: "old question".into(),
+                }],
+                tool_result: None,
+            },
+            HistoryMessage {
+                id: "a1".into(),
+                role: "assistant".into(),
+                content: vec![HistoryContent::Text {
+                    text: "old answer".into(),
+                }],
+                tool_result: None,
+            },
+        ];
+        state.apply_history(history, true);
+        // Resumed in-flight message arrives without a fresh TurnStart —
+        // exactly what the server emits when the client reconnects mid-turn.
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "resumed answer".into(),
+                }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"User("old question")"#.to_owned(),
+                r#"Assistant("old answer")"#.to_owned(),
+                r#"Assistant("resumed answer")"#.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn aborted_turn_leaves_the_streamed_row_intact() {
+        // TurnAborted stops streaming without a final AssistantMessage.
+        // Any streamed assistant text must remain visible so the user sees
+        // what the model said before the cancel. This test also proves
+        // aborted turns do not corrupt turn_start for a subsequent turn.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "partial".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::TurnAborted {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "next turn".into(),
+                }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("partial")"#.to_owned(),
+                r#"Assistant("next turn")"#.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_final_message_after_streamed_deltas_keeps_streamed_text() {
+        // A final AssistantMessage with empty text (or only-whitespace)
+        // must not erase or duplicate the streamed row. Some providers emit
+        // an empty final envelope when the response is tool-only.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "streamed".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text { text: "".into() }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![r#"Assistant("streamed")"#.to_owned()]
+        );
     }
 
     #[test]

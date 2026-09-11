@@ -1145,6 +1145,16 @@ impl ZetaView {
             .into_any_element()
     }
 
+    // SEAM-BEGIN: transcript-render
+    //
+    // Every render function inside this region MUST paint only through:
+    //   - `visible` — the ordered dynamic strings from `TranscriptEntry::visible_text`
+    //   - `chrome::*` — the fixed literals module (Fork here, Open Settings, hints, units)
+    //   - `state_text(row, color)` / `record_state(row, color)` — the state-color recorder
+    //
+    // The `transcript_render_functions_carry_no_stray_literals` test in
+    // `tests.rs` scans this region and fails on any user-visible string
+    // literal that is not in `chrome::ALL`.
     fn render_row_inner(
         &self,
         index: usize,
@@ -1179,21 +1189,21 @@ impl ZetaView {
         }
     }
 
-    fn render_thinking_row(&self, index: usize, visible: &[String], cx: &App) -> gpui::AnyElement {
+    fn render_thinking_row(&self, index: usize, visible: &[&str], cx: &App) -> gpui::AnyElement {
         // Header-only marker at muted-foreground. The label text comes from
         // the row's `visible_text` seam so no wording lives on both sides —
         // any regression that changes the string flows through both the
         // render layer and the tests that assert on it.
-        let label = visible.join("");
+        let label = visible.first().copied().unwrap_or_default().to_owned();
         let color = cx.theme().muted_foreground;
-        #[cfg(test)]
-        paint_probe::record(paint_probe::Row::Thinking, index, color);
-        div()
+        // state_text records (row_id, color) into the render_log at the
+        // exact moment the color is applied — a mutation that swaps the
+        // color argument at this call site is caught by the sample check.
+        state_text(&format!("thinking-header-{index}"), color)
             .debug_selector(move || format!("thinking-header-{index}"))
             .w_full()
             .min_w_0()
             .py(px(2.))
-            .text_color(color)
             .child(label)
             .into_any_element()
     }
@@ -1201,13 +1211,13 @@ impl ZetaView {
     fn render_user_row(
         &self,
         index: usize,
-        visible: &[String],
+        visible: &[&str],
         view: gpui::WeakEntity<Self>,
         cx: &App,
     ) -> gpui::AnyElement {
         // The user row's only dynamic body text is the prompt itself — the
         // first (and only) string in `visible_text`.
-        let text = visible.first().cloned().unwrap_or_default();
+        let text = visible.first().copied().unwrap_or_default().to_owned();
         let fork_id = self
             .state
             .session_view
@@ -1253,7 +1263,7 @@ impl ZetaView {
                                         .debug_selector(move || format!("fork-button-{index}"))
                                         .ghost()
                                         .compact()
-                                        .label("Fork here")
+                                        .label(chrome::FORK_HERE)
                                         .on_click(move |_, _, cx| {
                                             let id = click_id.clone();
                                             let _ = click_view
@@ -1303,7 +1313,7 @@ impl ZetaView {
     fn render_assistant_row(
         &self,
         index: usize,
-        visible: &[String],
+        visible: &[&str],
         preview_truncated: bool,
         cx: &App,
     ) -> gpui::AnyElement {
@@ -1324,7 +1334,7 @@ impl ZetaView {
         };
         // The assistant row's only dynamic body text is the rendered markdown
         // source — the first (and only) string in `visible_text`.
-        let source = visible.first().cloned().unwrap_or_default();
+        let source = visible.first().copied().unwrap_or_default().to_owned();
         div()
             .py(px(2.))
             .w_full()
@@ -1344,7 +1354,7 @@ impl ZetaView {
     fn render_tool_row(
         &self,
         index: usize,
-        visible: &[String],
+        visible: &[&str],
         entry: &TranscriptEntry,
         view: gpui::WeakEntity<Self>,
         cx: &App,
@@ -1356,16 +1366,16 @@ impl ZetaView {
         // State is signalled by COLOR ONLY. Running sits at normal text tier;
         // done fades to muted; failed/canceled land on danger. Contract line 83
         // forbids any textual "[working]/[done]/[failed]" marker — the color
-        // helper hands us the token, the render below applies it as text_color
-        // on the actual verb and detail spans (not on a hidden canary quad).
+        // helper hands us the token, and the render below applies it through
+        // `state_text` / `record_state` on the verb, detail, and chevron
+        // elements. A mutation that swaps the color argument at any call
+        // site records the wrong color and fails the sample check.
         let state_color = tool_state_color(entry.tool_state(), cx);
-        #[cfg(test)]
-        paint_probe::record(paint_probe::Row::Tool, index, state_color);
         // Verb and detail come from the visible-text seam — index 0 is the
         // tool name, index 1 is the summary. Any body text (expanded output)
         // sits at index 2+ and is painted below when the card is expanded.
-        let verb = visible.first().cloned().unwrap_or_default();
-        let detail = visible.get(1).cloned().unwrap_or_default();
+        let verb = visible.first().copied().unwrap_or_default().to_owned();
+        let detail = visible.get(1).copied().unwrap_or_default().to_owned();
         let group = format!("tool-row-{index}");
         let output_size = card.tail.text.len();
 
@@ -1400,30 +1410,24 @@ impl ZetaView {
                             IconName::ChevronRight
                         })
                         .size(px(12.))
-                        .text_color(state_color),
+                        .text_color(record_state(&format!("tool-chevron-{index}"), state_color)),
                     )
                     .child(
-                        // Verb + detail carry the state color as their OWN
-                        // text_color refinement so a refactor that drops the
-                        // color on a parent still keeps the row on the
-                        // contract token. The visible_text seam plus the
-                        // tool_state_color helper are the tested invariants;
-                        // gpui does not expose scene glyph sprites, so no
-                        // probe can observe the painted color directly here.
-                        div()
+                        // Verb + detail route their state color through the
+                        // recorder so a swap on this single call is caught
+                        // by the render_log sample check.
+                        state_text(&format!("tool-verb-{index}"), state_color)
                             .debug_selector(move || format!("tool-verb-{index}"))
                             .flex_shrink_0()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(state_color)
                             .child(verb),
                     )
                     .child(
-                        div()
+                        state_text(&format!("tool-detail-{index}"), state_color)
                             .debug_selector(move || format!("tool-detail-{index}"))
                             .min_w_0()
                             .flex_1()
                             .truncate()
-                            .text_color(state_color)
                             .opacity(0.78)
                             .child(detail),
                     )
@@ -1455,7 +1459,7 @@ impl ZetaView {
                 // "Earlier output omitted" marker is fixed chrome, not part
                 // of the dynamic strings — the renderer pulls it from the
                 // chrome-constants module when the tail was truncated.
-                let body = visible.get(2).cloned().unwrap_or_default();
+                let body = visible.get(2).copied().unwrap_or_default().to_owned();
                 let truncated = card.tail.truncated;
                 row.child(
                     div()
@@ -1488,7 +1492,7 @@ impl ZetaView {
     fn render_error_row(
         &self,
         index: usize,
-        visible: &[String],
+        visible: &[&str],
         settings_action: bool,
         login_provider: Option<&str>,
         view: gpui::WeakEntity<Self>,
@@ -1496,8 +1500,8 @@ impl ZetaView {
     ) -> gpui::AnyElement {
         // Error rows expose two visible strings: the "Error" header at index
         // 0 and the message body at index 1. Both flow through the seam.
-        let header = visible.first().cloned().unwrap_or_default();
-        let message = visible.get(1).cloned().unwrap_or_default();
+        let header = visible.first().copied().unwrap_or_default().to_owned();
+        let message = visible.get(1).copied().unwrap_or_default().to_owned();
         div()
             .debug_selector(move || format!("error-block-{index}"))
             .v_flex()
@@ -1539,7 +1543,7 @@ impl ZetaView {
                     block.child(
                         Button::new(("error-settings", index))
                             .debug_selector(move || format!("error-settings-{index}"))
-                            .label("Open Settings")
+                            .label(chrome::OPEN_SETTINGS)
                             .on_click(move |_, _, cx| {
                                 let _ = view.update(cx, |view, cx| view.open_settings(cx));
                             }),
@@ -1548,6 +1552,7 @@ impl ZetaView {
             )
             .into_any_element()
     }
+    // SEAM-END: transcript-render
 }
 
 impl ZetaView {
@@ -1849,13 +1854,12 @@ pub(crate) fn tool_state_color(state: zeta_gui::state::ToolState, cx: &App) -> g
     }
 }
 
-/// Fixed literals painted as row chrome (headings, hints, unit suffixes).
-/// Every string that reaches the user through a row's own text elements —
-/// but does NOT belong to `visible_text` (dynamic body text) — lives here.
-/// The seam tests enumerate this module and assert none contains a
-/// `[working]`/`[done]`/`[failed]`/`[canceled]` state marker; renderers must
-/// build every fixed literal from these constants so wording changes only
-/// have one home.
+/// Fixed literals painted as row chrome (headings, hints, unit suffixes,
+/// action labels). Every string that reaches the user through a row's own
+/// text elements — but does NOT belong to `visible_text` (dynamic body
+/// text) — lives here. The `transcript_render_functions_carry_no_stray_literals`
+/// test scans the SEAM region of `main.rs` and fails on any user-visible
+/// literal outside `ALL`, so a new action label added inline is caught.
 pub(crate) mod chrome {
     pub(crate) const ASSISTANT_TRUNCATED: &str = "Showing the latest streamed text…";
     pub(crate) const TOOL_HOVER_HINT: &str = "show output";
@@ -1865,8 +1869,12 @@ pub(crate) mod chrome {
     pub(crate) const OUTPUT_SIZE_UNIT_MB: &str = "MB";
     pub(crate) const ATTACHMENT_SIZE_SEPARATOR: &str = " · ";
     pub(crate) const ATTACHMENT_SIZE_SUFFIX: &str = " bytes";
-    /// Every fixed literal the render layer may paint. Used by the seam
-    /// tests to prove no state marker sneaks in through chrome wording.
+    pub(crate) const FORK_HERE: &str = "Fork here";
+    pub(crate) const OPEN_SETTINGS: &str = "Open Settings";
+    /// Every fixed literal the seam region may paint. Used by the seam
+    /// tests to prove no state marker sneaks through chrome wording AND
+    /// to allowlist the region's user-visible literals for the render
+    /// source lint (item 6).
     #[cfg(test)]
     pub(crate) const ALL: &[&str] = &[
         ASSISTANT_TRUNCATED,
@@ -1877,37 +1885,48 @@ pub(crate) mod chrome {
         OUTPUT_SIZE_UNIT_MB,
         ATTACHMENT_SIZE_SEPARATOR,
         ATTACHMENT_SIZE_SUFFIX,
+        FORK_HERE,
+        OPEN_SETTINGS,
     ];
 }
 
-/// Test-only observability. The render functions record which state color
-/// they applied per row so the tests can assert the actual value that
-/// reached `.text_color(...)` on the row's own text elements — the closest
-/// binding available given gpui exposes `painted_quads()` for quads but no
-/// accessor for the scene's glyph sprites. Bypassing the recorder means the
-/// test's count assertion fails, so a regression that hard-codes a wrong
-/// color instead of routing through `tool_state_color` cannot pass silently.
-#[cfg(test)]
-pub(crate) mod paint_probe {
+/// State-color recorder. Every state-colored text element in the SEAM
+/// region routes its color through `record_state` or the div-returning
+/// `state_text` shorthand, both of which write `(row_id, color)` to
+/// `render_log` under `test` or the `smoke-test` feature. Tests draw, then
+/// assert on the recorded samples per row — a mutation that swaps the color
+/// argument at any call site records the wrong color and fails the check.
+///
+/// This is the "call-time" replacement for the round-6 pre-draw probe: the
+/// recorder sits inside the color path itself, so the recorded value is by
+/// construction the value that reached `.text_color(...)`.
+#[cfg_attr(not(any(test, feature = "smoke-test")), allow(unused_variables))]
+pub(crate) fn record_state(row_id: &str, color: gpui::Hsla) -> gpui::Hsla {
+    #[cfg(any(test, feature = "smoke-test"))]
+    render_log::record(row_id, color);
+    color
+}
+
+/// Convenience wrapper: creates a `Div` with `.text_color(color)` set and
+/// records into the render log in one call. Preferred over `record_state`
+/// for divs; the bare recorder covers the icon path where `Icon` needs to
+/// receive the color directly.
+pub(crate) fn state_text(row_id: &str, color: gpui::Hsla) -> gpui::Div {
+    div().text_color(record_state(row_id, color))
+}
+
+#[cfg(any(test, feature = "smoke-test"))]
+pub(crate) mod render_log {
     use gpui::Hsla;
     use std::cell::RefCell;
 
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub(crate) enum Row {
-        Tool,
-        Thinking,
-    }
-
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     pub(crate) struct Sample {
-        pub(crate) index: usize,
-        pub(crate) row: Row,
+        pub(crate) row_id: String,
         pub(crate) color: Hsla,
     }
 
-    // Thread-local so parallel `cargo test` workers cannot see each other's
-    // recordings — `Theme::change` runs per-context, but a shared Mutex
-    // would still let one test's `render` land in another test's `samples`.
+    // Thread-local so parallel `cargo test` workers do not cross-contaminate.
     thread_local! {
         static SAMPLES: RefCell<Vec<Sample>> = const { RefCell::new(Vec::new()) };
     }
@@ -1916,8 +1935,13 @@ pub(crate) mod paint_probe {
         SAMPLES.with(|slot| slot.borrow_mut().clear());
     }
 
-    pub(crate) fn record(row: Row, index: usize, color: Hsla) {
-        SAMPLES.with(|slot| slot.borrow_mut().push(Sample { row, index, color }));
+    pub(crate) fn record(row_id: &str, color: Hsla) {
+        SAMPLES.with(|slot| {
+            slot.borrow_mut().push(Sample {
+                row_id: row_id.to_owned(),
+                color,
+            })
+        });
     }
 
     pub(crate) fn samples() -> Vec<Sample> {

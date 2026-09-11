@@ -423,7 +423,7 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     for case in [ToolState::Running, ToolState::Done, ToolState::Failed] {
-        super::paint_probe::clear();
+        super::render_log::clear();
         visual.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.state.transcript.clear();
@@ -486,26 +486,29 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
                 expected,
                 "tool row state color regressed off the contract token"
             );
-            // Paint-probe: exactly one Tool sample for row 0 must land with
-            // the expected color. Recorded inside `render_tool_row` right
-            // where the SAME `state_color` value flows into `.text_color`
-            // on the verb, detail, and chevron icon — so a divergence
-            // between the helper and the applied color is caught.
-            let samples = super::paint_probe::samples();
+            // render_log: every state-colored element in the tool row goes
+            // through `state_text` or `record_state`, so the samples for
+            // row 0 (verb, detail, chevron) are the actual colors reaching
+            // `.text_color(...)`. A mutation that swaps the color argument
+            // at any call site records the wrong color here.
+            let samples = super::render_log::samples();
             let tool_samples: Vec<_> = samples
                 .iter()
                 .filter(|sample| {
-                    matches!(sample.row, super::paint_probe::Row::Tool) && sample.index == 0
+                    sample.row_id == "tool-verb-0"
+                        || sample.row_id == "tool-detail-0"
+                        || sample.row_id == "tool-chevron-0"
                 })
                 .collect();
             assert!(
                 !tool_samples.is_empty(),
-                "render_tool_row must record a paint-probe sample for {case:?}"
+                "render_tool_row must record render_log samples for {case:?}"
             );
             for sample in &tool_samples {
                 assert_eq!(
                     sample.color, expected,
-                    "tool row {case:?} painted its glyphs at the wrong color"
+                    "tool row {case:?} painted {} at the wrong color",
+                    sample.row_id
                 );
             }
         });
@@ -588,6 +591,260 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
             });
         }
     }
+}
+
+#[test]
+fn transcript_render_functions_carry_no_stray_literals() {
+    // Renderer-literal lint (round-7 item 6): scan the SEAM region of
+    // main.rs and fail on any user-visible string literal that is NOT in
+    // `chrome::ALL`. User-visible = the literal contains at least one
+    // ASCII space OR at least one uppercase letter (English prose signal).
+    // Debug selectors, css-id fragments, and short id parts do not match —
+    // "tool-verb-0" has no space and no uppercase.
+    //
+    // This is the mechanical guard for holes like the older `.child("[done]")`
+    // regression: a new inline literal in a render function trips this
+    // test unless the wording is added to `chrome::ALL`, and any addition
+    // to `chrome::ALL` is subject to the marker-check in
+    // `every_row_text_flows_through_the_visible_seam_or_chrome_module`.
+    let source = include_str!("main.rs");
+    let start = source
+        .find("// SEAM-BEGIN: transcript-render")
+        .expect("SEAM-BEGIN marker present");
+    let end = source
+        .find("// SEAM-END: transcript-render")
+        .expect("SEAM-END marker present");
+    assert!(end > start, "SEAM markers in correct order");
+    let region = &source[start..end];
+    let allow: std::collections::HashSet<&str> = super::chrome::ALL.iter().copied().collect();
+    let literals = extract_string_literals(region);
+    for (lit, opening) in literals {
+        // Skip empty literals and pure-format-placeholder literals.
+        if lit.is_empty() {
+            continue;
+        }
+        // Panic / assert messages are developer-facing text; they never
+        // reach the user surface, so exempt them from the chrome allowlist.
+        if inside_panic_context(region, opening) {
+            continue;
+        }
+        let looks_user_visible = lit.contains(' ') || lit.chars().any(|c| c.is_ascii_uppercase());
+        if !looks_user_visible {
+            continue;
+        }
+        assert!(
+            allow.contains(lit.as_str()),
+            "SEAM region has stray user-visible literal {lit:?}; \
+             move it into chrome:: (in main.rs) so wording has one home"
+        );
+    }
+}
+
+/// Panic / assert macros whose literal argument is developer text, not
+/// user-facing chrome. A literal opened while inside one of these calls is
+/// exempt from the SEAM lint.
+const PANIC_CONTEXT_MACROS: &[&str] = &[
+    "unreachable!",
+    "panic!",
+    "todo!",
+    "unimplemented!",
+    "expect",
+    "assert!",
+    "assert_eq!",
+    "assert_ne!",
+    "debug_assert!",
+    "debug_assert_eq!",
+    "debug_assert_ne!",
+];
+
+/// True if the byte position `pos` sits inside a panic/assert call. Walks
+/// backwards over the immediately preceding tokens to find an opening `(`
+/// preceded by one of `PANIC_CONTEXT_MACROS`.
+fn inside_panic_context(source: &str, pos: usize) -> bool {
+    let bytes = source.as_bytes();
+    let mut i = pos;
+    let mut depth: i32 = 0;
+    while i > 0 {
+        i -= 1;
+        let b = bytes[i];
+        if b == b')' {
+            depth += 1;
+        } else if b == b'(' {
+            if depth == 0 {
+                // Found the opening paren the literal sits inside. Read
+                // the identifier immediately preceding.
+                let mut end = i;
+                while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+                    end -= 1;
+                }
+                let mut start = end;
+                while start > 0 {
+                    let c = bytes[start - 1];
+                    if c.is_ascii_alphanumeric() || c == b'_' || c == b'!' {
+                        start -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                if start < end {
+                    let ident = &source[start..end];
+                    return PANIC_CONTEXT_MACROS.contains(&ident);
+                }
+                return false;
+            }
+            depth -= 1;
+        }
+    }
+    false
+}
+
+/// Extract every double-quoted string literal from a slice of Rust source,
+/// respecting `\"` and `\\` escapes. Rejects `#"..."#` raw strings — the
+/// SEAM region does not use them, and rejecting keeps the parser tiny.
+/// Returns `(literal, byte_position_of_opening_quote)` pairs so callers
+/// can classify by surrounding context.
+fn extract_string_literals(source: &str) -> Vec<(String, usize)> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut in_line_comment = false;
+    let mut in_block_comment: usize = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_line_comment {
+            if b == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment > 0 {
+            if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                in_block_comment -= 1;
+                i += 2;
+                continue;
+            }
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                in_block_comment += 1;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'/' {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if bytes[i + 1] == b'*' {
+                in_block_comment = 1;
+                i += 2;
+                continue;
+            }
+        }
+        if b == b'\'' {
+            // Char literal — skip until closing quote, honouring escapes.
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'\'' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'"' {
+            let opening = i;
+            i += 1;
+            let mut collected = String::new();
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    // Simple escape decoding: keep \n / \t / \\ / \" verbatim
+                    match bytes[i + 1] {
+                        b'n' => collected.push('\n'),
+                        b't' => collected.push('\t'),
+                        b'\\' => collected.push('\\'),
+                        b'"' => collected.push('"'),
+                        b'\'' => collected.push('\''),
+                        b'0' => collected.push('\0'),
+                        other => {
+                            collected.push('\\');
+                            collected.push(other as char);
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    out.push((collected, opening));
+                    break;
+                }
+                collected.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+#[gpui::test]
+fn pending_user_rail_paints_a_single_one_pixel_rail(cx: &mut TestAppContext) {
+    // Item 8 guard: the queued strip pins to a 1px dashed rail. A revert to
+    // the thick 3px rail (contract line 85) or a fill-rail hybrid would
+    // read as an active user turn. Assert the exact left-border width via
+    // painted_quads — the scene reflects it directly, no probes needed.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, _| {
+            view.pending_user_turn = Some(super::PendingUserTurn {
+                text: "queued message".into(),
+                failed: false,
+            });
+        });
+        window.draw(cx).clear(cx);
+    });
+    let pending = visual
+        .debug_bounds("composer-pending")
+        .expect("queued strip renders");
+    visual.update(|window, _| {
+        let scaled = pending.scale(window.scale_factor());
+        let thin = px(f32::from(theme::RAIL_WIDTH_THIN)).scale(window.scale_factor());
+        let thick = px(f32::from(theme::RAIL_WIDTH_THICK)).scale(window.scale_factor());
+        let rails: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.bounds.top() >= scaled.top() - gpui::ScaledPixels::from(0.5)
+                    && quad.bounds.bottom() <= scaled.bottom() + gpui::ScaledPixels::from(0.5)
+                    && quad.border_widths.left > gpui::ScaledPixels::default()
+            })
+            .collect();
+        assert!(!rails.is_empty(), "queued strip must paint a left rail");
+        for rail in &rails {
+            // 1px rail exactly — a 3px revert lands at or above `thick`.
+            assert!(
+                rail.border_widths.left <= thin + gpui::ScaledPixels::from(0.5),
+                "queued rail width {:?} exceeds RAIL_WIDTH_THIN {:?} — thick revert",
+                rail.border_widths.left,
+                thin
+            );
+            assert!(
+                rail.border_widths.left < thick,
+                "queued rail width must never reach RAIL_WIDTH_THICK"
+            );
+        }
+    });
 }
 
 #[test]
@@ -1684,7 +1941,7 @@ fn thinking_row_paints_a_generic_header_and_never_leaks_private_reasoning(cx: &m
     // through both paths and asserts the sentinel never surfaces in state or
     // in painted text, and that the generic "+ Thought" header renders.
     use zeta_gui::client::{ContentBlock, Message};
-    super::paint_probe::clear();
+    super::render_log::clear();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let sentinel = "SECRET-PRIVATE-REASONING-NEVER-DISPLAY";
@@ -1761,20 +2018,20 @@ fn thinking_row_paints_a_generic_header_and_never_leaks_private_reasoning(cx: &m
         header_bounds.size.width > px(0.),
         "header bounds must have non-zero width so glyphs paint"
     );
-    // Paint-probe: `render_thinking_row` records the exact color it applied
-    // through `.text_color(...)`. The thinking header sits at
+    // render_log: `render_thinking_row` records the exact color it applied
+    // through `state_text(...)`. The thinking header sits at
     // `muted_foreground`; a regression that repaints it at accent or danger
     // fails here.
     visual.update(|_, cx| {
         let expected = cx.theme().muted_foreground;
-        let samples = super::paint_probe::samples();
+        let samples = super::render_log::samples();
         let thinking_samples: Vec<_> = samples
             .iter()
-            .filter(|sample| matches!(sample.row, super::paint_probe::Row::Thinking))
+            .filter(|sample| sample.row_id.starts_with("thinking-header-"))
             .collect();
         assert!(
             !thinking_samples.is_empty(),
-            "render_thinking_row must record a paint-probe sample"
+            "render_thinking_row must record a render_log sample"
         );
         for sample in &thinking_samples {
             assert_eq!(
