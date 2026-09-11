@@ -3,28 +3,30 @@
 //! One struct per row kind whose fields NAME every visible string the row
 //! renders — body text, action/button labels, attachment names and sizes,
 //! tool output sizes, chevrons/hints, and fixed chrome. The renderers in
-//! `main.rs` build their visible-text elements by destructuring this model;
-//! no visible string is sourced outside it. Together with the
-//! `renderer_literal_fence` guard test — which trips on any inline user-
-//! visible string literal in the six transcript render functions — the two
-//! together make a NEW stray literal impossible to add without failing a
-//! test.
+//! `transcript_render.rs` build their visible-text elements by destructuring
+//! this model; no visible string is sourced outside it. Together with the
+//! `renderer_literal_fence` AST guard — which parses the transcript render
+//! module and rejects ANY string or byte-string literal that does not sit
+//! inside the tight allowed-context allowlist — the two make a NEW stray
+//! literal impossible to add without failing a test.
 //!
 //! The typed model REPLACES the earlier positional
 //! `TranscriptEntry::visible_text -> Vec<&str>` seam. That seam covered row
-//! CONTENT only; action labels, attachment names/sizes, and tool output
-//! sizes still flowed from entry fields via inline `format!` calls in the
-//! render layer, so a new stray literal on any of those paths bypassed the
-//! seam. The typed model closes those paths.
+//! CONTENT only; action labels, attachment names/sizes, tool output sizes,
+//! AND the entire login-row surface still flowed from entry fields via
+//! inline `format!` calls in the render layer, so a new stray literal on
+//! any of those paths bypassed the seam. The typed model closes those
+//! paths — the login row now flows through `LoginRowText` too.
 //!
 //! Borrowing: content-shaped fields (`content`, `source`, `verb`, `detail`,
 //! `body`, `message`) hold a `&str` into the transcript entry, so a per-row
 //! `build()` allocates only for the composed labels (attachment lines,
-//! output-size string). A per-frame full-transcript clone is not
-//! introduced — this matches the ZETA-107 r5 borrowing invariant.
+//! output-size string, login labels). A per-frame full-transcript clone is
+//! not introduced — this matches the ZETA-107 r5 borrowing invariant.
 
+use crate::login::{LoginProgress, LoginProvider};
 use crate::session::SessionView;
-use crate::state::{TranscriptEntry, ERROR_HEADER_LABEL, THINKING_HEADER_LABEL};
+use crate::state::{ConnectionState, TranscriptEntry, ERROR_HEADER_LABEL, THINKING_HEADER_LABEL};
 
 /// Every fixed literal painted as row chrome (headings, hints, unit
 /// suffixes, action labels). Every user-visible string that reaches a row
@@ -41,6 +43,8 @@ pub mod chrome {
     pub const ATTACHMENT_SIZE_SUFFIX: &str = " bytes";
     pub const FORK_HERE: &str = "Fork here";
     pub const OPEN_SETTINGS: &str = "Open Settings";
+    pub const LOGIN_START_PREFIX: &str = "Log in with ";
+    pub const LOGIN_CANCEL: &str = "Cancel";
 
     /// Exhaustive set the guard tests iterate. Adding a new chrome literal
     /// without adding it here fails the fence's chrome-coverage check.
@@ -55,7 +59,76 @@ pub mod chrome {
         ATTACHMENT_SIZE_SUFFIX,
         FORK_HERE,
         OPEN_SETTINGS,
+        LOGIN_START_PREFIX,
+        LOGIN_CANCEL,
     ];
+}
+
+/// Widget-ID / debug-selector composers. Every selector the render module
+/// paints is produced by one of these helpers, so the render module itself
+/// has no bare `format!` fragments in its bodies — the AST fence stays
+/// strict on "no literal outside debug_selector/id/aria_label/role args".
+pub mod sel {
+    pub const TRANSCRIPT_ROW: &str = "transcript-row";
+    pub const ATTACHMENT_CHIP: &str = "attachment-chip";
+    pub const FORK_BUTTON_TAG: &str = "fork";
+    pub const TOOL_RECEIPT_TAG: &str = "tool-receipt";
+    pub const ERROR_SETTINGS_TAG: &str = "error-settings";
+
+    pub fn thinking_header(i: usize) -> String {
+        format!("thinking-header-{i}")
+    }
+    pub fn user_row_group(i: usize) -> String {
+        format!("user-row-{i}")
+    }
+    pub fn fork_button(i: usize) -> String {
+        format!("fork-button-{i}")
+    }
+    pub fn message(i: usize) -> String {
+        format!("message-{i}")
+    }
+    pub fn tool_row_group(i: usize) -> String {
+        format!("tool-row-{i}")
+    }
+    pub fn tool_receipt(i: usize) -> String {
+        format!("tool-receipt-{i}")
+    }
+    pub fn tool_chevron(i: usize) -> String {
+        format!("tool-chevron-{i}")
+    }
+    pub fn tool_verb(i: usize) -> String {
+        format!("tool-verb-{i}")
+    }
+    pub fn tool_detail(i: usize) -> String {
+        format!("tool-detail-{i}")
+    }
+    pub fn tool_output(i: usize) -> String {
+        format!("tool-output-{i}")
+    }
+    pub fn error_block(i: usize) -> String {
+        format!("error-block-{i}")
+    }
+    pub fn error_message(i: usize) -> String {
+        format!("error-message-{i}")
+    }
+    pub fn error_settings(i: usize) -> String {
+        format!("error-settings-{i}")
+    }
+    pub fn error_login_prefix(i: usize) -> String {
+        format!("error-login-{i}")
+    }
+    pub fn login_base_id(prefix: &str, provider: &str) -> String {
+        format!("{prefix}-{provider}")
+    }
+    pub fn login_start(base: &str) -> String {
+        format!("{base}-start")
+    }
+    pub fn login_cancel(base: &str) -> String {
+        format!("{base}-cancel")
+    }
+    pub fn login_error(base: &str) -> String {
+        format!("{base}-error")
+    }
 }
 
 /// Typed model of the user text a single transcript row paints. One variant
@@ -74,15 +147,20 @@ pub enum RowText<'a> {
 }
 
 /// User row: the prompt body plus optional attachment chips and the
-/// hover-revealed fork action.
+/// hover-revealed fork action. The attachment field is tri-state on purpose:
+/// text-only history rows carry `Some(vec![])` (attachment key present but
+/// empty) while pre-history rows carry `None`; the old positional seam
+/// collapsed both to "empty", which changed the row height when a user turn
+/// restored from history — the empty container's `mt_1` margin disappeared.
 #[derive(Debug, Clone)]
 pub struct UserRowText<'a> {
     /// The prompt body — the row's only dynamic body string.
     pub content: &'a str,
-    /// One label per attachment chip, pre-composed with the chrome
-    /// separator and unit suffix so the renderer never formats visible
-    /// text inline.
-    pub attachments: Vec<String>,
+    /// `Some(list)` when the session view has an attachment entry for this
+    /// index — even if `list` is empty. The renderer paints the mt_1
+    /// container whenever the value is `Some`, matching the pre-typed-seam
+    /// row height for text-only history rows. `None` skips the container.
+    pub attachments: Option<Vec<String>>,
     /// `Some(chrome::FORK_HERE)` when the row is fork-eligible; `None`
     /// otherwise (no button paints).
     pub fork_label: Option<&'static str>,
@@ -144,6 +222,56 @@ pub struct ErrorRowText<'a> {
     pub settings_action_label: Option<&'static str>,
 }
 
+/// Typed model of the login-row surface. Rendered from four call sites in
+/// the app — settings overlay, inline error recovery, in-progress banner,
+/// first-conversation prompt — every one of which paints the same six
+/// visible strings. Resolving the provider label BEFORE render kills the
+/// "raw provider text handed to the renderer" bypass the r1 review found.
+#[derive(Debug, Clone)]
+pub struct LoginRowText {
+    /// Outer widget id — used for `.id(...)` and as the base for the
+    /// button selectors below. Composed once in `build_login`, never in
+    /// the render body.
+    pub outer_id: String,
+    /// Provider header label — dynamic ("Claude", "ChatGPT", ...).
+    pub header_label: String,
+    /// Provider slug — carried alongside the label so the click callback
+    /// can identify the provider without seeing the visible text. Not
+    /// painted as visible text — it is the opaque handle passed to
+    /// `start_login`/`cancel_login`.
+    pub provider_slug: String,
+    /// Start button model — id + composed label + disabled flag.
+    pub start: LoginActionText,
+    /// Cancel button model — present only while the login is busy.
+    pub cancel: Option<LoginActionText>,
+    /// Status text — one of a fixed set of `&'static str` values sourced
+    /// from `LoginProvider::status()`.
+    pub status_text: &'static str,
+    /// Error alert model — present when the last attempt failed.
+    pub error: Option<LoginErrorText>,
+}
+
+/// One button on the login row.
+#[derive(Debug, Clone)]
+pub struct LoginActionText {
+    /// Composed widget id (also used for the debug selector).
+    pub id: String,
+    /// Composed visible label — always begins with `chrome::LOGIN_START_PREFIX`
+    /// for the start action, or equals `chrome::LOGIN_CANCEL` for cancel.
+    pub label: String,
+    /// Whether the button paints as disabled.
+    pub disabled: bool,
+}
+
+/// Error alert on the login row.
+#[derive(Debug, Clone)]
+pub struct LoginErrorText {
+    /// Composed widget id — `format!("{outer_id}-error")`.
+    pub id: String,
+    /// The provider's error text.
+    pub message: String,
+}
+
 impl<'a> RowText<'a> {
     /// Iterate every visible string the row paints — used by guard tests
     /// to sweep for stray markers or sentinel leaks. Chrome-only fields
@@ -160,7 +288,9 @@ impl<'a> RowText<'a> {
                     fork_label,
                 } = text;
                 out.push(content);
-                out.extend(attachments.iter().map(String::as_str));
+                if let Some(list) = attachments {
+                    out.extend(list.iter().map(String::as_str));
+                }
                 out.extend(fork_label.iter().copied());
             }
             Self::Assistant(text) => {
@@ -206,6 +336,25 @@ impl<'a> RowText<'a> {
     }
 }
 
+impl LoginRowText {
+    /// Sentinel/marker sweep for guard tests — yields every visible string
+    /// a login row paints.
+    pub fn visible_strings(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = vec![
+            self.header_label.as_str(),
+            self.start.label.as_str(),
+            self.status_text,
+        ];
+        if let Some(cancel) = &self.cancel {
+            out.push(cancel.label.as_str());
+        }
+        if let Some(error) = &self.error {
+            out.push(error.message.as_str());
+        }
+        out
+    }
+}
+
 /// Build the row-text model for one transcript row. Everything the
 /// renderer will paint as user-visible text is computed here — never in
 /// the render body.
@@ -218,15 +367,11 @@ pub fn build<'a>(
     match entry {
         TranscriptEntry::User(text) => RowText::User(UserRowText {
             content: text,
-            attachments: session_view
-                .attachments
-                .get(&index)
-                .map(|list| {
-                    list.iter()
-                        .map(|(name, size)| format_attachment(name, *size))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            attachments: session_view.attachments.get(&index).map(|list| {
+                list.iter()
+                    .map(|(name, size)| format_attachment(name, *size))
+                    .collect()
+            }),
             fork_label: fork_label_for(index, session_view),
         }),
         TranscriptEntry::Assistant(doc) => RowText::Assistant(AssistantRowText {
@@ -265,6 +410,51 @@ pub fn build<'a>(
             settings_action_label: (*settings_action && settings_action_available)
                 .then_some(chrome::OPEN_SETTINGS),
         }),
+    }
+}
+
+/// Build the login-row model from a provider record and its outer-id
+/// prefix. The provider label is resolved here — the renderer receives a
+/// composed `header_label`/`start.label` and never touches `provider.label()`
+/// again. This is the fix for the r1 review finding at main.rs:1564: the
+/// login renderer bypassed the typed model by reading `provider.label()`
+/// directly on every paint.
+pub fn build_login(
+    provider: &LoginProvider,
+    prefix: &str,
+    connection: &ConnectionState,
+) -> LoginRowText {
+    let outer_id = sel::login_base_id(prefix, &provider.provider);
+    let label = provider.label().to_owned();
+    let start_id = sel::login_start(&outer_id);
+    let cancel_id = sel::login_cancel(&outer_id);
+    let error_id = sel::login_error(&outer_id);
+    let start_disabled =
+        provider.progress.busy() || !matches!(connection, ConnectionState::Connected);
+    let cancel = provider.progress.busy().then(|| LoginActionText {
+        id: cancel_id,
+        label: chrome::LOGIN_CANCEL.to_owned(),
+        disabled: provider.progress == LoginProgress::Cancelling,
+    });
+    let error = match &provider.progress {
+        LoginProgress::Failed { error } => Some(LoginErrorText {
+            id: error_id,
+            message: error.message.clone(),
+        }),
+        _ => None,
+    };
+    LoginRowText {
+        outer_id,
+        header_label: label.clone(),
+        provider_slug: provider.provider.clone(),
+        start: LoginActionText {
+            id: start_id,
+            label: format!("{}{}", chrome::LOGIN_START_PREFIX, label),
+            disabled: start_disabled,
+        },
+        cancel,
+        status_text: provider.status(),
+        error,
     }
 }
 
@@ -313,6 +503,7 @@ fn format_output_size(bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::cards::Card;
+    use crate::login::{LoginError, LoginProgress, LoginProvider};
     use crate::state::ToolReceiptKey;
 
     fn empty_view() -> SessionView {
@@ -416,7 +607,10 @@ mod tests {
             panic!("user entry must build a User row")
         };
         assert_eq!(text.content, "hello");
-        assert_eq!(text.attachments, vec!["hero.png · 4096 bytes".to_owned()]);
+        assert_eq!(
+            text.attachments,
+            Some(vec!["hero.png · 4096 bytes".to_owned()])
+        );
         assert_eq!(text.fork_label, Some(chrome::FORK_HERE));
     }
 
@@ -428,6 +622,36 @@ mod tests {
             panic!("user entry must build a User row")
         };
         assert_eq!(text.fork_label, None);
+    }
+
+    #[test]
+    fn user_row_distinguishes_absent_key_from_present_empty_attachments() {
+        // Regression guard for the r1 review finding: text-only history
+        // rows store `Some(vec![])` in `session_view.attachments`, and the
+        // pre-typed-seam renderer painted the mt_1 container in that case.
+        // The typed model must preserve the tri-state so the renderer can
+        // keep those rows' height identical to the pre-seam behaviour.
+        use crate::state::AppState;
+        let entry = TranscriptEntry::User("hi".into());
+        // Absent key: renderer must skip the container.
+        let no_key = build(&entry, 0, &AppState::default().session_view, true);
+        let RowText::User(text) = no_key else {
+            unreachable!()
+        };
+        assert!(text.attachments.is_none(), "absent key must map to None");
+        // Present empty: renderer must paint the (empty) container so the
+        // row height matches text-only history rows before the refactor.
+        let mut state = AppState::default();
+        state.session_view.attachments.insert(0, Vec::new());
+        let present_empty = build(&entry, 0, &state.session_view, true);
+        let RowText::User(text) = present_empty else {
+            unreachable!()
+        };
+        assert_eq!(
+            text.attachments,
+            Some(Vec::<String>::new()),
+            "present-empty key must map to Some(empty)",
+        );
     }
 
     #[test]
@@ -462,5 +686,64 @@ mod tests {
             };
             assert_eq!(text.output_size_label, expected, "at {bytes}B");
         }
+    }
+
+    fn provider(progress: LoginProgress) -> LoginProvider {
+        LoginProvider {
+            provider: "claude".into(),
+            credentials_present: false,
+            progress,
+        }
+    }
+
+    #[test]
+    fn login_model_composes_start_label_from_chrome_prefix_and_provider_label() {
+        let text = build_login(
+            &provider(LoginProgress::Idle),
+            "settings-login",
+            &ConnectionState::Connected,
+        );
+        assert_eq!(text.header_label, "Claude");
+        assert_eq!(text.start.label, "Log in with Claude");
+        assert!(!text.start.disabled);
+        assert_eq!(text.status_text, "Not logged in");
+        assert!(text.cancel.is_none());
+        assert!(text.error.is_none());
+        // The composed IDs derive from the prefix + provider slug.
+        assert_eq!(text.outer_id, "settings-login-claude");
+        assert_eq!(text.start.id, "settings-login-claude-start");
+    }
+
+    #[test]
+    fn login_model_disables_start_when_disconnected_and_shows_cancel_when_busy() {
+        let text = build_login(
+            &provider(LoginProgress::Idle),
+            "settings-login",
+            &ConnectionState::Reconnecting,
+        );
+        assert!(text.start.disabled, "disconnected must disable start");
+        let busy = build_login(
+            &provider(LoginProgress::Starting),
+            "settings-login",
+            &ConnectionState::Connected,
+        );
+        let cancel = busy.cancel.expect("busy provider paints a cancel button");
+        assert_eq!(cancel.label, "Cancel");
+        assert!(!cancel.disabled);
+    }
+
+    #[test]
+    fn login_model_surfaces_the_failure_message() {
+        let mut prov = provider(LoginProgress::Failed {
+            error: LoginError {
+                code: "boom".into(),
+                message: "no browser".into(),
+            },
+        });
+        prov.credentials_present = false;
+        let text = build_login(&prov, "first-login", &ConnectionState::Connected);
+        let err = text.error.expect("failed progress must produce an error");
+        assert_eq!(err.message, "no browser");
+        assert_eq!(err.id, "first-login-claude-error");
     }
 }

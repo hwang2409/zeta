@@ -4218,212 +4218,230 @@ fn sidebar_row_focus_map_prunes_removed_rows_and_keeps_survivors(cx: &mut TestAp
     });
 }
 
-/// Renderer-literal fence — the ZETA-109 static guard.
+/// Renderer-literal fence — the ZETA-109 AST-based static guard.
 ///
-/// The typed row-text model (`row_text::RowText`) is the sole source of
-/// every user-visible string a transcript row paints. The fence proves it
-/// stays that way by parsing `main.rs` on every run, extracting each
-/// targeted `fn` body via a hand-rolled Rust tokenizer, and rejecting
-/// every inline string literal that does not match the tight widget-ID
-/// allowlist (or sit inside a diagnostic macro).
+/// The typed `row_text::RowText` / `LoginRowText` model is the sole source
+/// of every user-visible string a transcript row paints. This fence proves
+/// it stays that way by parsing the WHOLE `transcript_render.rs` module
+/// with `syn` on every run and rejecting every string / byte-string
+/// literal in expression position that does not sit inside the tight
+/// allowed-context allowlist.
 ///
-/// Negative fixtures the fence rejects — DO NOT paste any of these into
-/// a renderer body; they exist in this comment as documentation:
+/// AST context, not string shape, is what distinguishes an ID from
+/// visible text — that closes the r1 review's bypasses:
 ///
-///     .child("[done]")                    // bracketed state marker
-///     .child("Send message")              // uppercase prose
-///     .child("show details")              // has a space
-///     .child("Try again")                 // uppercase + space
-///     .label("Cancel")                    // capitalized action label
-///     .child(format!("You have {n}"))     // format string is prose
+///   * `.child("[done]")` — literal outside allowed subtree
+///   * `.child("done")`  — lowercase-safe shape does NOT save it
+///   * `Alert::error(..., "hardcoded")` — plain string second arg
+///   * `format!("hello {n}")` — bare format outside allowed subtree
+///   * `format!("tool-verb-{i}")` — ID-shaped format still flagged
+///   * `String::from_utf8_lossy(b"…")` — byte strings are flagged too
+///   * a new `render_login_row` helper hiding text — the WHOLE module is
+///     scanned, not a fixed six-fn allowlist, so renaming or splitting
+///     renderers cannot smuggle a literal past the fence.
 ///
-/// Positive fixtures the fence accepts:
+/// Allowed contexts (allowed literals descend from an ancestor node
+/// matching one of these):
 ///
-///     .debug_selector(|| "transcript-row".into())
-///     .debug_selector(move || format!("tool-verb-{index}"))
-///     Button::new(("fork", index))
-///     format!("error-login-{index}")
-///     unreachable!("row-inner-entry-mismatch")   // diagnostic macro escape
+/// * Method calls whose method identifier is exactly `debug_selector`,
+///   `id`, `aria_label`, or `role` — every widget-ID literal in the
+///   render module lives inside one of these calls.
+/// * Diagnostic macros — `panic!`, `unreachable!`, `todo!`,
+///   `unimplemented!`, `assert{,_eq,_ne}!`, `debug_assert{,_eq,_ne}!` —
+///   whose payloads never reach the user.
 ///
-/// Rules:
-///
-/// * The fence walks the SIX transcript render functions by exact
-///   signature: `render_row_inner`, `render_thinking_row`,
-///   `render_user_row`, `render_assistant_row`, `render_tool_row`,
-///   `render_error_row`. The set is spelled out below so a rename or
-///   split fails loudly instead of silently dropping a fn from the scan.
-///
-/// * Bodies are extracted by hand-rolled Rust tokenizer that skips line
-///   and (nested) block comments, char literals, byte strings, and both
-///   normal and raw string literals — a comment-marker parser was
-///   rejected by the ZETA-107 r7 reviewer for being bypassable by moving
-///   a fn or renaming markers. The tokenizer keys off Rust's actual
-///   syntax, not documentation cues.
-///
-/// * String literals inside diagnostic macros
-///   (`unreachable!/panic!/todo!/unimplemented!/assert{,_eq,_ne}!/
-///   debug_assert{,_eq,_ne}!`) are allowed — those payloads never reach
-///   the user. Every OTHER literal must match the widget-ID allowlist:
-///   empty, OR first char ASCII lowercase, remaining chars in
-///   `[a-z0-9_-]` with at most one trailing `-{ident}` format placeholder
-///   where `ident` is `[a-z_][a-z0-9_]*`. Everything else — spaces,
-///   uppercase, punctuation, prose — fails.
-///
-/// * The chrome-coverage arm proves `row_text::chrome::ALL` mentions
-///   every constant declared in the `chrome` module. Adding a new
-///   chrome constant without adding it to `ALL` regresses the seam
-///   tests that iterate `ALL`.
+/// The `chrome`-coverage arm parses `row_text.rs` for the `pub mod chrome`
+/// submodule and proves (a) every `pub const NAME: &str = "…"` sits at
+/// exactly `pub` visibility (no `pub(super)`/`pub(crate)`/private bypass)
+/// and (b) is a member of `chrome::ALL`. Adding a new chrome constant
+/// without listing it in `ALL` silently escapes the seam sweep — this
+/// test flags that regression.
 #[test]
-fn renderer_literal_fence_rejects_user_visible_strings_in_transcript_renderers() {
-    const SOURCE: &str = include_str!("main.rs");
-    const TARGET_FN_NAMES: &[&str] = &[
-        "render_row_inner",
-        "render_thinking_row",
-        "render_user_row",
-        "render_assistant_row",
-        "render_tool_row",
-        "render_error_row",
-    ];
-
-    let mut failures: Vec<String> = Vec::new();
-    for name in TARGET_FN_NAMES {
-        let (body_start, body_end) = fence::locate_fn_body(SOURCE, name).unwrap_or_else(|err| {
-            panic!("fence: locating `{name}` failed: {err}. If the fn was renamed, update TARGET_FN_NAMES.")
-        });
-        let body = &SOURCE[body_start..body_end];
-        let literals = fence::collect_string_literals(body)
-            .unwrap_or_else(|err| panic!("fence: tokenizing `{name}` body failed: {err}"));
-        for literal in &literals {
-            if literal.in_diagnostic_macro {
-                continue;
-            }
-            if fence::is_widget_id_shape(&literal.content) {
-                continue;
-            }
-            failures.push(format!(
-                "fn {name}: forbidden inline literal {:?} at byte offset {} \
-                 inside the fn body — route this string through the RowText \
-                 model or the row_text::chrome constants module.",
-                literal.content, literal.offset,
-            ));
-        }
-    }
+fn renderer_literal_fence_rejects_literals_outside_allowed_contexts() {
+    const SOURCE: &str = include_str!("transcript_render.rs");
+    let failures = fence::run(SOURCE);
     assert!(
         failures.is_empty(),
-        "renderer_literal_fence tripped:\n  - {}",
+        "renderer_literal_fence tripped on transcript_render.rs:\n  - {}",
         failures.join("\n  - "),
     );
 }
 
 #[test]
-fn renderer_literal_fence_widget_id_shape_accepts_ids_and_rejects_prose() {
-    for id in [
-        "",
-        "fork",
-        "attachment-chip",
-        "transcript-row",
-        "user-row-{index}",
-        "tool-receipt-{index}",
-        "error-login-{index}",
-        "tool-verb-{index}",
-    ] {
+fn renderer_literal_fence_ast_visitor_flags_the_probe_bypasses() {
+    // Mutation battery — the six probes the r1 review named MUST all
+    // trip. Runs the same AST visitor over synthetic module snippets so
+    // the guard's guard fires on every push. If any probe stops
+    // failing, the fence has weakened and the review's finding is
+    // silently back.
+    let probes: &[(&str, &str)] = &[
+        (
+            "bracketed state marker",
+            r#"impl X { fn f(&self) -> D { div().child("[done]") } }"#,
+        ),
+        (
+            "lowercase prose reaches child",
+            r#"impl X { fn f(&self) -> D { div().child("done") } }"#,
+        ),
+        (
+            "prose format! fragment outside allowed context",
+            r#"impl X { fn f(&self, n: usize) -> D { div().child(format!("hello {n}")) } }"#,
+        ),
+        (
+            "ID-shaped format! fragment outside allowed context",
+            r#"impl X { fn f(&self, i: usize) -> D { div().child(format!("tool-verb-{i}")) } }"#,
+        ),
+        (
+            "byte-string literal bypasses via from_utf8_lossy",
+            r#"impl X { fn f(&self) -> D { div().child(String::from_utf8_lossy(b"leaked").to_string()) } }"#,
+        ),
+        (
+            "renamed/new helper fn in the module still scanned",
+            r#"impl X { fn f(&self) -> D { self.helper() } fn helper(&self) -> D { div().child("leaked-via-helper") } }"#,
+        ),
+    ];
+    for (label, probe) in probes {
+        let failures = fence::run(probe);
         assert!(
-            fence::is_widget_id_shape(id),
-            "widget-ID shape must accept {id:?}"
-        );
-    }
-    for prose in [
-        "Fork here",
-        "Open Settings",
-        "Cancel",
-        "Send",
-        "show output",
-        "Earlier output omitted",
-        "[done]",
-        "[working]",
-        "{index}",
-        "-leading-hyphen",
-        "You have {n} messages",
-        "tool row",
-        "Tool-Row",
-    ] {
-        assert!(
-            !fence::is_widget_id_shape(prose),
-            "widget-ID shape must reject {prose:?}"
+            !failures.is_empty(),
+            "mutation probe MUST trip the fence — {label}\nsnippet: {probe}\ngot failures: {failures:?}"
         );
     }
 }
 
 #[test]
-fn renderer_literal_fence_tokenizer_ignores_comments_and_diagnostic_macros() {
-    // Mutation guard: prove the tokenizer skips comments, char literals,
-    // and raw strings, and that literals inside diagnostic macros are
-    // marked as such. A regression in the tokenizer that fails to skip
-    // a `//` line comment would surface here.
-    let sample = r##"
-        // "line-comment-literal"
-        /* "block-comment-literal" /* nested */ */
-        let a = '\n';
-        let b = r#""raw-inside""#;
-        panic!("panic message body");
-        div().child("Prose sneaks in");
-        format!("tool-verb-{index}");
-    "##;
-    let literals = fence::collect_string_literals(sample).expect("tokenize");
-    let seen: Vec<(&str, bool)> = literals
-        .iter()
-        .map(|lit| (lit.content.as_str(), lit.in_diagnostic_macro))
-        .collect();
-    assert_eq!(
-        seen,
-        vec![
-            ("\"raw-inside\"", false),
-            ("panic message body", true),
-            ("Prose sneaks in", false),
-            ("tool-verb-{index}", false),
-        ],
-        "tokenizer must skip comments and char literals, keep raw strings, \
-         and mark panic!-argument as diagnostic. Got: {seen:?}"
-    );
+fn renderer_literal_fence_accepts_the_legitimate_shapes() {
+    // Positive fixtures — every allowed usage the render module actually
+    // emits. If ANY of these starts failing, the fence has become too
+    // strict and legitimate render code cannot compile.
+    let positives: &[&str] = &[
+        // Widget-ID inside .debug_selector(closure)
+        r#"impl X { fn f(&self) -> D { div().debug_selector(|| "transcript-row".into()) } }"#,
+        // Format inside .debug_selector(closure) — ID-shaped
+        r#"impl X { fn f(&self, i: usize) -> D { div().debug_selector(move || format!("tool-verb-{i}")) } }"#,
+        // Widget-ID inside .id(tuple)
+        r#"impl X { fn f(&self, i: usize) -> D { div().id(("tool-receipt", i)) } }"#,
+        // Diagnostic macro escapes
+        r#"impl X { fn f(&self) { unreachable!("row-inner-entry-mismatch") } }"#,
+        r#"impl X { fn f(&self, ok: bool) { assert!(ok, "must be ok"); } }"#,
+        // Passing a chrome-const path through .child — no literal.
+        r#"impl X { fn f(&self) -> D { div().child(row_text::chrome::FORK_HERE) } }"#,
+        // aria_label / role are allowed
+        r#"impl X { fn f(&self) -> D { div().aria_label("dialog") } }"#,
+        r#"impl X { fn f(&self) -> D { div().role("region") } }"#,
+    ];
+    for probe in positives {
+        let failures = fence::run(probe);
+        assert!(
+            failures.is_empty(),
+            "positive fixture MUST pass the fence:\nsnippet: {probe}\ngot failures: {failures:?}",
+        );
+    }
 }
 
 #[test]
-fn renderer_literal_fence_chrome_all_lists_every_chrome_constant() {
-    // Chrome-coverage arm: parse the row_text.rs chrome module and prove
-    // every `pub const NAME: &str = "..."` appears in `chrome::ALL`. A new
-    // chrome constant without an ALL entry silently escapes the row-text
-    // seam sweep — this test flags that regression.
-    const CHROME_SOURCE: &str = include_str!("row_text.rs");
-    let declared = fence::chrome_constants(CHROME_SOURCE);
-    let all_names = fence::chrome_all_entries(CHROME_SOURCE);
+fn renderer_literal_fence_mutation_battery_against_the_real_module() {
+    // Round-2 mutation battery — each entry names a review-attested
+    // bypass and mutates the ACTUAL `transcript_render.rs` source. The
+    // fence MUST trip on every one. This is the same set the orchestrator
+    // re-runs on the final head; if any stops failing, the guard has
+    // weakened and the review's finding is silently back.
+    const SOURCE: &str = include_str!("transcript_render.rs");
+    let mutations: &[(&str, &str, &str)] = &[
+        // (label, injection point — matched verbatim, mutated snippet)
+        (
+            "child bracketed state marker",
+            ".child(header)\n            .into_any_element()\n    }",
+            ".child(\"[done]\")\n            .child(header)\n            .into_any_element()\n    }",
+        ),
+        (
+            "child lowercase prose",
+            ".child(header)\n            .into_any_element()\n    }",
+            ".child(\"done\")\n            .child(header)\n            .into_any_element()\n    }",
+        ),
+        (
+            "rename render_thinking_row",
+            "fn render_thinking_row(&self",
+            "fn render_thinking_pane(&self",
+        ),
+        (
+            "text moved into a fresh helper fn in the module",
+            "impl ZetaView {\n    pub(crate) fn render_row(",
+            "impl ZetaView {\n    fn newly_added_helper(&self) -> &str { \"leaked-via-helper\" }\n    pub(crate) fn render_row(",
+        ),
+        (
+            "prose format! fragment outside allowed context",
+            ".child(header)",
+            ".child(format!(\"You have {} messages\", 3)).child(header)",
+        ),
+        (
+            "ID-shaped format! fragment outside allowed context",
+            ".child(header)",
+            ".child(format!(\"tool-verb-{}\", 3)).child(header)",
+        ),
+    ];
+    let mut ran = 0usize;
+    for (label, needle, replacement) in mutations {
+        assert!(
+            SOURCE.contains(needle),
+            "mutation battery: injection anchor {needle:?} not found for probe {label:?}"
+        );
+        let mutated = SOURCE.replacen(needle, replacement, 1);
+        let failures = fence::run(&mutated);
+        // The `rename` mutation does NOT introduce a new literal; the fence
+        // MUST NOT trip for it. Every other mutation SHOULD trip.
+        let expect_trip = *label != "rename render_thinking_row";
+        if expect_trip {
+            assert!(
+                !failures.is_empty(),
+                "mutation MUST trip the fence — {label}\ngot failures: {failures:?}"
+            );
+        } else {
+            assert!(
+                failures.is_empty(),
+                "rename mutation MUST NOT trip the fence (fence scans WHOLE module, \
+                 not a fn-name list) — got failures: {failures:?}"
+            );
+        }
+        ran += 1;
+    }
+    assert_eq!(ran, 6, "battery must exercise all six review-named probes");
+}
+
+#[test]
+fn renderer_literal_fence_chrome_consts_are_public_and_listed_in_all() {
+    // Parse row_text.rs's `pub mod chrome` and check:
+    //   (a) every `pub const NAME: &str = "…"` sits at exactly `pub`
+    //       visibility — `pub(super)` / `pub(crate)` / private are the
+    //       exact bypass this test names,
+    //   (b) every declared constant appears in `chrome::ALL`, so the
+    //       seam-sweep tests that iterate `ALL` pick it up.
+    const SOURCE: &str = include_str!("row_text.rs");
+    let (declared, all) = fence::chrome_summary(SOURCE);
     assert!(
         !declared.is_empty(),
         "fence: chrome module scan returned zero constants — parser regressed?"
     );
     for name in &declared {
         assert!(
-            all_names.contains(name),
-            "chrome constant {name} is declared but missing from chrome::ALL — \
+            all.contains(name),
+            "chrome::{name} is declared but missing from chrome::ALL — \
              add it so the seam sweep and the fence pick it up"
         );
     }
 }
 
 mod fence {
-    //! Fence internals: hand-rolled Rust tokenizer used only by the
-    //! renderer-literal fence tests. Kept in a submodule so the tests
-    //! remain readable and the tokenizer stays testable in isolation.
+    //! AST fence internals — a `syn`-based visitor over a Rust module's
+    //! source. Kept in a submodule so the tests read cleanly and the
+    //! visitor stays testable on its own.
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(super) struct Literal {
-        pub content: String,
-        pub offset: usize,
-        pub in_diagnostic_macro: bool,
-    }
+    use syn::visit::{self, Visit};
 
+    const ALLOWED_METHODS: &[&str] = &["debug_selector", "id", "aria_label", "role"];
     const DIAGNOSTIC_MACROS: &[&str] = &[
-        "unreachable",
         "panic",
+        "unreachable",
         "todo",
         "unimplemented",
         "assert",
@@ -4434,571 +4452,216 @@ mod fence {
         "debug_assert_ne",
     ];
 
-    /// Widget-ID allowlist. Empty string is allowed; otherwise the string
-    /// must be `[a-z][a-z0-9_-]*(-\{[a-z_][a-z0-9_]*\})?`.
-    pub(super) fn is_widget_id_shape(s: &str) -> bool {
-        if s.is_empty() {
-            return true;
-        }
-        let bytes = s.as_bytes();
-        if !bytes[0].is_ascii_lowercase() {
-            return false;
-        }
-        let mut i = 0;
-        // Kebab-lowercase prefix.
-        while i < bytes.len() {
-            match bytes[i] {
-                b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' => i += 1,
-                b'{' => break,
-                _ => return false,
-            }
-        }
-        if i == bytes.len() {
-            // Must not end on `-` or `_` — but that's cosmetic; allow.
-            return bytes[i - 1] != b'-';
-        }
-        // Must be `-{ident}` at end.
-        if bytes[i] != b'{' || i == 0 || bytes[i - 1] != b'-' {
-            return false;
-        }
-        i += 1;
-        // First char of ident: [a-z_]
-        let ident_start = i;
-        if i >= bytes.len() || !matches!(bytes[i], b'a'..=b'z' | b'_') {
-            return false;
-        }
-        i += 1;
-        while i < bytes.len() && matches!(bytes[i], b'a'..=b'z' | b'0'..=b'9' | b'_') {
-            i += 1;
-        }
-        if i == ident_start {
-            return false;
-        }
-        if i >= bytes.len() || bytes[i] != b'}' {
-            return false;
-        }
-        i += 1;
-        i == bytes.len()
-    }
-
-    /// Locate the byte range of a fn's body — the inclusive-start /
-    /// exclusive-end offsets of everything between the opening `{` (after
-    /// the signature) and the matching closing `}`. Errors if the fn
-    /// isn't found, if it appears more than once (rename ambiguity), or
-    /// if the body is unterminated.
-    pub(super) fn locate_fn_body(source: &str, fn_name: &str) -> Result<(usize, usize), String> {
-        let needle = format!("fn {fn_name}(");
-        let mut occurrences: Vec<usize> = Vec::new();
-        let bytes = source.as_bytes();
-        let needle_bytes = needle.as_bytes();
-        let mut i = 0;
-        while i + needle_bytes.len() <= bytes.len() {
-            if &bytes[i..i + needle_bytes.len()] == needle_bytes {
-                // Guard: the byte before must be non-alphanumeric so we
-                // don't match `fn render_thinking_row_v2(`.
-                let starts_word = i == 0
-                    || !matches!(bytes[i - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
-                if starts_word {
-                    occurrences.push(i);
-                }
-                i += needle_bytes.len();
-            } else {
-                i += 1;
-            }
-        }
-        match occurrences.len() {
-            0 => return Err(format!("`{fn_name}` not found")),
-            1 => {}
-            n => return Err(format!("`{fn_name}` matched {n} times (rename ambiguity)")),
-        }
-        let sig_start = occurrences[0];
-        // From sig_start, find the first `{` at paren-depth zero AFTER the
-        // matching `)` of the signature. Rust tokenizer-lite.
-        let mut cursor = sig_start;
-        let mut paren_depth = 0i32;
-        let mut in_signature = true;
-        while cursor < bytes.len() {
-            let (new_cursor, event) = advance_token(bytes, cursor)?;
-            cursor = new_cursor;
-            match event {
-                TokenEvent::None => {}
-                TokenEvent::Open(b'(') => paren_depth += 1,
-                TokenEvent::Close(b')') => paren_depth -= 1,
-                TokenEvent::Open(b'{') if in_signature && paren_depth == 0 => {
-                    // Body starts.
-                    let body_start = cursor; // cursor is now just past the `{`
-                    let mut brace_depth = 1i32;
-                    let mut inner = cursor;
-                    while inner < bytes.len() {
-                        let (next, event) = advance_token(bytes, inner)?;
-                        inner = next;
-                        match event {
-                            TokenEvent::Open(b'{') => brace_depth += 1,
-                            TokenEvent::Close(b'}') => {
-                                brace_depth -= 1;
-                                if brace_depth == 0 {
-                                    let body_end = inner - 1; // exclude the `}`
-                                    return Ok((body_start, body_end));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    return Err(format!("`{fn_name}` body unterminated"));
-                }
-                _ => {
-                    in_signature = paren_depth != 0 || in_signature;
-                }
-            }
-        }
-        Err(format!("`{fn_name}` body not found after signature"))
-    }
-
-    /// Collect every string literal in `body`, recording its content,
-    /// byte offset (within `body`), and whether it sits inside a
-    /// diagnostic macro's argument list.
-    pub(super) fn collect_string_literals(body: &str) -> Result<Vec<Literal>, String> {
-        let bytes = body.as_bytes();
-        let mut i = 0;
-        let mut literals: Vec<Literal> = Vec::new();
-        let mut macro_stack: Vec<bool> = Vec::new(); // one entry per open bracket
-        while i < bytes.len() {
-            // Comment and literal-body skip is handled by advance_token; we
-            // need a variant that ALSO surfaces string literals to us.
-            if starts_with(bytes, i, b"//") {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            if starts_with(bytes, i, b"/*") {
-                let mut depth = 1;
-                i += 2;
-                while i < bytes.len() && depth > 0 {
-                    if starts_with(bytes, i, b"/*") {
-                        depth += 1;
-                        i += 2;
-                    } else if starts_with(bytes, i, b"*/") {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                continue;
-            }
-            // Char literal — heuristic: `'` followed by (\?any)`'`.
-            if bytes[i] == b'\'' && likely_char_literal(bytes, i) {
-                i += 1;
-                if i < bytes.len() && bytes[i] == b'\\' {
-                    i += 1;
-                    if i < bytes.len() {
-                        i += 1;
-                    }
-                } else if i < bytes.len() {
-                    i += 1;
-                }
-                while i < bytes.len() && bytes[i] != b'\'' {
-                    i += 1;
-                }
-                if i < bytes.len() {
-                    i += 1;
-                }
-                continue;
-            }
-            // Byte string / raw / normal string detection.
-            let (prefix_len, is_raw, is_byte) = scan_string_prefix(bytes, i);
-            let (hash_len, expects_string) = if is_raw {
-                let mut h = 0;
-                let mut cur = i + prefix_len;
-                while cur < bytes.len() && bytes[cur] == b'#' {
-                    h += 1;
-                    cur += 1;
-                }
-                (h, cur < bytes.len() && bytes[cur] == b'"')
-            } else if prefix_len > 0 {
-                (
-                    0,
-                    i + prefix_len < bytes.len() && bytes[i + prefix_len] == b'"',
-                )
-            } else if bytes[i] == b'"' {
-                (0, true)
-            } else {
-                (0, false)
-            };
-            if expects_string {
-                let content_start = i + prefix_len + hash_len + 1;
-                let mut j = content_start;
-                if is_raw {
-                    // find closing `"` followed by hash_len `#`.
-                    loop {
-                        if j >= bytes.len() {
-                            return Err(format!("unterminated raw string at offset {i}"));
-                        }
-                        if bytes[j] == b'"' {
-                            let mut k = j + 1;
-                            let mut matched = 0;
-                            while matched < hash_len && k < bytes.len() && bytes[k] == b'#' {
-                                matched += 1;
-                                k += 1;
-                            }
-                            if matched == hash_len {
-                                let content =
-                                    String::from_utf8_lossy(&bytes[content_start..j]).into_owned();
-                                let in_diagnostic_macro =
-                                    macro_stack.last().copied().unwrap_or(false);
-                                if !is_byte {
-                                    literals.push(Literal {
-                                        content,
-                                        offset: i,
-                                        in_diagnostic_macro,
-                                    });
-                                }
-                                i = k;
-                                break;
-                            }
-                        }
-                        j += 1;
-                    }
-                    continue;
-                } else {
-                    while j < bytes.len() {
-                        match bytes[j] {
-                            b'\\' => {
-                                j += 2;
-                            }
-                            b'"' => break,
-                            _ => j += 1,
-                        }
-                    }
-                    if j >= bytes.len() {
-                        return Err(format!("unterminated string at offset {i}"));
-                    }
-                    let content = decode_escapes(&bytes[content_start..j])
-                        .map_err(|e| format!("escape decode failed at {i}: {e}"))?;
-                    let in_diagnostic_macro = macro_stack.last().copied().unwrap_or(false);
-                    if !is_byte {
-                        literals.push(Literal {
-                            content,
-                            offset: i,
-                            in_diagnostic_macro,
-                        });
-                    }
-                    i = j + 1;
-                    continue;
-                }
-            }
-            // Bracket tracking. When we see `(`, `[`, or `{`, look back for
-            // an identifier ending with `!` to mark diagnostic-macro frames.
-            match bytes[i] {
-                b'(' | b'[' | b'{' => {
-                    let is_diag = preceding_identifier(bytes, i)
-                        .filter(|(_, bang)| *bang)
-                        .map(|(ident, _)| DIAGNOSTIC_MACROS.iter().any(|name| *name == ident))
-                        .unwrap_or(false);
-                    macro_stack.push(is_diag);
-                    i += 1;
-                }
-                b')' | b']' | b'}' => {
-                    macro_stack.pop();
-                    i += 1;
-                }
-                _ => i += 1,
-            }
-        }
-        Ok(literals)
-    }
-
-    /// Return (identifier, ended_with_bang) for the identifier immediately
-    /// before `pos` in `bytes`, skipping whitespace. If no identifier is
-    /// found, returns None.
-    fn preceding_identifier(bytes: &[u8], pos: usize) -> Option<(String, bool)> {
-        if pos == 0 {
-            return None;
-        }
-        let mut i = pos;
-        // Skip whitespace.
-        while i > 0 && matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r') {
-            i -= 1;
-        }
-        // Optional trailing `!`.
-        let mut bang = false;
-        if i > 0 && bytes[i - 1] == b'!' {
-            bang = true;
-            i -= 1;
-        }
-        let ident_end = i;
-        while i > 0 && matches!(bytes[i - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_') {
-            i -= 1;
-        }
-        if i == ident_end {
-            return None;
-        }
-        Some((
-            String::from_utf8_lossy(&bytes[i..ident_end]).into_owned(),
-            bang,
-        ))
-    }
-
-    fn starts_with(bytes: &[u8], pos: usize, needle: &[u8]) -> bool {
-        bytes.get(pos..pos + needle.len()) == Some(needle)
-    }
-
-    fn likely_char_literal(bytes: &[u8], pos: usize) -> bool {
-        // Rust lifetime tokens use `'`, e.g. `'a`, `'static`. Distinguish
-        // by looking for a closing `'` within a plausible range.
-        let mut j = pos + 1;
-        if j < bytes.len() && bytes[j] == b'\\' {
-            j += 2;
-        } else {
-            j += 1;
-        }
-        j < bytes.len() && bytes[j] == b'\''
-    }
-
-    fn scan_string_prefix(bytes: &[u8], pos: usize) -> (usize, bool, bool) {
-        // Returns (prefix_len, is_raw, is_byte). Handles `r`, `b`, `br`,
-        // `rb` prefixes.
-        let mut is_raw = false;
-        let mut is_byte = false;
-        let mut i = pos;
-        loop {
-            match bytes.get(i) {
-                Some(b'r') if !is_raw => {
-                    is_raw = true;
-                    i += 1;
-                }
-                Some(b'b') if !is_byte => {
-                    is_byte = true;
-                    i += 1;
-                }
-                _ => break,
-            }
-        }
-        (i - pos, is_raw, is_byte)
-    }
-
-    fn decode_escapes(bytes: &[u8]) -> Result<String, String> {
-        // Best-effort: decode common `\n`, `\t`, `\"`, `\\`, `\'` and Unicode
-        // escapes. Fence assertions compare against literal content, so a
-        // partial escape decode is fine — as long as we don't lose track of
-        // string boundaries, which is handled by the scanner above.
-        let mut out = String::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                match bytes[i + 1] {
-                    b'n' => out.push('\n'),
-                    b't' => out.push('\t'),
-                    b'r' => out.push('\r'),
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'\'' => out.push('\''),
-                    b'0' => out.push('\0'),
-                    b'u' => {
-                        // \u{XXXX} — skip through the closing `}`.
-                        let mut k = i + 2;
-                        while k < bytes.len() && bytes[k] != b'}' {
-                            k += 1;
-                        }
-                        if k < bytes.len() {
-                            out.push('?');
-                            i = k + 1;
-                            continue;
-                        }
-                    }
-                    other => out.push(other as char),
-                }
-                i += 2;
-            } else {
-                out.push(bytes[i] as char);
-                i += 1;
-            }
-        }
-        Ok(out)
-    }
-
-    #[derive(Debug)]
-    pub(super) enum TokenEvent {
-        None,
-        Open(u8),
-        Close(u8),
-    }
-
-    /// Advance one token from `pos`, returning the new position and any
-    /// bracket/paren event of interest. Skips comments, char literals,
-    /// and string literals in bulk.
-    pub(super) fn advance_token(bytes: &[u8], pos: usize) -> Result<(usize, TokenEvent), String> {
-        let mut i = pos;
-        if starts_with(bytes, i, b"//") {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            return Ok((i, TokenEvent::None));
-        }
-        if starts_with(bytes, i, b"/*") {
-            let mut depth = 1;
-            i += 2;
-            while i < bytes.len() && depth > 0 {
-                if starts_with(bytes, i, b"/*") {
-                    depth += 1;
-                    i += 2;
-                } else if starts_with(bytes, i, b"*/") {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            return Ok((i, TokenEvent::None));
-        }
-        if i < bytes.len() && bytes[i] == b'\'' && likely_char_literal(bytes, i) {
-            i += 1;
-            if i < bytes.len() && bytes[i] == b'\\' {
-                i += 2;
-            } else if i < bytes.len() {
-                i += 1;
-            }
-            while i < bytes.len() && bytes[i] != b'\'' {
-                i += 1;
-            }
-            if i < bytes.len() {
-                i += 1;
-            }
-            return Ok((i, TokenEvent::None));
-        }
-        let (prefix_len, is_raw, _is_byte) = scan_string_prefix(bytes, i);
-        let starts_string = if is_raw {
-            let mut cur = i + prefix_len;
-            while cur < bytes.len() && bytes[cur] == b'#' {
-                cur += 1;
-            }
-            cur < bytes.len() && bytes[cur] == b'"'
-        } else if prefix_len > 0 {
-            i + prefix_len < bytes.len() && bytes[i + prefix_len] == b'"'
-        } else if i < bytes.len() {
-            bytes[i] == b'"'
-        } else {
-            false
+    /// Parse `source` and return every literal the fence flags. Empty
+    /// vector means the source is clean.
+    pub(super) fn run(source: &str) -> Vec<String> {
+        let file = match syn::parse_file(source) {
+            Ok(file) => file,
+            Err(err) => return vec![format!("fence: parse error: {err}")],
         };
-        if starts_string {
-            let mut j = i + prefix_len;
-            let mut hashes = 0;
-            while j < bytes.len() && bytes[j] == b'#' {
-                hashes += 1;
-                j += 1;
-            }
-            j += 1; // past the opening `"`
-            if is_raw {
-                loop {
-                    if j >= bytes.len() {
-                        return Err(format!("unterminated raw string at offset {i}"));
-                    }
-                    if bytes[j] == b'"' {
-                        let mut k = j + 1;
-                        let mut matched = 0;
-                        while matched < hashes && k < bytes.len() && bytes[k] == b'#' {
-                            matched += 1;
-                            k += 1;
+        let mut visitor = Visitor::default();
+        visit::visit_file(&mut visitor, &file);
+        visitor.failures
+    }
+
+    /// Extract `(declared_names, all_names)` from `row_text.rs`'s
+    /// `pub mod chrome { ... }` submodule. Panics on unexpected shape so
+    /// the fence stays authoritative on chrome layout.
+    pub(super) fn chrome_summary(source: &str) -> (Vec<String>, Vec<String>) {
+        let file = syn::parse_file(source).expect("parse row_text.rs");
+        let chrome = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Mod(m) if m.ident == "chrome" => Some(m),
+                _ => None,
+            })
+            .expect("row_text.rs must declare `pub mod chrome`");
+        assert!(
+            matches!(chrome.vis, syn::Visibility::Public(_)),
+            "chrome module must be `pub`"
+        );
+        let content = &chrome
+            .content
+            .as_ref()
+            .expect("chrome module must be inline")
+            .1;
+        let mut declared = Vec::new();
+        let mut all = Vec::new();
+        for item in content {
+            let syn::Item::Const(c) = item else { continue };
+            let name = c.ident.to_string();
+            if name == "ALL" {
+                if let syn::Expr::Reference(refexpr) = c.expr.as_ref() {
+                    if let syn::Expr::Array(arr) = refexpr.expr.as_ref() {
+                        for elem in &arr.elems {
+                            if let syn::Expr::Path(p) = elem {
+                                let last = p
+                                    .path
+                                    .segments
+                                    .last()
+                                    .expect("chrome::ALL entry has at least one segment");
+                                all.push(last.ident.to_string());
+                            }
                         }
-                        if matched == hashes {
-                            return Ok((k, TokenEvent::None));
-                        }
                     }
-                    j += 1;
                 }
+                continue;
+            }
+            // Only inspect &str consts (the visible-string set). Other
+            // shapes (e.g. `pub const ALL: &[&str]`) are handled above.
+            if !is_str_ref_type(&c.ty) {
+                continue;
+            }
+            assert!(
+                matches!(c.vis, syn::Visibility::Public(_)),
+                "chrome::{name} must be `pub` (no `pub(super)` / `pub(crate)` / private) — \
+                 the visibility bypass fails the fence."
+            );
+            declared.push(name);
+        }
+        (declared, all)
+    }
+
+    fn is_str_ref_type(ty: &syn::Type) -> bool {
+        let syn::Type::Reference(r) = ty else {
+            return false;
+        };
+        let syn::Type::Path(p) = r.elem.as_ref() else {
+            return false;
+        };
+        p.path.is_ident("str")
+    }
+
+    #[derive(Default)]
+    struct Visitor {
+        failures: Vec<String>,
+        // Non-zero while the visitor is inside an allowed method-call
+        // argument subtree OR inside a diagnostic macro's token stream.
+        allowed_depth: usize,
+    }
+
+    impl<'ast> Visit<'ast> for Visitor {
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            let method_ok = ALLOWED_METHODS.iter().any(|name| node.method == *name);
+            if method_ok {
+                // Receiver stays outside the allowed subtree — literals
+                // in the parent chain are still checked normally. Only
+                // the method args (and any turbofish generics) inherit
+                // the allowance.
+                self.visit_expr(&node.receiver);
+                if let Some(g) = node.turbofish.as_ref() {
+                    self.visit_angle_bracketed_generic_arguments(g);
+                }
+                self.allowed_depth += 1;
+                for arg in &node.args {
+                    self.visit_expr(arg);
+                }
+                self.allowed_depth -= 1;
             } else {
-                while j < bytes.len() {
-                    match bytes[j] {
-                        b'\\' => {
-                            j += 2;
+                visit::visit_expr_method_call(self, node);
+            }
+        }
+
+        fn visit_expr_lit(&mut self, node: &'ast syn::ExprLit) {
+            self.check_lit(&node.lit);
+            visit::visit_expr_lit(self, node);
+        }
+
+        fn visit_lit(&mut self, lit: &'ast syn::Lit) {
+            // Also called for patterns and other non-Expr contexts. The
+            // depth counter still governs — anything outside allowed
+            // scope is flagged.
+            self.check_lit(lit);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            let name = node
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            let is_diag = DIAGNOSTIC_MACROS.iter().any(|d| *d == name);
+            if is_diag {
+                self.allowed_depth += 1;
+            }
+            self.scan_tokens(node.tokens.clone());
+            if is_diag {
+                self.allowed_depth -= 1;
+            }
+        }
+
+        fn visit_attribute(&mut self, _node: &'ast syn::Attribute) {
+            // Skip attribute contents entirely — `#[doc = "..."]`,
+            // `#[cfg_attr(..., allow_unused_variables)]`, `#[cfg(...)]`
+            // literals never reach the render surface.
+        }
+
+        fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+            // Const items in the render module MUST NOT declare visible
+            // strings — chrome consts live in row_text.rs. A `const FOO:
+            // &str = "..."` in transcript_render.rs is a bypass.
+            let is_str_const = is_str_ref_type(&node.ty);
+            if is_str_const {
+                self.failures.push(format!(
+                    "forbidden `const {}: &str = ...` in the render module — \
+                     move it to `row_text::chrome` so the seam-sweep tests \
+                     iterate it too.",
+                    node.ident
+                ));
+            }
+            visit::visit_item_const(self, node);
+        }
+    }
+
+    impl Visitor {
+        fn check_lit(&mut self, lit: &syn::Lit) {
+            let content = match lit {
+                syn::Lit::Str(s) => Some(("str", s.value())),
+                syn::Lit::ByteStr(b) => {
+                    Some(("byte-str", String::from_utf8_lossy(&b.value()).into_owned()))
+                }
+                _ => None,
+            };
+            if let Some((kind, text)) = content {
+                if self.allowed_depth == 0 {
+                    self.failures.push(format!(
+                        "forbidden {kind} literal {text:?} — route this string through \
+                         the RowText / LoginRowText model, the row_text::chrome constants, \
+                         or a selector helper (row_text::sel::*). Allowed literal contexts: \
+                         args to `debug_selector` / `id` / `aria_label` / `role`, or a \
+                         diagnostic macro payload."
+                    ));
+                }
+            }
+        }
+
+        fn scan_tokens(&mut self, ts: proc_macro2::TokenStream) {
+            for tt in ts {
+                match tt {
+                    proc_macro2::TokenTree::Group(g) => self.scan_tokens(g.stream()),
+                    proc_macro2::TokenTree::Literal(l) => {
+                        let text = l.to_string();
+                        let bytes = text.as_bytes();
+                        let is_str = matches!(bytes.first(), Some(b'"'))
+                            || bytes.starts_with(b"r\"")
+                            || bytes.starts_with(b"r#");
+                        let is_byte = bytes.starts_with(b"b\"")
+                            || bytes.starts_with(b"br\"")
+                            || bytes.starts_with(b"br#");
+                        if (is_str || is_byte) && self.allowed_depth == 0 {
+                            self.failures.push(format!(
+                                "forbidden macro-token literal {text} — route this string \
+                                 through the RowText / LoginRowText model. Allowed literal \
+                                 contexts: args to `debug_selector` / `id` / `aria_label` / \
+                                 `role`, or a diagnostic macro payload."
+                            ));
                         }
-                        b'"' => break,
-                        _ => j += 1,
                     }
-                }
-                if j >= bytes.len() {
-                    return Err(format!("unterminated string at offset {i}"));
-                }
-                return Ok((j + 1, TokenEvent::None));
-            }
-        }
-        if i < bytes.len() {
-            let byte = bytes[i];
-            match byte {
-                b'(' | b'[' | b'{' => Ok((i + 1, TokenEvent::Open(byte))),
-                b')' | b']' | b'}' => Ok((i + 1, TokenEvent::Close(byte))),
-                _ => Ok((i + 1, TokenEvent::None)),
-            }
-        } else {
-            Ok((i, TokenEvent::None))
-        }
-    }
-
-    /// Extract every `pub const NAME: &str = "..."` from the chrome module
-    /// in `row_text.rs`. Uses simple line-based parsing; the chrome module
-    /// is deliberately kept in that shape so this parser is trivial.
-    pub(super) fn chrome_constants(source: &str) -> Vec<String> {
-        let mut names = Vec::new();
-        let mut in_chrome = false;
-        let mut depth = 0i32;
-        for line in source.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("pub mod chrome {") {
-                in_chrome = true;
-                depth = 1;
-                continue;
-            }
-            if !in_chrome {
-                continue;
-            }
-            for ch in trimmed.chars() {
-                if ch == '{' {
-                    depth += 1;
-                } else if ch == '}' {
-                    depth -= 1;
-                    if depth == 0 {
-                        return names;
-                    }
-                }
-            }
-            if let Some(rest) = trimmed.strip_prefix("pub const ") {
-                if let Some(end) = rest.find(':') {
-                    let name = rest[..end].trim().to_string();
-                    if name != "ALL" {
-                        names.push(name);
-                    }
+                    _ => {}
                 }
             }
         }
-        names
-    }
-
-    /// Extract identifiers listed inside `pub const ALL: &[&str] = &[ ... ]`.
-    pub(super) fn chrome_all_entries(source: &str) -> Vec<String> {
-        let mut collecting = false;
-        let mut items = Vec::new();
-        for line in source.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("pub const ALL:") {
-                collecting = true;
-                continue;
-            }
-            if !collecting {
-                continue;
-            }
-            if trimmed.starts_with("];") {
-                break;
-            }
-            let ident: String = trimmed
-                .trim_end_matches(',')
-                .chars()
-                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                .collect();
-            if !ident.is_empty() {
-                items.push(ident);
-            }
-        }
-        items
     }
 }
