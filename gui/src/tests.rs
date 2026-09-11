@@ -508,6 +508,94 @@ fn assistant_markdown_style_pins_the_zeta_110_clipping_guards(cx: &mut TestAppCo
     });
 }
 
+/// A minimal Render that drops one UNSTYLED `TextView::markdown` (inline
+/// code, no local `.style(...)`) into a window. It exists only so the
+/// r3 default-install guard below can inspect the paint scene without
+/// dragging the whole `ZetaView`/`Root` chrome into a probe render.
+struct InlineCodeDefaultProbe;
+
+impl gpui::Render for InlineCodeDefaultProbe {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        gpui::div()
+            .size_full()
+            .p_4()
+            .child(gpui_kit::component::text::TextView::markdown(
+                "app-default-inline-code-probe",
+                "hello `world` there",
+            ))
+    }
+}
+
+#[gpui::test]
+fn app_wide_text_view_default_paints_inline_code_on_the_subtle_wash(cx: &mut TestAppContext) {
+    // ZETA-110 r3 root cause: gpui-component's `base_text_view_style`
+    // hardcodes the app-wide inline-code default to
+    // `HighlightStyle { background_color: Some(theme.accent) }`. Round 2
+    // only styled the ASSISTANT renderer locally, so every OTHER
+    // `TextView::markdown` (input popovers, error surfaces, previews —
+    // anywhere a caller does not pass a local `.style(...)`) still
+    // painted inline code on the solid violet slab.
+    //
+    // `theme::apply` overwrites `TextViewDefaults::global(cx)` AFTER
+    // `Theme::sync_base(cx)` so the app-wide default rides the same
+    // ~6% text-normal wash the assistant renderer already uses. This
+    // probe exercises that path: an UNSTYLED `TextView::markdown` with
+    // one inline `code` chip goes through the paint pipeline, and the
+    // resulting quads must carry the subtle wash — NEVER the accent.
+    //
+    // If the install line in `theme::apply` is removed, `sync_base`
+    // still puts gpui-component's accent-inline default in place and
+    // the inline chip paints on solid violet, so the second assertion
+    // (no accent-backed quad) fails.
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply);
+    let window = cx.open_window(gpui::size(px(400.), px(160.)), |_, _| {
+        InlineCodeDefaultProbe
+    });
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let subtle = theme.secondary_hover;
+        let accent = theme.accent;
+        assert_ne!(
+            subtle, accent,
+            "the subtle wash and solid accent must be distinct tokens \
+             or this guard degenerates to a tautology",
+        );
+        let quads = window.painted_quads();
+        let hit = |color: gpui::Hsla| quads.iter().any(|quad| quad.background == color.into());
+        assert!(
+            hit(subtle),
+            "unstyled TextView::markdown must paint the inline-code chip \
+             on the theme's secondary_hover wash — a removal of the \
+             `TextViewDefaults::install` call in theme::apply restores \
+             gpui-component's solid-accent default",
+        );
+        assert!(
+            !hit(accent),
+            "unstyled TextView::markdown must NOT paint any quad on \
+             solid theme.accent — the r3 regression paints the inline \
+             chip on the raw violet slab this test guards against",
+        );
+        // The Base-layer defaults must still carry the code-block
+        // syntax highlighter installed by `Theme::sync_base` — the
+        // r3 install rebuilds `TextViewDefaults` and any refactor that
+        // drops the `TextViewDefaults::global(cx).with_style(...)` clone
+        // (and installs a fresh `TextViewDefaults::new()` instead)
+        // would silently strip fenced-code coloring app-wide.
+        assert!(
+            gpui_kit::base::TextViewDefaults::global(cx).has_code_block_highlighter(),
+            "the installed defaults must retain the code-block syntax \
+             highlighter — dropping it kills fence colors app-wide",
+        );
+    });
+}
+
 #[gpui::test]
 fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut TestAppContext) {
     // The wiki contract encodes tool state through COLOR ONLY on the actual

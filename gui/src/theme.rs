@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use gpui::{px, App, Hsla, Pixels};
+use gpui::{px, App, Hsla, Pixels, StyleRefinement, Styled as _};
 use gpui_kit::component::{highlighter::HighlightTheme, ActiveTheme, Theme, ThemeMode};
 
 /// Base UI type size — the "one size drives everything" pin from the wiki
@@ -318,6 +318,65 @@ fn opencode_highlight_theme() -> Arc<HighlightTheme> {
     })
 }
 
+/// Base rich-text style for zeta's app-wide `TextViewDefaults`.
+///
+/// This mirrors gpui-component's crate-private `base_text_view_style`
+/// field-for-field from the same `cx.theme()` tokens, then swaps only
+/// `inline_code` so any UNSTYLED `TextView::markdown` in the app (input
+/// popovers, error surfaces, previews, gpui-component-internal renders)
+/// paints inline `code` on the wiki `.markdown-preview-view code` wash
+/// instead of gpui-component's shipped `theme.accent` slab.
+///
+/// The rest of the fields track the component defaults exactly — link,
+/// selection, code-block corner radii, table corner radii, table-head
+/// bg/fg refinement — so consumers keep the themed layout and only the
+/// inline-chip color moves. The assistant path routes through
+/// `resolve_component_style` and folds its own `HighlightStyle` on top,
+/// so this default only matters when a caller does NOT provide a local
+/// `.style(...)`; every unstyled TextView in zeta or in the component
+/// library it re-exports picks up the subtle wash here.
+pub(crate) fn zeta_text_view_style(theme: &Theme) -> gpui_kit::base::TextViewStyle {
+    let radius = theme.semantic_tokens().radius.md;
+    let corner_radii = gpui::CornersRefinement {
+        top_left: Some(radius.into()),
+        top_right: Some(radius.into()),
+        bottom_left: Some(radius.into()),
+        bottom_right: Some(radius.into()),
+    };
+    let table = StyleRefinement {
+        corner_radii: corner_radii.clone(),
+        ..Default::default()
+    };
+    let code_block = StyleRefinement {
+        corner_radii,
+        ..Default::default()
+    };
+    let table_head = StyleRefinement::default()
+        .bg(theme.table_head)
+        .text_color(theme.table_head_foreground);
+    // Inline `code` sits on a subtle text-normal wash at normal-tier
+    // glyph color — the exact pair the assistant renderer uses through
+    // `assistant_markdown_style`. Routing the DEFAULT through the same
+    // pair keeps every unstyled TextView on one inline-code shape.
+    let inline_code = gpui::HighlightStyle {
+        background_color: Some(theme.secondary_hover),
+        color: Some(theme.foreground),
+        ..Default::default()
+    };
+    gpui_kit::base::TextViewStyle::default()
+        .with_foreground(theme.foreground)
+        .with_muted_foreground(theme.muted_foreground)
+        .with_link(theme.link)
+        .with_selection(theme.selection)
+        .with_code_background(theme.muted)
+        .with_border(theme.border)
+        .with_code_block(code_block)
+        .with_table(table)
+        .with_table_head(table_head)
+        .with_inline_code(inline_code)
+        .with_dark(theme.is_dark())
+}
+
 /// Apply the opencode palette + shape + typography rhythm onto the global
 /// theme, then push the update down to the Base layer so scrollbars and
 /// resize handles paint with the same tokens.
@@ -541,6 +600,19 @@ pub fn apply(cx: &mut App) {
     theme.tokens = (&theme.colors).into();
 
     Theme::sync_base(cx);
+
+    // Overwrite gpui-component's app-wide `TextViewDefaults` so an
+    // UNSTYLED `TextView::markdown` anywhere in the app paints inline
+    // `code` on the subtle wiki wash instead of the solid-accent slab
+    // shipped by `base_text_view_style`. `sync_base` above just called
+    // `install_text_view_defaults`, which put the accent default (and
+    // the opencode-themed code-block highlighter) into the global; we
+    // clone that global so the highlighter stays attached and only
+    // overwrite the style. Removing this call regresses every
+    // unstyled TextView back onto solid violet inline chips.
+    gpui_kit::base::TextViewDefaults::global(cx)
+        .with_style(zeta_text_view_style(cx.theme()))
+        .install(cx);
 
     // Kit's Base derivation seeds thumb color + radius but leaves width
     // unset, which falls back to the 6px default. Overwrite the base
