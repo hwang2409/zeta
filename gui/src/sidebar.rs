@@ -146,11 +146,24 @@ impl ZetaView {
                 self.state.session_view.available
                     && !self.state.session_view.message_ids.is_empty(),
                 |sidebar| {
+                    // The fork hint anchors the whole sidebar tail (fork
+                    // hint + Branches heading + branch rows). At the tail
+                    // the sidebar sits directly above the composer strip
+                    // in the main column, and the wiki-run "breathing but
+                    // compact" rhythm asks for a visible seam before the
+                    // tail so the two surfaces read as separate. A top
+                    // border at the sidebar-border (subtle) tier plus
+                    // 8px vertical padding gives that seam without
+                    // fighting the sessions list rhythm above.
                     sidebar.child(
                         div()
                             .debug_selector(|| "sidebar-hint-fork".into())
                             .px(theme::SIDEBAR_ROW_PADDING_X)
-                            .py(theme::SIDEBAR_ROW_PADDING_Y)
+                            .pt_2()
+                            .pb_1()
+                            .mt_2()
+                            .border_t_1()
+                            .border_color(cx.theme().sidebar_border)
                             .text_color(theme::palette::text_faint())
                             .child("Hover over your message to fork from it"),
                     )
@@ -454,11 +467,16 @@ impl ZetaView {
             .pb_1()
             .text_color(theme::palette::text_faint())
             .child("Branches");
+        // The branches strip is the bottom-most sidebar surface — the
+        // composer strip in the main column sits directly beside its lower
+        // edge. `pb_2` gives the last branch row a small floor so the
+        // strip does not visually collide with the composer chrome.
         let mut section = div()
             .id("branches-list")
             .v_flex()
             .flex_shrink_0()
             .max_h(px(200.))
+            .pb_2()
             .overflow_y_scroll()
             .child(heading);
         for branch in &self.state.session_view.branches {

@@ -27,16 +27,18 @@ pub fn init_menus(cx: &mut App) {
     ]);
 }
 
+/// Header band 2 status line — usage/cache metadata WITHOUT the model prefix.
+///
+/// The model name is pinned to the right side of the same band on its own,
+/// so folding it into the middle slice paints the model twice on every
+/// screen. Keeping it out here also frees the middle slice to shrink and
+/// truncate before the pinned model clips at the window edge.
 pub fn status_label(metrics: &StatusMetrics) -> String {
     if metrics.tokens.is_none() && metrics.cache_hit_rate.is_none() {
-        return metrics.model.as_ref().map_or_else(
-            || "Usage appears after the first turn".into(),
-            |model| format!("{model} · Usage appears after the first turn"),
-        );
+        return "Usage appears after the first turn".into();
     }
     format!(
-        "{} · {} tokens · {} cache",
-        metrics.model_label(),
+        "{} tokens · {} cache",
         metrics.tokens_label(),
         metrics.cache_label()
     )

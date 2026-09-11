@@ -254,8 +254,58 @@ impl ZetaView {
             .border_1()
             .border_color(cx.theme().border)
             .whitespace_normal();
+        // Inline `code` sits on a subtle text-normal wash with normal-tier
+        // text, matching the wiki's `.markdown-preview-view code` rule. The
+        // gpui-component default paints the chip on the full accent, which
+        // reads as a solid violet slab in dark mode and steals attention
+        // from real state chrome (pills, current-item text).
+        let inline_code = gpui::HighlightStyle {
+            background_color: Some(theme::palette::inline_code_bg()),
+            color: Some(theme::palette::inline_code_fg()),
+            ..Default::default()
+        };
+        // Tables opt into gpui-base's SCROLL layout so column widths come
+        // from the shaped text of each cell instead of the wrap layout's
+        // character-count heuristic. Wrap layout budgets columns by
+        // character count and clamps the cell to `overflow_hidden`; on a
+        // proportional glyph run — inline code chips scaled to 0.875 plus
+        // 4px padding — that budget starves narrow columns and the trailing
+        // glyph disappears (`bas`, `tod`, `rea`, `edi` in the smoke shot
+        // instead of `bash`, `todo`, `read`, `edit`). Scroll mode grows
+        // every column to its measured content and only scrolls when the
+        // total content exceeds the transcript column.
+        let table = gpui::StyleRefinement {
+            overflow: gpui::PointRefinement {
+                x: Some(gpui::Overflow::Scroll),
+                y: None,
+            },
+            ..Default::default()
+        };
+        // Cell refinement:
+        //   * transparent border — kills the per-cell vertical grid so the
+        //     table reads as flat rows (row bottom rules ride on the row
+        //     div, not the cell, and survive this override), matching the
+        //     wiki's "header rule at most" look.
+        //   * white-space nowrap — in the scroll layout, per gpui-base's
+        //     own docs, nowrap on `style.table_cell` "keeps the cell text
+        //     on a single line, and the floors are raised to the full
+        //     content widths so the single-line columns never shrink."
+        //     That is the load-bearing fix for the inline-code chip
+        //     clipping: with nowrap, the Tool column's floor becomes the
+        //     shaped width of the widest chip (with its 4px padding) plus
+        //     the cell's own padding, so the chip's trailing glyph always
+        //     lands inside the column instead of getting sliced off by
+        //     the cell's `overflow_hidden()`.
+        let mut table_cell = gpui::StyleRefinement {
+            border_color: Some(gpui::transparent_black()),
+            ..Default::default()
+        };
+        table_cell.text.white_space = Some(gpui::WhiteSpace::Nowrap);
         let text_style = gpui_kit::component::text::TextViewStyle {
             code_block,
+            table,
+            table_cell,
+            inline_code,
             ..Default::default()
         };
         div()

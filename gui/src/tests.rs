@@ -2442,10 +2442,7 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
         tokens: Some(12),
         cache_hit_rate: Some(50.),
     };
-    assert_eq!(
-        polish::status_label(&metrics),
-        "model · 12 tokens · 50.0% cache"
-    );
+    assert_eq!(polish::status_label(&metrics), "12 tokens · 50.0% cache");
     let mut state = AppState::default();
     let mut status = StatusResult {
         session: Some(SessionMetadata {
@@ -2460,7 +2457,7 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
     state.apply_status(status.clone());
     assert_eq!(
         polish::status_label(&state.metrics),
-        "model · Usage appears after the first turn"
+        "Usage appears after the first turn"
     );
     status.usage = json!({
         "input_tokens": 4, "output_tokens": 4, "cache_read_input_tokens": 4
@@ -2468,7 +2465,7 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
     state.apply_status(status);
     assert_eq!(
         polish::status_label(&state.metrics),
-        "model · 12 tokens · 50.0% cache"
+        "12 tokens · 50.0% cache"
     );
     for (name, args, expected) in [
         (
@@ -3525,9 +3522,11 @@ fn session_edit_modal_matches_the_wiki_flat_panel_shape(cx: &mut TestAppContext)
 #[gpui::test]
 fn footer_status_strip_paints_vertical_rules_between_metadata(cx: &mut TestAppContext) {
     // The wiki header pattern rules adjacent metadata with 1x14 vertical
-    // separators. Two rules ride between the pill, the metrics label, and
-    // the hint — a regression that dropped them would fuse the strip into
-    // one uniform run.
+    // separators. Band 2 now carries only two metadata slices — the usage
+    // strip on the left and the model chip pinned right — so a single
+    // rule sits between them. A regression that dropped the rule would
+    // fuse the strip into one uniform run; one that reintroduced the
+    // composer-hint duplicate would paint two rules again.
     let (window, _view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| window.draw(cx).clear(cx));
@@ -3547,9 +3546,10 @@ fn footer_status_strip_paints_vertical_rules_between_metadata(cx: &mut TestAppCo
                     && quad.bounds.size.width <= px(2.).scale(window.scale_factor())
             })
             .collect();
-        assert!(
-            rules.len() >= 2,
-            "expected two vertical rules on the status strip, saw {}",
+        assert_eq!(
+            rules.len(),
+            1,
+            "expected one rule between metrics and model chip, saw {}",
             rules.len()
         );
     });
