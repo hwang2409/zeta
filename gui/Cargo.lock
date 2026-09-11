@@ -9025,8 +9025,10 @@ dependencies = [
  "chrono",
  "gpui-kit",
  "image",
+ "proc-macro2",
  "serde",
  "serde_json",
+ "syn 2.0.119",
  "thiserror 2.0.20",
 ]
 

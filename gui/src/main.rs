@@ -6,6 +6,7 @@ mod sidebar;
 #[cfg(feature = "smoke-test")]
 mod smoke;
 mod theme;
+mod transcript_render;
 
 use gpui::{
     div, ease_in_out, prelude::*, px, Animation, AnimationExt, App, Bounds, Context, Entity,
@@ -17,8 +18,7 @@ use gpui_kit::component::{
     dialog::DialogButtonProps,
     input::{InputEvent, Textarea, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
-    text::TextView,
-    ActiveTheme, Disableable, Icon, IconName, Root, Selectable, StyledExt, WindowExt,
+    ActiveTheme, Disableable, IconName, Root, Selectable, StyledExt, WindowExt,
 };
 use std::{
     borrow::Cow,
@@ -31,6 +31,7 @@ use std::{
 use zeta_gui::{
     client::Approval,
     login::{LoginProgress, LoginProvider},
+    row_text,
     session::{ImageAttachment, SessionSettings, APPROVAL_MODES},
     state::{AppState, ConnectionState, TranscriptEdit, TranscriptEntry},
     worker::{CommandMessage, ConnectionWorker, WorkerMessage},
@@ -556,77 +557,21 @@ impl ZetaView {
         }
     }
 
-    fn render_login_row(
+    /// Resolve a provider to its typed `LoginRowText` and hand it to the
+    /// transcript-render module's `render_login_row`. Every login-row call
+    /// site — settings overlay, error recovery, in-progress banner,
+    /// first-conversation prompt — flows through this pair so the visible
+    /// labels are computed OFF the render path and the render module never
+    /// sees raw `provider.label()` again (r1 finding 1).
+    fn render_login_provider(
         &self,
         provider: &LoginProvider,
         prefix: &str,
         view: gpui::WeakEntity<Self>,
         cx: &App,
     ) -> gpui::AnyElement {
-        let id = format!("{prefix}-{}", provider.provider);
-        let name = provider.provider.clone();
-        let cancel = name.clone();
-        let cancel_view = view.clone();
-        div()
-            .id(id.clone())
-            .v_flex()
-            .gap_2()
-            .p_2()
-            .child(
-                div()
-                    .h_flex()
-                    .gap_3()
-                    .items_center()
-                    .justify_between()
-                    .child(provider.label().to_owned())
-                    .child(
-                        Button::new(format!("{id}-start"))
-                            .debug_selector({
-                                let selector = format!("{id}-start");
-                                move || selector.clone()
-                            })
-                            .h(px(40.))
-                            .label(format!("Log in with {}", provider.label()))
-                            .disabled(
-                                provider.progress.busy()
-                                    || self.state.connection != ConnectionState::Connected,
-                            )
-                            .on_click(move |_, _, cx| {
-                                let _ = view.update(cx, |view, cx| view.start_login(&name, cx));
-                            }),
-                    )
-                    .when(provider.progress.busy(), |row| {
-                        row.child(
-                            Button::new(format!("{id}-cancel"))
-                                .debug_selector({
-                                    let selector = format!("{id}-cancel");
-                                    move || selector.clone()
-                                })
-                                .h(px(40.))
-                                .label("Cancel")
-                                .disabled(provider.progress == LoginProgress::Cancelling)
-                                .on_click(move |_, _, cx| {
-                                    let _ = cancel_view
-                                        .update(cx, |view, cx| view.cancel_login(&cancel, cx));
-                                }),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .whitespace_normal()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(provider.status()),
-            )
-            .when_some(
-                match &provider.progress {
-                    LoginProgress::Failed { error } => Some(error.message.clone()),
-                    _ => None,
-                },
-                |row, error| row.child(Alert::error(format!("{id}-error"), error)),
-            )
-            .into_any_element()
+        let text = row_text::build_login(provider, prefix, &self.state.connection);
+        self.render_login_row(text, view, cx)
     }
 
     fn new_session(&mut self, cx: &mut Context<Self>) {
@@ -1102,7 +1047,7 @@ impl ZetaView {
                     .child(modal_field_label("Approval mode", cx))
                     .child(mode_row)
                     .children(self.login_providers.iter().map(|provider| {
-                        self.render_login_row(
+                        self.render_login_provider(
                             provider,
                             "settings-login",
                             cx.entity().downgrade(),
@@ -1139,466 +1084,6 @@ impl ZetaView {
                                     ),
                             ),
                     ),
-            )
-            .into_any_element()
-    }
-
-    fn render_row(&self, index: usize, view: gpui::WeakEntity<Self>, cx: &App) -> gpui::AnyElement {
-        let is_first = index == 0;
-        let is_last = index + 1 == self.state.transcript.len();
-        let this_is_tool = matches!(self.state.transcript[index], TranscriptEntry::Tool { .. });
-        let next_is_tool = self
-            .state
-            .transcript
-            .get(index + 1)
-            .is_some_and(|entry| matches!(entry, TranscriptEntry::Tool { .. }));
-        // Adjacent tool rows collapse the row gap so a run of receipts reads
-        // as one column — matches the wiki agent-run rhythm exactly. The last
-        // row also carries no gap so column bottom padding lands cleanly.
-        let row_gap = if is_last || (this_is_tool && next_is_tool) {
-            px(0.)
-        } else {
-            theme::TRANSCRIPT_ROW_GAP
-        };
-
-        let inner = self.render_row_inner(index, view, cx);
-        div()
-            .debug_selector(|| "transcript-row".into())
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .items_center()
-            // Column top/bottom padding lives on the first/last row so it
-            // travels with the virtual scroller — a wrapper around the
-            // scroller would leave the padding fixed while rows scroll under.
-            .when(is_first, |row| row.pt_4())
-            .when(is_last, |row| row.pb_3())
-            .pb(row_gap)
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .max_w(theme::TRANSCRIPT_MAX_WIDTH)
-                    .px_4()
-                    .child(inner),
-            )
-            .into_any_element()
-    }
-
-    // Every render function reachable from `render_row_inner` MUST paint
-    // only through:
-    //   - `visible` — the ordered dynamic strings from `TranscriptEntry::visible_text`
-    //   - `chrome::*` — the fixed literals module (Fork here, Open Settings, hints, units)
-    //   - `state_text(row, color)` / `record_state(row, color)` — the state-color recorder
-    //
-    // The seam is documentary: the shipping guard is the
-    // `every_row_text_flows_through_the_visible_seam_or_chrome_module`
-    // check, which scans a KNOWN FIXTURE set of `TranscriptEntry` values
-    // (User, Assistant, Thinking, Error — Tool is not fixtured in this
-    // test) plus the `chrome::ALL` literal set for the four bracketed
-    // state markers `[working]/[done]/[failed]/[canceled]`. It does NOT
-    // walk this file for new inline literals and does NOT exhaustively
-    // iterate every `TranscriptEntry` variant — an exhaustive typed
-    // row-text model with a matching renderer-literal fence is captured
-    // as the ZETA-107 follow-up in docs/design.md.
-    fn render_row_inner(
-        &self,
-        index: usize,
-        view: gpui::WeakEntity<Self>,
-        cx: &App,
-    ) -> gpui::AnyElement {
-        let entry = &self.state.transcript[index];
-        // Single seam: every renderer receives the ordered visible strings for
-        // this entry (`TranscriptEntry::visible_text`). No renderer reads its
-        // dynamic text off the entry's raw fields — that guarantees a
-        // sentinel-carrying payload cannot bypass the seam through one path.
-        let visible = entry.visible_text();
-        match entry {
-            TranscriptEntry::User(_) => self.render_user_row(index, &visible, view, cx),
-            TranscriptEntry::Assistant(doc) => {
-                self.render_assistant_row(index, &visible, doc.preview_truncated, cx)
-            }
-            TranscriptEntry::Tool { .. } => self.render_tool_row(index, &visible, entry, view, cx),
-            TranscriptEntry::Thinking => self.render_thinking_row(index, &visible, cx),
-            TranscriptEntry::Error {
-                settings_action,
-                login_provider,
-                ..
-            } => self.render_error_row(
-                index,
-                &visible,
-                *settings_action,
-                login_provider.as_deref(),
-                view,
-                cx,
-            ),
-        }
-    }
-
-    fn render_thinking_row(&self, index: usize, visible: &[&str], cx: &App) -> gpui::AnyElement {
-        // Header-only marker at muted-foreground. The label text comes from
-        // the row's `visible_text` seam so no wording lives on both sides —
-        // any regression that changes the string flows through both the
-        // render layer and the tests that assert on it.
-        let label = visible.first().copied().unwrap_or_default().to_owned();
-        let color = cx.theme().muted_foreground;
-        // state_text records (row_id, color) into the render_log at the
-        // exact moment the color is applied — a mutation that swaps the
-        // color argument at this call site is caught by the sample check.
-        state_text(|| format!("thinking-header-{index}"), color)
-            .debug_selector(move || format!("thinking-header-{index}"))
-            .w_full()
-            .min_w_0()
-            .py(px(2.))
-            .child(label)
-            .into_any_element()
-    }
-
-    fn render_user_row(
-        &self,
-        index: usize,
-        visible: &[&str],
-        view: gpui::WeakEntity<Self>,
-        cx: &App,
-    ) -> gpui::AnyElement {
-        // The user row's only dynamic body text is the prompt itself — the
-        // first (and only) string in `visible_text`.
-        let text = visible.first().copied().unwrap_or_default().to_owned();
-        let fork_id = self
-            .state
-            .session_view
-            .available
-            .then(|| self.state.session_view.message_ids.get(&index).cloned())
-            .flatten();
-        let group = format!("user-row-{index}");
-        div()
-            .group(group.clone())
-            .v_flex()
-            .child(
-                // Rectangle + hover-reveal fork button live in the SAME layout
-                // cell (relative parent, absolute button). The invisible button
-                // no longer reserves a phantom row that breaks the 14px rhythm.
-                div()
-                    .relative()
-                    .w_full()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .py_2()
-                            .px_3()
-                            .bg(cx.theme().muted)
-                            .border_l(theme::RAIL_WIDTH_THICK)
-                            .border_color(cx.theme().primary)
-                            .whitespace_normal()
-                            .child(text),
-                    )
-                    .when_some(fork_id, |row, id| {
-                        let click_id = id.clone();
-                        let click_view = view.clone();
-                        row.child(
-                            div()
-                                .absolute()
-                                .top_1()
-                                .right_1()
-                                .opacity(0.)
-                                .group_hover(group.clone(), |style| style.opacity(1.))
-                                .child(
-                                    Button::new(("fork", index))
-                                        .debug_selector(move || format!("fork-button-{index}"))
-                                        .ghost()
-                                        .compact()
-                                        .label(chrome::FORK_HERE)
-                                        .on_click(move |_, _, cx| {
-                                            let id = click_id.clone();
-                                            let _ = click_view
-                                                .update(cx, |view, cx| view.fork_message(id, cx));
-                                        }),
-                                ),
-                        )
-                    }),
-            )
-            .children(
-                self.state
-                    .session_view
-                    .attachments
-                    .get(&index)
-                    .map(|attachments| {
-                        div().mt_1().h_flex().flex_wrap().gap_2().children(
-                            attachments.iter().enumerate().map(
-                                |(attachment_index, (name, size))| {
-                                    div()
-                                        .debug_selector(|| "attachment-chip".into())
-                                        .px_2()
-                                        .py_1()
-                                        .text_size(px(12.))
-                                        .bg(cx.theme().muted)
-                                        .h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .when_some(
-                                            self.sent_images
-                                                .get(&(index, attachment_index))
-                                                .cloned(),
-                                            |chip, image| chip.child(polish::thumbnail(image, cx)),
-                                        )
-                                        .child(format!(
-                                            "{name}{}{size}{}",
-                                            chrome::ATTACHMENT_SIZE_SEPARATOR,
-                                            chrome::ATTACHMENT_SIZE_SUFFIX
-                                        ))
-                                },
-                            ),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
-    fn render_assistant_row(
-        &self,
-        index: usize,
-        visible: &[&str],
-        preview_truncated: bool,
-        cx: &App,
-    ) -> gpui::AnyElement {
-        // Naked assistant turn: 2px vertical breath, no bg, no border, no rail.
-        // Hierarchy is carried by weight + color tier + rails on OTHER row types,
-        // not by framing the assistant. Prose sits at 1.65 line-height for the
-        // wiki reading rhythm; code fences carry 12x16 padding, a 1px border,
-        // and soft-wrap so long lines never introduce a horizontal scroll.
-        let code_block = gpui::StyleRefinement::default()
-            .py(px(12.))
-            .px(px(16.))
-            .border_1()
-            .border_color(cx.theme().border)
-            .whitespace_normal();
-        let text_style = gpui_kit::component::text::TextViewStyle {
-            code_block,
-            ..Default::default()
-        };
-        // The assistant row's only dynamic body text is the rendered markdown
-        // source — the first (and only) string in `visible_text`.
-        let source = visible.first().copied().unwrap_or_default().to_owned();
-        div()
-            .py(px(2.))
-            .w_full()
-            .min_w_0()
-            .line_height(gpui::rems(1.65))
-            .when(preview_truncated, |row| {
-                row.child(chrome::ASSISTANT_TRUNCATED)
-            })
-            .child(
-                TextView::markdown(format!("message-{index}"), source)
-                    .selectable(true)
-                    .style(text_style),
-            )
-            .into_any_element()
-    }
-
-    fn render_tool_row(
-        &self,
-        index: usize,
-        visible: &[&str],
-        entry: &TranscriptEntry,
-        view: gpui::WeakEntity<Self>,
-        cx: &App,
-    ) -> gpui::AnyElement {
-        let TranscriptEntry::Tool { card, .. } = entry else {
-            unreachable!("render_tool_row invoked on non-Tool entry");
-        };
-        let is_error = entry.unsuccessful();
-        // State is signalled by COLOR ONLY. Running sits at normal text tier;
-        // done fades to muted; failed/canceled land on danger. Contract line 83
-        // forbids any textual "[working]/[done]/[failed]" marker — the color
-        // helper hands us the token, and the render below applies it through
-        // `state_text` / `record_state` on the verb, detail, and chevron
-        // elements. A mutation that swaps the color argument at any call
-        // site records the wrong color and fails the sample check.
-        let state_color = tool_state_color(entry.tool_state(), cx);
-        // Verb and detail come from the visible-text seam — index 0 is the
-        // tool name, index 1 is the summary. Any body text (expanded output)
-        // sits at index 2+ and is painted below when the card is expanded.
-        let verb = visible.first().copied().unwrap_or_default().to_owned();
-        let detail = visible.get(1).copied().unwrap_or_default().to_owned();
-        let group = format!("tool-row-{index}");
-        let output_size = card.tail.text.len();
-
-        div()
-            .group(group.clone())
-            .id(("tool-receipt", index))
-            .debug_selector(move || format!("tool-receipt-{index}"))
-            .relative()
-            .w_full()
-            .min_w_0()
-            .cursor_pointer()
-            .hover(|style| style.bg(cx.theme().list_hover))
-            .on_click(move |_, _, cx| {
-                let _ = view.update(cx, |view, cx| {
-                    view.state.toggle_card(index);
-                    view.transcript.update(cx, |scroll, cx| {
-                        scroll.remeasure_items(index..index + 1, cx);
-                    });
-                    cx.notify();
-                });
-            })
-            .child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .items_center()
-                    .min_h(px(20.))
-                    .child(
-                        Icon::new(if card.expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(px(12.))
-                        .text_color(record_state(
-                            || format!("tool-chevron-{index}"),
-                            state_color,
-                        )),
-                    )
-                    .child(
-                        // Verb + detail route their state color through the
-                        // recorder so a swap on this single call is caught
-                        // by the render_log sample check.
-                        state_text(|| format!("tool-verb-{index}"), state_color)
-                            .debug_selector(move || format!("tool-verb-{index}"))
-                            .flex_shrink_0()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(verb),
-                    )
-                    .child(
-                        state_text(|| format!("tool-detail-{index}"), state_color)
-                            .debug_selector(move || format!("tool-detail-{index}"))
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .opacity(0.78)
-                            .child(detail),
-                    )
-                    // Collapsed rows carry the output size at faint tier and a
-                    // hover-fade "show output" hint — the visible affordance for
-                    // the click-to-expand behaviour.
-                    .when(!card.expanded && output_size > 0, |row| {
-                        row.child(
-                            div()
-                                .flex_shrink_0()
-                                .text_color(cx.theme().muted_foreground)
-                                .opacity(0.78)
-                                .text_size(px(12.))
-                                .child(format_output_size(output_size)),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_color(cx.theme().muted_foreground)
-                                .opacity(0.)
-                                .group_hover(group.clone(), |style| style.opacity(0.78))
-                                .text_size(px(12.))
-                                .child(chrome::TOOL_HOVER_HINT),
-                        )
-                    }),
-            )
-            .when(card.expanded, |row| {
-                // Expanded body text comes from the seam (index 2). The
-                // "Earlier output omitted" marker is fixed chrome, not part
-                // of the dynamic strings — the renderer pulls it from the
-                // chrome-constants module when the tail was truncated.
-                let body = visible.get(2).copied().unwrap_or_default().to_owned();
-                let truncated = card.tail.truncated;
-                row.child(
-                    div()
-                        .debug_selector(move || format!("tool-output-{index}"))
-                        // Indent rail: margin 3/0/5, padding-left 8, 1px rail,
-                        // panel fill — reads as a subordinate body without
-                        // fighting the row's leading verb. Vertical padding sits
-                        // at 2px per the wiki contract, not the 4px `.py_1()`.
-                        .mt(px(3.))
-                        .mb(px(5.))
-                        .pl_2()
-                        .py(px(2.))
-                        .border_l(theme::RAIL_WIDTH_THIN)
-                        .border_color(if is_error {
-                            cx.theme().danger
-                        } else {
-                            cx.theme().border
-                        })
-                        .bg(cx.theme().sidebar)
-                        .text_color(cx.theme().muted_foreground)
-                        .when(truncated, |output| {
-                            output.child(div().opacity(0.7).child(chrome::TOOL_TAIL_OMITTED))
-                        })
-                        .child(div().whitespace_normal().child(body)),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_error_row(
-        &self,
-        index: usize,
-        visible: &[&str],
-        settings_action: bool,
-        login_provider: Option<&str>,
-        view: gpui::WeakEntity<Self>,
-        cx: &App,
-    ) -> gpui::AnyElement {
-        // Error rows expose two visible strings: the "Error" header at index
-        // 0 and the message body at index 1. Both flow through the seam.
-        let header = visible.first().copied().unwrap_or_default().to_owned();
-        let message = visible.get(1).copied().unwrap_or_default().to_owned();
-        div()
-            .debug_selector(move || format!("error-block-{index}"))
-            .v_flex()
-            .gap_2()
-            .pl_3()
-            .py_1()
-            .border_l(theme::RAIL_WIDTH_THICK)
-            .border_color(cx.theme().danger)
-            .child(
-                div()
-                    .text_color(cx.theme().danger)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(header),
-            )
-            .child(
-                div()
-                    .debug_selector(move || format!("error-message-{index}"))
-                    .whitespace_normal()
-                    .child(message),
-            )
-            .when_some(
-                login_provider.and_then(|provider| {
-                    self.login_providers
-                        .iter()
-                        .find(|row| row.provider == provider)
-                }),
-                |block, provider| {
-                    block.child(self.render_login_row(
-                        provider,
-                        &format!("error-login-{index}"),
-                        view.clone(),
-                        cx,
-                    ))
-                },
-            )
-            .when(
-                settings_action && self.state.session_view.available,
-                |block| {
-                    block.child(
-                        Button::new(("error-settings", index))
-                            .debug_selector(move || format!("error-settings-{index}"))
-                            .label(chrome::OPEN_SETTINGS)
-                            .on_click(move |_, _, cx| {
-                                let _ = view.update(cx, |view, cx| view.open_settings(cx));
-                            }),
-                    )
-                },
             )
             .into_any_element()
     }
@@ -2016,47 +1501,6 @@ pub(crate) fn tool_state_color(state: zeta_gui::state::ToolState, cx: &App) -> g
     }
 }
 
-/// Fixed literals painted as row chrome (headings, hints, unit suffixes,
-/// action labels). Every string that reaches the user through a row's own
-/// text elements — but does NOT belong to `visible_text` (dynamic body
-/// text) — lives here so the seam has one home per literal. The
-/// `every_row_text_flows_through_the_visible_seam_or_chrome_module` check
-/// scans this literal set and a KNOWN FIXTURE set of `TranscriptEntry`
-/// values for the four bracketed state markers
-/// `[working]/[done]/[failed]/[canceled]` — nothing more. The deferred
-/// renderer-literal fence tracked in docs/design.md is what would
-/// statically catch a NEW action label added inline.
-pub(crate) mod chrome {
-    pub(crate) const ASSISTANT_TRUNCATED: &str = "Showing the latest streamed text…";
-    pub(crate) const TOOL_HOVER_HINT: &str = "show output";
-    pub(crate) const TOOL_TAIL_OMITTED: &str = "Earlier output omitted";
-    pub(crate) const OUTPUT_SIZE_UNIT_B: &str = "B";
-    pub(crate) const OUTPUT_SIZE_UNIT_KB: &str = "KB";
-    pub(crate) const OUTPUT_SIZE_UNIT_MB: &str = "MB";
-    pub(crate) const ATTACHMENT_SIZE_SEPARATOR: &str = " · ";
-    pub(crate) const ATTACHMENT_SIZE_SUFFIX: &str = " bytes";
-    pub(crate) const FORK_HERE: &str = "Fork here";
-    pub(crate) const OPEN_SETTINGS: &str = "Open Settings";
-    /// Every fixed literal the seam region may paint. The seam test walks
-    /// this set to prove no state marker sneaks through chrome wording,
-    /// and it stays exhaustive for the deferred renderer-literal fence
-    /// (see docs/design.md) — that fence, once implemented, will consume
-    /// `ALL` to allowlist chrome and fail on any inline literal outside it.
-    #[cfg(test)]
-    pub(crate) const ALL: &[&str] = &[
-        ASSISTANT_TRUNCATED,
-        TOOL_HOVER_HINT,
-        TOOL_TAIL_OMITTED,
-        OUTPUT_SIZE_UNIT_B,
-        OUTPUT_SIZE_UNIT_KB,
-        OUTPUT_SIZE_UNIT_MB,
-        ATTACHMENT_SIZE_SEPARATOR,
-        ATTACHMENT_SIZE_SUFFIX,
-        FORK_HERE,
-        OPEN_SETTINGS,
-    ];
-}
-
 /// State-color recorder. Every state-colored text element in the SEAM
 /// region routes its color through `record_state` or the div-returning
 /// `state_text` shorthand, both of which write `(row_id, color)` to
@@ -2123,28 +1567,6 @@ pub(crate) mod render_log {
 
     pub(crate) fn samples() -> Vec<Sample> {
         SAMPLES.with(|slot| slot.borrow().clone())
-    }
-}
-
-/// Compact byte-size label for the collapsed tool-row output peek. Kept short
-/// so the receipt still fits on one line at the wiki 1024px column. Unit
-/// suffixes come from the chrome-constants module so wording changes have
-/// one home and the seam tests can iterate them.
-fn format_output_size(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes}{}", chrome::OUTPUT_SIZE_UNIT_B)
-    } else if bytes < 1024 * 1024 {
-        format!(
-            "{:.1}{}",
-            bytes as f64 / 1024.0,
-            chrome::OUTPUT_SIZE_UNIT_KB
-        )
-    } else {
-        format!(
-            "{:.1}{}",
-            bytes as f64 / (1024.0 * 1024.0),
-            chrome::OUTPUT_SIZE_UNIT_MB
-        )
     }
 }
 
@@ -2297,7 +1719,7 @@ impl Render for ZetaView {
                         .iter()
                         .filter(|provider| provider.progress != LoginProgress::Idle)
                         .map(|provider| {
-                            self.render_login_row(
+                            self.render_login_provider(
                                 provider,
                                 "login-progress",
                                 cx.entity().downgrade(),
@@ -2353,7 +1775,7 @@ impl Render for ZetaView {
                                             needs_login && row.progress == LoginProgress::Idle
                                         })
                                         .map(|provider| {
-                                            self.render_login_row(
+                                            self.render_login_provider(
                                                 provider,
                                                 "first-login",
                                                 cx.entity().downgrade(),

@@ -527,16 +527,18 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
             visual.debug_bounds("tool-detail-0").is_some(),
             "detail element must paint for state {case:?}"
         );
-        // Visible-text seam: the row's own text goes through `visible_text`
-        // (name + summary + expanded body). No bracketed state marker may
-        // reach it in any state — that would revert contract line 83.
+        // Typed row-text model: the tool row's paint set (verb + detail +
+        // optional peek/hover/omitted/body) is a `ToolRowText` built by
+        // `row_text::build`. No bracketed state marker may reach any field
+        // in any state — that would revert contract line 83.
         view.read_with(&visual, |view, _| {
-            let strings = view.state.transcript[0].visible_text();
+            let entry = &view.state.transcript[0];
+            let row = zeta_gui::row_text::build(entry, 0, &view.state.session_view, true);
             for marker in ["[working]", "[done]", "[failed]", "[canceled]"] {
-                for text in &strings {
+                for text in row.visible_strings() {
                     assert!(
                         !text.contains(marker),
-                        "tool row visible_text carried state marker {marker} for {case:?}: {text:?}"
+                        "tool row text carried state marker {marker} for {case:?}: {text:?}"
                     );
                 }
             }
@@ -1091,33 +1093,55 @@ fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut 
 }
 
 #[test]
-fn every_row_text_flows_through_the_visible_seam_or_chrome_module() {
-    // No renderer may sneak dynamic body text past `visible_text` and no
-    // chrome literal may sneak past the `chrome` module. Iterating both and
-    // asserting on the joined string catches a regression that adds a
-    // bracketed state marker anywhere the user can read it.
+fn every_row_text_flows_through_the_typed_row_text_model() {
+    // Sentinel sweep across every `TranscriptEntry` variant: the row-text
+    // model iterates every field a renderer paints (content + attachments +
+    // labels + hints + body), so a marker anywhere on the row fails here.
+    // Together with the renderer-literal fence, the sweep guarantees no
+    // stray "[working]/[done]/[failed]/[canceled]" text lands on a row.
+    use zeta_gui::cards::Card;
+    use zeta_gui::row_text::{self, chrome};
+    use zeta_gui::state::ToolReceiptKey;
     let markers = ["[working]", "[done]", "[failed]", "[canceled]"];
+    let session_view = zeta_gui::session::SessionView::default();
     let entries = [
         TranscriptEntry::User("hi".into()),
         TranscriptEntry::Assistant("hello".into()),
         TranscriptEntry::Thinking,
         TranscriptEntry::Error {
             message: "boom".into(),
-            settings_action: false,
+            settings_action: true,
             login_provider: None,
+        },
+        TranscriptEntry::Tool {
+            key: ToolReceiptKey {
+                session_id: None,
+                agent_instance_id: None,
+                tool_call_id: "id".into(),
+            },
+            name: "bash".into(),
+            summary: "echo".into(),
+            complete: true,
+            error: false,
+            canceled: false,
+            card: Card {
+                expanded: true,
+                ..Default::default()
+            },
         },
     ];
     for entry in &entries {
-        for text in entry.visible_text() {
+        let row = row_text::build(entry, 0, &session_view, true);
+        for text in row.visible_strings() {
             for marker in markers {
                 assert!(
                     !text.contains(marker),
-                    "visible_text carried {marker} in {text:?}"
+                    "row text carried {marker} in {text:?}"
                 );
             }
         }
     }
-    for literal in super::chrome::ALL {
+    for literal in chrome::ALL {
         for marker in markers {
             assert!(
                 !literal.contains(marker),
@@ -1125,11 +1149,12 @@ fn every_row_text_flows_through_the_visible_seam_or_chrome_module() {
             );
         }
     }
-    // Thinking's visible text is exactly the generic header — no wording
-    // duplication between state.rs and the render layer.
+    // The Thinking row's paint set is exactly the generic header — no
+    // reasoning body ever leaks into the row's visible strings.
+    let thinking = row_text::build(&TranscriptEntry::Thinking, 0, &session_view, true);
     assert_eq!(
-        TranscriptEntry::Thinking.visible_text(),
-        vec![zeta_gui::state::THINKING_HEADER_LABEL.to_owned()]
+        thinking.visible_strings(),
+        vec![zeta_gui::state::THINKING_HEADER_LABEL]
     );
 }
 
@@ -2233,23 +2258,25 @@ fn thinking_row_paints_a_generic_header_and_never_leaks_private_reasoning(cx: &m
             "transcript must hold a single header-only Thinking marker, got {:?}",
             view.state.transcript
         );
-        // Visible-text seam: every visible string the render layer paints for
-        // any row goes through `visible_text`. The Thinking row's only
-        // contribution is the generic label — no row's visible text may
-        // contain the sentinel.
-        for entry in &view.state.transcript {
-            for text in entry.visible_text() {
+        // Row-text model: every visible string the render layer paints for
+        // any row is built by `row_text::build`. The Thinking row's only
+        // contribution is the generic header — no row's model may carry
+        // the sentinel on any field.
+        for (index, entry) in view.state.transcript.iter().enumerate() {
+            let row = zeta_gui::row_text::build(entry, index, &view.state.session_view, true);
+            for text in row.visible_strings() {
                 assert!(
                     !text.contains(sentinel),
                     "sentinel reached a row's visible text: {text:?}"
                 );
             }
         }
-        let thinking_text = view.state.transcript[0].visible_text();
+        let thinking =
+            zeta_gui::row_text::build(&view.state.transcript[0], 0, &view.state.session_view, true);
         assert_eq!(
-            thinking_text,
-            vec![zeta_gui::state::THINKING_HEADER_LABEL.to_owned()],
-            "Thinking row visible text must be exactly the generic label"
+            thinking.visible_strings(),
+            vec![zeta_gui::state::THINKING_HEADER_LABEL],
+            "Thinking row model text must be exactly the generic header"
         );
     });
     // Paint: the generic header renders.
@@ -2600,6 +2627,57 @@ fn sent_image_decode_failure_keeps_attachment_text(cx: &mut TestAppContext) {
     });
     assert!(visual.debug_bounds("attachment-chip").is_some());
     assert!(visual.debug_bounds("attachment-thumbnail").is_none());
+}
+
+#[gpui::test]
+fn text_only_history_user_row_paints_the_empty_attachment_gap(cx: &mut TestAppContext) {
+    // r3 rendered-bounds guard for the attachment tri-state.
+    //
+    // Text-only history rows carry `Some(vec![])` in
+    // `session_view.attachments` (attachment key present but empty) while
+    // pre-history rows carry `None`. The typed-seam renderer paints the
+    // `.mt_1()` container whenever the value is `Some` — even when the
+    // list is empty — so the row height matches the pre-seam behaviour
+    // for text-only history rows. A revert that collapses the tri-state
+    // to "check for empty list" would skip the container in the
+    // `Some(vec![])` case, shrinking the row height by the `.mt_1()`
+    // gap. This test measures the actual rendered row bounds so the
+    // regression fails here even if the unit test in `row_text.rs`
+    // remains green.
+    let render_single_user_row =
+        |cx: &mut TestAppContext, present_empty: bool| -> gpui::Bounds<gpui::Pixels> {
+            let (window, view, _) = setup(cx);
+            let mut visual = VisualTestContext::from_window(window.into(), cx);
+            visual.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.state.transcript = vec![TranscriptEntry::User("hi".into())];
+                    if present_empty {
+                        view.state.session_view.attachments.insert(0, Vec::new());
+                    }
+                    view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            visual
+                .debug_bounds("transcript-row")
+                .expect("transcript row renders")
+        };
+    let absent = render_single_user_row(cx, false);
+    let present_empty = render_single_user_row(cx, true);
+    // The attachment container is `.mt_1()` on top of an empty flex row,
+    // so the present-empty case must be at least ~4px taller. Allow a
+    // sub-logical-pixel slack for scaling arithmetic.
+    let delta = present_empty.size.height - absent.size.height;
+    assert!(
+        delta >= gpui::px(3.),
+        "text-only history user row must paint the `.mt_1()` attachment \
+         container (Some(vec![]) tri-state); present_empty={:?}, \
+         absent={:?}, delta={:?}",
+        present_empty.size.height,
+        absent.size.height,
+        delta,
+    );
 }
 
 #[gpui::test]
@@ -4189,4 +4267,516 @@ fn sidebar_row_focus_map_prunes_removed_rows_and_keeps_survivors(cx: &mut TestAp
             "surviving branch must keep the same focus handle across redraws"
         );
     });
+}
+
+/// Renderer-literal fence — the ZETA-109 AST-based static guard.
+///
+/// The typed `row_text::RowText` / `LoginRowText` model is the sole source
+/// of every user-visible string a transcript row paints. This fence proves
+/// it stays that way by parsing the WHOLE `transcript_render.rs` module
+/// with `syn` on every run and rejecting every string, byte-string, or
+/// C-string literal in expression position — no ambient allowance from any
+/// method-call subtree. The only literals that pass are the ones carried
+/// by an allowlisted macro payload.
+///
+/// AST context, not string shape, is what distinguishes an ID from
+/// visible text — that closes the r1 review's bypasses:
+///
+///   * `.child("[done]")` — literal outside allowed subtree
+///   * `.child("done")`  — lowercase-safe shape does NOT save it
+///   * `Alert::error(..., "hardcoded")` — plain string second arg
+///   * `format!("hello {n}")` — bare format outside allowed subtree
+///   * `format!("tool-verb-{i}")` — ID-shaped format still flagged
+///   * `String::from_utf8_lossy(b"…")` — byte strings are flagged too
+///   * `c"leaked"` — C-string literals are flagged too
+///   * `stringify!(leaked)` / `concat!("a", "b")` — forbidden macros
+///     (r3 finding — accidental non-`format!` string builders)
+///   * a new `render_login_row` helper hiding text — the WHOLE module is
+///     scanned, not a fixed six-fn allowlist, so renaming or splitting
+///     renderers cannot smuggle a literal past the fence.
+///
+/// Allowed macro payloads (every other literal is rejected):
+///
+/// * Diagnostic macros — `panic!`, `unreachable!`, `todo!`,
+///   `unimplemented!`, `assert{,_eq,_ne}!`, `debug_assert{,_eq,_ne}!` —
+///   whose payloads never reach the user.
+/// * `matches!` — the ONE pattern-only macro the render module uses;
+///   its payload is a pattern, never visible text.
+/// * `format!` — literal fragments in the payload are still checked
+///   against the (always-zero) ambient depth, so any literal there
+///   still trips. `format!` calls in the render module are rejected
+///   because there is no legitimate use — widget-ID composition lives
+///   in `row_text::sel::*` and returns a `String` back to the module.
+///
+/// Every OTHER macro (`stringify!`, `concat!`, `write!`, `println!`,
+/// arbitrary imported macros) is rejected outright — the module has no
+/// legitimate use for them.
+///
+/// The `chrome`-coverage arm parses `row_text.rs` for the `pub mod chrome`
+/// submodule and proves (a) every `pub const NAME: &str = "…"` sits at
+/// exactly `pub` visibility (no `pub(super)`/`pub(crate)`/private bypass)
+/// and (b) is a member of `chrome::ALL`. Adding a new chrome constant
+/// without listing it in `ALL` silently escapes the seam sweep — this
+/// test flags that regression.
+#[test]
+fn renderer_literal_fence_rejects_literals_outside_allowed_contexts() {
+    const SOURCE: &str = include_str!("transcript_render.rs");
+    let failures = fence::run(SOURCE);
+    assert!(
+        failures.is_empty(),
+        "renderer_literal_fence tripped on transcript_render.rs:\n  - {}",
+        failures.join("\n  - "),
+    );
+}
+
+#[test]
+fn renderer_literal_fence_ast_visitor_flags_the_probe_bypasses() {
+    // Mutation battery — the six probes the r1 review named MUST all
+    // trip. Runs the same AST visitor over synthetic module snippets so
+    // the guard's guard fires on every push. If any probe stops
+    // failing, the fence has weakened and the review's finding is
+    // silently back.
+    let probes: &[(&str, &str)] = &[
+        (
+            "bracketed state marker",
+            r#"impl X { fn f(&self) -> D { div().child("[done]") } }"#,
+        ),
+        (
+            "lowercase prose reaches child",
+            r#"impl X { fn f(&self) -> D { div().child("done") } }"#,
+        ),
+        (
+            "prose format! fragment outside allowed context",
+            r#"impl X { fn f(&self, n: usize) -> D { div().child(format!("hello {n}")) } }"#,
+        ),
+        (
+            "ID-shaped format! fragment outside allowed context",
+            r#"impl X { fn f(&self, i: usize) -> D { div().child(format!("tool-verb-{i}")) } }"#,
+        ),
+        (
+            "byte-string literal bypasses via from_utf8_lossy",
+            r#"impl X { fn f(&self) -> D { div().child(String::from_utf8_lossy(b"leaked").to_string()) } }"#,
+        ),
+        (
+            "renamed/new helper fn in the module still scanned",
+            r#"impl X { fn f(&self) -> D { self.helper() } fn helper(&self) -> D { div().child("leaked-via-helper") } }"#,
+        ),
+        (
+            "C-string literal reaches child",
+            r#"impl X { fn f(&self) -> D { div().child(c"leaked".to_str().unwrap()) } }"#,
+        ),
+        (
+            "stringify! macro assembles a leaked string",
+            r#"impl X { fn f(&self) -> D { div().child(stringify!(LEAKED_IDENT)) } }"#,
+        ),
+        (
+            "concat! macro joins literal fragments",
+            r#"impl X { fn f(&self) -> D { div().child(concat!("a", "-", "b")) } }"#,
+        ),
+        (
+            "write! macro (imports unlisted machinery)",
+            r#"impl X { fn f(&self, out: &mut String) { let _ = write!(out, "hi"); } }"#,
+        ),
+        (
+            "debug_selector method allowance is gone — bare literal still trips",
+            r#"impl X { fn f(&self) -> D { div().debug_selector(|| "transcript-row".into()) } }"#,
+        ),
+        (
+            "id method allowance is gone — bare literal still trips",
+            r#"impl X { fn f(&self, i: usize) -> D { div().id(("tool-receipt", i)) } }"#,
+        ),
+        (
+            "aria_label method allowance is gone — bare literal still trips",
+            r#"impl X { fn f(&self) -> D { div().aria_label("dialog") } }"#,
+        ),
+    ];
+    for (label, probe) in probes {
+        let failures = fence::run(probe);
+        assert!(
+            !failures.is_empty(),
+            "mutation probe MUST trip the fence — {label}\nsnippet: {probe}\ngot failures: {failures:?}"
+        );
+    }
+}
+
+#[test]
+fn renderer_literal_fence_accepts_the_legitimate_shapes() {
+    // Positive fixtures — every allowed usage the render module actually
+    // emits. If ANY of these starts failing, the fence has become too
+    // strict and legitimate render code cannot compile.
+    //
+    // r3 fence: the method-name allowance for `debug_selector`/`id`/
+    // `aria_label`/`role` is gone. Every selector call in the module
+    // takes a const path or a `sel::*` helper's `String`, so no bare
+    // literal ever sits inside those args. Every positive fixture here
+    // is literal-free outside diagnostic-macro payloads.
+    let positives: &[&str] = &[
+        // Selector const routed through .debug_selector — no literal.
+        r#"impl X { fn f(&self) -> D { div().debug_selector(|| sel::TRANSCRIPT_ROW.into()) } }"#,
+        // Selector helper returning a String routed through .debug_selector.
+        r#"impl X { fn f(&self, i: usize) -> D { div().debug_selector(move || sel::tool_verb(i)) } }"#,
+        // Selector const paired with an index tuple — no literal.
+        r#"impl X { fn f(&self, i: usize) -> D { div().id((sel::TOOL_RECEIPT_TAG, i)) } }"#,
+        // Owned selector ID routed through .id.
+        r#"impl X { fn f(&self, id: String) -> D { div().id(id) } }"#,
+        // Diagnostic macro escape — `unreachable!` is the only diagnostic
+        // the round-4-tightened allowlist keeps.
+        r#"impl X { fn f(&self) { unreachable!("row-inner-entry-mismatch") } }"#,
+        // matches! is a pattern-only macro the module legitimately uses.
+        r#"impl X { fn f(&self, e: &E) -> bool { matches!(e, E::Tool { .. }) } }"#,
+        // Passing a chrome-const path through .child — no literal.
+        r#"impl X { fn f(&self) -> D { div().child(row_text::chrome::FORK_HERE) } }"#,
+    ];
+    for probe in positives {
+        let failures = fence::run(probe);
+        assert!(
+            failures.is_empty(),
+            "positive fixture MUST pass the fence:\nsnippet: {probe}\ngot failures: {failures:?}",
+        );
+    }
+}
+
+#[test]
+fn renderer_literal_fence_mutation_battery_against_the_real_module() {
+    // Round-2 mutation battery — each entry names a review-attested
+    // bypass and mutates the ACTUAL `transcript_render.rs` source. The
+    // fence MUST trip on every one. This is the same set the orchestrator
+    // re-runs on the final head; if any stops failing, the guard has
+    // weakened and the review's finding is silently back.
+    const SOURCE: &str = include_str!("transcript_render.rs");
+    let mutations: &[(&str, &str, &str)] = &[
+        // (label, injection point — matched verbatim, mutated snippet)
+        (
+            "child bracketed state marker",
+            ".child(header)\n            .into_any_element()\n    }",
+            ".child(\"[done]\")\n            .child(header)\n            .into_any_element()\n    }",
+        ),
+        (
+            "child lowercase prose",
+            ".child(header)\n            .into_any_element()\n    }",
+            ".child(\"done\")\n            .child(header)\n            .into_any_element()\n    }",
+        ),
+        (
+            "rename render_thinking_row",
+            "fn render_thinking_row(&self",
+            "fn render_thinking_pane(&self",
+        ),
+        (
+            "text moved into a fresh helper fn in the module",
+            "impl ZetaView {\n    pub(crate) fn render_row(",
+            "impl ZetaView {\n    fn newly_added_helper(&self) -> &str { \"leaked-via-helper\" }\n    pub(crate) fn render_row(",
+        ),
+        (
+            "prose format! fragment outside allowed context",
+            ".child(header)",
+            ".child(format!(\"You have {} messages\", 3)).child(header)",
+        ),
+        (
+            "ID-shaped format! fragment outside allowed context",
+            ".child(header)",
+            ".child(format!(\"tool-verb-{}\", 3)).child(header)",
+        ),
+        (
+            "c-string literal leaks into a child slot",
+            ".child(header)",
+            ".child(c\"leaked\".to_str().unwrap()).child(header)",
+        ),
+        (
+            "stringify! macro leaks into a child slot",
+            ".child(header)",
+            ".child(stringify!(LEAKED_IDENT)).child(header)",
+        ),
+        (
+            "concat! macro leaks into a child slot",
+            ".child(header)",
+            ".child(concat!(\"a\", \"-\", \"b\")).child(header)",
+        ),
+    ];
+    let mut ran = 0usize;
+    for (label, needle, replacement) in mutations {
+        assert!(
+            SOURCE.contains(needle),
+            "mutation battery: injection anchor {needle:?} not found for probe {label:?}"
+        );
+        let mutated = SOURCE.replacen(needle, replacement, 1);
+        let failures = fence::run(&mutated);
+        // The `rename` mutation does NOT introduce a new literal; the fence
+        // MUST NOT trip for it. Every other mutation SHOULD trip.
+        let expect_trip = *label != "rename render_thinking_row";
+        if expect_trip {
+            assert!(
+                !failures.is_empty(),
+                "mutation MUST trip the fence — {label}\ngot failures: {failures:?}"
+            );
+        } else {
+            assert!(
+                failures.is_empty(),
+                "rename mutation MUST NOT trip the fence (fence scans WHOLE module, \
+                 not a fn-name list) — got failures: {failures:?}"
+            );
+        }
+        ran += 1;
+    }
+    assert_eq!(ran, 9, "battery must exercise every review-named probe");
+}
+
+#[test]
+fn renderer_literal_fence_chrome_consts_are_public_and_listed_in_all() {
+    // Parse row_text.rs's `pub mod chrome` and check:
+    //   (a) every `pub const NAME: &str = "…"` sits at exactly `pub`
+    //       visibility — `pub(super)` / `pub(crate)` / private are the
+    //       exact bypass this test names,
+    //   (b) every declared constant appears in `chrome::ALL`, so the
+    //       seam-sweep tests that iterate `ALL` pick it up.
+    const SOURCE: &str = include_str!("row_text.rs");
+    let (declared, all) = fence::chrome_summary(SOURCE);
+    assert!(
+        !declared.is_empty(),
+        "fence: chrome module scan returned zero constants — parser regressed?"
+    );
+    for name in &declared {
+        assert!(
+            all.contains(name),
+            "chrome::{name} is declared but missing from chrome::ALL — \
+             add it so the seam sweep and the fence pick it up"
+        );
+    }
+}
+
+mod fence {
+    //! AST fence internals — a `syn`-based visitor over a Rust module's
+    //! source. Kept in a submodule so the tests read cleanly and the
+    //! visitor stays testable on its own.
+
+    use syn::visit::{self, Visit};
+
+    /// Diagnostic macros whose payloads never reach the user. Their
+    /// token stream is scanned inside an allowed subtree so any literal
+    /// payload passes. Round-4 tightening: reduced to exactly what the
+    /// render module uses (`unreachable!`). Every other diagnostic macro
+    /// (`panic!`, `todo!`, `unimplemented!`, `assert*!`, `debug_assert*!`)
+    /// is default-deny — adding one to the module trips the fence.
+    const DIAGNOSTIC_MACROS: &[&str] = &["unreachable"];
+
+    /// Pattern-only macros the render module legitimately uses. Their
+    /// payload carries no visible text.
+    const PATTERN_MACROS: &[&str] = &["matches"];
+
+    /// `format!` is scanned WITHOUT bumping the allowed subtree — any
+    /// literal fragment in its payload is checked against the ambient
+    /// depth (which is always zero now that the method-name allowance
+    /// is gone) and trips the fence.
+    const FORMAT_MACRO: &str = "format";
+
+    /// Parse `source` and return every literal the fence flags. Empty
+    /// vector means the source is clean.
+    pub(super) fn run(source: &str) -> Vec<String> {
+        let file = match syn::parse_file(source) {
+            Ok(file) => file,
+            Err(err) => return vec![format!("fence: parse error: {err}")],
+        };
+        let mut visitor = Visitor::default();
+        visit::visit_file(&mut visitor, &file);
+        visitor.failures
+    }
+
+    /// Extract `(declared_names, all_names)` from `row_text.rs`'s
+    /// `pub mod chrome { ... }` submodule. Panics on unexpected shape so
+    /// the fence stays authoritative on chrome layout.
+    pub(super) fn chrome_summary(source: &str) -> (Vec<String>, Vec<String>) {
+        let file = syn::parse_file(source).expect("parse row_text.rs");
+        let chrome = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Mod(m) if m.ident == "chrome" => Some(m),
+                _ => None,
+            })
+            .expect("row_text.rs must declare `pub mod chrome`");
+        assert!(
+            matches!(chrome.vis, syn::Visibility::Public(_)),
+            "chrome module must be `pub`"
+        );
+        let content = &chrome
+            .content
+            .as_ref()
+            .expect("chrome module must be inline")
+            .1;
+        let mut declared = Vec::new();
+        let mut all = Vec::new();
+        for item in content {
+            let syn::Item::Const(c) = item else { continue };
+            let name = c.ident.to_string();
+            if name == "ALL" {
+                if let syn::Expr::Reference(refexpr) = c.expr.as_ref() {
+                    if let syn::Expr::Array(arr) = refexpr.expr.as_ref() {
+                        for elem in &arr.elems {
+                            if let syn::Expr::Path(p) = elem {
+                                let last = p
+                                    .path
+                                    .segments
+                                    .last()
+                                    .expect("chrome::ALL entry has at least one segment");
+                                all.push(last.ident.to_string());
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            // Only inspect &str consts (the visible-string set). Other
+            // shapes (e.g. `pub const ALL: &[&str]`) are handled above.
+            if !is_str_ref_type(&c.ty) {
+                continue;
+            }
+            assert!(
+                matches!(c.vis, syn::Visibility::Public(_)),
+                "chrome::{name} must be `pub` (no `pub(super)` / `pub(crate)` / private) — \
+                 the visibility bypass fails the fence."
+            );
+            declared.push(name);
+        }
+        (declared, all)
+    }
+
+    fn is_str_ref_type(ty: &syn::Type) -> bool {
+        let syn::Type::Reference(r) = ty else {
+            return false;
+        };
+        let syn::Type::Path(p) = r.elem.as_ref() else {
+            return false;
+        };
+        p.path.is_ident("str")
+    }
+
+    #[derive(Default)]
+    struct Visitor {
+        failures: Vec<String>,
+        // Non-zero while the visitor is inside an allowed method-call
+        // argument subtree OR inside a diagnostic macro's token stream.
+        allowed_depth: usize,
+    }
+
+    impl<'ast> Visit<'ast> for Visitor {
+        fn visit_expr_lit(&mut self, node: &'ast syn::ExprLit) {
+            self.check_lit(&node.lit);
+            visit::visit_expr_lit(self, node);
+        }
+
+        fn visit_lit(&mut self, lit: &'ast syn::Lit) {
+            // Also called for patterns and other non-Expr contexts. The
+            // depth counter still governs — anything outside allowed
+            // scope is flagged.
+            self.check_lit(lit);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            let name = node
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            if DIAGNOSTIC_MACROS.iter().any(|d| *d == name)
+                || PATTERN_MACROS.iter().any(|p| *p == name)
+            {
+                // Diagnostic payloads never surface. Pattern macros
+                // (`matches!`) carry patterns, not visible text. Both
+                // ride an allowed subtree so any literal token passes.
+                self.allowed_depth += 1;
+                self.scan_tokens(node.tokens.clone());
+                self.allowed_depth -= 1;
+            } else if name == FORMAT_MACRO {
+                // `format!` is scanned at ambient depth (always 0 now).
+                // Any literal fragment in its payload trips the fence.
+                self.scan_tokens(node.tokens.clone());
+            } else {
+                self.failures.push(format!(
+                    "forbidden macro `{name}!` in the render module — the fence \
+                     allowlists only `unreachable!`, the pattern-only `matches!`, \
+                     and `format!` (whose literal fragments are still checked). \
+                     Every other macro (`panic!`, `todo!`, `unimplemented!`, \
+                     `assert*!`, `debug_assert*!`, `stringify!`, `concat!`, \
+                     `write!`, unknown/imported macros) is rejected — route \
+                     every visible string through the RowText / LoginRowText \
+                     model or `row_text::chrome`."
+                ));
+                self.scan_tokens(node.tokens.clone());
+            }
+        }
+
+        fn visit_attribute(&mut self, _node: &'ast syn::Attribute) {
+            // Skip attribute contents entirely — `#[doc = "..."]`,
+            // `#[cfg_attr(..., allow_unused_variables)]`, `#[cfg(...)]`
+            // literals never reach the render surface.
+        }
+
+        fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+            // Const items in the render module MUST NOT declare visible
+            // strings — chrome consts live in row_text.rs. A `const FOO:
+            // &str = "..."` in transcript_render.rs is a bypass.
+            let is_str_const = is_str_ref_type(&node.ty);
+            if is_str_const {
+                self.failures.push(format!(
+                    "forbidden `const {}: &str = ...` in the render module — \
+                     move it to `row_text::chrome` so the seam-sweep tests \
+                     iterate it too.",
+                    node.ident
+                ));
+            }
+            visit::visit_item_const(self, node);
+        }
+    }
+
+    impl Visitor {
+        fn check_lit(&mut self, lit: &syn::Lit) {
+            let content = match lit {
+                syn::Lit::Str(s) => Some(("str", s.value())),
+                syn::Lit::ByteStr(b) => {
+                    Some(("byte-str", String::from_utf8_lossy(&b.value()).into_owned()))
+                }
+                syn::Lit::CStr(c) => Some(("c-str", c.value().to_string_lossy().into_owned())),
+                _ => None,
+            };
+            if let Some((kind, text)) = content {
+                if self.allowed_depth == 0 {
+                    self.failures.push(format!(
+                        "forbidden {kind} literal {text:?} — route this string through \
+                         the RowText / LoginRowText model, the row_text::chrome constants, \
+                         or a selector helper (row_text::sel::*). The only allowed literal \
+                         context is a diagnostic / matches! macro payload."
+                    ));
+                }
+            }
+        }
+
+        fn scan_tokens(&mut self, ts: proc_macro2::TokenStream) {
+            for tt in ts {
+                match tt {
+                    proc_macro2::TokenTree::Group(g) => self.scan_tokens(g.stream()),
+                    proc_macro2::TokenTree::Literal(l) => {
+                        let text = l.to_string();
+                        let bytes = text.as_bytes();
+                        let is_str = matches!(bytes.first(), Some(b'"'))
+                            || bytes.starts_with(b"r\"")
+                            || bytes.starts_with(b"r#");
+                        let is_byte = bytes.starts_with(b"b\"")
+                            || bytes.starts_with(b"br\"")
+                            || bytes.starts_with(b"br#");
+                        let is_cstr = bytes.starts_with(b"c\"")
+                            || bytes.starts_with(b"cr\"")
+                            || bytes.starts_with(b"cr#");
+                        if (is_str || is_byte || is_cstr) && self.allowed_depth == 0 {
+                            self.failures.push(format!(
+                                "forbidden macro-token literal {text} — route this string \
+                                 through the RowText / LoginRowText model. The only allowed \
+                                 literal context is a diagnostic / matches! macro payload."
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }

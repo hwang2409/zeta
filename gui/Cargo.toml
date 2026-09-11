@@ -37,3 +37,5 @@ required-features = ["gui"]
 
 [dev-dependencies]
 gpui-kit = { version = "0.6", features = ["test-support"] }
+proc-macro2 = "1"
+syn = { version = "2", features = ["full", "visit"] }
