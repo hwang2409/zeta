@@ -52,6 +52,59 @@ pub const STREAM_DOT_SIZE: Pixels = px(7.);
 /// textarea. Kept tight so the 64px composer floor stays honest.
 pub const COMPOSER_TARGET_HEIGHT: Pixels = px(16.);
 
+/// Sidebar container width — the wiki agent-run column pins this at 216px so
+/// the panel reads as a fixed column rather than a fluid drawer.
+pub const SIDEBAR_WIDTH: Pixels = px(216.);
+
+/// Session row min-height and padding. Contract line 81 pins 40px rows with
+/// 5px vertical / 8px horizontal padding — a compact-but-breathing rhythm
+/// that carries a ticket label + age on one line.
+pub const SIDEBAR_ROW_HEIGHT: Pixels = px(40.);
+pub const SIDEBAR_ROW_PADDING_X: Pixels = px(8.);
+pub const SIDEBAR_ROW_PADDING_Y: Pixels = px(5.);
+
+/// Nested branch row height — one tint step shorter than session rows so a
+/// run of siblings under a session reads as sub-items.
+pub const SIDEBAR_NESTED_ROW_HEIGHT: Pixels = px(32.);
+
+/// Left-gutter width for the accent dot the current session paints. Sized so
+/// the dot sits centred in a mono ticket's leading margin without pushing
+/// the label rightward.
+pub const SIDEBAR_GUTTER_WIDTH: Pixels = px(10.);
+
+/// Accent dot for the current sidebar row. Reads as a mono bullet at 15px
+/// text without borrowing hover fill.
+pub const SIDEBAR_CURRENT_DOT_SIZE: Pixels = px(5.);
+
+/// Attention rail that pins the leftmost 2px of a sidebar row when the row is
+/// signalling a failure or the connection is lost.
+pub const ATTENTION_RAIL_WIDTH: Pixels = px(2.);
+
+/// Two-band header/status strip heights. Band 1 (title + state pill) sits at
+/// 44px; band 2 (metadata) sits at 40px so the strip is a compact 84px
+/// column rather than a fluid banner.
+pub const HEADER_BAND1_MIN_HEIGHT: Pixels = px(44.);
+pub const HEADER_BAND2_MIN_HEIGHT: Pixels = px(40.);
+
+/// State pill padding — near-square shape the wiki agent-run uses to carry a
+/// one-word state label ("ready", "streaming", "offline").
+pub const STATE_PILL_PADDING_X: Pixels = px(9.);
+pub const STATE_PILL_PADDING_Y: Pixels = px(3.);
+
+/// Vertical separator ruled between header/status metadata items. The rule
+/// is a 1x14px line, drawn as a thin div with a border color.
+pub const STATUS_RULE_HEIGHT: Pixels = px(14.);
+
+/// Flat-panel modal shape. Width caps at 480px, padding is 12px on top / 16px
+/// horizontally / 14px on bottom, and the panel sits below a scrim at 25% of
+/// the viewport height.
+pub const MODAL_WIDTH: Pixels = px(480.);
+pub const MODAL_PADDING_TOP: Pixels = px(12.);
+pub const MODAL_PADDING_X: Pixels = px(16.);
+pub const MODAL_PADDING_BOTTOM: Pixels = px(14.);
+pub const MODAL_BUTTON_HEIGHT: Pixels = px(30.);
+pub const MODAL_TOP_FRACTION: f32 = 0.25;
+
 /// Semantic composer color roles. The composer paints its rail, fill, and
 /// target-line label from these — never from `palette::*` directly — so the
 /// call sites read as "composer at rest / composer focused" rather than
@@ -175,6 +228,12 @@ pub mod palette {
     /// lighter than the element surface so focus stays visible without a ring.
     pub fn composer_focus_fill() -> Hsla {
         hex(0x333326)
+    }
+    /// Danger 10% tint on canvas — the wiki blocker row's bg. Paired with the
+    /// 2px danger left rail so a failure surface reads as an alarm strip
+    /// without a full solid-red panel.
+    pub fn danger_tint() -> Hsla {
+        hex_a(0xe268_5c1a)
     }
 }
 
@@ -738,6 +797,41 @@ mod tests {
                 .expect("editor background is set");
             assert_eq!(editor_bg, palette::canvas());
         });
+    }
+
+    #[test]
+    fn sidebar_and_chrome_tokens_land_on_the_wiki_contract() {
+        // Guards the lane-3 numbers so a later ticket that widens the sidebar
+        // or grows the pill padding trips a named assert rather than only the
+        // paint-probes downstream.
+        assert_eq!(SIDEBAR_WIDTH, px(216.));
+        assert_eq!(SIDEBAR_ROW_HEIGHT, px(40.));
+        assert_eq!(SIDEBAR_NESTED_ROW_HEIGHT, px(32.));
+        assert_eq!(SIDEBAR_ROW_PADDING_X, px(8.));
+        assert_eq!(SIDEBAR_ROW_PADDING_Y, px(5.));
+        assert_eq!(SIDEBAR_GUTTER_WIDTH, px(10.));
+        assert_eq!(SIDEBAR_CURRENT_DOT_SIZE, px(5.));
+        assert_eq!(ATTENTION_RAIL_WIDTH, px(2.));
+        assert_eq!(HEADER_BAND1_MIN_HEIGHT, px(44.));
+        assert_eq!(HEADER_BAND2_MIN_HEIGHT, px(40.));
+        assert_eq!(STATE_PILL_PADDING_X, px(9.));
+        assert_eq!(STATE_PILL_PADDING_Y, px(3.));
+        assert_eq!(STATUS_RULE_HEIGHT, px(14.));
+        assert_eq!(MODAL_WIDTH, px(480.));
+        assert_eq!(MODAL_PADDING_TOP, px(12.));
+        assert_eq!(MODAL_PADDING_X, px(16.));
+        assert_eq!(MODAL_PADDING_BOTTOM, px(14.));
+        assert_eq!(MODAL_BUTTON_HEIGHT, px(30.));
+        assert!((MODAL_TOP_FRACTION - 0.25).abs() < f32::EPSILON);
+
+        // The blocker-row tint borrows the danger hue but stays transparent
+        // enough to read as ambient alarm chrome, not a solid red panel.
+        let tint = palette::danger_tint();
+        let danger = palette::danger();
+        assert_eq!(tint.h, danger.h);
+        assert_eq!(tint.s, danger.s);
+        assert_eq!(tint.l, danger.l);
+        assert!(tint.a > 0.05 && tint.a < 0.20);
     }
 
     #[test]
