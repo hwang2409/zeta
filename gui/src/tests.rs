@@ -4417,9 +4417,9 @@ fn renderer_literal_fence_accepts_the_legitimate_shapes() {
         r#"impl X { fn f(&self, i: usize) -> D { div().id((sel::TOOL_RECEIPT_TAG, i)) } }"#,
         // Owned selector ID routed through .id.
         r#"impl X { fn f(&self, id: String) -> D { div().id(id) } }"#,
-        // Diagnostic macro escapes
+        // Diagnostic macro escape — `unreachable!` is the only diagnostic
+        // the round-4-tightened allowlist keeps.
         r#"impl X { fn f(&self) { unreachable!("row-inner-entry-mismatch") } }"#,
-        r#"impl X { fn f(&self, ok: bool) { assert!(ok, "must be ok"); } }"#,
         // matches! is a pattern-only macro the module legitimately uses.
         r#"impl X { fn f(&self, e: &E) -> bool { matches!(e, E::Tool { .. }) } }"#,
         // Passing a chrome-const path through .child — no literal.
@@ -4550,19 +4550,11 @@ mod fence {
 
     /// Diagnostic macros whose payloads never reach the user. Their
     /// token stream is scanned inside an allowed subtree so any literal
-    /// payload passes.
-    const DIAGNOSTIC_MACROS: &[&str] = &[
-        "panic",
-        "unreachable",
-        "todo",
-        "unimplemented",
-        "assert",
-        "assert_eq",
-        "assert_ne",
-        "debug_assert",
-        "debug_assert_eq",
-        "debug_assert_ne",
-    ];
+    /// payload passes. Round-4 tightening: reduced to exactly what the
+    /// render module uses (`unreachable!`). Every other diagnostic macro
+    /// (`panic!`, `todo!`, `unimplemented!`, `assert*!`, `debug_assert*!`)
+    /// is default-deny — adding one to the module trips the fence.
+    const DIAGNOSTIC_MACROS: &[&str] = &["unreachable"];
 
     /// Pattern-only macros the render module legitimately uses. Their
     /// payload carries no visible text.
@@ -4699,11 +4691,11 @@ mod fence {
             } else {
                 self.failures.push(format!(
                     "forbidden macro `{name}!` in the render module — the fence \
-                     allowlists only diagnostic macros (panic/unreachable/todo/\
-                     unimplemented/assert{{,_eq,_ne}}/debug_assert{{,_eq,_ne}}), \
-                     the pattern-only `matches!`, and `format!` (whose literal \
-                     fragments are still checked). `stringify!`, `concat!`, \
-                     `write!`, and unknown/imported macros are rejected — route \
+                     allowlists only `unreachable!`, the pattern-only `matches!`, \
+                     and `format!` (whose literal fragments are still checked). \
+                     Every other macro (`panic!`, `todo!`, `unimplemented!`, \
+                     `assert*!`, `debug_assert*!`, `stringify!`, `concat!`, \
+                     `write!`, unknown/imported macros) is rejected — route \
                      every visible string through the RowText / LoginRowText \
                      model or `row_text::chrome`."
                 ));
