@@ -31,6 +31,9 @@ use std::{
 use zeta_gui::{
     client::Approval,
     login::{LoginProgress, LoginProvider},
+    row_text::{
+        self, AssistantRowText, ErrorRowText, RowText, ThinkingRowText, ToolRowText, UserRowText,
+    },
     session::{ImageAttachment, SessionSettings, APPROVAL_MODES},
     state::{AppState, ConnectionState, TranscriptEdit, TranscriptEntry},
     worker::{CommandMessage, ConnectionWorker, WorkerMessage},
@@ -1186,22 +1189,16 @@ impl ZetaView {
             .into_any_element()
     }
 
-    // Every render function reachable from `render_row_inner` MUST paint
-    // only through:
-    //   - `visible` — the ordered dynamic strings from `TranscriptEntry::visible_text`
-    //   - `chrome::*` — the fixed literals module (Fork here, Open Settings, hints, units)
-    //   - `state_text(row, color)` / `record_state(row, color)` — the state-color recorder
-    //
-    // The seam is documentary: the shipping guard is the
-    // `every_row_text_flows_through_the_visible_seam_or_chrome_module`
-    // check, which scans a KNOWN FIXTURE set of `TranscriptEntry` values
-    // (User, Assistant, Thinking, Error — Tool is not fixtured in this
-    // test) plus the `chrome::ALL` literal set for the four bracketed
-    // state markers `[working]/[done]/[failed]/[canceled]`. It does NOT
-    // walk this file for new inline literals and does NOT exhaustively
-    // iterate every `TranscriptEntry` variant — an exhaustive typed
-    // row-text model with a matching renderer-literal fence is captured
-    // as the ZETA-107 follow-up in docs/design.md.
+    // The six transcript render functions below MUST paint every user-
+    // visible string via the `RowText` model that `render_row_inner`
+    // builds. A destructured `let RowText::<Variant> { … }` at the top of
+    // each renderer names every field the model carries — clippy's
+    // `unused_variables` under `deny(warnings)` catches a renderer that
+    // stops painting a field, and the `renderer_literal_fence` guard
+    // test (see tests.rs) rejects any inline user-visible string literal
+    // in these fn bodies. Together the two guards make a NEW stray
+    // literal impossible: dropped fields fail the build, and new bare
+    // literals fail the fence.
     fn render_row_inner(
         &self,
         index: usize,
@@ -1209,39 +1206,39 @@ impl ZetaView {
         cx: &App,
     ) -> gpui::AnyElement {
         let entry = &self.state.transcript[index];
-        // Single seam: every renderer receives the ordered visible strings for
-        // this entry (`TranscriptEntry::visible_text`). No renderer reads its
-        // dynamic text off the entry's raw fields — that guarantees a
-        // sentinel-carrying payload cannot bypass the seam through one path.
-        let visible = entry.visible_text();
-        match entry {
-            TranscriptEntry::User(_) => self.render_user_row(index, &visible, view, cx),
-            TranscriptEntry::Assistant(doc) => {
-                self.render_assistant_row(index, &visible, doc.preview_truncated, cx)
+        // One typed model per row. `row_text::build` is the SINGLE source
+        // for every user-visible string a renderer paints, so a sentinel-
+        // carrying payload cannot reach any field through a side path.
+        let text = row_text::build(
+            entry,
+            index,
+            &self.state.session_view,
+            self.state.session_view.available,
+        );
+        match text {
+            RowText::User(text) => self.render_user_row(index, text, view, cx),
+            RowText::Assistant(text) => self.render_assistant_row(index, text, cx),
+            RowText::Tool(text) => self.render_tool_row(index, text, entry, view, cx),
+            RowText::Thinking(text) => self.render_thinking_row(index, text, cx),
+            RowText::Error(text) => {
+                let TranscriptEntry::Error { login_provider, .. } = entry else {
+                    unreachable!("row-text Error variant maps to TranscriptEntry::Error")
+                };
+                self.render_error_row(index, text, login_provider.as_deref(), view, cx)
             }
-            TranscriptEntry::Tool { .. } => self.render_tool_row(index, &visible, entry, view, cx),
-            TranscriptEntry::Thinking => self.render_thinking_row(index, &visible, cx),
-            TranscriptEntry::Error {
-                settings_action,
-                login_provider,
-                ..
-            } => self.render_error_row(
-                index,
-                &visible,
-                *settings_action,
-                login_provider.as_deref(),
-                view,
-                cx,
-            ),
         }
     }
 
-    fn render_thinking_row(&self, index: usize, visible: &[&str], cx: &App) -> gpui::AnyElement {
-        // Header-only marker at muted-foreground. The label text comes from
-        // the row's `visible_text` seam so no wording lives on both sides —
-        // any regression that changes the string flows through both the
-        // render layer and the tests that assert on it.
-        let label = visible.first().copied().unwrap_or_default().to_owned();
+    fn render_thinking_row(
+        &self,
+        index: usize,
+        text: ThinkingRowText,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        // Header-only marker at muted-foreground. The header text comes
+        // from the typed model; a sentinel-carrying reasoning payload
+        // cannot land here because `Thinking` carries no body.
+        let ThinkingRowText { header } = text;
         let color = cx.theme().muted_foreground;
         // state_text records (row_id, color) into the render_log at the
         // exact moment the color is applied — a mutation that swaps the
@@ -1251,26 +1248,26 @@ impl ZetaView {
             .w_full()
             .min_w_0()
             .py(px(2.))
-            .child(label)
+            .child(header)
             .into_any_element()
     }
 
     fn render_user_row(
         &self,
         index: usize,
-        visible: &[&str],
+        text: UserRowText<'_>,
         view: gpui::WeakEntity<Self>,
         cx: &App,
     ) -> gpui::AnyElement {
-        // The user row's only dynamic body text is the prompt itself — the
-        // first (and only) string in `visible_text`.
-        let text = visible.first().copied().unwrap_or_default().to_owned();
-        let fork_id = self
-            .state
-            .session_view
-            .available
-            .then(|| self.state.session_view.message_ids.get(&index).cloned())
-            .flatten();
+        // Destructure every field so a dropped painter fails the build.
+        let UserRowText {
+            content,
+            attachments,
+            fork_label,
+        } = text;
+        let content = content.to_owned();
+        let fork_id =
+            fork_label.and_then(|_| self.state.session_view.message_ids.get(&index).cloned());
         let group = format!("user-row-{index}");
         div()
             .group(group.clone())
@@ -1293,9 +1290,9 @@ impl ZetaView {
                             .border_l(theme::RAIL_WIDTH_THICK)
                             .border_color(cx.theme().primary)
                             .whitespace_normal()
-                            .child(text),
+                            .child(content),
                     )
-                    .when_some(fork_id, |row, id| {
+                    .when_some(fork_id.zip(fork_label), |row, (id, label)| {
                         let click_id = id.clone();
                         let click_view = view.clone();
                         row.child(
@@ -1310,7 +1307,7 @@ impl ZetaView {
                                         .debug_selector(move || format!("fork-button-{index}"))
                                         .ghost()
                                         .compact()
-                                        .label(chrome::FORK_HERE)
+                                        .label(label)
                                         .on_click(move |_, _, cx| {
                                             let id = click_id.clone();
                                             let _ = click_view
@@ -1320,48 +1317,38 @@ impl ZetaView {
                         )
                     }),
             )
-            .children(
-                self.state
-                    .session_view
-                    .attachments
-                    .get(&index)
-                    .map(|attachments| {
-                        div().mt_1().h_flex().flex_wrap().gap_2().children(
-                            attachments.iter().enumerate().map(
-                                |(attachment_index, (name, size))| {
-                                    div()
-                                        .debug_selector(|| "attachment-chip".into())
-                                        .px_2()
-                                        .py_1()
-                                        .text_size(px(12.))
-                                        .bg(cx.theme().muted)
-                                        .h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .when_some(
-                                            self.sent_images
-                                                .get(&(index, attachment_index))
-                                                .cloned(),
-                                            |chip, image| chip.child(polish::thumbnail(image, cx)),
-                                        )
-                                        .child(format!(
-                                            "{name}{}{size}{}",
-                                            chrome::ATTACHMENT_SIZE_SEPARATOR,
-                                            chrome::ATTACHMENT_SIZE_SUFFIX
-                                        ))
-                                },
-                            ),
-                        )
-                    }),
-            )
+            .when(!attachments.is_empty(), |row| {
+                row.child(
+                    div().mt_1().h_flex().flex_wrap().gap_2().children(
+                        attachments
+                            .into_iter()
+                            .enumerate()
+                            .map(|(attachment_index, label)| {
+                                div()
+                                    .debug_selector(|| "attachment-chip".into())
+                                    .px_2()
+                                    .py_1()
+                                    .text_size(px(12.))
+                                    .bg(cx.theme().muted)
+                                    .h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .when_some(
+                                        self.sent_images.get(&(index, attachment_index)).cloned(),
+                                        |chip, image| chip.child(polish::thumbnail(image, cx)),
+                                    )
+                                    .child(label)
+                            }),
+                    ),
+                )
+            })
             .into_any_element()
     }
 
     fn render_assistant_row(
         &self,
         index: usize,
-        visible: &[&str],
-        preview_truncated: bool,
+        text: AssistantRowText<'_>,
         cx: &App,
     ) -> gpui::AnyElement {
         // Naked assistant turn: 2px vertical breath, no bg, no border, no rail.
@@ -1369,6 +1356,11 @@ impl ZetaView {
         // not by framing the assistant. Prose sits at 1.65 line-height for the
         // wiki reading rhythm; code fences carry 12x16 padding, a 1px border,
         // and soft-wrap so long lines never introduce a horizontal scroll.
+        let AssistantRowText {
+            source,
+            truncated_hint,
+        } = text;
+        let source = source.to_owned();
         let code_block = gpui::StyleRefinement::default()
             .py(px(12.))
             .px(px(16.))
@@ -1379,17 +1371,12 @@ impl ZetaView {
             code_block,
             ..Default::default()
         };
-        // The assistant row's only dynamic body text is the rendered markdown
-        // source — the first (and only) string in `visible_text`.
-        let source = visible.first().copied().unwrap_or_default().to_owned();
         div()
             .py(px(2.))
             .w_full()
             .min_w_0()
             .line_height(gpui::rems(1.65))
-            .when(preview_truncated, |row| {
-                row.child(chrome::ASSISTANT_TRUNCATED)
-            })
+            .when_some(truncated_hint, |row, hint| row.child(hint))
             .child(
                 TextView::markdown(format!("message-{index}"), source)
                     .selectable(true)
@@ -1401,14 +1388,23 @@ impl ZetaView {
     fn render_tool_row(
         &self,
         index: usize,
-        visible: &[&str],
+        text: ToolRowText<'_>,
         entry: &TranscriptEntry,
         view: gpui::WeakEntity<Self>,
         cx: &App,
     ) -> gpui::AnyElement {
-        let TranscriptEntry::Tool { card, .. } = entry else {
-            unreachable!("render_tool_row invoked on non-Tool entry");
-        };
+        // Destructure every field so a dropped painter fails the build.
+        let ToolRowText {
+            verb,
+            detail,
+            output_size_label,
+            hover_hint,
+            tail_omitted_hint,
+            body,
+        } = text;
+        let verb = verb.to_owned();
+        let detail = detail.to_owned();
+        let body = body.map(str::to_owned);
         let is_error = entry.unsuccessful();
         // State is signalled by COLOR ONLY. Running sits at normal text tier;
         // done fades to muted; failed/canceled land on danger. Contract line 83
@@ -1418,13 +1414,8 @@ impl ZetaView {
         // elements. A mutation that swaps the color argument at any call
         // site records the wrong color and fails the sample check.
         let state_color = tool_state_color(entry.tool_state(), cx);
-        // Verb and detail come from the visible-text seam — index 0 is the
-        // tool name, index 1 is the summary. Any body text (expanded output)
-        // sits at index 2+ and is painted below when the card is expanded.
-        let verb = visible.first().copied().unwrap_or_default().to_owned();
-        let detail = visible.get(1).copied().unwrap_or_default().to_owned();
         let group = format!("tool-row-{index}");
-        let output_size = card.tail.text.len();
+        let expanded = body.is_some();
 
         div()
             .group(group.clone())
@@ -1451,7 +1442,7 @@ impl ZetaView {
                     .items_center()
                     .min_h(px(20.))
                     .child(
-                        Icon::new(if card.expanded {
+                        Icon::new(if expanded {
                             IconName::ChevronDown
                         } else {
                             IconName::ChevronRight
@@ -1484,33 +1475,29 @@ impl ZetaView {
                     // Collapsed rows carry the output size at faint tier and a
                     // hover-fade "show output" hint — the visible affordance for
                     // the click-to-expand behaviour.
-                    .when(!card.expanded && output_size > 0, |row| {
+                    .when_some(output_size_label, |row, label| {
                         row.child(
                             div()
                                 .flex_shrink_0()
                                 .text_color(cx.theme().muted_foreground)
                                 .opacity(0.78)
                                 .text_size(px(12.))
-                                .child(format_output_size(output_size)),
+                                .child(label),
                         )
-                        .child(
+                    })
+                    .when_some(hover_hint, |row, hint| {
+                        row.child(
                             div()
                                 .flex_shrink_0()
                                 .text_color(cx.theme().muted_foreground)
                                 .opacity(0.)
                                 .group_hover(group.clone(), |style| style.opacity(0.78))
                                 .text_size(px(12.))
-                                .child(chrome::TOOL_HOVER_HINT),
+                                .child(hint),
                         )
                     }),
             )
-            .when(card.expanded, |row| {
-                // Expanded body text comes from the seam (index 2). The
-                // "Earlier output omitted" marker is fixed chrome, not part
-                // of the dynamic strings — the renderer pulls it from the
-                // chrome-constants module when the tail was truncated.
-                let body = visible.get(2).copied().unwrap_or_default().to_owned();
-                let truncated = card.tail.truncated;
+            .when_some(body, |row, body| {
                 row.child(
                     div()
                         .debug_selector(move || format!("tool-output-{index}"))
@@ -1530,8 +1517,8 @@ impl ZetaView {
                         })
                         .bg(cx.theme().sidebar)
                         .text_color(cx.theme().muted_foreground)
-                        .when(truncated, |output| {
-                            output.child(div().opacity(0.7).child(chrome::TOOL_TAIL_OMITTED))
+                        .when_some(tail_omitted_hint, |output, hint| {
+                            output.child(div().opacity(0.7).child(hint))
                         })
                         .child(div().whitespace_normal().child(body)),
                 )
@@ -1542,16 +1529,18 @@ impl ZetaView {
     fn render_error_row(
         &self,
         index: usize,
-        visible: &[&str],
-        settings_action: bool,
+        text: ErrorRowText<'_>,
         login_provider: Option<&str>,
         view: gpui::WeakEntity<Self>,
         cx: &App,
     ) -> gpui::AnyElement {
-        // Error rows expose two visible strings: the "Error" header at index
-        // 0 and the message body at index 1. Both flow through the seam.
-        let header = visible.first().copied().unwrap_or_default().to_owned();
-        let message = visible.get(1).copied().unwrap_or_default().to_owned();
+        // Destructure every field so a dropped painter fails the build.
+        let ErrorRowText {
+            header,
+            message,
+            settings_action_label,
+        } = text;
+        let message = message.to_owned();
         div()
             .debug_selector(move || format!("error-block-{index}"))
             .v_flex()
@@ -1587,19 +1576,16 @@ impl ZetaView {
                     ))
                 },
             )
-            .when(
-                settings_action && self.state.session_view.available,
-                |block| {
-                    block.child(
-                        Button::new(("error-settings", index))
-                            .debug_selector(move || format!("error-settings-{index}"))
-                            .label(chrome::OPEN_SETTINGS)
-                            .on_click(move |_, _, cx| {
-                                let _ = view.update(cx, |view, cx| view.open_settings(cx));
-                            }),
-                    )
-                },
-            )
+            .when_some(settings_action_label, |block, label| {
+                block.child(
+                    Button::new(("error-settings", index))
+                        .debug_selector(move || format!("error-settings-{index}"))
+                        .label(label)
+                        .on_click(move |_, _, cx| {
+                            let _ = view.update(cx, |view, cx| view.open_settings(cx));
+                        }),
+                )
+            })
             .into_any_element()
     }
 }
@@ -2016,47 +2002,6 @@ pub(crate) fn tool_state_color(state: zeta_gui::state::ToolState, cx: &App) -> g
     }
 }
 
-/// Fixed literals painted as row chrome (headings, hints, unit suffixes,
-/// action labels). Every string that reaches the user through a row's own
-/// text elements — but does NOT belong to `visible_text` (dynamic body
-/// text) — lives here so the seam has one home per literal. The
-/// `every_row_text_flows_through_the_visible_seam_or_chrome_module` check
-/// scans this literal set and a KNOWN FIXTURE set of `TranscriptEntry`
-/// values for the four bracketed state markers
-/// `[working]/[done]/[failed]/[canceled]` — nothing more. The deferred
-/// renderer-literal fence tracked in docs/design.md is what would
-/// statically catch a NEW action label added inline.
-pub(crate) mod chrome {
-    pub(crate) const ASSISTANT_TRUNCATED: &str = "Showing the latest streamed text…";
-    pub(crate) const TOOL_HOVER_HINT: &str = "show output";
-    pub(crate) const TOOL_TAIL_OMITTED: &str = "Earlier output omitted";
-    pub(crate) const OUTPUT_SIZE_UNIT_B: &str = "B";
-    pub(crate) const OUTPUT_SIZE_UNIT_KB: &str = "KB";
-    pub(crate) const OUTPUT_SIZE_UNIT_MB: &str = "MB";
-    pub(crate) const ATTACHMENT_SIZE_SEPARATOR: &str = " · ";
-    pub(crate) const ATTACHMENT_SIZE_SUFFIX: &str = " bytes";
-    pub(crate) const FORK_HERE: &str = "Fork here";
-    pub(crate) const OPEN_SETTINGS: &str = "Open Settings";
-    /// Every fixed literal the seam region may paint. The seam test walks
-    /// this set to prove no state marker sneaks through chrome wording,
-    /// and it stays exhaustive for the deferred renderer-literal fence
-    /// (see docs/design.md) — that fence, once implemented, will consume
-    /// `ALL` to allowlist chrome and fail on any inline literal outside it.
-    #[cfg(test)]
-    pub(crate) const ALL: &[&str] = &[
-        ASSISTANT_TRUNCATED,
-        TOOL_HOVER_HINT,
-        TOOL_TAIL_OMITTED,
-        OUTPUT_SIZE_UNIT_B,
-        OUTPUT_SIZE_UNIT_KB,
-        OUTPUT_SIZE_UNIT_MB,
-        ATTACHMENT_SIZE_SEPARATOR,
-        ATTACHMENT_SIZE_SUFFIX,
-        FORK_HERE,
-        OPEN_SETTINGS,
-    ];
-}
-
 /// State-color recorder. Every state-colored text element in the SEAM
 /// region routes its color through `record_state` or the div-returning
 /// `state_text` shorthand, both of which write `(row_id, color)` to
@@ -2123,28 +2068,6 @@ pub(crate) mod render_log {
 
     pub(crate) fn samples() -> Vec<Sample> {
         SAMPLES.with(|slot| slot.borrow().clone())
-    }
-}
-
-/// Compact byte-size label for the collapsed tool-row output peek. Kept short
-/// so the receipt still fits on one line at the wiki 1024px column. Unit
-/// suffixes come from the chrome-constants module so wording changes have
-/// one home and the seam tests can iterate them.
-fn format_output_size(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes}{}", chrome::OUTPUT_SIZE_UNIT_B)
-    } else if bytes < 1024 * 1024 {
-        format!(
-            "{:.1}{}",
-            bytes as f64 / 1024.0,
-            chrome::OUTPUT_SIZE_UNIT_KB
-        )
-    } else {
-        format!(
-            "{:.1}{}",
-            bytes as f64 / (1024.0 * 1024.0),
-            chrome::OUTPUT_SIZE_UNIT_MB
-        )
     }
 }
 

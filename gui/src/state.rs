@@ -72,46 +72,15 @@ impl TranscriptEntry {
             ToolState::Running
         }
     }
-
-    /// Ordered visible strings the render layer paints for this row.
-    /// Single seam: any string that reaches the user through the row's own
-    /// text elements (not framing chrome like a chevron icon or a hover hint)
-    /// flows through this collection. Borrowed so a full-transcript pass
-    /// does not clone every source string on every draw — renderers convert
-    /// to owned SharedStrings only at the leaf gpui element that needs them.
-    pub fn visible_text(&self) -> Vec<&str> {
-        match self {
-            Self::User(text) => vec![text.as_str()],
-            Self::Assistant(doc) => vec![doc.source.as_ref()],
-            Self::Error { message, .. } => vec![ERROR_HEADER_LABEL, message.as_str()],
-            Self::Thinking => vec![THINKING_HEADER_LABEL],
-            Self::Tool {
-                name,
-                summary,
-                card,
-                ..
-            } => {
-                // Dynamic body text only: name at 0, summary at 1, and the
-                // expanded output tail at 2 when the card is open. Fixed
-                // chrome (headings, hints, unit suffixes) lives in the
-                // render-layer chrome module — one home per literal.
-                let mut strings = vec![name.as_str(), summary.as_str()];
-                if card.expanded {
-                    strings.push(card.tail.text.as_str());
-                }
-                strings
-            }
-        }
-    }
 }
 
-/// Single source of truth for the thinking marker text. Both `visible_text`
-/// and the render layer read this constant so no wording lives on both sides
-/// of the seam.
+/// Single source of truth for the thinking marker text. Read by
+/// `row_text::build` when composing the model for a `Thinking` row and by
+/// the guard tests that sweep for stray markers.
 pub const THINKING_HEADER_LABEL: &str = "+ Thought";
 
-/// Single source of truth for the error row header text. Kept alongside the
-/// thinking label so both sides of the seam read one constant.
+/// Single source of truth for the error row header text. Read by
+/// `row_text::build` and by the guard tests.
 pub const ERROR_HEADER_LABEL: &str = "Error";
 
 /// Semantic tool row state; the render layer maps each variant to a theme
