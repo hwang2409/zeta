@@ -145,10 +145,12 @@ pub struct AppState {
     pub thinking: bool,
     assistant_started: bool,
     /// Index into `transcript` where the current server turn began. Set to
-    /// `transcript.len()` on every `TurnStart`, and to 0 at construction /
-    /// session switch / history replay. `commit_assistant` reconciles only
-    /// against rows at or after this index, so a spontaneous second turn (no
-    /// user row of its own) never merges into the previous turn's rows.
+    /// `transcript.len()` on every `TurnStart`, session switch, and history
+    /// replay (each of those rebuilds the transcript, then anchors here to
+    /// the new tail). `commit_assistant` reconciles only against rows at or
+    /// after this index, so a spontaneous second turn (no user row of its
+    /// own) never merges into the previous turn's rows, and a resumed
+    /// in-flight message after a history replay never edits restored rows.
     turn_start: usize,
     pub metrics: StatusMetrics,
     pub metrics_boundary: bool,
@@ -667,10 +669,21 @@ impl AppState {
                 if prefix_ok {
                     let last_idx = *assistant_indices.last().unwrap();
                     let tail = assistant_text[cursor..].to_owned();
-                    if let TranscriptEntry::Assistant(current) = &mut self.transcript[last_idx] {
-                        *current = tail.into();
+                    // Empty tail means the leading rows already cover the full
+                    // final text — a shorter-than-streamed final or a final
+                    // equal to a mid-tool prefix would otherwise leave an
+                    // empty assistant row that still consumes transcript
+                    // rhythm. Drop the trailing row instead of blanking it.
+                    if tail.is_empty() {
+                        self.transcript.remove(last_idx);
+                        changed = last_idx.checked_sub(1);
+                    } else {
+                        if let TranscriptEntry::Assistant(current) = &mut self.transcript[last_idx]
+                        {
+                            *current = tail.into();
+                        }
+                        changed = Some(last_idx);
                     }
-                    changed = Some(last_idx);
                 } else {
                     for &idx in leading.iter().rev() {
                         self.transcript.remove(idx);
@@ -1618,6 +1631,158 @@ mod tests {
         assert_eq!(
             describe_transcript(&state.transcript),
             vec![r#"Assistant("streamed")"#.to_owned()]
+        );
+    }
+
+    #[test]
+    fn final_shorter_than_streamed_drops_the_trailing_blank_row() {
+        // Round-8 fix: streamed "pre", ToolStart, streamed "post", final
+        // AssistantMessage("pre"). The leading row already carries "pre",
+        // so the trailing assistant row's tail is empty. Blanking it would
+        // leave an empty row that still consumes transcript rhythm — drop
+        // the row instead.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "post".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text { text: "pre".into() }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("pre")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+            ],
+            "reconciliation must never leave an empty assistant row"
+        );
+    }
+
+    #[test]
+    fn multiple_tools_with_shorter_final_drop_every_blank_trailing_row() {
+        // Two tools bracket streamed text on both sides; the final message
+        // matches only the first fragment. Every empty tail must be
+        // removed — a lingering blank row breaks transcript rhythm.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "alpha".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "beta".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "gamma".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "alphabeta".into(),
+                }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("alpha")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                r#"Assistant("beta")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+            ],
+            "trailing empty assistant row after multiple tools must be dropped"
+        );
+    }
+
+    #[test]
+    fn empty_delta_around_tool_leaves_no_blank_row() {
+        // Empty deltas ("") never push their own assistant row (see the
+        // `AssistantDelta` handler's `!delta.is_empty()` guard), so the
+        // reconciler only ever sees the non-empty streamed fragments plus
+        // the final message. Even if a provider bookends a tool with empty
+        // deltas around a real fragment, the transcript still ends with no
+        // blank assistant row when the final text equals the streamed
+        // prefix.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "hello".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("hello")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+            ]
         );
     }
 

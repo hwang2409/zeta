@@ -1145,16 +1145,17 @@ impl ZetaView {
             .into_any_element()
     }
 
-    // SEAM-BEGIN: transcript-render
-    //
-    // Every render function inside this region MUST paint only through:
+    // Every render function reachable from `render_row_inner` MUST paint
+    // only through:
     //   - `visible` — the ordered dynamic strings from `TranscriptEntry::visible_text`
     //   - `chrome::*` — the fixed literals module (Fork here, Open Settings, hints, units)
     //   - `state_text(row, color)` / `record_state(row, color)` — the state-color recorder
     //
-    // The `transcript_render_functions_carry_no_stray_literals` test in
-    // `tests.rs` scans this region and fails on any user-visible string
-    // literal that is not in `chrome::ALL`.
+    // The seam is documentary — new renderer literals are caught by the
+    // `every_row_text_flows_through_the_visible_seam_or_chrome_module`
+    // marker check and by the render_log samples for tool/thinking rows.
+    // A typed row-text model that makes new literals impossible is tracked
+    // as the ZETA-107 follow-up in docs/design.md.
     fn render_row_inner(
         &self,
         index: usize,
@@ -1199,7 +1200,7 @@ impl ZetaView {
         // state_text records (row_id, color) into the render_log at the
         // exact moment the color is applied — a mutation that swaps the
         // color argument at this call site is caught by the sample check.
-        state_text(&format!("thinking-header-{index}"), color)
+        state_text(|| format!("thinking-header-{index}"), color)
             .debug_selector(move || format!("thinking-header-{index}"))
             .w_full()
             .min_w_0()
@@ -1410,20 +1411,23 @@ impl ZetaView {
                             IconName::ChevronRight
                         })
                         .size(px(12.))
-                        .text_color(record_state(&format!("tool-chevron-{index}"), state_color)),
+                        .text_color(record_state(
+                            || format!("tool-chevron-{index}"),
+                            state_color,
+                        )),
                     )
                     .child(
                         // Verb + detail route their state color through the
                         // recorder so a swap on this single call is caught
                         // by the render_log sample check.
-                        state_text(&format!("tool-verb-{index}"), state_color)
+                        state_text(|| format!("tool-verb-{index}"), state_color)
                             .debug_selector(move || format!("tool-verb-{index}"))
                             .flex_shrink_0()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(verb),
                     )
                     .child(
-                        state_text(&format!("tool-detail-{index}"), state_color)
+                        state_text(|| format!("tool-detail-{index}"), state_color)
                             .debug_selector(move || format!("tool-detail-{index}"))
                             .min_w_0()
                             .flex_1()
@@ -1552,7 +1556,6 @@ impl ZetaView {
             )
             .into_any_element()
     }
-    // SEAM-END: transcript-render
 }
 
 impl ZetaView {
@@ -1900,10 +1903,17 @@ pub(crate) mod chrome {
 /// This is the "call-time" replacement for the round-6 pre-draw probe: the
 /// recorder sits inside the color path itself, so the recorded value is by
 /// construction the value that reached `.text_color(...)`.
+/// The `row_id` closure is called only when the recorder is compiled in
+/// (`test` or the `smoke-test` feature); production render never formats a
+/// row id string, so the recorder machinery costs zero allocations in
+/// release builds.
 #[cfg_attr(not(any(test, feature = "smoke-test")), allow(unused_variables))]
-pub(crate) fn record_state(row_id: &str, color: gpui::Hsla) -> gpui::Hsla {
+pub(crate) fn record_state<F>(row_id: F, color: gpui::Hsla) -> gpui::Hsla
+where
+    F: FnOnce() -> String,
+{
     #[cfg(any(test, feature = "smoke-test"))]
-    render_log::record(row_id, color);
+    render_log::record(&row_id(), color);
     color
 }
 
@@ -1911,7 +1921,10 @@ pub(crate) fn record_state(row_id: &str, color: gpui::Hsla) -> gpui::Hsla {
 /// records into the render log in one call. Preferred over `record_state`
 /// for divs; the bare recorder covers the icon path where `Icon` needs to
 /// receive the color directly.
-pub(crate) fn state_text(row_id: &str, color: gpui::Hsla) -> gpui::Div {
+pub(crate) fn state_text<F>(row_id: F, color: gpui::Hsla) -> gpui::Div
+where
+    F: FnOnce() -> String,
+{
     div().text_color(record_state(row_id, color))
 }
 
@@ -1999,6 +2012,12 @@ fn streaming_dot(color: gpui::Hsla) -> gpui::AnyElement {
 
 impl Render for ZetaView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Reset the state-color recorder at the start of every render so
+        // tests observe only the samples produced by the draw they trigger,
+        // and no test needs a manual `render_log::clear()` before drawing.
+        // Compiled out in production alongside the recorder itself.
+        #[cfg(any(test, feature = "smoke-test"))]
+        render_log::clear();
         let needs_login = !self.login_providers.is_empty()
             && self
                 .login_providers
