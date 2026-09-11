@@ -1,20 +1,26 @@
 //! Single home for every transcript-row renderer.
 //!
 //! The AST-based `renderer_literal_fence` guard test parses THIS whole
-//! source (not a fixed function-name list) and rejects every string /
-//! byte-string literal in expression position outside a strict allowlist —
-//! arguments to `.debug_selector(...)`, `.id(...)`, `.aria_label(...)`,
-//! `.role(...)`, or inside a diagnostic macro (`panic!`, `unreachable!`,
-//! `todo!`, `unimplemented!`, `assert{,_eq,_ne}!`, `debug_assert{,_eq,_ne}!`).
+//! source (not a fixed function-name list) and rejects every string,
+//! byte-string, or C-string literal in expression position — no ambient
+//! method-name allowance. The only literals that pass ride an allowlisted
+//! macro payload (diagnostic — `panic!`, `unreachable!`, `todo!`,
+//! `unimplemented!`, `assert{,_eq,_ne}!`, `debug_assert{,_eq,_ne}!` — or
+//! pattern-only `matches!`); every other macro (`stringify!`, `concat!`,
+//! `write!`, unknown imports) is rejected outright. `format!` is scanned
+//! at ambient depth, so any literal fragment in its payload trips too.
 //! Every user-visible string a row paints has to come from the typed
 //! `row_text::RowText` / `LoginRowText` model — that is what makes a new
 //! stray literal impossible to add to any renderer WITHOUT failing a test,
 //! and it fixes the r1 review's "new helper fn / render_login_row bypass"
 //! by scanning the whole module rather than a fixed six-fn allowlist.
 //!
-//! Widget-ID composition (`format!("tool-verb-{i}")`, `Button::new(("fork",
-//! i))`, …) lives OUTSIDE this module in `row_text::sel` so the module's
-//! bodies stay literal-free apart from the four allowed selector methods.
+//! Widget-ID composition (`sel::tool_verb(index)`, `Button::new((sel::
+//! FORK_BUTTON_TAG, i))`, …) lives OUTSIDE this module in `row_text::sel`
+//! so the module's bodies stay literal-free apart from diagnostic macros.
+//! Every selector-method call (`.debug_selector(...)`, `.id(...)`) is
+//! fed by a `sel::*` const or helper's `String`, so removing the r2
+//! method-name allowance did not require any renderer edits.
 
 use gpui::{div, prelude::*, px, AnyElement, App, WeakEntity};
 use gpui_kit::component::{
@@ -81,8 +87,8 @@ impl ZetaView {
     //   - references to `row_text::chrome` constants (via the model)
     //   - selectors produced by `row_text::sel::*` (widget IDs are not
     //     user-visible; they live outside this module so the AST fence
-    //     stays strict on "no literal outside debug_selector/id/aria_label
-    //     /role args")
+    //     stays strict on "no bare literal anywhere in expression
+    //     position outside a diagnostic / matches! macro payload")
     //
     // A dropped field trips clippy's `unused_variables` under the crate's
     // `deny(warnings)`; a new bare literal trips the AST fence.
@@ -446,7 +452,7 @@ impl ZetaView {
                 |block, provider| {
                     let prefix = sel::error_login_prefix(index);
                     let login = row_text::build_login(provider, &prefix, &self.state.connection);
-                    block.child(self.render_login_row(&login, view.clone(), cx))
+                    block.child(self.render_login_row(login, view.clone(), cx))
                 },
             )
             .when_some(settings_action_label, |block, label| {
@@ -468,24 +474,32 @@ impl ZetaView {
     /// renderer never touches raw provider text. Fixes r1 finding 1: the
     /// pre-fix `render_login_row` read `provider.label()` at paint time
     /// and passed the raw label to `.child(...)`.
+    ///
+    /// r3 finding: `LoginRowText` is consumed BY VALUE via an exhaustive
+    /// destructure with no `..`. Adding a field without extending this
+    /// pattern fails to compile — that is the compiler-backed guarantee
+    /// that every login-row field lands somewhere on the render path.
     pub(crate) fn render_login_row(
         &self,
-        text: &LoginRowText,
+        text: LoginRowText,
         view: WeakEntity<Self>,
         cx: &App,
     ) -> AnyElement {
-        let outer_id = text.outer_id.clone();
-        let header_label = text.header_label.clone();
-        let status_text = text.status_text;
-        let start = text.start.clone();
-        let cancel = text.cancel.clone();
-        let error = text.error.clone();
-        let start_slug = text.provider_slug.clone();
-        let cancel_slug = text.provider_slug.clone();
+        let LoginRowText {
+            outer_id,
+            header_label,
+            provider_slug,
+            start,
+            cancel,
+            status_text,
+            error,
+        } = text;
+        let start_slug = provider_slug.clone();
+        let cancel_slug = provider_slug;
         let start_view = view.clone();
-        let cancel_view = view.clone();
+        let cancel_view = view;
         div()
-            .id(outer_id.clone())
+            .id(outer_id)
             .v_flex()
             .gap_2()
             .p_2()
@@ -519,19 +533,27 @@ impl ZetaView {
 /// method stays readable and the shared start/cancel machinery lives in
 /// one spot. `is_start` picks the click callback — `start_login` vs
 /// `cancel_login` — since the two share every visible field.
+///
+/// r3 finding: `LoginActionText` is consumed BY VALUE via an exhaustive
+/// destructure with no `..` — a new field on the struct fails to compile
+/// here until every field lands on the button.
 fn login_action_button(
     action: LoginActionText,
     provider_slug: String,
     view: WeakEntity<ZetaView>,
     is_start: bool,
 ) -> Button {
-    let id = action.id.clone();
+    let LoginActionText {
+        id,
+        label,
+        disabled,
+    } = action;
     let selector_id = id.clone();
     Button::new(id)
         .debug_selector(move || selector_id.clone())
         .h(px(40.))
-        .label(action.label)
-        .disabled(action.disabled)
+        .label(label)
+        .disabled(disabled)
         .on_click(move |_, _, cx| {
             let slug = provider_slug.clone();
             let _ = view.update(cx, move |view, cx| {

@@ -571,7 +571,7 @@ impl ZetaView {
         cx: &App,
     ) -> gpui::AnyElement {
         let text = row_text::build_login(provider, prefix, &self.state.connection);
-        self.render_login_row(&text, view, cx)
+        self.render_login_row(text, view, cx)
     }
 
     fn new_session(&mut self, cx: &mut Context<Self>) {

@@ -2630,6 +2630,55 @@ fn sent_image_decode_failure_keeps_attachment_text(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn text_only_history_user_row_paints_the_empty_attachment_gap(cx: &mut TestAppContext) {
+    // r3 rendered-bounds guard for the attachment tri-state.
+    //
+    // Text-only history rows carry `Some(vec![])` in
+    // `session_view.attachments` (attachment key present but empty) while
+    // pre-history rows carry `None`. The typed-seam renderer paints the
+    // `.mt_1()` container whenever the value is `Some` — even when the
+    // list is empty — so the row height matches the pre-seam behaviour
+    // for text-only history rows. A revert that collapses the tri-state
+    // to "check for empty list" would skip the container in the
+    // `Some(vec![])` case, shrinking the row height by the `.mt_1()`
+    // gap. This test measures the actual rendered row bounds so the
+    // regression fails here even if the unit test in `row_text.rs`
+    // remains green.
+    let render_single_user_row =
+        |cx: &mut TestAppContext, present_empty: bool| -> gpui::Bounds<gpui::Pixels> {
+            let (window, view, _) = setup(cx);
+            let mut visual = VisualTestContext::from_window(window.into(), cx);
+            visual.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.state.transcript = vec![TranscriptEntry::User("hi".into())];
+                    if present_empty {
+                        view.state.session_view.attachments.insert(0, Vec::new());
+                    }
+                    view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            visual.debug_bounds("transcript-row").unwrap()
+        };
+    let absent = render_single_user_row(cx, false);
+    let present_empty = render_single_user_row(cx, true);
+    // The attachment container is `.mt_1()` on top of an empty flex row,
+    // so the present-empty case must be at least ~4px taller. Allow a
+    // sub-logical-pixel slack for scaling arithmetic.
+    let delta = present_empty.size.height - absent.size.height;
+    assert!(
+        delta >= gpui::px(3.),
+        "text-only history user row must paint the `.mt_1()` attachment \
+         container (Some(vec![]) tri-state); present_empty={:?}, \
+         absent={:?}, delta={:?}",
+        present_empty.size.height,
+        absent.size.height,
+        delta,
+    );
+}
+
+#[gpui::test]
 fn refused_image_paste_falls_through_to_clipboard_text(cx: &mut TestAppContext) {
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
@@ -4223,9 +4272,10 @@ fn sidebar_row_focus_map_prunes_removed_rows_and_keeps_survivors(cx: &mut TestAp
 /// The typed `row_text::RowText` / `LoginRowText` model is the sole source
 /// of every user-visible string a transcript row paints. This fence proves
 /// it stays that way by parsing the WHOLE `transcript_render.rs` module
-/// with `syn` on every run and rejecting every string / byte-string
-/// literal in expression position that does not sit inside the tight
-/// allowed-context allowlist.
+/// with `syn` on every run and rejecting every string, byte-string, or
+/// C-string literal in expression position — no ambient allowance from any
+/// method-call subtree. The only literals that pass are the ones carried
+/// by an allowlisted macro payload.
 ///
 /// AST context, not string shape, is what distinguishes an ID from
 /// visible text — that closes the r1 review's bypasses:
@@ -4236,19 +4286,29 @@ fn sidebar_row_focus_map_prunes_removed_rows_and_keeps_survivors(cx: &mut TestAp
 ///   * `format!("hello {n}")` — bare format outside allowed subtree
 ///   * `format!("tool-verb-{i}")` — ID-shaped format still flagged
 ///   * `String::from_utf8_lossy(b"…")` — byte strings are flagged too
+///   * `c"leaked"` — C-string literals are flagged too
+///   * `stringify!(leaked)` / `concat!("a", "b")` — forbidden macros
+///     (r3 finding — accidental non-`format!` string builders)
 ///   * a new `render_login_row` helper hiding text — the WHOLE module is
 ///     scanned, not a fixed six-fn allowlist, so renaming or splitting
 ///     renderers cannot smuggle a literal past the fence.
 ///
-/// Allowed contexts (allowed literals descend from an ancestor node
-/// matching one of these):
+/// Allowed macro payloads (every other literal is rejected):
 ///
-/// * Method calls whose method identifier is exactly `debug_selector`,
-///   `id`, `aria_label`, or `role` — every widget-ID literal in the
-///   render module lives inside one of these calls.
 /// * Diagnostic macros — `panic!`, `unreachable!`, `todo!`,
 ///   `unimplemented!`, `assert{,_eq,_ne}!`, `debug_assert{,_eq,_ne}!` —
 ///   whose payloads never reach the user.
+/// * `matches!` — the ONE pattern-only macro the render module uses;
+///   its payload is a pattern, never visible text.
+/// * `format!` — literal fragments in the payload are still checked
+///   against the (always-zero) ambient depth, so any literal there
+///   still trips. `format!` calls in the render module are rejected
+///   because there is no legitimate use — widget-ID composition lives
+///   in `row_text::sel::*` and returns a `String` back to the module.
+///
+/// Every OTHER macro (`stringify!`, `concat!`, `write!`, `println!`,
+/// arbitrary imported macros) is rejected outright — the module has no
+/// legitimate use for them.
 ///
 /// The `chrome`-coverage arm parses `row_text.rs` for the `pub mod chrome`
 /// submodule and proves (a) every `pub const NAME: &str = "…"` sits at
@@ -4299,6 +4359,34 @@ fn renderer_literal_fence_ast_visitor_flags_the_probe_bypasses() {
             "renamed/new helper fn in the module still scanned",
             r#"impl X { fn f(&self) -> D { self.helper() } fn helper(&self) -> D { div().child("leaked-via-helper") } }"#,
         ),
+        (
+            "C-string literal reaches child",
+            r#"impl X { fn f(&self) -> D { div().child(c"leaked".to_str().unwrap()) } }"#,
+        ),
+        (
+            "stringify! macro assembles a leaked string",
+            r#"impl X { fn f(&self) -> D { div().child(stringify!(LEAKED_IDENT)) } }"#,
+        ),
+        (
+            "concat! macro joins literal fragments",
+            r#"impl X { fn f(&self) -> D { div().child(concat!("a", "-", "b")) } }"#,
+        ),
+        (
+            "write! macro (imports unlisted machinery)",
+            r#"impl X { fn f(&self, out: &mut String) { let _ = write!(out, "hi"); } }"#,
+        ),
+        (
+            "debug_selector method allowance is gone — bare literal still trips",
+            r#"impl X { fn f(&self) -> D { div().debug_selector(|| "transcript-row".into()) } }"#,
+        ),
+        (
+            "id method allowance is gone — bare literal still trips",
+            r#"impl X { fn f(&self, i: usize) -> D { div().id(("tool-receipt", i)) } }"#,
+        ),
+        (
+            "aria_label method allowance is gone — bare literal still trips",
+            r#"impl X { fn f(&self) -> D { div().aria_label("dialog") } }"#,
+        ),
     ];
     for (label, probe) in probes {
         let failures = fence::run(probe);
@@ -4314,21 +4402,28 @@ fn renderer_literal_fence_accepts_the_legitimate_shapes() {
     // Positive fixtures — every allowed usage the render module actually
     // emits. If ANY of these starts failing, the fence has become too
     // strict and legitimate render code cannot compile.
+    //
+    // r3 fence: the method-name allowance for `debug_selector`/`id`/
+    // `aria_label`/`role` is gone. Every selector call in the module
+    // takes a const path or a `sel::*` helper's `String`, so no bare
+    // literal ever sits inside those args. Every positive fixture here
+    // is literal-free outside diagnostic-macro payloads.
     let positives: &[&str] = &[
-        // Widget-ID inside .debug_selector(closure)
-        r#"impl X { fn f(&self) -> D { div().debug_selector(|| "transcript-row".into()) } }"#,
-        // Format inside .debug_selector(closure) — ID-shaped
-        r#"impl X { fn f(&self, i: usize) -> D { div().debug_selector(move || format!("tool-verb-{i}")) } }"#,
-        // Widget-ID inside .id(tuple)
-        r#"impl X { fn f(&self, i: usize) -> D { div().id(("tool-receipt", i)) } }"#,
+        // Selector const routed through .debug_selector — no literal.
+        r#"impl X { fn f(&self) -> D { div().debug_selector(|| sel::TRANSCRIPT_ROW.into()) } }"#,
+        // Selector helper returning a String routed through .debug_selector.
+        r#"impl X { fn f(&self, i: usize) -> D { div().debug_selector(move || sel::tool_verb(i)) } }"#,
+        // Selector const paired with an index tuple — no literal.
+        r#"impl X { fn f(&self, i: usize) -> D { div().id((sel::TOOL_RECEIPT_TAG, i)) } }"#,
+        // Owned selector ID routed through .id.
+        r#"impl X { fn f(&self, id: String) -> D { div().id(id) } }"#,
         // Diagnostic macro escapes
         r#"impl X { fn f(&self) { unreachable!("row-inner-entry-mismatch") } }"#,
         r#"impl X { fn f(&self, ok: bool) { assert!(ok, "must be ok"); } }"#,
+        // matches! is a pattern-only macro the module legitimately uses.
+        r#"impl X { fn f(&self, e: &E) -> bool { matches!(e, E::Tool { .. }) } }"#,
         // Passing a chrome-const path through .child — no literal.
         r#"impl X { fn f(&self) -> D { div().child(row_text::chrome::FORK_HERE) } }"#,
-        // aria_label / role are allowed
-        r#"impl X { fn f(&self) -> D { div().aria_label("dialog") } }"#,
-        r#"impl X { fn f(&self) -> D { div().role("region") } }"#,
     ];
     for probe in positives {
         let failures = fence::run(probe);
@@ -4379,6 +4474,21 @@ fn renderer_literal_fence_mutation_battery_against_the_real_module() {
             ".child(header)",
             ".child(format!(\"tool-verb-{}\", 3)).child(header)",
         ),
+        (
+            "c-string literal leaks into a child slot",
+            ".child(header)",
+            ".child(c\"leaked\".to_str().unwrap()).child(header)",
+        ),
+        (
+            "stringify! macro leaks into a child slot",
+            ".child(header)",
+            ".child(stringify!(LEAKED_IDENT)).child(header)",
+        ),
+        (
+            "concat! macro leaks into a child slot",
+            ".child(header)",
+            ".child(concat!(\"a\", \"-\", \"b\")).child(header)",
+        ),
     ];
     let mut ran = 0usize;
     for (label, needle, replacement) in mutations {
@@ -4405,7 +4515,7 @@ fn renderer_literal_fence_mutation_battery_against_the_real_module() {
         }
         ran += 1;
     }
-    assert_eq!(ran, 6, "battery must exercise all six review-named probes");
+    assert_eq!(ran, 9, "battery must exercise every review-named probe");
 }
 
 #[test]
@@ -4438,7 +4548,9 @@ mod fence {
 
     use syn::visit::{self, Visit};
 
-    const ALLOWED_METHODS: &[&str] = &["debug_selector", "id", "aria_label", "role"];
+    /// Diagnostic macros whose payloads never reach the user. Their
+    /// token stream is scanned inside an allowed subtree so any literal
+    /// payload passes.
     const DIAGNOSTIC_MACROS: &[&str] = &[
         "panic",
         "unreachable",
@@ -4451,6 +4563,16 @@ mod fence {
         "debug_assert_eq",
         "debug_assert_ne",
     ];
+
+    /// Pattern-only macros the render module legitimately uses. Their
+    /// payload carries no visible text.
+    const PATTERN_MACROS: &[&str] = &["matches"];
+
+    /// `format!` is scanned WITHOUT bumping the allowed subtree — any
+    /// literal fragment in its payload is checked against the ambient
+    /// depth (which is always zero now that the method-name allowance
+    /// is gone) and trips the fence.
+    const FORMAT_MACRO: &str = "format";
 
     /// Parse `source` and return every literal the fence flags. Empty
     /// vector means the source is clean.
@@ -4542,27 +4664,6 @@ mod fence {
     }
 
     impl<'ast> Visit<'ast> for Visitor {
-        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-            let method_ok = ALLOWED_METHODS.iter().any(|name| node.method == *name);
-            if method_ok {
-                // Receiver stays outside the allowed subtree — literals
-                // in the parent chain are still checked normally. Only
-                // the method args (and any turbofish generics) inherit
-                // the allowance.
-                self.visit_expr(&node.receiver);
-                if let Some(g) = node.turbofish.as_ref() {
-                    self.visit_angle_bracketed_generic_arguments(g);
-                }
-                self.allowed_depth += 1;
-                for arg in &node.args {
-                    self.visit_expr(arg);
-                }
-                self.allowed_depth -= 1;
-            } else {
-                visit::visit_expr_method_call(self, node);
-            }
-        }
-
         fn visit_expr_lit(&mut self, node: &'ast syn::ExprLit) {
             self.check_lit(&node.lit);
             visit::visit_expr_lit(self, node);
@@ -4582,13 +4683,31 @@ mod fence {
                 .last()
                 .map(|s| s.ident.to_string())
                 .unwrap_or_default();
-            let is_diag = DIAGNOSTIC_MACROS.iter().any(|d| *d == name);
-            if is_diag {
+            if DIAGNOSTIC_MACROS.iter().any(|d| *d == name)
+                || PATTERN_MACROS.iter().any(|p| *p == name)
+            {
+                // Diagnostic payloads never surface. Pattern macros
+                // (`matches!`) carry patterns, not visible text. Both
+                // ride an allowed subtree so any literal token passes.
                 self.allowed_depth += 1;
-            }
-            self.scan_tokens(node.tokens.clone());
-            if is_diag {
+                self.scan_tokens(node.tokens.clone());
                 self.allowed_depth -= 1;
+            } else if name == FORMAT_MACRO {
+                // `format!` is scanned at ambient depth (always 0 now).
+                // Any literal fragment in its payload trips the fence.
+                self.scan_tokens(node.tokens.clone());
+            } else {
+                self.failures.push(format!(
+                    "forbidden macro `{name}!` in the render module — the fence \
+                     allowlists only diagnostic macros (panic/unreachable/todo/\
+                     unimplemented/assert{{,_eq,_ne}}/debug_assert{{,_eq,_ne}}), \
+                     the pattern-only `matches!`, and `format!` (whose literal \
+                     fragments are still checked). `stringify!`, `concat!`, \
+                     `write!`, and unknown/imported macros are rejected — route \
+                     every visible string through the RowText / LoginRowText \
+                     model or `row_text::chrome`."
+                ));
+                self.scan_tokens(node.tokens.clone());
             }
         }
 
@@ -4622,6 +4741,7 @@ mod fence {
                 syn::Lit::ByteStr(b) => {
                     Some(("byte-str", String::from_utf8_lossy(&b.value()).into_owned()))
                 }
+                syn::Lit::CStr(c) => Some(("c-str", c.value().to_string_lossy().into_owned())),
                 _ => None,
             };
             if let Some((kind, text)) = content {
@@ -4629,9 +4749,8 @@ mod fence {
                     self.failures.push(format!(
                         "forbidden {kind} literal {text:?} — route this string through \
                          the RowText / LoginRowText model, the row_text::chrome constants, \
-                         or a selector helper (row_text::sel::*). Allowed literal contexts: \
-                         args to `debug_selector` / `id` / `aria_label` / `role`, or a \
-                         diagnostic macro payload."
+                         or a selector helper (row_text::sel::*). The only allowed literal \
+                         context is a diagnostic / matches! macro payload."
                     ));
                 }
             }
@@ -4650,12 +4769,14 @@ mod fence {
                         let is_byte = bytes.starts_with(b"b\"")
                             || bytes.starts_with(b"br\"")
                             || bytes.starts_with(b"br#");
-                        if (is_str || is_byte) && self.allowed_depth == 0 {
+                        let is_cstr = bytes.starts_with(b"c\"")
+                            || bytes.starts_with(b"cr\"")
+                            || bytes.starts_with(b"cr#");
+                        if (is_str || is_byte || is_cstr) && self.allowed_depth == 0 {
                             self.failures.push(format!(
                                 "forbidden macro-token literal {text} — route this string \
-                                 through the RowText / LoginRowText model. Allowed literal \
-                                 contexts: args to `debug_selector` / `id` / `aria_label` / \
-                                 `role`, or a diagnostic macro payload."
+                                 through the RowText / LoginRowText model. The only allowed \
+                                 literal context is a diagnostic / matches! macro payload."
                             ));
                         }
                     }
