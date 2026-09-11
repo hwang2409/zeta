@@ -1410,10 +1410,17 @@ impl ZetaView {
 
     fn render_run_header_band2(&self, cx: &App) -> gpui::AnyElement {
         // Band 2 shape (contract line 83): min-height 40, metadata items
-        // separated by 1x14 vertical rules at the faint tier. Metrics owns
-        // the middle; the trailing chip carries the keybind hint so a
-        // returning operator can still find "Enter sends" on the second
-        // line rather than only at the composer.
+        // separated by 1x14 vertical rules at the faint tier. The band is
+        // strictly RUNTIME metadata — usage on the left, model on the
+        // right — because band 1 already carries the composer hint / step
+        // text and the composer's own target line already prints the model
+        // above the input. Repeating either here paints the same text
+        // twice on every screen and pushes the right-hand slice off the
+        // window edge on wider model names.
+        //
+        // Left slice `flex_1 min_w_0 truncate` shrinks and ellipses before
+        // the model chip, so the model never clips at the window edge on
+        // any transcript width.
         div()
             .id("status-bar")
             .debug_selector(|| "status-bar".into())
@@ -1431,24 +1438,21 @@ impl ZetaView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .debug_selector(|| "composer-hint".into())
+                    .debug_selector(|| "status-metrics".into())
                     .child(polish::status_label(&self.state.metrics)),
             )
             .child(status_rule(cx))
             .child(
+                // Model chip pinned right. `max_w` caps the slice at a
+                // readable measure so an unusually long model name
+                // truncates INSIDE the chip rather than pushing the whole
+                // band past the right edge; `min_w_0 truncate` lets the
+                // ellipsis land cleanly on the chip's own boundary.
                 div()
                     .flex_shrink_0()
-                    .text_color(theme::palette::text_faint())
-                    .debug_selector(|| "footer-hints".into())
-                    .child(self.composer_hint()),
-            )
-            .child(status_rule(cx))
-            .child(
-                // Model name pinned right — the third metadata slice the
-                // wiki header carries, kept short so it never crowds out
-                // the hint.
-                div()
-                    .flex_shrink_0()
+                    .max_w(px(220.))
+                    .min_w_0()
+                    .truncate()
                     .text_color(theme::palette::text_faint())
                     .debug_selector(|| "run-header-model".into())
                     .child(

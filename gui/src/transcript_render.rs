@@ -38,6 +38,91 @@ use zeta_gui::row_text::{
 };
 use zeta_gui::state::TranscriptEntry;
 
+/// The assistant row's markdown style, extracted so the ZETA-110 clipping
+/// guards (scroll layout, per-cell nowrap, flat cell border, subtle inline
+/// code) can be pinned by a test that fails if any of them regress.
+///
+/// Every field is sourced from the ambient `cx.theme()` so the values move
+/// with the theme instead of the palette accessors — the gpui-kit
+/// rich-text default is `HighlightStyle { background_color: theme.accent }`,
+/// so a caller that skipped this override would paint the inline chip on
+/// solid accent. Routing through `theme.secondary_hover` (~6% text-normal
+/// wash) and `theme.foreground` mirrors the wiki `.markdown-preview-view
+/// code` rule and keeps the whole app on one inline-code shape.
+///
+/// The `table` and `table_cell` refinements carry the load-bearing
+/// clipping fix from round 1: `overflow.x = Scroll` grows every column to
+/// its measured glyph width instead of the wrap layout's character-count
+/// heuristic, and `white_space = Nowrap` on `table_cell` raises the
+/// per-column floors so an inline-code chip's trailing glyph never lands
+/// on the wrong side of the cell's `overflow_hidden()`. The transparent
+/// `border_color` on the cell keeps rows reading flat; the row-bottom
+/// rules ride on the row `div`, not the cell.
+pub(crate) fn assistant_markdown_style(cx: &App) -> gpui_kit::component::text::TextViewStyle {
+    let theme = cx.theme();
+    let code_block = gpui::StyleRefinement::default()
+        .py(px(12.))
+        .px(px(16.))
+        .border_1()
+        .border_color(theme.border)
+        .whitespace_normal();
+    // Inline `code` sits on a subtle text-normal wash with normal-tier
+    // text, matching the wiki's `.markdown-preview-view code` rule.
+    // Routing through the theme means a future TextView caller that
+    // reuses this helper — or that inherits the gpui-kit rich-text
+    // default we override at render time — never paints the chip on
+    // the raw accent slab the component library ships as its default.
+    let inline_code = gpui::HighlightStyle {
+        background_color: Some(theme.secondary_hover),
+        color: Some(theme.foreground),
+        ..Default::default()
+    };
+    // Tables opt into gpui-base's SCROLL layout so column widths come
+    // from the shaped text of each cell instead of the wrap layout's
+    // character-count heuristic. Wrap layout budgets columns by
+    // character count and clamps the cell to `overflow_hidden`; on a
+    // proportional glyph run — inline code chips scaled to 0.875 plus
+    // 4px padding — that budget starves narrow columns and the trailing
+    // glyph disappears (`bas`, `tod`, `rea`, `edi` in the smoke shot
+    // instead of `bash`, `todo`, `read`, `edit`). Scroll mode grows
+    // every column to its measured content and only scrolls when the
+    // total content exceeds the transcript column.
+    let table = gpui::StyleRefinement {
+        overflow: gpui::PointRefinement {
+            x: Some(gpui::Overflow::Scroll),
+            y: None,
+        },
+        ..Default::default()
+    };
+    // Cell refinement:
+    //   * transparent border — kills the per-cell vertical grid so the
+    //     table reads as flat rows (row bottom rules ride on the row
+    //     div, not the cell, and survive this override), matching the
+    //     wiki's "header rule at most" look.
+    //   * white-space nowrap — in the scroll layout, per gpui-base's
+    //     own docs, nowrap on `style.table_cell` "keeps the cell text
+    //     on a single line, and the floors are raised to the full
+    //     content widths so the single-line columns never shrink."
+    //     That is the load-bearing fix for the inline-code chip
+    //     clipping: with nowrap, the Tool column's floor becomes the
+    //     shaped width of the widest chip (with its 4px padding) plus
+    //     the cell's own padding, so the chip's trailing glyph always
+    //     lands inside the column instead of getting sliced off by
+    //     the cell's `overflow_hidden()`.
+    let mut table_cell = gpui::StyleRefinement {
+        border_color: Some(gpui::transparent_black()),
+        ..Default::default()
+    };
+    table_cell.text.white_space = Some(gpui::WhiteSpace::Nowrap);
+    gpui_kit::component::text::TextViewStyle {
+        code_block,
+        table,
+        table_cell,
+        inline_code,
+        ..Default::default()
+    }
+}
+
 impl ZetaView {
     pub(crate) fn render_row(&self, index: usize, view: WeakEntity<Self>, cx: &App) -> AnyElement {
         let is_first = index == 0;
@@ -248,16 +333,6 @@ impl ZetaView {
             truncated_hint,
         } = text;
         let source = source.to_owned();
-        let code_block = gpui::StyleRefinement::default()
-            .py(px(12.))
-            .px(px(16.))
-            .border_1()
-            .border_color(cx.theme().border)
-            .whitespace_normal();
-        let text_style = gpui_kit::component::text::TextViewStyle {
-            code_block,
-            ..Default::default()
-        };
         div()
             .py(px(2.))
             .w_full()
@@ -267,7 +342,7 @@ impl ZetaView {
             .child(
                 TextView::markdown(sel::message(index), source)
                     .selectable(true)
-                    .style(text_style),
+                    .style(assistant_markdown_style(cx)),
             )
             .into_any_element()
     }

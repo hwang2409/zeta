@@ -29,9 +29,15 @@ async def main():
                 TextContent(
                     "## Core chat loop\n\n"
                     "The native interface includes:\n\n"
-                    "- Readable session previews\n"
-                    "- Streaming markdown and tool receipts\n"
-                    "- A multiline composer with keyboard controls\n\n"
+                    "- Readable session previews with `session_id`\n"
+                    "- Streaming markdown, tool receipts, and `render_frame`\n"
+                    "- A multiline composer bound to `Cmd-Enter`\n\n"
+                    "| Tool | Purpose | Approval |\n"
+                    "| ---- | ------- | -------- |\n"
+                    "| `bash` | Run one shell command | ask |\n"
+                    "| `todo` | Track work in-flight | auto |\n"
+                    "| `read` | Read a file from disk | auto |\n"
+                    "| `edit` | Apply a scoped edit | ask |\n\n"
                     '```rust\nfn main() {\n    println!("Hello from zeta");\n}\n```'
                 ),
             ],

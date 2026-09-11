@@ -406,6 +406,197 @@ fn assistant_row_is_naked_and_carries_no_bg_or_rail(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn assistant_markdown_style_pins_the_zeta_110_clipping_guards(cx: &mut TestAppContext) {
+    // ZETA-110 r1 fixed the assistant-row table clipping by (a) opting the
+    // TextView table into gpui-base's SCROLL layout so column widths come
+    // from measured glyph runs, and (b) forcing per-cell nowrap so the
+    // column floors are raised to the full content width — mentally revert
+    // either lever and inline `code` chips in tool tables lose their
+    // trailing glyph again. r1 also flattened the cell borders and moved
+    // the inline chip off the raw accent onto a subtle text-normal wash
+    // sourced from the theme (routed through `cx.theme()` so the gpui-kit
+    // rich-text default — solid accent — cannot leak in through any
+    // future TextView caller that forgets a local style override).
+    //
+    // Only paint-probe / color tests guarded these fields before; a
+    // scroll-mode or nowrap regression would compile and paint the same
+    // colors while quietly reintroducing the clipping. This test pins the
+    // style struct's shape directly, so each of the four levers below
+    // fails a named assert if reverted.
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply);
+    cx.update(|cx| {
+        let style = super::transcript_render::assistant_markdown_style(cx);
+        let theme = cx.theme();
+
+        // Scroll mode — without this, the table falls back to the wrap
+        // layout that budgets columns by character count and clamps cells
+        // to `overflow_hidden`, which is what sliced the chip glyphs in
+        // the smoke shot before the fix.
+        assert_eq!(
+            style.table.overflow.x,
+            Some(gpui::Overflow::Scroll),
+            "table must opt into gpui-base's SCROLL layout — reverting this \
+             brings back the wrap layout's character-count column budget",
+        );
+        assert!(
+            style.table.overflow.y.is_none(),
+            "table must leave overflow.y unset so vertical scroll stays \
+             with the transcript column, not the individual table",
+        );
+
+        // Per-cell nowrap — the load-bearing floor-raise. gpui-base's own
+        // docs on `style.table_cell.white_space = Nowrap` say it "keeps
+        // the cell text on a single line, and the floors are raised to
+        // the full content widths so the single-line columns never
+        // shrink." That is what pushes the Tool column's floor out to the
+        // widest chip's shaped width so the trailing glyph lands inside
+        // the cell rather than outside its `overflow_hidden()`.
+        assert_eq!(
+            style.table_cell.text.white_space,
+            Some(gpui::WhiteSpace::Nowrap),
+            "table cells must carry nowrap so column floors are raised \
+             to their shaped-glyph widths — reverting this restarts the \
+             r1 inline-code-chip clipping",
+        );
+
+        // Transparent cell border — kills the per-cell vertical grid so
+        // rows read flat (the row-bottom rule rides on the row div, not
+        // the cell, and survives this override).
+        assert_eq!(
+            style.table_cell.border_color,
+            Some(gpui::transparent_black()),
+            "cell border must be transparent so the table reads as flat \
+             rows without a per-cell grid",
+        );
+
+        // Inline-code chip routed through the theme, not palette::
+        // directly. `secondary_hover` is the ~6% text-normal wash the
+        // wiki paints on `.markdown-preview-view code`; `foreground`
+        // paints the glyph at normal-tier text — together they keep the
+        // chip from competing with real accent chrome.
+        assert_eq!(
+            style.inline_code.background_color,
+            Some(theme.secondary_hover),
+            "inline-code chip bg must ride the theme's secondary_hover \
+             wash — a fallback to accent paints the solid violet slab \
+             the ticket set out to remove",
+        );
+        assert_eq!(
+            style.inline_code.color,
+            Some(theme.foreground),
+            "inline-code glyph must be normal-tier text so the chip \
+             reads as a quiet annotation, not accent chrome",
+        );
+
+        // The wash the theme routes into the chip must itself stay
+        // subtle and share the text hue — a regression that promoted
+        // secondary_hover to a solid fill would silently loud-up every
+        // inline chip AND every hover state at once, so a named assert
+        // here beats waiting for the visible regression.
+        let wash = theme.secondary_hover;
+        let text = theme.foreground;
+        assert!(
+            wash.a > 0.02 && wash.a < 0.10,
+            "inline-code wash alpha {:.3} must land in the wiki's \
+             ~6% text-normal band",
+            wash.a
+        );
+        assert_eq!(wash.h, text.h);
+        assert_eq!(wash.s, text.s);
+        assert_eq!(wash.l, text.l);
+    });
+}
+
+/// A minimal Render that drops one UNSTYLED `TextView::markdown` (inline
+/// code, no local `.style(...)`) into a window. It exists only so the
+/// r3 default-install guard below can inspect the paint scene without
+/// dragging the whole `ZetaView`/`Root` chrome into a probe render.
+struct InlineCodeDefaultProbe;
+
+impl gpui::Render for InlineCodeDefaultProbe {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        gpui::div()
+            .size_full()
+            .p_4()
+            .child(gpui_kit::component::text::TextView::markdown(
+                "app-default-inline-code-probe",
+                "hello `world` there",
+            ))
+    }
+}
+
+#[gpui::test]
+fn app_wide_text_view_default_paints_inline_code_on_the_subtle_wash(cx: &mut TestAppContext) {
+    // ZETA-110 r3 root cause: gpui-component's `base_text_view_style`
+    // hardcodes the app-wide inline-code default to
+    // `HighlightStyle { background_color: Some(theme.accent) }`. Round 2
+    // only styled the ASSISTANT renderer locally, so every OTHER
+    // `TextView::markdown` (input popovers, error surfaces, previews —
+    // anywhere a caller does not pass a local `.style(...)`) still
+    // painted inline code on the solid violet slab.
+    //
+    // `theme::apply` overwrites `TextViewDefaults::global(cx)` AFTER
+    // `Theme::sync_base(cx)` so the app-wide default rides the same
+    // ~6% text-normal wash the assistant renderer already uses. This
+    // probe exercises that path: an UNSTYLED `TextView::markdown` with
+    // one inline `code` chip goes through the paint pipeline, and the
+    // resulting quads must carry the subtle wash — NEVER the accent.
+    //
+    // If the install line in `theme::apply` is removed, `sync_base`
+    // still puts gpui-component's accent-inline default in place and
+    // the inline chip paints on solid violet, so the second assertion
+    // (no accent-backed quad) fails.
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply);
+    let window = cx.open_window(gpui::size(px(400.), px(160.)), |_, _| {
+        InlineCodeDefaultProbe
+    });
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let subtle = theme.secondary_hover;
+        let accent = theme.accent;
+        assert_ne!(
+            subtle, accent,
+            "the subtle wash and solid accent must be distinct tokens \
+             or this guard degenerates to a tautology",
+        );
+        let quads = window.painted_quads();
+        let hit = |color: gpui::Hsla| quads.iter().any(|quad| quad.background == color.into());
+        assert!(
+            hit(subtle),
+            "unstyled TextView::markdown must paint the inline-code chip \
+             on the theme's secondary_hover wash — a removal of the \
+             `TextViewDefaults::install` call in theme::apply restores \
+             gpui-component's solid-accent default",
+        );
+        assert!(
+            !hit(accent),
+            "unstyled TextView::markdown must NOT paint any quad on \
+             solid theme.accent — the r3 regression paints the inline \
+             chip on the raw violet slab this test guards against",
+        );
+        // The Base-layer defaults must still carry the code-block
+        // syntax highlighter installed by `Theme::sync_base` — the
+        // r3 install rebuilds `TextViewDefaults` and any refactor that
+        // drops the `TextViewDefaults::global(cx).with_style(...)` clone
+        // (and installs a fresh `TextViewDefaults::new()` instead)
+        // would silently strip fenced-code coloring app-wide.
+        assert!(
+            gpui_kit::base::TextViewDefaults::global(cx).has_code_block_highlighter(),
+            "the installed defaults must retain the code-block syntax \
+             highlighter — dropping it kills fence colors app-wide",
+        );
+    });
+}
+
+#[gpui::test]
 fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut TestAppContext) {
     // The wiki contract encodes tool state through COLOR ONLY on the actual
     // verb and detail text: running paints at foreground, done fades to
@@ -2442,10 +2633,7 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
         tokens: Some(12),
         cache_hit_rate: Some(50.),
     };
-    assert_eq!(
-        polish::status_label(&metrics),
-        "model · 12 tokens · 50.0% cache"
-    );
+    assert_eq!(polish::status_label(&metrics), "12 tokens · 50.0% cache");
     let mut state = AppState::default();
     let mut status = StatusResult {
         session: Some(SessionMetadata {
@@ -2460,7 +2648,7 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
     state.apply_status(status.clone());
     assert_eq!(
         polish::status_label(&state.metrics),
-        "model · Usage appears after the first turn"
+        "Usage appears after the first turn"
     );
     status.usage = json!({
         "input_tokens": 4, "output_tokens": 4, "cache_read_input_tokens": 4
@@ -2468,7 +2656,7 @@ fn status_and_approval_summaries_are_readable_without_raw_placeholders() {
     state.apply_status(status);
     assert_eq!(
         polish::status_label(&state.metrics),
-        "model · 12 tokens · 50.0% cache"
+        "12 tokens · 50.0% cache"
     );
     for (name, args, expected) in [
         (
@@ -3525,9 +3713,11 @@ fn session_edit_modal_matches_the_wiki_flat_panel_shape(cx: &mut TestAppContext)
 #[gpui::test]
 fn footer_status_strip_paints_vertical_rules_between_metadata(cx: &mut TestAppContext) {
     // The wiki header pattern rules adjacent metadata with 1x14 vertical
-    // separators. Two rules ride between the pill, the metrics label, and
-    // the hint — a regression that dropped them would fuse the strip into
-    // one uniform run.
+    // separators. Band 2 now carries only two metadata slices — the usage
+    // strip on the left and the model chip pinned right — so a single
+    // rule sits between them. A regression that dropped the rule would
+    // fuse the strip into one uniform run; one that reintroduced the
+    // composer-hint duplicate would paint two rules again.
     let (window, _view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| window.draw(cx).clear(cx));
@@ -3547,9 +3737,10 @@ fn footer_status_strip_paints_vertical_rules_between_metadata(cx: &mut TestAppCo
                     && quad.bounds.size.width <= px(2.).scale(window.scale_factor())
             })
             .collect();
-        assert!(
-            rules.len() >= 2,
-            "expected two vertical rules on the status strip, saw {}",
+        assert_eq!(
+            rules.len(),
+            1,
+            "expected one rule between metrics and model chip, saw {}",
             rules.len()
         );
     });
