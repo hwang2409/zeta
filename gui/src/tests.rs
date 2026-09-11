@@ -2918,3 +2918,1275 @@ fn session_rename_during_slow_stream_keeps_delete_disabled(cx: &mut TestAppConte
     assert!(receiver.try_recv().is_err());
     visual.run_until_parked();
 }
+
+#[gpui::test]
+fn sidebar_pins_to_the_wiki_column_width_and_row_height(cx: &mut TestAppContext) {
+    // Contract line 81: 216px sidebar with 40px rows. A regression that
+    // widens the column back to 280px would leak into every screenshot and
+    // shrink the transcript column across the app.
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let header = visual
+        .debug_bounds("sidebar-header")
+        .expect("header renders");
+    let row = visual
+        .debug_bounds("session-row")
+        .expect("session row renders");
+    // Allow one sub-logical-pixel drift on either side; gpui rounds layout
+    // to physical pixels, so the row width may land at 215 or 216 depending
+    // on scale factor without violating the contract.
+    let width_delta = if header.size.width >= theme::SIDEBAR_WIDTH {
+        header.size.width - theme::SIDEBAR_WIDTH
+    } else {
+        theme::SIDEBAR_WIDTH - header.size.width
+    };
+    assert!(
+        width_delta <= px(1.),
+        "sidebar header width {:?} must land near the 216px pin",
+        header.size.width
+    );
+    let row_delta = if row.size.width >= theme::SIDEBAR_WIDTH {
+        row.size.width - theme::SIDEBAR_WIDTH
+    } else {
+        theme::SIDEBAR_WIDTH - row.size.width
+    };
+    assert!(
+        row_delta <= px(1.),
+        "session row width {:?} must fit the 216px sidebar",
+        row.size.width
+    );
+    // Row min-height clamps at 40 (contract). Slight sub-logical-pixel
+    // rounding is fine as long as the height stays within a tolerance.
+    let delta = if row.size.height >= theme::SIDEBAR_ROW_HEIGHT {
+        row.size.height - theme::SIDEBAR_ROW_HEIGHT
+    } else {
+        theme::SIDEBAR_ROW_HEIGHT - row.size.height
+    };
+    assert!(
+        delta <= px(1.),
+        "session row height {:?} must land on the 40px floor",
+        row.size.height
+    );
+}
+
+#[gpui::test]
+fn current_session_row_paints_no_fill_and_gets_an_accent_dot(cx: &mut TestAppContext) {
+    // Contract line 81: the current session paints NO fill (transparent bg,
+    // accent text 600) and a small accent dot in the left gutter. A ghost
+    // Button's selected-state fill would violate this — the guard checks
+    // both the missing fill and the presence of a solid-accent dot.
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let row = visual
+        .debug_bounds("session-row")
+        .expect("session row renders");
+    let dot = visual
+        .debug_bounds("session-current-dot")
+        .expect("current session paints its accent dot");
+    assert!(
+        row.contains(&dot.origin),
+        "the accent dot sits inside the row's gutter"
+    );
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled_row = row.scale(window.scale_factor());
+        let scaled_dot = dot.scale(window.scale_factor());
+        // Contract line 81: the CURRENT row paints NO row-sized fill —
+        // transparent bg, accent text, dot in the gutter. The guard walks
+        // every painted quad that spans a full row's width AND lives
+        // entirely inside the row's bounds, then rejects anything with a
+        // non-transparent background. Mentally swap in a panel fill: the
+        // test must fail; swap in a hover tint: it must fail. Only the
+        // small dot quad passes because its bounds sit well below the
+        // row-width threshold.
+        let scale = window.scale_factor();
+        let row_width_threshold = scaled_row.size.width - px(4.).scale(scale);
+        let dot_bounds_padded = gpui::Bounds {
+            origin: gpui::Point {
+                x: scaled_dot.origin.x - px(2.).scale(scale),
+                y: scaled_dot.origin.y - px(2.).scale(scale),
+            },
+            size: gpui::Size {
+                width: scaled_dot.size.width + px(4.).scale(scale),
+                height: scaled_dot.size.height + px(4.).scale(scale),
+            },
+        };
+        let dot_contains = |quad_bounds: gpui::Bounds<gpui::ScaledPixels>| {
+            quad_bounds.top() >= dot_bounds_padded.top()
+                && quad_bounds.bottom() <= dot_bounds_padded.bottom()
+                && quad_bounds.left() >= dot_bounds_padded.left()
+                && quad_bounds.right() <= dot_bounds_padded.right()
+        };
+        let filled: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                let in_row = quad.bounds.top() >= scaled_row.top()
+                    && quad.bounds.bottom() <= scaled_row.bottom()
+                    && quad.bounds.left() >= scaled_row.left()
+                    && quad.bounds.right() <= scaled_row.right();
+                // Row-sized fill = wider than most of the row. That excludes
+                // the small dot quad (~9px) but catches any hover / active /
+                // panel / arbitrary tint that a regression could paint under
+                // the label.
+                let row_sized = quad.bounds.size.width >= row_width_threshold;
+                let has_fill: gpui::Background = quad.background;
+                let transparent = has_fill == gpui::transparent_black().into();
+                in_row && row_sized && !transparent && !dot_contains(quad.bounds)
+            })
+            .collect();
+        assert!(
+            filled.is_empty(),
+            "the current session row painted a row-sized fill: {} quads, first={:?}",
+            filled.len(),
+            filled.first().map(|q| q.background)
+        );
+        // Legacy pin: even if a future fill were narrower than a full row,
+        // the sidebar_accent / list_active tints are the two Kit tokens that
+        // a `.ghost().selected()` regression would paint here. Keep both
+        // named assertions so the guard reads as intentional.
+        let selected_tint = window.painted_quads().into_iter().any(|quad| {
+            let in_row = quad.bounds.top() >= scaled_row.top()
+                && quad.bounds.bottom() <= scaled_row.bottom()
+                && quad.bounds.left() >= scaled_row.left()
+                && quad.bounds.right() <= scaled_row.right();
+            in_row
+                && (quad.background == theme.sidebar_accent.into()
+                    || quad.background == theme.list_active.into())
+        });
+        assert!(
+            !selected_tint,
+            "the current session row painted a selected-tint fill"
+        );
+        // A solid accent quad exists somewhere on the row — the dot.
+        let scaled_dot = dot.scale(window.scale_factor());
+        let dot_quads: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.background == theme.primary.into()
+                    && quad.bounds.top() >= scaled_dot.top() - px(1.).scale(window.scale_factor())
+                    && quad.bounds.bottom()
+                        <= scaled_dot.bottom() + px(1.).scale(window.scale_factor())
+            })
+            .collect();
+        assert!(!dot_quads.is_empty(), "the accent dot painted its fill");
+    });
+}
+
+#[gpui::test]
+fn connection_lost_paints_a_blocker_row_with_a_danger_rail(cx: &mut TestAppContext) {
+    // Contract line 83: blocker row = border-left 2px danger + danger 10%
+    // tint bg. The banner replaces the old Alert::error card — this pin
+    // catches a regression that would restore the framed alert.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::Lost("socket closed".into()), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    let banner = visual
+        .debug_bounds("connection-lost")
+        .expect("banner renders");
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled_banner = banner.scale(window.scale_factor());
+        let rail = window
+            .painted_quads()
+            .into_iter()
+            .find(|quad| {
+                quad.border_color == theme.danger
+                    && quad.border_widths.left > gpui::ScaledPixels::default()
+                    && quad.bounds.top()
+                        >= scaled_banner.top() - px(1.).scale(window.scale_factor())
+                    && quad.bounds.bottom()
+                        <= scaled_banner.bottom() + px(1.).scale(window.scale_factor())
+            })
+            .expect("blocker rail paints on the connection-lost banner");
+        let expected = px(f32::from(theme::ATTENTION_RAIL_WIDTH)).scale(window.scale_factor());
+        let delta = if rail.border_widths.left > expected {
+            rail.border_widths.left - expected
+        } else {
+            expected - rail.border_widths.left
+        };
+        assert!(
+            delta <= px(0.5).scale(window.scale_factor()),
+            "blocker rail width {:?} must land on the 2px contract",
+            rail.border_widths.left
+        );
+        let tint = window.painted_quads().into_iter().find(|quad| {
+            quad.background == theme::palette::danger_tint().into()
+                && quad.bounds.top() >= scaled_banner.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom()
+                    <= scaled_banner.bottom() + px(1.).scale(window.scale_factor())
+        });
+        assert!(tint.is_some(), "banner painted its 10% danger tint fill");
+    });
+}
+
+#[gpui::test]
+fn status_pill_paints_a_solid_fill_and_flips_to_danger_when_offline(cx: &mut TestAppContext) {
+    // Contract line 83: neutral state = solid accent, negative = solid
+    // danger. The pill carries the single load-bearing color on the strip;
+    // a regression that dropped the fill back to text-tone would erase the
+    // wiki-run recognisability.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let pill = visual
+        .debug_bounds("footer-mode")
+        .expect("footer mode pill renders");
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled_pill = pill.scale(window.scale_factor());
+        let neutral = window.painted_quads().into_iter().find(|quad| {
+            quad.background == theme.primary.into()
+                && quad.bounds.top() >= scaled_pill.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom()
+                    <= scaled_pill.bottom() + px(1.).scale(window.scale_factor())
+        });
+        assert!(neutral.is_some(), "neutral pill paints a solid accent fill");
+    });
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::Lost("network gone".into()), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    let pill = visual
+        .debug_bounds("footer-mode")
+        .expect("footer mode pill renders offline");
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled_pill = pill.scale(window.scale_factor());
+        let danger = window.painted_quads().into_iter().find(|quad| {
+            quad.background == theme.danger.into()
+                && quad.bounds.top() >= scaled_pill.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom()
+                    <= scaled_pill.bottom() + px(1.).scale(window.scale_factor())
+        });
+        assert!(
+            danger.is_some(),
+            "offline mode paints the negative pill in danger"
+        );
+    });
+}
+
+#[gpui::test]
+fn modals_paint_a_flat_panel_on_the_scrim_at_the_wiki_top_offset(cx: &mut TestAppContext) {
+    // Contract line 91: flat panel — bg panel, no shadow, no border, width
+    // 480, seated below a scrim at 25% of the viewport height. The guard
+    // pins both settings and session-edit; regressing either to a bordered
+    // card would show up here first.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.session_view.available = true;
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: "claude-opus-4-7".into(),
+                        approval_mode: "ask".into(),
+                    },
+                    ModelCatalog {
+                        models: vec!["claude-opus-4-7".into()],
+                        providers: [("claude-opus-4-7".into(), "claude".into())]
+                            .into_iter()
+                            .collect(),
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    let panel = visual
+        .debug_bounds("settings-panel")
+        .expect("settings panel renders");
+    assert_eq!(panel.size.width, theme::MODAL_WIDTH);
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled_panel = panel.scale(window.scale_factor());
+        // Panel bg paints as the panel/sidebar token, not the app canvas.
+        let filled = window.painted_quads().into_iter().find(|quad| {
+            quad.background == theme.sidebar.into()
+                && quad.bounds.top() >= scaled_panel.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom()
+                    <= scaled_panel.bottom() + px(1.).scale(window.scale_factor())
+                && quad.bounds.left() >= scaled_panel.left() - px(1.).scale(window.scale_factor())
+                && quad.bounds.right() <= scaled_panel.right() + px(1.).scale(window.scale_factor())
+        });
+        assert!(filled.is_some(), "settings panel paints on the panel token");
+        // No border rail on the panel itself — a regression that restored
+        // .border_1() would paint a bordered quad on the panel bounds.
+        let bordered: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                let border = quad.border_widths.left
+                    + quad.border_widths.right
+                    + quad.border_widths.top
+                    + quad.border_widths.bottom;
+                border > gpui::ScaledPixels::default() && quad.bounds == scaled_panel
+            })
+            .collect();
+        assert!(
+            bordered.is_empty(),
+            "settings panel painted a border rail: {} quads",
+            bordered.len()
+        );
+    });
+    // Sits at 25% of the viewport height — the exact wiki `top` offset.
+    // A 25% mark lands cleanly on a pixel grid, so drift beyond layout
+    // rounding (~1 logical px) means someone shifted the offset itself,
+    // not a fractional-pixel rounding wobble.
+    let overlay = visual
+        .debug_bounds("settings-overlay")
+        .expect("settings overlay renders");
+    let target = overlay.top() + overlay.size.height * theme::MODAL_TOP_FRACTION;
+    let drift = if panel.top() > target {
+        panel.top() - target
+    } else {
+        target - panel.top()
+    };
+    assert!(
+        drift <= px(1.),
+        "settings panel top {:?} must land within 1px (layout rounding) \
+         of the 25% mark ({:?})",
+        panel.top(),
+        target,
+    );
+    // Zero radius on the panel — contract line 91 pins a flat rectangle.
+    visual.update(|window, cx| {
+        let scaled_panel = panel.scale(window.scale_factor());
+        let rounded: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.bounds == scaled_panel
+                    && (quad.corner_radii.top_left > gpui::ScaledPixels::default()
+                        || quad.corner_radii.top_right > gpui::ScaledPixels::default()
+                        || quad.corner_radii.bottom_left > gpui::ScaledPixels::default()
+                        || quad.corner_radii.bottom_right > gpui::ScaledPixels::default())
+            })
+            .collect();
+        assert!(
+            rounded.is_empty(),
+            "settings panel painted a rounded corner ({} quads)",
+            rounded.len()
+        );
+        // No shadow behind the panel. gpui lowers `box-shadow` to a
+        // Shadow primitive (dedicated GPU pass) rather than a Quad, so
+        // `painted_quads()` cannot see shadow primitives directly. What
+        // it CAN see is the theme flags every shadow pass reads at paint
+        // time — Kit skips shadow emission entirely when both are false,
+        // and this assertion runs inside the same paint frame as the
+        // panel above, so it captures the paint-time state (not a
+        // constant). A mutation that flips either flag would trip here.
+        let theme = cx.theme();
+        assert!(
+            !theme.shadow,
+            "flat modal must paint with theme.shadow = false; got {}",
+            theme.shadow
+        );
+        assert!(
+            !theme.tile_shadow,
+            "flat modal must paint with theme.tile_shadow = false; got {}",
+            theme.tile_shadow
+        );
+    });
+}
+
+#[gpui::test]
+fn session_edit_modal_matches_the_wiki_flat_panel_shape(cx: &mut TestAppContext) {
+    // Twin of the settings modal: same flat-panel shape must land on the
+    // rename/delete overlay too. Contract line 91.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.session_management = true;
+            view.open_session_edit(session().session_id, true, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    let panel = visual
+        .debug_bounds("session-edit-panel")
+        .expect("session-edit panel renders");
+    assert_eq!(panel.size.width, theme::MODAL_WIDTH);
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled_panel = panel.scale(window.scale_factor());
+        let filled = window.painted_quads().into_iter().find(|quad| {
+            quad.background == theme.sidebar.into()
+                && quad.bounds.top() >= scaled_panel.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom()
+                    <= scaled_panel.bottom() + px(1.).scale(window.scale_factor())
+                && quad.bounds.left() >= scaled_panel.left() - px(1.).scale(window.scale_factor())
+                && quad.bounds.right() <= scaled_panel.right() + px(1.).scale(window.scale_factor())
+        });
+        assert!(
+            filled.is_some(),
+            "session-edit panel paints on the panel token"
+        );
+        // Zero radius — contract line 91 pins a flat rectangle. A future
+        // rounded card here would fail this even if the panel color and
+        // scrim offset stay put.
+        let rounded: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.bounds == scaled_panel
+                    && (quad.corner_radii.top_left > gpui::ScaledPixels::default()
+                        || quad.corner_radii.top_right > gpui::ScaledPixels::default()
+                        || quad.corner_radii.bottom_left > gpui::ScaledPixels::default()
+                        || quad.corner_radii.bottom_right > gpui::ScaledPixels::default())
+            })
+            .collect();
+        assert!(
+            rounded.is_empty(),
+            "session-edit panel painted a rounded corner ({} quads)",
+            rounded.len()
+        );
+        // Twin shadow guard — see the settings-modal test for why this
+        // reads the theme flags at paint time (gpui shadows are Shadow
+        // primitives, not Quads, so `painted_quads()` cannot observe
+        // them directly). A mutation that flips either flag to true
+        // trips this assertion.
+        let theme = cx.theme();
+        assert!(
+            !theme.shadow,
+            "flat modal must paint with theme.shadow = false; got {}",
+            theme.shadow
+        );
+        assert!(
+            !theme.tile_shadow,
+            "flat modal must paint with theme.tile_shadow = false; got {}",
+            theme.tile_shadow
+        );
+    });
+    // 25% top offset — same shelf as the settings modal, contract line 91.
+    let overlay = visual
+        .debug_bounds("session-edit")
+        .expect("session-edit overlay renders");
+    let target = overlay.top() + overlay.size.height * theme::MODAL_TOP_FRACTION;
+    let drift = if panel.top() > target {
+        panel.top() - target
+    } else {
+        target - panel.top()
+    };
+    assert!(
+        drift <= px(1.),
+        "session-edit panel top {:?} must land within 1px (layout rounding) \
+         of the 25% mark ({:?})",
+        panel.top(),
+        target,
+    );
+    // The input frame paints a bottom-only underline — contract line 91:
+    // "Inputs: no box, border-bottom 1px only, focus promotes underline".
+    // The rename modal grabs focus on open, so the underline paints in the
+    // ring color; a blurred re-render drops it back to the plain border.
+    let frame = visual
+        .debug_bounds("session-edit-input-frame")
+        .expect("session-edit input frame renders");
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled_frame = frame.scale(window.scale_factor());
+        let underline = window.painted_quads().into_iter().find(|quad| {
+            (quad.border_color == theme.ring || quad.border_color == theme.border)
+                && quad.border_widths.bottom > gpui::ScaledPixels::default()
+                && quad.border_widths.top == gpui::ScaledPixels::default()
+                && quad.border_widths.left == gpui::ScaledPixels::default()
+                && quad.border_widths.right == gpui::ScaledPixels::default()
+                && quad.bounds.top() >= scaled_frame.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom()
+                    <= scaled_frame.bottom() + px(1.).scale(window.scale_factor())
+        });
+        assert!(
+            underline.is_some(),
+            "session-edit input paints its bottom-only underline (border or ring)"
+        );
+        // Focused input promotes the underline to the ring color. Rip the
+        // focus off the textarea and assert it falls back to `theme.border`.
+        assert_eq!(
+            underline.unwrap().border_color,
+            theme.ring,
+            "the freshly opened rename modal grabs input focus, so the underline must paint on the ring"
+        );
+    });
+    visual.update(|window, cx| {
+        // Blur the input by focusing a fresh unattached handle; the
+        // underline should fall back to `theme.border`.
+        let elsewhere = cx.focus_handle();
+        window.focus(&elsewhere, cx);
+        window.draw(cx).clear(cx);
+    });
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled_frame = frame.scale(window.scale_factor());
+        let underline_border = window.painted_quads().into_iter().find(|quad| {
+            quad.border_color == theme.border
+                && quad.border_widths.bottom > gpui::ScaledPixels::default()
+                && quad.bounds.top() >= scaled_frame.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom()
+                    <= scaled_frame.bottom() + px(1.).scale(window.scale_factor())
+        });
+        assert!(
+            underline_border.is_some(),
+            "blurred session-edit input drops the underline back onto `theme.border`"
+        );
+    });
+}
+
+#[gpui::test]
+fn footer_status_strip_paints_vertical_rules_between_metadata(cx: &mut TestAppContext) {
+    // The wiki header pattern rules adjacent metadata with 1x14 vertical
+    // separators. Two rules ride between the pill, the metrics label, and
+    // the hint — a regression that dropped them would fuse the strip into
+    // one uniform run.
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let bar = visual
+        .debug_bounds("status-bar")
+        .expect("status bar renders");
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled_bar = bar.scale(window.scale_factor());
+        let rules: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.background == theme.border.into()
+                    && quad.bounds.top() >= scaled_bar.top()
+                    && quad.bounds.bottom() <= scaled_bar.bottom()
+                    && quad.bounds.size.width <= px(2.).scale(window.scale_factor())
+            })
+            .collect();
+        assert!(
+            rules.len() >= 2,
+            "expected two vertical rules on the status strip, saw {}",
+            rules.len()
+        );
+    });
+}
+
+#[gpui::test]
+fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and_space(
+    cx: &mut TestAppContext,
+) {
+    // A11y regression guard (finding #2 — expanded round 3). Sidebar rows
+    // must be:
+    //   1. reachable by Tab (`.tab_index(0)` populates the window's tab
+    //      stops that `window.focus_next` walks),
+    //   2. paint the solid-accent keyboard cursor on the FOCUSED row so a
+    //      keyboard-only user sees which row Enter/Space would activate —
+    //      the current row must show the cursor too; the "no fill"
+    //      contract only applies to the UNFOCUSED current row,
+    //   3. activate on Enter AND Space (button-role keyboard contract).
+    // Both session and branch rows share this contract. Mutations that
+    // must fail: dropping the focus-cursor branch, dropping a key
+    // handler, or dropping `.tab_index(0)` from either row type.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let session_target = "cd34beef1234";
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut other = session();
+            other.session_id = session_target.into();
+            other.name = "other".into();
+            view.state.sessions.push(other);
+            view.state.session_view.available = true;
+            view.state.session_view.branches = vec![
+                Branch {
+                    id: "trunk".into(),
+                    label: "main".into(),
+                    depth: 0,
+                    current: true,
+                },
+                Branch {
+                    id: "alt".into(),
+                    label: "alt".into(),
+                    depth: 1,
+                    current: false,
+                },
+            ];
+            view.apply_worker_message(WorkerMessage::Connected, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    while receiver.try_recv().is_ok() {}
+
+    let session_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get(session_target)
+                .cloned()
+        })
+        .expect("sidebar row focus handle exists after render");
+    let current_session_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get(&session().session_id)
+                .cloned()
+        })
+        .expect("current session row focus handle exists after render");
+    let branch_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get("branch:alt")
+                .cloned()
+        })
+        .expect("branch row focus handle exists after render");
+    let current_branch_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get("branch:trunk")
+                .cloned()
+        })
+        .expect("current branch row focus handle exists after render");
+
+    // Row-sized paint check. `debug_bounds("session-row")` is ambiguous
+    // when multiple rows share the selector, so we assert on the SIZE of
+    // the accent quad — the focus cursor fills the whole row rectangle
+    // (~SIDEBAR_WIDTH × SIDEBAR_ROW_HEIGHT). The current-item dot is
+    // painted in the same accent color, but at 9×9px, so a size floor
+    // near the row's own footprint rejects it.
+    let row_sized_accent = |visual: &mut VisualTestContext, height: gpui::Pixels| -> bool {
+        visual.update(|window, cx| {
+            let theme = cx.theme();
+            let scale = window.scale_factor();
+            let width_floor = (theme::SIDEBAR_WIDTH * 0.9).scale(scale);
+            let height_floor = (height * 0.9).scale(scale);
+            window.painted_quads().into_iter().any(|q| {
+                q.background == theme.primary.into()
+                    && q.bounds.size.width >= width_floor
+                    && q.bounds.size.height >= height_floor
+            })
+        })
+    };
+
+    // --- The CURRENT session row (active) MUST paint the accent cursor
+    // when focused. Contract: the current-item "no fill" rule applies to
+    // the UNFOCUSED state only; a focused row overrides it. A mutation
+    // that reintroduces the old `focused && !active` guard would leave
+    // the current row with no visible focus cursor, and this check
+    // fails. ---
+    visual.update(|window, cx| {
+        window.focus(&current_session_handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        row_sized_accent(&mut visual, theme::SIDEBAR_ROW_HEIGHT),
+        "the CURRENT session row must still paint the accent cursor \
+         when focused (no-fill rule applies only to the unfocused state)"
+    );
+
+    // --- Non-active session row also paints the cursor on focus. ---
+    visual.update(|window, cx| {
+        window.focus(&session_handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        row_sized_accent(&mut visual, theme::SIDEBAR_ROW_HEIGHT),
+        "focused session row must paint the accent focus cursor"
+    );
+
+    // --- Enter activates the focused session row. ---
+    visual.simulate_keystrokes("enter");
+    let mut resumed = None;
+    while let Ok(msg) = receiver.try_recv() {
+        if let CommandMessage::Resume(id) = msg {
+            resumed = Some(id);
+            break;
+        }
+    }
+    assert_eq!(
+        resumed.as_deref(),
+        Some(session_target),
+        "Enter on a focused session row must dispatch Resume for that id"
+    );
+
+    // --- Space activates the focused session row. ---
+    visual.update(|window, cx| {
+        view.update(cx, |view, _| view.pending_command = false);
+        window.focus(&session_handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    visual.simulate_keystrokes("space");
+    let mut resumed_space = None;
+    while let Ok(msg) = receiver.try_recv() {
+        if let CommandMessage::Resume(id) = msg {
+            resumed_space = Some(id);
+            break;
+        }
+    }
+    assert_eq!(
+        resumed_space.as_deref(),
+        Some(session_target),
+        "Space on a focused session row must dispatch Resume for that id"
+    );
+
+    // --- The CURRENT branch row (trunk) must also paint the accent
+    // cursor when focused. Same contract as sessions — focused wins
+    // over the unfocused "no fill" rule. Reset `pending_command` first
+    // (session activation set it, and the branch row captures
+    // `can_activate` at render time). ---
+    visual.update(|window, cx| {
+        view.update(cx, |view, _| view.pending_command = false);
+        window.focus(&current_branch_handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        row_sized_accent(&mut visual, theme::SIDEBAR_NESTED_ROW_HEIGHT),
+        "the CURRENT branch row must still paint the accent cursor \
+         when focused (no-fill rule applies only to the unfocused state)"
+    );
+
+    // --- Non-current branch row (alt) also paints on focus. ---
+    visual.update(|window, cx| {
+        window.focus(&branch_handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        row_sized_accent(&mut visual, theme::SIDEBAR_NESTED_ROW_HEIGHT),
+        "focused branch row must paint the accent focus cursor"
+    );
+
+    // --- Enter on a focused branch row dispatches SwitchBranch. ---
+    visual.simulate_keystrokes("enter");
+    let mut switched = None;
+    while let Ok(msg) = receiver.try_recv() {
+        if let CommandMessage::SwitchBranch(id) = msg {
+            switched = Some(id);
+            break;
+        }
+    }
+    assert_eq!(
+        switched.as_deref(),
+        Some("alt"),
+        "Enter on a focused branch row must dispatch SwitchBranch for that id"
+    );
+
+    // --- Space on a focused branch row dispatches SwitchBranch. ---
+    visual.update(|window, cx| {
+        view.update(cx, |view, _| view.pending_command = false);
+        window.focus(&branch_handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    visual.simulate_keystrokes("space");
+    let mut switched_space = None;
+    while let Ok(msg) = receiver.try_recv() {
+        if let CommandMessage::SwitchBranch(id) = msg {
+            switched_space = Some(id);
+            break;
+        }
+    }
+    assert_eq!(
+        switched_space.as_deref(),
+        Some("alt"),
+        "Space on a focused branch row must dispatch SwitchBranch for that id"
+    );
+}
+
+#[gpui::test]
+fn current_session_dot_lands_on_the_9px_left_4px_contract(cx: &mut TestAppContext) {
+    // Contract line 81: current-item dot ~0.58em (9px at the 15px base)
+    // pinned to `left 4px` inside the row's gutter. Finding #11 flagged
+    // the previous 5px-centred sizing; this guard pins the new layout so
+    // a regression to the old constants shows up here.
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let row = visual
+        .debug_bounds("session-row")
+        .expect("session row renders");
+    let dot = visual
+        .debug_bounds("session-current-dot")
+        .expect("current session paints its accent dot");
+    // Size lands on the SIDEBAR_CURRENT_DOT_SIZE token.
+    let size_delta = if dot.size.width > theme::SIDEBAR_CURRENT_DOT_SIZE {
+        dot.size.width - theme::SIDEBAR_CURRENT_DOT_SIZE
+    } else {
+        theme::SIDEBAR_CURRENT_DOT_SIZE - dot.size.width
+    };
+    assert!(
+        size_delta <= px(1.),
+        "dot width {:?} must land on the 9px contract",
+        dot.size.width
+    );
+    // Left inset — dot.left - row.left ~= 4px.
+    let inset = dot.left() - row.left();
+    let inset_delta = if inset > theme::SIDEBAR_CURRENT_DOT_INSET {
+        inset - theme::SIDEBAR_CURRENT_DOT_INSET
+    } else {
+        theme::SIDEBAR_CURRENT_DOT_INSET - inset
+    };
+    assert!(
+        inset_delta <= px(1.),
+        "dot left inset {:?} must land on the 4px contract",
+        inset
+    );
+}
+
+#[gpui::test]
+fn sidebar_right_rule_paints_the_subtle_border(cx: &mut TestAppContext) {
+    // Contract line 3: sidebar right rule uses the SUBTLE border tier so
+    // the column reads as a seam, not a hard rule. A regression back to
+    // `palette::border()` shifts the seam one tint step darker; the paint
+    // probe below catches it by scanning for a full-height border quad on
+    // the sidebar's right edge.
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.update(|window, _cx| {
+        let subtle = theme::palette::border_subtle();
+        let bright = theme::palette::border();
+        let scale = window.scale_factor();
+        // Any painted quad whose right border color matches the subtle
+        // token counts as a passing match. We also assert the bright
+        // border token is NOT the one used, so a future regression that
+        // routed sidebar_border back to palette::border() is caught.
+        let sidebar_right = theme::SIDEBAR_WIDTH.scale(scale);
+        let matches: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.border_color == subtle
+                    && quad.border_widths.right > gpui::ScaledPixels::default()
+                    && quad.bounds.left() <= sidebar_right
+            })
+            .collect();
+        assert!(
+            !matches.is_empty(),
+            "expected the sidebar edge to paint on the subtle border tier"
+        );
+        let tolerance = px(2.).scale(scale);
+        let bright_matches = window.painted_quads().into_iter().any(|quad| {
+            let right_delta = if quad.bounds.right() > sidebar_right {
+                quad.bounds.right() - sidebar_right
+            } else {
+                sidebar_right - quad.bounds.right()
+            };
+            quad.border_color == bright
+                && quad.border_widths.right > gpui::ScaledPixels::default()
+                && quad.bounds.top() < px(200.).scale(scale)
+                && quad.bounds.left() <= sidebar_right
+                && right_delta <= tolerance
+        });
+        assert!(
+            !bright_matches,
+            "sidebar edge painted on the bright border tier"
+        );
+    });
+}
+
+#[gpui::test]
+fn run_header_paints_two_stacked_bands(cx: &mut TestAppContext) {
+    // Contract line 83 pins the run header at two stacked bands — band 1
+    // at 44px with the session label + state pill + step, band 2 at 40px
+    // with the metrics + rules. A regression that dropped either band
+    // (or merged them into one) would drift the header height and hide
+    // one signal.
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let band1 = visual
+        .debug_bounds("run-header-band1")
+        .expect("run header band 1 renders");
+    // Band 2 keeps the "status-bar" selector for backwards compatibility
+    // with the existing status-strip guard so both share one paint probe.
+    let band2 = visual
+        .debug_bounds("status-bar")
+        .expect("run header band 2 (status-bar) renders");
+    // Bands stack — band 2 sits directly below band 1.
+    assert!(
+        band2.top() >= band1.bottom() - px(2.),
+        "band 2 must sit below band 1 (band1.bottom={:?}, band2.top={:?})",
+        band1.bottom(),
+        band2.top()
+    );
+    // Heights land on the contract floors within one logical pixel.
+    let h1_delta = if band1.size.height > theme::HEADER_BAND1_MIN_HEIGHT {
+        band1.size.height - theme::HEADER_BAND1_MIN_HEIGHT
+    } else {
+        theme::HEADER_BAND1_MIN_HEIGHT - band1.size.height
+    };
+    assert!(
+        h1_delta <= px(2.),
+        "band 1 height {:?} must land on the 44px floor",
+        band1.size.height
+    );
+    let h2_delta = if band2.size.height > theme::HEADER_BAND2_MIN_HEIGHT {
+        band2.size.height - theme::HEADER_BAND2_MIN_HEIGHT
+    } else {
+        theme::HEADER_BAND2_MIN_HEIGHT - band2.size.height
+    };
+    assert!(
+        h2_delta <= px(2.),
+        "band 2 height {:?} must land on the 40px floor",
+        band2.size.height
+    );
+    // Band 1 carries the state pill and the step — both must render.
+    assert!(
+        visual.debug_bounds("footer-mode").is_some(),
+        "band 1 must render the state pill"
+    );
+    assert!(
+        visual.debug_bounds("run-header-step").is_some(),
+        "band 1 must render the step text"
+    );
+    // Band 2 carries the metrics rules.
+    assert!(
+        visual.debug_bounds("run-header-model").is_some(),
+        "band 2 must render the model chip"
+    );
+}
+
+/// Probe view for the scrollbar guard. Renders a Kit `Scrollbar` in
+/// `Always` mode inside a fixed-size viewport with an oversized scroll
+/// area, so the thumb paints in the very first frame.
+struct ScrollbarProbe {
+    handle: gpui::ScrollHandle,
+    scroll_size: gpui::Size<gpui::Pixels>,
+    viewport: gpui::Size<gpui::Pixels>,
+}
+
+impl gpui::Render for ScrollbarProbe {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        gpui::div()
+            .relative()
+            .w(self.viewport.width)
+            .h(self.viewport.height)
+            .child(
+                gpui_kit::base::Scrollbar::vertical(&self.handle)
+                    .mode(gpui_kit::base::ScrollbarMode::Always)
+                    .scroll_size(self.scroll_size)
+                    .viewport_from_layout(),
+            )
+    }
+}
+
+#[gpui::test]
+fn scrollbar_thumb_lands_on_the_wiki_8px_and_text_alpha_mix(cx: &mut TestAppContext) {
+    // Contract line 93: transcript scrollbar rides at 8px wide, painted
+    // in text-normal color at 20% alpha (rest) / 40% alpha (hover). The
+    // `base.scrollbar.with_styles(...)` block in `theme::apply` pushes
+    // those tokens into `gpui-base::ScrollbarTheme` so any Scrollbar
+    // consumer picks them up.
+    //
+    // Mutation to catch: deleting the `base.scrollbar.with_styles(...)`
+    // block in `theme::apply`. Kit's Scrollbar falls back to the 6px
+    // default and a foreground-derived 35% mix — both differences are
+    // observable directly in `painted_quads()`.
+    cx.update(init);
+    let handle = gpui::ScrollHandle::new();
+    let viewport = gpui::size(px(160.), px(80.));
+    let scroll_size = gpui::size(px(160.), px(320.));
+    let handle_for_probe = handle.clone();
+    let (_view, cx) = cx.add_window_view(move |_, cx| {
+        theme::apply(cx);
+        ScrollbarProbe {
+            handle: handle_for_probe,
+            scroll_size,
+            viewport,
+        }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // --- Rest: thumb paints at 8px in the text-normal 20% mix. ---
+    let (thumb_bounds, rest_scale) = cx.update(|window, _| {
+        let scale = window.scale_factor();
+        let rest_bg: gpui::Background = theme::palette::scrollbar_thumb().into();
+        let thumb = window
+            .painted_quads()
+            .into_iter()
+            .find(|q| q.background == rest_bg)
+            .expect("scrollbar paints its resting thumb at the 20% text mix");
+        (thumb.bounds, scale)
+    });
+    let thumb_target = theme::SCROLLBAR_THUMB_WIDTH.scale(rest_scale);
+    let width_delta = if thumb_bounds.size.width > thumb_target {
+        thumb_bounds.size.width - thumb_target
+    } else {
+        thumb_target - thumb_bounds.size.width
+    };
+    assert!(
+        width_delta <= px(1.).scale(rest_scale),
+        "thumb width {:?} must land on the 8px contract",
+        thumb_bounds.size.width
+    );
+
+    // --- Hover: same 8px width, hover mix (40% alpha). ---
+    // Hover the mouse over the middle of the resting thumb bounds; Kit
+    // flips `hovered_on_thumb` on the very next MouseMoveEvent and the
+    // next paint reads `style_for_hovered_thumb`. Kit's mouse events
+    // arrive in logical (unscaled) pixels, so undo the device scale.
+    let center = thumb_bounds.center();
+    let hover_pos = gpui::point(
+        px(center.x.as_f32() / rest_scale),
+        px(center.y.as_f32() / rest_scale),
+    );
+    cx.simulate_mouse_move(hover_pos, None, gpui::Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, _| {
+        let hover_bg: gpui::Background = theme::palette::scrollbar_thumb_hover().into();
+        let hover_thumb = window
+            .painted_quads()
+            .into_iter()
+            .find(|q| q.background == hover_bg)
+            .expect("scrollbar paints its hovered thumb at the 40% text mix");
+        let scale = window.scale_factor();
+        let hover_delta = if hover_thumb.bounds.size.width > thumb_target {
+            hover_thumb.bounds.size.width - thumb_target
+        } else {
+            thumb_target - hover_thumb.bounds.size.width
+        };
+        assert!(
+            hover_delta <= px(1.).scale(scale),
+            "hovered thumb width {:?} must also land on the 8px contract",
+            hover_thumb.bounds.size.width
+        );
+    });
+}
+
+#[gpui::test]
+fn sidebar_row_focus_handles_are_real_tab_stops_reached_via_focus_next(cx: &mut TestAppContext) {
+    // Round-4 a11y guard. `cx.focus_handle()` defaults to `tab_stop=false`,
+    // and the div's `.tab_index(0)` does NOT propagate to a tracked focus
+    // handle. Without setting `tab_stop(true)` on the handle itself,
+    // `window.focus_next` walks past every sidebar row. The prior row-3
+    // guard only exercised `window.focus(&handle)` directly, so a missing
+    // tab-stop flag never showed. This test uses `focus_next` and MUST
+    // fail if the handle is not registered as a tab stop.
+    let (window, view, _receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let session_target = "cd34beef1234";
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut other = session();
+            other.session_id = session_target.into();
+            other.name = "other".into();
+            view.state.sessions.push(other);
+            view.state.session_view.available = true;
+            view.state.session_view.branches = vec![
+                Branch {
+                    id: "trunk".into(),
+                    label: "main".into(),
+                    depth: 0,
+                    current: true,
+                },
+                Branch {
+                    id: "alt".into(),
+                    label: "alt".into(),
+                    depth: 1,
+                    current: false,
+                },
+            ];
+            view.apply_worker_message(WorkerMessage::Connected, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+
+    let session_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get(session_target)
+                .cloned()
+        })
+        .expect("sidebar row focus handle exists after render");
+    let branch_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get("branch:alt")
+                .cloned()
+        })
+        .expect("branch row focus handle exists after render");
+    // Blur so `focus_next` starts from the beginning of the tab order —
+    // sequence becomes deterministic regardless of what the composer or
+    // any kit control grabbed at construction time.
+    visual.update(|window, cx| window.blur(cx));
+
+    // Bound the walk. `focus_next` wraps around, so we cap at a very
+    // generous ceiling to defend against a runaway loop while still
+    // proving reachability.
+    let max_steps = 512;
+    let mut saw_session_at = None;
+    let mut saw_branch_at = None;
+    for step in 0..max_steps {
+        visual.update(|window, cx| window.focus_next(cx));
+        let focused = visual.update(|window, cx| window.focused(cx));
+        if focused.as_ref() == Some(&session_handle) && saw_session_at.is_none() {
+            saw_session_at = Some(step);
+        }
+        if focused.as_ref() == Some(&branch_handle) && saw_branch_at.is_none() {
+            saw_branch_at = Some(step);
+        }
+        if saw_session_at.is_some() && saw_branch_at.is_some() {
+            break;
+        }
+    }
+
+    let session_step = saw_session_at.expect(
+        "focus_next must land on a session row — proves the row focus handle \
+         is registered as a real tab stop, not just a tracked handle with \
+         tab_stop=false",
+    );
+    let branch_step = saw_branch_at.expect(
+        "focus_next must land on a branch row — proves the branch row focus \
+         handle is registered as a real tab stop",
+    );
+    assert!(
+        session_step < branch_step,
+        "session rows paint before branch rows and must be reached first via \
+         focus_next (session at step {session_step}, branch at step {branch_step})"
+    );
+}
+
+#[gpui::test]
+fn sidebar_row_focus_map_prunes_removed_rows_and_keeps_survivors(cx: &mut TestAppContext) {
+    // Round-4 leak guard. Every new branch head mints a fresh UUID, so an
+    // insert-only handle map grows for the app's lifetime. `render_sidebar`
+    // prunes to the live key set on every paint. This test renders once
+    // with a set of rows, mutates the state (drop one session, replace
+    // one branch head, keep one of each), renders again, and asserts:
+    //   1. stale keys are gone from `sidebar_row_focus`,
+    //   2. surviving keys retain the SAME handle instance so tab focus
+    //      does not drift across redraws.
+    let (window, view, _receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let keep_session = "cd34beef1234";
+    let drop_session = "aa11aa11aa11";
+    let keep_branch = "trunk";
+    let old_branch = "old-branch-head";
+    let new_branch = "new-branch-head";
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let mut a = session();
+            a.session_id = keep_session.into();
+            let mut b = session();
+            b.session_id = drop_session.into();
+            view.state.sessions.push(a);
+            view.state.sessions.push(b);
+            view.state.session_view.available = true;
+            view.state.session_view.branches = vec![
+                Branch {
+                    id: keep_branch.into(),
+                    label: "main".into(),
+                    depth: 0,
+                    current: true,
+                },
+                Branch {
+                    id: old_branch.into(),
+                    label: "old".into(),
+                    depth: 1,
+                    current: false,
+                },
+            ];
+            view.apply_worker_message(WorkerMessage::Connected, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+
+    let (keep_session_before, keep_branch_before, drop_session_before, old_branch_before) = visual
+        .update(|_, cx| {
+            let map = view.read(cx).sidebar_row_focus.borrow();
+            (
+                map.get(keep_session).cloned(),
+                map.get(&format!("branch:{keep_branch}")).cloned(),
+                map.get(drop_session).cloned(),
+                map.get(&format!("branch:{old_branch}")).cloned(),
+            )
+        });
+    assert!(
+        keep_session_before.is_some() && drop_session_before.is_some(),
+        "both session rows must register a focus handle on first render"
+    );
+    assert!(
+        keep_branch_before.is_some() && old_branch_before.is_some(),
+        "both branch rows must register a focus handle on first render"
+    );
+
+    // Mutate: drop the second session, replace the second branch head
+    // with a fresh UUID (the real bug — branch heads churn UUIDs on
+    // every turn). Keep the first of each.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state
+                .sessions
+                .retain(|s| s.session_id.as_str() == keep_session);
+            view.state.session_view.branches = vec![
+                Branch {
+                    id: keep_branch.into(),
+                    label: "main".into(),
+                    depth: 0,
+                    current: true,
+                },
+                Branch {
+                    id: new_branch.into(),
+                    label: "new".into(),
+                    depth: 1,
+                    current: false,
+                },
+            ];
+            view.apply_worker_message(WorkerMessage::Connected, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+
+    visual.update(|_, cx| {
+        let map = view.read(cx).sidebar_row_focus.borrow();
+        assert!(
+            !map.contains_key(drop_session),
+            "dropped session must be pruned from the focus map"
+        );
+        assert!(
+            !map.contains_key(&format!("branch:{old_branch}")),
+            "replaced branch head must be pruned from the focus map"
+        );
+        assert!(
+            map.contains_key(keep_session),
+            "surviving session must remain in the focus map"
+        );
+        assert!(
+            map.contains_key(&format!("branch:{keep_branch}")),
+            "surviving branch must remain in the focus map"
+        );
+        assert!(
+            map.contains_key(&format!("branch:{new_branch}")),
+            "new branch head must be registered on the second render"
+        );
+        assert_eq!(
+            map.get(keep_session),
+            keep_session_before.as_ref(),
+            "surviving session must keep the same focus handle across redraws"
+        );
+        assert_eq!(
+            map.get(&format!("branch:{keep_branch}")),
+            keep_branch_before.as_ref(),
+            "surviving branch must keep the same focus handle across redraws"
+        );
+    });
+}

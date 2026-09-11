@@ -109,6 +109,12 @@ struct ZetaView {
     session_edit: Option<session_management::SessionEdit>,
     session_edit_focus: gpui::FocusHandle,
     settings_focus: gpui::FocusHandle,
+    // One persistent focus handle per sidebar row id — a session id or a
+    // branch id. Populated lazily in the sidebar render and reused across
+    // paints so tab focus survives redraws and tests can look a row's
+    // handle up by the same key the renderer uses.
+    pub(crate) sidebar_row_focus:
+        std::cell::RefCell<std::collections::HashMap<String, gpui::FocusHandle>>,
     login_providers: Vec<LoginProvider>,
     settings_error: Option<String>,
     composer_images: Vec<ImageAttachment>,
@@ -161,6 +167,7 @@ impl ZetaView {
             session_edit: None,
             session_edit_focus: cx.focus_handle(),
             settings_focus: cx.focus_handle(),
+            sidebar_row_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             login_providers: Vec::new(),
             settings_error: None,
             composer_images: Vec::new(),
@@ -964,7 +971,11 @@ impl ZetaView {
         cx.notify();
     }
 
-    fn render_settings_overlay(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_settings_overlay(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let view = &self.state.session_view;
         let providers = &view.model_providers;
         let group_of = |model: &str| providers.get(model).cloned().unwrap_or_default();
@@ -1008,7 +1019,6 @@ impl ZetaView {
                         .px_3()
                         .pt_2()
                         .pb_1()
-                        .text_size(px(11.))
                         .text_color(cx.theme().muted_foreground)
                         .child(group),
                 );
@@ -1031,7 +1041,6 @@ impl ZetaView {
                             .when(model == &view.current_model, |row| {
                                 row.child(
                                     div()
-                                        .text_size(px(11.))
                                         .text_color(cx.theme().muted_foreground)
                                         .child("current"),
                                 )
@@ -1065,38 +1074,32 @@ impl ZetaView {
             .track_focus(&self.settings_focus)
             .occlude()
             .bg(cx.theme().overlay)
-            .h_flex()
+            .v_flex()
             .items_center()
-            .justify_center()
+            // Flat panel on scrim: sits at 25% of the viewport HEIGHT rather
+            // than centred, matching the wiki modal shape. GPUI's
+            // `pt(relative(0.25))` computes a fraction of parent WIDTH
+            // (CSS-quirk), which drifts the modal off the shelf on wide
+            // windows — measure the height directly and offset in pixels.
+            // Contract line 91.
+            .pt(window.viewport_size().height * theme::MODAL_TOP_FRACTION)
+            .px(px(16.))
             .child(
                 div()
+                    .debug_selector(|| "settings-panel".into())
                     .v_flex()
-                    .w(px(520.))
+                    .w(theme::MODAL_WIDTH)
+                    .max_w_full()
                     .max_h(px(560.))
-                    .p_5()
+                    .pt(theme::MODAL_PADDING_TOP)
+                    .pb(theme::MODAL_PADDING_BOTTOM)
+                    .px(theme::MODAL_PADDING_X)
                     .gap_3()
-                    .bg(cx.theme().background)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        div()
-                            .text_size(px(18.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("Session settings"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Model"),
-                    )
+                    .bg(cx.theme().sidebar)
+                    .child(modal_title("Session settings"))
+                    .child(modal_field_label("Model", cx))
                     .child(list)
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Approval mode"),
-                    )
+                    .child(modal_field_label("Approval mode", cx))
                     .child(mode_row)
                     .children(self.login_providers.iter().map(|provider| {
                         self.render_login_row(
@@ -1119,6 +1122,7 @@ impl ZetaView {
                                     .debug_selector(|| "settings-close".into())
                                     .ghost()
                                     .label("Close")
+                                    .h(theme::MODAL_BUTTON_HEIGHT)
                                     .on_click(cx.listener(|view, _, window, cx| {
                                         view.close_settings(window, cx)
                                     })),
@@ -1129,6 +1133,7 @@ impl ZetaView {
                                     .primary()
                                     .label(if pending { "Applying…" } else { "Apply" })
                                     .disabled(pending)
+                                    .h(theme::MODAL_BUTTON_HEIGHT)
                                     .on_click(
                                         cx.listener(|view, _, _, cx| view.apply_settings(cx)),
                                     ),
@@ -1612,14 +1617,6 @@ impl ZetaView {
         }
     }
 
-    fn footer_mode_color(cx: &App) -> gpui::Hsla {
-        // The mode word always paints in the accent tier — the one load-bearing
-        // color on this strip. Off-nominal states signal through the mode WORD
-        // ("offline"/"connecting"/"approve") plus the streaming dot's presence,
-        // never by recoloring the label — that would leak the alarm elsewhere.
-        cx.theme().primary
-    }
-
     fn render_pending_user_turn(&self, cx: &App) -> Option<gpui::AnyElement> {
         // Queued strip: user turn dashed while awaiting the server's echo;
         // flips to danger rail on `Rejected`/`Lost` so the user sees the send
@@ -1831,40 +1828,119 @@ impl ZetaView {
             .into_any_element()
     }
 
-    fn render_footer(&self, cx: &App) -> gpui::AnyElement {
-        // Mode word carries the single load-bearing color on this strip.
-        // Metrics and hints sit at the FAINT tier (not muted) so the mode word
-        // wins the eye by a wide margin — a hint at muted-tier reads as ambient
-        // text and eats the mode word's accent-scarcity budget.
-        let mode_color = Self::footer_mode_color(cx);
+    fn render_run_header(&self, cx: &App) -> gpui::AnyElement {
+        // Two-band run header (contract line 83): band 1 (44px) carries the
+        // active session label + state pill + step text; band 2 (40px)
+        // carries the runtime metadata separated by 1x14 vertical rules.
+        // The step text mirrors the composer's own hint so the "what am I
+        // waiting for?" answer sits at both the top and the input row.
+        div()
+            .v_flex()
+            .flex_shrink_0()
+            .id("run-header")
+            .debug_selector(|| "run-header".into())
+            .child(self.render_run_header_band1(cx))
+            .child(self.render_run_header_band2(cx))
+            .into_any_element()
+    }
+
+    fn render_run_header_band1(&self, cx: &App) -> gpui::AnyElement {
+        // Band 1 shape (contract line 83): min-height 44, padding 7x14, a
+        // ticket-labeled title on the left, a state pill in the middle and
+        // the step/blocker text filling the rest. Session label = the
+        // sidebar's own preview so the operator never loses track of which
+        // conversation the pill and metrics belong to.
+        let session_label = self
+            .state
+            .active_session
+            .as_ref()
+            .and_then(|id| {
+                self.state
+                    .sessions
+                    .iter()
+                    .find(|row| &row.session_id == id)
+                    .map(|row| sidebar::session_label(row, Some(&self.state.transcript)))
+            })
+            .unwrap_or_else(|| "No session".to_owned());
+        let (pill_bg, pill_fg) = self.status_pill_colors(cx);
+        let mode_word = self.footer_mode_word();
         let show_streaming_dot = self.state.streaming || self.state.thinking;
+        let (step_text, step_color) = self.run_header_step(cx);
+        div()
+            .debug_selector(|| "run-header-band1".into())
+            .h_flex()
+            .items_center()
+            .gap(px(10.))
+            .flex_shrink_0()
+            .min_h(theme::HEADER_BAND1_MIN_HEIGHT)
+            .py(px(7.))
+            .px(px(14.))
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                // The session label is the ticket-shaped anchor for the
+                // whole header — mono 600 at the normal text tier so it
+                // reads as the primary identity of the run.
+                div()
+                    .debug_selector(|| "run-header-title".into())
+                    .flex_shrink_0()
+                    .max_w(px(320.))
+                    .truncate()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().foreground)
+                    .child(session_label),
+            )
+            .child(
+                // State pill: solid fill + canvas text, mono 600 lowercase,
+                // near-square. Neutral states land on accent; the offline
+                // mode lands on danger for the scarce, load-bearing alarm
+                // signal. Kept as "footer-mode" for test stability.
+                div()
+                    .debug_selector(|| "footer-mode".into())
+                    .flex_shrink_0()
+                    .py(theme::STATE_PILL_PADDING_Y)
+                    .px(theme::STATE_PILL_PADDING_X)
+                    .bg(pill_bg)
+                    .text_color(pill_fg)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(mode_word),
+            )
+            .when(show_streaming_dot, |row| {
+                row.child(streaming_dot(cx.theme().primary))
+            })
+            .child(
+                // Step text — the one-line explanation of what the run is
+                // waiting for. Reuses `composer_hint` so the header and
+                // composer never drift out of sync.
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .debug_selector(|| "run-header-step".into())
+                    .text_color(step_color)
+                    .child(step_text),
+            )
+            .into_any_element()
+    }
+
+    fn render_run_header_band2(&self, cx: &App) -> gpui::AnyElement {
+        // Band 2 shape (contract line 83): min-height 40, metadata items
+        // separated by 1x14 vertical rules at the faint tier. Metrics owns
+        // the middle; the trailing chip carries the keybind hint so a
+        // returning operator can still find "Enter sends" on the second
+        // line rather than only at the composer.
         div()
             .id("status-bar")
+            .debug_selector(|| "status-bar".into())
             .h_flex()
             .items_center()
             .flex_shrink_0()
-            .gap_4()
-            .px_4()
-            .py_2()
-            .text_size(px(12.))
+            .gap(px(10.))
+            .px(px(14.))
+            .min_h(theme::HEADER_BAND2_MIN_HEIGHT)
+            .border_b_1()
+            .border_color(cx.theme().border)
             .text_color(theme::palette::text_faint())
-            .debug_selector(|| "status-bar".into())
-            .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_color(mode_color)
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .debug_selector(|| "footer-mode".into())
-                            .child(self.footer_mode_word()),
-                    )
-                    .when(show_streaming_dot, |row| {
-                        row.child(streaming_dot(mode_color))
-                    }),
-            )
             .child(
                 div()
                     .flex_1()
@@ -1873,6 +1949,7 @@ impl ZetaView {
                     .debug_selector(|| "composer-hint".into())
                     .child(polish::status_label(&self.state.metrics)),
             )
+            .child(status_rule(cx))
             .child(
                 div()
                     .flex_shrink_0()
@@ -1880,7 +1957,48 @@ impl ZetaView {
                     .debug_selector(|| "footer-hints".into())
                     .child(self.composer_hint()),
             )
+            .child(status_rule(cx))
+            .child(
+                // Model name pinned right — the third metadata slice the
+                // wiki header carries, kept short so it never crowds out
+                // the hint.
+                div()
+                    .flex_shrink_0()
+                    .text_color(theme::palette::text_faint())
+                    .debug_selector(|| "run-header-model".into())
+                    .child(
+                        self.state
+                            .metrics
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+            )
             .into_any_element()
+    }
+
+    /// The one-line "step" text painted in band 1. Danger tier while the
+    /// connection is lost so the header carries its own blocker signal
+    /// before the transcript-level banner picks it up.
+    fn run_header_step(&self, cx: &App) -> (&'static str, gpui::Hsla) {
+        let color = match &self.state.connection {
+            ConnectionState::Lost(_) => cx.theme().danger,
+            _ => cx.theme().muted_foreground,
+        };
+        (self.composer_hint(), color)
+    }
+
+    fn status_pill_colors(&self, cx: &App) -> (gpui::Hsla, gpui::Hsla) {
+        // Offline lands on the negative pill (solid danger); every other
+        // mode paints as neutral accent. The wiki "positive" state (success
+        // fill) has no zeta equivalent today — the assistant never reports
+        // an explicit merge-ready state — so the pill only picks between
+        // neutral and negative, never surprising the eye with green chrome.
+        let theme = cx.theme();
+        match &self.state.connection {
+            ConnectionState::Lost(_) => (theme.danger, theme.danger_foreground),
+            _ => (theme.primary, theme.primary_foreground),
+        }
     }
 }
 
@@ -2030,6 +2148,47 @@ fn format_output_size(bytes: usize) -> String {
     }
 }
 
+/// Modal title band: 15px semibold on the left, a plain-text `esc` hint at
+/// the right. Contract line 91 pins this shape for every wiki-run modal.
+pub(crate) fn modal_title(title: &'static str) -> gpui::AnyElement {
+    div()
+        .debug_selector(|| "modal-title".into())
+        .h_flex()
+        .items_center()
+        .justify_between()
+        .w_full()
+        .child(
+            div()
+                .text_size(theme::FONT_SIZE)
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(title),
+        )
+        .child(div().text_color(theme::palette::text_faint()).child("esc"))
+        .into_any_element()
+}
+
+/// Modal field caption: muted tier, no uppercase, used to name a control
+/// group (model list, approval mode row). Hierarchy comes from color tier
+/// alone — contract line 62 pins ONE size across the whole app.
+pub(crate) fn modal_field_label(label: &'static str, cx: &App) -> gpui::AnyElement {
+    div()
+        .text_color(cx.theme().muted_foreground)
+        .child(label)
+        .into_any_element()
+}
+
+/// Thin vertical separator between status-strip items. One-pixel wide, 14px
+/// tall — the wiki header pattern for ruling adjacent metadata.
+fn status_rule(cx: &App) -> gpui::AnyElement {
+    div()
+        .debug_selector(|| "status-rule".into())
+        .flex_shrink_0()
+        .w(px(1.))
+        .h(theme::STATUS_RULE_HEIGHT)
+        .bg(cx.theme().border)
+        .into_any_element()
+}
+
 /// Small pulsing dot rendered while the assistant is streaming or thinking.
 /// Opacity cycles 0.25 → 1 over ~1.2s in a synced loop so all zeta windows on
 /// screen breathe in phase — matches the wiki agent-run indicator.
@@ -2081,27 +2240,44 @@ impl Render for ZetaView {
         .flex_1()
         .min_h_0()
         .min_w_0();
+        // Connection banner paints as a wiki-run "blocker row": a 2px danger
+        // left rail on a 10% danger tint, no framed alert card. Reconnecting
+        // borrows the same shape at the accent tier (transitional, not
+        // blocking). Contract line 83.
         let banner = match &self.state.connection {
             ConnectionState::Lost(error) => Some(
                 div()
+                    .debug_selector(|| "connection-lost".into())
                     .v_flex()
                     .gap_2()
-                    .p_3()
+                    .py(px(8.))
+                    .px(px(14.))
+                    .border_l(theme::ATTENTION_RAIL_WIDTH)
+                    .border_color(cx.theme().danger)
+                    .bg(theme::palette::danger_tint())
                     .child(
-                        Alert::error("connection-lost", format!("Connection lost: {error}"))
-                            .banner(),
+                        div()
+                            .text_color(cx.theme().danger)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(format!("Connection lost: {error}")),
                     )
                     .child(
                         Button::new("reconnect")
                             .debug_selector(|| "reconnect-button".into())
                             .label("Reconnect")
+                            .h(theme::MODAL_BUTTON_HEIGHT)
                             .on_click(cx.listener(|view, _, _, cx| view.reconnect(cx))),
                     ),
             ),
             ConnectionState::Reconnecting => Some(
                 div()
-                    .p_3()
-                    .child(Alert::info("connecting", "Connecting to zeta…").banner()),
+                    .debug_selector(|| "connecting".into())
+                    .py(px(8.))
+                    .px(px(14.))
+                    .border_l(theme::ATTENTION_RAIL_WIDTH)
+                    .border_color(cx.theme().primary)
+                    .text_color(cx.theme().primary)
+                    .child("Connecting to zeta…"),
             ),
             ConnectionState::Connected => None,
         };
@@ -2110,6 +2286,10 @@ impl Render for ZetaView {
             .flex_1()
             .min_w_0()
             .h_full()
+            // Two-band run header sits above the blocker banner so a
+            // connection-lost state shows the danger pill on band 1 first
+            // and the tint-rail banner directly below. Contract line 83.
+            .child(self.render_run_header(cx))
             .children(banner)
             .when(!self.settings_open, |main| {
                 main.children(
@@ -2127,7 +2307,21 @@ impl Render for ZetaView {
                 )
             })
             .when_some(self.command_error.clone(), |main, error| {
-                main.child(Alert::error("command-error", error).banner())
+                // Command-error strip carries the same blocker treatment as
+                // the connection-lost banner — one alarm chrome pattern for
+                // every top-of-main failure.
+                main.child(
+                    div()
+                        .debug_selector(|| "command-error".into())
+                        .py(px(8.))
+                        .px(px(14.))
+                        .border_l(theme::ATTENTION_RAIL_WIDTH)
+                        .border_color(cx.theme().danger)
+                        .bg(theme::palette::danger_tint())
+                        .text_color(cx.theme().danger)
+                        .whitespace_normal()
+                        .child(error),
+                )
             })
             .child(
                 div()
@@ -2172,8 +2366,7 @@ impl Render for ZetaView {
                     .child(transcript),
             )
             .children(self.render_pending_user_turn(cx))
-            .child(self.render_composer(can_send, window, cx))
-            .child(self.render_footer(cx));
+            .child(self.render_composer(can_send, window, cx));
         div()
             .size_full()
             .relative()
@@ -2219,15 +2412,15 @@ impl Render for ZetaView {
                     .h_flex()
                     .size_full()
                     .items_stretch()
-                    .child(self.render_sidebar(cx))
+                    .child(self.render_sidebar(window, cx))
                     .child(main),
             )
             .child(self.dialogs.clone())
             .when(self.session_edit.is_some(), |view| {
-                view.child(self.render_session_edit(cx))
+                view.child(self.render_session_edit(window, cx))
             })
             .when(self.settings_open, |view| {
-                view.child(self.render_settings_overlay(cx))
+                view.child(self.render_settings_overlay(window, cx))
             })
     }
 }

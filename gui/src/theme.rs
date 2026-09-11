@@ -52,6 +52,67 @@ pub const STREAM_DOT_SIZE: Pixels = px(7.);
 /// textarea. Kept tight so the 64px composer floor stays honest.
 pub const COMPOSER_TARGET_HEIGHT: Pixels = px(16.);
 
+/// Sidebar container width — the wiki agent-run column pins this at 216px so
+/// the panel reads as a fixed column rather than a fluid drawer.
+pub const SIDEBAR_WIDTH: Pixels = px(216.);
+
+/// Session row min-height and padding. Contract line 81 pins 40px rows with
+/// 5px vertical / 8px horizontal padding — a compact-but-breathing rhythm
+/// that carries a ticket label + age on one line.
+pub const SIDEBAR_ROW_HEIGHT: Pixels = px(40.);
+pub const SIDEBAR_ROW_PADDING_X: Pixels = px(8.);
+pub const SIDEBAR_ROW_PADDING_Y: Pixels = px(5.);
+
+/// Nested branch row height — one tint step shorter than session rows so a
+/// run of siblings under a session reads as sub-items.
+pub const SIDEBAR_NESTED_ROW_HEIGHT: Pixels = px(32.);
+
+/// Left-gutter width reserved for the current-item dot. Wide enough to seat
+/// a 9px dot with a 4px left inset per contract line 81 (`left 4px`).
+pub const SIDEBAR_GUTTER_WIDTH: Pixels = px(13.);
+
+/// Distance from the row's left edge to the dot. Contract line 81 pins this
+/// at 4px so the dot sits inside the row's leading margin, not centred.
+pub const SIDEBAR_CURRENT_DOT_INSET: Pixels = px(4.);
+
+/// Accent dot for the current sidebar row. Wiki contract calls for ~0.58em
+/// at a 15px base — 9px rounded — so the dot reads as a mono bullet without
+/// borrowing hover fill.
+pub const SIDEBAR_CURRENT_DOT_SIZE: Pixels = px(9.);
+
+/// Attention rail that pins the leftmost 2px of a sidebar row when the row is
+/// signalling a failure or the connection is lost.
+pub const ATTENTION_RAIL_WIDTH: Pixels = px(2.);
+
+/// Width of every scrollbar thumb. Contract line 93 pins the strip to a thin
+/// 8px lane so the transcript column keeps its readable measure.
+pub const SCROLLBAR_THUMB_WIDTH: Pixels = px(8.);
+
+/// Two-band header/status strip heights. Band 1 (title + state pill) sits at
+/// 44px; band 2 (metadata) sits at 40px so the strip is a compact 84px
+/// column rather than a fluid banner.
+pub const HEADER_BAND1_MIN_HEIGHT: Pixels = px(44.);
+pub const HEADER_BAND2_MIN_HEIGHT: Pixels = px(40.);
+
+/// State pill padding — near-square shape the wiki agent-run uses to carry a
+/// one-word state label ("ready", "streaming", "offline").
+pub const STATE_PILL_PADDING_X: Pixels = px(9.);
+pub const STATE_PILL_PADDING_Y: Pixels = px(3.);
+
+/// Vertical separator ruled between header/status metadata items. The rule
+/// is a 1x14px line, drawn as a thin div with a border color.
+pub const STATUS_RULE_HEIGHT: Pixels = px(14.);
+
+/// Flat-panel modal shape. Width caps at 480px, padding is 12px on top / 16px
+/// horizontally / 14px on bottom, and the panel sits below a scrim at 25% of
+/// the viewport height.
+pub const MODAL_WIDTH: Pixels = px(480.);
+pub const MODAL_PADDING_TOP: Pixels = px(12.);
+pub const MODAL_PADDING_X: Pixels = px(16.);
+pub const MODAL_PADDING_BOTTOM: Pixels = px(14.);
+pub const MODAL_BUTTON_HEIGHT: Pixels = px(30.);
+pub const MODAL_TOP_FRACTION: f32 = 0.25;
+
 /// Semantic composer color roles. The composer paints its rail, fill, and
 /// target-line label from these — never from `palette::*` directly — so the
 /// call sites read as "composer at rest / composer focused" rather than
@@ -112,6 +173,12 @@ pub mod palette {
     pub fn border() -> Hsla {
         hex(0x35352a)
     }
+    /// Softer rail used on the sidebar edge — one tint step below `border`
+    /// so the column reads as separation without a visible seam. Contract
+    /// line 3 lists `border-subtle ~#2f2f25`.
+    pub fn border_subtle() -> Hsla {
+        hex(0x2f2f25)
+    }
     pub fn border_active() -> Hsla {
         hex(0x706f62)
     }
@@ -157,14 +224,15 @@ pub mod palette {
     pub fn overlay_strong() -> Hsla {
         hex_a(0x0000_0073)
     }
-    /// Solid scrollbar thumb. Wiki's opencode ships opaque olive-warm greys
-    /// here so the thumb reads the same regardless of what surface it sits
-    /// over.
+    /// Scrollbar thumb painted as a text-normal mix on transparent — a
+    /// warm-off-white at 20% at rest, 40% on hover. Contract line 93 pins
+    /// the mix so the thumb reads on any surface without importing a fresh
+    /// warm-grey token that would drift when the palette shifts.
     pub fn scrollbar_thumb() -> Hsla {
-        hex(0x3a382c)
+        hex_a(0xece9_d833)
     }
     pub fn scrollbar_thumb_hover() -> Hsla {
-        hex(0x4c4a3a)
+        hex_a(0xece9_d866)
     }
     /// Composer rail at rest — accent at ~62% opacity. Focus promotes it back
     /// to the full accent so the rail is the composer's focus signal.
@@ -175,6 +243,12 @@ pub mod palette {
     /// lighter than the element surface so focus stays visible without a ring.
     pub fn composer_focus_fill() -> Hsla {
         hex(0x333326)
+    }
+    /// Danger 10% tint on canvas — the wiki blocker row's bg. Paired with the
+    /// 2px danger left rail so a failure surface reads as an alarm strip
+    /// without a full solid-red panel.
+    pub fn danger_tint() -> Hsla {
+        hex_a(0xe268_5c1a)
     }
 }
 
@@ -342,7 +416,9 @@ pub fn apply(cx: &mut App) {
 
     colors.sidebar = palette::panel();
     colors.sidebar_foreground = palette::text();
-    colors.sidebar_border = palette::border();
+    // Sidebar edge sits at the SUBTLE tier — one tint below the app border
+    // so the column reads as a seam, not a hard rule. Contract line 3.
+    colors.sidebar_border = palette::border_subtle();
     colors.sidebar_accent = palette::active();
     colors.sidebar_accent_foreground = palette::text();
     colors.sidebar_primary = palette::accent();
@@ -465,6 +541,36 @@ pub fn apply(cx: &mut App) {
     theme.tokens = (&theme.colors).into();
 
     Theme::sync_base(cx);
+
+    // Kit's Base derivation seeds thumb color + radius but leaves width
+    // unset, which falls back to the 6px default. Overwrite the base
+    // scrollbar styles here so the transcript's thumb rides at the wiki
+    // 8px width and picks up the text-normal alpha mix from `palette`.
+    let base = gpui_kit::base::Theme::global_mut(cx);
+    base.scrollbar = base.scrollbar.clone().with_styles(
+        gpui_kit::base::ScrollbarStyles::default()
+            .track(|style| style.bg(gpui::transparent_black()))
+            .track_hover(|style| style.bg(gpui::transparent_black()))
+            .track_active(|style| style.bg(gpui::transparent_black()))
+            .thumb(|style| {
+                style
+                    .bg(palette::scrollbar_thumb())
+                    .width(SCROLLBAR_THUMB_WIDTH)
+                    .radius(px(0.))
+            })
+            .thumb_hover(|style| {
+                style
+                    .bg(palette::scrollbar_thumb_hover())
+                    .width(SCROLLBAR_THUMB_WIDTH)
+                    .radius(px(0.))
+            })
+            .thumb_active(|style| {
+                style
+                    .bg(palette::scrollbar_thumb_hover())
+                    .width(SCROLLBAR_THUMB_WIDTH)
+                    .radius(px(0.))
+            }),
+    );
 }
 
 #[cfg(test)]
@@ -546,13 +652,29 @@ mod tests {
             assert_eq!(theme.popover, palette::panel());
             assert_eq!(theme.overlay, palette::overlay_strong());
             assert_eq!(theme.selection, palette::selection());
-            // Solid, not alpha — a translucent thumb shifts hue with the
-            // surface underneath and stops reading as a scrollbar.
+            // Alpha-mix of the text-normal color — contract line 93. A regression
+            // that restored an opaque olive quad here loses the thin-strip feel
+            // and the whole thumb reads as an out-of-palette bar.
             assert_eq!(theme.scrollbar_thumb, palette::scrollbar_thumb());
             assert_eq!(
                 theme.scrollbar_thumb_hover,
                 palette::scrollbar_thumb_hover()
             );
+            assert!(
+                theme.scrollbar_thumb.a > 0.1 && theme.scrollbar_thumb.a < 0.35,
+                "thumb rest alpha {:.3} must land near the 20% contract mix",
+                theme.scrollbar_thumb.a
+            );
+            assert!(
+                theme.scrollbar_thumb_hover.a > 0.3 && theme.scrollbar_thumb_hover.a < 0.55,
+                "thumb hover alpha {:.3} must land near the 40% contract mix",
+                theme.scrollbar_thumb_hover.a
+            );
+            // The mix borrows text-normal's hue — a future palette shuffle
+            // that swapped to accent or a fresh warm-grey would surface here.
+            assert_eq!(theme.scrollbar_thumb.h, palette::text().h);
+            assert_eq!(theme.scrollbar_thumb.s, palette::text().s);
+            assert_eq!(theme.scrollbar_thumb.l, palette::text().l);
         });
     }
 
@@ -741,6 +863,43 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_and_chrome_tokens_land_on_the_wiki_contract() {
+        // Guards the lane-3 numbers so a later ticket that widens the sidebar
+        // or grows the pill padding trips a named assert rather than only the
+        // paint-probes downstream.
+        assert_eq!(SIDEBAR_WIDTH, px(216.));
+        assert_eq!(SIDEBAR_ROW_HEIGHT, px(40.));
+        assert_eq!(SIDEBAR_NESTED_ROW_HEIGHT, px(32.));
+        assert_eq!(SIDEBAR_ROW_PADDING_X, px(8.));
+        assert_eq!(SIDEBAR_ROW_PADDING_Y, px(5.));
+        assert_eq!(SIDEBAR_GUTTER_WIDTH, px(13.));
+        assert_eq!(SIDEBAR_CURRENT_DOT_SIZE, px(9.));
+        assert_eq!(SIDEBAR_CURRENT_DOT_INSET, px(4.));
+        assert_eq!(SCROLLBAR_THUMB_WIDTH, px(8.));
+        assert_eq!(ATTENTION_RAIL_WIDTH, px(2.));
+        assert_eq!(HEADER_BAND1_MIN_HEIGHT, px(44.));
+        assert_eq!(HEADER_BAND2_MIN_HEIGHT, px(40.));
+        assert_eq!(STATE_PILL_PADDING_X, px(9.));
+        assert_eq!(STATE_PILL_PADDING_Y, px(3.));
+        assert_eq!(STATUS_RULE_HEIGHT, px(14.));
+        assert_eq!(MODAL_WIDTH, px(480.));
+        assert_eq!(MODAL_PADDING_TOP, px(12.));
+        assert_eq!(MODAL_PADDING_X, px(16.));
+        assert_eq!(MODAL_PADDING_BOTTOM, px(14.));
+        assert_eq!(MODAL_BUTTON_HEIGHT, px(30.));
+        assert!((MODAL_TOP_FRACTION - 0.25).abs() < f32::EPSILON);
+
+        // The blocker-row tint borrows the danger hue but stays transparent
+        // enough to read as ambient alarm chrome, not a solid red panel.
+        let tint = palette::danger_tint();
+        let danger = palette::danger();
+        assert_eq!(tint.h, danger.h);
+        assert_eq!(tint.s, danger.s);
+        assert_eq!(tint.l, danger.l);
+        assert!(tint.a > 0.05 && tint.a < 0.20);
+    }
+
+    #[test]
     fn transcript_and_composer_tokens_land_on_the_wiki_contract() {
         // Guards against a silent number drift when a later ticket bumps
         // spacing or rethinks the readable-column measure.
@@ -793,6 +952,21 @@ mod tests {
             assert!(!theme.tile_shadow);
             assert!(theme.focus_ring);
             assert!(theme.is_dark());
+        });
+    }
+
+    #[gpui::test]
+    fn sidebar_border_lands_on_the_subtle_tier(cx: &mut TestAppContext) {
+        // Wiki contract line 3 pins the sidebar edge to `border-subtle`
+        // (one tint below `border`) so the column reads as a seam, not a
+        // hard rule. Regressing this back to `palette::border()` would
+        // restore the visible seam this ticket set out to remove.
+        cx.update(gpui_kit::init);
+        cx.update(apply);
+        cx.update(|cx| {
+            let theme = cx.theme();
+            assert_eq!(theme.sidebar_border, palette::border_subtle());
+            assert_ne!(theme.sidebar_border, palette::border());
         });
     }
 

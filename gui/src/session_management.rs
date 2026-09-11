@@ -85,19 +85,70 @@ impl ZetaView {
         cx.notify();
     }
 
-    pub fn render_session_edit(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub fn render_session_edit(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let Some(edit) = &self.session_edit else {
             return div().into_any_element();
         };
         let rename = matches!(edit, SessionEdit::Rename { .. });
+        // Inputs paint no box — border-bottom only, focus promotes the
+        // underline to the ring color. Kit's Textarea gets
+        // `appearance(false).bordered(false)` so we control the box
+        // treatment; the wrapper div carries the 1px bottom rail whose
+        // color flips from `border` at rest to `ring` on focus.
         let content = match edit {
-            SessionEdit::Rename { input, .. } => div().v_flex().gap_3()
-                .child(Textarea::new(input).h(px(44.)))
-                .child("Leave empty to use the first message."),
+            SessionEdit::Rename { input, .. } => {
+                let input_focused = input.read(cx).focus_handle(cx).is_focused(window);
+                let underline_color = if input_focused {
+                    cx.theme().ring
+                } else {
+                    cx.theme().border
+                };
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .debug_selector(|| "session-edit-input-frame".into())
+                            .w_full()
+                            .border_b_1()
+                            .border_color(underline_color)
+                            .child(
+                                Textarea::new(input)
+                                    .h(px(44.))
+                                    .appearance(false)
+                                    .bordered(false),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Leave empty to use the first message."),
+                    )
+            }
             SessionEdit::Delete { label, id } => div().v_flex().gap_3()
                 .child(div().truncate().child(label.clone()))
-                .child("Delete this conversation and its stored files? This cannot be undone.")
-                .when(self.state.active_session.as_ref() == Some(id), |view| view.child("This conversation is active. Cancel and select another session before deleting it.")),
+                .child(div().text_color(cx.theme().muted_foreground).child("Delete this conversation and its stored files? This cannot be undone."))
+                .when(self.state.active_session.as_ref() == Some(id), |view| view.child(div().text_color(cx.theme().danger).child("This conversation is active. Cancel and select another session before deleting it."))),
+        };
+        let title = if rename {
+            "Rename session"
+        } else {
+            "Delete session"
+        };
+        let confirm_label = if self.pending_command {
+            if rename {
+                "Saving…"
+            } else {
+                "Deleting…"
+            }
+        } else if rename {
+            "Save"
+        } else {
+            "Delete"
         };
         div()
             .absolute()
@@ -106,28 +157,25 @@ impl ZetaView {
             .track_focus(&self.session_edit_focus)
             .occlude()
             .bg(cx.theme().overlay)
-            .h_flex()
+            .v_flex()
             .items_center()
-            .justify_center()
+            // 25% of viewport HEIGHT — pixels, not `relative(0.25)`, which
+            // in gpui is a CSS-quirk fraction of parent WIDTH. Contract
+            // line 91.
+            .pt(window.viewport_size().height * theme::MODAL_TOP_FRACTION)
+            .px(px(16.))
             .child(
                 div()
+                    .debug_selector(|| "session-edit-panel".into())
                     .v_flex()
-                    .w(px(480.))
-                    .p_5()
+                    .w(theme::MODAL_WIDTH)
+                    .max_w_full()
+                    .pt(theme::MODAL_PADDING_TOP)
+                    .pb(theme::MODAL_PADDING_BOTTOM)
+                    .px(theme::MODAL_PADDING_X)
                     .gap_3()
-                    .bg(cx.theme().background)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        div()
-                            .text_size(px(18.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child(if rename {
-                                "Rename session"
-                            } else {
-                                "Delete session"
-                            }),
-                    )
+                    .bg(cx.theme().sidebar)
+                    .child(modal_title(title))
                     .child(content)
                     .when_some(self.command_error.clone(), |view, error| {
                         view.child(
@@ -146,7 +194,7 @@ impl ZetaView {
                                     .debug_selector(|| "session-edit-cancel".into())
                                     .ghost()
                                     .label("Cancel")
-                                    .h(px(40.))
+                                    .h(theme::MODAL_BUTTON_HEIGHT)
                                     .disabled(self.pending_command)
                                     .on_click(cx.listener(|view, _, window, cx| {
                                         view.close_session_edit(window, cx)
@@ -156,18 +204,8 @@ impl ZetaView {
                                 Button::new("session-edit-confirm")
                                     .debug_selector(|| "session-edit-confirm".into())
                                     .primary()
-                                    .label(if self.pending_command {
-                                        if rename {
-                                            "Saving…"
-                                        } else {
-                                            "Deleting…"
-                                        }
-                                    } else if rename {
-                                        "Save"
-                                    } else {
-                                        "Delete"
-                                    })
-                                    .h(px(40.))
+                                    .label(confirm_label)
+                                    .h(theme::MODAL_BUTTON_HEIGHT)
                                     .disabled(self.pending_command)
                                     .on_click(
                                         cx.listener(|view, _, _, cx| view.commit_session_edit(cx)),
