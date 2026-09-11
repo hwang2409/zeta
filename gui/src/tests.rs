@@ -406,6 +406,109 @@ fn assistant_row_is_naked_and_carries_no_bg_or_rail(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn assistant_markdown_style_pins_the_zeta_110_clipping_guards(cx: &mut TestAppContext) {
+    // ZETA-110 r1 fixed the assistant-row table clipping by (a) opting the
+    // TextView table into gpui-base's SCROLL layout so column widths come
+    // from measured glyph runs, and (b) forcing per-cell nowrap so the
+    // column floors are raised to the full content width — mentally revert
+    // either lever and inline `code` chips in tool tables lose their
+    // trailing glyph again. r1 also flattened the cell borders and moved
+    // the inline chip off the raw accent onto a subtle text-normal wash
+    // sourced from the theme (routed through `cx.theme()` so the gpui-kit
+    // rich-text default — solid accent — cannot leak in through any
+    // future TextView caller that forgets a local style override).
+    //
+    // Only paint-probe / color tests guarded these fields before; a
+    // scroll-mode or nowrap regression would compile and paint the same
+    // colors while quietly reintroducing the clipping. This test pins the
+    // style struct's shape directly, so each of the four levers below
+    // fails a named assert if reverted.
+    cx.update(gpui_kit::init);
+    cx.update(theme::apply);
+    cx.update(|cx| {
+        let style = super::transcript_render::assistant_markdown_style(cx);
+        let theme = cx.theme();
+
+        // Scroll mode — without this, the table falls back to the wrap
+        // layout that budgets columns by character count and clamps cells
+        // to `overflow_hidden`, which is what sliced the chip glyphs in
+        // the smoke shot before the fix.
+        assert_eq!(
+            style.table.overflow.x,
+            Some(gpui::Overflow::Scroll),
+            "table must opt into gpui-base's SCROLL layout — reverting this \
+             brings back the wrap layout's character-count column budget",
+        );
+        assert!(
+            style.table.overflow.y.is_none(),
+            "table must leave overflow.y unset so vertical scroll stays \
+             with the transcript column, not the individual table",
+        );
+
+        // Per-cell nowrap — the load-bearing floor-raise. gpui-base's own
+        // docs on `style.table_cell.white_space = Nowrap` say it "keeps
+        // the cell text on a single line, and the floors are raised to
+        // the full content widths so the single-line columns never
+        // shrink." That is what pushes the Tool column's floor out to the
+        // widest chip's shaped width so the trailing glyph lands inside
+        // the cell rather than outside its `overflow_hidden()`.
+        assert_eq!(
+            style.table_cell.text.white_space,
+            Some(gpui::WhiteSpace::Nowrap),
+            "table cells must carry nowrap so column floors are raised \
+             to their shaped-glyph widths — reverting this restarts the \
+             r1 inline-code-chip clipping",
+        );
+
+        // Transparent cell border — kills the per-cell vertical grid so
+        // rows read flat (the row-bottom rule rides on the row div, not
+        // the cell, and survives this override).
+        assert_eq!(
+            style.table_cell.border_color,
+            Some(gpui::transparent_black()),
+            "cell border must be transparent so the table reads as flat \
+             rows without a per-cell grid",
+        );
+
+        // Inline-code chip routed through the theme, not palette::
+        // directly. `secondary_hover` is the ~6% text-normal wash the
+        // wiki paints on `.markdown-preview-view code`; `foreground`
+        // paints the glyph at normal-tier text — together they keep the
+        // chip from competing with real accent chrome.
+        assert_eq!(
+            style.inline_code.background_color,
+            Some(theme.secondary_hover),
+            "inline-code chip bg must ride the theme's secondary_hover \
+             wash — a fallback to accent paints the solid violet slab \
+             the ticket set out to remove",
+        );
+        assert_eq!(
+            style.inline_code.color,
+            Some(theme.foreground),
+            "inline-code glyph must be normal-tier text so the chip \
+             reads as a quiet annotation, not accent chrome",
+        );
+
+        // The wash the theme routes into the chip must itself stay
+        // subtle and share the text hue — a regression that promoted
+        // secondary_hover to a solid fill would silently loud-up every
+        // inline chip AND every hover state at once, so a named assert
+        // here beats waiting for the visible regression.
+        let wash = theme.secondary_hover;
+        let text = theme.foreground;
+        assert!(
+            wash.a > 0.02 && wash.a < 0.10,
+            "inline-code wash alpha {:.3} must land in the wiki's \
+             ~6% text-normal band",
+            wash.a
+        );
+        assert_eq!(wash.h, text.h);
+        assert_eq!(wash.s, text.s);
+        assert_eq!(wash.l, text.l);
+    });
+}
+
+#[gpui::test]
 fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut TestAppContext) {
     // The wiki contract encodes tool state through COLOR ONLY on the actual
     // verb and detail text: running paints at foreground, done fades to

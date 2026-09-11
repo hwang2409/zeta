@@ -250,19 +250,6 @@ pub mod palette {
     pub fn danger_tint() -> Hsla {
         hex_a(0xe268_5c1a)
     }
-    /// Inline `code` wash. Wiki markdown paints inline code on
-    /// `background-modifier-hover` — a ~6% text-normal tint — so the chip
-    /// reads as a quiet annotation, not a solid violet slab. Zeta borrows
-    /// the same alpha here so the two products look consistent.
-    pub fn inline_code_bg() -> Hsla {
-        hover()
-    }
-    /// Inline `code` glyph color — normal text, not accent. Matches the
-    /// wiki `.markdown-preview-view code { color: var(--text-normal) }`
-    /// rule and stops the chip from competing with real accent chrome.
-    pub fn inline_code_fg() -> Hsla {
-        text()
-    }
 }
 
 /// Opencode syntax palette, ported from `wiki/frontend/src/themes.css`.
@@ -910,31 +897,6 @@ mod tests {
         assert_eq!(tint.s, danger.s);
         assert_eq!(tint.l, danger.l);
         assert!(tint.a > 0.05 && tint.a < 0.20);
-    }
-
-    #[test]
-    fn inline_code_wash_stays_subtle_and_on_the_text_hue() {
-        // The wiki paints inline `code` at ~6% text-normal on canvas. If a
-        // later refactor swaps this back to the accent (violet), the chip
-        // becomes the visual peer of a state pill and the assistant row
-        // stops reading as prose. Test the alpha AND the hue so both
-        // regressions surface here.
-        let bg = palette::inline_code_bg();
-        let text = palette::text();
-        assert!(
-            bg.a < 0.10,
-            "inline-code fill alpha {:.3} must stay under the 10% ceiling",
-            bg.a
-        );
-        assert!(
-            bg.a > 0.02,
-            "inline-code fill alpha {:.3} must stay visible on canvas",
-            bg.a
-        );
-        assert_eq!(bg.h, text.h);
-        assert_eq!(bg.s, text.s);
-        assert_eq!(bg.l, text.l);
-        assert_eq!(palette::inline_code_fg(), text);
     }
 
     #[test]
