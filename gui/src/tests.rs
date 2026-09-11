@@ -2659,7 +2659,9 @@ fn text_only_history_user_row_paints_the_empty_attachment_gap(cx: &mut TestAppCo
                 });
                 window.draw(cx).clear(cx);
             });
-            visual.debug_bounds("transcript-row").unwrap()
+            visual
+                .debug_bounds("transcript-row")
+                .expect("transcript row renders")
         };
     let absent = render_single_user_row(cx, false);
     let present_empty = render_single_user_row(cx, true);
