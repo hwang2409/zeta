@@ -233,10 +233,13 @@ impl ZetaView {
         } else {
             cx.theme().muted_foreground
         };
-        // Solid-accent keyboard cursor when the row has focus and the
-        // pointer isn't already committing (`active` still wins on the
-        // dot). The fill inverts to canvas text so contrast holds.
-        let (row_bg, row_fg) = if focused && !active {
+        // Solid-accent keyboard cursor whenever the row has focus — even the
+        // current row must show the cursor so keyboard-only users see WHICH
+        // row would activate on Enter/Space. The current-item "no fill" rule
+        // (contract line 81) applies to the UNFOCUSED selected state; a
+        // focused row overrides it. The fill inverts to canvas text so
+        // contrast holds against the accent.
+        let (row_bg, row_fg) = if focused {
             (cx.theme().primary, cx.theme().primary_foreground)
         } else {
             (gpui::transparent_black(), label_color)
@@ -279,7 +282,7 @@ impl ZetaView {
                 div()
                     .flex_shrink_0()
                     .pl_2()
-                    .text_color(if focused && !active {
+                    .text_color(if focused {
                         cx.theme().primary_foreground
                     } else {
                         theme::palette::text_faint()
@@ -436,7 +439,11 @@ impl ZetaView {
             } else {
                 cx.theme().muted_foreground
             };
-            let (row_bg, row_fg) = if focused && !current {
+            // Same focus-cursor contract as session rows: any focused row —
+            // even the current one — paints the accent cursor so keyboard
+            // users see the active tab-stop. Unfocused rows keep the
+            // no-fill accent-text look for the current branch.
+            let (row_bg, row_fg) = if focused {
                 (cx.theme().primary, cx.theme().primary_foreground)
             } else {
                 (gpui::transparent_black(), label_color)

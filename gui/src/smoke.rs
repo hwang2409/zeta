@@ -88,22 +88,20 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                 entity.update(cx, |view, cx| {
                                     view.state.connection = ConnectionState::Connected;
                                     view.settings_open = true;
-                                    view.state.session_view.models = vec![
-                                        "claude-opus-4-7".into(),
-                                        "claude-fable-5".into(),
-                                    ];
+                                    view.state.session_view.models =
+                                        vec!["claude-opus-4-7".into(), "claude-fable-5".into()];
                                     view.state.session_view.current_model =
                                         "claude-opus-4-7".into();
                                     view.state.session_view.selected_model = 0;
                                     view.state.session_view.selected_mode = 0;
-                                    view.state.session_view.model_providers.insert(
-                                        "claude-opus-4-7".into(),
-                                        "claude".into(),
-                                    );
-                                    view.state.session_view.model_providers.insert(
-                                        "claude-fable-5".into(),
-                                        "claude".into(),
-                                    );
+                                    view.state
+                                        .session_view
+                                        .model_providers
+                                        .insert("claude-opus-4-7".into(), "claude".into());
+                                    view.state
+                                        .session_view
+                                        .model_providers
+                                        .insert("claude-fable-5".into(), "claude".into());
                                     // Restore the lost-connection banner so
                                     // the shot carries every piece of chrome
                                     // the reviewer named.

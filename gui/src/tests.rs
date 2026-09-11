@@ -3243,8 +3243,9 @@ fn modals_paint_a_flat_panel_on_the_scrim_at_the_wiki_top_offset(cx: &mut TestAp
         );
     });
     // Sits at 25% of the viewport height — the exact wiki `top` offset.
-    // A 15-50% acceptance band lets a dead-centred layout slip through;
-    // pinning the number keeps the modal on the wiki's shelf position.
+    // A 25% mark lands cleanly on a pixel grid, so drift beyond layout
+    // rounding (~1 logical px) means someone shifted the offset itself,
+    // not a fractional-pixel rounding wobble.
     let overlay = visual
         .debug_bounds("settings-overlay")
         .expect("settings overlay renders");
@@ -3255,8 +3256,9 @@ fn modals_paint_a_flat_panel_on_the_scrim_at_the_wiki_top_offset(cx: &mut TestAp
         target - panel.top()
     };
     assert!(
-        drift <= px(6.),
-        "settings panel top {:?} must land within 6px of the 25% mark ({:?})",
+        drift <= px(1.),
+        "settings panel top {:?} must land within 1px (layout rounding) \
+         of the 25% mark ({:?})",
         panel.top(),
         target,
     );
@@ -3279,11 +3281,25 @@ fn modals_paint_a_flat_panel_on_the_scrim_at_the_wiki_top_offset(cx: &mut TestAp
             "settings panel painted a rounded corner ({} quads)",
             rounded.len()
         );
-        // No shadow on the panel — Kit strips shadow when `theme.shadow`
-        // is false, but a manual `.shadow_*()` on the panel would leak
-        // one through. The theme guard already flips `shadow = false`;
-        // this doubles as a paint-time assertion.
-        let _ = cx.theme();
+        // No shadow behind the panel. gpui lowers `box-shadow` to a
+        // Shadow primitive (dedicated GPU pass) rather than a Quad, so
+        // `painted_quads()` cannot see shadow primitives directly. What
+        // it CAN see is the theme flags every shadow pass reads at paint
+        // time — Kit skips shadow emission entirely when both are false,
+        // and this assertion runs inside the same paint frame as the
+        // panel above, so it captures the paint-time state (not a
+        // constant). A mutation that flips either flag would trip here.
+        let theme = cx.theme();
+        assert!(
+            !theme.shadow,
+            "flat modal must paint with theme.shadow = false; got {}",
+            theme.shadow
+        );
+        assert!(
+            !theme.tile_shadow,
+            "flat modal must paint with theme.tile_shadow = false; got {}",
+            theme.tile_shadow
+        );
     });
 }
 
@@ -3338,6 +3354,22 @@ fn session_edit_modal_matches_the_wiki_flat_panel_shape(cx: &mut TestAppContext)
             "session-edit panel painted a rounded corner ({} quads)",
             rounded.len()
         );
+        // Twin shadow guard — see the settings-modal test for why this
+        // reads the theme flags at paint time (gpui shadows are Shadow
+        // primitives, not Quads, so `painted_quads()` cannot observe
+        // them directly). A mutation that flips either flag to true
+        // trips this assertion.
+        let theme = cx.theme();
+        assert!(
+            !theme.shadow,
+            "flat modal must paint with theme.shadow = false; got {}",
+            theme.shadow
+        );
+        assert!(
+            !theme.tile_shadow,
+            "flat modal must paint with theme.tile_shadow = false; got {}",
+            theme.tile_shadow
+        );
     });
     // 25% top offset — same shelf as the settings modal, contract line 91.
     let overlay = visual
@@ -3350,8 +3382,9 @@ fn session_edit_modal_matches_the_wiki_flat_panel_shape(cx: &mut TestAppContext)
         target - panel.top()
     };
     assert!(
-        drift <= px(6.),
-        "session-edit panel top {:?} must land within 6px of the 25% mark ({:?})",
+        drift <= px(1.),
+        "session-edit panel top {:?} must land within 1px (layout rounding) \
+         of the 25% mark ({:?})",
         panel.top(),
         target,
     );
@@ -3445,41 +3478,135 @@ fn footer_status_strip_paints_vertical_rules_between_metadata(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-fn session_rows_are_keyboard_focusable_and_activate_on_enter(cx: &mut TestAppContext) {
-    // A11y regression guard (finding #2): sidebar rows must be focusable
-    // controls, activatable by Enter and Space — not pointer-only divs. A
-    // regression that removed `track_focus`/`tab_index`/`on_key_down`
-    // would leave keyboard-only users unable to switch sessions.
+fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and_space(
+    cx: &mut TestAppContext,
+) {
+    // A11y regression guard (finding #2 — expanded round 3). Sidebar rows
+    // must be:
+    //   1. reachable by Tab (`.tab_index(0)` populates the window's tab
+    //      stops that `window.focus_next` walks),
+    //   2. paint the solid-accent keyboard cursor on the FOCUSED row so a
+    //      keyboard-only user sees which row Enter/Space would activate —
+    //      the current row must show the cursor too; the "no fill"
+    //      contract only applies to the UNFOCUSED current row,
+    //   3. activate on Enter AND Space (button-role keyboard contract).
+    // Both session and branch rows share this contract. Mutations that
+    // must fail: dropping the focus-cursor branch, dropping a key
+    // handler, or dropping `.tab_index(0)` from either row type.
     let (window, view, receiver) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    // Register a second session so there's a switchable target.
+    let session_target = "cd34beef1234";
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             let mut other = session();
-            other.session_id = "cd34beef1234".into();
+            other.session_id = session_target.into();
             other.name = "other".into();
             view.state.sessions.push(other);
+            view.state.session_view.available = true;
+            view.state.session_view.branches = vec![
+                Branch {
+                    id: "trunk".into(),
+                    label: "main".into(),
+                    depth: 0,
+                    current: true,
+                },
+                Branch {
+                    id: "alt".into(),
+                    label: "alt".into(),
+                    depth: 1,
+                    current: false,
+                },
+            ];
             view.apply_worker_message(WorkerMessage::Connected, window, cx);
         });
         window.draw(cx).clear(cx);
     });
     while receiver.try_recv().is_ok() {}
-    // Focus the row by the same keyed handle the sidebar uses at render
-    // time, then press Enter. A regression that dropped `.track_focus()`
-    // + `.on_key_down()` from the row would swallow the keystroke and
-    // fail to dispatch Resume.
-    let target_id = "cd34beef1234";
+
+    let session_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get(session_target)
+                .cloned()
+        })
+        .expect("sidebar row focus handle exists after render");
+    let current_session_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get(&session().session_id)
+                .cloned()
+        })
+        .expect("current session row focus handle exists after render");
+    let branch_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get("branch:alt")
+                .cloned()
+        })
+        .expect("branch row focus handle exists after render");
+    let current_branch_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get("branch:trunk")
+                .cloned()
+        })
+        .expect("current branch row focus handle exists after render");
+
+    // Row-sized paint check. `debug_bounds("session-row")` is ambiguous
+    // when multiple rows share the selector, so we assert on the SIZE of
+    // the accent quad — the focus cursor fills the whole row rectangle
+    // (~SIDEBAR_WIDTH × SIDEBAR_ROW_HEIGHT). The current-item dot is
+    // painted in the same accent color, but at 9×9px, so a size floor
+    // near the row's own footprint rejects it.
+    let row_sized_accent = |visual: &mut VisualTestContext, height: gpui::Pixels| -> bool {
+        visual.update(|window, cx| {
+            let theme = cx.theme();
+            let scale = window.scale_factor();
+            let width_floor = (theme::SIDEBAR_WIDTH * 0.9).scale(scale);
+            let height_floor = (height * 0.9).scale(scale);
+            window.painted_quads().into_iter().any(|q| {
+                q.background == theme.primary.into()
+                    && q.bounds.size.width >= width_floor
+                    && q.bounds.size.height >= height_floor
+            })
+        })
+    };
+
+    // --- The CURRENT session row (active) MUST paint the accent cursor
+    // when focused. Contract: the current-item "no fill" rule applies to
+    // the UNFOCUSED state only; a focused row overrides it. A mutation
+    // that reintroduces the old `focused && !active` guard would leave
+    // the current row with no visible focus cursor, and this check
+    // fails. ---
     visual.update(|window, cx| {
-        let handle = view
-            .read(cx)
-            .sidebar_row_focus
-            .borrow()
-            .get(target_id)
-            .cloned()
-            .expect("sidebar row focus handle exists after render");
-        window.focus(&handle, cx);
+        window.focus(&current_session_handle, cx);
         window.draw(cx).clear(cx);
     });
+    assert!(
+        row_sized_accent(&mut visual, theme::SIDEBAR_ROW_HEIGHT),
+        "the CURRENT session row must still paint the accent cursor \
+         when focused (no-fill rule applies only to the unfocused state)"
+    );
+
+    // --- Non-active session row also paints the cursor on focus. ---
+    visual.update(|window, cx| {
+        window.focus(&session_handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        row_sized_accent(&mut visual, theme::SIDEBAR_ROW_HEIGHT),
+        "focused session row must paint the accent focus cursor"
+    );
+
+    // --- Enter activates the focused session row. ---
     visual.simulate_keystrokes("enter");
     let mut resumed = None;
     while let Ok(msg) = receiver.try_recv() {
@@ -3490,20 +3617,14 @@ fn session_rows_are_keyboard_focusable_and_activate_on_enter(cx: &mut TestAppCon
     }
     assert_eq!(
         resumed.as_deref(),
-        Some(target_id),
+        Some(session_target),
         "Enter on a focused session row must dispatch Resume for that id"
     );
-    // Space is the other button-activation key by convention.
+
+    // --- Space activates the focused session row. ---
     visual.update(|window, cx| {
         view.update(cx, |view, _| view.pending_command = false);
-        let handle = view
-            .read(cx)
-            .sidebar_row_focus
-            .borrow()
-            .get(target_id)
-            .cloned()
-            .expect("sidebar row focus handle exists after render");
-        window.focus(&handle, cx);
+        window.focus(&session_handle, cx);
         window.draw(cx).clear(cx);
     });
     visual.simulate_keystrokes("space");
@@ -3516,8 +3637,69 @@ fn session_rows_are_keyboard_focusable_and_activate_on_enter(cx: &mut TestAppCon
     }
     assert_eq!(
         resumed_space.as_deref(),
-        Some(target_id),
+        Some(session_target),
         "Space on a focused session row must dispatch Resume for that id"
+    );
+
+    // --- The CURRENT branch row (trunk) must also paint the accent
+    // cursor when focused. Same contract as sessions — focused wins
+    // over the unfocused "no fill" rule. Reset `pending_command` first
+    // (session activation set it, and the branch row captures
+    // `can_activate` at render time). ---
+    visual.update(|window, cx| {
+        view.update(cx, |view, _| view.pending_command = false);
+        window.focus(&current_branch_handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        row_sized_accent(&mut visual, theme::SIDEBAR_NESTED_ROW_HEIGHT),
+        "the CURRENT branch row must still paint the accent cursor \
+         when focused (no-fill rule applies only to the unfocused state)"
+    );
+
+    // --- Non-current branch row (alt) also paints on focus. ---
+    visual.update(|window, cx| {
+        window.focus(&branch_handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        row_sized_accent(&mut visual, theme::SIDEBAR_NESTED_ROW_HEIGHT),
+        "focused branch row must paint the accent focus cursor"
+    );
+
+    // --- Enter on a focused branch row dispatches SwitchBranch. ---
+    visual.simulate_keystrokes("enter");
+    let mut switched = None;
+    while let Ok(msg) = receiver.try_recv() {
+        if let CommandMessage::SwitchBranch(id) = msg {
+            switched = Some(id);
+            break;
+        }
+    }
+    assert_eq!(
+        switched.as_deref(),
+        Some("alt"),
+        "Enter on a focused branch row must dispatch SwitchBranch for that id"
+    );
+
+    // --- Space on a focused branch row dispatches SwitchBranch. ---
+    visual.update(|window, cx| {
+        view.update(cx, |view, _| view.pending_command = false);
+        window.focus(&branch_handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    visual.simulate_keystrokes("space");
+    let mut switched_space = None;
+    while let Ok(msg) = receiver.try_recv() {
+        if let CommandMessage::SwitchBranch(id) = msg {
+            switched_space = Some(id);
+            break;
+        }
+    }
+    assert_eq!(
+        switched_space.as_deref(),
+        Some("alt"),
+        "Space on a focused branch row must dispatch SwitchBranch for that id"
     );
 }
 
@@ -3673,4 +3855,115 @@ fn run_header_paints_two_stacked_bands(cx: &mut TestAppContext) {
         visual.debug_bounds("run-header-model").is_some(),
         "band 2 must render the model chip"
     );
+}
+
+/// Probe view for the scrollbar guard. Renders a Kit `Scrollbar` in
+/// `Always` mode inside a fixed-size viewport with an oversized scroll
+/// area, so the thumb paints in the very first frame.
+struct ScrollbarProbe {
+    handle: gpui::ScrollHandle,
+    scroll_size: gpui::Size<gpui::Pixels>,
+    viewport: gpui::Size<gpui::Pixels>,
+}
+
+impl gpui::Render for ScrollbarProbe {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        gpui::div()
+            .relative()
+            .w(self.viewport.width)
+            .h(self.viewport.height)
+            .child(
+                gpui_kit::base::Scrollbar::vertical(&self.handle)
+                    .mode(gpui_kit::base::ScrollbarMode::Always)
+                    .scroll_size(self.scroll_size)
+                    .viewport_from_layout(),
+            )
+    }
+}
+
+#[gpui::test]
+fn scrollbar_thumb_lands_on_the_wiki_8px_and_text_alpha_mix(cx: &mut TestAppContext) {
+    // Contract line 93: transcript scrollbar rides at 8px wide, painted
+    // in text-normal color at 20% alpha (rest) / 40% alpha (hover). The
+    // `base.scrollbar.with_styles(...)` block in `theme::apply` pushes
+    // those tokens into `gpui-base::ScrollbarTheme` so any Scrollbar
+    // consumer picks them up.
+    //
+    // Mutation to catch: deleting the `base.scrollbar.with_styles(...)`
+    // block in `theme::apply`. Kit's Scrollbar falls back to the 6px
+    // default and a foreground-derived 35% mix — both differences are
+    // observable directly in `painted_quads()`.
+    cx.update(init);
+    let handle = gpui::ScrollHandle::new();
+    let viewport = gpui::size(px(160.), px(80.));
+    let scroll_size = gpui::size(px(160.), px(320.));
+    let handle_for_probe = handle.clone();
+    let (_view, cx) = cx.add_window_view(move |_, cx| {
+        theme::apply(cx);
+        ScrollbarProbe {
+            handle: handle_for_probe,
+            scroll_size,
+            viewport,
+        }
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // --- Rest: thumb paints at 8px in the text-normal 20% mix. ---
+    let (thumb_bounds, rest_scale) = cx.update(|window, _| {
+        let scale = window.scale_factor();
+        let rest_bg: gpui::Background = theme::palette::scrollbar_thumb().into();
+        let thumb = window
+            .painted_quads()
+            .into_iter()
+            .find(|q| q.background == rest_bg)
+            .expect("scrollbar paints its resting thumb at the 20% text mix");
+        (thumb.bounds, scale)
+    });
+    let thumb_target = theme::SCROLLBAR_THUMB_WIDTH.scale(rest_scale);
+    let width_delta = if thumb_bounds.size.width > thumb_target {
+        thumb_bounds.size.width - thumb_target
+    } else {
+        thumb_target - thumb_bounds.size.width
+    };
+    assert!(
+        width_delta <= px(1.).scale(rest_scale),
+        "thumb width {:?} must land on the 8px contract",
+        thumb_bounds.size.width
+    );
+
+    // --- Hover: same 8px width, hover mix (40% alpha). ---
+    // Hover the mouse over the middle of the resting thumb bounds; Kit
+    // flips `hovered_on_thumb` on the very next MouseMoveEvent and the
+    // next paint reads `style_for_hovered_thumb`. Kit's mouse events
+    // arrive in logical (unscaled) pixels, so undo the device scale.
+    let center = thumb_bounds.center();
+    let hover_pos = gpui::point(
+        px(center.x.as_f32() / rest_scale),
+        px(center.y.as_f32() / rest_scale),
+    );
+    cx.simulate_mouse_move(hover_pos, None, gpui::Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, _| {
+        let hover_bg: gpui::Background = theme::palette::scrollbar_thumb_hover().into();
+        let hover_thumb = window
+            .painted_quads()
+            .into_iter()
+            .find(|q| q.background == hover_bg)
+            .expect("scrollbar paints its hovered thumb at the 40% text mix");
+        let scale = window.scale_factor();
+        let hover_delta = if hover_thumb.bounds.size.width > thumb_target {
+            hover_thumb.bounds.size.width - thumb_target
+        } else {
+            thumb_target - hover_thumb.bounds.size.width
+        };
+        assert!(
+            hover_delta <= px(1.).scale(scale),
+            "hovered thumb width {:?} must also land on the 8px contract",
+            hover_thumb.bounds.size.width
+        );
+    });
 }
