@@ -4,9 +4,9 @@
 //! source (not a fixed function-name list) and rejects every string,
 //! byte-string, or C-string literal in expression position — no ambient
 //! method-name allowance. The only literals that pass ride an allowlisted
-//! macro payload (diagnostic — `panic!`, `unreachable!`, `todo!`,
-//! `unimplemented!`, `assert{,_eq,_ne}!`, `debug_assert{,_eq,_ne}!` — or
-//! pattern-only `matches!`); every other macro (`stringify!`, `concat!`,
+//! macro payload (`unreachable!` and pattern-only `matches!` — the only
+//! two the module actually uses); every other macro (`panic!`, `todo!`,
+//! `unimplemented!`, `assert*!`, `debug_assert*!`, `stringify!`, `concat!`,
 //! `write!`, unknown imports) is rejected outright. `format!` is scanned
 //! at ambient depth, so any literal fragment in its payload trips too.
 //! Every user-visible string a row paints has to come from the typed
@@ -33,8 +33,8 @@ use gpui_kit::component::{
 use super::{record_state, state_text, tool_state_color, ZetaView};
 use crate::{polish, theme};
 use zeta_gui::row_text::{
-    self, sel, AssistantRowText, ErrorRowText, LoginActionText, LoginRowText, RowText,
-    ThinkingRowText, ToolRowText, UserRowText,
+    self, sel, AssistantRowText, ErrorRowText, LoginActionText, LoginErrorText, LoginRowText,
+    RowText, ThinkingRowText, ToolRowText, UserRowText,
 };
 use zeta_gui::state::TranscriptEntry;
 
@@ -523,7 +523,8 @@ impl ZetaView {
                     .child(status_text),
             )
             .when_some(error, |row, error| {
-                row.child(Alert::error(error.id, error.message))
+                let LoginErrorText { id, message } = error;
+                row.child(Alert::error(id, message))
             })
             .into_any_element()
     }
