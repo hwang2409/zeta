@@ -5,8 +5,8 @@ use crate::{
 use std::collections::HashMap;
 
 use crate::client::{
-    Approval, Message, ServerEvent, SessionMetadata, StatusResult, SubAgentReceipt, SubAgentStatus,
-    ToolCall,
+    Approval, ContentBlock, Message, ServerEvent, SessionMetadata, StatusResult, SubAgentReceipt,
+    SubAgentStatus, ToolCall,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,24 +44,109 @@ pub enum TranscriptEntry {
         canceled: bool,
         card: Card,
     },
+    /// Generic thinking marker. Zeta's provider protocol has no display-safe
+    /// summary channel — `ContentBlock::Thinking` mixes raw reasoning with any
+    /// model-emitted summary — so the GUI never renders body text. The entry is
+    /// purely a header ("+ Thought"), signalling that the model thought without
+    /// leaking what.
+    Thinking,
 }
 
 impl TranscriptEntry {
-    pub fn tool_marker(&self) -> &'static str {
-        match self {
-            Self::Tool { canceled: true, .. } => "[canceled]",
-            Self::Tool { error: true, .. } => "[failed]",
-            Self::Tool { complete: true, .. } => "[done]",
-            _ => "[working]",
-        }
-    }
-
     pub fn unsuccessful(&self) -> bool {
         matches!(
             self,
             Self::Tool { error: true, .. } | Self::Tool { canceled: true, .. }
         )
     }
+
+    /// Semantic state carried by a tool row. Contract line 83: state is signalled by
+    /// COLOR ONLY — no textual "[working]/[done]/[failed]" markers land on the
+    /// visible row. The render layer maps each state to a theme token.
+    pub fn tool_state(&self) -> ToolState {
+        if self.unsuccessful() {
+            ToolState::Failed
+        } else if matches!(self, Self::Tool { complete: true, .. }) {
+            ToolState::Done
+        } else {
+            ToolState::Running
+        }
+    }
+
+    /// Ordered visible strings the render layer paints for this row.
+    /// Single seam: any string that reaches the user through the row's own
+    /// text elements (not framing chrome like a chevron icon or a hover hint)
+    /// flows through this collection. Borrowed so a full-transcript pass
+    /// does not clone every source string on every draw — renderers convert
+    /// to owned SharedStrings only at the leaf gpui element that needs them.
+    pub fn visible_text(&self) -> Vec<&str> {
+        match self {
+            Self::User(text) => vec![text.as_str()],
+            Self::Assistant(doc) => vec![doc.source.as_ref()],
+            Self::Error { message, .. } => vec![ERROR_HEADER_LABEL, message.as_str()],
+            Self::Thinking => vec![THINKING_HEADER_LABEL],
+            Self::Tool {
+                name,
+                summary,
+                card,
+                ..
+            } => {
+                // Dynamic body text only: name at 0, summary at 1, and the
+                // expanded output tail at 2 when the card is open. Fixed
+                // chrome (headings, hints, unit suffixes) lives in the
+                // render-layer chrome module — one home per literal.
+                let mut strings = vec![name.as_str(), summary.as_str()];
+                if card.expanded {
+                    strings.push(card.tail.text.as_str());
+                }
+                strings
+            }
+        }
+    }
+}
+
+/// Single source of truth for the thinking marker text. Both `visible_text`
+/// and the render layer read this constant so no wording lives on both sides
+/// of the seam.
+pub const THINKING_HEADER_LABEL: &str = "+ Thought";
+
+/// Single source of truth for the error row header text. Kept alongside the
+/// thinking label so both sides of the seam read one constant.
+pub const ERROR_HEADER_LABEL: &str = "Error";
+
+/// Semantic tool row state; the render layer maps each variant to a theme
+/// token per the wiki contract (running=foreground, done=muted_foreground,
+/// failed/canceled=danger).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolState {
+    Running,
+    Done,
+    Failed,
+}
+
+/// One primitive edit performed on the transcript. `AppState::apply` returns
+/// the ORDERED list of edits that describe a reconcile completely — a single
+/// event may append a row AND drop another row AND remeasure a third, and
+/// the view applies each edit in order to keep its virtual-list metadata
+/// cache aligned to the transcript. A one-action signal cannot describe a
+/// compound reconcile (append Thinking + remove middle assistant), so the
+/// view would splice only one operation and drift out of sync.
+///
+/// Every index is expressed against the transcript state the view holds at
+/// the moment that edit is applied — earlier edits in the same batch have
+/// already been applied. State.rs emits removals in descending order so an
+/// earlier `Remove(hi)` never invalidates a later `Remove(lo)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptEdit {
+    /// A new row was inserted at `index`. The view splices `index..index`
+    /// with one new row, growing the list by one.
+    Insert(usize),
+    /// The row at `index` was removed. The view splices `index..index + 1`
+    /// out, shrinking the list by one; downstream rows shift left.
+    Remove(usize),
+    /// The row at `index` was mutated in place. The view remeasures exactly
+    /// that row; count is unchanged.
+    Remeasure(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +169,14 @@ pub struct AppState {
     pub streaming: bool,
     pub thinking: bool,
     assistant_started: bool,
+    /// Index into `transcript` where the current server turn began. Set to
+    /// `transcript.len()` on every `TurnStart`, session switch, and history
+    /// replay (each of those rebuilds the transcript, then anchors here to
+    /// the new tail). `commit_assistant` reconciles only against rows at or
+    /// after this index, so a spontaneous second turn (no user row of its
+    /// own) never merges into the previous turn's rows, and a resumed
+    /// in-flight message after a history replay never edits restored rows.
+    turn_start: usize,
     pub metrics: StatusMetrics,
     pub metrics_boundary: bool,
 }
@@ -102,6 +195,7 @@ impl Default for AppState {
             streaming: false,
             thinking: false,
             assistant_started: false,
+            turn_start: 0,
             metrics: StatusMetrics::default(),
             metrics_boundary: true,
         }
@@ -113,6 +207,10 @@ impl AppState {
         use crate::client::HistoryContent;
         if replace {
             self.transcript.clear();
+            // Reset temporarily; the rebuilt tail becomes the anchor at the
+            // end of this method so a resumed in-flight `AssistantMessage`
+            // never folds into a pre-history row.
+            self.turn_start = 0;
         }
         self.session_view.message_ids.clear();
         self.session_view.attachments.clear();
@@ -184,6 +282,14 @@ impl AppState {
                 }
             }
         }
+        if replace {
+            // Anchor the next turn's reconciliation to the rebuilt tail. A
+            // resumed in-flight `AssistantMessage` following history replay
+            // would otherwise scan from index 0 and replace an old assistant
+            // row from the restored history. Regression test:
+            // `resumed_stream_after_history_replay_does_not_edit_older_rows`.
+            self.turn_start = self.transcript.len();
+        }
     }
 
     pub fn mark_connection_lost(&mut self, error: impl Into<String>) {
@@ -212,6 +318,7 @@ impl AppState {
         self.active_session = session_id;
         self.thinking = false;
         self.assistant_started = false;
+        self.turn_start = self.transcript.len();
         self.session_view = crate::session::SessionView {
             available: self.session_view.available,
             ..Default::default()
@@ -238,14 +345,18 @@ impl AppState {
         self.approvals = status.pending_approvals;
     }
 
-    pub fn apply(&mut self, event: ServerEvent) -> Option<usize> {
-        let mut changed = None;
+    pub fn apply(&mut self, event: ServerEvent) -> Vec<TranscriptEdit> {
+        let mut edits: Vec<TranscriptEdit> = Vec::new();
         match event {
             ServerEvent::TurnStart { .. } => {
                 self.streaming = true;
                 self.thinking = false;
                 self.assistant_started = false;
                 self.metrics_boundary = false;
+                // Anchor reconciliation for this turn to the current tail so
+                // streamed rows and the final AssistantMessage merge here
+                // without folding into the previous turn's rows.
+                self.turn_start = self.transcript.len();
             }
             ServerEvent::AgentEnd { .. } | ServerEvent::TurnAborted { .. } => {
                 self.streaming = false;
@@ -262,24 +373,47 @@ impl AppState {
             {
                 self.thinking = false;
                 self.assistant_started = true;
-                match self.transcript.last_mut() {
-                    Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
-                    _ => self
-                        .transcript
-                        .push(TranscriptEntry::Assistant(Markdown::streaming(delta))),
+                let appended = match self.transcript.last_mut() {
+                    Some(TranscriptEntry::Assistant(text)) => {
+                        text.push_str(&delta);
+                        false
+                    }
+                    _ => {
+                        self.transcript
+                            .push(TranscriptEntry::Assistant(Markdown::streaming(delta)));
+                        true
+                    }
+                };
+                if let Some(index) = self.transcript.len().checked_sub(1) {
+                    edits.push(if appended {
+                        TranscriptEdit::Insert(index)
+                    } else {
+                        TranscriptEdit::Remeasure(index)
+                    });
                 }
-                changed = self.transcript.len().checked_sub(1);
             }
             ServerEvent::AssistantDelta { kind, delta, .. }
                 if kind == "thinking" && !delta.is_empty() =>
             {
                 self.thinking = !self.assistant_started;
+                // Emit the header-only thinking marker the first time we see
+                // thinking in this turn. The reasoning delta itself is never
+                // stored — the provider protocol has no display-safe summary
+                // channel, so the row carries no body.
+                if self.thinking
+                    && !matches!(self.transcript.last(), Some(TranscriptEntry::Thinking))
+                {
+                    self.transcript.push(TranscriptEntry::Thinking);
+                    if let Some(index) = self.transcript.len().checked_sub(1) {
+                        edits.push(TranscriptEdit::Insert(index));
+                    }
+                }
             }
             ServerEvent::AssistantDelta { .. } => {}
             ServerEvent::AssistantMessage { message, .. } => {
                 self.thinking = false;
                 self.assistant_started |= !message.text().is_empty();
-                changed = self.commit_assistant(message)
+                edits.extend(self.commit_assistant(message));
             }
             ServerEvent::ToolStart {
                 session_id,
@@ -291,7 +425,9 @@ impl AppState {
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
                 ));
-                changed = self.transcript.len().checked_sub(1);
+                if let Some(index) = self.transcript.len().checked_sub(1) {
+                    edits.push(TranscriptEdit::Insert(index));
+                }
             }
             ServerEvent::ToolOutput {
                 session_id,
@@ -299,11 +435,15 @@ impl AppState {
                 output,
                 data,
             } => {
-                let (index, entry) = self.tool_receipt(
+                let (index, inserted, entry) = self.tool_receipt(
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
                 );
-                changed = Some(index);
+                edits.push(if inserted {
+                    TranscriptEdit::Insert(index)
+                } else {
+                    TranscriptEdit::Remeasure(index)
+                });
                 if let TranscriptEntry::Tool { summary, card, .. } = entry {
                     card.tail.append(&output);
                     if let Some(line) = card
@@ -323,11 +463,15 @@ impl AppState {
                 session_id,
                 data,
             } => {
-                let (index, entry) = self.tool_receipt(
+                let (index, inserted, entry) = self.tool_receipt(
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
                 );
-                changed = Some(index);
+                edits.push(if inserted {
+                    TranscriptEdit::Insert(index)
+                } else {
+                    TranscriptEdit::Remeasure(index)
+                });
                 if let TranscriptEntry::Tool {
                     complete,
                     error,
@@ -382,7 +526,7 @@ impl AppState {
                 session_id,
                 receipt,
             } => {
-                changed = Some(self.commit_sub_agent(session_id, receipt));
+                edits.push(self.commit_sub_agent(session_id, receipt));
             }
             ServerEvent::ApprovalRequest { approval, .. } => {
                 if !self
@@ -408,11 +552,13 @@ impl AppState {
                     settings_action,
                     login_provider: data["login_provider"].as_str().map(str::to_owned),
                 });
-                changed = self.transcript.len().checked_sub(1);
+                if let Some(index) = self.transcript.len().checked_sub(1) {
+                    edits.push(TranscriptEdit::Insert(index));
+                }
             }
             ServerEvent::Other { .. } => {}
         }
-        changed
+        edits
     }
 
     pub fn toggle_card(&mut self, index: usize) {
@@ -425,32 +571,35 @@ impl AppState {
         &mut self,
         tool_call: &ToolCall,
         key: ToolReceiptKey,
-    ) -> (usize, &mut TranscriptEntry) {
-        let index = self
-            .transcript
-            .iter()
-            .position(
-                |entry| matches!(entry, TranscriptEntry::Tool { key: existing, .. } if existing == &key),
-            )
-            .unwrap_or_else(|| {
+    ) -> (usize, bool, &mut TranscriptEntry) {
+        let existing = self.transcript.iter().position(
+            |entry| matches!(entry, TranscriptEntry::Tool { key: found, .. } if found == &key),
+        );
+        let (index, inserted) = match existing {
+            Some(index) => (index, false),
+            None => {
                 self.transcript.push(tool_entry(tool_call, key));
-                self.transcript.len() - 1
-            });
-        (index, &mut self.transcript[index])
+                (self.transcript.len() - 1, true)
+            }
+        };
+        (index, inserted, &mut self.transcript[index])
     }
 
-    fn commit_sub_agent(&mut self, session_id: Option<String>, receipt: SubAgentReceipt) -> usize {
+    fn commit_sub_agent(
+        &mut self,
+        session_id: Option<String>,
+        receipt: SubAgentReceipt,
+    ) -> TranscriptEdit {
         // Durable notifications have no raw tool ID. The launch result supplies
         // the child identity when we saw it; reconnect drains can create it alone.
-        let index = self
-            .transcript
-            .iter()
-            .position(|entry| {
-                matches!(entry, TranscriptEntry::Tool { key, card, .. }
+        let existing = self.transcript.iter().position(|entry| {
+            matches!(entry, TranscriptEntry::Tool { key, card, .. }
                 if key.session_id == session_id
                     && card.child_instance_id.as_deref() == Some(&receipt.child_instance_id))
-            })
-            .unwrap_or_else(|| {
+        });
+        let (index, inserted) = match existing {
+            Some(index) => (index, false),
+            None => {
                 self.transcript.push(TranscriptEntry::Tool {
                     key: ToolReceiptKey {
                         session_id,
@@ -467,8 +616,9 @@ impl AppState {
                         ..Default::default()
                     },
                 });
-                self.transcript.len() - 1
-            });
+                (self.transcript.len() - 1, true)
+            }
+        };
         if let TranscriptEntry::Tool {
             summary,
             complete,
@@ -497,21 +647,132 @@ impl AppState {
             card.tail = OutputTail::default();
             card.tail.append(&receipt.text);
         }
-        index
+        if inserted {
+            TranscriptEdit::Insert(index)
+        } else {
+            TranscriptEdit::Remeasure(index)
+        }
     }
 
-    fn commit_assistant(&mut self, message: Message) -> Option<usize> {
-        let text = message.text();
-        if text.is_empty() {
-            return None;
+    fn commit_assistant(&mut self, message: Message) -> Vec<TranscriptEdit> {
+        let has_thinking = message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Thinking { .. }));
+        let mut assistant_text = String::new();
+        for block in &message.content {
+            if let ContentBlock::Text { text } = block {
+                assistant_text.push_str(text);
+            }
         }
-        match self.transcript.last_mut() {
-            Some(TranscriptEntry::Assistant(current)) => *current = text.into(),
-            _ => self
-                .transcript
-                .push(TranscriptEntry::Assistant(text.into())),
+        // Reconcile against the active turn only. `self.turn_start` is set to
+        // `transcript.len()` on every `TurnStart`, so streamed rows plus the
+        // final `AssistantMessage` in the SAME turn merge here — while a
+        // spontaneous second turn (no fresh user row) never folds into the
+        // previous turn's Thinking or Assistant rows. Clamped defensively in
+        // case a mutation trimmed the transcript after the last TurnStart.
+        let turn_start = self.turn_start.min(self.transcript.len());
+        let has_thinking_marker = self.transcript[turn_start..]
+            .iter()
+            .any(|entry| matches!(entry, TranscriptEntry::Thinking));
+        let mut edits: Vec<TranscriptEdit> = Vec::new();
+        // Thinking body text is never retained — the provider protocol mixes
+        // raw reasoning with any summary, so we only guarantee that a
+        // header-only marker exists when the turn thought at all. A compound
+        // reconcile (Thinking marker append + trailing assistant row drop)
+        // MUST emit both edits — the view applies them in order so the
+        // virtual-list count and cached heights end aligned to the
+        // transcript. A one-action signal would splice only one operation.
+        if has_thinking && !has_thinking_marker {
+            self.transcript.push(TranscriptEntry::Thinking);
+            if let Some(index) = self.transcript.len().checked_sub(1) {
+                edits.push(TranscriptEdit::Insert(index));
+            }
         }
-        self.transcript.len().checked_sub(1)
+        if !assistant_text.is_empty() {
+            // Every assistant row in the current turn, in transcript order.
+            // An interleaved stream — AssistantDelta("pre"), ToolStart,
+            // AssistantDelta("post") — leaves TWO assistant rows around the
+            // tool row. Reconciling only the last row (the old `rposition`
+            // path) replaced it with the full final "prepost" and left "pre"
+            // in the earlier row, duplicating the prefix on screen.
+            //
+            // The correct behaviour preserves row order around tools: keep
+            // the leading assistant rows exactly as streamed and put the
+            // trailing remainder in the last row so the concatenation
+            // equals the final text. If the streamed rows are not a real
+            // prefix of the final (a rare drop/reorder), collapse the
+            // earlier ones into the last row rather than paint stale text.
+            let assistant_indices: Vec<usize> = self.transcript[turn_start..]
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, entry)| {
+                    matches!(entry, TranscriptEntry::Assistant(_)).then_some(turn_start + offset)
+                })
+                .collect();
+            if assistant_indices.is_empty() {
+                self.transcript
+                    .push(TranscriptEntry::Assistant(assistant_text.into()));
+                if let Some(index) = self.transcript.len().checked_sub(1) {
+                    edits.push(TranscriptEdit::Insert(index));
+                }
+            } else {
+                let leading = &assistant_indices[..assistant_indices.len() - 1];
+                let mut cursor = 0usize;
+                let mut prefix_ok = true;
+                for &idx in leading {
+                    let TranscriptEntry::Assistant(doc) = &self.transcript[idx] else {
+                        unreachable!("assistant_indices filter matched this row")
+                    };
+                    let src = doc.source.as_ref();
+                    if assistant_text[cursor..].starts_with(src) {
+                        cursor += src.len();
+                    } else {
+                        prefix_ok = false;
+                        break;
+                    }
+                }
+                if prefix_ok {
+                    let last_idx = *assistant_indices.last().unwrap();
+                    let tail = assistant_text[cursor..].to_owned();
+                    // Empty tail means the leading rows already cover the full
+                    // final text — a shorter-than-streamed final or a final
+                    // equal to a mid-tool prefix would otherwise leave an
+                    // empty assistant row that still consumes transcript
+                    // rhythm. Drop the trailing row instead of blanking it.
+                    if tail.is_empty() {
+                        self.transcript.remove(last_idx);
+                        edits.push(TranscriptEdit::Remove(last_idx));
+                    } else {
+                        if let TranscriptEntry::Assistant(current) = &mut self.transcript[last_idx]
+                        {
+                            *current = tail.into();
+                        }
+                        edits.push(TranscriptEdit::Remeasure(last_idx));
+                    }
+                } else {
+                    // Divergent prefix — remove leading rows in DESCENDING
+                    // index order so an earlier `Remove(hi)` never invalidates
+                    // a later `Remove(lo)`. The view applies each edit in
+                    // sequence: after Remove(hi), the row previously at `lo`
+                    // is still at `lo`, so the next Remove is well-formed.
+                    for &idx in leading.iter().rev() {
+                        self.transcript.remove(idx);
+                        edits.push(TranscriptEdit::Remove(idx));
+                    }
+                    let last_idx = self.transcript[turn_start..]
+                        .iter()
+                        .rposition(|entry| matches!(entry, TranscriptEntry::Assistant(_)))
+                        .map(|offset| turn_start + offset)
+                        .expect("collapsed assistant row still present");
+                    if let TranscriptEntry::Assistant(current) = &mut self.transcript[last_idx] {
+                        *current = assistant_text.into();
+                    }
+                    edits.push(TranscriptEdit::Remeasure(last_idx));
+                }
+            }
+        }
+        edits
     }
 }
 
@@ -625,17 +886,17 @@ mod tests {
                 tool_result: Some(result),
                 data: json!({}),
             });
-            assert_eq!(changed, Some(0));
+            assert_eq!(changed, vec![TranscriptEdit::Insert(0)]);
             let entry = &state.transcript[0];
-            assert_eq!(entry.tool_marker(), "[canceled]");
             assert!(entry.unsuccessful());
             assert!(matches!(
                 entry,
                 TranscriptEntry::Tool {
                     complete: true,
                     canceled: true,
+                    error,
                     ..
-                }
+                } if *error == is_error
             ));
         }
     }
@@ -745,8 +1006,52 @@ mod tests {
             },
         });
         assert_eq!(
-            state.transcript,
-            vec![TranscriptEntry::Assistant("hello".into())]
+            describe_transcript(&state.transcript),
+            vec![r#"Assistant("hello")"#.to_owned()]
+        );
+    }
+
+    #[test]
+    fn streamed_mixed_turn_reconciles_without_duplicating_rows() {
+        // Regression: with mixed content, the stream emits a thinking delta
+        // (which pushes the Thinking marker) and a text delta (which pushes the
+        // Assistant row). The final AssistantMessage carries BOTH blocks. The
+        // old reconciler only checked `last()`, so it saw the Assistant on top
+        // and pushed a second Thinking, then found the second Thinking on top
+        // and pushed a second Assistant — [Thinking, Assistant, Thinking,
+        // Assistant]. Reconciliation must update the existing rows in place.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "reasoning trace".into(),
+            kind: "thinking".into(),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "hello".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![
+                    crate::client::ContentBlock::Thinking {
+                        text: "reasoning trace".into(),
+                    },
+                    crate::client::ContentBlock::Text {
+                        text: "hello".into(),
+                    },
+                ],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec!["Thinking".to_owned(), r#"Assistant("hello")"#.to_owned(),]
         );
     }
 
@@ -1007,6 +1312,745 @@ mod tests {
                 message: text, settings_action, ..
             } if text == message && *settings_action == expected));
         }
+    }
+
+    /// Assemble a stream: TurnStart, one or more AssistantDelta chunks, then
+    /// the final `AssistantMessage`. Returns the resulting transcript so the
+    /// test can compare live and replay shapes byte for byte.
+    fn stream_turn(state: &mut AppState, deltas: &[(&str, &str)], final_blocks: Vec<ContentBlock>) {
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        for (kind, delta) in deltas {
+            state.apply(ServerEvent::AssistantDelta {
+                session_id: None,
+                delta: (*delta).into(),
+                kind: (*kind).into(),
+            });
+        }
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: final_blocks,
+            },
+        });
+        state.apply(ServerEvent::TurnEnd {
+            session_id: None,
+            data: json!({}),
+        });
+    }
+
+    #[test]
+    fn final_only_second_turn_appends_without_editing_the_first_turn() {
+        // Turn 1 leaves an Assistant row on the transcript. Turn 2 emits no
+        // user prompt and no streamed deltas — only a final AssistantMessage.
+        // The old User/Error boundary scan treated the previous turn's row as
+        // inside the current turn and overwrote it. Reconciliation must anchor
+        // on the TurnStart index so Turn 2's text lands on a NEW row.
+        let mut state = AppState::default();
+        stream_turn(
+            &mut state,
+            &[],
+            vec![ContentBlock::Text {
+                text: "first turn".into(),
+            }],
+        );
+        stream_turn(
+            &mut state,
+            &[],
+            vec![ContentBlock::Text {
+                text: "second turn".into(),
+            }],
+        );
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("first turn")"#.to_owned(),
+                r#"Assistant("second turn")"#.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn thinking_only_second_turn_emits_its_own_marker_not_the_previous_one() {
+        // A pure-thinking turn following an assistant turn must push its own
+        // marker rather than reuse the earlier turn's Thinking row (which is
+        // what happens if reconciliation scans without a turn boundary).
+        let mut state = AppState::default();
+        stream_turn(
+            &mut state,
+            &[("thinking", "reasoning"), ("assistant", "hello")],
+            vec![
+                ContentBlock::Thinking {
+                    text: "reasoning".into(),
+                },
+                ContentBlock::Text {
+                    text: "hello".into(),
+                },
+            ],
+        );
+        stream_turn(
+            &mut state,
+            &[],
+            vec![ContentBlock::Thinking {
+                text: "silent turn".into(),
+            }],
+        );
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                "Thinking".to_owned(),
+                r#"Assistant("hello")"#.to_owned(),
+                "Thinking".to_owned(),
+            ],
+            "third row is a fresh Thinking marker, not a merge into the first turn's marker"
+        );
+    }
+
+    #[test]
+    fn text_only_final_message_carries_over_one_row() {
+        // Baseline: a turn with no thinking and no streamed deltas produces a
+        // single Assistant row.
+        let mut state = AppState::default();
+        stream_turn(
+            &mut state,
+            &[],
+            vec![ContentBlock::Text {
+                text: "answer".into(),
+            }],
+        );
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![r#"Assistant("answer")"#.to_owned()]
+        );
+    }
+
+    #[test]
+    fn mixed_streamed_then_final_matches_replay_of_committed_events_only() {
+        // The live state receives EVERY event — TurnStart, streamed deltas,
+        // the final AssistantMessage, TurnEnd. The replay state receives
+        // ONLY the committed events (TurnStart / AssistantMessage / TurnEnd)
+        // that history playback carries. If both produce the same
+        // transcript, reconciliation is idempotent under history replay —
+        // this is the round-6 bug the earlier test hid by feeding identical
+        // event streams to both states.
+        let session = "session";
+        let live_events = vec![
+            ServerEvent::TurnStart {
+                session_id: Some(session.to_owned()),
+                data: json!({}),
+            },
+            ServerEvent::AssistantDelta {
+                session_id: Some(session.to_owned()),
+                delta: "trace".into(),
+                kind: "thinking".into(),
+            },
+            ServerEvent::AssistantDelta {
+                session_id: Some(session.to_owned()),
+                delta: "hi".into(),
+                kind: "assistant".into(),
+            },
+            ServerEvent::AssistantMessage {
+                session_id: Some(session.to_owned()),
+                message: Message {
+                    role: "assistant".into(),
+                    content: vec![
+                        ContentBlock::Thinking {
+                            text: "trace".into(),
+                        },
+                        ContentBlock::Text { text: "hi".into() },
+                    ],
+                },
+            },
+            ServerEvent::TurnEnd {
+                session_id: Some(session.to_owned()),
+                data: json!({}),
+            },
+            ServerEvent::TurnStart {
+                session_id: Some(session.to_owned()),
+                data: json!({}),
+            },
+            ServerEvent::AssistantMessage {
+                session_id: Some(session.to_owned()),
+                message: Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "followup".into(),
+                    }],
+                },
+            },
+            ServerEvent::TurnEnd {
+                session_id: Some(session.to_owned()),
+                data: json!({}),
+            },
+        ];
+        // Replay drops the streamed deltas — a rebuilt session hydrates
+        // through the committed messages only, then this event stream fires.
+        let replay_events: Vec<ServerEvent> = live_events
+            .iter()
+            .filter(|event| !matches!(event, ServerEvent::AssistantDelta { .. }))
+            .cloned()
+            .collect();
+        let mut live = AppState::default();
+        for event in live_events {
+            live.apply(event);
+        }
+        let mut replay = AppState::default();
+        for event in replay_events {
+            replay.apply(event);
+        }
+        let live_shape = describe_transcript(&live.transcript);
+        let replay_shape = describe_transcript(&replay.transcript);
+        assert_eq!(
+            live_shape,
+            vec![
+                "Thinking".to_owned(),
+                r#"Assistant("hi")"#.to_owned(),
+                r#"Assistant("followup")"#.to_owned(),
+            ],
+            "live transcript regressed: {live_shape:?}"
+        );
+        assert_eq!(
+            live_shape, replay_shape,
+            "live vs replay diverge — reconciliation is not idempotent"
+        );
+    }
+
+    /// Compact per-row descriptor: kind + the row's own dynamic text. The
+    /// five reconciliation tests below compare full vectors of descriptors
+    /// so a regression that flips a row kind OR a body string fails with a
+    /// readable diff, not a `matches!` slot check.
+    #[cfg(test)]
+    fn describe_transcript(rows: &[TranscriptEntry]) -> Vec<String> {
+        rows.iter()
+            .map(|entry| match entry {
+                TranscriptEntry::User(text) => format!("User({text:?})"),
+                TranscriptEntry::Assistant(doc) => {
+                    format!("Assistant({:?})", doc.source.as_ref())
+                }
+                TranscriptEntry::Thinking => "Thinking".to_owned(),
+                TranscriptEntry::Tool { name, summary, .. } => {
+                    format!("Tool({name:?}, {summary:?})")
+                }
+                TranscriptEntry::Error { message, .. } => format!("Error({message:?})"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn interleaved_assistant_and_tool_row_reconcile_without_duplicating_prefix() {
+        // ROUND-7 regression: streamed sequence AssistantDelta("pre"),
+        // ToolStart, AssistantDelta("post"), then the final AssistantMessage
+        // carries "prepost". The old `rposition` reconciler replaced the
+        // LAST assistant row with the full "prepost" and left the earlier
+        // "pre" row untouched — "pre" appeared twice on screen. The new
+        // reconciler preserves row order around tools and puts the
+        // remainder in the trailing row so their concatenation matches.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "post".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "prepost".into(),
+                }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("pre")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                r#"Assistant("post")"#.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resumed_stream_after_history_replay_does_not_edit_older_rows() {
+        // ROUND-7 regression: `apply_history(replace=true)` used to leave
+        // `turn_start` at 0. A resumed in-flight AssistantMessage arriving
+        // just after history replay would then scan from index 0 and
+        // overwrite an OLD assistant row from the restored history. Anchor
+        // must move to the rebuilt tail so the resumed message appends.
+        use crate::client::{HistoryContent, HistoryMessage};
+        let mut state = AppState::default();
+        let history = vec![
+            HistoryMessage {
+                id: "u1".into(),
+                role: "user".into(),
+                content: vec![HistoryContent::Text {
+                    text: "old question".into(),
+                }],
+                tool_result: None,
+            },
+            HistoryMessage {
+                id: "a1".into(),
+                role: "assistant".into(),
+                content: vec![HistoryContent::Text {
+                    text: "old answer".into(),
+                }],
+                tool_result: None,
+            },
+        ];
+        state.apply_history(history, true);
+        // Resumed in-flight message arrives without a fresh TurnStart —
+        // exactly what the server emits when the client reconnects mid-turn.
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "resumed answer".into(),
+                }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"User("old question")"#.to_owned(),
+                r#"Assistant("old answer")"#.to_owned(),
+                r#"Assistant("resumed answer")"#.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn aborted_turn_leaves_the_streamed_row_intact() {
+        // TurnAborted stops streaming without a final AssistantMessage.
+        // Any streamed assistant text must remain visible so the user sees
+        // what the model said before the cancel. This test also proves
+        // aborted turns do not corrupt turn_start for a subsequent turn.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "partial".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::TurnAborted {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "next turn".into(),
+                }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("partial")"#.to_owned(),
+                r#"Assistant("next turn")"#.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_final_message_after_streamed_deltas_keeps_streamed_text() {
+        // A final AssistantMessage with empty text (or only-whitespace)
+        // must not erase or duplicate the streamed row. Some providers emit
+        // an empty final envelope when the response is tool-only.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "streamed".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text { text: "".into() }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![r#"Assistant("streamed")"#.to_owned()]
+        );
+    }
+
+    #[test]
+    fn final_shorter_than_streamed_drops_the_trailing_blank_row() {
+        // Round-8 fix: streamed "pre", ToolStart, streamed "post", final
+        // AssistantMessage("pre"). The leading row already carries "pre",
+        // so the trailing assistant row's tail is empty. Blanking it would
+        // leave an empty row that still consumes transcript rhythm — drop
+        // the row instead.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "post".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text { text: "pre".into() }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("pre")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+            ],
+            "reconciliation must never leave an empty assistant row"
+        );
+    }
+
+    #[test]
+    fn middle_row_removal_reports_the_exact_removed_index() {
+        // Round-9: a blank-row removal at index 2 leaves rows AFTER it in
+        // the transcript (a trailing Tool row here at old index 3). The
+        // change signal must carry that removed index so the view splices
+        // the virtual list at slot 2 — not at the tail, which would leave
+        // shifted rows anchored to their pre-removal cached heights.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "post".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        // Transcript before the final message:
+        //   [Assistant("pre"), Tool, Assistant("post"), Tool]
+        // Final "pre" reconciles by dropping Assistant("post") at index 2.
+        let change = state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text { text: "pre".into() }],
+            },
+        });
+        assert_eq!(
+            change,
+            vec![TranscriptEdit::Remove(2)],
+            "the exact removed index must reach the view — the tail delta alone would splice the wrong slot"
+        );
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("pre")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn compound_reconcile_emits_thinking_insert_and_middle_removal_in_order() {
+        // A single AssistantMessage can both (a) append a Thinking marker
+        // AND (b) drop a middle assistant row when the final text is a
+        // prefix of the streamed fragments bracketed by tools. `apply` MUST
+        // return BOTH edits, in order — a single-action signal would splice
+        // only one operation and the virtual list would desync from the
+        // transcript. This test fails any mutation that collapses
+        // `commit_assistant` to a one-edit return.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "post".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        // Transcript: [Assistant("pre"), Tool, Assistant("post"), Tool].
+        // The final message brings a Thinking block AND text that matches
+        // only the first fragment, so Thinking appends at index 4 and
+        // Assistant("post") at index 2 is dropped.
+        let edits = state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![
+                    ContentBlock::Thinking {
+                        text: "hidden".into(),
+                    },
+                    ContentBlock::Text { text: "pre".into() },
+                ],
+            },
+        });
+        assert_eq!(
+            edits,
+            vec![TranscriptEdit::Insert(4), TranscriptEdit::Remove(2)],
+            "compound reconcile MUST emit every edit in order — one-edit \
+             collapses would desync the virtual list from the transcript"
+        );
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("pre")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                "Thinking".to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn divergent_prefix_emits_leading_removals_in_descending_index_order() {
+        // When the streamed fragments are NOT a prefix of the final text,
+        // `commit_assistant` collapses the leading assistant rows into
+        // the last one. The emitted edits MUST list every removal (in
+        // descending index order so an earlier `Remove(hi)` never
+        // invalidates a later `Remove(lo)`) and a final `Remeasure` for
+        // the surviving row. A mutation that returns only the final
+        // `Remeasure` leaves the leading rows still occupying scroller
+        // slots — this test fails it.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "alpha".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "beta".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "gamma".into(),
+            kind: "assistant".into(),
+        });
+        // Transcript: [Assistant("alpha"), Tool, Assistant("beta"), Tool,
+        //   Assistant("gamma")]. Final text "zzz" is NOT a prefix of any
+        // streamed fragment — the reconciler removes the two leading
+        // assistant rows and rewrites the tail assistant row.
+        let edits = state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text { text: "zzz".into() }],
+            },
+        });
+        assert_eq!(
+            edits,
+            vec![
+                TranscriptEdit::Remove(2),
+                TranscriptEdit::Remove(0),
+                TranscriptEdit::Remeasure(2),
+            ],
+            "divergent-prefix collapse MUST report every leading-row \
+             removal (in descending order) plus the surviving-row remeasure"
+        );
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                r#"Assistant("zzz")"#.to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn multiple_tools_with_shorter_final_drop_every_blank_trailing_row() {
+        // Two tools bracket streamed text on both sides; the final message
+        // matches only the first fragment. Every empty tail must be
+        // removed — a lingering blank row breaks transcript rhythm.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "alpha".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "beta".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "gamma".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "alphabeta".into(),
+                }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("alpha")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                r#"Assistant("beta")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+            ],
+            "trailing empty assistant row after multiple tools must be dropped"
+        );
+    }
+
+    #[test]
+    fn empty_delta_around_tool_leaves_no_blank_row() {
+        // Empty deltas ("") never push their own assistant row (see the
+        // `AssistantDelta` handler's `!delta.is_empty()` guard), so the
+        // reconciler only ever sees the non-empty streamed fragments plus
+        // the final message. Even if a provider bookends a tool with empty
+        // deltas around a real fragment, the transcript still ends with no
+        // blank assistant row when the final text equals the streamed
+        // prefix.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "hello".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+            },
+        });
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("hello")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+            ]
+        );
     }
 
     #[test]

@@ -244,22 +244,43 @@ fn virtual_transcript_and_session_rows_fit_their_viewports(cx: &mut TestAppConte
         assert!(session.size.width <= px(280.));
         assert!(transcript.size.height > px(300.));
         visual.update(|window, cx| {
+            let viewport = transcript.scale(window.scale_factor());
+            let composer_bounds = composer.scale(window.scale_factor());
+            // Identify transcript quads by their PAINT attributes alone —
+            // primary-color left rail — and exclude the composer's rail
+            // explicitly by bounds. The old test filtered by content_mask
+            // inside the viewport, which silently DROPPED any leaking quad
+            // rather than failing on it. Here we identify without that
+            // filter, then assert every quad's content mask (the clipping
+            // rectangle the virtual list assigns) stays inside the viewport.
             let quads: Vec<_> = window
                 .painted_quads()
                 .into_iter()
                 .filter(|quad| {
                     quad.border_color == cx.theme().primary
                         && quad.border_widths.left > gpui::ScaledPixels::default()
+                        && !(quad.bounds.top() >= composer_bounds.top()
+                            && quad.bounds.bottom() <= composer_bounds.bottom())
                 })
                 .collect();
             assert!(!quads.is_empty(), "user message borders were painted");
+            // The 760px window minus header, banner, composer, and footer
+            // leaves ≲520px of transcript viewport. With the 22px row rhythm
+            // that fits ~24 rows; a healthy virtual list over-renders a small
+            // buffer above and below. Anything past that means the list is
+            // materialising off-screen work.
             assert!(quads.len() < 20, "the virtual list paints only nearby rows");
-            let viewport = transcript.scale(window.scale_factor());
             for quad in quads {
-                assert!(quad.content_mask.bounds.top() >= viewport.top());
-                assert!(quad.content_mask.bounds.bottom() <= viewport.bottom());
-                assert!(quad.content_mask.bounds.left() >= viewport.left());
-                assert!(quad.content_mask.bounds.right() <= viewport.right());
+                assert!(
+                    quad.content_mask.bounds.top() >= viewport.top()
+                        && quad.content_mask.bounds.bottom() <= viewport.bottom(),
+                    "transcript row content-mask leaks vertically outside the viewport"
+                );
+                assert!(
+                    quad.content_mask.bounds.left() >= viewport.left()
+                        && quad.content_mask.bounds.right() <= viewport.right(),
+                    "transcript row content-mask leaks horizontally outside the viewport"
+                );
             }
         });
     }
@@ -267,6 +288,1034 @@ fn virtual_transcript_and_session_rows_fit_their_viewports(cx: &mut TestAppConte
 
 fn png_bytes() -> Vec<u8> {
     b"\x89PNG\r\n\x1a\n".to_vec()
+}
+
+#[gpui::test]
+fn transcript_column_caps_at_wiki_readable_measure_and_centers(cx: &mut TestAppContext) {
+    // Wiki agent-run column pins at 1024px centered. The default 1100px window
+    // minus the 216px sidebar leaves ~884px of transcript viewport — narrower
+    // than the column cap, which means the centering branch never runs. Resize
+    // to a wide window here so the cap and centering are both exercised.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1600.), px(760.)));
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::User("wide user turn ".repeat(500))];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let row = visual.debug_bounds("transcript-row").unwrap();
+    let transcript = visual.debug_bounds("transcript-viewport").unwrap();
+    assert!(row.size.width <= transcript.size.width);
+    // The transcript viewport must clear the column cap, otherwise this test
+    // regresses to the old "cap never activates" hole.
+    assert!(
+        transcript.size.width > theme::TRANSCRIPT_MAX_WIDTH,
+        "viewport {:?} must exceed the 1024px cap for centering to matter",
+        transcript.size.width
+    );
+    visual.update(|window, cx| {
+        let scale = window.scale_factor();
+        let scaled_viewport = transcript.scale(scale);
+        let scaled_row = row.scale(scale);
+        let scaled_column_cap = px(f32::from(theme::TRANSCRIPT_MAX_WIDTH)).scale(scale);
+        let user_quads: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.border_color == cx.theme().primary
+                    && quad.border_widths.left > gpui::ScaledPixels::default()
+                    && quad.content_mask.bounds.top() >= scaled_row.top()
+                    && quad.content_mask.bounds.bottom() <= scaled_row.bottom()
+            })
+            .collect();
+        assert!(!user_quads.is_empty(), "user rail was painted");
+        // The user rectangle sits inside a bounded inner column: 1024px minus
+        // 16px horizontal padding on each side (`.px_4()`). The rectangle's
+        // quad bounds are its border-box, so a 3px left-rail adds up to 3px
+        // to the observed width — allow that plus a sub-logical-pixel wiggle.
+        let inner_column = scaled_column_cap - px(32.).scale(scale);
+        let tolerance = px(4.).scale(scale);
+        for quad in user_quads {
+            let width = quad.bounds.size.width;
+            let delta = if width > inner_column {
+                width - inner_column
+            } else {
+                inner_column - width
+            };
+            assert!(
+                delta <= tolerance,
+                "user rectangle width {:?} must land on the inner 1024-32px column {:?}",
+                width,
+                inner_column,
+            );
+            let left_gap = quad.bounds.left() - scaled_viewport.left();
+            let right_gap = scaled_viewport.right() - quad.bounds.right();
+            let asymmetry = if left_gap > right_gap {
+                left_gap - right_gap
+            } else {
+                right_gap - left_gap
+            };
+            assert!(
+                asymmetry <= tolerance,
+                "column not centered: left {left_gap:?}, right {right_gap:?}"
+            );
+        }
+    });
+}
+
+#[gpui::test]
+fn assistant_row_is_naked_and_carries_no_bg_or_rail(cx: &mut TestAppContext) {
+    // The wiki assistant turn has NO frame — 2px vertical breath, no bg, no
+    // border, no rail. Regressing to a card style would fight the mono prose.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::Assistant("plain answer".into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let row = visual.debug_bounds("transcript-row").unwrap();
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled_row = row.scale(window.scale_factor());
+        let framed: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                let in_row = quad.content_mask.bounds.top() >= scaled_row.top()
+                    && quad.content_mask.bounds.bottom() <= scaled_row.bottom();
+                let has_left_rail = quad.border_widths.left > gpui::ScaledPixels::default();
+                let element_fill = quad.background == theme.muted.into()
+                    || quad.background == theme.sidebar.into();
+                in_row && (has_left_rail || element_fill)
+            })
+            .collect();
+        assert!(
+            framed.is_empty(),
+            "naked assistant row painted framing chrome: {} quads",
+            framed.len()
+        );
+    });
+}
+
+#[gpui::test]
+fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut TestAppContext) {
+    // The wiki contract encodes tool state through COLOR ONLY on the actual
+    // verb and detail text: running paints at foreground, done fades to
+    // muted, failed lands on danger. No textual "[working]/[done]/[failed]"
+    // marker may reach the row. This guard drives real tool rows through the
+    // state layer and asserts on: (a) the `visible_text` seam (no bracketed
+    // marker), (b) the `tool_state_color` helper (contract token per state),
+    // and (c) the paint-probe (the ACTUAL color the render layer applied via
+    // `.text_color(state_color)`). Since gpui's public test surface exposes
+    // painted quads but not the scene's glyph sprites, the probe binds the
+    // renderer's applied color to the assertion; a regression that
+    // hard-codes a wrong token instead of routing through the helper is
+    // caught because it either records the wrong color or records nothing.
+    use zeta_gui::state::ToolState;
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for case in [ToolState::Running, ToolState::Done, ToolState::Failed] {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.state.transcript.clear();
+                view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
+                let call = ToolCall {
+                    id: "receipt".into(),
+                    name: "bash".into(),
+                    arguments: Default::default(),
+                };
+                view.apply_worker_message(
+                    WorkerMessage::Event(ServerEvent::ToolStart {
+                        session_id: view.state.active_session.clone(),
+                        tool_call: call.clone(),
+                        data: json!({}),
+                    }),
+                    window,
+                    cx,
+                );
+                if !matches!(case, ToolState::Running) {
+                    let is_error = matches!(case, ToolState::Failed);
+                    view.apply_worker_message(
+                        WorkerMessage::Event(ServerEvent::ToolEnd {
+                            session_id: view.state.active_session.clone(),
+                            tool_call: call,
+                            tool_result: Some(zeta_gui::client::ToolResult {
+                                tool_call_id: "receipt".into(),
+                                content: "line".into(),
+                                is_error,
+                                is_canceled: false,
+                                structured_content: None,
+                                content_blocks: Vec::new(),
+                            }),
+                            data: json!({}),
+                        }),
+                        window,
+                        cx,
+                    );
+                    // Expand collapsed successful rows so the indent-rail body paints.
+                    if matches!(case, ToolState::Done) {
+                        view.state.toggle_card(0);
+                        cx.notify();
+                    }
+                }
+            });
+            window.draw(cx).clear(cx);
+        });
+        // Contract mapping: running=foreground, done=muted_foreground,
+        // failed=danger. Same helper the render function reads.
+        visual.update(|_, cx| {
+            let theme = cx.theme();
+            let expected = match case {
+                ToolState::Running => theme.foreground,
+                ToolState::Done => theme.muted_foreground,
+                ToolState::Failed => theme.danger,
+            };
+            let entry_state = view.read(cx).state.transcript[0].tool_state();
+            assert_eq!(entry_state, case, "state classification regressed");
+            assert_eq!(
+                super::tool_state_color(entry_state, cx),
+                expected,
+                "tool row state color regressed off the contract token"
+            );
+            // render_log: every state-colored element in the tool row goes
+            // through `state_text` or `record_state`, so the samples for
+            // row 0 (verb, detail, chevron) are the actual colors reaching
+            // `.text_color(...)`. A mutation that swaps the color argument
+            // at any call site either records the wrong color OR drops a
+            // required row id from the recorded set — both fail here.
+            let samples = super::render_log::samples();
+            let recorded: std::collections::HashSet<&str> = samples
+                .iter()
+                .map(|sample| sample.row_id.as_str())
+                .filter(|id| id.starts_with("tool-"))
+                .collect();
+            let expected_ids: std::collections::HashSet<&str> =
+                ["tool-verb-0", "tool-detail-0", "tool-chevron-0"]
+                    .into_iter()
+                    .collect();
+            assert_eq!(
+                recorded, expected_ids,
+                "render_tool_row must record verb, detail, and chevron samples for {case:?}"
+            );
+            for sample in samples
+                .iter()
+                .filter(|s| expected_ids.contains(s.row_id.as_str()))
+            {
+                assert_eq!(
+                    sample.color, expected,
+                    "tool row {case:?} painted {} at the wrong color",
+                    sample.row_id
+                );
+            }
+        });
+        // The verb and detail elements paint their bounds — the color check
+        // above proves the contract token is on the entry; this pins the
+        // debug selectors so a rename regresses.
+        assert!(
+            visual.debug_bounds("tool-verb-0").is_some(),
+            "verb element must paint for state {case:?}"
+        );
+        assert!(
+            visual.debug_bounds("tool-detail-0").is_some(),
+            "detail element must paint for state {case:?}"
+        );
+        // Visible-text seam: the row's own text goes through `visible_text`
+        // (name + summary + expanded body). No bracketed state marker may
+        // reach it in any state — that would revert contract line 83.
+        view.read_with(&visual, |view, _| {
+            let strings = view.state.transcript[0].visible_text();
+            for marker in ["[working]", "[done]", "[failed]", "[canceled]"] {
+                for text in &strings {
+                    assert!(
+                        !text.contains(marker),
+                        "tool row visible_text carried state marker {marker} for {case:?}: {text:?}"
+                    );
+                }
+            }
+        });
+        // Failed tool bodies auto-expand (see state::ServerEvent::ToolEnd),
+        // so the indent-rail assertion still runs for that case. The Done
+        // case toggles above; Running has no expanded body.
+        if matches!(case, ToolState::Done | ToolState::Failed) {
+            let body = visual
+                .debug_bounds("tool-output-0")
+                .expect("expanded tool body renders");
+            visual.update(|window, cx| {
+                let theme = cx.theme();
+                let scaled_body = body.scale(window.scale_factor());
+                let thin_rail = px(f32::from(theme::RAIL_WIDTH_THIN)).scale(window.scale_factor());
+                let thick_rail =
+                    px(f32::from(theme::RAIL_WIDTH_THICK)).scale(window.scale_factor());
+                let rails: Vec<_> = window
+                    .painted_quads()
+                    .into_iter()
+                    .filter(|quad| {
+                        let in_body = quad.bounds.top() >= scaled_body.top()
+                            && quad.bounds.bottom() <= scaled_body.bottom();
+                        let is_thin_rail = quad.border_widths.left >= thin_rail
+                            && quad.border_widths.left < thick_rail;
+                        in_body && is_thin_rail
+                    })
+                    .collect();
+                let danger_count = rails
+                    .iter()
+                    .filter(|quad| quad.border_color == theme.danger)
+                    .count();
+                let neutral_count = rails
+                    .iter()
+                    .filter(|quad| quad.border_color == theme.border)
+                    .count();
+                if matches!(case, ToolState::Failed) {
+                    assert!(
+                        danger_count > 0,
+                        "failed tool body must paint its rail in danger"
+                    );
+                    assert_eq!(
+                        neutral_count, 0,
+                        "failed tool body must not paint any neutral rails"
+                    );
+                } else {
+                    assert!(
+                        neutral_count > 0,
+                        "successful tool body must paint its rail in the neutral border color"
+                    );
+                    assert_eq!(
+                        danger_count, 0,
+                        "successful tool body must not paint any danger rails"
+                    );
+                }
+            });
+        }
+    }
+}
+
+#[gpui::test]
+fn pending_user_rail_paints_a_single_one_pixel_rail(cx: &mut TestAppContext) {
+    // Item 8 guard: the queued strip pins to a 1px dashed rail. A revert to
+    // the thick 3px rail (contract line 85) or a fill-rail hybrid would
+    // read as an active user turn. Assert the exact left-border width via
+    // painted_quads — the scene reflects it directly, no probes needed.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, _| {
+            view.pending_user_turn = Some(super::PendingUserTurn {
+                text: "queued message".into(),
+                failed: false,
+            });
+        });
+        window.draw(cx).clear(cx);
+    });
+    let pending = visual
+        .debug_bounds("composer-pending")
+        .expect("queued strip renders");
+    visual.update(|window, _| {
+        let scaled = pending.scale(window.scale_factor());
+        let thin = px(f32::from(theme::RAIL_WIDTH_THIN)).scale(window.scale_factor());
+        let thick = px(f32::from(theme::RAIL_WIDTH_THICK)).scale(window.scale_factor());
+        let rails: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.bounds.top() >= scaled.top() - gpui::ScaledPixels::from(0.5)
+                    && quad.bounds.bottom() <= scaled.bottom() + gpui::ScaledPixels::from(0.5)
+                    && quad.border_widths.left > gpui::ScaledPixels::default()
+            })
+            .collect();
+        assert!(!rails.is_empty(), "queued strip must paint a left rail");
+        for rail in &rails {
+            // 1px rail exactly — a 3px revert lands at or above `thick`.
+            assert!(
+                rail.border_widths.left <= thin + gpui::ScaledPixels::from(0.5),
+                "queued rail width {:?} exceeds RAIL_WIDTH_THIN {:?} — thick revert",
+                rail.border_widths.left,
+                thin
+            );
+            assert!(
+                rail.border_widths.left < thick,
+                "queued rail width must never reach RAIL_WIDTH_THICK"
+            );
+            // Style must be dashed — a revert to solid drops the "queued"
+            // signal and reads as an active-turn rail. `Quad::border_style`
+            // defaults to `Solid`, so this catches a `.border_dashed()`
+            // removal directly at the paint layer.
+            assert_eq!(
+                rail.border_style,
+                gpui::BorderStyle::Dashed,
+                "queued rail must paint dashed, not solid"
+            );
+        }
+    });
+}
+
+#[test]
+fn scroll_sync_translates_every_edit_in_order() {
+    // Round-10 structural pin. `apply` returns an ordered edit list; the
+    // view MUST apply every edit as its own scroller op, in order. A
+    // mutation that drops all but one edit (the round-9 shape) or reverts
+    // any removal to a tail splice fails these assertions.
+    use zeta_gui::state::TranscriptEdit;
+    assert_eq!(
+        scroll_sync(6, &[TranscriptEdit::Remove(4)], false),
+        vec![ScrollSync::Splice(4..5, 0)],
+    );
+    assert_eq!(
+        scroll_sync(4, &[TranscriptEdit::Insert(3)], false),
+        vec![ScrollSync::Splice(3..3, 1)],
+    );
+    assert_eq!(
+        scroll_sync(5, &[TranscriptEdit::Remeasure(2)], false),
+        vec![ScrollSync::Remeasure(2)],
+    );
+    assert_eq!(scroll_sync(5, &[], false), Vec::<ScrollSync>::new());
+    // Replace (history swap / session switch) resets regardless of edits.
+    assert_eq!(scroll_sync(8, &[], true), vec![ScrollSync::Reset(8)],);
+    // Compound edit: append a Thinking row AND remove a middle assistant
+    // row in ONE reconcile. The view must splice BOTH operations — a
+    // one-action signal collapses to a single op and desyncs the list.
+    assert_eq!(
+        scroll_sync(
+            5,
+            &[TranscriptEdit::Insert(4), TranscriptEdit::Remove(2)],
+            false,
+        ),
+        vec![ScrollSync::Splice(4..4, 1), ScrollSync::Splice(2..3, 0)],
+    );
+}
+
+#[gpui::test]
+fn middle_row_removal_syncs_the_virtual_list_at_the_exact_index(cx: &mut TestAppContext) {
+    // End-to-end pin for the state → view sync. Streams a mixed turn that
+    // ends with the final message equal to the FIRST streamed fragment, so
+    // the reconciler drops the middle assistant row rather than blanking
+    // it. The virtual list must land on the reconciled item count and the
+    // full flow — apply_worker_message → scroll_sync → MessageScrollerState
+    // — must not panic on the middle-slot splice.
+    use zeta_gui::client::{ContentBlock, Message};
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let session_id = view.read_with(&visual, |view, _| view.state.active_session.clone());
+    let stream_events = vec![
+        ServerEvent::TurnStart {
+            session_id: session_id.clone(),
+            data: json!({}),
+        },
+        ServerEvent::AssistantDelta {
+            session_id: session_id.clone(),
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        },
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-a".into(),
+                name: "read".into(),
+                arguments: serde_json::from_value(json!({"path": "README.md"})).unwrap(),
+            },
+            data: json!({}),
+        },
+        ServerEvent::AssistantDelta {
+            session_id: session_id.clone(),
+            delta: "post".into(),
+            kind: "assistant".into(),
+        },
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-b".into(),
+                name: "list".into(),
+                arguments: serde_json::from_value(json!({"path": "gui/src"})).unwrap(),
+            },
+            data: json!({}),
+        },
+    ];
+    for event in stream_events {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_worker_message(WorkerMessage::Event(event), window, cx);
+            });
+        });
+    }
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.state.transcript.len(), 4);
+            assert_eq!(view.transcript.read(cx).item_count(), 4);
+        });
+    });
+    // Final "pre" trims the trailing Assistant("post") at index 2, leaving
+    // a Tool row past the removed slot. The sync must splice the middle
+    // slot's cache — a tail splice would corrupt the survivor's metadata.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantMessage {
+                    session_id,
+                    message: Message {
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::Text { text: "pre".into() }],
+                    },
+                }),
+                window,
+                cx,
+            );
+        });
+    });
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.state.transcript.len(), 3);
+            assert_eq!(
+                view.transcript.read(cx).item_count(),
+                3,
+                "virtual list item count must track the reconciled transcript"
+            );
+        });
+    });
+    // Post-reconcile transcript: [Assistant("pre"), Tool, Tool]. Adjacent
+    // tool rows carry a zero row-gap per the wiki contract; a splice at
+    // the wrong slot would leave the second tool anchored below the
+    // removed assistant's cached height.
+    let tool_a = visual
+        .debug_bounds("tool-receipt-1")
+        .expect("first tool row must paint");
+    let tool_b = visual
+        .debug_bounds("tool-receipt-2")
+        .expect("second tool row must paint");
+    assert!(
+        tool_b.top() >= tool_a.top(),
+        "tool rows must remain in transcript order"
+    );
+    let gap = tool_b.top() - tool_a.bottom();
+    assert!(
+        gap < px(8.),
+        "adjacent tool rows must sit at zero gap (measured gap={gap:?})"
+    );
+}
+
+#[gpui::test]
+fn compound_reconcile_syncs_the_virtual_list_row_for_row(cx: &mut TestAppContext) {
+    // Round-10 mutation gate. A single AssistantMessage can append a
+    // Thinking marker AND drop a middle assistant row in the same
+    // reconcile. `apply` returns BOTH edits in order and the view must
+    // splice each — a mutation that keeps only one edit leaves the
+    // virtual list off by one item from the transcript. This end-to-end
+    // pin fails any such collapse (name: compound-edit desync).
+    use zeta_gui::client::{ContentBlock, Message};
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let session_id = view.read_with(&visual, |view, _| view.state.active_session.clone());
+    let stream_events = vec![
+        ServerEvent::TurnStart {
+            session_id: session_id.clone(),
+            data: json!({}),
+        },
+        ServerEvent::AssistantDelta {
+            session_id: session_id.clone(),
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        },
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-a".into(),
+                name: "read".into(),
+                arguments: serde_json::from_value(json!({"path": "README.md"})).unwrap(),
+            },
+            data: json!({}),
+        },
+        ServerEvent::AssistantDelta {
+            session_id: session_id.clone(),
+            delta: "post".into(),
+            kind: "assistant".into(),
+        },
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-b".into(),
+                name: "list".into(),
+                arguments: serde_json::from_value(json!({"path": "gui/src"})).unwrap(),
+            },
+            data: json!({}),
+        },
+    ];
+    for event in stream_events {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_worker_message(WorkerMessage::Event(event), window, cx);
+            });
+        });
+    }
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.state.transcript.len(), 4);
+            assert_eq!(view.transcript.read(cx).item_count(), 4);
+        });
+    });
+    // Final "pre" with a Thinking block: append Thinking AND drop the
+    // middle Assistant("post"). Transcript ends at four items — the
+    // scroller item count MUST equal that; the compound reconcile is
+    // exactly the shape that the round-9 single-action signal missed.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantMessage {
+                    session_id,
+                    message: Message {
+                        role: "assistant".into(),
+                        content: vec![
+                            ContentBlock::Thinking {
+                                text: "hidden".into(),
+                            },
+                            ContentBlock::Text { text: "pre".into() },
+                        ],
+                    },
+                }),
+                window,
+                cx,
+            );
+        });
+    });
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.state.transcript.len(), 4);
+            assert_eq!(
+                view.transcript.read(cx).item_count(),
+                4,
+                "compound reconcile MUST leave the virtual list aligned to \
+                 the transcript — a dropped edit desyncs the counts"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+fn variable_height_survivor_positions_stay_stable_after_middle_removal(cx: &mut TestAppContext) {
+    // Round-10 stability pin. Build several rows of DIFFERENT painted
+    // heights after the removed slot, scroll AWAY from the tail so the
+    // splice cannot rely on tail follow-mode, then drop a middle row.
+    // Every surviving row past the removal must sit at exactly its
+    // pre-removal top MINUS the removed row's height — otherwise the
+    // splice landed on the wrong slot and the survivors carry stale
+    // metadata. A tail-splice mutation shifts these numbers.
+    use zeta_gui::client::{ContentBlock, Message};
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let session_id = view.read_with(&visual, |view, _| view.state.active_session.clone());
+    let bulk = "line ".repeat(60);
+    let stream_events = vec![
+        ServerEvent::TurnStart {
+            session_id: session_id.clone(),
+            data: json!({}),
+        },
+        // Row 0: short assistant fragment (streamed).
+        ServerEvent::AssistantDelta {
+            session_id: session_id.clone(),
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        },
+        // Row 1: first tool receipt.
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-a".into(),
+                name: "read".into(),
+                arguments: serde_json::from_value(json!({"path": "README.md"})).unwrap(),
+            },
+            data: json!({}),
+        },
+        // Row 2: streamed assistant fragment that will be dropped.
+        ServerEvent::AssistantDelta {
+            session_id: session_id.clone(),
+            delta: "post".into(),
+            kind: "assistant".into(),
+        },
+        // Row 3: second tool receipt with a large output (different height).
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-b".into(),
+                name: "list".into(),
+                arguments: serde_json::from_value(json!({"path": "gui/src"})).unwrap(),
+            },
+            data: json!({}),
+        },
+        ServerEvent::ToolOutput {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-b".into(),
+                name: "list".into(),
+                arguments: serde_json::from_value(json!({"path": "gui/src"})).unwrap(),
+            },
+            output: bulk.clone(),
+            data: json!({}),
+        },
+        // Row 4: third tool receipt (short again).
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-c".into(),
+                name: "read".into(),
+                arguments: serde_json::from_value(json!({"path": "Cargo.toml"})).unwrap(),
+            },
+            data: json!({}),
+        },
+    ];
+    for event in stream_events {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_worker_message(WorkerMessage::Event(event), window, cx);
+            });
+        });
+    }
+    // Expand the tall tool receipt so its painted height differs from
+    // the short ones — the point of the test is heights that are NOT
+    // uniform.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.toggle_card(3);
+            view.transcript.update(cx, |scroll, cx| {
+                scroll.remeasure_items(3..4, cx);
+            });
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    // Scroll away from the tail. `is_scrolled_up()` is truthy only when
+    // the user has left tail-follow — assert the split before mutating.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.transcript.update(cx, |scroll, cx| {
+                scroll.scroll_to_item(0, cx);
+            });
+        });
+        window.draw(cx).clear(cx);
+    });
+    visual.update(|_, cx| {
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.state.transcript.len(), 5);
+            assert_eq!(view.transcript.read(cx).item_count(), 5);
+        });
+    });
+    let tool_b_top_before = visual
+        .debug_bounds("tool-receipt-3")
+        .expect("tall tool row must paint")
+        .top();
+    let tool_c_top_before = visual
+        .debug_bounds("tool-receipt-4")
+        .expect("trailing short tool row must paint")
+        .top();
+    // Reconcile: final "pre" drops Assistant("post") at slot 2. Every
+    // surviving row past the removal must shift up by the SAME amount —
+    // the height of the dropped row. A tail-splice mutation would leave
+    // the tall Tb anchored to Assistant("post")'s stale cached height,
+    // so Tb and Tc would end up at inconsistent shifts.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantMessage {
+                    session_id,
+                    message: Message {
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::Text { text: "pre".into() }],
+                    },
+                }),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    visual.update(|_, cx| {
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.state.transcript.len(), 4);
+            assert_eq!(
+                view.transcript.read(cx).item_count(),
+                4,
+                "middle removal MUST keep scroller count aligned to \
+                 the transcript"
+            );
+        });
+    });
+    let tool_b_top_after = visual
+        .debug_bounds("tool-receipt-2")
+        .expect("tall tool row must still paint after removal")
+        .top();
+    let tool_c_top_after = visual
+        .debug_bounds("tool-receipt-3")
+        .expect("trailing tool row must still paint after removal")
+        .top();
+    let tolerance = px(1.);
+    let tall_shift = tool_b_top_before - tool_b_top_after;
+    let tail_shift = tool_c_top_before - tool_c_top_after;
+    assert!(
+        tall_shift > px(0.),
+        "tall tool row must shift up after the middle removal \
+         (shift={tall_shift:?})"
+    );
+    assert!(
+        tail_shift > px(0.),
+        "trailing tool row must shift up after the middle removal \
+         (shift={tail_shift:?})"
+    );
+    assert!(
+        (tall_shift - tail_shift).abs() <= tolerance,
+        "surviving rows past the removal MUST shift up by an equal \
+         amount — differing shifts (tall={tall_shift:?}, \
+         tail={tail_shift:?}) mean the splice landed on the wrong slot \
+         and the cache under one survivor is stale"
+    );
+    // Additional invariant: adjacent tool rows sit at zero row-gap per
+    // the wiki contract. A wrong-slot splice leaves the second tool
+    // anchored below the removed row's cached height, opening a gap.
+    let tool_a_after = visual
+        .debug_bounds("tool-receipt-1")
+        .expect("first tool row must paint")
+        .bottom();
+    let gap = tool_b_top_after - tool_a_after;
+    assert!(
+        gap < px(8.),
+        "adjacent tool rows must sit at zero gap after middle removal \
+         (measured gap={gap:?})"
+    );
+}
+
+#[test]
+fn every_row_text_flows_through_the_visible_seam_or_chrome_module() {
+    // No renderer may sneak dynamic body text past `visible_text` and no
+    // chrome literal may sneak past the `chrome` module. Iterating both and
+    // asserting on the joined string catches a regression that adds a
+    // bracketed state marker anywhere the user can read it.
+    let markers = ["[working]", "[done]", "[failed]", "[canceled]"];
+    let entries = [
+        TranscriptEntry::User("hi".into()),
+        TranscriptEntry::Assistant("hello".into()),
+        TranscriptEntry::Thinking,
+        TranscriptEntry::Error {
+            message: "boom".into(),
+            settings_action: false,
+            login_provider: None,
+        },
+    ];
+    for entry in &entries {
+        for text in entry.visible_text() {
+            for marker in markers {
+                assert!(
+                    !text.contains(marker),
+                    "visible_text carried {marker} in {text:?}"
+                );
+            }
+        }
+    }
+    for literal in super::chrome::ALL {
+        for marker in markers {
+            assert!(
+                !literal.contains(marker),
+                "chrome literal {literal:?} carried state marker {marker}"
+            );
+        }
+    }
+    // Thinking's visible text is exactly the generic header — no wording
+    // duplication between state.rs and the render layer.
+    assert_eq!(
+        TranscriptEntry::Thinking.visible_text(),
+        vec![zeta_gui::state::THINKING_HEADER_LABEL.to_owned()]
+    );
+}
+
+#[gpui::test]
+fn composer_focus_promotes_the_rail_and_lightens_the_fill(cx: &mut TestAppContext) {
+    // Focus is the ONLY chrome cue on the composer: rail promotes to full
+    // accent AND fill lightens one step. Any border ring or extra outline
+    // would fail the wiki contract — so this test paints both blurred and
+    // focused states and asserts exact rail width, the actual painted fill
+    // promotion, and that no other border/ring lives in the composer bounds.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+
+    // Blurred: force focus off the composer via a fresh focus handle.
+    visual.update(|window, cx| {
+        let handle = cx.focus_handle();
+        window.focus(&handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    let composer = visual.debug_bounds("composer").unwrap();
+    let (blurred_rail_alpha, blurred_fill) = visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled = composer.scale(window.scale_factor());
+        let rail_width_scaled = px(f32::from(theme::RAIL_WIDTH_THICK)).scale(window.scale_factor());
+        let composer_quads: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.bounds.top() >= scaled.top() && quad.bounds.bottom() <= scaled.bottom()
+            })
+            .collect();
+        let rail = composer_quads
+            .iter()
+            .find(|quad| {
+                quad.border_widths.left >= rail_width_scaled
+                    && quad.bounds.left() <= scaled.left() + gpui::ScaledPixels::from(1.0)
+            })
+            .expect("blurred composer paints a left rail");
+        // Rail must land on the DIM accent (rail alpha < full accent).
+        assert!(rail.border_color.a < theme.primary.a);
+        assert!((rail.border_color.h - theme.primary.h).abs() < 0.01);
+        // Rail width is EXACTLY the wiki thick rail — a 2px regression would
+        // pass a `>=` check but slip under this equality.
+        assert!(rail.border_widths.left <= rail_width_scaled + gpui::ScaledPixels::from(0.5));
+        // No ring: no non-left border on any composer quad. The rail is the
+        // only chrome; a border ring elsewhere would trip this.
+        for quad in &composer_quads {
+            assert!(
+                quad.border_widths.top == gpui::ScaledPixels::default(),
+                "composer must not paint a top border"
+            );
+            assert!(
+                quad.border_widths.right == gpui::ScaledPixels::default(),
+                "composer must not paint a right border"
+            );
+            assert!(
+                quad.border_widths.bottom == gpui::ScaledPixels::default(),
+                "composer must not paint a bottom border"
+            );
+        }
+        // Blurred fill is the ambient element surface.
+        let fill_quad = composer_quads
+            .iter()
+            .find(|quad| {
+                quad.background == theme.muted.into()
+                    || quad.background == theme::palette::composer_focus_fill().into()
+            })
+            .expect("blurred composer paints its fill");
+        assert_eq!(
+            fill_quad.background,
+            theme.muted.into(),
+            "blurred composer must sit on the ambient element surface"
+        );
+        (rail.border_color.a, fill_quad.background)
+    });
+
+    // Focused: restore focus to the composer input.
+    visual.update(|window, cx| {
+        let handle = view.read(cx).composer.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scaled = composer.scale(window.scale_factor());
+        let rail_width_scaled = px(f32::from(theme::RAIL_WIDTH_THICK)).scale(window.scale_factor());
+        let composer_quads: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.bounds.top() >= scaled.top() && quad.bounds.bottom() <= scaled.bottom()
+            })
+            .collect();
+        let rail = composer_quads
+            .iter()
+            .find(|quad| {
+                quad.border_widths.left >= rail_width_scaled
+                    && quad.bounds.left() <= scaled.left() + gpui::ScaledPixels::from(1.0)
+                    && quad.border_color == theme.primary
+            })
+            .expect("focused composer paints a full-accent left rail");
+        // Rail width remains at the wiki thick rail — not the ring style.
+        assert!(rail.border_widths.left <= rail_width_scaled + gpui::ScaledPixels::from(0.5));
+        // No border ring anywhere in the composer.
+        for quad in &composer_quads {
+            assert!(
+                quad.border_widths.top == gpui::ScaledPixels::default(),
+                "focused composer must not paint a top border"
+            );
+            assert!(
+                quad.border_widths.right == gpui::ScaledPixels::default(),
+                "focused composer must not paint a right border"
+            );
+            assert!(
+                quad.border_widths.bottom == gpui::ScaledPixels::default(),
+                "focused composer must not paint a bottom border"
+            );
+        }
+        // Focus must promote the rail alpha above the blurred alpha AND change
+        // the composer fill to the lighter step — asserting both prevents a
+        // regression that promotes only one.
+        assert!(
+            rail.border_color.a > blurred_rail_alpha,
+            "focus must strengthen the rail alpha"
+        );
+        let fill_quad = composer_quads
+            .iter()
+            .find(|quad| {
+                quad.background == theme.muted.into()
+                    || quad.background == theme::palette::composer_focus_fill().into()
+            })
+            .expect("focused composer paints its fill");
+        assert_eq!(
+            fill_quad.background,
+            theme::palette::composer_focus_fill().into(),
+            "focus must lighten the composer fill one step"
+        );
+        assert_ne!(
+            fill_quad.background, blurred_fill,
+            "focused fill must differ from the blurred fill"
+        );
+    });
+}
+
+#[gpui::test]
+fn adjacent_tool_rows_have_zero_gap_between_them(cx: &mut TestAppContext) {
+    // A run of tool receipts is visually a single column in the wiki. Non-tool
+    // neighbours reintroduce the 14px rhythm on both sides so a mixed sequence
+    // still breathes.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let tool = |id: &str| TranscriptEntry::Tool {
+        key: zeta_gui::state::ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: id.into(),
+        },
+        name: "bash".into(),
+        summary: id.into(),
+        complete: true,
+        error: false,
+        canceled: false,
+        card: zeta_gui::cards::Card::default(),
+    };
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![
+                TranscriptEntry::User("q".into()),
+                tool("a"),
+                tool("b"),
+                tool("c"),
+                TranscriptEntry::Assistant("plain answer".into()),
+            ];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(5, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let tool_a = visual.debug_bounds("tool-receipt-1").unwrap();
+    let tool_b = visual.debug_bounds("tool-receipt-2").unwrap();
+    let tool_c = visual.debug_bounds("tool-receipt-3").unwrap();
+    // Zero gap between adjacent tools; the receipts stack immediately.
+    let gap_ab = tool_b.top() - tool_a.bottom();
+    let gap_bc = tool_c.top() - tool_b.bottom();
+    assert!(gap_ab <= px(2.), "adjacent tool rows must sit flush");
+    assert!(gap_bc <= px(2.));
 }
 
 #[gpui::test]
@@ -586,8 +1635,16 @@ fn attachments_paste_shows_chip_and_send_dispatches_send_images(cx: &mut TestApp
             view.state.session_view.attachments.get(&0),
             Some(&vec![("pasted-image.png".to_string(), 8)])
         );
+        // ImagesSent clears the queued-strip state alongside Sent — otherwise
+        // an image-only send leaves a phantom dashed strip beside the solid
+        // transcript turn.
+        assert!(
+            view.pending_user_turn.is_none(),
+            "ImagesSent must clear the queued strip"
+        );
     });
     assert!(visual.debug_bounds("composer-chip").is_none());
+    assert!(visual.debug_bounds("composer-pending").is_none());
 }
 
 #[gpui::test]
@@ -1058,7 +2115,13 @@ fn thinking_feedback_stops_on_text_and_turn_boundaries(cx: &mut TestAppContext) 
                 view.composer_hint(),
                 "zeta is thinking… · Esc stops the turn"
             );
-            assert!(view.state.transcript.is_empty());
+            // Thinking now paints a header-only marker row — never the
+            // private reasoning text, which the final assertion of this test
+            // still guards against below.
+            assert!(matches!(
+                view.state.transcript.as_slice(),
+                [TranscriptEntry::Thinking]
+            ));
             view.apply_worker_message(
                 WorkerMessage::Event(ServerEvent::AssistantDelta {
                     session_id: None,
@@ -1107,6 +2170,195 @@ fn thinking_feedback_stops_on_text_and_turn_boundaries(cx: &mut TestAppContext) 
             assert!(!view.state.thinking);
             assert!(!format!("{:?}", view.state.transcript).contains("private reasoning"));
         });
+    });
+}
+
+#[gpui::test]
+fn thinking_row_paints_a_generic_header_and_never_leaks_private_reasoning(cx: &mut TestAppContext) {
+    // Privacy guard for the thinking chrome. Zeta's provider protocol has no
+    // display-safe summary channel — `ContentBlock::Thinking` carries raw
+    // reasoning (codex.py Thinking assembly, Anthropic raw thinking) — so
+    // the GUI must never render its text. A streamed thinking delta AND a
+    // finalized Thinking block both drop their payloads on the way in; the
+    // transcript keeps only a header-only marker. This test feeds a sentinel
+    // through both paths and asserts the sentinel never surfaces in state or
+    // in painted text, and that the generic "+ Thought" header renders.
+    use zeta_gui::client::{ContentBlock, Message};
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let sentinel = "SECRET-PRIVATE-REASONING-NEVER-DISPLAY";
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::TurnStart {
+                    session_id: None,
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantDelta {
+                    session_id: None,
+                    delta: sentinel.into(),
+                    kind: "thinking".into(),
+                }),
+                window,
+                cx,
+            );
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantMessage {
+                    session_id: None,
+                    message: Message {
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::Thinking {
+                            text: sentinel.into(),
+                        }],
+                    },
+                }),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    // State: the transcript holds only a header-only marker; the sentinel
+    // reached no field on the way in.
+    view.read_with(&visual, |view, _| {
+        assert!(
+            matches!(
+                view.state.transcript.as_slice(),
+                [TranscriptEntry::Thinking]
+            ),
+            "transcript must hold a single header-only Thinking marker, got {:?}",
+            view.state.transcript
+        );
+        // Visible-text seam: every visible string the render layer paints for
+        // any row goes through `visible_text`. The Thinking row's only
+        // contribution is the generic label — no row's visible text may
+        // contain the sentinel.
+        for entry in &view.state.transcript {
+            for text in entry.visible_text() {
+                assert!(
+                    !text.contains(sentinel),
+                    "sentinel reached a row's visible text: {text:?}"
+                );
+            }
+        }
+        let thinking_text = view.state.transcript[0].visible_text();
+        assert_eq!(
+            thinking_text,
+            vec![zeta_gui::state::THINKING_HEADER_LABEL.to_owned()],
+            "Thinking row visible text must be exactly the generic label"
+        );
+    });
+    // Paint: the generic header renders.
+    let header_bounds = visual
+        .debug_bounds("thinking-header-0")
+        .expect("generic thinking header renders");
+    assert!(
+        header_bounds.size.width > px(0.),
+        "header bounds must have non-zero width so glyphs paint"
+    );
+    // render_log: `render_thinking_row` records the exact color it applied
+    // through `state_text(...)`. The thinking header sits at
+    // `muted_foreground`; a regression that repaints it at accent or danger
+    // fails here.
+    visual.update(|_, cx| {
+        let expected = cx.theme().muted_foreground;
+        let samples = super::render_log::samples();
+        let thinking_samples: Vec<_> = samples
+            .iter()
+            .filter(|sample| sample.row_id.starts_with("thinking-header-"))
+            .collect();
+        assert!(
+            !thinking_samples.is_empty(),
+            "render_thinking_row must record a render_log sample"
+        );
+        for sample in &thinking_samples {
+            assert_eq!(
+                sample.color, expected,
+                "thinking header painted off the muted-foreground token"
+            );
+        }
+    });
+    // Row-level fields the previous chrome would have exposed (title,
+    // duration, body) must not paint under any selector.
+    for stale in ["thinking-title-0", "thinking-duration-0", "thinking-body-0"] {
+        assert!(
+            visual.debug_bounds(stale).is_none(),
+            "removed thinking chrome resurfaced under selector {stale}"
+        );
+    }
+}
+
+#[gpui::test]
+fn disabled_send_button_paints_transparent_fill_and_semantic_outline(cx: &mut TestAppContext) {
+    // Guard for contract line 85. Kit's Custom variant derives its border
+    // color FROM the fill color, so a naive `.color(transparent)` on the
+    // variant kills the outline too. The disabled state paints its outline
+    // through a plain div instead: transparent fill AND an explicit semantic
+    // border color, with the whole presentation dimmed to 0.55 opacity.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Force disable by clearing the active session so `can_send` flips false
+    // — the composer keeps rendering, the send button falls into the
+    // disabled branch.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.active_session = None;
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let send = visual
+        .debug_bounds("send-button")
+        .expect("send button paints when disabled");
+    let outline_token = theme::palette::border_active();
+    visual.update(|window, _| {
+        let scaled = send.scale(window.scale_factor());
+        let button_quads: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.bounds.top() >= scaled.top() - gpui::ScaledPixels::from(0.5)
+                    && quad.bounds.bottom() <= scaled.bottom() + gpui::ScaledPixels::from(0.5)
+                    && quad.bounds.left() >= scaled.left() - gpui::ScaledPixels::from(0.5)
+                    && quad.bounds.right() <= scaled.right() + gpui::ScaledPixels::from(0.5)
+            })
+            .collect();
+        // Locate the outline quad by border color — asserting on the ACTUAL
+        // painted border color, not on a theme constant we chose ourselves.
+        let outline = button_quads
+            .iter()
+            .find(|quad| {
+                let color = quad.border_color;
+                color.h == outline_token.h
+                    && color.s == outline_token.s
+                    && color.l == outline_token.l
+                    && quad.border_widths.top > gpui::ScaledPixels::default()
+            })
+            .expect("disabled send button paints a semantic outline");
+        // Complete presentation at 0.55 opacity: element opacity multiplies
+        // into every painted color's alpha, so the outline alpha lands near
+        // outline_token.a * 0.55.
+        let expected_alpha = outline_token.a * 0.55;
+        assert!(
+            (outline.border_color.a - expected_alpha).abs() < 0.02,
+            "outline alpha {} must land near 0.55 * token ({expected_alpha})",
+            outline.border_color.a
+        );
+        // No fill quad — background is transparent. The outline quad itself
+        // may carry `background = transparent`; a REGRESSION would paint a
+        // separate quad with a non-transparent background inside the button
+        // bounds. Assert no such quad has visible alpha.
+        for quad in &button_quads {
+            let bg_alpha = quad.background.as_solid().map_or(0.0, |color| color.a);
+            assert!(
+                bg_alpha < 0.02,
+                "disabled send button must not paint a fill (got alpha {bg_alpha})"
+            );
+        }
     });
 }
 

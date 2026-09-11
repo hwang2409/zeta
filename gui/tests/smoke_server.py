@@ -7,7 +7,7 @@ from pathlib import Path
 
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.server import ZetaServer
-from zeta.types import TextContent, ToolCall
+from zeta.types import TextContent, ThinkingContent
 
 
 async def main():
@@ -18,11 +18,14 @@ async def main():
     home = Path(os.environ["ZETA_HOME"])
     turns = [
         ScriptedTurn(
-            content=[TextContent("I will inspect the project before changing it.")],
-            tool_calls=[ToolCall("demo-read", "bash", {"command": "pwd"})],
-        ),
-        ScriptedTurn(
             content=[
+                # Thinking seeds the header-only "+ Thought" marker; the text
+                # block seeds the assistant preamble. The GUI never renders
+                # the reasoning text — the marker row is enough for the
+                # screenshot. The trailing delay holds streaming open long
+                # enough for the capture loop to snap a frame while the
+                # composer's Send button is in its disabled-outline state.
+                ThinkingContent("consider the project layout"),
                 TextContent(
                     "## Core chat loop\n\n"
                     "The native interface includes:\n\n"
@@ -30,8 +33,9 @@ async def main():
                     "- Streaming markdown and tool receipts\n"
                     "- A multiline composer with keyboard controls\n\n"
                     '```rust\nfn main() {\n    println!("Hello from zeta");\n}\n```'
-                )
+                ),
             ],
+            delay=2.0,
             usage={"input_tokens": 128, "output_tokens": 96},
         ),
     ]

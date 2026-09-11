@@ -8,12 +8,12 @@ mod smoke;
 mod theme;
 
 use gpui::{
-    div, prelude::*, px, App, Bounds, Context, Entity, Focusable, KeyDownEvent, Render, Task,
-    Window, WindowBounds, WindowOptions,
+    div, ease_in_out, prelude::*, px, Animation, AnimationExt, App, Bounds, Context, Entity,
+    Focusable, KeyDownEvent, Render, Task, Window, WindowBounds, WindowOptions,
 };
 use gpui_kit::component::{
     alert::Alert,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonCustomVariant, ButtonVariants},
     dialog::DialogButtonProps,
     input::{InputEvent, Textarea, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
@@ -32,7 +32,7 @@ use zeta_gui::{
     client::Approval,
     login::{LoginProgress, LoginProvider},
     session::{ImageAttachment, SessionSettings, APPROVAL_MODES},
-    state::{AppState, ConnectionState, TranscriptEntry},
+    state::{AppState, ConnectionState, TranscriptEdit, TranscriptEntry},
     worker::{CommandMessage, ConnectionWorker, WorkerMessage},
 };
 
@@ -44,6 +44,54 @@ impl Render for DialogLayer {
     }
 }
 
+/// Local queued state for a user turn that has been submitted but not yet
+/// echoed by the server. Rendered as a dashed strip between the transcript
+/// and the composer so users see the message is on its way, and the strip
+/// promotes to a solid user turn on `Sent` or flips its rail to danger on
+/// `Rejected`.
+#[derive(Debug, Clone, PartialEq)]
+struct PendingUserTurn {
+    text: String,
+    failed: bool,
+}
+
+/// Ordered virtual-list operations that mirror the ordered edit list from
+/// `AppState::apply`. Extracted as a pure function so a mutation that
+/// collapses the compound-edit case to a tail splice (or drops all but one
+/// edit) is caught by a unit test — the visual sync path only observes the
+/// bug when off-viewport rows drift or the item count desyncs, which is
+/// impractical to reproduce here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScrollSync {
+    Reset(usize),
+    Splice(std::ops::Range<usize>, usize),
+    Remeasure(usize),
+}
+
+fn scroll_sync(new_count: usize, edits: &[TranscriptEdit], replace: bool) -> Vec<ScrollSync> {
+    // A session switch or history swap replaces the transcript wholesale.
+    // The edit list from any concurrent apply cannot describe the new state,
+    // so reset is authoritative — the view drops its cache and rebuilds from
+    // the new item count.
+    if replace {
+        return vec![ScrollSync::Reset(new_count)];
+    }
+    // One-to-one translation of the ordered edits — each edit describes an
+    // operation against the transcript state the view currently holds, so
+    // applying them in the same order keeps the virtual-list metadata cache
+    // aligned to the transcript row-for-row, whether the reconcile is a
+    // single append, a middle removal, or a compound append + remove +
+    // remeasure.
+    edits
+        .iter()
+        .map(|edit| match *edit {
+            TranscriptEdit::Insert(index) => ScrollSync::Splice(index..index, 1),
+            TranscriptEdit::Remove(index) => ScrollSync::Splice(index..index + 1, 0),
+            TranscriptEdit::Remeasure(index) => ScrollSync::Remeasure(index),
+        })
+        .collect()
+}
+
 struct ZetaView {
     state: AppState,
     dialogs: Entity<DialogLayer>,
@@ -52,6 +100,7 @@ struct ZetaView {
     sidebar_scroll: gpui_kit::component::VirtualListScrollHandle,
     model_scroll: gpui::ScrollHandle,
     pending_command: bool,
+    pending_user_turn: Option<PendingUserTurn>,
     command_error: Option<String>,
     dialog_request: Option<String>,
     approval_pending: bool,
@@ -103,6 +152,7 @@ impl ZetaView {
             sidebar_scroll: gpui_kit::component::VirtualListScrollHandle::new(),
             model_scroll: gpui::ScrollHandle::new(),
             pending_command: false,
+            pending_user_turn: None,
             command_error: None,
             dialog_request: None,
             approval_pending: false,
@@ -168,8 +218,7 @@ impl ZetaView {
                 | WorkerMessage::Lost(_)
         );
         let previous_session = self.state.active_session.clone();
-        let previous_count = self.state.transcript.len();
-        let mut changed_row = None;
+        let mut edits: Vec<TranscriptEdit> = Vec::new();
         let mut replace = false;
         match message {
             WorkerMessage::LoginProviders(providers) => self.login_providers = providers,
@@ -224,9 +273,14 @@ impl ZetaView {
             }
             WorkerMessage::ImagesSent(text, images) => {
                 self.pending_command = false;
+                // Both Sent and ImagesSent land the real user turn in the
+                // transcript; the queued strip must clear here too or an
+                // image-only send leaves a phantom dashed row beside it.
+                self.pending_user_turn = None;
                 self.state.streaming = true;
                 let index = self.state.transcript.len();
                 self.state.transcript.push(TranscriptEntry::User(text));
+                edits.push(TranscriptEdit::Insert(index));
                 self.state.session_view.attachments.insert(
                     index,
                     images
@@ -251,8 +305,11 @@ impl ZetaView {
             }
             WorkerMessage::Sent(text) => {
                 self.pending_command = false;
+                self.pending_user_turn = None;
                 self.state.streaming = true;
+                let index = self.state.transcript.len();
                 self.state.transcript.push(TranscriptEntry::User(text));
+                edits.push(TranscriptEdit::Insert(index));
                 self.composer
                     .update(cx, |input, cx| input.set_value("", window, cx));
             }
@@ -312,6 +369,9 @@ impl ZetaView {
             WorkerMessage::Rejected(error) => {
                 self.pending_command = false;
                 self.approval_pending = false;
+                if let Some(pending) = &mut self.pending_user_turn {
+                    pending.failed = true;
+                }
                 if self.settings_open {
                     self.settings_error = Some(error);
                 } else {
@@ -319,13 +379,16 @@ impl ZetaView {
                 }
             }
             WorkerMessage::Connected => self.state.connection = ConnectionState::Connected,
-            WorkerMessage::Event(event) => changed_row = self.state.apply(event),
+            WorkerMessage::Event(event) => edits = self.state.apply(event),
             WorkerMessage::Lost(error) => {
                 if self.session_edit.is_some() {
                     self.command_error = Some(error.clone());
                 }
                 self.pending_command = false;
                 self.approval_pending = false;
+                if let Some(pending) = &mut self.pending_user_turn {
+                    pending.failed = true;
+                }
                 for row in &mut self.login_providers {
                     if row.progress.busy() {
                         row.progress = LoginProgress::failed(
@@ -353,18 +416,15 @@ impl ZetaView {
         }
         let count = self.state.transcript.len();
         self.transcript.update(cx, |scroll, cx| {
-            if replace {
-                scroll.reset(count, cx);
-            } else {
-                if count != previous_count {
-                    scroll.splice(
-                        previous_count.min(count)..previous_count,
-                        count.saturating_sub(previous_count),
-                        cx,
-                    );
-                }
-                if let Some(index) = changed_row {
-                    scroll.remeasure_items(index..index + 1, cx);
+            for op in scroll_sync(count, &edits, replace) {
+                match op {
+                    ScrollSync::Reset(new_count) => scroll.reset(new_count, cx),
+                    ScrollSync::Splice(range, insert) => {
+                        scroll.splice(range, insert, cx);
+                    }
+                    ScrollSync::Remeasure(index) => {
+                        scroll.remeasure_items(index..index + 1, cx);
+                    }
                 }
             }
         });
@@ -420,6 +480,13 @@ impl ZetaView {
         }
         self.composer_empty_hint = false;
         self.pending_command = true;
+        // Record the queued text so a dashed strip renders under the composer
+        // while the server has not yet echoed the turn. `WorkerMessage::Sent`
+        // clears it; `Rejected` flips `failed` for the danger rail.
+        self.pending_user_turn = Some(PendingUserTurn {
+            text: text.clone(),
+            failed: false,
+        });
         if has_images {
             self.queue(CommandMessage::SendImages(
                 text,
@@ -1072,235 +1139,931 @@ impl ZetaView {
     }
 
     fn render_row(&self, index: usize, view: gpui::WeakEntity<Self>, cx: &App) -> gpui::AnyElement {
-        let row = div()
+        let is_first = index == 0;
+        let is_last = index + 1 == self.state.transcript.len();
+        let this_is_tool = matches!(self.state.transcript[index], TranscriptEntry::Tool { .. });
+        let next_is_tool = self
+            .state
+            .transcript
+            .get(index + 1)
+            .is_some_and(|entry| matches!(entry, TranscriptEntry::Tool { .. }));
+        // Adjacent tool rows collapse the row gap so a run of receipts reads
+        // as one column — matches the wiki agent-run rhythm exactly. The last
+        // row also carries no gap so column bottom padding lands cleanly.
+        let row_gap = if is_last || (this_is_tool && next_is_tool) {
+            px(0.)
+        } else {
+            theme::TRANSCRIPT_ROW_GAP
+        };
+
+        let inner = self.render_row_inner(index, view, cx);
+        div()
             .debug_selector(|| "transcript-row".into())
             .w_full()
             .min_w_0()
-            .px_6()
-            .py_3();
-        match &self.state.transcript[index] {
-            TranscriptEntry::User(text) => {
-                let fork_id = self
-                    .state
-                    .session_view
-                    .available
-                    .then(|| self.state.session_view.message_ids.get(&index).cloned())
-                    .flatten();
-                let group = format!("user-row-{index}");
-                row.group(group.clone())
+            .flex()
+            .flex_col()
+            .items_center()
+            // Column top/bottom padding lives on the first/last row so it
+            // travels with the virtual scroller — a wrapper around the
+            // scroller would leave the padding fixed while rows scroll under.
+            .when(is_first, |row| row.pt_4())
+            .when(is_last, |row| row.pb_3())
+            .pb(row_gap)
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_w(theme::TRANSCRIPT_MAX_WIDTH)
+                    .px_4()
+                    .child(inner),
+            )
+            .into_any_element()
+    }
+
+    // Every render function reachable from `render_row_inner` MUST paint
+    // only through:
+    //   - `visible` — the ordered dynamic strings from `TranscriptEntry::visible_text`
+    //   - `chrome::*` — the fixed literals module (Fork here, Open Settings, hints, units)
+    //   - `state_text(row, color)` / `record_state(row, color)` — the state-color recorder
+    //
+    // The seam is documentary: the shipping guard is the
+    // `every_row_text_flows_through_the_visible_seam_or_chrome_module`
+    // check, which scans a KNOWN FIXTURE set of `TranscriptEntry` values
+    // (User, Assistant, Thinking, Error — Tool is not fixtured in this
+    // test) plus the `chrome::ALL` literal set for the four bracketed
+    // state markers `[working]/[done]/[failed]/[canceled]`. It does NOT
+    // walk this file for new inline literals and does NOT exhaustively
+    // iterate every `TranscriptEntry` variant — an exhaustive typed
+    // row-text model with a matching renderer-literal fence is captured
+    // as the ZETA-107 follow-up in docs/design.md.
+    fn render_row_inner(
+        &self,
+        index: usize,
+        view: gpui::WeakEntity<Self>,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let entry = &self.state.transcript[index];
+        // Single seam: every renderer receives the ordered visible strings for
+        // this entry (`TranscriptEntry::visible_text`). No renderer reads its
+        // dynamic text off the entry's raw fields — that guarantees a
+        // sentinel-carrying payload cannot bypass the seam through one path.
+        let visible = entry.visible_text();
+        match entry {
+            TranscriptEntry::User(_) => self.render_user_row(index, &visible, view, cx),
+            TranscriptEntry::Assistant(doc) => {
+                self.render_assistant_row(index, &visible, doc.preview_truncated, cx)
+            }
+            TranscriptEntry::Tool { .. } => self.render_tool_row(index, &visible, entry, view, cx),
+            TranscriptEntry::Thinking => self.render_thinking_row(index, &visible, cx),
+            TranscriptEntry::Error {
+                settings_action,
+                login_provider,
+                ..
+            } => self.render_error_row(
+                index,
+                &visible,
+                *settings_action,
+                login_provider.as_deref(),
+                view,
+                cx,
+            ),
+        }
+    }
+
+    fn render_thinking_row(&self, index: usize, visible: &[&str], cx: &App) -> gpui::AnyElement {
+        // Header-only marker at muted-foreground. The label text comes from
+        // the row's `visible_text` seam so no wording lives on both sides —
+        // any regression that changes the string flows through both the
+        // render layer and the tests that assert on it.
+        let label = visible.first().copied().unwrap_or_default().to_owned();
+        let color = cx.theme().muted_foreground;
+        // state_text records (row_id, color) into the render_log at the
+        // exact moment the color is applied — a mutation that swaps the
+        // color argument at this call site is caught by the sample check.
+        state_text(|| format!("thinking-header-{index}"), color)
+            .debug_selector(move || format!("thinking-header-{index}"))
+            .w_full()
+            .min_w_0()
+            .py(px(2.))
+            .child(label)
+            .into_any_element()
+    }
+
+    fn render_user_row(
+        &self,
+        index: usize,
+        visible: &[&str],
+        view: gpui::WeakEntity<Self>,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        // The user row's only dynamic body text is the prompt itself — the
+        // first (and only) string in `visible_text`.
+        let text = visible.first().copied().unwrap_or_default().to_owned();
+        let fork_id = self
+            .state
+            .session_view
+            .available
+            .then(|| self.state.session_view.message_ids.get(&index).cloned())
+            .flatten();
+        let group = format!("user-row-{index}");
+        div()
+            .group(group.clone())
+            .v_flex()
+            .child(
+                // Rectangle + hover-reveal fork button live in the SAME layout
+                // cell (relative parent, absolute button). The invisible button
+                // no longer reserves a phantom row that breaks the 14px rhythm.
+                div()
+                    .relative()
+                    .w_full()
+                    .min_w_0()
                     .child(
                         div()
-                            .h_flex()
-                            .items_center()
-                            .justify_between()
-                            .mb_2()
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("you"),
-                            )
-                            .when_some(fork_id, |header, id| {
-                                let click_id = id.clone();
-                                let click_view = view.clone();
-                                header.child(
+                            .w_full()
+                            .min_w_0()
+                            .py_2()
+                            .px_3()
+                            .bg(cx.theme().muted)
+                            .border_l(theme::RAIL_WIDTH_THICK)
+                            .border_color(cx.theme().primary)
+                            .whitespace_normal()
+                            .child(text),
+                    )
+                    .when_some(fork_id, |row, id| {
+                        let click_id = id.clone();
+                        let click_view = view.clone();
+                        row.child(
+                            div()
+                                .absolute()
+                                .top_1()
+                                .right_1()
+                                .opacity(0.)
+                                .group_hover(group.clone(), |style| style.opacity(1.))
+                                .child(
                                     Button::new(("fork", index))
                                         .debug_selector(move || format!("fork-button-{index}"))
                                         .ghost()
-                                        .label("Fork here")
-                                        // Hover-reveal keeps the affordance out of
-                                        // the row's default reading order.
-                                        .opacity(0.)
-                                        .group_hover(group.clone(), |style| style.opacity(1.))
+                                        .compact()
+                                        .label(chrome::FORK_HERE)
                                         .on_click(move |_, _, cx| {
                                             let id = click_id.clone();
                                             let _ = click_view
                                                 .update(cx, |view, cx| view.fork_message(id, cx));
                                         }),
-                                )
-                            }),
+                                ),
+                        )
+                    }),
+            )
+            .children(
+                self.state
+                    .session_view
+                    .attachments
+                    .get(&index)
+                    .map(|attachments| {
+                        div().mt_1().h_flex().flex_wrap().gap_2().children(
+                            attachments.iter().enumerate().map(
+                                |(attachment_index, (name, size))| {
+                                    div()
+                                        .debug_selector(|| "attachment-chip".into())
+                                        .px_2()
+                                        .py_1()
+                                        .text_size(px(12.))
+                                        .bg(cx.theme().muted)
+                                        .h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .when_some(
+                                            self.sent_images
+                                                .get(&(index, attachment_index))
+                                                .cloned(),
+                                            |chip, image| chip.child(polish::thumbnail(image, cx)),
+                                        )
+                                        .child(format!(
+                                            "{name}{}{size}{}",
+                                            chrome::ATTACHMENT_SIZE_SEPARATOR,
+                                            chrome::ATTACHMENT_SIZE_SUFFIX
+                                        ))
+                                },
+                            ),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_assistant_row(
+        &self,
+        index: usize,
+        visible: &[&str],
+        preview_truncated: bool,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        // Naked assistant turn: 2px vertical breath, no bg, no border, no rail.
+        // Hierarchy is carried by weight + color tier + rails on OTHER row types,
+        // not by framing the assistant. Prose sits at 1.65 line-height for the
+        // wiki reading rhythm; code fences carry 12x16 padding, a 1px border,
+        // and soft-wrap so long lines never introduce a horizontal scroll.
+        let code_block = gpui::StyleRefinement::default()
+            .py(px(12.))
+            .px(px(16.))
+            .border_1()
+            .border_color(cx.theme().border)
+            .whitespace_normal();
+        let text_style = gpui_kit::component::text::TextViewStyle {
+            code_block,
+            ..Default::default()
+        };
+        // The assistant row's only dynamic body text is the rendered markdown
+        // source — the first (and only) string in `visible_text`.
+        let source = visible.first().copied().unwrap_or_default().to_owned();
+        div()
+            .py(px(2.))
+            .w_full()
+            .min_w_0()
+            .line_height(gpui::rems(1.65))
+            .when(preview_truncated, |row| {
+                row.child(chrome::ASSISTANT_TRUNCATED)
+            })
+            .child(
+                TextView::markdown(format!("message-{index}"), source)
+                    .selectable(true)
+                    .style(text_style),
+            )
+            .into_any_element()
+    }
+
+    fn render_tool_row(
+        &self,
+        index: usize,
+        visible: &[&str],
+        entry: &TranscriptEntry,
+        view: gpui::WeakEntity<Self>,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let TranscriptEntry::Tool { card, .. } = entry else {
+            unreachable!("render_tool_row invoked on non-Tool entry");
+        };
+        let is_error = entry.unsuccessful();
+        // State is signalled by COLOR ONLY. Running sits at normal text tier;
+        // done fades to muted; failed/canceled land on danger. Contract line 83
+        // forbids any textual "[working]/[done]/[failed]" marker — the color
+        // helper hands us the token, and the render below applies it through
+        // `state_text` / `record_state` on the verb, detail, and chevron
+        // elements. A mutation that swaps the color argument at any call
+        // site records the wrong color and fails the sample check.
+        let state_color = tool_state_color(entry.tool_state(), cx);
+        // Verb and detail come from the visible-text seam — index 0 is the
+        // tool name, index 1 is the summary. Any body text (expanded output)
+        // sits at index 2+ and is painted below when the card is expanded.
+        let verb = visible.first().copied().unwrap_or_default().to_owned();
+        let detail = visible.get(1).copied().unwrap_or_default().to_owned();
+        let group = format!("tool-row-{index}");
+        let output_size = card.tail.text.len();
+
+        div()
+            .group(group.clone())
+            .id(("tool-receipt", index))
+            .debug_selector(move || format!("tool-receipt-{index}"))
+            .relative()
+            .w_full()
+            .min_w_0()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().list_hover))
+            .on_click(move |_, _, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    view.state.toggle_card(index);
+                    view.transcript.update(cx, |scroll, cx| {
+                        scroll.remeasure_items(index..index + 1, cx);
+                    });
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .items_center()
+                    .min_h(px(20.))
+                    .child(
+                        Icon::new(if card.expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(px(12.))
+                        .text_color(record_state(
+                            || format!("tool-chevron-{index}"),
+                            state_color,
+                        )),
                     )
                     .child(
-                        div()
-                            .pl_3()
-                            .border_l_2()
-                            .border_color(cx.theme().primary)
-                            .child(text.clone()),
+                        // Verb + detail route their state color through the
+                        // recorder so a swap on this single call is caught
+                        // by the render_log sample check.
+                        state_text(|| format!("tool-verb-{index}"), state_color)
+                            .debug_selector(move || format!("tool-verb-{index}"))
+                            .flex_shrink_0()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(verb),
                     )
-                    .children(
-                        self.state
-                            .session_view
-                            .attachments
-                            .get(&index)
-                            .map(|attachments| {
-                                div().h_flex().flex_wrap().gap_2().mt_2().children(
-                                    attachments.iter().enumerate().map(
-                                        |(attachment_index, (name, size))| {
-                                            div()
-                                                .debug_selector(|| "attachment-chip".into())
-                                                .px_2()
-                                                .py_1()
-                                                .text_size(px(12.))
-                                                .bg(cx.theme().muted)
-                                                .h_flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .when_some(
-                                                    self.sent_images
-                                                        .get(&(index, attachment_index))
-                                                        .cloned(),
-                                                    |chip, image| {
-                                                        chip.child(polish::thumbnail(image, cx))
-                                                    },
-                                                )
-                                                .child(format!("{name} · {size} bytes"))
-                                        },
-                                    ),
-                                )
-                            }),
+                    .child(
+                        state_text(|| format!("tool-detail-{index}"), state_color)
+                            .debug_selector(move || format!("tool-detail-{index}"))
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .opacity(0.78)
+                            .child(detail),
                     )
-                    .into_any_element()
-            }
-            TranscriptEntry::Assistant(doc) => row
-                .child(
+                    // Collapsed rows carry the output size at faint tier and a
+                    // hover-fade "show output" hint — the visible affordance for
+                    // the click-to-expand behaviour.
+                    .when(!card.expanded && output_size > 0, |row| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(cx.theme().muted_foreground)
+                                .opacity(0.78)
+                                .text_size(px(12.))
+                                .child(format_output_size(output_size)),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(cx.theme().muted_foreground)
+                                .opacity(0.)
+                                .group_hover(group.clone(), |style| style.opacity(0.78))
+                                .text_size(px(12.))
+                                .child(chrome::TOOL_HOVER_HINT),
+                        )
+                    }),
+            )
+            .when(card.expanded, |row| {
+                // Expanded body text comes from the seam (index 2). The
+                // "Earlier output omitted" marker is fixed chrome, not part
+                // of the dynamic strings — the renderer pulls it from the
+                // chrome-constants module when the tail was truncated.
+                let body = visible.get(2).copied().unwrap_or_default().to_owned();
+                let truncated = card.tail.truncated;
+                row.child(
                     div()
-                        .mb_2()
-                        .text_size(px(12.))
-                        .text_color(cx.theme().muted_foreground)
-                        .child("zeta"),
-                )
-                .when(doc.preview_truncated, |row| {
-                    row.child("Showing the latest streamed text…")
-                })
-                .child(
-                    TextView::markdown(format!("message-{index}"), doc.source.to_string())
-                        .selectable(true),
-                )
-                .into_any_element(),
-            entry @ TranscriptEntry::Tool {
-                name,
-                summary,
-                card,
-                ..
-            } => row
-                .id(("tool-receipt", index))
-                .debug_selector(move || format!("tool-receipt-{index}"))
-                .py_1()
-                .cursor_pointer()
-                .hover(|style| style.bg(cx.theme().muted))
-                .on_click(move |_, _, cx| {
-                    let _ = view.update(cx, |view, cx| {
-                        view.state.toggle_card(index);
-                        view.transcript.update(cx, |scroll, cx| {
-                            scroll.remeasure_items(index..index + 1, cx);
-                        });
-                        cx.notify();
-                    });
-                })
-                .child(
-                    div()
-                        .h_flex()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .min_h(px(40.))
-                        .bg(cx.theme().muted)
-                        .text_size(px(12.))
-                        .text_color(if entry.unsuccessful() {
+                        .debug_selector(move || format!("tool-output-{index}"))
+                        // Indent rail: margin 3/0/5, padding-left 8, 1px rail,
+                        // panel fill — reads as a subordinate body without
+                        // fighting the row's leading verb. Vertical padding sits
+                        // at 2px per the wiki contract, not the 4px `.py_1()`.
+                        .mt(px(3.))
+                        .mb(px(5.))
+                        .pl_2()
+                        .py(px(2.))
+                        .border_l(theme::RAIL_WIDTH_THIN)
+                        .border_color(if is_error {
                             cx.theme().danger
                         } else {
-                            cx.theme().muted_foreground
+                            cx.theme().border
                         })
-                        .child(
-                            Icon::new(if card.expanded {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .size(px(12.)),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .child(format!("{} {name}  {summary}", entry.tool_marker())),
-                        ),
+                        .bg(cx.theme().sidebar)
+                        .text_color(cx.theme().muted_foreground)
+                        .when(truncated, |output| {
+                            output.child(div().opacity(0.7).child(chrome::TOOL_TAIL_OMITTED))
+                        })
+                        .child(div().whitespace_normal().child(body)),
                 )
-                .when(card.expanded, |row| {
-                    row.child(
-                        div()
-                            .debug_selector(move || format!("tool-output-{index}"))
-                            .ml_3()
-                            .pl_3()
-                            .py_2()
-                            .border_l_2()
-                            .border_color(cx.theme().border)
-                            .text_size(px(12.))
-                            .text_color(cx.theme().muted_foreground)
-                            .when(card.tail.truncated, |output| {
-                                output.child(div().child("Earlier output omitted"))
-                            })
-                            .child(div().whitespace_normal().child(card.tail.text.clone())),
-                    )
-                })
-                .into_any_element(),
-            TranscriptEntry::Error {
-                message,
-                settings_action,
-                login_provider,
-            } => row
-                .child(
-                    div()
-                        .debug_selector(move || format!("error-block-{index}"))
-                        .v_flex()
-                        .gap_2()
-                        .pl_3()
-                        .border_l_2()
-                        .border_color(cx.theme().danger)
-                        .child(div().text_color(cx.theme().danger).child("Error"))
-                        .child(
-                            div()
-                                .debug_selector(move || format!("error-message-{index}"))
-                                .whitespace_normal()
-                                .child(message.clone()),
-                        )
-                        .when_some(
-                            login_provider.as_ref().and_then(|provider| {
-                                self.login_providers
-                                    .iter()
-                                    .find(|row| &row.provider == provider)
+            })
+            .into_any_element()
+    }
+
+    fn render_error_row(
+        &self,
+        index: usize,
+        visible: &[&str],
+        settings_action: bool,
+        login_provider: Option<&str>,
+        view: gpui::WeakEntity<Self>,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        // Error rows expose two visible strings: the "Error" header at index
+        // 0 and the message body at index 1. Both flow through the seam.
+        let header = visible.first().copied().unwrap_or_default().to_owned();
+        let message = visible.get(1).copied().unwrap_or_default().to_owned();
+        div()
+            .debug_selector(move || format!("error-block-{index}"))
+            .v_flex()
+            .gap_2()
+            .pl_3()
+            .py_1()
+            .border_l(theme::RAIL_WIDTH_THICK)
+            .border_color(cx.theme().danger)
+            .child(
+                div()
+                    .text_color(cx.theme().danger)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(header),
+            )
+            .child(
+                div()
+                    .debug_selector(move || format!("error-message-{index}"))
+                    .whitespace_normal()
+                    .child(message),
+            )
+            .when_some(
+                login_provider.and_then(|provider| {
+                    self.login_providers
+                        .iter()
+                        .find(|row| row.provider == provider)
+                }),
+                |block, provider| {
+                    block.child(self.render_login_row(
+                        provider,
+                        &format!("error-login-{index}"),
+                        view.clone(),
+                        cx,
+                    ))
+                },
+            )
+            .when(
+                settings_action && self.state.session_view.available,
+                |block| {
+                    block.child(
+                        Button::new(("error-settings", index))
+                            .debug_selector(move || format!("error-settings-{index}"))
+                            .label(chrome::OPEN_SETTINGS)
+                            .on_click(move |_, _, cx| {
+                                let _ = view.update(cx, |view, cx| view.open_settings(cx));
                             }),
-                            |block, provider| {
-                                block.child(self.render_login_row(
-                                    provider,
-                                    &format!("error-login-{index}"),
-                                    view.clone(),
-                                    cx,
-                                ))
-                            },
-                        )
-                        .when(
-                            *settings_action && self.state.session_view.available,
-                            |block| {
-                                block.child(
-                                    Button::new(("error-settings", index))
-                                        .debug_selector(move || format!("error-settings-{index}"))
-                                        .label("Open Settings")
-                                        .on_click(move |_, _, cx| {
-                                            let _ =
-                                                view.update(cx, |view, cx| view.open_settings(cx));
-                                        }),
-                                )
-                            },
-                        ),
-                )
-                .into_any_element(),
-        }
+                    )
+                },
+            )
+            .into_any_element()
     }
 }
 
+impl ZetaView {
+    fn footer_mode_word(&self) -> &'static str {
+        match &self.state.connection {
+            ConnectionState::Lost(_) => "offline",
+            ConnectionState::Reconnecting => "connecting",
+            _ if !self.state.approvals.is_empty() => "approve",
+            _ if self.state.thinking => "thinking",
+            _ if self.state.streaming => "streaming",
+            _ if self.state.active_session.is_none() => "idle",
+            _ => "ready",
+        }
+    }
+
+    fn footer_mode_color(cx: &App) -> gpui::Hsla {
+        // The mode word always paints in the accent tier — the one load-bearing
+        // color on this strip. Off-nominal states signal through the mode WORD
+        // ("offline"/"connecting"/"approve") plus the streaming dot's presence,
+        // never by recoloring the label — that would leak the alarm elsewhere.
+        cx.theme().primary
+    }
+
+    fn render_pending_user_turn(&self, cx: &App) -> Option<gpui::AnyElement> {
+        // Queued strip: user turn dashed while awaiting the server's echo;
+        // flips to danger rail on `Rejected`/`Lost` so the user sees the send
+        // failed without a modal or toast. Clears the moment `Sent` arrives —
+        // that same instant the real user turn appears in the transcript.
+        let pending = self.pending_user_turn.as_ref()?;
+        let (rail_color, opacity) = if pending.failed {
+            (cx.theme().danger, 0.85)
+        } else {
+            (cx.theme().primary, 0.6)
+        };
+        Some(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .px_4()
+                .pb_2()
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .max_w(theme::TRANSCRIPT_MAX_WIDTH)
+                        .debug_selector(|| "composer-pending".into())
+                        .py_2()
+                        .px_3()
+                        .bg(cx.theme().muted)
+                        // Contract line 85 pins the queued strip to a 1px dashed
+                        // rail. A thick rail here would read as an active user
+                        // turn, not a waiting-for-echo signal.
+                        .border_l(theme::RAIL_WIDTH_THIN)
+                        .border_dashed()
+                        .border_color(rail_color)
+                        .opacity(opacity)
+                        .whitespace_normal()
+                        .child(pending.text.clone()),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_composer(
+        &self,
+        can_send: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let focused = self.composer.focus_handle(cx).is_focused(window);
+        // Composer paints its state from the semantic tokens, not from raw
+        // palette values — a future theme rethink moves the tokens in one place
+        // and every state stays coherent.
+        let roles = theme::composer_roles(cx);
+        let rail_color = if focused {
+            roles.rail_focus
+        } else {
+            roles.rail_rest
+        };
+        let fill_color = if focused {
+            roles.fill_focus
+        } else {
+            roles.fill_rest
+        };
+        // Enabled send: inverted — text color on canvas, hover fades to muted.
+        let send_variant = ButtonCustomVariant::new(cx)
+            .color(cx.theme().foreground)
+            .foreground(cx.theme().background)
+            .hover(cx.theme().muted_foreground)
+            .active(cx.theme().muted_foreground);
+        let model_target = self
+            .state
+            .metrics
+            .model
+            .clone()
+            .unwrap_or_else(|| "no model".to_owned());
+
+        div()
+            .id("composer")
+            .debug_selector(|| "composer".into())
+            .v_flex()
+            .flex_shrink_0()
+            .py(theme::COMPOSER_PADDING_Y)
+            .px(theme::COMPOSER_PADDING_X)
+            .min_h(theme::COMPOSER_MIN_HEIGHT)
+            .bg(fill_color)
+            .border_l(theme::RAIL_WIDTH_THICK)
+            .border_color(rail_color)
+            .on_action(|_: &gpui_kit::component::input::Enter, _, _| {})
+            .when(!self.composer_images.is_empty(), |composer| {
+                composer.child(
+                    div().mb_1().h_flex().flex_wrap().gap_2().children(
+                        self.composer_images
+                            .iter()
+                            .enumerate()
+                            .map(|(index, image)| {
+                                div()
+                                    .h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_2()
+                                    .py_1()
+                                    .bg(cx.theme().sidebar)
+                                    .text_size(px(12.))
+                                    .debug_selector(|| "composer-chip".into())
+                                    .child(format!("{} · {} bytes", image.name, image.size))
+                                    .child(
+                                        Button::new(("chip-remove", index))
+                                            .ghost()
+                                            .compact()
+                                            .label("Remove")
+                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                                view.remove_attached_image(index, cx)
+                                            })),
+                                    )
+                            }),
+                    ),
+                )
+            })
+            .when_some(self.composer_image_error.clone(), |composer, error| {
+                composer.child(div().mb_1().child(Alert::error("image-error", error)))
+            })
+            // Target line above the input: mono muted with the model name in
+            // the accent tier. Reads as "which target this composer is pointed
+            // at" — the same role wiki's composer target-line plays.
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .h(theme::COMPOSER_TARGET_HEIGHT)
+                    .text_size(px(12.))
+                    .debug_selector(|| "composer-target".into())
+                    .child(div().text_color(roles.target_label).child("→"))
+                    .child(
+                        div()
+                            .text_color(roles.target_value)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .debug_selector(|| "composer-target-name".into())
+                            .child(model_target),
+                    ),
+            )
+            // Inline row: textarea flows, action buttons sit inline — a compact
+            // 64px grid rather than a 120px v_flex stack. min-height 44px keeps
+            // the textarea legible without inflating the composer floor.
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Textarea::new(&self.composer)
+                                .h(px(44.))
+                                .appearance(false)
+                                .bordered(false)
+                                .disabled(!can_send)
+                                .aria_label("Message zeta"),
+                        ),
+                    )
+                    .child(
+                        Button::new("attach")
+                            .debug_selector(|| "attach-button".into())
+                            .ghost()
+                            .compact()
+                            .label("Attach image")
+                            .disabled(!can_send)
+                            .h(theme::SEND_BUTTON_HEIGHT)
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.attach_from_files(window, cx)
+                            })),
+                    )
+                    .child(if can_send {
+                        Button::new("send")
+                            .debug_selector(|| "send-button".into())
+                            .custom(send_variant)
+                            .label("Send")
+                            .h(theme::SEND_BUTTON_HEIGHT)
+                            .min_w(theme::SEND_BUTTON_MIN_WIDTH)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .on_click(cx.listener(|view, _, _, cx| view.send_composer(cx)))
+                            .into_any_element()
+                    } else {
+                        // Disabled: paint the outline ourselves. Kit's Custom
+                        // variant derives the border color from the fill color
+                        // (button.rs:1011), so a transparent fill kills the
+                        // border too. A plain div sets fill and border
+                        // independently, with the whole presentation dimmed to
+                        // 0.55 opacity per contract line 85.
+                        div()
+                            .debug_selector(|| "send-button".into())
+                            .h_flex()
+                            .items_center()
+                            .justify_center()
+                            .h(theme::SEND_BUTTON_HEIGHT)
+                            .min_w(theme::SEND_BUTTON_MIN_WIDTH)
+                            .px_3()
+                            .bg(gpui::transparent_black())
+                            .border_1()
+                            .border_color(roles.send_disabled_outline)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(roles.send_disabled_outline)
+                            .opacity(0.55)
+                            .child("Send")
+                            .into_any_element()
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_footer(&self, cx: &App) -> gpui::AnyElement {
+        // Mode word carries the single load-bearing color on this strip.
+        // Metrics and hints sit at the FAINT tier (not muted) so the mode word
+        // wins the eye by a wide margin — a hint at muted-tier reads as ambient
+        // text and eats the mode word's accent-scarcity budget.
+        let mode_color = Self::footer_mode_color(cx);
+        let show_streaming_dot = self.state.streaming || self.state.thinking;
+        div()
+            .id("status-bar")
+            .h_flex()
+            .items_center()
+            .flex_shrink_0()
+            .gap_4()
+            .px_4()
+            .py_2()
+            .text_size(px(12.))
+            .text_color(theme::palette::text_faint())
+            .debug_selector(|| "status-bar".into())
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_color(mode_color)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .debug_selector(|| "footer-mode".into())
+                            .child(self.footer_mode_word()),
+                    )
+                    .when(show_streaming_dot, |row| {
+                        row.child(streaming_dot(mode_color))
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .debug_selector(|| "composer-hint".into())
+                    .child(polish::status_label(&self.state.metrics)),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(theme::palette::text_faint())
+                    .debug_selector(|| "footer-hints".into())
+                    .child(self.composer_hint()),
+            )
+            .into_any_element()
+    }
+}
+
+/// Map a tool row's semantic state onto the wiki contract's color-only
+/// signal: running=foreground, done=muted_foreground, failed=danger. Kept as
+/// a free helper so the render layer and the guard test can only ever read
+/// the same mapping.
+pub(crate) fn tool_state_color(state: zeta_gui::state::ToolState, cx: &App) -> gpui::Hsla {
+    use zeta_gui::state::ToolState;
+    let theme = cx.theme();
+    match state {
+        ToolState::Running => theme.foreground,
+        ToolState::Done => theme.muted_foreground,
+        ToolState::Failed => theme.danger,
+    }
+}
+
+/// Fixed literals painted as row chrome (headings, hints, unit suffixes,
+/// action labels). Every string that reaches the user through a row's own
+/// text elements — but does NOT belong to `visible_text` (dynamic body
+/// text) — lives here so the seam has one home per literal. The
+/// `every_row_text_flows_through_the_visible_seam_or_chrome_module` check
+/// scans this literal set and a KNOWN FIXTURE set of `TranscriptEntry`
+/// values for the four bracketed state markers
+/// `[working]/[done]/[failed]/[canceled]` — nothing more. The deferred
+/// renderer-literal fence tracked in docs/design.md is what would
+/// statically catch a NEW action label added inline.
+pub(crate) mod chrome {
+    pub(crate) const ASSISTANT_TRUNCATED: &str = "Showing the latest streamed text…";
+    pub(crate) const TOOL_HOVER_HINT: &str = "show output";
+    pub(crate) const TOOL_TAIL_OMITTED: &str = "Earlier output omitted";
+    pub(crate) const OUTPUT_SIZE_UNIT_B: &str = "B";
+    pub(crate) const OUTPUT_SIZE_UNIT_KB: &str = "KB";
+    pub(crate) const OUTPUT_SIZE_UNIT_MB: &str = "MB";
+    pub(crate) const ATTACHMENT_SIZE_SEPARATOR: &str = " · ";
+    pub(crate) const ATTACHMENT_SIZE_SUFFIX: &str = " bytes";
+    pub(crate) const FORK_HERE: &str = "Fork here";
+    pub(crate) const OPEN_SETTINGS: &str = "Open Settings";
+    /// Every fixed literal the seam region may paint. The seam test walks
+    /// this set to prove no state marker sneaks through chrome wording,
+    /// and it stays exhaustive for the deferred renderer-literal fence
+    /// (see docs/design.md) — that fence, once implemented, will consume
+    /// `ALL` to allowlist chrome and fail on any inline literal outside it.
+    #[cfg(test)]
+    pub(crate) const ALL: &[&str] = &[
+        ASSISTANT_TRUNCATED,
+        TOOL_HOVER_HINT,
+        TOOL_TAIL_OMITTED,
+        OUTPUT_SIZE_UNIT_B,
+        OUTPUT_SIZE_UNIT_KB,
+        OUTPUT_SIZE_UNIT_MB,
+        ATTACHMENT_SIZE_SEPARATOR,
+        ATTACHMENT_SIZE_SUFFIX,
+        FORK_HERE,
+        OPEN_SETTINGS,
+    ];
+}
+
+/// State-color recorder. Every state-colored text element in the SEAM
+/// region routes its color through `record_state` or the div-returning
+/// `state_text` shorthand, both of which write `(row_id, color)` to
+/// `render_log` under `test` or the `smoke-test` feature. Tests draw, then
+/// assert on the recorded samples per row — a mutation that swaps the color
+/// argument at any call site records the wrong color and fails the check.
+///
+/// This is the "call-time" replacement for the round-6 pre-draw probe: the
+/// recorder sits inside the color path itself, so the recorded value is by
+/// construction the value that reached `.text_color(...)`.
+/// The `row_id` closure is called only when the recorder is compiled in
+/// (`test` or the `smoke-test` feature); production render never formats a
+/// row id string, so the recorder machinery costs zero allocations in
+/// release builds.
+#[cfg_attr(not(any(test, feature = "smoke-test")), allow(unused_variables))]
+pub(crate) fn record_state<F>(row_id: F, color: gpui::Hsla) -> gpui::Hsla
+where
+    F: FnOnce() -> String,
+{
+    #[cfg(any(test, feature = "smoke-test"))]
+    render_log::record(&row_id(), color);
+    color
+}
+
+/// Convenience wrapper: creates a `Div` with `.text_color(color)` set and
+/// records into the render log in one call. Preferred over `record_state`
+/// for divs; the bare recorder covers the icon path where `Icon` needs to
+/// receive the color directly.
+pub(crate) fn state_text<F>(row_id: F, color: gpui::Hsla) -> gpui::Div
+where
+    F: FnOnce() -> String,
+{
+    div().text_color(record_state(row_id, color))
+}
+
+#[cfg(any(test, feature = "smoke-test"))]
+pub(crate) mod render_log {
+    use gpui::Hsla;
+    use std::cell::RefCell;
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct Sample {
+        pub(crate) row_id: String,
+        pub(crate) color: Hsla,
+    }
+
+    // Thread-local so parallel `cargo test` workers do not cross-contaminate.
+    thread_local! {
+        static SAMPLES: RefCell<Vec<Sample>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn clear() {
+        SAMPLES.with(|slot| slot.borrow_mut().clear());
+    }
+
+    pub(crate) fn record(row_id: &str, color: Hsla) {
+        SAMPLES.with(|slot| {
+            slot.borrow_mut().push(Sample {
+                row_id: row_id.to_owned(),
+                color,
+            })
+        });
+    }
+
+    pub(crate) fn samples() -> Vec<Sample> {
+        SAMPLES.with(|slot| slot.borrow().clone())
+    }
+}
+
+/// Compact byte-size label for the collapsed tool-row output peek. Kept short
+/// so the receipt still fits on one line at the wiki 1024px column. Unit
+/// suffixes come from the chrome-constants module so wording changes have
+/// one home and the seam tests can iterate them.
+fn format_output_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes}{}", chrome::OUTPUT_SIZE_UNIT_B)
+    } else if bytes < 1024 * 1024 {
+        format!(
+            "{:.1}{}",
+            bytes as f64 / 1024.0,
+            chrome::OUTPUT_SIZE_UNIT_KB
+        )
+    } else {
+        format!(
+            "{:.1}{}",
+            bytes as f64 / (1024.0 * 1024.0),
+            chrome::OUTPUT_SIZE_UNIT_MB
+        )
+    }
+}
+
+/// Small pulsing dot rendered while the assistant is streaming or thinking.
+/// Opacity cycles 0.25 → 1 over ~1.2s in a synced loop so all zeta windows on
+/// screen breathe in phase — matches the wiki agent-run indicator.
+fn streaming_dot(color: gpui::Hsla) -> gpui::AnyElement {
+    div()
+        .w(theme::STREAM_DOT_SIZE)
+        .h(theme::STREAM_DOT_SIZE)
+        .rounded_full()
+        .bg(color)
+        .debug_selector(|| "streaming-dot".into())
+        .with_animation(
+            "streaming-dot",
+            Animation::new(Duration::from_millis(1200))
+                .repeat_synced()
+                .with_easing(ease_in_out),
+            |el, delta| {
+                // Delta 0..1: triangle wave 0..1..0 so we breathe up then down
+                // without the pop-back that a sawtooth would show.
+                let triangle = 1.0 - (delta * 2.0 - 1.0).abs();
+                let alpha = 0.25 + triangle * 0.75;
+                el.opacity(alpha)
+            },
+        )
+        .into_any_element()
+}
+
 impl Render for ZetaView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Reset the state-color recorder at the start of every render so
+        // tests observe only the samples produced by the draw they trigger,
+        // and no test needs a manual `render_log::clear()` before drawing.
+        // Compiled out in production alongside the recorder itself.
+        #[cfg(any(test, feature = "smoke-test"))]
+        render_log::clear();
         let needs_login = !self.login_providers.is_empty()
             && self
                 .login_providers
@@ -1408,115 +2171,9 @@ impl Render for ZetaView {
                     })
                     .child(transcript),
             )
-            .child(
-                div()
-                    .id("composer")
-                    .debug_selector(|| "composer".into())
-                    .v_flex()
-                    .flex_shrink_0()
-                    .gap_2()
-                    .p_4()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    // The kit emits PressEnter and propagates its action. Consume it
-                    // here so native text input cannot insert a newline after submit.
-                    .on_action(|_: &gpui_kit::component::input::Enter, _, _| {})
-                    .when(!self.composer_images.is_empty(), |composer| {
-                        composer.child(
-                            div().h_flex().flex_wrap().gap_2().children(
-                                self.composer_images
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(index, image)| {
-                                        div()
-                                            .h_flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .px_2()
-                                            .py_1()
-                                            .bg(cx.theme().muted)
-                                            .text_size(px(12.))
-                                            .debug_selector(|| "composer-chip".into())
-                                            .child(format!("{} · {} bytes", image.name, image.size))
-                                            .child(
-                                                Button::new(("chip-remove", index))
-                                                    .ghost()
-                                                    .label("Remove")
-                                                    .on_click(cx.listener(
-                                                        move |view, _, _, cx| {
-                                                            view.remove_attached_image(index, cx)
-                                                        },
-                                                    )),
-                                            )
-                                    }),
-                            ),
-                        )
-                    })
-                    .when_some(self.composer_image_error.clone(), |composer, error| {
-                        composer.child(Alert::error("image-error", error))
-                    })
-                    .child(
-                        Textarea::new(&self.composer)
-                            .h(px(96.))
-                            .disabled(!can_send)
-                            .aria_label("Message zeta"),
-                    )
-                    .child(
-                        div()
-                            .h_flex()
-                            .justify_between()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(cx.theme().muted_foreground)
-                                    .debug_selector(|| "composer-hint".into())
-                                    .child(self.composer_hint()),
-                            )
-                            .child(
-                                div()
-                                    .h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("attach")
-                                            .debug_selector(|| "attach-button".into())
-                                            .ghost()
-                                            .label("Attach image")
-                                            .disabled(!can_send)
-                                            .h(px(40.))
-                                            .on_click(cx.listener(|view, _, window, cx| {
-                                                view.attach_from_files(window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("send")
-                                            .debug_selector(|| "send-button".into())
-                                            .primary()
-                                            .label("Send")
-                                            .disabled(!can_send)
-                                            .h(px(40.))
-                                            .on_click(
-                                                cx.listener(|view, _, _, cx| {
-                                                    view.send_composer(cx)
-                                                }),
-                                            ),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .id("status-bar")
-                    .h_flex()
-                    .flex_shrink_0()
-                    .gap_4()
-                    .px_4()
-                    .py_2()
-                    .text_size(px(12.))
-                    .text_color(cx.theme().muted_foreground)
-                    .debug_selector(|| "status-bar".into())
-                    .child(polish::status_label(&self.state.metrics)),
-            );
+            .children(self.render_pending_user_turn(cx))
+            .child(self.render_composer(can_send, window, cx))
+            .child(self.render_footer(cx));
         div()
             .size_full()
             .relative()
