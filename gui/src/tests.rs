@@ -657,6 +657,155 @@ fn pending_user_rail_paints_a_single_one_pixel_rail(cx: &mut TestAppContext) {
 }
 
 #[test]
+fn scroll_sync_splices_a_middle_removal_at_its_exact_index() {
+    // Round-9 regression: `commit_assistant` can drop an assistant row from
+    // the MIDDLE of the transcript when the final message is a prefix of the
+    // streamed fragments bracketed by tools. The virtual-list sync used to
+    // derive its splice range from the count delta alone, which points at
+    // the TAIL. The surviving rows past the removed index kept stale cached
+    // heights and scroll offsets tied to their pre-removal positions.
+    //
+    // The change signal now carries the exact removed index and the sync
+    // helper turns it into `Splice(index..index+1, 0)` — a tail-only splice
+    // fails this test.
+    assert_eq!(
+        scroll_sync(
+            7,
+            6,
+            Some(zeta_gui::state::TranscriptChange::Removed(4)),
+            false
+        ),
+        ScrollSync::Splice(4..5, 0),
+    );
+    // A plain append still routes through the count-delta branch — the tail
+    // splice is correct there, and this pin catches an accidental collapse
+    // of the append path into the removal branch.
+    assert_eq!(
+        scroll_sync(3, 4, Some(zeta_gui::state::TranscriptChange::Row(3)), false),
+        ScrollSync::Splice(3..3, 1),
+    );
+    // A modify-in-place with no count change must only remeasure — a splice
+    // here would wipe the cache for a row whose content is still valid.
+    assert_eq!(
+        scroll_sync(5, 5, Some(zeta_gui::state::TranscriptChange::Row(2)), false),
+        ScrollSync::Remeasure(2),
+    );
+    assert_eq!(scroll_sync(5, 5, None, false), ScrollSync::None);
+    // Replace (history swap / session switch) resets regardless of change.
+    assert_eq!(scroll_sync(5, 8, None, true), ScrollSync::Reset(8));
+}
+
+#[gpui::test]
+fn middle_row_removal_syncs_the_virtual_list_at_the_exact_index(cx: &mut TestAppContext) {
+    // End-to-end pin for the state → view sync. Streams a mixed turn that
+    // ends with the final message equal to the FIRST streamed fragment, so
+    // the reconciler drops the middle assistant row rather than blanking
+    // it. The virtual list must land on the reconciled item count and the
+    // full flow — apply_worker_message → scroll_sync → MessageScrollerState
+    // — must not panic on the middle-slot splice.
+    use zeta_gui::client::{ContentBlock, Message};
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let session_id = view.read_with(&visual, |view, _| view.state.active_session.clone());
+    let stream_events = vec![
+        ServerEvent::TurnStart {
+            session_id: session_id.clone(),
+            data: json!({}),
+        },
+        ServerEvent::AssistantDelta {
+            session_id: session_id.clone(),
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        },
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-a".into(),
+                name: "read".into(),
+                arguments: serde_json::from_value(json!({"path": "README.md"})).unwrap(),
+            },
+            data: json!({}),
+        },
+        ServerEvent::AssistantDelta {
+            session_id: session_id.clone(),
+            delta: "post".into(),
+            kind: "assistant".into(),
+        },
+        ServerEvent::ToolStart {
+            session_id: session_id.clone(),
+            tool_call: ToolCall {
+                id: "tool-b".into(),
+                name: "list".into(),
+                arguments: serde_json::from_value(json!({"path": "gui/src"})).unwrap(),
+            },
+            data: json!({}),
+        },
+    ];
+    for event in stream_events {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_worker_message(WorkerMessage::Event(event), window, cx);
+            });
+        });
+    }
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.state.transcript.len(), 4);
+            assert_eq!(view.transcript.read(cx).item_count(), 4);
+        });
+    });
+    // Final "pre" trims the trailing Assistant("post") at index 2, leaving
+    // a Tool row past the removed slot. The sync must splice the middle
+    // slot's cache — a tail splice would corrupt the survivor's metadata.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantMessage {
+                    session_id,
+                    message: Message {
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::Text { text: "pre".into() }],
+                    },
+                }),
+                window,
+                cx,
+            );
+        });
+    });
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.state.transcript.len(), 3);
+            assert_eq!(
+                view.transcript.read(cx).item_count(),
+                3,
+                "virtual list item count must track the reconciled transcript"
+            );
+        });
+    });
+    // Post-reconcile transcript: [Assistant("pre"), Tool, Tool]. Adjacent
+    // tool rows carry a zero row-gap per the wiki contract; a splice at
+    // the wrong slot would leave the second tool anchored below the
+    // removed assistant's cached height.
+    let tool_a = visual
+        .debug_bounds("tool-receipt-1")
+        .expect("first tool row must paint");
+    let tool_b = visual
+        .debug_bounds("tool-receipt-2")
+        .expect("second tool row must paint");
+    assert!(
+        tool_b.top() >= tool_a.top(),
+        "tool rows must remain in transcript order"
+    );
+    let gap = tool_b.top() - tool_a.bottom();
+    assert!(
+        gap < px(8.),
+        "adjacent tool rows must sit at zero gap (measured gap={gap:?})"
+    );
+}
+
+#[test]
 fn every_row_text_flows_through_the_visible_seam_or_chrome_module() {
     // No renderer may sneak dynamic body text past `visible_text` and no
     // chrome literal may sneak past the `chrome` module. Iterating both and

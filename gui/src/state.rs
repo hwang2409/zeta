@@ -124,6 +124,22 @@ pub enum ToolState {
     Failed,
 }
 
+/// What `AppState::apply` did to the transcript, for the view to splice the
+/// virtual-list metadata cache in step. A bare count delta cannot say WHERE
+/// a row was removed, so the tail-splice branch would drop the cache entry
+/// for the last row while the surviving rows kept stale heights and scroll
+/// offsets from their pre-removal positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptChange {
+    /// Row at this index was appended or mutated in place. The view remeasures
+    /// exactly that row.
+    Row(usize),
+    /// Row at this index was removed from the transcript. The view splices
+    /// `index..index + 1` out of its metadata cache so the shifted rows keep
+    /// their measured heights aligned to their new positions.
+    Removed(usize),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
     Connected,
@@ -320,8 +336,8 @@ impl AppState {
         self.approvals = status.pending_approvals;
     }
 
-    pub fn apply(&mut self, event: ServerEvent) -> Option<usize> {
-        let mut changed = None;
+    pub fn apply(&mut self, event: ServerEvent) -> Option<TranscriptChange> {
+        let mut changed: Option<TranscriptChange> = None;
         match event {
             ServerEvent::TurnStart { .. } => {
                 self.streaming = true;
@@ -354,7 +370,11 @@ impl AppState {
                         .transcript
                         .push(TranscriptEntry::Assistant(Markdown::streaming(delta))),
                 }
-                changed = self.transcript.len().checked_sub(1);
+                changed = self
+                    .transcript
+                    .len()
+                    .checked_sub(1)
+                    .map(TranscriptChange::Row);
             }
             ServerEvent::AssistantDelta { kind, delta, .. }
                 if kind == "thinking" && !delta.is_empty() =>
@@ -368,14 +388,18 @@ impl AppState {
                     && !matches!(self.transcript.last(), Some(TranscriptEntry::Thinking))
                 {
                     self.transcript.push(TranscriptEntry::Thinking);
-                    changed = self.transcript.len().checked_sub(1);
+                    changed = self
+                        .transcript
+                        .len()
+                        .checked_sub(1)
+                        .map(TranscriptChange::Row);
                 }
             }
             ServerEvent::AssistantDelta { .. } => {}
             ServerEvent::AssistantMessage { message, .. } => {
                 self.thinking = false;
                 self.assistant_started |= !message.text().is_empty();
-                changed = self.commit_assistant(message)
+                changed = self.commit_assistant(message);
             }
             ServerEvent::ToolStart {
                 session_id,
@@ -387,7 +411,11 @@ impl AppState {
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
                 ));
-                changed = self.transcript.len().checked_sub(1);
+                changed = self
+                    .transcript
+                    .len()
+                    .checked_sub(1)
+                    .map(TranscriptChange::Row);
             }
             ServerEvent::ToolOutput {
                 session_id,
@@ -399,7 +427,7 @@ impl AppState {
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
                 );
-                changed = Some(index);
+                changed = Some(TranscriptChange::Row(index));
                 if let TranscriptEntry::Tool { summary, card, .. } = entry {
                     card.tail.append(&output);
                     if let Some(line) = card
@@ -423,7 +451,7 @@ impl AppState {
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
                 );
-                changed = Some(index);
+                changed = Some(TranscriptChange::Row(index));
                 if let TranscriptEntry::Tool {
                     complete,
                     error,
@@ -478,7 +506,9 @@ impl AppState {
                 session_id,
                 receipt,
             } => {
-                changed = Some(self.commit_sub_agent(session_id, receipt));
+                changed = Some(TranscriptChange::Row(
+                    self.commit_sub_agent(session_id, receipt),
+                ));
             }
             ServerEvent::ApprovalRequest { approval, .. } => {
                 if !self
@@ -504,7 +534,11 @@ impl AppState {
                     settings_action,
                     login_provider: data["login_provider"].as_str().map(str::to_owned),
                 });
-                changed = self.transcript.len().checked_sub(1);
+                changed = self
+                    .transcript
+                    .len()
+                    .checked_sub(1)
+                    .map(TranscriptChange::Row);
             }
             ServerEvent::Other { .. } => {}
         }
@@ -596,7 +630,7 @@ impl AppState {
         index
     }
 
-    fn commit_assistant(&mut self, message: Message) -> Option<usize> {
+    fn commit_assistant(&mut self, message: Message) -> Option<TranscriptChange> {
         let has_thinking = message
             .content
             .iter()
@@ -617,13 +651,17 @@ impl AppState {
         let has_thinking_marker = self.transcript[turn_start..]
             .iter()
             .any(|entry| matches!(entry, TranscriptEntry::Thinking));
-        let mut changed = None;
+        let mut changed: Option<TranscriptChange> = None;
         // Thinking body text is never retained — the provider protocol mixes
         // raw reasoning with any summary, so we only guarantee that a
         // header-only marker exists when the turn thought at all.
         if has_thinking && !has_thinking_marker {
             self.transcript.push(TranscriptEntry::Thinking);
-            changed = self.transcript.len().checked_sub(1);
+            changed = self
+                .transcript
+                .len()
+                .checked_sub(1)
+                .map(TranscriptChange::Row);
         }
         if !assistant_text.is_empty() {
             // Every assistant row in the current turn, in transcript order.
@@ -649,7 +687,11 @@ impl AppState {
             if assistant_indices.is_empty() {
                 self.transcript
                     .push(TranscriptEntry::Assistant(assistant_text.into()));
-                changed = self.transcript.len().checked_sub(1);
+                changed = self
+                    .transcript
+                    .len()
+                    .checked_sub(1)
+                    .map(TranscriptChange::Row);
             } else {
                 let leading = &assistant_indices[..assistant_indices.len() - 1];
                 let mut cursor = 0usize;
@@ -673,16 +715,18 @@ impl AppState {
                     // final text — a shorter-than-streamed final or a final
                     // equal to a mid-tool prefix would otherwise leave an
                     // empty assistant row that still consumes transcript
-                    // rhythm. Drop the trailing row instead of blanking it.
+                    // rhythm. Drop the trailing row instead of blanking it,
+                    // and report the exact removed index so the view splices
+                    // metadata at that position rather than at the tail.
                     if tail.is_empty() {
                         self.transcript.remove(last_idx);
-                        changed = last_idx.checked_sub(1);
+                        changed = Some(TranscriptChange::Removed(last_idx));
                     } else {
                         if let TranscriptEntry::Assistant(current) = &mut self.transcript[last_idx]
                         {
                             *current = tail.into();
                         }
-                        changed = Some(last_idx);
+                        changed = Some(TranscriptChange::Row(last_idx));
                     }
                 } else {
                     for &idx in leading.iter().rev() {
@@ -696,7 +740,7 @@ impl AppState {
                     if let TranscriptEntry::Assistant(current) = &mut self.transcript[last_idx] {
                         *current = assistant_text.into();
                     }
-                    changed = Some(last_idx);
+                    changed = Some(TranscriptChange::Row(last_idx));
                 }
             }
         }
@@ -814,7 +858,7 @@ mod tests {
                 tool_result: Some(result),
                 data: json!({}),
             });
-            assert_eq!(changed, Some(0));
+            assert_eq!(changed, Some(TranscriptChange::Row(0)));
             let entry = &state.transcript[0];
             assert!(entry.unsuccessful());
             assert!(matches!(
@@ -1675,6 +1719,63 @@ mod tests {
                 r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
             ],
             "reconciliation must never leave an empty assistant row"
+        );
+    }
+
+    #[test]
+    fn middle_row_removal_reports_the_exact_removed_index() {
+        // Round-9: a blank-row removal at index 2 leaves rows AFTER it in
+        // the transcript (a trailing Tool row here at old index 3). The
+        // change signal must carry that removed index so the view splices
+        // the virtual list at slot 2 — not at the tail, which would leave
+        // shifted rows anchored to their pre-removal cached heights.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "pre".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        state.apply(ServerEvent::AssistantDelta {
+            session_id: None,
+            delta: "post".into(),
+            kind: "assistant".into(),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call(),
+            data: json!({}),
+        });
+        // Transcript before the final message:
+        //   [Assistant("pre"), Tool, Assistant("post"), Tool]
+        // Final "pre" reconciles by dropping Assistant("post") at index 2.
+        let change = state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text { text: "pre".into() }],
+            },
+        });
+        assert_eq!(
+            change,
+            Some(TranscriptChange::Removed(2)),
+            "the exact removed index must reach the view — the tail delta alone would splice the wrong slot"
+        );
+        assert_eq!(
+            describe_transcript(&state.transcript),
+            vec![
+                r#"Assistant("pre")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+                r#"Tool("read", "{\"path\":\"README.md\"}")"#.to_owned(),
+            ],
         );
     }
 

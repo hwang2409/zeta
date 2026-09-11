@@ -32,7 +32,7 @@ use zeta_gui::{
     client::Approval,
     login::{LoginProgress, LoginProvider},
     session::{ImageAttachment, SessionSettings, APPROVAL_MODES},
-    state::{AppState, ConnectionState, TranscriptEntry},
+    state::{AppState, ConnectionState, TranscriptChange, TranscriptEntry},
     worker::{CommandMessage, ConnectionWorker, WorkerMessage},
 };
 
@@ -53,6 +53,45 @@ impl Render for DialogLayer {
 struct PendingUserTurn {
     text: String,
     failed: bool,
+}
+
+/// How the transcript virtual list must follow an `AppState` change. Extracted
+/// as a pure function so a mutation that reverts to the old tail-splice
+/// heuristic is caught by a unit test — the visual sync path only observes the
+/// bug when off-viewport rows drift, which is impractical to reproduce here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScrollSync {
+    Reset(usize),
+    Splice(std::ops::Range<usize>, usize),
+    Remeasure(usize),
+    None,
+}
+
+fn scroll_sync(
+    previous_count: usize,
+    new_count: usize,
+    change: Option<TranscriptChange>,
+    replace: bool,
+) -> ScrollSync {
+    if replace {
+        return ScrollSync::Reset(new_count);
+    }
+    // A removal carries its exact index so the metadata splice lands at that
+    // slot. A count-delta-only heuristic would splice the TAIL, dropping the
+    // last row's cache while the shifted middle rows kept stale heights.
+    if let Some(TranscriptChange::Removed(index)) = change {
+        return ScrollSync::Splice(index..index + 1, 0);
+    }
+    if new_count != previous_count {
+        return ScrollSync::Splice(
+            previous_count.min(new_count)..previous_count,
+            new_count.saturating_sub(previous_count),
+        );
+    }
+    if let Some(TranscriptChange::Row(index)) = change {
+        return ScrollSync::Remeasure(index);
+    }
+    ScrollSync::None
 }
 
 struct ZetaView {
@@ -377,19 +416,15 @@ impl ZetaView {
         }
         let count = self.state.transcript.len();
         self.transcript.update(cx, |scroll, cx| {
-            if replace {
-                scroll.reset(count, cx);
-            } else {
-                if count != previous_count {
-                    scroll.splice(
-                        previous_count.min(count)..previous_count,
-                        count.saturating_sub(previous_count),
-                        cx,
-                    );
+            match scroll_sync(previous_count, count, changed_row, replace) {
+                ScrollSync::Reset(new_count) => scroll.reset(new_count, cx),
+                ScrollSync::Splice(range, insert) => {
+                    scroll.splice(range, insert, cx);
                 }
-                if let Some(index) = changed_row {
+                ScrollSync::Remeasure(index) => {
                     scroll.remeasure_items(index..index + 1, cx);
                 }
+                ScrollSync::None => {}
             }
         });
         if login_changed {
@@ -1151,11 +1186,15 @@ impl ZetaView {
     //   - `chrome::*` — the fixed literals module (Fork here, Open Settings, hints, units)
     //   - `state_text(row, color)` / `record_state(row, color)` — the state-color recorder
     //
-    // The seam is documentary — new renderer literals are caught by the
+    // The seam is documentary: the shipping guard is the
     // `every_row_text_flows_through_the_visible_seam_or_chrome_module`
-    // marker check and by the render_log samples for tool/thinking rows.
-    // A typed row-text model that makes new literals impossible is tracked
-    // as the ZETA-107 follow-up in docs/design.md.
+    // check, which scans `TranscriptEntry::visible_text` for every kind
+    // and the `chrome::ALL` literal set for the bracketed state markers
+    // `[working]/[done]/[failed]/[canceled]`, plus the render_log samples
+    // that pin the state colour per row-id for tool/thinking rows. The
+    // guard does NOT walk this file for new inline literals — an
+    // exhaustive typed row-text model with a matching renderer-literal
+    // fence is captured as the ZETA-107 follow-up in docs/design.md.
     fn render_row_inner(
         &self,
         index: usize,
@@ -1860,9 +1899,12 @@ pub(crate) fn tool_state_color(state: zeta_gui::state::ToolState, cx: &App) -> g
 /// Fixed literals painted as row chrome (headings, hints, unit suffixes,
 /// action labels). Every string that reaches the user through a row's own
 /// text elements — but does NOT belong to `visible_text` (dynamic body
-/// text) — lives here. The `transcript_render_functions_carry_no_stray_literals`
-/// test scans the SEAM region of `main.rs` and fails on any user-visible
-/// literal outside `ALL`, so a new action label added inline is caught.
+/// text) — lives here so the seam has one home per literal. The
+/// `every_row_text_flows_through_the_visible_seam_or_chrome_module` check
+/// asserts none of these literals nor any `visible_text` string carries a
+/// bracketed state marker (`[working]/[done]/[failed]/[canceled]`); the
+/// deferred renderer-literal fence tracked in docs/design.md is what
+/// would statically catch a NEW action label added inline.
 pub(crate) mod chrome {
     pub(crate) const ASSISTANT_TRUNCATED: &str = "Showing the latest streamed text…";
     pub(crate) const TOOL_HOVER_HINT: &str = "show output";
@@ -1874,10 +1916,11 @@ pub(crate) mod chrome {
     pub(crate) const ATTACHMENT_SIZE_SUFFIX: &str = " bytes";
     pub(crate) const FORK_HERE: &str = "Fork here";
     pub(crate) const OPEN_SETTINGS: &str = "Open Settings";
-    /// Every fixed literal the seam region may paint. Used by the seam
-    /// tests to prove no state marker sneaks through chrome wording AND
-    /// to allowlist the region's user-visible literals for the render
-    /// source lint (item 6).
+    /// Every fixed literal the seam region may paint. The seam test walks
+    /// this set to prove no state marker sneaks through chrome wording,
+    /// and it stays exhaustive for the deferred renderer-literal fence
+    /// (see docs/design.md) — that fence, once implemented, will consume
+    /// `ALL` to allowlist chrome and fail on any inline literal outside it.
     #[cfg(test)]
     pub(crate) const ALL: &[&str] = &[
         ASSISTANT_TRUNCATED,
