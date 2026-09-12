@@ -18,6 +18,22 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
+MCP_TOOL_SEPARATOR = "__"
+
+
+def tool_prefix(server: str) -> str:
+    """Namespace prefix for one MCP server's tools.
+
+    Anthropic rejects tool names outside ``^[a-zA-Z0-9_-]{1,128}$``, so this is
+    ``__`` and never ``:``. MCP *prompts* keep ``:`` (``mount.py``) because they
+    are slash commands and never reach a provider as tool names. Registration,
+    unregistration and provider-schema pruning all read this one definition, so
+    they cannot drift apart.
+    """
+
+    return f"{server}{MCP_TOOL_SEPARATOR}"
+
+
 class MCPConfigError(ValueError):
     """Raised when an MCP config file is not valid JSON or has a bad shape."""
 

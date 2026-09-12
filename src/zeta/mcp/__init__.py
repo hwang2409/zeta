@@ -22,6 +22,7 @@ from .config import (
     read_mcp_config_file,
     resolve_server_config,
     server_to_json,
+    tool_prefix,
     write_mcp_config,
 )
 from .http import StreamableHTTPMCPClient
@@ -54,5 +55,6 @@ __all__ = [
     "read_mcp_config_file",
     "resolve_server_config",
     "server_to_json",
+    "tool_prefix",
     "write_mcp_config",
 ]
