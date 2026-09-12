@@ -15,7 +15,7 @@ from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..types import StructuredToolResult
 from .client import MCPClient, MCPPrompt, MCPTool, make_error_result
-from .config import MCPServerConfig, mcp_log_path
+from .config import MCPServerConfig, mcp_log_path, tool_prefix
 from .prompt_actor import (
     CallFinished as _CallFinished,
     CallRequest as _CallRequest,
@@ -1080,10 +1080,15 @@ class MCPServerActor:
             self._client,
         )
 
+    def _tool_prefix(self) -> str:
+        """Namespace prefix for this server's tools."""
+
+        return tool_prefix(self.name)
+
     def _register_tool(self, tool: MCPTool, generation: int) -> None:
         if self._registry is None or self._client is None:
             return
-        name = f"{self.name}:{tool.name}"
+        name = f"{self._tool_prefix()}{tool.name}"
 
         async def handler(
             arguments: dict[str, object], abort_signal: AbortSignal
@@ -1109,7 +1114,7 @@ class MCPServerActor:
     def _unregister_tools(self) -> None:
         if self._registry is None:
             return
-        prefix = f"{self.name}:"
+        prefix = self._tool_prefix()
         for name in tuple(self._registry.definitions_by_name):
             if name.startswith(prefix):
                 self._registry.unregister(name)
