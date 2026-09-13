@@ -883,6 +883,19 @@ class SubmissionMixin:
     async def slash_mcp(self, args: str) -> str:
         return await self.loop.slash_mcp(args)
 
+    async def slash_automations(self, args: str) -> str:
+        from ..automations.commands import slash
+        from ..core.session import env_home
+
+        try:
+            return await slash(
+                args,
+                home=getattr(self, "_zeta_home", None) or env_home(),
+                cwd=self.loop.store.cwd,
+            )
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
+            return f"automation error: {exc}"
+
     async def slash_mcp_prompt(
         self, name: str, arguments: dict[str, str]
     ) -> str:
