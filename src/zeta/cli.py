@@ -119,6 +119,10 @@ def build_parser() -> argparse.ArgumentParser:
     from .session_cli import add_subcommand as _add_session_subcommand
 
     _add_session_subcommand(commands)
+
+    from .automations.cli import add_subcommand as _add_automation_subcommand
+
+    _add_automation_subcommand(commands)
     serve_parser = commands.add_parser(
         "serve", help="serve zeta to one local frontend client"
     )
@@ -167,6 +171,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"logged in as {handle}" if handle else "ok")
         return 0
+    if args.command == "automation":
+        from .automations.cli import run as run_automation
+
+        return run_automation(args)
     if args.command == "session":
         from .session_cli import run as _run_session
 

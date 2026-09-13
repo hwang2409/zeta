@@ -412,7 +412,13 @@ class ToolRegistry:
         session_store: ConversationStore | None = None,
         max_output_chars: int = 10_000,
         register_builtin: bool = True,
+        enforce_approvals: bool = False,
     ) -> None:
+        if enforce_approvals and approval_policy is None:
+            raise ValueError("enforced approvals require a policy")
+        self.enforce_approvals = enforce_approvals
+        # Deliberately shared by session clones so child denials reach the run record.
+        self.denied_tools: list[str] = []
         self.cwd = Path(os.path.abspath(os.fspath(Path(cwd).expanduser())))
         cwd_fd = -1
         try:
@@ -633,6 +639,8 @@ class ToolRegistry:
         self.bash_cwd = cwd
 
     def set_approval_policy(self, policy: ApprovalPolicy | None) -> None:
+        if self.enforce_approvals and policy is None:
+            raise ValueError("cannot remove an enforced approval policy")
         self.approval_policy = policy
         self._approval_gate.policy = policy
         if policy is not None:  # tell the policy which argument scopes each tool
@@ -647,7 +655,7 @@ class ToolRegistry:
         if definition is None:
             self._abort_approval(tool_call)
             return None
-        if not definition.requires_approval:
+        if not definition.requires_approval and not self.enforce_approvals:
             return None
         if definition.validate_arguments:
             try:
@@ -725,10 +733,18 @@ class ToolRegistry:
             signal_state,
             lambda current: self._next_abort_generation(current, _scope_signal),
             _lifecycle_sink,
-            skip_approval=_skip_approval or not definition.requires_approval,
+            skip_approval=(
+                not self.enforce_approvals
+                and (_skip_approval or not definition.requires_approval)
+            ),
             persist_request=_persist_approval,
         )
         if gate_result is not None:
+            if (
+                self.enforce_approvals
+                and gate_result.content == "tool execution denied"
+            ):
+                self.denied_tools.append(tool_call.name)
             return finalize(_legacy_result(gate_result))
         if _scope_signal is not None:
             execution_signal = _scope_signal
