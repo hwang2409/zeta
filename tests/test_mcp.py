@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -493,7 +494,7 @@ async def test_stdio_abort_marks_mount_failed(
     signal = AbortSignal()
     task = asyncio.create_task(
         registry.execute(
-            ToolCall("call", "abort:echo", {"value": "wait"}),
+            ToolCall("call", "abort__echo", {"value": "wait"}),
             abort_signal=signal,
         )
     )
@@ -509,7 +510,7 @@ async def test_stdio_abort_marks_mount_failed(
     assert mount.statuses["abort"].state == "degraded"
     assert mount.statuses["abort"].tool_count == 1
     assert mount.clients == ()
-    assert "abort:echo" in {schema["name"] for schema in registry.schemas}
+    assert "abort__echo" in {schema["name"] for schema in registry.schemas}
     assert "abort: degraded" in mount.render()
     await mount.close()
 
@@ -707,9 +708,39 @@ async def test_mount_registers_prefixed_tool(tmp_path: Path, monkeypatch: pytest
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     registry = ToolRegistry(tmp_path, register_builtin=False)
     mount = await mount_mcp_servers(registry, MCPConfig(tmp_path / "mcp.json", {"fake": _stdio_config()}))
-    result = await registry.execute(ToolCall("call", "fake:echo", {"value": "mounted"}))
+    result = await registry.execute(ToolCall("call", "fake__echo", {"value": "mounted"}))
     assert result["content"][0]["text"] == "mounted"
     assert registry.schemas[0]["parameters"]["$defs"] == {"value": {"type": "string"}}
+    await mount.close()
+
+
+@pytest.mark.asyncio
+async def test_mounted_tool_names_satisfy_the_anthropic_name_pattern(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Anthropic 400s on any tool name outside ^[a-zA-Z0-9_-]{1,128}$.
+
+    zeta prefixed MCP tools "server__tool" until 2026-09-10, so every Anthropic
+    request carrying a mounted MCP tool died with
+    `tools.N.custom.name: String should match pattern`. Fake backends never
+    validate names, so the suite stayed green while real MCP was unusable.
+    """
+
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    registry = ToolRegistry(tmp_path, register_builtin=False)
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"fake": _stdio_config()})
+    )
+    # Execute before asserting, as test_mount_registers_prefixed_tool does:
+    # it is what waits for the mount to finish. Reading registry.schemas
+    # straight after mount_mcp_servers races the in-flight setup, and the
+    # close() below then hangs instead of failing.
+    result = await registry.execute(ToolCall("call", "fake__echo", {"value": "ok"}))
+    assert result["content"][0]["text"] == "ok"
+    pattern = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+    names = [schema["name"] for schema in registry.schemas]
+    assert names
+    assert [name for name in names if not pattern.fullmatch(name)] == []
     await mount.close()
 
 
@@ -954,7 +985,7 @@ async def test_mount_reconnects_one_server_and_rejects_unknown(
     assert mount.statuses["recover"].state == "failed"
     await mount.reconnect("recover")
     assert mount.statuses["recover"].state == "mounted"
-    assert "recover:echo" in {schema["name"] for schema in registry.schemas}
+    assert "recover__echo" in {schema["name"] for schema in registry.schemas}
     with pytest.raises(ValueError, match="unknown MCP server: absent"):
         await mount.reconnect("absent")
     await mount.close()
@@ -970,7 +1001,7 @@ async def test_removed_handler_rejects_a_readded_same_name_server(
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"same": config})
     )
-    old_handler = registry.definitions_by_name["same:echo"].handler
+    old_handler = registry.definitions_by_name["same__echo"].handler
 
     await mount.remove_server("same")
     await mount.add_server(config, source=tmp_path / "mcp.json")
@@ -1105,7 +1136,7 @@ async def test_hung_tool_call_does_not_block_reconnect(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
 
-    call = asyncio.create_task(registry.execute(ToolCall("call", "server:echo", {})))
+    call = asyncio.create_task(registry.execute(ToolCall("call", "server__echo", {})))
     await started.wait()
     await asyncio.wait_for(mount.reconnect("server"), timeout=0.2)
     release.set()
@@ -1130,7 +1161,7 @@ async def test_completed_call_children_are_removed(
     actor = mount._actors["server"]
 
     for index in range(25):
-        result = await registry.execute(ToolCall(str(index), "server:echo", {}))
+        result = await registry.execute(ToolCall(str(index), "server__echo", {}))
         assert result["isError"] is False
 
     assert not actor._children
@@ -1154,7 +1185,7 @@ async def test_call_after_close_does_not_start_a_replacement(
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
-    old_handler = registry.definitions_by_name["server:echo"].handler
+    old_handler = registry.definitions_by_name["server__echo"].handler
 
     await mount.close()
     result = await old_handler({}, AbortSignal())
@@ -1183,9 +1214,9 @@ async def test_failed_manual_reconnect_preserves_degraded_recovery(
 
     assert mount.statuses["recover"].state == "degraded"
     assert mount.statuses["recover"].tool_count == 1
-    assert "recover:echo" in {schema["name"] for schema in registry.schemas}
+    assert "recover__echo" in {schema["name"] for schema in registry.schemas}
 
-    result = await registry.execute(ToolCall("recover", "recover:echo", {}))
+    result = await registry.execute(ToolCall("recover", "recover__echo", {}))
 
     assert result["isError"] is False
     assert mount.statuses["recover"].state == "mounted"
@@ -1250,7 +1281,7 @@ async def test_remount_replaces_the_full_tool_set(
 
     await mount.reconnect("server")
 
-    assert {schema["name"] for schema in registry.schemas} == {"server:new"}
+    assert {schema["name"] for schema in registry.schemas} == {"server__new"}
     assert mount.statuses["server"].tool_count == 1
     await mount.close()
 
@@ -1270,7 +1301,7 @@ async def test_old_tool_lease_cannot_call_replacement_client(
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
-    old_handler = registry.definitions_by_name["server:echo"].handler
+    old_handler = registry.definitions_by_name["server__echo"].handler
 
     await mount.reconnect("server")
     result = await old_handler({}, AbortSignal())
@@ -1302,7 +1333,7 @@ async def test_auto_remount_backoff_caps_at_large_failure_count(
     actor._failure_count = 1024
     before = mount_module.time.monotonic()
 
-    result = await registry.execute(ToolCall("retry", "retry:echo", {}))
+    result = await registry.execute(ToolCall("retry", "retry__echo", {}))
 
     assert result["isError"] is True
     retry_at = mount.statuses["retry"].next_retry_at
@@ -1328,7 +1359,7 @@ async def test_failed_auto_remount_drops_client_before_next_attempt(
 
     initial.fail_transport("server exited")
     await asyncio.sleep(0)
-    failed_result = await registry.execute(ToolCall("retry", "retry:echo", {}))
+    failed_result = await registry.execute(ToolCall("retry", "retry__echo", {}))
 
     assert failed_result["isError"] is True
     assert mount.clients == ()
@@ -1355,7 +1386,7 @@ async def test_delayed_auto_remount_rejects_a_stale_same_name_generation(
     )
     initial.fail_transport("server exited")
     await asyncio.sleep(0)
-    old_handler = registry.definitions_by_name["same:echo"].handler
+    old_handler = registry.definitions_by_name["same__echo"].handler
 
     await mount.remove_server("same")
     await mount.add_server(new_config, source=tmp_path / "new.json")
@@ -1411,7 +1442,7 @@ async def test_abandoned_completed_auto_remount_closes_stale_client(
 
     actor._queue_setup_result = hold_setup_result
     call = asyncio.create_task(
-        registry.execute(ToolCall("retry", "same:echo", {}))
+        registry.execute(ToolCall("retry", "same__echo", {}))
     )
     await auto_completed.wait()
     for _ in range(20):
@@ -1485,7 +1516,7 @@ async def test_degraded_tool_call_auto_remounts_once(
         await asyncio.sleep(0)
 
     result = await registry.execute(
-        ToolCall("call", "recover:echo", {"value": "ignored"})
+        ToolCall("call", "recover__echo", {"value": "ignored"})
     )
 
     assert result["isError"] is False
@@ -1519,8 +1550,8 @@ async def test_degraded_calls_use_bounded_auto_remount_backoff(
     initial.fail_transport("server exited")
     await asyncio.sleep(0)
 
-    first = await registry.execute(ToolCall("first", "retry:echo", {}))
-    second = await registry.execute(ToolCall("second", "retry:echo", {}))
+    first = await registry.execute(ToolCall("first", "retry__echo", {}))
+    second = await registry.execute(ToolCall("second", "retry__echo", {}))
 
     assert first["isError"] is True
     assert second["isError"] is True
@@ -1529,7 +1560,7 @@ async def test_degraded_calls_use_bounded_auto_remount_backoff(
     assert "Use /mcp reconnect retry." in second["content"][0]["text"]
 
     await asyncio.sleep(0.06)
-    await registry.execute(ToolCall("third", "retry:echo", {}))
+    await registry.execute(ToolCall("third", "retry__echo", {}))
     assert attempts == 3
     await mount.close()
 
@@ -1567,10 +1598,10 @@ async def test_parallel_degraded_calls_do_not_start_two_remounts(
     await asyncio.sleep(0)
 
     first_task = asyncio.create_task(
-        registry.execute(ToolCall("first", "race:echo", {}))
+        registry.execute(ToolCall("first", "race__echo", {}))
     )
     await started.wait()
-    second = await registry.execute(ToolCall("second", "race:echo", {}))
+    second = await registry.execute(ToolCall("second", "race__echo", {}))
     release.set()
     first = await first_task
 
@@ -1714,7 +1745,7 @@ async def test_stdio_exit_updates_mount_status(
         await asyncio.sleep(0.01)
 
     assert mount.statuses["dead"].state == "degraded"
-    assert "dead:echo" in {schema["name"] for schema in registry.schemas}
+    assert "dead__echo" in {schema["name"] for schema in registry.schemas}
     await mount.close()
 
 
@@ -1755,8 +1786,8 @@ async def test_mount_arms_failure_handler_during_sibling_setup(
     mount = await task
 
     assert mount.statuses["early"].state == "degraded"
-    assert "early:echo" not in {schema["name"] for schema in registry.schemas}
-    assert "sibling:echo" in {schema["name"] for schema in registry.schemas}
+    assert "early__echo" not in {schema["name"] for schema in registry.schemas}
+    assert "sibling__echo" in {schema["name"] for schema in registry.schemas}
     await mount.close()
 
 
@@ -2085,11 +2116,11 @@ async def test_mcp_application_error_keeps_server_mounted(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"app": client.config}),
     )
-    result = await registry.execute(ToolCall("call", "app:echo", {}))
+    result = await registry.execute(ToolCall("call", "app__echo", {}))
 
     assert result["isError"] is True
     assert mount.statuses["app"].state == "mounted"
-    assert "app:echo" in {schema["name"] for schema in registry.schemas}
+    assert "app__echo" in {schema["name"] for schema in registry.schemas}
     await mount.close()
 
 
@@ -2105,14 +2136,14 @@ async def test_mcp_failure_refreshes_agent_loop_tool_schemas(
     loop = AgentLoop(
         FakeBackend([]),
         ConversationStore(tmp_path),
-        tool_schemas=[{"name": "dead:echo", "description": "", "parameters": {}}],
+        tool_schemas=[{"name": "dead__echo", "description": "", "parameters": {}}],
     )
 
     await loop.ensure_mcp_servers()
-    assert "dead:echo" in {schema["name"] for schema in loop.tool_schemas}
+    assert "dead__echo" in {schema["name"] for schema in loop.tool_schemas}
     client.fail_transport("transport dropped")
 
-    assert "dead:echo" in {schema["name"] for schema in loop.tool_schemas}
+    assert "dead__echo" in {schema["name"] for schema in loop.tool_schemas}
     await loop.close()
 
 
@@ -2132,7 +2163,7 @@ async def test_mount_continues_when_failed_server_cleanup_raises(
     registry = ToolRegistry(tmp_path, register_builtin=False)
     mount = await mount_mcp_servers(registry, MCPConfig(tmp_path / "mcp.json", configs))
 
-    assert "good:echo" in {schema["name"] for schema in registry.schemas}
+    assert "good__echo" in {schema["name"] for schema in registry.schemas}
     await mount.close()
 
 
@@ -2145,7 +2176,7 @@ async def test_mount_isolates_bad_server_from_good_server(
     config = MCPConfig(tmp_path / "mcp.json", {"bad": bad, "good": _stdio_config("good")})
     registry = ToolRegistry(tmp_path, register_builtin=False)
     mount = await mount_mcp_servers(registry, config)
-    assert "good:echo" in {schema["name"] for schema in registry.schemas}
+    assert "good__echo" in {schema["name"] for schema in registry.schemas}
     await mount.close()
 
 
@@ -2160,11 +2191,11 @@ async def test_mcp_application_error_does_not_affect_other_server(
     )
     registry = ToolRegistry(tmp_path, register_builtin=False)
     mount = await mount_mcp_servers(registry, config)
-    failed = await registry.execute(ToolCall("failed", "fail:echo", {"value": "x"}))
-    healthy = await registry.execute(ToolCall("healthy", "good:echo", {"value": "ok"}))
+    failed = await registry.execute(ToolCall("failed", "fail__echo", {"value": "x"}))
+    healthy = await registry.execute(ToolCall("healthy", "good__echo", {"value": "ok"}))
     assert failed["isError"] is True
     assert mount.statuses["fail"].state == "mounted"
-    assert "fail:echo" in {schema["name"] for schema in registry.schemas}
+    assert "fail__echo" in {schema["name"] for schema in registry.schemas}
     assert healthy["isError"] is False
     assert healthy["content"][0]["text"] == "ok"
     await mount.close()
@@ -2364,7 +2395,7 @@ async def test_slash_mcp_add_stdio_writes_project_file_and_mounts(
     }
     assert loop._mcp_mount is not None
     assert loop._mcp_mount.statuses["live"].state == "mounted"
-    assert "live:echo" in {schema["name"] for schema in loop.tool_registry.schemas}
+    assert "live__echo" in {schema["name"] for schema in loop.tool_registry.schemas}
     await loop.close()
 
 
@@ -2437,13 +2468,13 @@ async def test_slash_mcp_remove_deletes_entry_and_unmounts(
     loop.set_mcp_scope(home=home, project_dir=project)
 
     await loop.slash_mcp("add live --http https://mcp.example")
-    assert "live:ping" in {schema["name"] for schema in loop.tool_registry.schemas}
+    assert "live__ping" in {schema["name"] for schema in loop.tool_registry.schemas}
     output = await loop.slash_mcp("remove live")
 
     assert "live" not in output
     assert loop._mcp_mount is not None
     assert "live" not in loop._mcp_mount.configs
-    assert "live:ping" not in {schema["name"] for schema in loop.tool_registry.schemas}
+    assert "live__ping" not in {schema["name"] for schema in loop.tool_registry.schemas}
     data = json.loads(project_config_path(project).read_text())["servers"]
     assert "live" not in data
     await loop.close()
@@ -2885,15 +2916,15 @@ async def test_mcp_remove_clears_provider_schema_after_unmount(
     loop = AgentLoop(
         FakeBackend([]),
         ConversationStore(project),
-        tool_schemas=[{"name": "dead:echo", "description": "", "parameters": {}}],
+        tool_schemas=[{"name": "dead__echo", "description": "", "parameters": {}}],
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
 
     await loop.slash_mcp("add dead --http https://mcp.example")
-    assert "dead:echo" in {schema["name"] for schema in loop.tool_schemas}
+    assert "dead__echo" in {schema["name"] for schema in loop.tool_schemas}
     await loop.slash_mcp("remove dead")
 
-    assert "dead:echo" not in {schema["name"] for schema in loop.tool_schemas}
+    assert "dead__echo" not in {schema["name"] for schema in loop.tool_schemas}
     await loop.close()
 
 
@@ -2909,14 +2940,14 @@ async def test_mcp_schema_refresh_does_not_duplicate_current_provider_schema(
     loop = AgentLoop(
         FakeBackend([]),
         ConversationStore(tmp_path),
-        tool_schemas=[{"name": "live:echo", "description": "", "parameters": {}}],
+        tool_schemas=[{"name": "live__echo", "description": "", "parameters": {}}],
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "project")
 
     await loop.slash_mcp("add live --http https://mcp.example")
     loop._refresh_mcp_tool_schemas()
 
-    assert [schema["name"] for schema in loop.tool_schemas].count("live:echo") == 1
+    assert [schema["name"] for schema in loop.tool_schemas].count("live__echo") == 1
     await loop.close()
 
 

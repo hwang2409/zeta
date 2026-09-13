@@ -42,6 +42,7 @@ from .mcp import (
     load_mcp_config_overlay,
     mount_mcp_servers,
     project_config_path,
+    tool_prefix,
 )
 from .mcp.commands import (
     MCP_USAGE,
@@ -769,7 +770,7 @@ class AgentLoop:
         mount = mount or self._mcp_mount
         if mount is None:
             return
-        mcp_prefixes = tuple(f"{name}:" for name in mount.configs)
+        mcp_prefixes = tuple(tool_prefix(name) for name in mount.configs)
         current_mcp = [
             schema
             for schema in self.tool_registry.schemas
