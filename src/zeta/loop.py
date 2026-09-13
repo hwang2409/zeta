@@ -753,6 +753,15 @@ class AgentLoop:
             self._mcp_mount.set_prompt_refresh(self._mcp_prompt_refresh)
         self._mcp_mount_attempted = True
 
+    def attach_mcp_mount(self, mount: MCPMount) -> None:
+        """Adopt an explicitly selected mount without loading project configuration."""
+
+        if self._mcp_mount is not None:
+            raise ValueError("MCP mount already attached")
+        self._mcp_mount = mount
+        self._mcp_mount_attempted = True
+        mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
+
     def set_mcp_scope(
         self,
         *,

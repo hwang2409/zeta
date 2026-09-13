@@ -516,6 +516,10 @@ async def authorize(
     server_name: str,
     server_url: str,
     home: str | None = None,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    callback_port: int = 0,
+    scopes: tuple[str, ...] | None = None,
     resource_metadata_url: str | None = None,
     http_client: httpx.AsyncClient | None = None,
     browser_opener: BrowserOpener | None = None,
@@ -540,13 +544,15 @@ async def authorize(
             redirect_uri,
             payload,
             signal,
-        ) = await start_redirect_listener()
-        client_id, client_secret = await register_client(
-            metadata, redirect_uri, http_client=http_client
-        )
+        ) = await start_redirect_listener(**({"port": callback_port} if callback_port else {}))
+        if client_id is None:
+            client_id, client_secret = await register_client(
+                metadata, redirect_uri, http_client=http_client
+            )
         verifier, challenge = generate_pkce()
         state = secrets.token_urlsafe(24)
-        scope = " ".join(metadata.scopes_supported) if metadata.scopes_supported else None
+        requested_scopes = metadata.scopes_supported if scopes is None else scopes
+        scope = " ".join(requested_scopes) if requested_scopes else None
         url = build_authorization_url(
             metadata,
             client_id=client_id,

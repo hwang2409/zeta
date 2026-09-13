@@ -1106,6 +1106,7 @@ class MCPServerActor:
                 handler,
                 description=tool.description,
                 parameters=tool.input_schema,
+                approval_subject=self.config.approval_subjects.get(tool.name),
                 validate_arguments=False,
             )
         except (TypeError, ValueError) as exc:
