@@ -10,6 +10,7 @@ from .discovery import (
     MarkdownDocument,
     contained_path,
     discover_markdown,
+    discover_session_items,
     is_slash_safe_name,
     read_markdown,
     snapshot_metadata,
@@ -194,32 +195,20 @@ def discover_session_skills(
 ) -> SkillCatalog:
     """Discover packaged, home, and project skills for one session."""
 
-    notices: list[str] = []
-    tiers: list[list[SkillMeta]] = [
-        discover_skills(
+    skills, notices = discover_session_items(
+        home=home,
+        project_dir=project_dir,
+        packaged=lambda notices: discover_skills(
             _PACKAGED_SKILLS_DIR.parent,
             source="packaged",
             notices=notices,
             skills_dir=_PACKAGED_SKILLS_DIR,
-        )
-    ]
-    if home is not None:
-        tiers.append(discover_skills(Path(home), source="home", notices=notices))
-    if project_dir is not None:
-        tiers.append(
-            discover_skills(
-                Path(project_dir) / ".zeta", source="project", notices=notices
-            )
-        )
-
-    selected: dict[str, SkillMeta] = {}
-    for tier in tiers:
-        for skill in tier:
-            selected[skill.name] = skill
-    skills = tuple(
-        skill for tier in tiers for skill in tier if selected[skill.name] is skill
+        ),
+        discover=lambda root, source, notices: discover_skills(
+            root, source=source, notices=notices
+        ),
     )
-    return SkillCatalog(skills, tuple(notices))
+    return SkillCatalog(skills, notices)
 
 
 def discover_packaged_skills() -> SkillCatalog:

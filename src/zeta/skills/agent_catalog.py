@@ -11,6 +11,7 @@ from .discovery import (
     MarkdownDocument,
     contained_path,
     discover_markdown,
+    discover_session_items,
     read_markdown,
     snapshot_metadata,
     warn_discovery,
@@ -18,7 +19,6 @@ from .discovery import (
 
 AgentMeta = AgentPreset
 
-_PACKAGED_AGENT_NAMES = frozenset(AGENT_PRESETS)
 _CLAUDE_TOOL_NAMES = {
     "Read": "read",
     "Edit": "edit",
@@ -247,35 +247,22 @@ def discover_session_agents(
 ) -> AgentCatalog:
     """Discover packaged, home, and project agents for one session."""
 
-    notices: list[str] = []
-    packaged = [replace(preset, source="packaged") for preset in AGENT_PRESETS.values()]
-    tiers: list[list[AgentPreset]] = [packaged]
-    if home is not None:
-        tiers.append(discover_agents(Path(home), source="home", notices=notices))
-    if project_dir is not None:
-        tiers.append(
-            discover_agents(
-                Path(project_dir) / ".zeta", source="project", notices=notices
-            )
-        )
-    for tier in tiers[1:]:
-        for agent in tier:
-            if agent.name in _PACKAGED_AGENT_NAMES:
-                notices.append(
-                    warn_discovery(
-                        agent.path or Path(agent.name),
-                        "custom definition overrides packaged preset",
-                        "agent",
-                    )
-                )
-    selected: dict[str, AgentPreset] = {}
-    for tier in tiers:
-        for agent in tier:
-            selected[agent.name] = agent
-    agents = tuple(
-        agent for tier in tiers for agent in tier if selected[agent.name] is agent
+    agents, notices = discover_session_items(
+        home=home,
+        project_dir=project_dir,
+        packaged=lambda _notices: [
+            replace(preset, source="packaged") for preset in AGENT_PRESETS.values()
+        ],
+        discover=lambda root, source, notices: discover_agents(
+            root, source=source, notices=notices
+        ),
+        warn_override=lambda agent: warn_discovery(
+            agent.path or Path(agent.name),
+            "custom definition overrides packaged preset",
+            "agent",
+        ),
     )
-    return AgentCatalog(agents, tuple(notices))
+    return AgentCatalog(agents, notices)
 
 
 def discover_packaged_agents() -> AgentCatalog:

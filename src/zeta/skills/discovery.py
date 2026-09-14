@@ -6,6 +6,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import yaml
 
@@ -21,6 +22,10 @@ class MarkdownDocument:
     root: Path
     metadata: dict[str, object]
     body: str
+
+
+class NamedItem(Protocol):
+    name: str
 
 
 def is_slash_safe_name(name: str) -> bool:
@@ -174,6 +179,40 @@ def discover_markdown[Item](
     return discovered
 
 
+def discover_session_items[Item: NamedItem](
+    *,
+    home: str | Path | None,
+    project_dir: str | Path | None,
+    packaged: Callable[[list[str]], list[Item]],
+    discover: Callable[[Path, str, list[str]], list[Item]],
+    warn_override: Callable[[Item], str] | None = None,
+) -> tuple[tuple[Item, ...], tuple[str, ...]]:
+    """Discover packaged, home, and project items with last-tier precedence."""
+
+    notices: list[str] = []
+    tiers: list[list[Item]] = [packaged(notices)]
+    if home is not None:
+        tiers.append(discover(Path(home), "home", notices))
+    if project_dir is not None:
+        tiers.append(discover(Path(project_dir) / ".zeta", "project", notices))
+
+    if warn_override is not None:
+        packaged_names = {item.name for item in tiers[0]}
+        for tier in tiers[1:]:
+            for item in tier:
+                if item.name in packaged_names:
+                    notices.append(warn_override(item))
+
+    selected: dict[str, Item] = {}
+    for tier in tiers:
+        for item in tier:
+            selected[item.name] = item
+    items = tuple(
+        item for tier in tiers for item in tier if selected[item.name] is item
+    )
+    return items, tuple(notices)
+
+
 def snapshot_metadata(
     *,
     name: str,
@@ -198,6 +237,7 @@ __all__ = [
     "MarkdownDocument",
     "contained_path",
     "discover_markdown",
+    "discover_session_items",
     "is_slash_safe_name",
     "parse_frontmatter",
     "read_markdown",
