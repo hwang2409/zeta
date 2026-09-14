@@ -7,6 +7,7 @@ import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from markdown_it import MarkdownIt
@@ -31,6 +32,7 @@ from ..types import (
     ThinkingContent,
     ToolCall,
     ToolUseContent,
+    decoded_image_bytes,
     flatten_tool_content,
 )
 from . import theme
@@ -411,6 +413,35 @@ def _tool_body(event: StreamEvent) -> Text | None:
     content = _tool_content(event)
     sections, generic = _split_tool_output(content)
     result = event.tool_result
+    call = event.tool_call
+    if (
+        call is not None
+        and call.name.lower() == "read"
+        and result is not None
+        and result.structured_content is not None
+        and any(block.get("type") == "image" for block in result.content_blocks or [])
+    ):
+        image = next(
+            block for block in result.content_blocks or [] if block.get("type") == "image"
+        )
+        structured = result.structured_content or {}
+        filename = structured.get("filename")
+        if not isinstance(filename, str) or not filename:
+            path = image.get("path")
+            filename = Path(path).name if isinstance(path, str) else "image"
+        size = structured.get("bytes", image.get("size"))
+        if not isinstance(size, int):
+            data = decoded_image_bytes(image)
+            size = len(data) if data is not None else 0
+        format_name = structured.get("format")
+        if not isinstance(format_name, str) or not format_name:
+            format_name = str(image.get("mimeType", "image")).removeprefix("image/")
+        return Text(
+            f"filename={filename} bytes={size} format={format_name}",
+            style=theme.BODY,
+            overflow="ellipsis",
+            no_wrap=True,
+        )
     extra_lines: list[str] = []
     if result is not None and result.content_blocks:
         char_sizes = [
