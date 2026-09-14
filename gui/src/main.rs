@@ -1690,7 +1690,7 @@ impl ZetaView {
     }
 
     /// Pending-chip row. One chip per `composer_attachments` slot: valid
-    /// entries paint a thumbnail (or a file glyph fallback), name, size, and
+    /// entries paint a thumbnail, name, size, and
     /// a remove button; invalid entries paint an error icon, name, and the
     /// inline error message. Every dimension routes through theme tokens so
     /// the whole row scales with the appearance picker.
