@@ -28,7 +28,7 @@ def tool_prefix(server: str) -> str:
     ``__`` and never ``:``. MCP *prompts* keep ``:`` (``mount.py``) because they
     are slash commands and never reach a provider as tool names. Registration,
     unregistration and provider-schema pruning all read this one definition, so
-    they cannot drift apart.
+    they cannot drift apart the way they did before 2026-09-10.
     """
 
     return f"{server}{MCP_TOOL_SEPARATOR}"
@@ -50,6 +50,11 @@ class MCPServerConfig:
     auth_token: str | None = None
     missing_env: tuple[str, ...] = ()
     malformed_reason: str | None = None
+    client_id: str | None = None
+    client_secret: str | None = None
+    callback_port: int = 0
+    scopes: tuple[str, ...] | None = None
+    approval_subjects: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,7 +240,11 @@ def _overlay(base: MCPConfig, top: MCPConfig) -> MCPConfig:
     for name in {*top.servers, *top.skipped_servers, *top.malformed_servers}:
         for bucket in (servers, skipped, malformed):
             bucket.pop(name, None)
-    servers.update(top.servers)
+    # Project overlays cannot define the meaning of a trusted scoped grant.
+    for name, config in top.servers.items():
+        if config.approval_subjects:
+            logger.warning("ignoring project approval_subjects for MCP server %s", name)
+        servers[name] = replace(config, approval_subjects={})
     skipped.update(top.skipped_servers)
     malformed.update(top.malformed_servers)
     return MCPConfig(
@@ -293,6 +302,22 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
     auth_type = raw_auth.get("type", "none")
     if auth_type not in {"none", "bearer", "oauth"}:
         raise ValueError("auth.type must be 'none', 'bearer', or 'oauth'")
+    client_id = raw_auth.get("client_id")
+    client_secret = raw_auth.get("client_secret")
+    for key, item in (("client_id", client_id), ("client_secret", client_secret)):
+        if item is not None and (type(item) is not str or not item):
+            raise ValueError(f"auth.{key} must be a nonempty string")
+    if client_secret is not None and client_id is None:
+        raise ValueError("auth.client_secret requires client_id")
+    callback_port = raw_auth.get("callback_port", 0)
+    if type(callback_port) is not int or not 0 <= callback_port <= 65535:
+        raise ValueError("auth.callback_port must be an integer in 0..65535")
+    scopes = raw_auth.get("scopes")
+    if scopes is not None and (type(scopes) is not list or any(type(item) is not str or not item for item in scopes)):
+        raise ValueError("auth.scopes must be an array of nonempty strings")
+    subjects = value.get("approval_subjects", {})
+    if type(subjects) is not dict or any(type(key) is not str or type(item) is not str or not item for key, item in subjects.items()):
+        raise ValueError("approval_subjects must map tool names to argument names")
     token = raw_auth.get("token")
     if auth_type == "bearer" and (type(token) is not str or not token):
         raise ValueError("bearer auth requires a token")
@@ -321,6 +346,11 @@ def _parse_server(name: str, value: object) -> MCPServerConfig:
         url=url_value if type(url_value) is str else None,
         auth_type=auth_type,
         auth_token=token if type(token) is str else None,
+        client_id=client_id,
+        client_secret=client_secret,
+        callback_port=callback_port,
+        scopes=None if scopes is None else tuple(scopes),
+        approval_subjects=dict(subjects),
     )
 
 
@@ -372,7 +402,18 @@ def server_to_json(config: MCPServerConfig) -> dict[str, object]:
     if config.auth_type == "bearer" and config.auth_token is not None:
         payload["auth"] = {"type": "bearer", "token": config.auth_token}
     elif config.auth_type == "oauth":
-        payload["auth"] = {"type": "oauth"}
+        auth: dict[str, object] = {"type": "oauth"}
+        if config.client_id is not None:
+            auth["client_id"] = config.client_id
+        if config.client_secret is not None:
+            auth["client_secret"] = config.client_secret
+        if config.callback_port:
+            auth["callback_port"] = config.callback_port
+        if config.scopes is not None:
+            auth["scopes"] = list(config.scopes)
+        payload["auth"] = auth
+    if config.approval_subjects:
+        payload["approval_subjects"] = dict(config.approval_subjects)
     return payload
 
 

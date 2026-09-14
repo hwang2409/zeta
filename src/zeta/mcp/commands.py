@@ -235,6 +235,9 @@ async def run_mcp_auth(
             server_name=name,
             server_url=config.url,
             home=home,
+            **({"client_id": config.client_id, "client_secret": config.client_secret,
+                "callback_port": config.callback_port, "scopes": config.scopes}
+               if config.client_id is not None or config.callback_port or config.scopes is not None else {}),
         )
     except MCPOAuthError as exc:
         return f"mcp error: {exc}"

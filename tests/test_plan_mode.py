@@ -15,7 +15,7 @@ from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.mcp.prompt_commands import SlashModelInput
-from zeta.tools.plan_mode import PLAN_MODE_TOOLS
+from zeta.tools.plan_mode import PLAN_MODE_PREAMBLE, PLAN_MODE_TOOLS
 from zeta.tui.app import create_app
 from zeta.tui.render import format_status
 from zeta.types import StreamEvent, TextContent, ToolCall
@@ -118,7 +118,11 @@ def test_plan_mode_wraps_and_restores_the_system_prompt(tmp_path: Path) -> None:
     )
     assert "PLAN MODE" in text
     assert "deliver" in text
-    assert "approve" not in text
+    # ZETA-65 deleted the approval-gated exit, so the plan-mode preamble must
+    # never tell the model to seek approval. Scope this to the preamble: the
+    # identity block legitimately says "approve" about arming automations, and
+    # asserting over the whole composed prompt made unrelated prompt edits fail.
+    assert "approve" not in PLAN_MODE_PREAMBLE
     loop.set_plan_mode(False)
     assert loop.context_assembler.system_prompt is original
 

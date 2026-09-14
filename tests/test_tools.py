@@ -147,7 +147,7 @@ async def test_builtin_tools_read_and_exec_use_session_cwd(tmp_path: Path) -> No
     assert read_result["content"][0]["text"] == "two"
     assert exec_result["isError"] is False
     assert str(tmp_path) in exec_result["content"][0]["text"]
-    assert "not a sandbox" in registry.schemas[2]["description"]
+    assert "not a sandbox" in registry.definitions_by_name["exec"].description
 
 
 @pytest.mark.asyncio
