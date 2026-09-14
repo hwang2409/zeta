@@ -1,7 +1,9 @@
 import asyncio
 import base64
 import io
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
@@ -11,6 +13,8 @@ from zeta.core.store import ConversationStore
 from zeta.providers.anthropic import build_messages_payload
 from zeta.providers.codex import build_responses_payload
 from zeta.tools import ToolRegistry
+from zeta.tools.read import IMAGE_MAX_BYTES
+from zeta.tui.checkpoints import CheckpointTranscriptMixin
 from zeta.tui.render import render_event
 from zeta.types import (
     ImageContent,
@@ -21,6 +25,7 @@ from zeta.types import (
     TextContent,
     ToolCall,
     ToolResult,
+    detect_image_media_type,
 )
 
 PNG = bytes.fromhex(
@@ -82,6 +87,26 @@ async def test_read_keeps_text_behavior_for_non_images(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_falls_back_for_webp_lookalike_text(tmp_path: Path) -> None:
+    path = tmp_path / "note.bin"
+    path.write_bytes(b"RIFFxxxxWEBPthis is UTF-8 text\n")
+
+    result = await ToolRegistry(tmp_path).execute(
+        ToolCall("read-lookalike", "read", {"path": path.name})
+    )
+
+    assert result["isError"] is False
+    assert result["content"][0]["text"] == "RIFFxxxxWEBPthis is UTF-8 text"
+
+
+def test_png_lookalike_fails_full_image_validation() -> None:
+    data = b"\x89PNG\r\n\x1a\nthis is UTF-8 text"
+
+    assert detect_image_media_type(data) == "image/png"
+    assert detect_image_media_type(data, complete=True) is None
+
+
+@pytest.mark.asyncio
 async def test_read_rejects_oversized_images_with_size_and_cap(tmp_path: Path) -> None:
     path = tmp_path / "large.png"
     path.write_bytes(PNG + b"x" * (4 * 1024 * 1024))
@@ -114,11 +139,43 @@ async def test_read_rejects_paging_arguments_for_images(
     )
 
 
+@pytest.mark.asyncio
+async def test_read_image_near_cap_fits_default_context_budget(tmp_path: Path) -> None:
+    path = tmp_path / "near-cap.png"
+    path.write_bytes(PNG + b"x" * (IMAGE_MAX_BYTES - len(PNG)))
+
+    result = await ToolRegistry(tmp_path).execute(
+        ToolCall("read-near-cap", "read", {"path": path.name})
+    )
+    assert result["isError"] is False
+
+    blocks = result["content"]
+    receipt = blocks[0]["text"]
+    store = ConversationStore(tmp_path, session_id="near-cap-session")
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            tool_result=ToolResult(
+                "read-near-cap",
+                receipt,
+                content_blocks=blocks,
+                structured_content=result["structuredContent"],
+            ),
+        )
+    )
+
+    assembled = await ContextAssembler(store).assemble()
+
+    assert assembled[0].tool_result is not None
+    assert assembled[0].tool_result.content_blocks is not None
+    assert len(assembled[0].tool_result.content_blocks[1]["data"]) > 5_000_000
+
+
 def _image_tool_result(data: bytes = PNG) -> ToolResult:
     encoded = base64.b64encode(data).decode("ascii")
     return ToolResult(
         "read-call",
-        "",
+        "filename=screenshot.png bytes=70 format=png",
         content_blocks=[
             {
                 "type": "text",
@@ -228,4 +285,62 @@ def test_tui_renders_compact_image_read_card() -> None:
     output = io.StringIO()
     Console(file=output, width=100, force_terminal=False).print(rendered)
 
-    assert "filename=screenshot.png bytes=70 format=png" in output.getvalue()
+    assert output.getvalue().count("filename=screenshot.png bytes=70 format=png") == 1
+
+
+@pytest.mark.parametrize("corruption", ["missing", "invalid"])
+def test_corrupt_stored_image_block_keeps_receipt(
+    tmp_path: Path, corruption: str
+) -> None:
+    store = ConversationStore(tmp_path, session_id="corrupt-image")
+    store.append_message(
+        Message(MessageRole.TOOL_RESULT, tool_result=_image_tool_result())
+    )
+    rows = store.path.read_text().splitlines()
+    row = json.loads(rows[1])
+    block = row["data"]["message"]["tool_result"]["content_blocks"][1]
+    if corruption == "missing":
+        del block["data"]
+    else:
+        block["data"] = "not-base64"
+    rows[1] = json.dumps(row)
+    store.path.write_text("\n".join(rows) + "\n")
+
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    result = reopened.messages()[0].tool_result
+    assert result is not None
+    assert result.content == "filename=screenshot.png bytes=70 format=png"
+    assert result.content_blocks == [
+        {
+            "type": "text",
+            "text": "filename=screenshot.png bytes=70 format=png",
+            "truncated": False,
+            "full_size": 43,
+        }
+    ]
+
+
+def test_tui_resume_renders_receipt_for_corrupt_stored_image(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="tui-corrupt-image")
+    store.append_message(
+        Message(MessageRole.TOOL_RESULT, tool_result=_image_tool_result())
+    )
+    rows = store.path.read_text().splitlines()
+    row = json.loads(rows[1])
+    del row["data"]["message"]["tool_result"]["content_blocks"][1]["data"]
+    rows[1] = json.dumps(row)
+    store.path.write_text("\n".join(rows) + "\n")
+    reopened = ConversationStore(tmp_path, session_id=store.session_id)
+
+    app = object.__new__(CheckpointTranscriptMixin)
+    printed: list[object] = []
+    app.loop = SimpleNamespace(store=reopened)
+    app._presenter = SimpleNamespace(clear=lambda: None)
+    app._failed_turn = None
+    app._print_unit = printed.append
+    app._print_system = printed.append
+
+    app._rebuild_transcript()
+
+    assert len(printed) == 1

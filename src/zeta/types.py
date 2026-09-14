@@ -409,6 +409,26 @@ SUPPORTED_IMAGE_MEDIA_TYPES = frozenset(
 )
 
 
+def detect_image_media_type(data: bytes, *, complete: bool = False) -> str | None:
+    """Detect a supported image, optionally requiring a complete payload."""
+
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime_type = "image/png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        mime_type = "image/jpeg"
+    elif data.startswith((b"GIF87a", b"GIF89a")):
+        mime_type = "image/gif"
+    elif len(data) >= 4 and data[:4] == b"RIFF" and (
+        len(data) < 12 or data[8:12] == b"WEBP"
+    ):
+        mime_type = "image/webp"
+    else:
+        return None
+    if complete and not image_signature_matches(mime_type, data):
+        return None
+    return mime_type
+
+
 def image_signature_matches(mime_type: str, data: bytes) -> bool:
     if mime_type == "image/png":
         return (
@@ -710,6 +730,11 @@ class ToolResult:
                         validate_tool_content_block(index, block)
                     )
                 except ValueError as exc:
+                    # Historical tool results keep their receipt if an image
+                    # payload is no longer usable. New results stay strict in
+                    # validate_tool_result before they reach this loader.
+                    if isinstance(block, dict) and block.get("type") == "image":
+                        continue
                     raise ValueError(
                         f"tool result content block is invalid: {exc}"
                     ) from exc

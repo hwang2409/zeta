@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
 from ..core.abort import AbortSignal
-from ..types import StructuredToolResult
+from ..types import StructuredToolResult, detect_image_media_type
 from ._sandbox import open_target
 from .registry import (
     ToolRegistry,
@@ -27,20 +27,6 @@ class _Digest(Protocol):
 
 
 IMAGE_MAX_BYTES = 4 * 1024 * 1024
-
-
-def _image_media_type(header: bytes) -> str | None:
-    """Return the media type from a file signature, without decoding pixels."""
-
-    if header.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if header.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if header.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
-        return "image/webp"
-    return None
 
 
 async def _read_handle(
@@ -155,8 +141,23 @@ async def _read(
                 raise
             with handle:
                 file_size = os.fstat(file_descriptor).st_size
-                media_type = _image_media_type(os.pread(file_descriptor, 12, 0))
-                if media_type is not None:
+                sniffed_type = detect_image_media_type(
+                    os.pread(file_descriptor, 12, 0)
+                )
+                if sniffed_type is not None:
+                    data = handle.read(IMAGE_MAX_BYTES + 1)
+                    media_type = detect_image_media_type(data, complete=True)
+                    if media_type is None:
+                        handle.seek(0)
+                        return await _read_handle(
+                            handle,
+                            resolved_path,
+                            offset,
+                            limit,
+                            output,
+                            digest,
+                            abort_signal,
+                        )
                     if "offset" in arguments or "limit" in arguments:
                         raise ValueError(
                             "offset and limit are not supported for image reads"
@@ -166,7 +167,6 @@ async def _read(
                             f"image is {file_size} bytes; cap is "
                             f"{IMAGE_MAX_BYTES} bytes (4 MiB)"
                         )
-                    data = handle.read()
                     if len(data) > IMAGE_MAX_BYTES:
                         raise ValueError(
                             f"image is {len(data)} bytes; cap is "

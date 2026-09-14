@@ -58,9 +58,44 @@ class _ContextItem:
     fixed: bool = False
 
 
+IMAGE_TOKEN_ESTIMATE = 1024
+
+
 def _message_token_count(message: Message) -> int:
-    encoded = json.dumps(message.to_dict(), sort_keys=True, separators=(",", ":"))
-    return max(1, ceil(len(encoded) / 4))
+    """Estimate text tokens and charge a small fixed amount per image.
+
+    Base64 is transport data, not text. Without image dimensions, use a fixed
+    estimate that keeps images near the 4 MiB transport cap usable.
+    """
+
+    value = message.to_dict()
+    image_count = 0
+    content = value.get("content")
+    if isinstance(content, list):
+        for index, block in enumerate(content):
+            if isinstance(block, dict) and block.get("type") == "image":
+                content[index] = {
+                    key: item for key, item in block.items() if key != "data"
+                }
+                image_count += 1
+    tool_result = value.get("tool_result")
+    if isinstance(tool_result, dict):
+        blocks = tool_result.get("content_blocks")
+        if isinstance(blocks, list):
+            tool_result["content_blocks"] = [
+                {
+                    key: item for key, item in block.items() if key != "data"
+                }
+                if isinstance(block, dict) and block.get("type") == "image"
+                else block
+                for block in blocks
+            ]
+            image_count += sum(
+                isinstance(block, dict) and block.get("type") == "image"
+                for block in blocks
+            )
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return max(1, ceil(len(encoded) / 4) + image_count * IMAGE_TOKEN_ESTIMATE)
 
 
 def _digest(messages: Sequence[Message]) -> str:
