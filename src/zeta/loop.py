@@ -295,7 +295,7 @@ class AgentLoop:
         )
         self.max_turns = max_turns
         if system_prompt is None:
-            system_prompt = load_identity()
+            system_prompt = load_identity(catalog=self.tool_registry.skill_catalog)
         self.context_assembler = context_assembler or ContextAssembler(
             store,
             token_budget=token_budget,

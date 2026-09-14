@@ -19,7 +19,11 @@ from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..settings import load_settings
 from ..settings import resolve as resolve_settings
-from ..skill_catalog import SkillCatalog, discover_session_skills
+from ..skill_catalog import (
+    SkillCatalog,
+    discover_session_skills,
+    replace_skill_index,
+)
 from ..types import CompletionBackend, StreamEvent
 from .fake_backend import ServerFakeBackend
 
@@ -228,6 +232,15 @@ class ServerRuntime:
                 skill_catalog = discover_session_skills(
                     home=self.home,
                     project_dir=discover_repo_root(Path(opened.metadata.cwd)),
+                )
+                self.manager.persist_skill_catalog(
+                    opened.metadata,
+                    skill_catalog,
+                    system_prompt=(
+                        replace_skill_index(opened.metadata.system_prompt, skill_catalog)
+                        if opened.metadata.system_prompt
+                        else None
+                    ),
                 )
             else:
                 skill_catalog = SkillCatalog.from_snapshot(

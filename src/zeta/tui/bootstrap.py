@@ -25,7 +25,11 @@ from ..core.session import (
 from ..runtime import compose_runtime
 from ..settings import ResolvedConfig
 from ..settings import resolve as resolve_settings
-from ..skill_catalog import SkillCatalog, discover_session_skills
+from ..skill_catalog import (
+    SkillCatalog,
+    discover_session_skills,
+    replace_skill_index,
+)
 from . import theme as _theme
 from .key_bindings import KeybindingError, resolve_keybindings
 from .layout import content_width, resume_picker_line
@@ -260,7 +264,6 @@ def _create_app_with_root(
     _validate_keybindings(config.keybindings)
     startup_notices = (
         tuple(loaded_settings.notices)
-        + skill_catalog.notices
         + project_context.notices
         + external_tools.notices
         + theme_notices
@@ -316,7 +319,15 @@ def _session_skill_catalog(
         catalog = discover_session_skills(
             home=home, project_dir=discover_repo_root(Path(metadata.cwd))
         )
-        persisted = manager.persist_skill_catalog(metadata, catalog)
+        persisted = manager.persist_skill_catalog(
+            metadata,
+            catalog,
+            system_prompt=(
+                replace_skill_index(metadata.system_prompt, catalog)
+                if metadata.system_prompt
+                else None
+            ),
+        )
         try:
             return SkillCatalog.from_snapshot(persisted.skill_catalog)
         except ValueError as exc:

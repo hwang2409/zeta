@@ -8,6 +8,8 @@ from ..skill_catalog import (
     discover_session_skills,
     discover_skills,
     load_skill,
+    load_skill_prompt,
+    replace_skill_index,
 )
 
 __all__ = [
@@ -18,4 +20,6 @@ __all__ = [
     "discover_session_skills",
     "discover_skills",
     "load_skill",
+    "load_skill_prompt",
+    "replace_skill_index",
 ]

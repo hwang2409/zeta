@@ -75,7 +75,9 @@ def test_malformed_skill_frontmatter_is_skipped(
 
 @pytest.mark.asyncio
 async def test_skill_tool_loads_and_reports_unknown_name(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path)
+    from zeta.skills.loader import discover_packaged_skills
+
+    registry = ToolRegistry(tmp_path, skill_catalog=discover_packaged_skills())
 
     loaded = await registry.execute(ToolCall("skill-load", "skill", {"name": "review"}))
     unknown = await registry.execute(
@@ -239,6 +241,35 @@ def test_symlinked_skills_root_can_point_to_a_complete_skills_tree(
     assert load_skill(skills[0]) == "review body"
 
 
+def test_skill_load_rejects_replaced_discovery_root(tmp_path: Path) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_skill(skills_dir / "review.md", "review", "inside body")
+    skill = discover_skills(tmp_path)[0]
+    outside = tmp_path / "outside"
+    _write_skill(outside / "review.md", "review", "outside body")
+
+    skills_dir.rename(tmp_path / "original-skills")
+    skills_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="outside skills root"):
+        load_skill(skill)
+    restored = SkillCatalog.from_snapshot(SkillCatalog((skill,)).to_snapshot())
+    with pytest.raises(ValueError, match="outside skills root"):
+        load_skill(restored.find("review"))
+
+
+def test_discovery_skips_names_that_cannot_be_invoked_as_slash_commands(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    path = tmp_path / "skills" / "two-words.md"
+    path.parent.mkdir()
+    _write_skill(path, "two words", "body")
+
+    assert discover_skills(tmp_path) == []
+    assert "must be one nonempty word" in caplog.text
+
+
 def test_home_directory_named_skills_still_uses_nested_skills_directory(
     tmp_path: Path,
 ) -> None:
@@ -261,9 +292,7 @@ def test_malformed_skill_is_skipped_with_warning(
     assert f"ignored skill {bad}" in caplog.text
 
 
-def test_session_catalog_rediscovery_is_not_cached(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_session_catalog_is_selected_once_per_session(tmp_path: Path) -> None:
     first_home = tmp_path / "first"
     second_home = tmp_path / "second"
     _write_skill(first_home / "skills" / "first.md", "first", "first")
@@ -277,10 +306,8 @@ def test_session_catalog_rediscovery_is_not_cached(
 
     from zeta.prompts import load_identity
 
-    monkeypatch.setenv("ZETA_HOME", str(first_home))
-    first_prompt = load_identity()
-    monkeypatch.setenv("ZETA_HOME", str(second_home))
-    second_prompt = load_identity()
+    first_prompt = load_identity(catalog=first)
+    second_prompt = load_identity(catalog=second)
     assert "first description" in first_prompt
     assert "first description" not in second_prompt
     assert "second description" in second_prompt

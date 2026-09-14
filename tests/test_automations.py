@@ -431,8 +431,13 @@ async def test_unattended_runtime_ignores_global_yolo_hooks_and_project_tools(
     (tmp_path / "settings.toml").write_text(
         'yolo = true\n[approval]\nallow = ["bash"]\n'
     )
+    catalog = discover_session_skills(home=tmp_path)
     session = SessionManager(tmp_path).create(
-        provider="fake", model="fake", cwd=tmp_path
+        provider="fake",
+        model="fake",
+        cwd=tmp_path,
+        system_prompt=load_identity(catalog=catalog),
+        skill_catalog=catalog,
     )
     loop = build_unattended_loop(
         session, home=tmp_path, allow=(), backend=FakeBackend([])

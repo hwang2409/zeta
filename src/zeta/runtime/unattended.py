@@ -6,7 +6,7 @@ from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.session import OpenedSession, SessionManager
 from ..loop import AgentLoop
 from ..providers.factory import build_backend
-from ..skill_catalog import SkillCatalog, discover_session_skills
+from ..skill_catalog import SkillCatalog
 from ..tools import ToolRegistry
 from ..types import CompletionBackend
 
@@ -25,17 +25,17 @@ def build_unattended_loop(
     policy = ApprovalPolicy(
         store=store, default=ApprovalDecision.DENY, always_allow=allow
     )
+    if skill_catalog is None:
+        if session.metadata.skill_catalog is None:
+            raise ValueError("unattended sessions require a skill catalog")
+        skill_catalog = SkillCatalog.from_snapshot(session.metadata.skill_catalog)
     registry = ToolRegistry(
         metadata.cwd,
         session_store=store,
         approval_store=store,
         approval_policy=policy,
         enforce_approvals=True,
-        skill_catalog=(
-            skill_catalog
-            if skill_catalog is not None
-            else discover_session_skills(home=home)
-        ),
+        skill_catalog=skill_catalog,
     )
     return AgentLoop(
         backend,

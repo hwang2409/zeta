@@ -16,7 +16,7 @@ from ..mcp.prompt_commands import (
     SlashPromptError,
     dispatch_prompt,
 )
-from ..skill_catalog import SkillCatalog, SkillMeta, discover_session_skills, load_skill
+from ..skill_catalog import SkillCatalog, SkillMeta, load_skill_prompt
 from ..types import Message, MessageRole, StreamEventType, TextContent
 from .commands.custom_commands import (
     COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
@@ -682,7 +682,7 @@ class SlashCommandRegistry:
         custom = self._custom_commands.get(parts[0])
         skill = self._skills.get(parts[0])
         if skill is not None:
-            return SlashModelInput(load_skill(skill))
+            return SlashModelInput(load_skill_prompt(skill))
         prompt = self._mcp_prompts.get(parts[0])
         if prompt is not None:
             return dispatch_prompt(
@@ -1040,10 +1040,5 @@ def create_slash_registry(
     registry._notices.extend(result.notices)
     for command in result.commands:
         registry.register_custom(command)
-    registry.register_skills(
-        skill_catalog
-        or discover_session_skills(
-            home=effective_home, project_dir=project_dir or Path.cwd()
-        )
-    )
+    registry.register_skills(skill_catalog or SkillCatalog(()))
     return registry

@@ -32,6 +32,7 @@ from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.providers import PROVIDER_MODELS
 from zeta.providers.usage import normalize_usage
+from zeta.skill_catalog import discover_session_skills
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings
 from zeta.tui.composer import SlashCompleter
@@ -93,7 +94,11 @@ def test_skill_slash_commands_follow_collision_precedence(tmp_path: Path) -> Non
     command_dir.mkdir(parents=True)
     (command_dir / "custom.md").write_text("custom command", encoding="utf-8")
 
-    registry = create_slash_registry(zeta_home=home, project_dir=project)
+    registry = create_slash_registry(
+        zeta_home=home,
+        project_dir=project,
+        skill_catalog=discover_session_skills(home=home, project_dir=project),
+    )
 
     result = registry.dispatch(session(), "/unique")
     assert isinstance(result, SlashModelInput)
@@ -110,7 +115,10 @@ def test_skill_slash_commands_follow_collision_precedence(tmp_path: Path) -> Non
 def test_skill_commands_appear_in_completer_with_source_badge(tmp_path: Path) -> None:
     project = tmp_path / "project"
     _write_skill(project / ".zeta" / "skills" / "unique.md", "unique", "unique body")
-    registry = create_slash_registry(project_dir=project)
+    registry = create_slash_registry(
+        project_dir=project,
+        skill_catalog=discover_session_skills(project_dir=project),
+    )
 
     completions = list(
         SlashCompleter(registry).get_completions(
@@ -121,6 +129,21 @@ def test_skill_commands_appear_in_completer_with_source_badge(tmp_path: Path) ->
     assert len(completions) == 1
     assert completions[0].text == "unique"
     assert "[project] unique description" in str(completions[0].display_meta)
+
+
+def test_directory_skill_slash_load_reports_resource_directory(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / "bundle"
+    _write_skill(skill_dir / "SKILL.md", "bundle", "bundle body")
+    catalog = discover_session_skills(home=tmp_path)
+    registry = create_slash_registry(skill_catalog=catalog)
+
+    result = registry.dispatch(session(), "/bundle")
+
+    assert isinstance(result, SlashModelInput)
+    assert result.text == (
+        "bundle body\n\nSkill resources directory: "
+        f"{skill_dir.resolve()}"
+    )
 
 
 @pytest.mark.asyncio

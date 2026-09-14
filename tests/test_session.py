@@ -140,6 +140,40 @@ def test_legacy_resume_persists_context_snapshot(
     assert saved["context_files"] == [str(context_file.resolve())]
 
 
+def test_legacy_resume_migrates_prompt_index_with_skill_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    skill_path = home / "skills" / "legacy.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text(
+        "---\nname: legacy\ndescription: legacy skill\n---\n\nlegacy body\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    legacy_prompt = (
+        "legacy prompt\n\n<zeta-skills>\nAvailable skills:\n- old: old skill\n"
+        "</zeta-skills>\n\nlegacy tail"
+    )
+    opened = SessionManager(home).create(
+        provider="fake",
+        model="offline",
+        cwd=tmp_path,
+        system_prompt=legacy_prompt,
+    )
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
+    )
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+
+    assert "legacy prompt" in prompt
+    assert "legacy: legacy skill" in prompt
+    assert "- old: old skill" not in prompt
+    assert "legacy tail" in prompt
+
+
 def test_legacy_resume_uses_persisted_snapshot_on_second_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

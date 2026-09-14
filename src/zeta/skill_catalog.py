@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 
@@ -21,6 +21,8 @@ class SkillMeta:
     keywords: list[str]
     path: Path
     source: str = ""
+    # Keep the discovery root independent from later filesystem changes.
+    skills_root: Path | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +78,9 @@ class SkillCatalog:
                 "keywords": list(skill.keywords),
                 "path": str(skill.path),
                 "source": skill.source,
+                "skills_root": str(
+                    skill.skills_root or skill.path.parent
+                ),
             }
             for skill in self.skills
         ]
@@ -95,6 +100,11 @@ class SkillCatalog:
             keywords = item.get("keywords")
             path = item.get("path")
             source = item.get("source", "")
+            skills_root = item.get("skills_root")
+            if skills_root is None:
+                # Older snapshots stored resolved skill paths. Their parent
+                # remains a stable root even if the original directory moves.
+                skills_root = str(Path(path).parent) if type(path) is str else None
             if (
                 type(name) is not str
                 or type(description) is not str
@@ -102,6 +112,7 @@ class SkillCatalog:
                 or any(type(keyword) is not str for keyword in keywords)
                 or type(path) is not str
                 or type(source) is not str
+                or type(skills_root) is not str
             ):
                 raise ValueError("skill catalog snapshot entry is invalid")
             skills.append(
@@ -111,6 +122,7 @@ class SkillCatalog:
                     keywords=keywords,
                     path=Path(path),
                     source=source,
+                    skills_root=Path(skills_root),
                 )
             )
         return cls(tuple(skills))
@@ -200,8 +212,9 @@ def discover_skills(
                 name=name,
                 description=metadata["description"],
                 keywords=metadata["keywords"],
-                path=path.resolve(),
+                path=path.absolute(),
                 source=source,
+                skills_root=skills_root,
             )
         )
     return discovered
@@ -258,9 +271,34 @@ def load_skill(meta: SkillMeta) -> str:
     """Load the prompt body for one discovered skill."""
 
     document = _document_path(meta.path)
-    resolved_document = _contained_path(document, meta.path.parent.resolve())
+    skills_root = meta.skills_root or meta.path.parent
+    resolved_document = _contained_path(document, skills_root)
     _, body = _read_skill(resolved_document)
     return body
+
+
+def load_skill_prompt(meta: SkillMeta) -> str:
+    """Load a skill body and expose resources for directory skills."""
+
+    body = load_skill(meta)
+    if meta.path.is_dir():
+        body += f"\n\nSkill resources directory: {meta.path}"
+    return body
+
+
+def replace_skill_index(prompt: str, catalog: SkillCatalog) -> str:
+    """Replace only the skill index in a saved system prompt."""
+
+    start_marker = "<zeta-skills>"
+    end_marker = "</zeta-skills>"
+    start = prompt.find(start_marker)
+    if start < 0:
+        return prompt
+    end = prompt.find(end_marker, start)
+    if end < 0:
+        return prompt
+    end += len(end_marker)
+    return prompt[:start] + catalog.index() + prompt[end:]
 
 
 def _warn_skill(path: Path, error: Exception) -> str:
@@ -302,6 +340,10 @@ def _parse_frontmatter(lines: list[str], path: Path) -> dict[str, str | list[str
     name = values["name"]
     if type(name) is not str or not name.strip():
         raise ValueError(f"skill {path} frontmatter name must be a nonempty string")
+    if any(character.isspace() for character in name):
+        raise ValueError(
+            f"skill {path} frontmatter name must be one nonempty word"
+        )
     description = values["description"]
     if type(description) is not str or not description.strip():
         raise ValueError(
@@ -323,4 +365,6 @@ __all__ = [
     "discover_session_skills",
     "discover_skills",
     "load_skill",
+    "load_skill_prompt",
+    "replace_skill_index",
 ]

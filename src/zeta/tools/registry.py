@@ -49,7 +49,7 @@ from ..execution import (
     build_execution_arguments,
     run_handler_with_abort,
 )
-from ..skill_catalog import SkillCatalog, discover_packaged_skills
+from ..skill_catalog import SkillCatalog
 from ..types import (
     StructuredContentValue,
     StructuredToolResult,
@@ -466,7 +466,7 @@ class ToolRegistry:
             session_store.bash_cwd if session_store is not None else str(self.cwd)
         )
         self._tools: dict[str, ToolDefinition] = {}
-        self.skill_catalog = skill_catalog or discover_packaged_skills()
+        self.skill_catalog = skill_catalog if skill_catalog is not None else SkillCatalog(())
         self._register_builtin = register_builtin
         if register_builtin:
             _register_discovered_tools(self)

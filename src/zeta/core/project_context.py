@@ -209,7 +209,7 @@ def load_project_context(
         sections: list[str] = [system_override]
     else:
         sections = [
-            load_identity(home=home, project_dir=stop_at, catalog=catalog)
+            load_identity(catalog=catalog)
         ]
         candidates: list[Path] = []
         home_agents = home / AGENTS_FILENAME
