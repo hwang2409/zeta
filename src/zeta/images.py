@@ -375,7 +375,15 @@ def image_dimensions(
 
 
 def _webp_dimensions(data: bytes) -> tuple[int, int] | None:
-    return _parse_webp(data, len(data))[1]
+    if len(data) < 20 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    chunk_type = data[12:16]
+    chunk_size = int.from_bytes(data[16:20], "little")
+    if chunk_type not in {b"VP8 ", b"VP8L", b"VP8X"}:
+        return None
+    if len(data) < 20 + chunk_size:
+        return None
+    return _webp_chunk_dimensions(data, chunk_type, 20, chunk_size)
 
 
 def image_description(
