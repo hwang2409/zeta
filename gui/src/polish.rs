@@ -64,6 +64,20 @@ pub fn approval_summary(call: &ToolCall) -> Option<String> {
     })
 }
 
+/// Short byte-size label for composer chips ("512 B", "42 KB", "0.3 MB").
+/// Kept alongside the composer thumbnail helper so the chip's two visible
+/// pieces travel through the same module. Never returns a negative or a
+/// fractional byte count.
+pub fn format_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 pub fn image_source(image: &ImageAttachment) -> Option<Arc<gpui::Image>> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&image.data)

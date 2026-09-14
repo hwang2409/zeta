@@ -2,10 +2,34 @@
 use super::*;
 use gpui_kit::test::TestWindowExt;
 
+/// Encode a tiny checkerboard PNG for the ZETA-112 attachment-chrome shot.
+/// A one-shot helper — the smoke driver seeds a real attachment so the
+/// chip decodes into a Valid variant with a live thumbnail (the only path
+/// that paints a preview; a decode failure would surface as an error chip
+/// instead).
+fn png_seed_bytes() -> Vec<u8> {
+    let pixels = image::RgbaImage::from_fn(48, 32, |x, y| {
+        if ((x / 8) + (y / 8)) % 2 == 0 {
+            image::Rgba([210, 180, 90, 255])
+        } else {
+            image::Rgba([40, 40, 50, 255])
+        }
+    });
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    pixels
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("encode seed png");
+    bytes.into_inner()
+}
+
 pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     let Some(path) = env::var_os("ZETA_GUI_SMOKE_IMAGE") else {
         return;
     };
+    // Optional second capture — the ZETA-112 composer chrome with pending
+    // attachment chips visible, before the settings modal covers them. Emits
+    // a separate PNG so the primary shot stays comparable with prior tickets.
+    let attachment_path = env::var_os("ZETA_GUI_SMOKE_ATTACHMENT_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -85,6 +109,64 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                 phase = 3;
                             }
                             3 => {
+                                // ZETA-112 attachment capture — seed a mixed
+                                // batch (one valid chip with a real decoded
+                                // thumbnail, one decode-failure chip whose
+                                // header parses but whose body cannot decode,
+                                // and one format-reject chip) so the shot
+                                // proves the typed pending model: a valid
+                                // chip always paints a thumbnail, and every
+                                // failure mode surfaces its own error chip.
+                                // Clear before the modal shot below so the
+                                // primary after-screenshot stays unchanged.
+                                if let Some(ref attach_path) = attachment_path {
+                                    entity.update(cx, |view, cx| {
+                                        // The `add_pending_attachments` guard
+                                        // requires a live connection and an
+                                        // idle turn — the smoke driver's prior
+                                        // phase deliberately synthesises a
+                                        // lost-connection banner, so lift the
+                                        // guard to attach the seeded chips.
+                                        view.state.streaming = false;
+                                        view.state.connection = ConnectionState::Connected;
+                                        let mut items: Vec<
+                                            Result<
+                                                zeta_gui::session::ImageAttachment,
+                                                (String, String),
+                                            >,
+                                        > = Vec::new();
+                                        if let Ok(image) =
+                                            zeta_gui::session::ImageAttachment::from_bytes(
+                                                "diagram.png".into(),
+                                                &png_seed_bytes(),
+                                            )
+                                        {
+                                            items.push(Ok(image));
+                                        }
+                                        if let Ok(broken) =
+                                            zeta_gui::session::ImageAttachment::from_bytes(
+                                                "sketch.png".into(),
+                                                b"\x89PNG\r\n\x1a\n",
+                                            )
+                                        {
+                                            items.push(Ok(broken));
+                                        }
+                                        items.push(Err((
+                                            "notes.bmp".into(),
+                                            "choose a PNG, JPEG, GIF, or WebP image".into(),
+                                        )));
+                                        view.add_pending_attachments(items, cx);
+                                    });
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer capture")
+                                        .save(PathBuf::from(attach_path))
+                                        .expect("save attachment screenshot");
+                                    entity.update(cx, |view, cx| {
+                                        view.clear_composer_images(cx);
+                                    });
+                                }
                                 entity.update(cx, |view, cx| {
                                     view.state.connection = ConnectionState::Connected;
                                     view.settings_open = true;
