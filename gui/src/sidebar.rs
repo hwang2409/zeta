@@ -154,6 +154,7 @@ impl ZetaView {
                         .debug_selector(|| "sidebar-truncated".into())
                         .px(theme::SIDEBAR_ROW_PADDING_X)
                         .py(theme::SIDEBAR_ROW_PADDING_Y)
+                        .text_size(theme::label_small(cx.theme().font_size))
                         .text_color(theme::palette::text_faint())
                         .child("Showing a partial session list"),
                 )
@@ -164,6 +165,7 @@ impl ZetaView {
                         .debug_selector(|| "sidebar-hint-no-session".into())
                         .px(theme::SIDEBAR_ROW_PADDING_X)
                         .py(theme::SIDEBAR_ROW_PADDING_Y)
+                        .text_size(theme::label_small(cx.theme().font_size))
                         .text_color(theme::palette::text_faint())
                         .child("Create or select a session to use Settings"),
                 )
@@ -221,6 +223,7 @@ impl ZetaView {
             .border_color(cx.theme().sidebar_border)
             .child(
                 div()
+                    .text_size(theme::title(cx.theme().font_size))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(cx.theme().foreground)
                     .child("zeta"),
@@ -344,6 +347,7 @@ impl ZetaView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
+                    .text_size(theme::label(cx.theme().font_size))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(label),
             )
@@ -351,6 +355,7 @@ impl ZetaView {
                 div()
                     .flex_shrink_0()
                     .pl_2()
+                    .text_size(theme::label_small(cx.theme().font_size))
                     .text_color(if focused {
                         cx.theme().primary_foreground
                     } else {
@@ -521,6 +526,7 @@ impl ZetaView {
             .px(theme::SIDEBAR_ROW_PADDING_X)
             .pt_3()
             .pb_1()
+            .text_size(theme::label_small(cx.theme().font_size))
             .text_color(theme::palette::text_faint())
             .child("Branches");
         // The branches strip is the bottom-most sidebar surface — the
@@ -599,6 +605,7 @@ impl ZetaView {
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            .text_size(theme::label(cx.theme().font_size))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(label),
                     )

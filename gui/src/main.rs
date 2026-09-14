@@ -1245,6 +1245,7 @@ impl ZetaView {
                             .when(model == &view.current_model, |row| {
                                 row.child(
                                     div()
+                                        .text_size(theme::label_small(cx.theme().font_size))
                                         .text_color(cx.theme().muted_foreground)
                                         .child("current"),
                                 )
@@ -1340,11 +1341,16 @@ impl ZetaView {
                     .disabled(!can_grow)
                     .on_click(cx.listener(|view, _, _, cx| view.adjust_font_size(1., cx))),
             )
-            .child(div().text_color(cx.theme().muted_foreground).child(format!(
-                "range {}-{}px",
-                theme::MIN_FONT_SIZE_PX as i32,
-                theme::MAX_FONT_SIZE_PX as i32
-            )));
+            .child(
+                div()
+                    .text_size(theme::label_small(cx.theme().font_size))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "range {}-{}px",
+                        theme::MIN_FONT_SIZE_PX as i32,
+                        theme::MAX_FONT_SIZE_PX as i32,
+                    )),
+            );
         let pending = self.pending_command;
         let error = self.settings_error.clone();
         div()
@@ -1949,7 +1955,7 @@ impl ZetaView {
             .debug_selector(|| "composer-drop-target".into())
             .child(
                 div()
-                    .text_size(base_size)
+                    .text_size(theme::body(base_size))
                     .text_color(cx.theme().foreground)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(chrome::DROP_TARGET_TITLE),
@@ -1991,6 +1997,7 @@ impl ZetaView {
             .model
             .clone()
             .unwrap_or_else(|| "—".into());
+        let base_size = cx.theme().font_size;
         div()
             .id("run-header")
             .debug_selector(|| "run-header".into())
@@ -2003,6 +2010,7 @@ impl ZetaView {
             .px(px(14.))
             .border_b_1()
             .border_color(cx.theme().border)
+            .text_size(theme::label_small(base_size))
             .child(
                 // Session title — the primary identity of the run. Grows
                 // to eat leftover space so the metadata cluster always
@@ -2027,6 +2035,7 @@ impl ZetaView {
                     .flex_1()
                     .min_w(theme::HEADER_TITLE_MIN_WIDTH)
                     .truncate()
+                    .text_size(theme::title(base_size))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(cx.theme().foreground)
                     .child(session_label),
@@ -2193,9 +2202,11 @@ pub(crate) mod render_log {
     }
 }
 
-/// Modal title band: 15px semibold on the left, a plain-text `esc` hint at
-/// the right. Contract line 91 pins this shape for every wiki-run modal.
+/// Modal title band: title-tier semibold on the left, a small-label `esc`
+/// hint at the right. Contract line 91 pins this shape for every wiki-run
+/// modal; the title role rides the same +2 step every promoted header takes.
 pub(crate) fn modal_title(title: &'static str) -> gpui::AnyElement {
+    let base = theme::current_font_size();
     div()
         .debug_selector(|| "modal-title".into())
         .h_flex()
@@ -2204,19 +2215,25 @@ pub(crate) fn modal_title(title: &'static str) -> gpui::AnyElement {
         .w_full()
         .child(
             div()
-                .text_size(theme::current_font_size())
+                .text_size(theme::title(base))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .child(title),
         )
-        .child(div().text_color(theme::palette::text_faint()).child("esc"))
+        .child(
+            div()
+                .text_size(theme::label_small(base))
+                .text_color(theme::palette::text_faint())
+                .child("esc"),
+        )
         .into_any_element()
 }
 
 /// Modal field caption: muted tier, no uppercase, used to name a control
-/// group (model list, approval mode row). Hierarchy comes from color tier
-/// alone — contract line 62 pins ONE size across the whole app.
+/// group (model list, approval mode row). Sits at the small-label role so
+/// it reads as a caption below the modal title without borrowing weight.
 pub(crate) fn modal_field_label(label: &'static str, cx: &App) -> gpui::AnyElement {
     div()
+        .text_size(theme::label_small(cx.theme().font_size))
         .text_color(cx.theme().muted_foreground)
         .child(label)
         .into_any_element()
@@ -2425,7 +2442,7 @@ impl Render for ZetaView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .font_family(theme::current_font_family())
-            .text_size(theme::current_font_size())
+            .text_size(theme::body(theme::current_font_size()))
             .on_action(cx.listener(|view, _: &polish::NewSession, _, cx| view.new_session(cx)))
             .on_action(|_: &polish::About, window, cx| {
                 drop(window.prompt(

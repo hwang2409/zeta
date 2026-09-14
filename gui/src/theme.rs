@@ -165,9 +165,38 @@ pub fn clamp_font_size(px_value: f32) -> Pixels {
 /// chip / hint / preview labels legible.
 pub const MIN_LABEL_PX: f32 = 9.0;
 
+/// Title-tier size derived from the current base font size. Reserved for the
+/// header session label and modal titles — the ONE strongly-promoted role on
+/// screen so a run-header title reads as the top of the hierarchy without
+/// borrowing an oversized weight. Sits one step above body at every base.
+///
+/// At the shipped default (13px) this lands at 15px (~1.15x body), matching
+/// the ratio the type-scale contract asks for. The `+2` grows linearly with
+/// the picker so 11px→13px and 18px→20px keep the same visual step.
+pub fn title(base: Pixels) -> Pixels {
+    px(f32::from(base) + 2.)
+}
+
+/// Body-tier size. The transcript prose and every unadorned block of user
+/// text ride here — the pin the appearance picker moves. Kept as an alias
+/// for the base so a text site that means "normal reading text" reads that
+/// way at the call site rather than passing `cx.theme().font_size` bare.
+pub fn body(base: Pixels) -> Pixels {
+    base
+}
+
+/// Label-tier size derived from the current base font size. One step below
+/// body — sidebar rows, branch rows, and any secondary label that must sit
+/// tighter than prose without falling into hint territory. Floored at
+/// `MIN_LABEL_PX` so the picker's `MIN_FONT_SIZE_PX` still lands legibly.
+pub fn label(base: Pixels) -> Pixels {
+    px((f32::from(base) - 1.).max(MIN_LABEL_PX))
+}
+
 /// Small-tier label size derived from the current base font size. Attachment
-/// chips, composer target lines, tool hints, and login status paint with
-/// this — one step below body text at every base, floored at `MIN_LABEL_PX`.
+/// chips, composer target lines, tool hints, login status, status pills and
+/// runtime metadata paint with this — two steps below body at every base,
+/// floored at `MIN_LABEL_PX`.
 pub fn label_small(base: Pixels) -> Pixels {
     px((f32::from(base) - 2.).max(MIN_LABEL_PX))
 }
@@ -177,6 +206,27 @@ pub fn label_small(base: Pixels) -> Pixels {
 /// step below `label_small`, floored at `MIN_LABEL_PX`.
 pub fn label_micro(base: Pixels) -> Pixels {
     px((f32::from(base) - 3.).max(MIN_LABEL_PX))
+}
+
+/// Reading-measure target for transcript prose, in characters of the base
+/// mono font. Sits inside the "comfortable measure" window (~66-90ch for
+/// readability); 90 gives room without letting the column sprawl.
+pub const PROSE_MEASURE_CH: f32 = 90.0;
+
+/// Monospace glyph advance as a fraction of the font size. JetBrains Mono
+/// (and every family the appearance picker filters to) advances ~0.6em per
+/// glyph; the extra 0.02 gives a small margin so wrapping never pushes the
+/// last glyph past the column edge on subpixel rounding.
+pub const MONO_CH_ADVANCE: f32 = 0.62;
+
+/// Reading-measure cap for transcript PROSE rows (user, assistant,
+/// thinking) — the row-kind narrower column that keeps assistant lines
+/// scannable. Tool receipts and framed error blocks keep
+/// `TRANSCRIPT_MAX_WIDTH` so a wide command line or code block does not
+/// re-wrap at the prose measure. Scales with the appearance picker's base
+/// so an 18px reader keeps their character measure.
+pub fn prose_max_width(base: Pixels) -> Pixels {
+    px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH)
 }
 
 /// Pending-attachment chip thumbnail size. Base 13px keeps parity with the

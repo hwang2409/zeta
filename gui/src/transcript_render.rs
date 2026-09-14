@@ -143,6 +143,21 @@ impl ZetaView {
         };
 
         let inner = self.render_row_inner(index, view, cx);
+        // Prose rows (user, assistant, thinking) cap at the narrower reading
+        // measure so long assistant lines wrap at a comfortable ~90ch. Tool
+        // receipts, error blocks, and any other row keep the wider
+        // `TRANSCRIPT_MAX_WIDTH` so a long command line or a code fence has
+        // room. The measure scales with the appearance picker's base font
+        // so an 18px reader keeps the same character budget on screen.
+        let prose_row = matches!(
+            self.state.transcript[index],
+            TranscriptEntry::User(_) | TranscriptEntry::Assistant(_) | TranscriptEntry::Thinking
+        );
+        let max_width = if prose_row {
+            theme::prose_max_width(cx.theme().font_size)
+        } else {
+            theme::TRANSCRIPT_MAX_WIDTH
+        };
         div()
             .debug_selector(|| sel::TRANSCRIPT_ROW.into())
             .w_full()
@@ -158,9 +173,10 @@ impl ZetaView {
             .pb(row_gap)
             .child(
                 div()
+                    .debug_selector(|| sel::TRANSCRIPT_COLUMN.into())
                     .w_full()
                     .min_w_0()
-                    .max_w(theme::TRANSCRIPT_MAX_WIDTH)
+                    .max_w(max_width)
                     .px_4()
                     .child(inner),
             )
@@ -408,7 +424,7 @@ impl ZetaView {
                         } else {
                             IconName::ChevronRight
                         })
-                        .size(px(12.))
+                        .size(theme::label_small(cx.theme().font_size))
                         .text_color(record_state(|| sel::tool_chevron(index), state_color)),
                     )
                     .child(

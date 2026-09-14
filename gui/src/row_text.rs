@@ -70,6 +70,7 @@ pub mod chrome {
 /// strict on "no literal outside debug_selector/id/aria_label/role args".
 pub mod sel {
     pub const TRANSCRIPT_ROW: &str = "transcript-row";
+    pub const TRANSCRIPT_COLUMN: &str = "transcript-column";
     pub const ATTACHMENT_CHIP: &str = "attachment-chip";
     pub const FORK_BUTTON_TAG: &str = "fork";
     pub const TOOL_RECEIPT_TAG: &str = "tool-receipt";

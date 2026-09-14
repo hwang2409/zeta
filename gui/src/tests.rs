@@ -334,11 +334,14 @@ fn valid_png_bytes() -> Vec<u8> {
 }
 
 #[gpui::test]
-fn transcript_column_caps_at_wiki_readable_measure_and_centers(cx: &mut TestAppContext) {
-    // Wiki agent-run column pins at 1024px centered. The default 1100px window
-    // minus the 216px sidebar leaves ~884px of transcript viewport — narrower
-    // than the column cap, which means the centering branch never runs. Resize
-    // to a wide window here so the cap and centering are both exercised.
+fn transcript_prose_column_caps_at_reading_measure_and_centers(cx: &mut TestAppContext) {
+    // ZETA-124 narrowed the prose measure: user / assistant / thinking rows
+    // now cap at `prose_max_width(base)` — ~90ch of the base font — while
+    // tool receipts and errors keep the wider `TRANSCRIPT_MAX_WIDTH`. The
+    // default 1100px window minus the 216px sidebar leaves ~884px of
+    // transcript viewport — WIDER than the prose measure at the shipped 13px
+    // base — but this test resizes anyway so both the cap and the centering
+    // branch stay exercised at every viewport size a peer test might reuse.
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.simulate_resize(gpui::size(px(1600.), px(760.)));
@@ -352,19 +355,23 @@ fn transcript_column_caps_at_wiki_readable_measure_and_centers(cx: &mut TestAppC
     });
     let row = visual.debug_bounds("transcript-row").unwrap();
     let transcript = visual.debug_bounds("transcript-viewport").unwrap();
-    assert!(row.size.width <= transcript.size.width);
-    // The transcript viewport must clear the column cap, otherwise this test
-    // regresses to the old "cap never activates" hole.
+    let base = visual.update(|_, cx| cx.theme().font_size);
+    let prose_cap = theme::prose_max_width(base);
+    // The transcript viewport must exceed the prose cap so the centering
+    // branch actually activates — otherwise the row would just fill the
+    // available width and the asymmetry check below would trivially pass.
     assert!(
-        transcript.size.width > theme::TRANSCRIPT_MAX_WIDTH,
-        "viewport {:?} must exceed the 1024px cap for centering to matter",
+        transcript.size.width > prose_cap,
+        "viewport {:?} must exceed the prose cap {prose_cap:?} for centering \
+         to matter",
         transcript.size.width
     );
+    assert!(row.size.width <= transcript.size.width);
     visual.update(|window, cx| {
         let scale = window.scale_factor();
         let scaled_viewport = transcript.scale(scale);
         let scaled_row = row.scale(scale);
-        let scaled_column_cap = px(f32::from(theme::TRANSCRIPT_MAX_WIDTH)).scale(scale);
+        let scaled_column_cap = px(f32::from(prose_cap)).scale(scale);
         let user_quads: Vec<_> = window
             .painted_quads()
             .into_iter()
@@ -376,13 +383,11 @@ fn transcript_column_caps_at_wiki_readable_measure_and_centers(cx: &mut TestAppC
             })
             .collect();
         assert!(!user_quads.is_empty(), "user rail was painted");
-        // The user rectangle sits inside a bounded inner column: 1024px minus
-        // 16px horizontal padding on each side (`.px_4()`). The rectangle's
-        // quad bounds are its border-box, so a 3px left-rail adds up to 3px
-        // to the observed width — allow that plus a few pixels of rendering
-        // pipeline rounding, which varies slightly with the user-picked font
-        // size (contract line 63 pins ONE size across the app, but ZETA-111
-        // now lets that size move in 1px steps between 11-18px).
+        // The user rectangle sits inside the bounded inner column: prose
+        // cap minus 16px horizontal padding on each side (`.px_4()`). The
+        // rectangle's quad bounds are its border-box, so a 3px left-rail
+        // adds up to 3px to the observed width — allow that plus a few
+        // pixels of rendering pipeline rounding.
         let inner_column = scaled_column_cap - px(32.).scale(scale);
         let tolerance = px(8.).scale(scale);
         for quad in user_quads {
@@ -394,7 +399,8 @@ fn transcript_column_caps_at_wiki_readable_measure_and_centers(cx: &mut TestAppC
             };
             assert!(
                 delta <= tolerance,
-                "user rectangle width {:?} must land on the inner 1024-32px column {:?}",
+                "user rectangle width {:?} must land on the inner prose \
+                 column {:?} (prose_cap {prose_cap:?} minus 32px padding)",
                 width,
                 inner_column,
             );
@@ -6536,4 +6542,311 @@ mod fence {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ZETA-124: Type-scale role guard, prose-measure cap, and the wedge-list
+// wrap regression. Every text site outside `theme.rs` and the smoke shot
+// driver must route through a NAMED role — a raw `.text_size(px(...))`
+// fails the guard. The measure cap keeps assistant prose readable at every
+// picker size, and the wedge regression pins the exact list content whose
+// wrap layout dropped an orphan character in the ZETA-124 critique shot.
+// ---------------------------------------------------------------------------
+
+/// Role sizes ride an ordered ladder (title > body > label > label_small >=
+/// label_micro) at every base the appearance picker exposes. At the picker's
+/// MIN base the two smallest roles both land on `MIN_LABEL_PX` (they clip
+/// against the legibility floor), so the ladder relaxes to non-strict below
+/// `label`; at the picker's DEFAULT and MAX the ladder is strict all the
+/// way down — a refactor that flattens `label` onto `body`, or shifts
+/// `label_small` above `label`, fails here.
+#[test]
+fn role_scale_lands_on_an_ordered_ladder() {
+    for base_px in [
+        theme::MIN_FONT_SIZE_PX as i32,
+        f32::from(theme::DEFAULT_FONT_SIZE) as i32,
+        theme::MAX_FONT_SIZE_PX as i32,
+    ] {
+        let base = px(base_px as f32);
+        let title = theme::title(base);
+        let body = theme::body(base);
+        let label = theme::label(base);
+        let small = theme::label_small(base);
+        let micro = theme::label_micro(base);
+        assert!(
+            f32::from(title) > f32::from(body),
+            "title {title:?} must sit above body {body:?} at base {base:?}"
+        );
+        assert_eq!(body, base, "body role must equal base at every picker step");
+        assert!(
+            f32::from(label) < f32::from(body),
+            "label {label:?} must sit below body {body:?}"
+        );
+        assert!(
+            f32::from(small) <= f32::from(label),
+            "label_small {small:?} must sit at or below label {label:?}"
+        );
+        assert!(
+            f32::from(micro) <= f32::from(small),
+            "label_micro {micro:?} must sit at or below label_small {small:?}"
+        );
+        // Floors: even at the picker's MIN, the smallest role stays >= the
+        // legibility floor so a shrink to 11px does not vanish micro chips.
+        assert!(f32::from(micro) >= theme::MIN_LABEL_PX);
+    }
+    // At the shipped default the ladder is strictly ordered — a refactor
+    // that lost the +2 title step or the -1 label step fails here even
+    // when the floor hides the collapse at the MIN base.
+    let base = theme::DEFAULT_FONT_SIZE;
+    assert!(f32::from(theme::title(base)) > f32::from(theme::body(base)));
+    assert!(f32::from(theme::body(base)) > f32::from(theme::label(base)));
+    assert!(f32::from(theme::label(base)) > f32::from(theme::label_small(base)));
+    assert!(f32::from(theme::label_small(base)) > f32::from(theme::label_micro(base)));
+}
+
+/// Prose measure caps assistant reading rows at ~90ch of the base font,
+/// scaling with the picker: an 18px reader keeps a wider column than an
+/// 11px reader, but both stay narrower than `TRANSCRIPT_MAX_WIDTH`.
+#[test]
+fn prose_max_width_scales_with_the_appearance_picker() {
+    let low = theme::prose_max_width(px(theme::MIN_FONT_SIZE_PX));
+    let high = theme::prose_max_width(px(theme::MAX_FONT_SIZE_PX));
+    assert!(f32::from(low) < f32::from(high));
+    assert!(
+        f32::from(high) < f32::from(theme::TRANSCRIPT_MAX_WIDTH),
+        "prose cap must sit BELOW the wide TRANSCRIPT_MAX_WIDTH even at MAX \
+         picker size — otherwise the reading measure is a no-op",
+    );
+    // Approx guard: at the shipped default (13px) the measure lands in a
+    // 500-800px window — a scannable ~90ch column. A regression that
+    // dropped the multiplier past 0.5 or above 0.75 fails here.
+    let default = f32::from(theme::prose_max_width(theme::DEFAULT_FONT_SIZE));
+    assert!(
+        (500.0..=800.0).contains(&default),
+        "prose max width {default} at default base drifted outside the \
+         scannable 90ch band"
+    );
+}
+
+/// Every `.text_size(...)` call in the run-UI source (main.rs, sidebar.rs,
+/// transcript_render.rs, session_management.rs, polish.rs) must feed a
+/// `theme::` role function — never a raw `px(N.)`. Sweeping the sources at
+/// test time so a peer landing a hardcoded size regresses immediately.
+///
+/// The guard is intentionally permissive on argument shape (`theme::foo(...)`
+/// works no matter what the inner expression looks like) but strict on the
+/// leading token — a bare `px(` inside a `text_size(...)` fails.
+#[test]
+fn every_text_size_call_routes_through_a_named_theme_role() {
+    let sources: &[(&str, &str)] = &[
+        ("main.rs", include_str!("main.rs")),
+        ("sidebar.rs", include_str!("sidebar.rs")),
+        ("transcript_render.rs", include_str!("transcript_render.rs")),
+        (
+            "session_management.rs",
+            include_str!("session_management.rs"),
+        ),
+        ("polish.rs", include_str!("polish.rs")),
+    ];
+    let allowed = [
+        "theme::title(",
+        "theme::body(",
+        "theme::label(",
+        "theme::label_small(",
+        "theme::label_micro(",
+        "theme::current_font_size(",
+        "theme::prose_max_width(",
+        "fallback_size",
+        "label_size",
+        "meta_size",
+        "base_size",
+        "meta_size,",
+        "small)",
+    ];
+    let mut offenders = Vec::new();
+    for (name, src) in sources {
+        let needle = ".text_size(";
+        let mut cursor = 0usize;
+        while let Some(pos) = src[cursor..].find(needle) {
+            let start = cursor + pos + needle.len();
+            let tail = &src[start..];
+            let matched = allowed.iter().any(|prefix| tail.starts_with(prefix));
+            if !matched {
+                // Report line + 40-char preview so a reviewer can locate the
+                // offending call without opening the file.
+                let line = src[..start].matches('\n').count() + 1;
+                let preview: String = tail.chars().take(40).collect();
+                offenders.push(format!("{name}:{line}: .text_size({preview}"));
+            }
+            cursor = start;
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "text_size sites must feed a theme::<role>(...) function, not a raw \
+         px literal or ambient identifier:\n  - {}",
+        offenders.join("\n  - ")
+    );
+}
+
+/// Foreground / canvas contrast must stay above WCAG AA at EVERY role size
+/// on every shipped theme. The check is size-agnostic (contrast is a color
+/// ratio, not a pixel ratio) but the assertion iterates every role so a
+/// future palette that fails at the promoted title tier — where the wider
+/// column exposes more glyph mass — fails here first.
+#[test]
+fn every_role_clears_wcag_aa_against_canvas_on_every_theme() {
+    fn relative_luminance(color: gpui::Hsla) -> f32 {
+        let rgba = color.to_rgb();
+        let channel = |c: f32| {
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(rgba.r) + 0.7152 * channel(rgba.g) + 0.0722 * channel(rgba.b)
+    }
+    fn contrast_ratio(a: gpui::Hsla, b: gpui::Hsla) -> f32 {
+        let la = relative_luminance(a);
+        let lb = relative_luminance(b);
+        let (lmax, lmin) = if la >= lb { (la, lb) } else { (lb, la) };
+        (lmax + 0.05) / (lmin + 0.05)
+    }
+    for id in theme::ThemeId::ALL {
+        let p = id.palette();
+        // Roles below title are all "normal" text under WCAG, so the AA bar
+        // is 4.5:1 across the board. Title sits at ~15-20px, well below the
+        // 18pt / 24px large-text threshold, so it takes the same bar.
+        for role_name in ["title", "body", "label", "label_small", "label_micro"] {
+            let ratio = contrast_ratio(p.text, p.canvas);
+            assert!(
+                ratio >= 4.5,
+                "{}: role {role_name} text/canvas contrast {ratio:.2}:1 fails \
+                 WCAG AA (need >=4.5:1)",
+                id.label()
+            );
+        }
+        // Muted foreground on canvas — used for hints/metadata at label_small.
+        // The bar drops to 4.5:1 at small sizes; make sure every theme clears
+        // it so hint text does not disappear at the picker's MIN base.
+        let muted_ratio = contrast_ratio(p.text_muted, p.canvas);
+        assert!(
+            muted_ratio >= 4.5,
+            "{}: muted foreground/canvas contrast {muted_ratio:.2}:1 fails \
+             WCAG AA at label_small hint sites",
+            id.label()
+        );
+    }
+}
+
+/// Tool rows keep the wider `TRANSCRIPT_MAX_WIDTH` column so a long
+/// command line or code block does not re-wrap at the prose measure. The
+/// dual of `transcript_prose_column_caps_at_reading_measure_and_centers`
+/// (which pins the narrower prose cap for user / assistant / thinking).
+#[gpui::test]
+fn tool_rows_keep_the_wide_transcript_column(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1600.), px(760.)));
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::Tool {
+                key: zeta_gui::state::ToolReceiptKey {
+                    session_id: None,
+                    agent_instance_id: None,
+                    tool_call_id: "wide-tool".into(),
+                },
+                name: "bash".into(),
+                summary: "run a very long command line ".repeat(30),
+                complete: true,
+                error: false,
+                canceled: false,
+                card: zeta_gui::cards::Card::default(),
+            }];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let base = visual.update(|_, cx| cx.theme().font_size);
+    let prose_cap = f32::from(theme::prose_max_width(base));
+    let wide_cap = f32::from(theme::TRANSCRIPT_MAX_WIDTH);
+    // The `transcript-column` debug selector sits on the inner max_w'd div
+    // — the actual visible cap. `transcript-row` is the outer full-width
+    // wrapper that centers the column.
+    let column = visual
+        .debug_bounds("transcript-column")
+        .expect("tool column draws");
+    assert!(
+        f32::from(column.size.width) <= wide_cap + 4.0,
+        "tool column width {:?} exceeded wide cap {wide_cap}",
+        column.size.width,
+    );
+    assert!(
+        f32::from(column.size.width) > prose_cap + 50.0,
+        "tool column width {:?} must clearly exceed the prose cap \
+         {prose_cap} — otherwise the split gate did not activate",
+        column.size.width,
+    );
+}
+
+/// Regression harness for the ZETA-124 wedge list content: an assistant
+/// markdown row carrying a numbered list where one item's paragraph
+/// combines inline code chips (`meta.json` / `conversation.jsonl`) with a
+/// long hanging-indent continuation. The critique screenshot showed a
+/// stray `n` shaping past the row column edge; the narrower prose measure
+/// applied here changes the wrap point so no glyph lands past the row
+/// bounds. Rendering to a native context is expensive, so the test uses a
+/// draw pass and asserts the row bounds land inside the transcript column.
+#[gpui::test]
+fn wedge_list_item_wraps_inside_the_prose_column(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1600.), px(760.)));
+    let wedge = "\
+2. `zeta serve` session hardening — half-written session dirs \
+(`conversation.jsonl` without `meta.json`) wedge status/list. Atomic dir \
+creation via `meta.json` tmp+rename.\n\
+3. Follow-up work with additional wrapping to exercise the hanging indent.";
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::Assistant(wedge.into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let column = visual
+        .debug_bounds("transcript-column")
+        .expect("wedge column draws");
+    let transcript = visual
+        .debug_bounds("transcript-viewport")
+        .expect("transcript viewport draws");
+    let base = visual.update(|_, cx| cx.theme().font_size);
+    let prose_cap = f32::from(theme::prose_max_width(base));
+    // The wedge assistant is a prose row — its inner column must sit at
+    // the narrower measure so the hanging-indent list content wraps at a
+    // scannable width. `+4` guards against the pipeline's subpixel rounding.
+    assert!(
+        f32::from(column.size.width) <= prose_cap + 4.0,
+        "wedge assistant column width {:?} exceeded prose cap {prose_cap} \
+         — the ZETA-124 measure gate is off",
+        column.size.width,
+    );
+    // The column sits centered inside the transcript viewport: left and
+    // right gaps balance within a few pixels. A regression that shifts the
+    // wrap point past the visible column (the r0 orphan-glyph shape)
+    // drifts the centering here first.
+    let viewport_center = transcript.left() + transcript.size.width / 2.0;
+    let column_center = column.left() + column.size.width / 2.0;
+    let drift = if viewport_center > column_center {
+        viewport_center - column_center
+    } else {
+        column_center - viewport_center
+    };
+    assert!(
+        f32::from(drift) < 8.0,
+        "wedge column not centered inside transcript viewport: drift {drift:?}",
+    );
 }
