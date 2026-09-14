@@ -89,7 +89,7 @@ _zeta() {
                     case ${original_words[command_index+1]} in
                         list|daemon) _message 'no arguments' ;;
                         show|approve|disable) _arguments '1:name:' ;;
-                        import) _arguments '1:JSON path:_files' ;;
+                        import) _arguments '*:JSON path:_files' ;;
                         *) _describe 'verb' automation_verbs ;;
                     esac
                     ;;
@@ -113,7 +113,11 @@ def bash_script() -> str:
         token="${COMP_WORDS[index]}"
         case "$token" in
             --provider|--model|--resume|--token-budget|--max-turns|--format|--system-prompt|--append-system-prompt|--socket|--port|--cwd|-p|--print)
-                (( index += 2 ))
+                if [[ "${COMP_WORDS[index+1]:-}" == "=" ]]; then
+                    (( index += 3 ))
+                else
+                    (( index += 2 ))
+                fi
                 ;;
             --provider=*|--model=*|--resume=*|--token-budget=*|--max-turns=*|--format=*|--system-prompt=*|--append-system-prompt=*|--socket=*|--port=*|--cwd=*|-p*)
                 (( index++ ))
@@ -139,7 +143,7 @@ def bash_script() -> str:
     if (( command_index > 0 && COMP_CWORD > command_index + 1 )); then
         verb="${COMP_WORDS[command_index+1]}"
     fi
-    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --max-turns --print -p --format --system-prompt --append-system-prompt --socket --port --cwd"
+    local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --token-budget --max-turns --print -p --format --system-prompt --append-system-prompt"
     local commands="login serve session automation completion"
 
     if (( command_index == 0 )); then
