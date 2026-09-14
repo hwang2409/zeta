@@ -156,6 +156,34 @@ def _no_eoi_progressive_jpeg() -> bytes:
     return b"\xff\xd8\xff\xc2\x00\x11" + b"progressive JPEG without EOI"
 
 
+def _jpeg_eoi_in_app_payload() -> bytes:
+    return b"\xff\xd8\xff\xe1\x00\x05ab\xff\xd9"
+
+
+def _progressive_jpeg() -> bytes:
+    return (
+        b"\xff\xd8\xff\xc2\x00\x11"
+        + b"\x08\x00\x01\x00\x01\x03\x01\x11\x00\x02\x11\x01\x03\x11\x00"
+        + b"\xff\xd9"
+    )
+
+
+def _oversized_truncated_png() -> bytes:
+    data = PNG[:24]
+    return data + b"x" * (IMAGE_MAX_BYTES + 1 - len(data))
+
+
+def _malformed_webp_chunks() -> bytes:
+    return (
+        b"RIFF"
+        + (26).to_bytes(4, "little")
+        + b"WEBPVP8X"
+        + (10).to_bytes(4, "little")
+        + b"\x00" * 10
+        + b"NOPE"
+    )
+
+
 DECISION_TABLE_CASES = [
     pytest.param("row-1-text", b"plain text\n", {}, "text", id="row-1-text"),
     pytest.param(
@@ -171,6 +199,13 @@ DECISION_TABLE_CASES = [
         {},
         "size",
         id="row-2-oversized-invalid-webp",
+    ),
+    pytest.param(
+        "row-2-oversized-truncated-png",
+        _oversized_truncated_png(),
+        {},
+        "size",
+        id="row-2-oversized-truncated-png",
     ),
     pytest.param(
         "row-2-oversized-lookalike",
@@ -199,8 +234,20 @@ DECISION_TABLE_CASES.extend(
 )
 DECISION_TABLE_CASES.extend(
     pytest.param(
+        f"row-4-{format_name}-invalid-with-paging",
+        data,
+        {"limit": 1},
+        "paging",
+        id=f"row-4-{format_name}-invalid-with-paging",
+    )
+    for (format_name, _image_mime_type, _valid_data), (_mime_type, data) in zip(
+        IMAGE_FIXTURES, INVALID_IMAGE_FIXTURES, strict=True
+    )
+)
+DECISION_TABLE_CASES.extend(
+    pytest.param(
         f"row-5-{format_name}-trailing-data",
-        data + b"trailing metadata",
+        (_progressive_jpeg() if format_name == "jpeg" else data) + b"trailing metadata",
         {},
         "image",
         id=f"row-5-{format_name}-trailing-data",
@@ -213,29 +260,52 @@ DECISION_TABLE_CASES.extend(
             "row-6-invalid-png",
             PNG[:24],
             {},
-            "fallback",
+            (
+                True,
+                "'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte",
+            ),
             id="row-6-invalid-png",
         ),
         pytest.param(
             "row-6-no-eoi-progressive-jpeg",
             _no_eoi_progressive_jpeg(),
             {},
-            "fallback",
+            (
+                True,
+                "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte",
+            ),
             id="row-6-no-eoi-progressive-jpeg",
         ),
         pytest.param(
-            "row-6-invalid-gif",
-            b"GIF89a\x01\x00\x01\x00lookalike",
+            "row-6-jpeg-eoi-in-app-payload",
+            _jpeg_eoi_in_app_payload(),
             {},
-            "fallback",
+            (
+                True,
+                "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte",
+            ),
+            id="row-6-jpeg-eoi-in-app-payload",
+        ),
+        pytest.param(
+            "row-6-invalid-gif",
+            b"GIF89a\x01\x00\x01\x00\x00\x00;",
+            {},
+            (False, "GIF89a\x01\x00\x01\x00\x00\x00;"),
             id="row-6-invalid-gif",
         ),
         pytest.param(
             "row-6-invalid-webp-lookalike",
             b"RIFFxxxxWEBPthis is UTF-8 text\n",
             {},
-            "fallback",
+            (False, "RIFFxxxxWEBPthis is UTF-8 text"),
             id="row-6-invalid-webp-lookalike",
+        ),
+        pytest.param(
+            "row-6-malformed-webp-chunks",
+            _malformed_webp_chunks(),
+            {},
+            (False, _malformed_webp_chunks().decode()),
+            id="row-6-malformed-webp-chunks",
         ),
     ]
 )
@@ -278,7 +348,10 @@ async def test_image_read_decision_table(
         assert result["isError"] is False
         assert result["content"][0]["text"] == "plain text"
     else:
-        assert all(block["type"] != "image" for block in result["content"])
+        assert isinstance(expected, tuple)
+        expected_error, expected_text = expected
+        assert result["isError"] is expected_error
+        assert result["content"][0]["text"] == expected_text
 
 @pytest.mark.asyncio
 async def test_read_rejects_oversized_images_with_size_and_cap(tmp_path: Path) -> None:

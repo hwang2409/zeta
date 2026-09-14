@@ -157,6 +157,10 @@ async def _read(
                             f"image is {observed_size} bytes; cap is "
                             f"{IMAGE_MAX_BYTES} bytes (4 MiB)"
                         )
+                    if "offset" in arguments or "limit" in arguments:
+                        raise ValueError(
+                            "offset and limit are not supported for image reads"
+                        )
                     media_type = detect_image_media_type(data, complete=True)
                     if media_type is None:
                         handle.seek(0)
@@ -168,10 +172,6 @@ async def _read(
                             output,
                             digest,
                             abort_signal,
-                        )
-                    if "offset" in arguments or "limit" in arguments:
-                        raise ValueError(
-                            "offset and limit are not supported for image reads"
                         )
                     file_size = len(data)
                     format_name = media_type.removeprefix("image/")

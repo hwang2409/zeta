@@ -105,39 +105,195 @@ def _png_validation_status(data: bytes, total_size: int) -> ImageValidation:
 
 
 def _jpeg_validation_status(data: bytes, total_size: int) -> ImageValidation:
-    if len(data) < 2 or data[:2] != b"\xff\xd8":
+    if len(data) < 2:
+        return "incomplete" if len(data) < total_size else "invalid"
+    if data[:2] != b"\xff\xd8":
         return "invalid"
-    if len(data) < total_size:
-        return "incomplete"
-    return "valid" if b"\xff\xd9" in data[2:] else "invalid"
+    offset = 2
+    while True:
+        if offset >= len(data):
+            return "incomplete" if len(data) < total_size else "invalid"
+        if data[offset] != 0xFF:
+            return "invalid"
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            return "incomplete" if len(data) < total_size else "invalid"
+        marker = data[offset]
+        offset += 1
+        if marker == 0xD9:
+            return "valid"
+        if marker == 0x00:
+            return "invalid"
+        if marker in {0xD8, 0x01} or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > total_size:
+            return "invalid"
+        if offset + 2 > len(data):
+            return "incomplete"
+        segment_size = int.from_bytes(data[offset : offset + 2], "big")
+        if segment_size < 2:
+            return "invalid"
+        segment_end = offset + segment_size
+        if segment_end > total_size:
+            return "invalid"
+        if segment_end > len(data):
+            return "incomplete"
+        offset = segment_end
+        if marker != 0xDA:
+            continue
+        while True:
+            if offset >= len(data):
+                return "incomplete" if len(data) < total_size else "invalid"
+            if data[offset] != 0xFF:
+                offset += 1
+                continue
+            marker_start = offset
+            offset += 1
+            while offset < len(data) and data[offset] == 0xFF:
+                offset += 1
+            if offset >= len(data):
+                return "incomplete" if len(data) < total_size else "invalid"
+            scan_marker = data[offset]
+            if scan_marker == 0x00 or 0xD0 <= scan_marker <= 0xD7:
+                offset += 1
+                continue
+            if scan_marker == 0xD9:
+                return "valid"
+            offset = marker_start
+            break
 
 
 def _gif_validation_status(data: bytes, total_size: int) -> ImageValidation:
-    if len(data) < 6 or data[:6] not in {b"GIF87a", b"GIF89a"}:
+    if len(data) < 6:
+        return "incomplete" if len(data) < total_size else "invalid"
+    if data[:6] not in {b"GIF87a", b"GIF89a"}:
         return "invalid"
-    if len(data) < total_size:
-        return "incomplete"
-    return "valid" if b"\x3b" in data[6:] else "invalid"
+    if len(data) < 13:
+        return "incomplete" if len(data) < total_size else "invalid"
+    offset = 13
+    packed = data[10]
+    if packed & 0x80:
+        color_table_end = offset + 3 * (1 << ((packed & 0x07) + 1))
+        if color_table_end > total_size:
+            return "invalid"
+        if color_table_end > len(data):
+            return "incomplete"
+        offset = color_table_end
+    while True:
+        if offset >= len(data):
+            return "incomplete" if len(data) < total_size else "invalid"
+        block_type = data[offset]
+        offset += 1
+        if block_type == 0x3B:
+            return "valid"
+        if block_type == 0x21:
+            if offset >= len(data):
+                return "incomplete" if len(data) < total_size else "invalid"
+            offset += 1
+        elif block_type == 0x2C:
+            descriptor_end = offset + 9
+            if descriptor_end > total_size:
+                return "invalid"
+            if descriptor_end > len(data):
+                return "incomplete"
+            packed = data[offset + 8]
+            offset = descriptor_end
+            if packed & 0x80:
+                color_table_end = offset + 3 * (1 << ((packed & 0x07) + 1))
+                if color_table_end > total_size:
+                    return "invalid"
+                if color_table_end > len(data):
+                    return "incomplete"
+                offset = color_table_end
+            if offset >= len(data):
+                return "incomplete" if len(data) < total_size else "invalid"
+            offset += 1
+        else:
+            return "invalid"
+        while True:
+            if offset >= len(data):
+                return "incomplete" if len(data) < total_size else "invalid"
+            block_size = data[offset]
+            offset += 1
+            block_end = offset + block_size
+            if block_end > total_size:
+                return "invalid"
+            if block_end > len(data):
+                return "incomplete"
+            offset = block_end
+            if block_size == 0:
+                break
+
+
+def _webp_chunk_dimensions(
+    data: bytes, chunk_type: bytes, offset: int, chunk_size: int
+) -> tuple[int, int] | None:
+    if chunk_type == b"VP8X" and chunk_size >= 10:
+        dimensions = (
+            1 + int.from_bytes(data[offset + 4 : offset + 7], "little"),
+            1 + int.from_bytes(data[offset + 7 : offset + 10], "little"),
+        )
+        return dimensions if all(dimensions) else None
+    if chunk_type == b"VP8L" and chunk_size >= 5 and data[offset] == 0x2F:
+        packed = int.from_bytes(data[offset + 1 : offset + 5], "little")
+        dimensions = 1 + (packed & 0x3FFF), 1 + ((packed >> 14) & 0x3FFF)
+        return dimensions if all(dimensions) else None
+    if (
+        chunk_type == b"VP8 "
+        and chunk_size >= 10
+        and data[offset + 3 : offset + 6] == b"\x9d\x01\x2a"
+    ):
+        dimensions = (
+            int.from_bytes(data[offset + 6 : offset + 8], "little") & 0x3FFF,
+            int.from_bytes(data[offset + 8 : offset + 10], "little") & 0x3FFF,
+        )
+        return dimensions if all(dimensions) else None
+    return None
+
+
+def _parse_webp(
+    data: bytes, total_size: int
+) -> tuple[ImageValidation, tuple[int, int] | None]:
+    if len(data) < 12:
+        return ("incomplete" if len(data) < total_size else "invalid", None)
+    if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return "invalid", None
+    riff_end = int.from_bytes(data[4:8], "little") + 8
+    if riff_end > total_size:
+        return "invalid", None
+    if len(data) < riff_end:
+        return "incomplete", None
+    offset = 12
+    image_dimensions: tuple[int, int] | None = None
+    while offset < riff_end:
+        if offset + 8 > riff_end:
+            return "invalid", None
+        chunk_type = data[offset : offset + 4]
+        chunk_size = int.from_bytes(data[offset + 4 : offset + 8], "little")
+        payload_offset = offset + 8
+        chunk_end = payload_offset + chunk_size
+        padded_end = chunk_end + (chunk_size & 1)
+        if padded_end > riff_end:
+            return "invalid", None
+        if padded_end > len(data):
+            return "incomplete", None
+        if chunk_type in {b"VP8 ", b"VP8L", b"VP8X"}:
+            chunk_dimensions = _webp_chunk_dimensions(
+                data, chunk_type, payload_offset, chunk_size
+            )
+            if chunk_dimensions is None:
+                return "invalid", None
+            if image_dimensions is None:
+                image_dimensions = chunk_dimensions
+        offset = padded_end
+    if image_dimensions is None:
+        return "invalid", None
+    return "valid", image_dimensions
 
 
 def _webp_validation_status(data: bytes, total_size: int) -> ImageValidation:
-    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
-        return "invalid"
-    riff_end = int.from_bytes(data[4:8], "little") + 8
-    if riff_end > total_size:
-        return "invalid"
-    if len(data) < riff_end:
-        return "incomplete"
-    if len(data) < 20:
-        return "invalid"
-    chunk_type = data[12:16]
-    chunk_size = int.from_bytes(data[16:20], "little")
-    if chunk_type not in {b"VP8 ", b"VP8L", b"VP8X"}:
-        return "invalid"
-    chunk_end = 20 + chunk_size
-    if chunk_end > riff_end:
-        return "invalid"
-    return "valid" if chunk_end <= len(data) else "incomplete"
+    return _parse_webp(data, total_size)[0]
 
 
 _IMAGE_VALIDATORS: dict[str, Callable[[bytes, int], ImageValidation]] = {
@@ -146,18 +302,6 @@ _IMAGE_VALIDATORS: dict[str, Callable[[bytes, int], ImageValidation]] = {
     "image/gif": _gif_validation_status,
     "image/webp": _webp_validation_status,
 }
-
-
-def _webp_chunk(data: bytes) -> tuple[bytes, int, int] | None:
-    if len(data) < 20 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
-        return None
-    chunk_type = data[12:16]
-    chunk_size = int.from_bytes(data[16:20], "little")
-    if chunk_type not in {b"VP8 ", b"VP8L", b"VP8X"}:
-        return None
-    if len(data) < 20 + chunk_size:
-        return None
-    return chunk_type, 20, chunk_size
 
 
 def decoded_image_bytes(block: ToolImageBlock) -> bytes | None:
@@ -231,31 +375,7 @@ def image_dimensions(
 
 
 def _webp_dimensions(data: bytes) -> tuple[int, int] | None:
-    chunk = _webp_chunk(data)
-    if chunk is None:
-        return None
-    chunk_type, offset, chunk_size = chunk
-    if chunk_type == b"VP8X" and chunk_size >= 10:
-        dimensions = (
-            1 + int.from_bytes(data[offset + 4 : offset + 7], "little"),
-            1 + int.from_bytes(data[offset + 7 : offset + 10], "little"),
-        )
-        return dimensions if all(dimensions) else None
-    if chunk_type == b"VP8L" and chunk_size >= 5 and data[offset] == 0x2F:
-        packed = int.from_bytes(data[offset + 1 : offset + 5], "little")
-        dimensions = 1 + (packed & 0x3FFF), 1 + ((packed >> 14) & 0x3FFF)
-        return dimensions if all(dimensions) else None
-    if (
-        chunk_type == b"VP8 "
-        and chunk_size >= 10
-        and data[offset + 3 : offset + 6] == b"\x9d\x01\x2a"
-    ):
-        dimensions = (
-            int.from_bytes(data[offset + 6 : offset + 8], "little") & 0x3FFF,
-            int.from_bytes(data[offset + 8 : offset + 10], "little") & 0x3FFF,
-        )
-        return dimensions if all(dimensions) else None
-    return None
+    return _parse_webp(data, len(data))[1]
 
 
 def image_description(
