@@ -8,7 +8,7 @@ import sys
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from .completion import completion_script
+from .core.commands.completion import completion_script
 from .core.login_flow import run_login
 from .core.session import SessionError, env_home
 from .providers.login import build_login_provider, pkce_values

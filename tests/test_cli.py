@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from zeta.cli import build_parser, main
-from zeta.completion import completion_script
+from zeta.core.commands.completion import completion_script
 
 
 def test_completion_parser_accepts_both_shells() -> None:
