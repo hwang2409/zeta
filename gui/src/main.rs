@@ -11,7 +11,7 @@ mod transcript_render;
 
 use gpui::{
     div, ease_in_out, prelude::*, px, Animation, AnimationExt, App, Bounds, Context, Entity,
-    Focusable, KeyDownEvent, Render, Task, Window, WindowBounds, WindowOptions,
+    ExternalPaths, Focusable, KeyDownEvent, Render, Task, Window, WindowBounds, WindowOptions,
 };
 use gpui_kit::component::{
     alert::Alert,
@@ -19,7 +19,7 @@ use gpui_kit::component::{
     dialog::DialogButtonProps,
     input::{InputEvent, Textarea, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
-    ActiveTheme, Disableable, IconName, Root, Selectable, StyledExt, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, Root, Selectable, StyledExt, WindowExt,
 };
 use std::{
     borrow::Cow,
@@ -37,6 +37,23 @@ use zeta_gui::{
     state::{AppState, ConnectionState, TranscriptEdit, TranscriptEntry},
     worker::{CommandMessage, ConnectionWorker, WorkerMessage},
 };
+
+/// Composer chip / drop-target chrome literals. Lives at module scope so the
+/// composer renderer references named consts rather than bare strings, and a
+/// wording change lands in one place. The transcript-render module has its
+/// own ZETA-109 typed model + AST fence; composer chrome is view chrome (not
+/// a transcript row) and stays outside that fence.
+mod chrome {
+    pub const ATTACH_ICON_LABEL: &str = "Attach image";
+    pub const ATTACH_HINT: &str = "Attach an image · drag files in · Cmd-V pastes";
+    pub const DROP_TARGET_TITLE: &str = "Drop image to attach";
+    pub const DROP_TARGET_HINT: &str = "PNG · JPEG · GIF · WebP · up to 512 KiB";
+    pub const CHIP_REMOVE_LABEL: &str = "Remove attachment";
+    pub const ATTACH_LIMIT_ERROR: &str = "Attach up to 4 images, 512 KiB total.";
+}
+
+/// Cap on pending attachments before a batch trips the size-limit error.
+const MAX_ATTACHMENTS: usize = 4;
 
 struct DialogLayer;
 
@@ -122,6 +139,12 @@ struct ZetaView {
     composer_images: Vec<ImageAttachment>,
     composer_image_error: Option<String>,
     composer_empty_hint: bool,
+    /// Pending-chip thumbnails, one slot per `composer_images` entry. Cached
+    /// so the base64 payload is decoded once at attach time instead of on
+    /// every composer paint. `None` means decode failed (falls back to the
+    /// chip's file glyph); stays aligned with `composer_images` through the
+    /// add/remove/clear helpers.
+    composer_thumbnails: Vec<Option<std::sync::Arc<gpui::Image>>>,
     sent_images: std::collections::BTreeMap<(usize, usize), std::sync::Arc<gpui::Image>>,
     commands: Sender<CommandMessage>,
     _poll_task: Option<Task<()>>,
@@ -180,6 +203,7 @@ impl ZetaView {
             composer_images: Vec::new(),
             composer_image_error: None,
             composer_empty_hint: false,
+            composer_thumbnails: Vec::new(),
             sent_images: Default::default(),
             commands,
             _poll_task: None,
@@ -312,8 +336,7 @@ impl ZetaView {
                         }
                     }
                 }
-                self.composer_images.clear();
-                self.composer_image_error = None;
+                self.clear_composer_images(cx);
                 self.composer
                     .update(cx, |input, cx| input.set_value("", window, cx));
             }
@@ -414,8 +437,7 @@ impl ZetaView {
             }
         }
         if self.state.active_session != previous_session {
-            self.composer_images.clear();
-            self.composer_image_error = None;
+            self.clear_composer_images(cx);
             self.composer_empty_hint = false;
             if self.settings_open {
                 self.close_settings(window, cx);
@@ -735,10 +757,11 @@ impl ZetaView {
                     .chain(new_images.iter())
                     .map(|image| image.size)
                     .sum();
-                if combined > 4 || total_bytes > zeta_gui::session::MAX_IMAGE_BYTES {
-                    self.composer_image_error =
-                        Some("attach at most 4 images, totaling 512 KiB".into());
+                if combined > MAX_ATTACHMENTS || total_bytes > zeta_gui::session::MAX_IMAGE_BYTES {
+                    self.composer_image_error = Some(chrome::ATTACH_LIMIT_ERROR.into());
                 } else {
+                    self.composer_thumbnails
+                        .extend(new_images.iter().map(polish::image_source));
                     self.composer_images.append(&mut new_images);
                     self.composer_image_error = None;
                     self.composer_empty_hint = false;
@@ -753,9 +776,23 @@ impl ZetaView {
     fn remove_attached_image(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.composer_images.len() {
             self.composer_images.remove(index);
+            if index < self.composer_thumbnails.len() {
+                self.composer_thumbnails.remove(index);
+            }
             self.composer_image_error = None;
             cx.notify();
         }
+    }
+
+    /// Drop every pending attachment plus its cached thumbnail and reset the
+    /// error banner. The three call sites — send success, session switch, and
+    /// disconnect — share this one path so the thumbnail vec stays aligned
+    /// with `composer_images` in every branch.
+    fn clear_composer_images(&mut self, cx: &mut Context<Self>) {
+        self.composer_images.clear();
+        self.composer_thumbnails.clear();
+        self.composer_image_error = None;
+        cx.notify();
     }
 
     fn attach_from_files(&mut self, _: &mut Window, cx: &mut Context<Self>) {
@@ -774,17 +811,24 @@ impl ZetaView {
                 Ok(Ok(Some(paths))) => paths,
                 _ => return,
             };
-            let images: Result<Vec<ImageAttachment>, String> = selection
-                .iter()
-                .map(|path| ImageAttachment::from_path(path))
-                .collect();
             let _ = view.update(cx, |view, cx| {
                 if view.state.active_session == session {
-                    view.add_attached_images(images, cx);
+                    view.attach_from_paths(&selection, cx);
                 }
             });
         })
         .detach();
+    }
+
+    /// Attach a batch of on-disk paths as image attachments. Shared by the
+    /// file-picker and drag-and-drop entry points so both routes surface the
+    /// same size/type errors and both flow through `add_attached_images`.
+    fn attach_from_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) -> bool {
+        let images: Result<Vec<ImageAttachment>, String> = paths
+            .iter()
+            .map(|path| ImageAttachment::from_path(path))
+            .collect();
+        self.add_attached_images(images, cx)
     }
 
     fn attach_from_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
@@ -801,12 +845,7 @@ impl ZetaView {
                     );
                 }
                 gpui::ClipboardEntry::ExternalPaths(paths) => {
-                    let images: Result<Vec<ImageAttachment>, String> = paths
-                        .paths()
-                        .iter()
-                        .map(|path| ImageAttachment::from_path(path))
-                        .collect();
-                    return self.add_attached_images(images, cx);
+                    return self.attach_from_paths(paths.paths(), cx);
                 }
                 gpui::ClipboardEntry::String(_) => {}
             }
@@ -1326,11 +1365,14 @@ impl ZetaView {
             .clone()
             .unwrap_or_else(|| "no model".to_owned());
 
+        let drop_enabled = can_send;
+        let drag_active = drop_enabled && cx.has_active_drag();
         div()
             .id("composer")
             .debug_selector(|| "composer".into())
             .v_flex()
             .flex_shrink_0()
+            .relative()
             .py(theme::COMPOSER_PADDING_Y)
             .px(theme::COMPOSER_PADDING_X)
             .min_h(theme::COMPOSER_MIN_HEIGHT)
@@ -1338,35 +1380,17 @@ impl ZetaView {
             .border_l(theme::RAIL_WIDTH_THICK)
             .border_color(rail_color)
             .on_action(|_: &gpui_kit::component::input::Enter, _, _| {})
+            .when(drop_enabled, |composer| {
+                composer
+                    .on_drop::<ExternalPaths>(cx.listener(|view, paths: &ExternalPaths, _, cx| {
+                        view.attach_from_paths(paths.paths(), cx);
+                    }))
+                    .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                        style.border_color(cx.theme().drag_border)
+                    })
+            })
             .when(!self.composer_images.is_empty(), |composer| {
-                composer.child(
-                    div().mb_1().h_flex().flex_wrap().gap_2().children(
-                        self.composer_images
-                            .iter()
-                            .enumerate()
-                            .map(|(index, image)| {
-                                div()
-                                    .h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .px_2()
-                                    .py_1()
-                                    .bg(cx.theme().sidebar)
-                                    .text_size(theme::label_small(cx.theme().font_size))
-                                    .debug_selector(|| "composer-chip".into())
-                                    .child(format!("{} · {} bytes", image.name, image.size))
-                                    .child(
-                                        Button::new(("chip-remove", index))
-                                            .ghost()
-                                            .compact()
-                                            .label("Remove")
-                                            .on_click(cx.listener(move |view, _, _, cx| {
-                                                view.remove_attached_image(index, cx)
-                                            })),
-                                    )
-                            }),
-                    ),
-                )
+                composer.child(self.render_attachment_chips(cx))
             })
             .when_some(self.composer_image_error.clone(), |composer, error| {
                 composer.child(div().mb_1().child(Alert::error("image-error", error)))
@@ -1411,13 +1435,21 @@ impl ZetaView {
                         ),
                     )
                     .child(
+                        // Icon-only attach affordance: a `+` glyph sitting in
+                        // a square 40x40 hit box (matches SEND_BUTTON_HEIGHT
+                        // so the two controls read as one row). The tooltip
+                        // spells the full attach surface — click, drag, and
+                        // paste all reach the same batch.
                         Button::new("attach")
                             .debug_selector(|| "attach-button".into())
                             .ghost()
                             .compact()
-                            .label("Attach image")
+                            .icon(IconName::Plus)
+                            .accessibility_label(chrome::ATTACH_ICON_LABEL)
+                            .tooltip(chrome::ATTACH_HINT)
                             .disabled(!can_send)
                             .h(theme::SEND_BUTTON_HEIGHT)
+                            .w(theme::SEND_BUTTON_HEIGHT)
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.attach_from_files(window, cx)
                             })),
@@ -1456,6 +1488,162 @@ impl ZetaView {
                             .child("Send")
                             .into_any_element()
                     }),
+            )
+            .when(drag_active, |composer| {
+                composer.child(self.render_drop_target(cx))
+            })
+            .into_any_element()
+    }
+
+    /// Pending-chip row. One chip per `composer_images` slot: thumbnail (or a
+    /// file glyph on decode failure), name, size, and a compact remove button
+    /// pinned to the right. Chip surface + border read on every theme via
+    /// semantic tokens; the whole row scales with the appearance picker's
+    /// font size through `label_small` / `label_micro`.
+    fn render_attachment_chips(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let base_size = cx.theme().font_size;
+        let label_size = theme::label_small(base_size);
+        let meta_size = theme::label_micro(base_size);
+        div()
+            .mb_1()
+            .h_flex()
+            .flex_wrap()
+            .gap_2()
+            .debug_selector(|| "composer-chip-row".into())
+            .children(
+                self.composer_images
+                    .iter()
+                    .enumerate()
+                    .map(|(index, image)| {
+                        self.render_attachment_chip(index, image, label_size, meta_size, cx)
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_attachment_chip(
+        &self,
+        index: usize,
+        image: &ImageAttachment,
+        label_size: gpui::Pixels,
+        meta_size: gpui::Pixels,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        // Thumbnail area: 32x24 flat rectangle with the same subtle
+        // black/white outline the transcript thumbnails use, so the pending
+        // chip and the sent-turn thumbnail read as one family. Falls back to
+        // a name-initial glyph when the base64 payload fails to decode.
+        let thumb_border = if cx.theme().is_dark() {
+            gpui::white()
+        } else {
+            gpui::black()
+        }
+        .opacity(0.1);
+        let thumbnail = self.composer_thumbnails.get(index).cloned().flatten();
+        let name = image.name.clone();
+        let size_label = polish::format_bytes(image.size);
+        div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .pl_1()
+            .pr_1()
+            .py(px(3.))
+            .bg(cx.theme().muted)
+            .border_1()
+            .border_color(cx.theme().border)
+            .debug_selector(|| "composer-chip".into())
+            .child(match thumbnail {
+                Some(image) => gpui::img(image)
+                    .w(px(32.))
+                    .h(px(24.))
+                    .object_fit(gpui::ObjectFit::Cover)
+                    .border_1()
+                    .border_color(thumb_border)
+                    .into_any_element(),
+                None => div()
+                    .w(px(32.))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .text_size(meta_size)
+                    .text_color(cx.theme().muted_foreground)
+                    .child(Icon::new(IconName::File).size(px(12.)))
+                    .into_any_element(),
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_w_0()
+                    .max_w(px(180.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(label_size)
+                            .text_color(cx.theme().foreground)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .text_size(meta_size)
+                            .text_color(cx.theme().muted_foreground)
+                            .child(size_label),
+                    ),
+            )
+            .child(
+                Button::new(("chip-remove", index))
+                    .debug_selector(move || format!("chip-remove-{index}"))
+                    .ghost()
+                    .compact()
+                    .icon(IconName::Close)
+                    .accessibility_label(chrome::CHIP_REMOVE_LABEL)
+                    .tooltip(chrome::CHIP_REMOVE_LABEL)
+                    .h(px(24.))
+                    .w(px(24.))
+                    .on_click(
+                        cx.listener(move |view, _, _, cx| view.remove_attached_image(index, cx)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Drop-target overlay painted while a file drag is active over the
+    /// composer. Sits absolutely over the composer bounds so the input
+    /// underneath still stops the drag from falling through to the
+    /// transcript, and the whole layer reads as one flat drop zone rather
+    /// than a per-cell border flicker.
+    fn render_drop_target(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let base_size = cx.theme().font_size;
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .bg(cx.theme().drop_target)
+            .border_1()
+            .border_dashed()
+            .border_color(cx.theme().drag_border)
+            .debug_selector(|| "composer-drop-target".into())
+            .child(
+                div()
+                    .text_size(base_size)
+                    .text_color(cx.theme().foreground)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(chrome::DROP_TARGET_TITLE),
+            )
+            .child(
+                div()
+                    .text_size(theme::label_small(base_size))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(chrome::DROP_TARGET_HINT),
             )
             .into_any_element()
     }

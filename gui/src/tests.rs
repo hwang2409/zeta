@@ -1,5 +1,5 @@
 use super::*;
-use gpui::{TestAppContext, VisualTestContext, WindowHandle};
+use gpui::{InputEvent as _, TestAppContext, VisualTestContext, WindowHandle};
 use gpui_kit::component::Theme;
 use serde_json::json;
 use std::path::PathBuf;
@@ -2025,6 +2025,194 @@ fn attachment_validation_error_renders_and_clears_on_a_good_image(cx: &mut TestA
         assert!(view.composer_image_error.is_none());
         assert_eq!(view.composer_images.len(), 1);
     });
+}
+
+#[gpui::test]
+fn attach_button_paints_an_icon_hit_target_at_send_button_height(cx: &mut TestAppContext) {
+    // The icon-only attach affordance keeps the Send row compact but must
+    // still meet the 40px hit-area floor from make-interfaces-feel-better so
+    // pointer users, tab focus, and touch targets all land on the same box.
+    let (window, _, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let attach = visual
+        .debug_bounds("attach-button")
+        .expect("attach button renders");
+    assert!(
+        attach.size.height >= px(40.) && attach.size.width >= px(40.),
+        "attach hit area must be at least 40x40 (got {:?})",
+        attach.size,
+    );
+    let send = visual
+        .debug_bounds("send-button")
+        .expect("send button renders");
+    // Both controls share the composer row's vertical rhythm.
+    assert_eq!(
+        attach.size.height, send.size.height,
+        "attach and send buttons must share the composer action-row height",
+    );
+}
+
+#[gpui::test]
+fn drag_over_composer_paints_drop_target_and_drop_adds_attachments(cx: &mut TestAppContext) {
+    // The full drag-and-drop path: entering the composer bounds with an
+    // ExternalPaths payload lights up the overlay; submitting the drop
+    // dispatches the same batch flow as the file picker, so a real PNG on
+    // disk lands as a pending attachment. Exiting without a drop must clear
+    // the overlay without touching the chip row.
+    let temp = std::env::temp_dir().join(format!("zeta-drop-{}.png", std::process::id()));
+    std::fs::write(&temp, png_bytes()).expect("write drop-source png");
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let composer = visual.debug_bounds("composer").expect("composer renders");
+    let inside = composer.center();
+    // Enter → overlay paints; Exit → overlay clears; no chip yet.
+    visual.update(|window, cx| {
+        window.dispatch_event(
+            gpui::FileDropEvent::Entered {
+                position: inside,
+                paths: gpui::ExternalPaths([temp.clone()].into_iter().collect()),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("composer-drop-target").is_some(),
+        "drop-target overlay must paint while an external drag is active",
+    );
+    view.read_with(&visual, |view, _| {
+        assert!(
+            view.composer_images.is_empty(),
+            "hover alone must not attach"
+        );
+    });
+    visual.update(|window, cx| {
+        window.dispatch_event(gpui::FileDropEvent::Exited.to_platform_input(), cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("composer-drop-target").is_none(),
+        "drop-target overlay must clear when the drag leaves the window",
+    );
+    // Re-enter and submit → the drop hits attach_from_paths, which decodes
+    // the file into an ImageAttachment and renders the pending chip.
+    visual.update(|window, cx| {
+        window.dispatch_event(
+            gpui::FileDropEvent::Entered {
+                position: inside,
+                paths: gpui::ExternalPaths([temp.clone()].into_iter().collect()),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::FileDropEvent::Submit { position: inside }.to_platform_input(),
+            cx,
+        );
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.composer_images.len(), 1);
+        assert!(view.composer_images[0].name.ends_with(".png"));
+    });
+    assert!(visual.debug_bounds("composer-chip").is_some());
+    let _ = std::fs::remove_file(&temp);
+}
+
+#[gpui::test]
+fn attachment_chip_renders_remove_button_and_multi_attachments(cx: &mut TestAppContext) {
+    // Multiple pending attachments each render their own chip with a
+    // remove-button hit target; clicking a chip's remove drops just that
+    // attachment and keeps the others intact.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let images = vec![
+                thumbnail_attachment(8, 6, 1),
+                thumbnail_attachment(8, 6, 2),
+                thumbnail_attachment(8, 6, 3),
+            ];
+            view.add_attached_images(Ok(images), cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.composer_images.len(), 3);
+        assert_eq!(view.composer_thumbnails.len(), 3);
+    });
+    let remove_middle = visual
+        .debug_bounds("chip-remove-1")
+        .expect("middle chip remove button renders");
+    assert!(
+        remove_middle.size.height >= px(20.) && remove_middle.size.width >= px(20.),
+        "remove target must be at least visible-sized (got {:?})",
+        remove_middle.size,
+    );
+    visual.simulate_click(remove_middle.center(), Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.composer_images.len(), 2);
+        assert_eq!(view.composer_thumbnails.len(), 2);
+    });
+    // The chip row still paints for the two survivors.
+    assert!(visual.debug_bounds("composer-chip").is_some());
+    assert!(visual.debug_bounds("chip-remove-0").is_some());
+    assert!(visual.debug_bounds("chip-remove-1").is_some());
+    assert!(visual.debug_bounds("chip-remove-2").is_none());
+}
+
+#[gpui::test]
+fn drop_reuses_the_batch_limit_error_and_leaves_chips_intact(cx: &mut TestAppContext) {
+    // Drop routes through `add_attached_images` so the shared 4-image cap
+    // fires the same error banner the paste and file-picker paths surface.
+    // A dropped fifth file must land in the error surface, not silently.
+    let temp = std::env::temp_dir().join(format!("zeta-drop-limit-{}.png", std::process::id()));
+    std::fs::write(&temp, png_bytes()).expect("write drop-source png");
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            for _ in 0..4 {
+                view.add_attached_images(Ok(vec![thumbnail_attachment(8, 6, 1)]), cx);
+            }
+            assert_eq!(view.composer_images.len(), 4);
+        });
+        window.draw(cx).clear(cx);
+    });
+    let composer = visual.debug_bounds("composer").unwrap();
+    visual.update(|window, cx| {
+        window.dispatch_event(
+            gpui::FileDropEvent::Entered {
+                position: composer.center(),
+                paths: gpui::ExternalPaths([temp.clone()].into_iter().collect()),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::FileDropEvent::Submit {
+                position: composer.center(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.composer_images.len(), 4, "cap must not be exceeded");
+        assert!(
+            view.composer_image_error
+                .as_ref()
+                .is_some_and(|e| e.contains("512")),
+            "the batch limit banner must fire on the offending drop, got {:?}",
+            view.composer_image_error,
+        );
+    });
+    let _ = std::fs::remove_file(&temp);
 }
 
 #[gpui::test]

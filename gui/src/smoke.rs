@@ -2,10 +2,32 @@
 use super::*;
 use gpui_kit::test::TestWindowExt;
 
+/// Encode a tiny checkerboard PNG for the ZETA-112 attachment-chrome shot.
+/// A one-shot helper — the smoke driver seeds a real attachment so the
+/// thumbnail slot decodes rather than falling back to the file glyph.
+fn png_seed_bytes() -> Vec<u8> {
+    let pixels = image::RgbaImage::from_fn(48, 32, |x, y| {
+        if ((x / 8) + (y / 8)) % 2 == 0 {
+            image::Rgba([210, 180, 90, 255])
+        } else {
+            image::Rgba([40, 40, 50, 255])
+        }
+    });
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    pixels
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("encode seed png");
+    bytes.into_inner()
+}
+
 pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     let Some(path) = env::var_os("ZETA_GUI_SMOKE_IMAGE") else {
         return;
     };
+    // Optional second capture — the ZETA-112 composer chrome with pending
+    // attachment chips visible, before the settings modal covers them. Emits
+    // a separate PNG so the primary shot stays comparable with prior tickets.
+    let attachment_path = env::var_os("ZETA_GUI_SMOKE_ATTACHMENT_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -85,6 +107,47 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                 phase = 3;
                             }
                             3 => {
+                                // ZETA-112 attachment capture — seed two
+                                // pending chips (one decoded thumbnail, one
+                                // fallback icon), draw once, capture, then
+                                // clear before the modal shot below so the
+                                // primary after-screenshot stays unchanged.
+                                if let Some(ref attach_path) = attachment_path {
+                                    entity.update(cx, |view, cx| {
+                                        let ok = zeta_gui::session::ImageAttachment::from_bytes(
+                                            "diagram.png".into(),
+                                            &png_seed_bytes(),
+                                        );
+                                        if let Ok(image) = ok {
+                                            view.composer_thumbnails
+                                                .push(polish::image_source(&image));
+                                            view.composer_images.push(image);
+                                        }
+                                        if let Ok(broken) =
+                                            zeta_gui::session::ImageAttachment::from_bytes(
+                                                "sketch.png".into(),
+                                                b"\x89PNG\r\n\x1a\n",
+                                            )
+                                        {
+                                            view.composer_thumbnails
+                                                .push(polish::image_source(&broken));
+                                            view.composer_images.push(broken);
+                                        }
+                                        view.state.connection = ConnectionState::Connected;
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer capture")
+                                        .save(PathBuf::from(attach_path))
+                                        .expect("save attachment screenshot");
+                                    entity.update(cx, |view, cx| {
+                                        view.composer_images.clear();
+                                        view.composer_thumbnails.clear();
+                                        cx.notify();
+                                    });
+                                }
                                 entity.update(cx, |view, cx| {
                                     view.state.connection = ConnectionState::Connected;
                                     view.settings_open = true;
