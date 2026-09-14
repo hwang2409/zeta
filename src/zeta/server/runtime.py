@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..agent_catalog import AgentCatalog, discover_session_agents
 from ..core.approval import ApprovalPolicy
 from ..core.project_context import (
     ProjectContext,
@@ -200,6 +201,7 @@ class ServerRuntime:
         config = self._config(provider, model)
         repo_root = discover_repo_root(self.cwd)
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
+        agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
         context = load_project_context(
             cwd=self.cwd,
             repo_root=repo_root,
@@ -212,6 +214,7 @@ class ServerRuntime:
             model=config.model,
             project_context=context,
             skill_catalog=skill_catalog,
+            agent_catalog=agent_catalog,
         )
         await self._replace(composition)
         return self.metadata
@@ -246,6 +249,14 @@ class ServerRuntime:
                 skill_catalog = SkillCatalog.from_snapshot(
                     opened.metadata.skill_catalog
                 )
+            if opened.metadata.agent_catalog is None:
+                agent_catalog = discover_session_agents(
+                    home=self.home,
+                    project_dir=discover_repo_root(Path(opened.metadata.cwd)),
+                )
+                self.manager.persist_agent_catalog(opened.metadata, agent_catalog)
+            else:
+                agent_catalog = AgentCatalog.from_snapshot(opened.metadata.agent_catalog)
             context = ProjectContext(
                 opened.metadata.system_prompt,
                 tuple(Path(path) for path in opened.metadata.context_files),
@@ -257,6 +268,7 @@ class ServerRuntime:
                 model=opened.metadata.model,
                 project_context=context,
                 skill_catalog=skill_catalog,
+                agent_catalog=agent_catalog,
                 opened=opened,
             )
         except BaseException:

@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 
+from ..agent_catalog import discover_packaged_agents
 from ..core.session import SessionManager
 from ..mcp.mount import MCPMount
 from ..prompts import load_identity
@@ -77,12 +78,14 @@ async def run_claimed(
         return
     job = state.job
     skill_catalog = discover_session_skills(home=home)
+    agent_catalog = discover_packaged_agents()
     session = SessionManager(home).create(
         provider=job.provider,
         model=job.model,
         cwd=job.cwd,
         system_prompt=load_identity(catalog=skill_catalog),
         skill_catalog=skill_catalog,
+        agent_catalog=agent_catalog,
         name=f"automation: {job.name}"[:60],
     )
     store.attach_session(run_id, session.metadata.session_id)

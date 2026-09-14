@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..agent_catalog import AgentCatalog, discover_session_agents
 from ..core.project_context import (
     ProjectContext,
     PromptArgumentError,
@@ -140,6 +141,7 @@ def _create_app_with_root(
         cleanup.enter_context(opened.store)
         metadata = opened.metadata
         skill_catalog = _session_skill_catalog(metadata, home, manager)
+        agent_catalog = _session_agent_catalog(metadata, home, manager)
         cli_provider = getattr(args, "provider", None)
         cli_model = getattr(args, "model", None)
         provider_override = cli_provider or loaded_settings.settings.provider
@@ -197,6 +199,7 @@ def _create_app_with_root(
         provider = config.provider
         model = config.model
         skill_catalog = discover_session_skills(home=home, project_dir=repo_root)
+        agent_catalog = discover_session_agents(home=home, project_dir=repo_root)
         project_context = _app.load_project_context(
             cwd=Path.cwd(),
             repo_root=repo_root,
@@ -249,6 +252,7 @@ def _create_app_with_root(
         on_plan_mode_change=plan_mode_changed,
         max_turns=max_turns_override,
         skill_catalog=skill_catalog,
+        agent_catalog=agent_catalog,
     )
     if opened is None:
         cleanup.enter_context(composition.opened.store)
@@ -336,6 +340,24 @@ def _session_skill_catalog(
         return SkillCatalog.from_snapshot(metadata.skill_catalog)
     except ValueError as exc:
         raise SessionError("session skill catalog is invalid") from exc
+
+
+def _session_agent_catalog(
+    metadata: SessionMetadata, home: Path, manager: SessionManager
+):
+    if metadata.agent_catalog is None:
+        catalog = discover_session_agents(
+            home=home, project_dir=discover_repo_root(Path(metadata.cwd))
+        )
+        persisted = manager.persist_agent_catalog(metadata, catalog)
+        try:
+            return AgentCatalog.from_snapshot(persisted.agent_catalog)
+        except ValueError as exc:
+            raise SessionError("session agent catalog is invalid") from exc
+    try:
+        return AgentCatalog.from_snapshot(metadata.agent_catalog)
+    except ValueError as exc:
+        raise SessionError("session agent catalog is invalid") from exc
 
 
 def _apply_startup_theme(name: str | None, home: Path) -> tuple[str, ...]:

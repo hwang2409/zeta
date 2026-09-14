@@ -21,6 +21,7 @@ from typing import Any, Mapping
 from rich.cells import cell_len
 
 from ..skills import SkillCatalog
+from ..agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .store import ConversationStore
 from .session_files import SessionError, SessionInUseError, open_session_file, session_directory, session_root, child_directory, write_session_json
@@ -157,6 +158,7 @@ class SessionMetadata:
     system_prompt: str = ""
     context_files: list[str] = field(default_factory=list)
     skill_catalog: list[dict[str, Any]] | None = None
+    agent_catalog: list[dict[str, Any]] | None = None
     vim_mode: bool = True
     budget_pinned: bool = False
     plan_mode: bool = False
@@ -178,6 +180,7 @@ class SessionMetadata:
         system_prompt: str = "",
         context_files: list[str] | tuple[str, ...] = (),
         skill_catalog: SkillCatalog | None = None,
+        agent_catalog: AgentCatalog | None = None,
         vim_mode: bool = True,
         budget_pinned: bool = False,
         plan_mode: bool = False,
@@ -198,6 +201,9 @@ class SessionMetadata:
             context_files=list(context_files),
             skill_catalog=skill_catalog.to_snapshot()
             if skill_catalog is not None
+            else None,
+            agent_catalog=agent_catalog.to_snapshot()
+            if agent_catalog is not None
             else None,
             vim_mode=vim_mode,
             budget_pinned=budget_pinned,
@@ -248,6 +254,7 @@ class SessionMetadata:
         system_prompt = value.get("system_prompt", "") if has_context_snapshot else ""
         context_files = value.get("context_files", []) if has_context_snapshot else []
         skill_catalog = value.get("skill_catalog")
+        agent_catalog = value.get("agent_catalog")
         vim_mode = value.get("vim_mode", True)
         budget_pinned = value.get("budget_pinned", False)
         plan_mode = value.get("plan_mode", False)
@@ -263,6 +270,13 @@ class SessionMetadata:
                     or any(type(item) is not dict for item in skill_catalog)
                 )
             )
+            or (
+                agent_catalog is not None
+                and (
+                    type(agent_catalog) is not list
+                    or any(type(item) is not dict for item in agent_catalog)
+                )
+            )
             or type(vim_mode) is not bool
             or type(budget_pinned) is not bool
             or type(plan_mode) is not bool
@@ -275,6 +289,11 @@ class SessionMetadata:
                 SkillCatalog.from_snapshot(skill_catalog)
             except ValueError as exc:
                 raise SessionError(f"session metadata skill catalog is invalid: {path}") from exc
+        if agent_catalog is not None:
+            try:
+                AgentCatalog.from_snapshot(agent_catalog)
+            except ValueError as exc:
+                raise SessionError(f"session metadata agent catalog is invalid: {path}") from exc
         return cls(
             version=value["version"],
             session_id=value["session_id"],
@@ -290,6 +309,9 @@ class SessionMetadata:
             context_files=list(context_files),
             skill_catalog=[dict(item) for item in skill_catalog]
             if skill_catalog is not None
+            else None,
+            agent_catalog=[dict(item) for item in agent_catalog]
+            if agent_catalog is not None
             else None,
             vim_mode=vim_mode,
             budget_pinned=budget_pinned,
@@ -314,6 +336,7 @@ class SessionMetadata:
             "system_prompt": self.system_prompt,
             "context_files": self.context_files,
             "skill_catalog": self.skill_catalog,
+            "agent_catalog": self.agent_catalog,
             "vim_mode": self.vim_mode,
             "budget_pinned": self.budget_pinned,
             "plan_mode": self.plan_mode,
@@ -352,6 +375,7 @@ class SessionManager:
         system_prompt: str = "",
         context_files: list[str] | tuple[str, ...] = (),
         skill_catalog: SkillCatalog | None = None,
+        agent_catalog: AgentCatalog | None = None,
         vim_mode: bool = True,
         budget_pinned: bool = False,
         name: str = "",
@@ -371,6 +395,7 @@ class SessionManager:
                 system_prompt=system_prompt,
                 context_files=context_files,
                 skill_catalog=skill_catalog,
+                agent_catalog=agent_catalog,
                 vim_mode=vim_mode,
                 budget_pinned=budget_pinned,
                 name=name,
@@ -539,6 +564,21 @@ class SessionManager:
                 item.system_prompt = system_prompt
             if context_files is not None:
                 item.context_files = list(context_files)
+            return self._touch(item)
+
+        current = self._mutate(metadata.session_id, update)
+        self._copy_metadata(metadata, current)
+        return current
+
+    def persist_agent_catalog(
+        self, metadata: SessionMetadata, catalog: AgentCatalog
+    ) -> SessionMetadata:
+        """Snapshot the session agent catalog so resumes do not rediscover it."""
+
+        def update(item: SessionMetadata) -> SessionMetadata:
+            if item.agent_catalog is not None:
+                return item
+            item.agent_catalog = catalog.to_snapshot()
             return self._touch(item)
 
         current = self._mutate(metadata.session_id, update)
@@ -794,6 +834,11 @@ class SessionManager:
         target.skill_catalog = (
             [dict(item) for item in source.skill_catalog]
             if source.skill_catalog is not None
+            else None
+        )
+        target.agent_catalog = (
+            [dict(item) for item in source.agent_catalog]
+            if source.agent_catalog is not None
             else None
         )
         target.vim_mode = source.vim_mode
