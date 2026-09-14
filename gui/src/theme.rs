@@ -837,7 +837,12 @@ static PALETTE_GRUVBOX_LIGHT: LazyLock<Palette> = LazyLock::new(|| Palette {
     text_muted: hex(0x665c54),
     text_faint: hex(0x928374),
     accent: hex(0x458588),
-    accent_hover: hex(0x076678),
+    // Hover LIGHTENS the neutral-blue rest fill to Gruvbox's bright_blue
+    // #83a598. The obvious "darker teal" direction (faded_blue #076678)
+    // drops the near-black `accent_fg` label to 3.00:1 on the primary /
+    // info button hover — accent rest is already at the darkness floor
+    // #458588 clears 4.68:1, so hover has to go the other way.
+    accent_hover: hex(0x83a598),
     success: hex(0x98971a),
     warning: hex(0xd79921),
     danger: hex(0xcc241d),
@@ -1773,19 +1778,36 @@ mod tests {
     fn every_solid_semantic_pair_clears_wcag_aa() {
         // Text painted on a solid semantic fill (accent state pill, primary
         // button, warning/danger button) must reach the WCAG AA normal-text
-        // ratio of 4.5:1. The regression this catches: routing one
-        // foreground onto every semantic drops several pairs below that bar
-        // (VSCode warning 1.73:1, Gruvbox Light warning 2.19:1, Nord danger
-        // 3.05:1 measured on the pre-fix single-fg palette). If someone
-        // collapses the four `*_fg` fields back into one shared value, this
-        // test fails on the same three pairs.
+        // ratio of 4.5:1 in every state that repaints the fill. The
+        // regressions this catches:
+        //   * Routing one foreground onto every semantic drops several rest
+        //     pairs below that bar (VSCode warning 1.73:1, Gruvbox Light
+        //     warning 2.19:1, Nord danger 3.05:1 on the pre-fix single-fg
+        //     palette).
+        //   * Picking an `accent_hover` fill that stays paired with
+        //     `accent_fg` on the primary / info button hover state but
+        //     drops below 4.5:1 (Gruvbox Light 3.00:1 on the pre-fix
+        //     faded-blue #076678).
+        //
+        // Coverage picks the (fill, fg) pair actually painted:
+        //   * Rest: `<semantic>` fill + `<semantic>_fg` (theme.rs primary
+        //     button assigns button_primary_foreground = accent_fg, etc.).
+        //   * Hover: primary + info buttons swap to `accent_hover` while
+        //     keeping `accent_fg` on top (theme.rs button_primary_hover /
+        //     button_info_hover). success / warning / danger hover reuse
+        //     the rest fill (theme.rs button_*_hover = palette.<semantic>),
+        //     so their hover check is subsumed by the rest pair.
+        //   * Active: every solid semantic button repaints the rest fill
+        //     (theme.rs button_*_active = palette.<semantic>), so no extra
+        //     pair is painted.
         for id in ThemeId::ALL {
             let p = id.palette();
             for (label, bg, fg) in [
-                ("accent", p.accent, p.accent_fg),
-                ("success", p.success, p.success_fg),
-                ("warning", p.warning, p.warning_fg),
-                ("danger", p.danger, p.danger_fg),
+                ("accent rest", p.accent, p.accent_fg),
+                ("success rest", p.success, p.success_fg),
+                ("warning rest", p.warning, p.warning_fg),
+                ("danger rest", p.danger, p.danger_fg),
+                ("accent hover", p.accent_hover, p.accent_fg),
             ] {
                 let ratio = contrast_ratio(fg, bg);
                 assert!(
