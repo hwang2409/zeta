@@ -578,19 +578,25 @@ async def test_session_lifecycle_has_no_absolute_session_file_operations(tmp_pat
     probe = sessions / "audit-probe"
     probe.mkdir()
     try:
-        for event, operation in (
-            ("os.scandir", lambda: os.scandir(probe).close()),
-            ("os.listdir", lambda: os.listdir(probe)),
-            ("os.stat", probe.stat),
-            ("os.stat", probe.lstat),
-            ("os.lstat", lambda: os.lstat(probe)),
-            ("os.rmdir", probe.rmdir),
+        # Path.lstat() raises os.stat on Linux and os.lstat on macOS. Which
+        # name CPython uses is a platform detail; the contract under test is
+        # that the listener catches the operation at all, so accept either.
+        for accepted, operation in (
+            (("os.scandir",), lambda: os.scandir(probe).close()),
+            (("os.listdir",), lambda: os.listdir(probe)),
+            (("os.stat",), probe.stat),
+            (("os.stat", "os.lstat"), probe.lstat),
+            (("os.lstat",), lambda: os.lstat(probe)),
+            (("os.rmdir",), probe.rmdir),
         ):
             events.clear()
             recording = True
             operation()
             recording = False
-            assert (event, probe) in violations()
+            found = violations()
+            assert any((event, probe) in found for event in accepted), (
+                f"expected one of {accepted} for {probe}, saw {sorted(found)}"
+            )
     finally:
         recording = False
 
