@@ -6,6 +6,12 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from ..images import (
+    SUPPORTED_IMAGE_MEDIA_TYPES,
+    decoded_image_bytes,
+    image_description,
+    image_signature_matches,
+)
 from ..types import (
     ContentBlock,
     ImageContent,
@@ -17,9 +23,22 @@ from ..types import (
     ToolSchema,
     ToolUseContent,
     flatten_tool_content,
-    image_description,
 )
 from .codex_errors import CodexHTTPError
+
+
+def _image_input_block(image: ToolImageBlock) -> dict[str, Any] | None:
+    data = decoded_image_bytes(image)
+    if (
+        data is None
+        or image["mimeType"] not in SUPPORTED_IMAGE_MEDIA_TYPES
+        or not image_signature_matches(image["mimeType"], data)
+    ):
+        return None
+    return {
+        "type": "input_image",
+        "image_url": f"data:{image['mimeType']};base64,{image['data']}",
+    }
 
 
 def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str, Any]]:
@@ -39,8 +58,10 @@ def _wire_text(blocks: Sequence[ContentBlock], *, output: bool) -> list[dict[str
                 image["path"] = block.path
             if block.size is not None:
                 image["size"] = block.size
+            wire = _image_input_block(image)
             result.append(
-                {
+                wire
+                or {
                     "type": "input_text",
                     "text": image_description(image, detailed=True),
                 }
@@ -81,8 +102,8 @@ def build_responses_payload(
 ) -> dict[str, Any]:
     """Build a Responses request.
 
-    Codex has no native image tool-result block. Its one fallback is the
-    provider-neutral text description emitted by ``flatten_tool_content``.
+    Codex receives tool images as a following user image input. The function
+    output remains a text receipt because it cannot carry image content here.
     """
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
@@ -94,20 +115,42 @@ def build_responses_payload(
         elif message.role is MessageRole.TOOL_RESULT:
             if message.tool_result is None:
                 raise CodexHTTPError("tool result message is missing its result")
+            blocks = message.tool_result.content_blocks
+            images: list[dict[str, Any]] = []
+            if blocks is None:
+                receipt = message.tool_result.content
+            else:
+                receipt_blocks = []
+                has_text_block = any(block["type"] == "text" for block in blocks)
+                for block in blocks:
+                    if block["type"] == "image":
+                        wire = _image_input_block(block)
+                        if wire is not None:
+                            images.append(wire)
+                            if not has_text_block:
+                                description = image_description(block, detailed=True)
+                                receipt_blocks.append(
+                                    {
+                                        "type": "text",
+                                        "text": description,
+                                        "truncated": False,
+                                        "full_size": len(description.encode()),
+                                    }
+                                )
+                            continue
+                    receipt_blocks.append(block)
+                receipt = flatten_tool_content(receipt_blocks, detailed_images=True)
+                if not receipt and images:
+                    receipt = "image attached"
             input_items.append(
                 {
                     "type": "function_call_output",
                     "call_id": message.tool_result.tool_call_id,
-                    "output": (
-                        flatten_tool_content(
-                            message.tool_result.content_blocks,
-                            detailed_images=True,
-                        )
-                        if message.tool_result.content_blocks is not None
-                        else message.tool_result.content
-                    ),
+                    "output": receipt,
                 }
             )
+            if images:
+                input_items.append({"role": "user", "content": images})
         else:
             output = message.role is MessageRole.ASSISTANT
             if output and "codex_output_items" in message.metadata:

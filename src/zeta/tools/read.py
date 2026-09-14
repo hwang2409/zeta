@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import codecs
 import hashlib
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
 from ..core.abort import AbortSignal
+from ..images import detect_image_media_type
 from ..types import StructuredToolResult
 from ._sandbox import open_target
 from .registry import (
@@ -23,6 +25,9 @@ class _Digest(Protocol):
     def update(self, data: bytes, /) -> None: ...
 
     def hexdigest(self) -> str: ...
+
+
+IMAGE_MAX_BYTES = 4 * 1024 * 1024
 
 
 async def _read_handle(
@@ -136,6 +141,70 @@ async def _read(
                 os.close(file_descriptor)
                 raise
             with handle:
+                file_size = os.fstat(file_descriptor).st_size
+                sniffed_type = detect_image_media_type(
+                    os.pread(file_descriptor, 12, 0)
+                )
+                if sniffed_type is not None:
+                    data = handle.read(IMAGE_MAX_BYTES + 1)
+                    observed_size = max(file_size, len(data))
+                    if observed_size > IMAGE_MAX_BYTES:
+                        if "offset" in arguments or "limit" in arguments:
+                            raise ValueError(
+                                "offset and limit are not supported for image reads"
+                            )
+                        raise ValueError(
+                            f"image is {observed_size} bytes; cap is "
+                            f"{IMAGE_MAX_BYTES} bytes (4 MiB)"
+                        )
+                    if "offset" in arguments or "limit" in arguments:
+                        raise ValueError(
+                            "offset and limit are not supported for image reads"
+                        )
+                    media_type = detect_image_media_type(data, complete=True)
+                    if media_type is None:
+                        handle.seek(0)
+                        return await _read_handle(
+                            handle,
+                            resolved_path,
+                            offset,
+                            limit,
+                            output,
+                            digest,
+                            abort_signal,
+                        )
+                    file_size = len(data)
+                    format_name = media_type.removeprefix("image/")
+                    filename = resolved_path.name
+                    receipt = (
+                        f"filename={filename} bytes={file_size} "
+                        f"format={format_name}"
+                    )
+                    return {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": receipt,
+                                "truncated": False,
+                                "full_size": len(receipt.encode("utf-8")),
+                            },
+                            {
+                                "type": "image",
+                                "data": base64.b64encode(data).decode("ascii"),
+                                "mimeType": media_type,
+                                "path": str(resolved_path),
+                                "size": file_size,
+                            },
+                        ],
+                        "isError": False,
+                        "structuredContent": {
+                            "path": str(resolved_path),
+                            "filename": filename,
+                            "bytes": file_size,
+                            "format": format_name,
+                            "sha256": hashlib.sha256(data).hexdigest(),
+                        },
+                    }
                 return await _read_handle(
                     handle,
                     resolved_path,
@@ -155,7 +224,8 @@ def register(registry: ToolRegistry) -> None:
         _read,
         approval_subject="path",
         description=(
-            "Read a UTF-8 file. Relative paths use the session cwd; "
+            "Read a UTF-8 text file or a PNG, JPEG, GIF, or WebP image. "
+            "Image reads return the image bytes. Relative paths use the session cwd; "
             "~ and absolute paths outside the cwd are allowed."
         ),
         parallel_safe=True,

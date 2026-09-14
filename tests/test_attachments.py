@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -60,7 +61,12 @@ async def run_ctrl_v(app: TUIApp, value: str) -> list[str]:
 
 
 def webp_data(chunk_type: bytes, chunk_data: bytes) -> bytes:
-    chunk = chunk_type + len(chunk_data).to_bytes(4, "little") + chunk_data
+    chunk = (
+        chunk_type
+        + len(chunk_data).to_bytes(4, "little")
+        + chunk_data
+        + (b"\x00" if len(chunk_data) % 2 else b"")
+    )
     return b"RIFF" + (len(chunk) + 4).to_bytes(4, "little") + b"WEBP" + chunk
 
 
@@ -172,8 +178,10 @@ def test_image_attachment_round_trips_and_uses_provider_boundaries(tmp_path: Pat
     assert anthropic["messages"][0]["content"][1]["type"] == "image"
 
     codex = build_responses_payload([persisted], [], model="codex")
-    assert codex["input"][0]["content"][1]["type"] == "input_text"
-    assert "renamed.data" in codex["input"][0]["content"][1]["text"]
+    assert codex["input"][0]["content"][1] == {
+        "type": "input_image",
+        "image_url": "data:image/png;base64," + base64.b64encode(PNG).decode(),
+    }
 
 
 def test_paste_image_queues_a_session_attachment(

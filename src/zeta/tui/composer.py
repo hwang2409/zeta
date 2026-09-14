@@ -38,6 +38,7 @@ from ..core.session_files import (
 )
 from ..core.slash import SlashCommandRegistry
 from ..core.store import ConversationStore
+from ..images import image_signature_matches
 from ..types import (
     ErrorInfo,
     ImageContent,
@@ -46,7 +47,6 @@ from ..types import (
     StreamEvent,
     StreamEventType,
     TextContent,
-    image_signature_matches,
 )
 from . import theme
 from .key_bindings import (

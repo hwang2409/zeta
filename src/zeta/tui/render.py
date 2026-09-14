@@ -90,6 +90,22 @@ def _tool_content(event: StreamEvent) -> str:
     blocks = result.content_blocks or []
     if not blocks:
         return result.content
+    if (
+        event.tool_call is not None
+        and event.tool_call.name.lower() == "read"
+        and any(block.get("type") == "image" for block in blocks)
+        and isinstance(result.structured_content, dict)
+        and type(result.structured_content.get("format")) is str
+        and result.structured_content["format"] in {
+            "png",
+            "jpeg",
+            "gif",
+            "webp",
+        }
+    ):
+        return flatten_tool_content(
+            [block for block in blocks if block.get("type") == "text"]
+        )
     tool_name = event.tool_call.name if event.tool_call is not None else "tool"
     return flatten_tool_content(blocks, detailed_images=True, tool_name=tool_name)
 

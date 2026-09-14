@@ -11,13 +11,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from ..core.session_files import child_directory, write_session_file
+from ..images import image_signature_matches
 from ..model_catalog import PROVIDER_MODELS, known_model_names
 from ..types import (
     ImageContent,
     Message,
     MessageRole,
     TextContent,
-    image_signature_matches,
 )
 from .protocol import MAX_REQUEST_ID_BYTES, FrameCodec, ProtocolError, bounded
 from .runtime import ServerRuntime
