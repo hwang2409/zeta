@@ -50,6 +50,7 @@ mod chrome {
     pub const DROP_TARGET_HINT: &str = "PNG · JPEG · GIF · WebP · up to 512 KiB";
     pub const CHIP_REMOVE_LABEL: &str = "Remove attachment";
     pub const ATTACH_LIMIT_ERROR: &str = "Attach up to 4 images, 512 KiB total.";
+    pub const ATTACH_DECODE_ERROR: &str = "could not decode this image";
 }
 
 /// Cap on pending attachments before a batch trips the size-limit error.
@@ -213,10 +214,12 @@ struct ZetaView {
     /// True while an external drag is HOVERING the composer element (as
     /// opposed to being active anywhere in the window). Gates the composer's
     /// drop-target overlay so a drag over the sidebar does not light the
-    /// composer up. `Rc<Cell>` because the `drag_over<S>` closure runs with
-    /// `&mut App` only and needs to flip the flag without a `Context<Self>`
-    /// handle; `render_composer` reads then resets it every frame so
-    /// leaving-the-composer clears within one repaint.
+    /// composer up. Updated by the composer's `on_drag_move::<ExternalPaths>`
+    /// listener BEFORE each render, so a single draw per drag event paints
+    /// the correct overlay state; `render_composer` also clears the flag
+    /// whenever `has_active_drag()` is false so a fresh drag starts clean.
+    /// `Rc<Cell>` because the flag is read from `render_composer` and mutated
+    /// from GPUI's event listeners without a `Context<Self>` handle.
     drag_over_composer: std::rc::Rc<std::cell::Cell<bool>>,
     sent_images: std::collections::BTreeMap<(usize, usize), std::sync::Arc<gpui::Image>>,
     commands: Sender<CommandMessage>,
@@ -830,34 +833,63 @@ impl ZetaView {
         if items.is_empty() {
             return false;
         }
-        let combined = self.composer_attachments.len() + items.len();
-        let incoming_bytes: usize = items
+        // Decode thumbnails up-front so a corrupt payload (valid header,
+        // undecodable body) demotes the item to an Invalid chip BEFORE the
+        // cap check. Otherwise Send would emit an image the preview never
+        // rendered, and a batch of five undecodables would blow the cap on
+        // paths that were never going to ship.
+        let prepared: Vec<PendingAttachment> = items
+            .into_iter()
+            .map(|item| match item {
+                Ok(image) => match polish::image_source(&image) {
+                    Some(thumbnail) => PendingAttachment::Valid {
+                        image,
+                        thumbnail: Some(thumbnail),
+                    },
+                    None => PendingAttachment::Invalid {
+                        name: image.name,
+                        error: chrome::ATTACH_DECODE_ERROR.to_string(),
+                    },
+                },
+                Err((name, error)) => PendingAttachment::Invalid { name, error },
+            })
+            .collect();
+        // The 4-image and 512 KiB caps count only the payloads that would
+        // actually ship. Invalid chips are visible but non-sendable, so a
+        // mixed batch of three good + two error files stays under a 4-cap
+        // and every valid image attaches.
+        let existing_valid_count = self
+            .composer_attachments
             .iter()
-            .filter_map(|item| item.as_ref().ok().map(|image| image.size))
+            .filter(|item| matches!(item, PendingAttachment::Valid { .. }))
+            .count();
+        let incoming_valid_count = prepared
+            .iter()
+            .filter(|item| matches!(item, PendingAttachment::Valid { .. }))
+            .count();
+        let combined_valid = existing_valid_count + incoming_valid_count;
+        let incoming_bytes: usize = prepared
+            .iter()
+            .filter_map(|item| match item {
+                PendingAttachment::Valid { image, .. } => Some(image.size),
+                PendingAttachment::Invalid { .. } => None,
+            })
             .sum();
         let existing_bytes: usize = self
             .composer_attachments
             .iter()
             .filter_map(|item| item.valid_ref().map(|image| image.size))
             .sum();
-        if combined > MAX_ATTACHMENTS
+        if combined_valid > MAX_ATTACHMENTS
             || existing_bytes + incoming_bytes > zeta_gui::session::MAX_IMAGE_BYTES
         {
             self.composer_image_error = Some(chrome::ATTACH_LIMIT_ERROR.into());
             cx.notify();
             return false;
         }
-        let mut appended_any = false;
-        for item in items {
-            let pending = match item {
-                Ok(image) => {
-                    let thumbnail = polish::image_source(&image);
-                    PendingAttachment::Valid { image, thumbnail }
-                }
-                Err((name, error)) => PendingAttachment::Invalid { name, error },
-            };
+        let appended_any = !prepared.is_empty();
+        for pending in prepared {
             self.composer_attachments.push(pending);
-            appended_any = true;
         }
         if appended_any {
             self.composer_image_error = None;
@@ -1499,18 +1531,20 @@ impl ZetaView {
 
         let drop_enabled = can_send;
         // Overlay lights only when the drag is actually over the composer,
-        // not any time a drag is active in the window. Read the previous
-        // frame's `drag_over_composer` value (set by the drag_over closure
-        // during the last paint) THEN reset it — the paint on this frame
-        // will fire the closure again if the drag is still over, so the
-        // next frame's read stays true; if the drag left, no closure fires
-        // this frame and the reset takes over. `has_active_drag()` gates
-        // the whole thing, so drag-ended (which flips it false) also hides
-        // the overlay immediately.
-        let over_composer_last_frame = self.drag_over_composer.get();
-        self.drag_over_composer.set(false);
-        let drag_active = drop_enabled && cx.has_active_drag() && over_composer_last_frame;
-        let drag_flag = std::rc::Rc::clone(&self.drag_over_composer);
+        // not any time a drag is active in the window. `on_drag_move` fires
+        // in Capture phase on every drag movement and carries the composer
+        // hitbox as `event.bounds` — a bounds-vs-position check there
+        // updates `drag_over_composer` BEFORE the render that reads it, so
+        // one draw per drag event paints the correct overlay state.
+        //
+        // When the drag ends (`FileDropEvent::Exited`/`Ended` flip
+        // `has_active_drag` false and call `refresh()`), we also clear the
+        // hover flag here so a subsequent drag starts fresh — otherwise the
+        // last-known "inside" state from the prior drag would linger.
+        if !cx.has_active_drag() {
+            self.drag_over_composer.set(false);
+        }
+        let drag_active = drop_enabled && cx.has_active_drag() && self.drag_over_composer.get();
         div()
             .id("composer")
             .debug_selector(|| "composer".into())
@@ -1525,21 +1559,32 @@ impl ZetaView {
             .border_color(rail_color)
             .on_action(|_: &gpui_kit::component::input::Enter, _, _| {})
             .when(drop_enabled, |composer| {
-                // GPUI's built-in `on_hover` skips fires while a drag is
-                // active (gpui-pre-0.3.4 div.rs line 3094), and
-                // `on_mouse_exit` only fires on window-leave, so neither
-                // is a fit for "drag left the composer". The `drag_over`
-                // closure DOES fire (per paint) while the drag hovers the
-                // hitbox — so we side-effect the shared `drag_flag` from
-                // it, then rely on `render_composer`'s per-frame reset to
-                // notice when the closure stops firing.
+                // Hover tracking runs in `on_drag_move`, not the fluent
+                // `drag_over` style. GPUI's `drag_over` closure fires per
+                // PAINT while the drag is over the hitbox — reading its
+                // side-effect the next frame is a stale-state trap: one
+                // move outside the composer leaves the overlay visible
+                // for a frame, and rapid exit/re-entry flickers. The
+                // `on_drag_move` handler receives the current mouse
+                // position and this element's bounds every drag move
+                // (Capture phase, before the render that reads the flag),
+                // so a bounds-vs-position check there updates hover
+                // state BEFORE the next paint.
                 composer
                     .on_drop::<ExternalPaths>(cx.listener(|view, paths: &ExternalPaths, _, cx| {
                         view.drag_over_composer.set(false);
                         view.attach_from_paths(paths.paths(), cx);
                     }))
-                    .drag_over::<ExternalPaths>(move |style, _, _, cx| {
-                        drag_flag.set(true);
+                    .on_drag_move::<ExternalPaths>(cx.listener(
+                        |view, event: &gpui::DragMoveEvent<ExternalPaths>, _, cx| {
+                            let inside = event.bounds.contains(&event.event.position);
+                            if view.drag_over_composer.get() != inside {
+                                view.drag_over_composer.set(inside);
+                                cx.notify();
+                            }
+                        },
+                    ))
+                    .drag_over::<ExternalPaths>(|style, _, _, cx| {
                         style.border_color(cx.theme().drag_border)
                     })
             })
@@ -1712,6 +1757,11 @@ impl ZetaView {
         .opacity(0.1);
         let name = image.name.clone();
         let size_label = polish::format_bytes(image.size);
+        // Chip name text routes through `record_state` so the appearance
+        // themes test (per ThemeId::ALL) can assert the RENDERED text color
+        // at draw time, not the palette-field it points at — a mutation that
+        // paints the label with the fill color would slip past a token-only
+        // check but fail the render_log sample.
         self.chip_frame(padding_y, cx)
             .debug_selector(|| "composer-chip".into())
             .child(match thumbnail {
@@ -1721,6 +1771,7 @@ impl ZetaView {
                     .object_fit(gpui::ObjectFit::Cover)
                     .border_1()
                     .border_color(thumb_border)
+                    .debug_selector(move || format!("composer-chip-thumbnail-{index}"))
                     .into_any_element(),
                 None => div()
                     .w(thumb_w)
@@ -1733,6 +1784,7 @@ impl ZetaView {
                     .border_color(cx.theme().border)
                     .text_size(meta_size)
                     .text_color(cx.theme().muted_foreground)
+                    .debug_selector(move || format!("composer-chip-thumbnail-{index}"))
                     .child(Icon::new(IconName::File).size(meta_size))
                     .into_any_element(),
             })
@@ -1746,7 +1798,10 @@ impl ZetaView {
                         div()
                             .truncate()
                             .text_size(label_size)
-                            .text_color(cx.theme().foreground)
+                            .text_color(record_state(
+                                || format!("chip-name-{index}"),
+                                cx.theme().foreground,
+                            ))
                             .child(name),
                     )
                     .child(

@@ -321,6 +321,18 @@ fn png_bytes() -> Vec<u8> {
     b"\x89PNG\r\n\x1a\n".to_vec()
 }
 
+/// A tiny but decodable PNG. Used in tests that need `image_source` to
+/// succeed — the header-only `png_bytes()` above passes the parser's magic
+/// check but fails the decoder, and now demotes to an Invalid chip.
+fn valid_png_bytes() -> Vec<u8> {
+    let pixels = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    pixels
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    bytes.into_inner()
+}
+
 #[gpui::test]
 fn transcript_column_caps_at_wiki_readable_measure_and_centers(cx: &mut TestAppContext) {
     // Wiki agent-run column pins at 1024px centered. The default 1100px window
@@ -1938,11 +1950,14 @@ fn settings_selection_scrolls_the_current_model_into_view(cx: &mut TestAppContex
 fn attachments_paste_shows_chip_and_send_dispatches_send_images(cx: &mut TestAppContext) {
     let (window, view, receiver) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    // Prime the clipboard with a valid PNG stub; the paste hook adds the chip.
+    // Prime the clipboard with a real decodable PNG; the paste hook adds the
+    // chip. `png_bytes()` is a header-only stub — decoding fails and the app
+    // now (correctly) demotes it to an error chip, but this test wants the
+    // happy-path chip to Send.
     visual.update(|_, cx| {
         cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image {
             format: gpui::ImageFormat::Png,
-            bytes: png_bytes(),
+            bytes: valid_png_bytes(),
             id: 42,
         }))
     });
@@ -1974,11 +1989,12 @@ fn attachments_paste_shows_chip_and_send_dispatches_send_images(cx: &mut TestApp
         });
         window.draw(cx).clear(cx);
     });
+    let recorded_size = valid_png_bytes().len();
     view.read_with(&visual, |view, _| {
         assert!(view.composer_attachments.is_empty());
         assert_eq!(
             view.state.session_view.attachments.get(&0),
-            Some(&vec![("pasted-image.png".to_string(), 8)])
+            Some(&vec![("pasted-image.png".to_string(), recorded_size)])
         );
         // ImagesSent clears the queued-strip state alongside Sent — otherwise
         // an image-only send leaves a phantom dashed strip beside the solid
@@ -2024,12 +2040,18 @@ fn per_file_parse_errors_render_their_own_chip_and_never_ship(cx: &mut TestAppCo
         visual.debug_bounds("composer-chip-error-0").is_some(),
         "bad file still paints an error chip so the user can see and remove it"
     );
-    // Adding a valid sibling leaves the invalid chip in place.
+    // Adding a valid sibling leaves the invalid chip in place. `png_bytes()`
+    // above passes the header parser but fails the thumbnail decoder, so we
+    // hand a real decodable PNG here — otherwise the sibling would also
+    // demote to Invalid and the Send-filter assertion below has nothing to
+    // ship.
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.add_pending_attachments(
-                vec![ImageAttachment::from_bytes("good.png".into(), &png_bytes())
-                    .map_err(|error| ("good.png".to_string(), error))],
+                vec![
+                    ImageAttachment::from_bytes("good.png".into(), &valid_png_bytes())
+                        .map_err(|error| ("good.png".to_string(), error)),
+                ],
                 cx,
             );
         });
@@ -2051,6 +2073,125 @@ fn per_file_parse_errors_render_their_own_chip_and_never_ship(cx: &mut TestAppCo
         }
         other => panic!("expected SendImages, got {other:?}"),
     }
+}
+
+#[gpui::test]
+fn header_valid_but_undecodable_bytes_demote_to_an_error_chip(cx: &mut TestAppContext) {
+    // `png_bytes()` is the PNG magic prefix with no IHDR — it passes the
+    // header parser inside `ImageAttachment::from_bytes` so `attach_from_*`
+    // hands the app an Ok(image), but the thumbnail decoder fails. The app
+    // must catch that failure at the attach step and demote the item to an
+    // Invalid chip — otherwise Send would ship an image the preview never
+    // rendered, and the server would receive base64 the model cannot read.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let broken = ImageAttachment::from_bytes("corrupt.png".into(), &png_bytes())
+                .expect("header parses; the decoder should be the one to reject");
+            view.add_pending_attachments(vec![Ok(broken)], cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert_eq!(
+            view.valid_attachment_count(),
+            0,
+            "corrupt bytes must not sit as a Valid chip — Send would ship them"
+        );
+        assert_eq!(
+            view.invalid_attachment_count(),
+            1,
+            "the corrupt payload paints its own error chip"
+        );
+    });
+    assert!(
+        visual.debug_bounds("composer-chip-error-0").is_some(),
+        "error chip renders for the corrupt attachment"
+    );
+    // Send must NOT dispatch an image for the corrupt entry. With no other
+    // text or valid images the composer surfaces its empty-hint instead.
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| view.send_composer(cx));
+    });
+    assert!(
+        receiver.try_recv().is_err(),
+        "corrupt-only Send must dispatch nothing to the worker channel"
+    );
+    view.read_with(&visual, |view, _| {
+        assert!(
+            view.composer_empty_hint,
+            "corrupt-only Send should surface the empty-hint"
+        );
+    });
+}
+
+#[gpui::test]
+fn attachment_cap_counts_only_valid_chips(cx: &mut TestAppContext) {
+    // The 4-image cap gates PAYLOADS THAT WILL SHIP. An invalid chip is
+    // visible but never ships, so a mixed batch — three valid + two invalid
+    // files — must attach all five entries. A regression that counted the
+    // vec length would reject the whole batch and force the user to retry.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let items: Vec<Result<ImageAttachment, (String, String)>> = vec![
+                Ok(thumbnail_attachment(8, 6, 1)),
+                Ok(thumbnail_attachment(8, 6, 2)),
+                Ok(thumbnail_attachment(8, 6, 3)),
+                Err(("bad-a.png".into(), "junk bytes".into())),
+                Err(("bad-b.png".into(), "junk bytes".into())),
+            ];
+            let appended = view.add_pending_attachments(items, cx);
+            assert!(appended, "cap must not fire on 3 valid + 2 invalid");
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.valid_attachment_count(), 3);
+        assert_eq!(view.invalid_attachment_count(), 2);
+        assert!(
+            view.composer_image_error.is_none(),
+            "batch banner must not fire when the valid count fits: {:?}",
+            view.composer_image_error,
+        );
+    });
+    // A follow-up attach of one more valid image is fine — 3 + 1 = 4 valid.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let appended =
+                view.add_pending_attachments(vec![Ok(thumbnail_attachment(8, 6, 4))], cx);
+            assert!(appended, "fourth valid attachment must slot under the cap");
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.valid_attachment_count(), 4);
+        assert!(view.composer_image_error.is_none());
+    });
+    // The fifth valid attachment DOES trip the cap.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let appended =
+                view.add_pending_attachments(vec![Ok(thumbnail_attachment(8, 6, 5))], cx);
+            assert!(
+                !appended,
+                "fifth valid attachment must fail the cap and leave chips intact"
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.valid_attachment_count(), 4);
+        assert!(
+            view.composer_image_error
+                .as_ref()
+                .is_some_and(|e| e.contains('4')),
+            "batch banner must fire on the fifth valid image, got {:?}",
+            view.composer_image_error,
+        );
+    });
 }
 
 #[gpui::test]
@@ -2149,15 +2290,15 @@ fn drag_over_composer_paints_drop_target_and_drop_adds_attachments(cx: &mut Test
     // disk lands as a pending attachment. Exiting without a drop must clear
     // the overlay without touching the chip row.
     let temp = std::env::temp_dir().join(format!("zeta-drop-{}.png", std::process::id()));
-    std::fs::write(&temp, png_bytes()).expect("write drop-source png");
+    std::fs::write(&temp, valid_png_bytes()).expect("write drop-source png");
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| window.draw(cx).clear(cx));
     let composer = visual.debug_bounds("composer").expect("composer renders");
     let inside = composer.center();
-    // Enter → overlay paints; Exit → overlay clears; no chip yet.
-    // The first draw processes the mouse-move-into-composer event; the
-    // second draw sees `drag_over_composer=true` and paints the overlay.
+    // Enter → overlay paints on the next draw; Exit → overlay clears; no
+    // chip yet. `on_drag_move` updates the hover flag BEFORE the render
+    // that reads it, so one draw per drag event suffices.
     visual.update(|window, cx| {
         window.dispatch_event(
             gpui::FileDropEvent::Entered {
@@ -2167,7 +2308,6 @@ fn drag_over_composer_paints_drop_target_and_drop_adds_attachments(cx: &mut Test
             .to_platform_input(),
             cx,
         );
-        window.draw(cx).clear(cx);
         window.draw(cx).clear(cx);
     });
     assert!(
@@ -2217,9 +2357,13 @@ fn drag_over_composer_paints_drop_target_and_drop_adds_attachments(cx: &mut Test
 fn drop_overlay_hides_when_the_drag_leaves_the_composer_bounds(cx: &mut TestAppContext) {
     // The overlay must scope to the composer's hitbox — a drag that starts
     // over the composer and moves onto the sidebar clears the overlay even
-    // though `has_active_drag()` stays true window-wide.
+    // though `has_active_drag()` stays true window-wide. `on_drag_move`
+    // updates hover state BEFORE the render that reads it, so ONE draw per
+    // drag event paints the correct state — a mutation that reverts the
+    // hover path to a paint-time side effect would need two draws to catch
+    // up and fail this test.
     let temp = std::env::temp_dir().join(format!("zeta-drop-scope-{}.png", std::process::id()));
-    std::fs::write(&temp, png_bytes()).expect("write drop-source png");
+    std::fs::write(&temp, valid_png_bytes()).expect("write drop-source png");
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| window.draw(cx).clear(cx));
@@ -2227,8 +2371,7 @@ fn drop_overlay_hides_when_the_drag_leaves_the_composer_bounds(cx: &mut TestAppC
     let sidebar = visual
         .debug_bounds("sidebar-header")
         .expect("sidebar renders");
-    // Enter the composer → overlay paints. Two draws so the first paint
-    // registers the hover hitbox and the second sees drag_over_composer.
+    // Enter the composer → overlay paints after a SINGLE draw.
     visual.update(|window, cx| {
         window.dispatch_event(
             gpui::FileDropEvent::Entered {
@@ -2239,14 +2382,16 @@ fn drop_overlay_hides_when_the_drag_leaves_the_composer_bounds(cx: &mut TestAppC
             cx,
         );
         window.draw(cx).clear(cx);
-        window.draw(cx).clear(cx);
     });
-    assert!(visual.debug_bounds("composer-drop-target").is_some());
+    assert!(
+        visual.debug_bounds("composer-drop-target").is_some(),
+        "overlay must paint after ONE draw once the drag enters the composer",
+    );
     view.read_with(&visual, |view, _| {
         assert!(view.drag_over_composer.get());
     });
-    // Move the drag pointer onto the sidebar → overlay clears, though the
-    // window-wide drag is still active.
+    // Move the drag pointer onto the sidebar → overlay clears after ONE
+    // draw, though the window-wide drag is still active.
     visual.update(|window, cx| {
         window.dispatch_event(
             gpui::FileDropEvent::Pending {
@@ -2255,7 +2400,6 @@ fn drop_overlay_hides_when_the_drag_leaves_the_composer_bounds(cx: &mut TestAppC
             .to_platform_input(),
             cx,
         );
-        window.draw(cx).clear(cx);
         window.draw(cx).clear(cx);
     });
     view.read_with(&visual, |view, _| {
@@ -2267,6 +2411,23 @@ fn drop_overlay_hides_when_the_drag_leaves_the_composer_bounds(cx: &mut TestAppC
     assert!(
         visual.debug_bounds("composer-drop-target").is_none(),
         "overlay must not paint while the drag hovers a peer element",
+    );
+    // Re-enter the composer → overlay lights back up on the very next draw.
+    // Guards against a regression where the flag stays stuck false after a
+    // sidebar excursion.
+    visual.update(|window, cx| {
+        window.dispatch_event(
+            gpui::FileDropEvent::Pending {
+                position: composer.center(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("composer-drop-target").is_some(),
+        "re-entering the composer bounds must relight the overlay after ONE draw",
     );
     let _ = std::fs::remove_file(&temp);
 }
@@ -2375,7 +2536,7 @@ fn drop_reuses_the_batch_limit_error_and_leaves_chips_intact(cx: &mut TestAppCon
     // surface. A dropped fifth file must land in the error surface, not
     // silently, and the four existing chips survive.
     let temp = std::env::temp_dir().join(format!("zeta-drop-limit-{}.png", std::process::id()));
-    std::fs::write(&temp, png_bytes()).expect("write drop-source png");
+    std::fs::write(&temp, valid_png_bytes()).expect("write drop-source png");
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| {
@@ -2476,8 +2637,11 @@ fn removing_and_clearing_pending_chips_evict_thumbnail_assets(cx: &mut TestAppCo
 fn attachment_chip_scales_with_the_appearance_font_size(cx: &mut TestAppContext) {
     // Chip dimensions route through theme tokens keyed on font size, so a
     // chip painted at the picker's 11px floor is visibly smaller than the
-    // same chip at the 18px ceiling. Guards against regressing the chip
-    // chrome back to hardcoded pixel literals.
+    // same chip at the 18px ceiling. Measures RENDERED sub-parts — the
+    // whole chip's outer bounds could stay the same if only the thumbnail
+    // shrank while padding grew, so we probe the thumbnail img and the
+    // remove-button bounds directly. A regression that hardcoded either
+    // inner size to a pixel literal is caught here.
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| {
@@ -2486,8 +2650,11 @@ fn attachment_chip_scales_with_the_appearance_font_size(cx: &mut TestAppContext)
         });
         window.draw(cx).clear(cx);
     });
-    // Snapshot the chip bounds at the appearance-picker MIN and MAX so a
-    // future refactor that hardcodes a pixel literal is caught here.
+    struct ChipParts {
+        chip: gpui::Bounds<gpui::Pixels>,
+        thumbnail: gpui::Bounds<gpui::Pixels>,
+        remove: gpui::Bounds<gpui::Pixels>,
+    }
     let mut appearance = theme::Appearance::default();
     let mut chip_at = |base: f32, visual: &mut VisualTestContext| {
         appearance.font_size = theme::clamp_font_size(base);
@@ -2496,31 +2663,40 @@ fn attachment_chip_scales_with_the_appearance_font_size(cx: &mut TestAppContext)
             view.update(cx, |_, cx| cx.notify());
             window.draw(cx).clear(cx);
         });
-        visual.debug_bounds("composer-chip").expect("chip renders")
+        ChipParts {
+            chip: visual.debug_bounds("composer-chip").expect("chip renders"),
+            thumbnail: visual
+                .debug_bounds("composer-chip-thumbnail-0")
+                .expect("chip thumbnail renders"),
+            remove: visual
+                .debug_bounds("chip-remove-0")
+                .expect("chip remove button renders"),
+        }
     };
     let small = chip_at(theme::MIN_FONT_SIZE_PX, &mut visual);
     let large = chip_at(theme::MAX_FONT_SIZE_PX, &mut visual);
     assert!(
-        large.size.height > small.size.height,
-        "chip height must scale with the base font size (11px→{}, 18px→{})",
-        small.size.height,
-        large.size.height,
+        large.chip.size.height > small.chip.size.height
+            && large.chip.size.width > small.chip.size.width,
+        "outer chip bounds must scale (11px→{:?}, 18px→{:?})",
+        small.chip.size,
+        large.chip.size,
     );
     assert!(
-        large.size.width > small.size.width,
-        "chip width must scale with the base font size (11px→{}, 18px→{})",
-        small.size.width,
-        large.size.width,
+        large.thumbnail.size.height > small.thumbnail.size.height
+            && large.thumbnail.size.width > small.thumbnail.size.width,
+        "chip thumbnail must scale — a mutation that hardcoded the inner \
+         image dimensions would leave these equal (11px→{:?}, 18px→{:?})",
+        small.thumbnail.size,
+        large.thumbnail.size,
     );
-    // Also confirm the remove-button hit target scales — the wiki chip
-    // remove buttons keep pace with the rest of the row.
-    let control_small = theme::chip_control_size(px(theme::MIN_FONT_SIZE_PX));
-    let control_large = theme::chip_control_size(px(theme::MAX_FONT_SIZE_PX));
     assert!(
-        control_large > control_small,
-        "chip control size must scale (11px→{:?}, 18px→{:?})",
-        control_small,
-        control_large,
+        large.remove.size.height > small.remove.size.height
+            && large.remove.size.width > small.remove.size.width,
+        "chip remove button must scale — a mutation that hardcoded the hit \
+         target would leave these equal (11px→{:?}, 18px→{:?})",
+        small.remove.size,
+        large.remove.size,
     );
     // Reset back to the default so downstream tests see the baseline theme.
     visual.update(|_, cx| theme::apply(cx));
@@ -2529,8 +2705,11 @@ fn attachment_chip_scales_with_the_appearance_font_size(cx: &mut TestAppContext)
 #[gpui::test]
 fn attachment_chips_render_legibly_across_every_shipped_theme(cx: &mut TestAppContext) {
     // Every appearance-picker theme must keep the chip surface + chip text
-    // visually distinct — if a palette painted the chip and its label with
-    // the same color the chip would be invisible.
+    // visually distinct. Asserts the RENDERED colors — the chip's fill quad
+    // comes from `painted_quads` and the chip name's text color from the
+    // `record_state` sample logged at draw time — so a mutation that painted
+    // the label with the fill color, or the fill quad with the text color,
+    // would slip past a palette-field check and fail here.
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| {
@@ -2544,10 +2723,13 @@ fn attachment_chips_render_legibly_across_every_shipped_theme(cx: &mut TestAppCo
             theme: *id,
             ..theme::Appearance::default()
         };
-        visual.update(|window, cx| {
+        super::render_log::clear();
+        let (expected_fill, expected_text) = visual.update(|window, cx| {
             theme::apply_with(cx, &appearance);
             view.update(cx, |_, cx| cx.notify());
             window.draw(cx).clear(cx);
+            let theme = cx.theme();
+            (theme.muted, theme.foreground)
         });
         let chip = visual
             .debug_bounds("composer-chip")
@@ -2557,14 +2739,42 @@ fn attachment_chips_render_legibly_across_every_shipped_theme(cx: &mut TestAppCo
             "chip must have positive bounds under {:?}",
             id.slug(),
         );
-        // The chip's muted-bg role (palette.element) must differ from the
-        // text role (palette.text) — otherwise the filename label paints
-        // invisibly against the chip fill.
-        let palette = id.palette();
+        // Rendered fill: a painted quad whose background matches the
+        // theme.muted token AND whose bounds sit inside the chip.
+        visual.update(|window, _| {
+            let scale = window.scale_factor();
+            let scaled_chip = chip.scale(scale);
+            let fill = window.painted_quads().into_iter().find(|quad| {
+                quad.background == expected_fill.into()
+                    && quad.bounds.top() >= scaled_chip.top() - px(1.).scale(scale)
+                    && quad.bounds.bottom() <= scaled_chip.bottom() + px(1.).scale(scale)
+                    && quad.bounds.left() >= scaled_chip.left() - px(1.).scale(scale)
+                    && quad.bounds.right() <= scaled_chip.right() + px(1.).scale(scale)
+            });
+            assert!(
+                fill.is_some(),
+                "chip fill must paint theme.muted ({:?}) under {:?}",
+                expected_fill,
+                id.slug(),
+            );
+        });
+        // Rendered text color: the render_log sample for chip-name-0 is the
+        // color that reached the `.text_color(...)` call at draw time.
+        let sample = super::render_log::samples()
+            .into_iter()
+            .find(|s| s.row_id == "chip-name-0")
+            .unwrap_or_else(|| panic!("chip name text must record under {:?}", id.slug()));
+        assert_eq!(
+            sample.color,
+            expected_text,
+            "chip name text must paint theme.foreground under {:?}",
+            id.slug(),
+        );
         assert_ne!(
-            palette.element,
-            palette.text,
-            "chip surface and label text must differ under {:?}",
+            sample.color,
+            expected_fill,
+            "chip name text must not paint the fill color under {:?} — \
+             filename would render invisible against the chip",
             id.slug(),
         );
     }
@@ -2910,7 +3120,7 @@ fn session_changes_clear_ui_state_but_same_session_status_preserves_it(cx: &mut 
                 view.add_pending_attachments(
                     vec![Ok(ImageAttachment::from_bytes(
                         "test.png".into(),
-                        &png_bytes(),
+                        &valid_png_bytes(),
                     )
                     .unwrap())],
                     cx,
@@ -2957,7 +3167,7 @@ fn image_paste_is_claimed_only_when_an_image_is_accepted(cx: &mut TestAppContext
     visual.update(|_, cx| {
         cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
             gpui::ImageFormat::Png,
-            png_bytes(),
+            valid_png_bytes(),
         )));
         view.update(cx, |view, cx| {
             view.state.active_session = None;
@@ -3558,7 +3768,7 @@ fn refused_image_paste_falls_through_to_clipboard_text(cx: &mut TestAppContext) 
             entries: vec![
                 gpui::ClipboardEntry::Image(gpui::Image::from_bytes(
                     gpui::ImageFormat::Png,
-                    png_bytes(),
+                    valid_png_bytes(),
                 )),
                 gpui::ClipboardEntry::String(gpui::ClipboardString::new("fallback text".into())),
             ],
