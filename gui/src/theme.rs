@@ -159,6 +159,38 @@ pub fn label_micro(base: Pixels) -> Pixels {
     px((f32::from(base) - 3.).max(MIN_LABEL_PX))
 }
 
+/// Pending-attachment chip thumbnail size. Base 13px keeps parity with the
+/// original 32x24 rectangle; other sizes scale proportionally so the chip
+/// row rhythm matches the appearance picker's base font.
+pub fn chip_thumbnail_size(base: Pixels) -> (Pixels, Pixels) {
+    let scale = f32::from(base) / 13.0;
+    let width = (32. * scale).round().max(24.);
+    let height = (24. * scale).round().max(18.);
+    (px(width), px(height))
+}
+
+/// Pending-attachment chip remove-button hit target. Same 24px baseline
+/// as the thumbnail height at 13px; scales with the base font.
+pub fn chip_control_size(base: Pixels) -> Pixels {
+    let scale = f32::from(base) / 13.0;
+    px((24. * scale).round().max(20.))
+}
+
+/// Vertical padding around the chip row's content. Small enough to keep the
+/// chip visually flat; scales gently with the appearance base.
+pub fn chip_padding_y(base: Pixels) -> Pixels {
+    let scale = f32::from(base) / 13.0;
+    px((3. * scale).round().max(2.))
+}
+
+/// Chip label-column maximum width. Truncates a long filename before the
+/// chip stretches past a scannable measure; scales with the base font so
+/// bigger picks keep roughly the same character budget on-screen.
+pub fn chip_label_max_width(base: Pixels) -> Pixels {
+    let scale = f32::from(base) / 13.0;
+    px((180. * scale).round().max(140.))
+}
+
 /// Named palettes the appearance picker exposes. Opencode ships as the
 /// default and mirrors the wiki agent-run look; the other four give the
 /// user a spread of dark and light options without leaving the flat,

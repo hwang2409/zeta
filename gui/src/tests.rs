@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::LazyLock;
 use zeta_gui::client::{ModelCatalog, ServerEvent, SessionMetadata, StatusResult, ToolCall};
-use zeta_gui::session::{Branch, ImageAttachment, SessionSettings};
+use zeta_gui::session::{self, Branch, ImageAttachment, SessionSettings};
 
 /// Isolated `ZETA_HOME` shared by every test in this file. Set once on first
 /// access via `LazyLock` so any test that reads or writes `prefs::prefs_path`
@@ -1953,8 +1953,7 @@ fn attachments_paste_shows_chip_and_send_dispatches_send_images(cx: &mut TestApp
         .expect("pasted image becomes a chip");
     assert!(chip.size.width > px(0.));
     view.read_with(&visual, |view, _| {
-        assert_eq!(view.composer_images.len(), 1);
-        assert_eq!(view.composer_images[0].name, "pasted-image.png");
+        assert_eq!(view.valid_attachment_names(), vec!["pasted-image.png"]);
     });
     // Click Send dispatches SendImages with the pending attachments.
     let send = visual
@@ -1970,13 +1969,13 @@ fn attachments_paste_shows_chip_and_send_dispatches_send_images(cx: &mut TestApp
     // Worker ack clears the chip and records the attachment on the transcript row.
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
-            let images = view.composer_images.clone();
+            let images = view.valid_attachments();
             view.apply_worker_message(WorkerMessage::ImagesSent(String::new(), images), window, cx);
         });
         window.draw(cx).clear(cx);
     });
     view.read_with(&visual, |view, _| {
-        assert!(view.composer_images.is_empty());
+        assert!(view.composer_attachments.is_empty());
         assert_eq!(
             view.state.session_view.attachments.get(&0),
             Some(&vec![("pasted-image.png".to_string(), 8)])
@@ -1994,37 +1993,126 @@ fn attachments_paste_shows_chip_and_send_dispatches_send_images(cx: &mut TestApp
 }
 
 #[gpui::test]
-fn attachment_validation_error_renders_and_clears_on_a_good_image(cx: &mut TestAppContext) {
+fn per_file_parse_errors_render_their_own_chip_and_never_ship(cx: &mut TestAppContext) {
+    // A bad clipboard payload lands as its own inline error chip — never in
+    // the batch banner and never sendable — while good siblings and later
+    // additions keep their own chips.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.add_pending_attachments(
+                vec![
+                    ImageAttachment::from_bytes("bad.png".into(), b"not a real png")
+                        .map_err(|error| ("bad.png".to_string(), error)),
+                ],
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert!(
+            view.composer_image_error.is_none(),
+            "per-file errors must NOT set the batch banner: {:?}",
+            view.composer_image_error,
+        );
+        assert_eq!(view.valid_attachment_count(), 0);
+        assert_eq!(view.invalid_attachment_count(), 1);
+    });
+    assert!(
+        visual.debug_bounds("composer-chip-error-0").is_some(),
+        "bad file still paints an error chip so the user can see and remove it"
+    );
+    // Adding a valid sibling leaves the invalid chip in place.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.add_pending_attachments(
+                vec![ImageAttachment::from_bytes("good.png".into(), &png_bytes())
+                    .map_err(|error| ("good.png".to_string(), error))],
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.valid_attachment_count(), 1);
+        assert_eq!(view.invalid_attachment_count(), 1);
+    });
+    // Send fires with the valid image only — the invalid one is filtered out.
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| view.send_composer(cx));
+    });
+    let dispatched = receiver.try_recv().expect("send fires with valid images");
+    match dispatched {
+        CommandMessage::SendImages(_, images) => {
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].name, "good.png");
+        }
+        other => panic!("expected SendImages, got {other:?}"),
+    }
+}
+
+#[gpui::test]
+fn attachment_parse_errors_cover_all_four_kinds(cx: &mut TestAppContext) {
+    // Each of the four parse-error categories the attach path can raise —
+    // unreadable path, oversize file, undecodable bytes, unsupported format
+    // — lands as its own per-file chip, never rejects a batch, and each
+    // survives Send filtering.
+    let temp_dir = std::env::temp_dir();
+    let unique = std::process::id();
+    let oversize_path = temp_dir.join(format!("zeta-parse-oversize-{unique}.png"));
+    let unsupported_path = temp_dir.join(format!("zeta-parse-unsupported-{unique}.bmp"));
+    let undecodable_path = temp_dir.join(format!("zeta-parse-undecodable-{unique}.png"));
+    let missing_path = temp_dir.join(format!("zeta-parse-missing-{unique}.png"));
+    // Oversize: a PNG magic-header prefix padded past the 512 KiB cap.
+    let mut oversize_bytes = png_bytes();
+    oversize_bytes.resize(session::MAX_IMAGE_BYTES + 1, 0u8);
+    std::fs::write(&oversize_path, &oversize_bytes).unwrap();
+    // Unsupported: a valid BMP header the parser rejects.
+    std::fs::write(&unsupported_path, b"BM\x00\x00\x00\x00\x00\x00").unwrap();
+    // Undecodable: a `.png`-named file with junk bytes.
+    std::fs::write(&undecodable_path, b"junk bytes").unwrap();
+    // Missing: never written, so the read fails first.
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.add_attached_images(
-                ImageAttachment::from_bytes("bad.png".into(), b"not a real png")
-                    .map(|image| vec![image]),
+            view.attach_from_paths(
+                &[
+                    missing_path.clone(),
+                    oversize_path.clone(),
+                    undecodable_path.clone(),
+                    unsupported_path.clone(),
+                ],
                 cx,
             );
         });
         window.draw(cx).clear(cx);
     });
     view.read_with(&visual, |view, _| {
-        assert!(view.composer_image_error.is_some());
-        assert!(view.composer_images.is_empty());
-    });
-    visual.update(|window, cx| {
-        view.update(cx, |view, cx| {
-            view.add_attached_images(
-                ImageAttachment::from_bytes("good.png".into(), &png_bytes())
-                    .map(|image| vec![image]),
-                cx,
-            );
-        });
-        window.draw(cx).clear(cx);
-    });
-    view.read_with(&visual, |view, _| {
+        assert_eq!(
+            view.invalid_attachment_count(),
+            4,
+            "every parse error becomes its own chip"
+        );
+        assert_eq!(view.valid_attachment_count(), 0);
         assert!(view.composer_image_error.is_none());
-        assert_eq!(view.composer_images.len(), 1);
     });
+    for selector in [
+        "composer-chip-error-0",
+        "composer-chip-error-1",
+        "composer-chip-error-2",
+        "composer-chip-error-3",
+    ] {
+        assert!(
+            visual.debug_bounds(selector).is_some(),
+            "error chip {selector} paints"
+        );
+    }
+    for path in [oversize_path, unsupported_path, undecodable_path] {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[gpui::test]
@@ -2068,6 +2156,8 @@ fn drag_over_composer_paints_drop_target_and_drop_adds_attachments(cx: &mut Test
     let composer = visual.debug_bounds("composer").expect("composer renders");
     let inside = composer.center();
     // Enter → overlay paints; Exit → overlay clears; no chip yet.
+    // The first draw processes the mouse-move-into-composer event; the
+    // second draw sees `drag_over_composer=true` and paints the overlay.
     visual.update(|window, cx| {
         window.dispatch_event(
             gpui::FileDropEvent::Entered {
@@ -2078,6 +2168,7 @@ fn drag_over_composer_paints_drop_target_and_drop_adds_attachments(cx: &mut Test
             cx,
         );
         window.draw(cx).clear(cx);
+        window.draw(cx).clear(cx);
     });
     assert!(
         visual.debug_bounds("composer-drop-target").is_some(),
@@ -2085,7 +2176,7 @@ fn drag_over_composer_paints_drop_target_and_drop_adds_attachments(cx: &mut Test
     );
     view.read_with(&visual, |view, _| {
         assert!(
-            view.composer_images.is_empty(),
+            view.composer_attachments.is_empty(),
             "hover alone must not attach"
         );
     });
@@ -2115,11 +2206,91 @@ fn drag_over_composer_paints_drop_target_and_drop_adds_attachments(cx: &mut Test
         window.draw(cx).clear(cx);
     });
     view.read_with(&visual, |view, _| {
-        assert_eq!(view.composer_images.len(), 1);
-        assert!(view.composer_images[0].name.ends_with(".png"));
+        assert_eq!(view.valid_attachment_count(), 1);
+        assert!(view.valid_attachment_names()[0].ends_with(".png"));
     });
     assert!(visual.debug_bounds("composer-chip").is_some());
     let _ = std::fs::remove_file(&temp);
+}
+
+#[gpui::test]
+fn drop_overlay_hides_when_the_drag_leaves_the_composer_bounds(cx: &mut TestAppContext) {
+    // The overlay must scope to the composer's hitbox — a drag that starts
+    // over the composer and moves onto the sidebar clears the overlay even
+    // though `has_active_drag()` stays true window-wide.
+    let temp = std::env::temp_dir().join(format!("zeta-drop-scope-{}.png", std::process::id()));
+    std::fs::write(&temp, png_bytes()).expect("write drop-source png");
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let composer = visual.debug_bounds("composer").expect("composer renders");
+    let sidebar = visual
+        .debug_bounds("sidebar-header")
+        .expect("sidebar renders");
+    // Enter the composer → overlay paints. Two draws so the first paint
+    // registers the hover hitbox and the second sees drag_over_composer.
+    visual.update(|window, cx| {
+        window.dispatch_event(
+            gpui::FileDropEvent::Entered {
+                position: composer.center(),
+                paths: gpui::ExternalPaths([temp.clone()].into_iter().collect()),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.draw(cx).clear(cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("composer-drop-target").is_some());
+    view.read_with(&visual, |view, _| {
+        assert!(view.drag_over_composer.get());
+    });
+    // Move the drag pointer onto the sidebar → overlay clears, though the
+    // window-wide drag is still active.
+    visual.update(|window, cx| {
+        window.dispatch_event(
+            gpui::FileDropEvent::Pending {
+                position: sidebar.center(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.draw(cx).clear(cx);
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert!(
+            !view.drag_over_composer.get(),
+            "drag pointer left the composer bounds — overlay must clear",
+        );
+    });
+    assert!(
+        visual.debug_bounds("composer-drop-target").is_none(),
+        "overlay must not paint while the drag hovers a peer element",
+    );
+    let _ = std::fs::remove_file(&temp);
+}
+
+#[gpui::test]
+fn attach_button_click_invokes_the_file_picker(cx: &mut TestAppContext) {
+    // Clicking the attach button routes through `attach_from_files`, which
+    // opens the platform path prompt. The test harness records the prompt
+    // so we can observe the click actually reached the picker.
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(!visual.did_prompt_for_paths());
+    let attach = visual
+        .debug_bounds("attach-button")
+        .expect("attach button renders");
+    visual.simulate_click(attach.center(), Default::default());
+    visual.run_until_parked();
+    assert!(
+        visual.did_prompt_for_paths(),
+        "the attach button must open the platform path prompt"
+    );
+    // Cancel the prompt so it does not linger for later tests.
+    visual.simulate_path_prompt_response(|_options| None);
 }
 
 #[gpui::test]
@@ -2131,18 +2302,17 @@ fn attachment_chip_renders_remove_button_and_multi_attachments(cx: &mut TestAppC
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
-            let images = vec![
-                thumbnail_attachment(8, 6, 1),
-                thumbnail_attachment(8, 6, 2),
-                thumbnail_attachment(8, 6, 3),
+            let items = vec![
+                Ok(thumbnail_attachment(8, 6, 1)),
+                Ok(thumbnail_attachment(8, 6, 2)),
+                Ok(thumbnail_attachment(8, 6, 3)),
             ];
-            view.add_attached_images(Ok(images), cx);
+            view.add_pending_attachments(items, cx);
         });
         window.draw(cx).clear(cx);
     });
     view.read_with(&visual, |view, _| {
-        assert_eq!(view.composer_images.len(), 3);
-        assert_eq!(view.composer_thumbnails.len(), 3);
+        assert_eq!(view.valid_attachment_count(), 3);
     });
     let remove_middle = visual
         .debug_bounds("chip-remove-1")
@@ -2155,8 +2325,7 @@ fn attachment_chip_renders_remove_button_and_multi_attachments(cx: &mut TestAppC
     visual.simulate_click(remove_middle.center(), Default::default());
     visual.update(|window, cx| window.draw(cx).clear(cx));
     view.read_with(&visual, |view, _| {
-        assert_eq!(view.composer_images.len(), 2);
-        assert_eq!(view.composer_thumbnails.len(), 2);
+        assert_eq!(view.valid_attachment_count(), 2);
     });
     // The chip row still paints for the two survivors.
     assert!(visual.debug_bounds("composer-chip").is_some());
@@ -2166,10 +2335,45 @@ fn attachment_chip_renders_remove_button_and_multi_attachments(cx: &mut TestAppC
 }
 
 #[gpui::test]
+fn removing_an_invalid_attachment_chip_drops_only_that_entry(cx: &mut TestAppContext) {
+    // Invalid chips are removable via their own remove button; the survivor
+    // list keeps its valid siblings intact.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let items = vec![
+                Ok(thumbnail_attachment(8, 6, 1)),
+                Err(("junk.bin".to_string(), "unsupported format".to_string())),
+                Ok(thumbnail_attachment(8, 6, 2)),
+            ];
+            view.add_pending_attachments(items, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.valid_attachment_count(), 2);
+        assert_eq!(view.invalid_attachment_count(), 1);
+    });
+    assert!(visual.debug_bounds("composer-chip-error-1").is_some());
+    let remove = visual
+        .debug_bounds("chip-remove-1")
+        .expect("error-chip remove button");
+    visual.simulate_click(remove.center(), Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.valid_attachment_count(), 2);
+        assert_eq!(view.invalid_attachment_count(), 0);
+    });
+    assert!(visual.debug_bounds("composer-chip-error-1").is_none());
+}
+
+#[gpui::test]
 fn drop_reuses_the_batch_limit_error_and_leaves_chips_intact(cx: &mut TestAppContext) {
-    // Drop routes through `add_attached_images` so the shared 4-image cap
-    // fires the same error banner the paste and file-picker paths surface.
-    // A dropped fifth file must land in the error surface, not silently.
+    // Drop routes through `add_pending_attachments` so the shared 4-image
+    // cap fires the same batch-limit banner the paste and file-picker paths
+    // surface. A dropped fifth file must land in the error surface, not
+    // silently, and the four existing chips survive.
     let temp = std::env::temp_dir().join(format!("zeta-drop-limit-{}.png", std::process::id()));
     std::fs::write(&temp, png_bytes()).expect("write drop-source png");
     let (window, view, _) = setup(cx);
@@ -2177,9 +2381,9 @@ fn drop_reuses_the_batch_limit_error_and_leaves_chips_intact(cx: &mut TestAppCon
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             for _ in 0..4 {
-                view.add_attached_images(Ok(vec![thumbnail_attachment(8, 6, 1)]), cx);
+                view.add_pending_attachments(vec![Ok(thumbnail_attachment(8, 6, 1))], cx);
             }
-            assert_eq!(view.composer_images.len(), 4);
+            assert_eq!(view.valid_attachment_count(), 4);
         });
         window.draw(cx).clear(cx);
     });
@@ -2203,7 +2407,7 @@ fn drop_reuses_the_batch_limit_error_and_leaves_chips_intact(cx: &mut TestAppCon
         window.draw(cx).clear(cx);
     });
     view.read_with(&visual, |view, _| {
-        assert_eq!(view.composer_images.len(), 4, "cap must not be exceeded");
+        assert_eq!(view.valid_attachment_count(), 4, "cap must not be exceeded");
         assert!(
             view.composer_image_error
                 .as_ref()
@@ -2213,6 +2417,159 @@ fn drop_reuses_the_batch_limit_error_and_leaves_chips_intact(cx: &mut TestAppCon
         );
     });
     let _ = std::fs::remove_file(&temp);
+}
+
+#[gpui::test]
+fn removing_and_clearing_pending_chips_evict_thumbnail_assets(cx: &mut TestAppContext) {
+    // Repeated attach → remove / attach → clear cycles must free the GPU
+    // asset cache slot, or long compose sessions leak textures. `remove` and
+    // `clear` both route through `PendingAttachment::Valid`'s thumbnail
+    // Arc so `remove_asset` fires per handle.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // First pass: add + render (populates the asset cache) → remove →
+    // asset must be evicted.
+    let cached_after_remove = visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.add_pending_attachments(vec![Ok(thumbnail_attachment(16, 12, 1))], cx);
+        });
+        window.draw(cx).clear(cx);
+        view.update(cx, |view, cx| {
+            let handle = match &view.composer_attachments[0] {
+                PendingAttachment::Valid { thumbnail, .. } => thumbnail.clone().expect("decoded"),
+                PendingAttachment::Invalid { .. } => panic!("expected valid attachment"),
+            };
+            handle.clone().get_render_image(window, cx);
+            assert!(handle.is_asset_cached(cx), "asset must cache after render");
+            view.remove_attached_image(0, cx);
+            handle.is_asset_cached(cx)
+        })
+    });
+    assert!(
+        !cached_after_remove,
+        "the removed thumbnail must be evicted from the asset cache"
+    );
+    // Second pass: add + render → clear → asset must be evicted.
+    let cached_after_clear = visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.add_pending_attachments(vec![Ok(thumbnail_attachment(16, 12, 2))], cx);
+        });
+        window.draw(cx).clear(cx);
+        view.update(cx, |view, cx| {
+            let handle = match &view.composer_attachments[0] {
+                PendingAttachment::Valid { thumbnail, .. } => thumbnail.clone().expect("decoded"),
+                PendingAttachment::Invalid { .. } => panic!("expected valid attachment"),
+            };
+            handle.clone().get_render_image(window, cx);
+            assert!(handle.is_asset_cached(cx), "asset must cache after render");
+            view.clear_composer_images(cx);
+            handle.is_asset_cached(cx)
+        })
+    });
+    assert!(
+        !cached_after_clear,
+        "clear must evict every held thumbnail from the asset cache"
+    );
+}
+
+#[gpui::test]
+fn attachment_chip_scales_with_the_appearance_font_size(cx: &mut TestAppContext) {
+    // Chip dimensions route through theme tokens keyed on font size, so a
+    // chip painted at the picker's 11px floor is visibly smaller than the
+    // same chip at the 18px ceiling. Guards against regressing the chip
+    // chrome back to hardcoded pixel literals.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.add_pending_attachments(vec![Ok(thumbnail_attachment(16, 12, 1))], cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    // Snapshot the chip bounds at the appearance-picker MIN and MAX so a
+    // future refactor that hardcodes a pixel literal is caught here.
+    let mut appearance = theme::Appearance::default();
+    let mut chip_at = |base: f32, visual: &mut VisualTestContext| {
+        appearance.font_size = theme::clamp_font_size(base);
+        visual.update(|window, cx| {
+            theme::apply_with(cx, &appearance);
+            view.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear(cx);
+        });
+        visual.debug_bounds("composer-chip").expect("chip renders")
+    };
+    let small = chip_at(theme::MIN_FONT_SIZE_PX, &mut visual);
+    let large = chip_at(theme::MAX_FONT_SIZE_PX, &mut visual);
+    assert!(
+        large.size.height > small.size.height,
+        "chip height must scale with the base font size (11px→{}, 18px→{})",
+        small.size.height,
+        large.size.height,
+    );
+    assert!(
+        large.size.width > small.size.width,
+        "chip width must scale with the base font size (11px→{}, 18px→{})",
+        small.size.width,
+        large.size.width,
+    );
+    // Also confirm the remove-button hit target scales — the wiki chip
+    // remove buttons keep pace with the rest of the row.
+    let control_small = theme::chip_control_size(px(theme::MIN_FONT_SIZE_PX));
+    let control_large = theme::chip_control_size(px(theme::MAX_FONT_SIZE_PX));
+    assert!(
+        control_large > control_small,
+        "chip control size must scale (11px→{:?}, 18px→{:?})",
+        control_small,
+        control_large,
+    );
+    // Reset back to the default so downstream tests see the baseline theme.
+    visual.update(|_, cx| theme::apply(cx));
+}
+
+#[gpui::test]
+fn attachment_chips_render_legibly_across_every_shipped_theme(cx: &mut TestAppContext) {
+    // Every appearance-picker theme must keep the chip surface + chip text
+    // visually distinct — if a palette painted the chip and its label with
+    // the same color the chip would be invisible.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.add_pending_attachments(vec![Ok(thumbnail_attachment(16, 12, 1))], cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    for id in theme::ThemeId::ALL {
+        let appearance = theme::Appearance {
+            theme: *id,
+            ..theme::Appearance::default()
+        };
+        visual.update(|window, cx| {
+            theme::apply_with(cx, &appearance);
+            view.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear(cx);
+        });
+        let chip = visual
+            .debug_bounds("composer-chip")
+            .unwrap_or_else(|| panic!("chip must paint under {:?}", id.slug()));
+        assert!(
+            chip.size.width > px(0.) && chip.size.height > px(0.),
+            "chip must have positive bounds under {:?}",
+            id.slug(),
+        );
+        // The chip's muted-bg role (palette.element) must differ from the
+        // text role (palette.text) — otherwise the filename label paints
+        // invisibly against the chip fill.
+        let palette = id.palette();
+        assert_ne!(
+            palette.element,
+            palette.text,
+            "chip surface and label text must differ under {:?}",
+            id.slug(),
+        );
+    }
+    // Reset back to the default so downstream tests see the baseline theme.
+    visual.update(|_, cx| theme::apply(cx));
 }
 
 #[gpui::test]
@@ -2527,7 +2884,7 @@ fn settings_trap_typing_editing_paste_and_shortcuts(cx: &mut TestAppContext) {
     visual.simulate_keystrokes("x backspace cmd-a cmd-v shift-enter tab cmd-n down");
     view.read_with(&visual, |view, cx| {
         assert_eq!(view.composer.read(cx).value().as_ref(), "draft");
-        assert!(view.composer_images.is_empty());
+        assert!(view.composer_attachments.is_empty());
         assert_eq!(view.state.session_view.selected_model, 1);
     });
     assert!(receiver.try_recv().is_err());
@@ -2550,8 +2907,14 @@ fn session_changes_clear_ui_state_but_same_session_status_preserves_it(cx: &mut 
                     session_id: current,
                     ..session()
                 };
-                view.composer_images =
-                    vec![ImageAttachment::from_bytes("test.png".into(), &png_bytes()).unwrap()];
+                view.add_pending_attachments(
+                    vec![Ok(ImageAttachment::from_bytes(
+                        "test.png".into(),
+                        &png_bytes(),
+                    )
+                    .unwrap())],
+                    cx,
+                );
                 view.composer_image_error = Some("old image error".into());
                 view.settings_open = true;
                 view.settings_error = Some("old settings error".into());
@@ -2563,7 +2926,7 @@ fn session_changes_clear_ui_state_but_same_session_status_preserves_it(cx: &mut 
                     compaction_markers: 0,
                 };
                 view.apply_worker_message(WorkerMessage::Status(status.clone()), window, cx);
-                assert_eq!(view.composer_images.len(), 1);
+                assert_eq!(view.valid_attachment_count(), 1);
                 assert!(view.settings_open);
                 let next = SessionMetadata {
                     session_id: format!("next-{via_status}"),
@@ -2578,7 +2941,7 @@ fn session_changes_clear_ui_state_but_same_session_status_preserves_it(cx: &mut 
                     WorkerMessage::Session(next)
                 };
                 view.apply_worker_message(change, window, cx);
-                assert!(view.composer_images.is_empty());
+                assert!(view.composer_attachments.is_empty());
                 assert!(view.composer_image_error.is_none());
                 assert!(!view.settings_open);
                 assert!(view.settings_error.is_none());
@@ -2610,9 +2973,9 @@ fn image_paste_is_claimed_only_when_an_image_is_accepted(cx: &mut TestAppContext
                 assert!(view.attach_from_clipboard(cx));
             }
             assert!(!view.attach_from_clipboard(cx));
-            assert_eq!(view.composer_images.len(), 4);
+            assert_eq!(view.valid_attachment_count(), 4);
             assert!(view.composer_image_error.is_some());
-            view.composer_images.clear();
+            view.clear_composer_images(cx);
         });
         cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
             gpui::ImageFormat::Png,
@@ -3203,17 +3566,19 @@ fn refused_image_paste_falls_through_to_clipboard_text(cx: &mut TestAppContext) 
     });
     visual.simulate_keystrokes("cmd-v");
     view.read_with(&visual, |view, cx| {
-        assert_eq!(view.composer_images.len(), 1);
+        assert_eq!(view.valid_attachment_count(), 1);
         assert!(view.composer.read(cx).value().is_empty());
     });
     visual.update(|_, cx| {
-        view.update(cx, |view, _| {
-            view.composer_images = vec![view.composer_images[0].clone(); 4]
+        view.update(cx, |view, cx| {
+            let base = view.valid_attachments()[0].clone();
+            view.clear_composer_images(cx);
+            view.add_pending_attachments(vec![Ok(base.clone()); 4], cx);
         });
     });
     visual.simulate_keystrokes("cmd-v");
     view.read_with(&visual, |view, cx| {
-        assert_eq!(view.composer_images.len(), 4);
+        assert_eq!(view.valid_attachment_count(), 4);
         assert_eq!(view.composer.read(cx).value().as_ref(), "fallback text");
     });
 }

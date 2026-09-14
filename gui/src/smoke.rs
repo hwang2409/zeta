@@ -107,21 +107,36 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                 phase = 3;
                             }
                             3 => {
-                                // ZETA-112 attachment capture — seed two
-                                // pending chips (one decoded thumbnail, one
-                                // fallback icon), draw once, capture, then
-                                // clear before the modal shot below so the
-                                // primary after-screenshot stays unchanged.
+                                // ZETA-112 attachment capture — seed a mixed
+                                // batch (valid decoded thumbnail, valid fallback
+                                // glyph, and one error chip surfaced by a per
+                                // file parse failure) so the shot proves the
+                                // typed pending model. Clear before the modal
+                                // shot below so the primary after-screenshot
+                                // stays unchanged.
                                 if let Some(ref attach_path) = attachment_path {
                                     entity.update(cx, |view, cx| {
-                                        let ok = zeta_gui::session::ImageAttachment::from_bytes(
-                                            "diagram.png".into(),
-                                            &png_seed_bytes(),
-                                        );
-                                        if let Ok(image) = ok {
-                                            view.composer_thumbnails
-                                                .push(polish::image_source(&image));
-                                            view.composer_images.push(image);
+                                        // The `add_pending_attachments` guard
+                                        // requires a live connection and an
+                                        // idle turn — the smoke driver's prior
+                                        // phase deliberately synthesises a
+                                        // lost-connection banner, so lift the
+                                        // guard to attach the seeded chips.
+                                        view.state.streaming = false;
+                                        view.state.connection = ConnectionState::Connected;
+                                        let mut items: Vec<
+                                            Result<
+                                                zeta_gui::session::ImageAttachment,
+                                                (String, String),
+                                            >,
+                                        > = Vec::new();
+                                        if let Ok(image) =
+                                            zeta_gui::session::ImageAttachment::from_bytes(
+                                                "diagram.png".into(),
+                                                &png_seed_bytes(),
+                                            )
+                                        {
+                                            items.push(Ok(image));
                                         }
                                         if let Ok(broken) =
                                             zeta_gui::session::ImageAttachment::from_bytes(
@@ -129,12 +144,13 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                                 b"\x89PNG\r\n\x1a\n",
                                             )
                                         {
-                                            view.composer_thumbnails
-                                                .push(polish::image_source(&broken));
-                                            view.composer_images.push(broken);
+                                            items.push(Ok(broken));
                                         }
-                                        view.state.connection = ConnectionState::Connected;
-                                        cx.notify();
+                                        items.push(Err((
+                                            "notes.bmp".into(),
+                                            "choose a PNG, JPEG, GIF, or WebP image".into(),
+                                        )));
+                                        view.add_pending_attachments(items, cx);
                                     });
                                     window.render_frame(cx);
                                     window
@@ -143,9 +159,7 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         .save(PathBuf::from(attach_path))
                                         .expect("save attachment screenshot");
                                     entity.update(cx, |view, cx| {
-                                        view.composer_images.clear();
-                                        view.composer_thumbnails.clear();
-                                        cx.notify();
+                                        view.clear_composer_images(cx);
                                     });
                                 }
                                 entity.update(cx, |view, cx| {
