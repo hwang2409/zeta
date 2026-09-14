@@ -8,9 +8,7 @@ MAX_FILE_LINES = 1250
 # Bumped on 2026-08-27 for the dedicated TUI agent-card seam and again on
 # 2026-09-06 for the ZETA-77 external tool discovery seam.
 # Bumped on 2026-09-10 for the ZETA-103 fd-anchored session-file safety seam.
-# Bumped on 2026-09-14 for the ZETA-119 shell completion module alongside
-# the image and skill catalog modules already on main.
-MAX_FILES_PER_DIRECTORY = 19
+MAX_FILES_PER_DIRECTORY = 17
 
 
 def test_module_limits() -> None:
