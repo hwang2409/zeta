@@ -16,6 +16,7 @@ from ..core.slash import resolve_session_budget
 from ..loop import AgentLoop
 from ..settings import ResolvedConfig
 from ..skills import SkillCatalog
+from ..skills.agent_catalog import AgentCatalog
 from ..tools._user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from ..types import CompletionBackend, StreamEvent
@@ -52,6 +53,7 @@ def compose_runtime(
     max_turns: int | None = None,
     background_event_sink: BackgroundEventSink | None = None,
     skill_catalog: SkillCatalog,
+    agent_catalog: AgentCatalog | None = None,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
 
@@ -76,6 +78,7 @@ def compose_runtime(
                 system_prompt=project_context.system_prompt,
                 context_files=[str(path) for path in project_context.files],
                 skill_catalog=skill_catalog,
+                agent_catalog=agent_catalog,
                 budget_pinned=budget_pinned,
             )
             cleanup.enter_context(opened.store)
@@ -99,6 +102,9 @@ def compose_runtime(
         if metadata.skill_catalog is None:
             raise ValueError("session has no persisted skill catalog")
         skill_catalog = SkillCatalog.from_snapshot(metadata.skill_catalog)
+        if metadata.agent_catalog is None:
+            raise ValueError("session has no persisted agent catalog")
+        agent_catalog = AgentCatalog.from_snapshot(metadata.agent_catalog)
         completion_callback = on_completion_success or (lambda: manager.touch(metadata))
         policy = ApprovalPolicy(
             store=opened.store,
@@ -118,7 +124,11 @@ def compose_runtime(
         }
         if max_turns is not None and max_turns > 0:
             loop_kwargs["max_turns"] = max_turns
-        registry = ToolRegistry(opened.store.cwd, skill_catalog=skill_catalog)
+        registry = ToolRegistry(
+            opened.store.cwd,
+            skill_catalog=skill_catalog,
+            agent_catalog=agent_catalog,
+        )
         cleanup.callback(registry.background_tasks.release_directory)
         loop = AgentLoop(
             backend,

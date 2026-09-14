@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 from ..types import Message, MessageRole, TextContent
@@ -14,11 +15,28 @@ AgentType = Literal["general", "explore", "plan", "run"]
 class AgentPreset:
     """Define the child prompt, tools, and turn budget for one agent type."""
 
-    name: AgentType
+    name: str
     turn_cap: int
     tool_names: frozenset[str] | None
     preamble: str
     selection_guidance: str
+    model: str | None = None
+    prompt_suffix: str = ""
+    source: str = "packaged"
+    path: Path | None = field(default=None, compare=False)
+    agents_root: Path | None = field(default=None, compare=False)
+
+    @property
+    def description(self) -> str:
+        return self.selection_guidance
+
+    @property
+    def tools(self) -> list[str] | None:
+        return sorted(self.tool_names) if self.tool_names is not None else None
+
+    @property
+    def body(self) -> str:
+        return self.prompt_suffix
 
 
 GENERAL_PRESET = AgentPreset(

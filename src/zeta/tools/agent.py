@@ -41,8 +41,6 @@ from ..types import (
 from .agent_presets import (
     GENERAL_PRESET,
     AgentType,
-    agent_type_description,
-    agent_type_names,
 )
 from .agent_send import (  # noqa: F401
     AGENT_SEND_COMMIT_TIMEOUT_SECONDS,
@@ -782,6 +780,8 @@ async def _agent(
 
 
 def register(registry: ToolRegistry) -> None:
+    agent_names = registry.agent_catalog.names()
+    agent_description = registry.agent_catalog.description()
     registry.register_session_tool(
         "agent",
         _agent,
@@ -792,7 +792,7 @@ def register(registry: ToolRegistry) -> None:
             "Pass model to run the child on another provider's model and "
             "orchestrate it from here. The returned child_instance_id is the "
             "stable handle for agent_status. Built-in types: "
-            f"{agent_type_description()}"
+            f"{agent_description}"
         ),
         parameters={
             "type": "object",
@@ -801,8 +801,15 @@ def register(registry: ToolRegistry) -> None:
                 "description": {"type": "string"},
                 "agent_type": {
                     "type": "string",
-                    "enum": agent_type_names(),
-                    "description": agent_type_description(),
+                    "enum": agent_names,
+                    "description": agent_description,
+                },
+                "preset": {
+                    "type": "string",
+                    "enum": agent_names,
+                    "description": (
+                        "Alias for agent_type. Select a preset from the session catalog."
+                    ),
                 },
                 "model": {
                     "type": "string",

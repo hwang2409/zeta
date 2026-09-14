@@ -20,14 +20,14 @@ from .core.checkpoints import _now
 from .core.store import ConversationStore
 from .model_catalog import provider_for_model
 from .providers.factory import build_backend, credential_store
+from .skills.agent_catalog import load_agent
 from .tools import ToolStreamPublisher
 from .tools.agent import ChildApprovalPolicy, agent_stats
 from .tools.agent_presets import (
     GENERAL_PRESET,
     RUN_PRESET,
-    agent_type_names,
+    AgentPreset,
     compose_system_prompt,
-    get_agent_preset,
 )
 from .tools.registry import ToolExecutionContext
 from .types import (
@@ -318,14 +318,22 @@ async def run_agent_tool(
 ) -> dict[str, object]:
     prompt = arguments.get("prompt")
     description = arguments.get("description")
-    agent_type = arguments.get("agent_type", GENERAL_PRESET.name)
-    model = arguments.get("model")
-    # The long kinds default to background -- a run on someone else's model, or
-    # one sized for a big task. Waiting on either blocks the orchestrator for
-    # the whole thing. An explicit background argument still wins.
-    background = arguments.get(
-        "background", model is not None or agent_type == RUN_PRESET.name
+    requested_preset = arguments.get("preset")
+    legacy_agent_type = arguments.get("agent_type")
+    if requested_preset is not None and legacy_agent_type is not None:
+        return loop._child_result_payload(
+            tool_call.id,
+            "agent error: pass only one of preset and agent_type",
+            state="failed",
+        )
+    agent_type = (
+        requested_preset
+        if requested_preset is not None
+        else legacy_agent_type
+        if legacy_agent_type is not None
+        else GENERAL_PRESET.name
     )
+    model = arguments.get("model")
     if type(prompt) is not str or not prompt.strip():
         return loop._child_result_payload(
             tool_call.id,
@@ -336,12 +344,6 @@ async def run_agent_tool(
         return loop._child_result_payload(
             tool_call.id,
             "agent error: description must be a nonempty string",
-            state="failed",
-        )
-    if type(background) is not bool:
-        return loop._child_result_payload(
-            tool_call.id,
-            "agent error: background must be a boolean",
             state="failed",
         )
     max_turns_arg = arguments.get("max_turns")
@@ -366,26 +368,49 @@ async def run_agent_tool(
                 "agent call; children inherit the tree turn budget",
                 state="failed",
             )
-    preset = get_agent_preset(agent_type)
-    if preset is None:
+    catalog = loop.tool_registry.agent_catalog
+    if type(agent_type) is not str:
         return loop._child_result_payload(
             tool_call.id,
-            "agent error: unknown agent_type "
-            f"{agent_type!r}; expected one of: {', '.join(agent_type_names())}",
+            f"agent error: preset must be one of: {', '.join(catalog.names())}",
             state="failed",
         )
-    if loop.plan_mode and preset.name == GENERAL_PRESET.name:
+    try:
+        preset = catalog.find(agent_type)
+    except ValueError:
+        return loop._child_result_payload(
+            tool_call.id,
+            f"agent error: unknown agent_type/preset {agent_type!r}; expected one of: "
+            f"{', '.join(catalog.names())}",
+            state="failed",
+        )
+    if loop.plan_mode and preset.source == "packaged" and preset.name == GENERAL_PRESET.name:
         return loop._child_result_payload(
             tool_call.id,
             "agent error: general agents are unavailable in plan mode; "
             "use agent_type 'explore' or 'plan'",
             state="failed",
         )
-    child_backend, backend_error = resolve_child_backend(loop, model)
+    effective_model = model if model is not None else preset.model
+    child_backend, backend_error = resolve_child_backend(loop, effective_model)
     if backend_error is not None:
         return loop._child_result_payload(
             tool_call.id,
             backend_error,
+            state="failed",
+        )
+    # The long kinds default to background -- a run on someone else's model, or
+    # one sized for a big task. Waiting on either blocks the orchestrator for
+    # the whole thing. An explicit background argument still wins.
+    background = arguments.get(
+        "background",
+        effective_model is not None
+        or (preset.source == "packaged" and preset.name == RUN_PRESET.name),
+    )
+    if type(background) is not bool:
+        return loop._child_result_payload(
+            tool_call.id,
+            "agent error: background must be a boolean",
             state="failed",
         )
     child_depth, nesting_error = next_agent_depth(loop.agent_depth, background)
@@ -418,8 +443,12 @@ async def run_agent_tool(
     # AgentTree budget (ensure_budget above), so a run needs no special-cased
     # budget of its own -- it just needs routing to consume_run below for
     # follow-up delivery.
-    is_run = preset.name == RUN_PRESET.name
-    stored_agent_type = None if preset.name == GENERAL_PRESET.name else preset.name
+    is_run = preset.source == "packaged" and preset.name == RUN_PRESET.name
+    stored_agent_type = (
+        None
+        if preset.source == "packaged" and preset.name == GENERAL_PRESET.name
+        else preset.name
+    )
     child_number = loop.store.allocate_agent_index()
     agents_root = loop.store.session_dir / "agents"
     child_store = loop._background_owner.store_leases.enter_context(ConversationStore(
@@ -462,7 +491,7 @@ async def run_agent_tool(
         excluded_names = {"agent"} if child_depth == MAX_AGENT_DEPTH else set()
         if preset.tool_names is not None:
             allowed_names = set(preset.tool_names)
-            if child_depth < MAX_AGENT_DEPTH:
+            if preset.source == "packaged" and child_depth < MAX_AGENT_DEPTH:
                 allowed_names.add("agent")
             excluded_names.update(
                 set(loop.tool_registry.definitions_by_name) - allowed_names
@@ -494,10 +523,10 @@ async def run_agent_tool(
             max_turns=child_turn_cap,
             token_budget=loop.context_assembler.token_budget,
             retained_tail=loop.context_assembler.retained_tail,
-            system_prompt=compose_system_prompt(
-                loop.context_assembler.system_prompt,
-                preset.preamble,
+            system_prompt=_compose_child_system_prompt(
+                loop.context_assembler.system_prompt, preset
             ),
+            agent_catalog=child_registry.agent_catalog,
             skip_mcp_mount=True,
             agent_depth=child_depth,
             agent_instance_id=child_instance_id,
@@ -760,3 +789,21 @@ async def run_agent_tool(
 def _assistant_text_snippet(message: Message) -> str:
     text = assistant_text(message).replace("\r", " ").replace("\n", " ")
     return text if len(text) <= 160 else f"{text[:157]}..."
+
+
+def _compose_child_system_prompt(
+    system_prompt: str | Message, preset: AgentPreset
+) -> str | Message:
+    """Apply the preset preamble and custom body to the child prompt."""
+
+    composed = compose_system_prompt(system_prompt, preset.preamble)
+    body = load_agent(preset)
+    if not body:
+        return composed
+    if isinstance(composed, Message):
+        return Message(
+            MessageRole.SYSTEM,
+            [*composed.content, TextContent(body)],
+            metadata=dict(composed.metadata),
+        )
+    return f"{composed}\n\n{body}"

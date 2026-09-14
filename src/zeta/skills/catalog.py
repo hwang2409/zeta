@@ -2,24 +2,22 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 
-import yaml
+from .discovery import (
+    MarkdownDocument,
+    contained_path,
+    discover_markdown,
+    discover_session_items,
+    is_slash_safe_name,
+    read_markdown,
+    snapshot_metadata,
+)
 
-_logger = logging.getLogger(__name__)
 SKILL_INDEX_BYTE_LIMIT = 32 * 1024
 _PACKAGED_SKILLS_DIR = Path(__file__).parent
-
-
-def is_slash_safe_name(name: str) -> bool:
-    """Return whether a name can be addressed by slash input."""
-
-    return bool(name) and not name.startswith("/") and not any(
-        character.isspace() for character in name
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,19 +83,19 @@ class SkillCatalog:
     def to_snapshot(self) -> list[dict[str, object]]:
         """Return the discovery result in a session-metadata-safe shape."""
 
-        return [
-            {
-                "name": skill.name,
-                "description": skill.description,
-                "keywords": list(skill.keywords),
-                "path": str(skill.path),
-                "source": skill.source,
-                "skills_root": str(
-                    skill.skills_root or skill.path.parent
-                ),
-            }
-            for skill in self.skills
-        ]
+        snapshots = []
+        for skill in self.skills:
+            snapshot = snapshot_metadata(
+                name=skill.name,
+                description=skill.description,
+                source=skill.source,
+                path=skill.path,
+                root_name="skills_root",
+                root=skill.skills_root or skill.path.parent,
+            )
+            snapshot["keywords"] = list(skill.keywords)
+            snapshots.append(snapshot)
+        return snapshots
 
     @classmethod
     def from_snapshot(cls, value: object) -> SkillCatalog:
@@ -150,23 +148,6 @@ def _document_path(path: Path) -> Path:
     return path / "SKILL.md" if path.is_dir() else path
 
 
-def _candidate_paths(skills_dir: Path) -> list[Path]:
-    flat = list(skills_dir.glob("*.md"))
-    directories = [path for path in skills_dir.iterdir() if path.is_dir()]
-    return sorted(flat + directories, key=lambda path: path.name)
-
-
-def _contained_path(path: Path, skills_root: Path) -> Path:
-    try:
-        resolved = path.resolve()
-        resolved.relative_to(skills_root)
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise ValueError(
-            f"skill document {path} resolves outside skills root {skills_root}"
-        ) from exc
-    return resolved
-
-
 def discover_skills(
     home: Path,
     *,
@@ -177,61 +158,36 @@ def discover_skills(
     """Discover one tier of flat and Claude-Code-style skills."""
 
     skills_dir = skills_dir or _skills_dir(home)
-    if not skills_dir.is_dir():
-        return []
-    try:
-        skills_root = skills_dir.resolve()
-    except (OSError, RuntimeError) as exc:
-        notice = _warn_skill(skills_dir, exc)
-        if notices is not None:
-            notices.append(notice)
-        return []
-    discovered: list[SkillMeta] = []
-    paths_by_name: dict[str, Path] = {}
-    try:
-        paths = _candidate_paths(skills_dir)
-    except (OSError, UnicodeError) as exc:
-        notice = _warn_skill(skills_dir, exc)
-        if notices is not None:
-            notices.append(notice)
-        return []
-    for path in paths:
-        document = _document_path(path)
-        try:
-            resolved_document = _contained_path(document, skills_root)
-            if path.is_dir() and not resolved_document.is_file():
-                continue
-            metadata, _ = _read_skill(resolved_document)
-        except (
-            OSError,
-            UnicodeError,
-            ValueError,
-            RecursionError,
-            yaml.YAMLError,
-        ) as exc:
-            notice = _warn_skill(document, exc)
-            if notices is not None:
-                notices.append(notice)
-            continue
-        name = metadata["name"]
-        assert isinstance(name, str)
-        previous_path = paths_by_name.get(name)
-        if previous_path is not None:
+
+    def build(document: MarkdownDocument) -> SkillMeta:
+        keywords = document.metadata.get("keywords", [])
+        if type(keywords) is not list or any(
+            type(item) is not str or not item.strip() for item in keywords
+        ):
             raise ValueError(
-                f"duplicate skill name {name!r} in {previous_path} and {path}"
+                f"skill {document.path} frontmatter keywords must be a list of strings"
             )
-        paths_by_name[name] = path
-        discovered.append(
-            SkillMeta(
-                name=name,
-                description=metadata["description"],
-                keywords=metadata["keywords"],
-                path=path.absolute(),
-                source=source,
-                skills_root=skills_root,
-            )
+        name = document.metadata["name"]
+        description = document.metadata["description"]
+        assert isinstance(name, str)
+        assert isinstance(description, str)
+        return SkillMeta(
+            name=name,
+            description=description,
+            keywords=keywords,
+            path=document.entry_path.absolute(),
+            source=source,
+            skills_root=document.root,
         )
-    return discovered
+
+    return discover_markdown(
+        skills_dir,
+        source=source,
+        kind="skill",
+        build=build,
+        notices=notices,
+        document_name="SKILL.md",
+    )
 
 
 def discover_session_skills(
@@ -239,32 +195,20 @@ def discover_session_skills(
 ) -> SkillCatalog:
     """Discover packaged, home, and project skills for one session."""
 
-    notices: list[str] = []
-    tiers: list[list[SkillMeta]] = [
-        discover_skills(
+    skills, notices = discover_session_items(
+        home=home,
+        project_dir=project_dir,
+        packaged=lambda notices: discover_skills(
             _PACKAGED_SKILLS_DIR.parent,
             source="packaged",
             notices=notices,
             skills_dir=_PACKAGED_SKILLS_DIR,
-        )
-    ]
-    if home is not None:
-        tiers.append(discover_skills(Path(home), source="home", notices=notices))
-    if project_dir is not None:
-        tiers.append(
-            discover_skills(
-                Path(project_dir) / ".zeta", source="project", notices=notices
-            )
-        )
-
-    selected: dict[str, SkillMeta] = {}
-    for tier in tiers:
-        for skill in tier:
-            selected[skill.name] = skill
-    skills = tuple(
-        skill for tier in tiers for skill in tier if selected[skill.name] is skill
+        ),
+        discover=lambda root, source, notices: discover_skills(
+            root, source=source, notices=notices
+        ),
     )
-    return SkillCatalog(skills, tuple(notices))
+    return SkillCatalog(skills, notices)
 
 
 def discover_packaged_skills() -> SkillCatalog:
@@ -286,8 +230,8 @@ def load_skill(meta: SkillMeta) -> str:
 
     document = _document_path(meta.path)
     skills_root = meta.skills_root or meta.path.parent
-    resolved_document = _contained_path(document, skills_root)
-    _, body = _read_skill(resolved_document)
+    resolved_document = contained_path(document, skills_root, "skill")
+    _, body = read_markdown(resolved_document, "skill")
     return body
 
 
@@ -313,62 +257,6 @@ def replace_skill_index(prompt: str, catalog: SkillCatalog) -> str:
         raise ValueError("saved prompt has an unterminated skill index")
     end += len(end_marker)
     return prompt[:start] + catalog.index() + prompt[end:]
-
-
-def _warn_skill(path: Path, error: Exception) -> str:
-    message = f"ignored skill {path}: {error}"
-    _logger.warning(message)
-    return message
-
-
-def _read_skill(path: Path) -> tuple[dict[str, str | list[str]], str]:
-    text = path.read_text(encoding="utf-8")
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        raise ValueError(f"skill {path} is missing YAML frontmatter")
-    try:
-        end = next(
-            index for index, line in enumerate(lines[1:], 1) if line.strip() == "---"
-        )
-    except StopIteration as exc:
-        raise ValueError(f"skill {path} has unterminated YAML frontmatter") from exc
-    metadata = _parse_frontmatter(lines[1:end], path)
-    body = "\n".join(lines[end + 1 :]).strip()
-    if not body:
-        raise ValueError(f"skill {path} has an empty prompt body")
-    return metadata, body
-
-
-def _parse_frontmatter(lines: list[str], path: Path) -> dict[str, str | list[str]]:
-    try:
-        values = yaml.safe_load("\n".join(lines))
-    except yaml.YAMLError as exc:
-        raise ValueError(f"skill {path} has invalid YAML frontmatter") from exc
-    if not isinstance(values, dict):
-        raise ValueError(  # noqa: TRY004 — malformed metadata is skipped
-            f"skill {path} frontmatter must be a mapping"
-        )
-    missing = [key for key in ("name", "description") if key not in values]
-    if missing:
-        raise ValueError(f"skill {path} frontmatter is missing: {', '.join(missing)}")
-    name = values["name"]
-    if type(name) is not str or not name.strip():
-        raise ValueError(f"skill {path} frontmatter name must be a nonempty string")
-    if not is_slash_safe_name(name):
-        raise ValueError(
-            f"skill {path} frontmatter name must be one nonempty word"
-        )
-    description = values["description"]
-    if type(description) is not str or not description.strip():
-        raise ValueError(
-            f"skill {path} frontmatter description must be a nonempty string"
-        )
-    keywords = values.get("keywords", [])
-    if type(keywords) is not list or any(
-        type(item) is not str or not item.strip() for item in keywords
-    ):
-        raise ValueError(f"skill {path} frontmatter keywords must be a list of strings")
-    return {"name": name, "description": description, "keywords": keywords}
 
 
 __all__ = [

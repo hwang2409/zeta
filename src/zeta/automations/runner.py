@@ -15,6 +15,7 @@ from ..prompts import load_identity
 from ..runtime.driver import drive_turn
 from ..runtime.unattended import build_unattended_loop
 from ..skills import discover_session_skills
+from ..skills.agent_catalog import discover_packaged_agents
 from ..tools import ToolRegistry
 from ..types import CompletionBackend, Message, MessageRole, TextContent
 from .delivery import Delivery, SlackDelivery
@@ -77,12 +78,14 @@ async def run_claimed(
         return
     job = state.job
     skill_catalog = discover_session_skills(home=home)
+    agent_catalog = discover_packaged_agents()
     session = SessionManager(home).create(
         provider=job.provider,
         model=job.model,
         cwd=job.cwd,
         system_prompt=load_identity(catalog=skill_catalog),
         skill_catalog=skill_catalog,
+        agent_catalog=agent_catalog,
         name=f"automation: {job.name}"[:60],
     )
     store.attach_session(run_id, session.metadata.session_id)

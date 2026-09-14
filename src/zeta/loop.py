@@ -58,12 +58,13 @@ from .mcp.commands import (
 from .mcp.prompt_commands import SlashModelInput
 from .prompts import load_identity
 from .skills import SkillCatalog
+from .skills.agent_catalog import AgentCatalog
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from .tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from .tools.agent_presets import (
     compose_system_prompt,
-    get_agent_preset,
 )
+from .tools.loop_setup import select_tool_registry
 from .tools.plan_mode import (
     PLAN_MODE_PREAMBLE,
     PLAN_MODE_TOOLS,
@@ -191,6 +192,7 @@ class AgentLoop:
         *,
         tools: Mapping[str, ToolHandler] | ToolRegistry | None = None,
         skill_catalog: SkillCatalog,
+        agent_catalog: AgentCatalog | None = None,
         registry: ToolRegistry | None = None,
         approval_policy: ApprovalPolicy | None = None,
         tool_schemas: Sequence[ToolSchema] | None = None,
@@ -235,45 +237,14 @@ class AgentLoop:
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
         recover_agent_children(self)
-        if registry is not None and tools is not None:
-            raise ValueError("pass only one tool registry")
-        selected_registry = registry if registry is not None else tools if isinstance(tools, ToolRegistry) else None
-        if selected_registry is not None:
-            if selected_registry.skill_catalog != skill_catalog:
-                raise ValueError("loop catalog must match the tool registry catalog")
-            self.tool_registry = selected_registry
-        elif isinstance(tools, Mapping):
-            self.tool_registry = ToolRegistry(
-                store.cwd, register_builtin=False, skill_catalog=skill_catalog
-            )
-            schemas_by_name = {
-                schema.get("name"): schema
-                for schema in (tool_schemas or [])
-                if isinstance(schema.get("name"), str)
-            }
-            for name, handler in tools.items():
-                schema = schemas_by_name.get(name, {})
-                parameters = schema.get("parameters", schema.get("input_schema"))
-                if parameters is None:
-                    parameters = {
-                        key: value
-                        for key, value in schema.items()
-                        if key not in {"name", "description", "cache_control"}
-                    }
-                self.tool_registry.register(
-                    name,
-                    handler,
-                    description=(
-                        schema.get("description", "")
-                        if isinstance(schema.get("description", ""), str)
-                        else ""
-                    ),
-                    parameters=parameters,
-                )
-        elif tools is None:
-            self.tool_registry = ToolRegistry(store.cwd, skill_catalog=skill_catalog)
-        else:
-            raise TypeError("tools must be a mapping or ToolRegistry")
+        self.tool_registry = select_tool_registry(
+            store,
+            tools=tools,
+            registry=registry,
+            skill_catalog=skill_catalog,
+            agent_catalog=agent_catalog,
+            tool_schemas=tool_schemas,
+        )
         self._mcp_mount: MCPMount | None = None
         self._mcp_mount_attempted = skip_mcp_mount
         self._mcp_mount_task: asyncio.Task[None] | None = None
@@ -285,6 +256,7 @@ class AgentLoop:
         self._mcp_schema_names: set[str] = set()
         self._provided_tool_schemas = tool_schemas is not None
         self.tool_registry.bind_session_store(store)
+        self.agent_catalog = self.tool_registry.agent_catalog
         if (
             approval_policy is not None
             and self.tool_registry.approval_policy is not None
@@ -592,11 +564,7 @@ class AgentLoop:
             error=result_status == "failed",
             turns_used=turns,
             child_session_path=path,
-            agent_type=(
-                preset.name
-                if (preset := get_agent_preset(agent_type)) is not None
-                else None
-            ),
+            agent_type=agent_type if isinstance(agent_type, str) else None,
             status=status if status == "running" else None,
             child_instance_id=child_instance_id,
             description=description,
