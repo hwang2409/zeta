@@ -5152,6 +5152,165 @@ fn run_header_paints_a_single_row_without_the_keyboard_hint(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn run_header_title_survives_narrow_widths_and_metadata_never_overflows(cx: &mut TestAppContext) {
+    // ZETA-123 round 2, finding 2: at 760px the title measured 0px and
+    // the model text painted past the right edge — quiet metadata was
+    // pinned as `flex_shrink_0` and starved the title. The fix keeps
+    // the title as a flex_1 spacer with `min_w_0` (no max_w cap) and
+    // lets tokens/model shrink and truncate first. Guard against a
+    // regression at three widths: narrow-ish (600), the reproduced
+    // failure (760), and wide (1200).
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Populate a realistic metrics load — long model id + tokens/cache
+    // string — so the shrink path exercises real content.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.metrics.model = Some("claude-opus-4-7-super-long-model-identifier".into());
+            view.state.metrics.tokens = Some(123_456);
+            view.state.metrics.cache_hit_rate = Some(0.42);
+            cx.notify();
+            let _ = window;
+        });
+    });
+    for probe_width in [px(600.), px(760.), px(1200.)] {
+        visual.simulate_resize(gpui::size(probe_width, px(760.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let header = visual
+            .debug_bounds("run-header")
+            .expect("run header renders at every probe width");
+        let title = visual
+            .debug_bounds("run-header-title")
+            .expect("title renders");
+        let model = visual
+            .debug_bounds("run-header-model")
+            .expect("model chip renders");
+        let metrics = visual
+            .debug_bounds("status-metrics")
+            .expect("status-metrics slot renders");
+        // Title must survive with a scannable measure — at least ~48px
+        // (a few characters). Zero-width title reads as "the header
+        // has no identity" and is the exact bug we're guarding.
+        assert!(
+            title.size.width >= px(48.),
+            "title width {:?} collapsed at width {:?} — metadata cluster ate the row",
+            title.size.width,
+            probe_width,
+        );
+        // No metadata slot paints past the header's right edge.
+        let right_edge = header.right();
+        for (name, bounds) in [("model", model), ("status-metrics", metrics)] {
+            assert!(
+                bounds.right() <= right_edge + px(1.),
+                "{name} bounds {:?} paint past the header right edge {:?} at width {:?}",
+                bounds,
+                right_edge,
+                probe_width,
+            );
+        }
+    }
+}
+
+#[gpui::test]
+fn run_header_status_dot_is_the_only_dot_and_pulses_when_busy(cx: &mut TestAppContext) {
+    // ZETA-123 round 2, finding 4: streaming/thinking used to paint a
+    // SECOND dot next to the status dot — the reader saw two pulses
+    // and wondered which one was authoritative. One dot per state
+    // (Selective Attention). The same run-header-status-dot pulses
+    // when busy; the separate `streaming-dot` selector is gone.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    // Rest: one status dot renders, no streaming-dot selector exists.
+    assert!(
+        visual.debug_bounds("run-header-status-dot").is_some(),
+        "status dot renders at rest",
+    );
+    assert!(
+        visual.debug_bounds("streaming-dot").is_none(),
+        "the second streaming-dot selector must be gone — one dot per state",
+    );
+    // Enter streaming state and confirm we STILL have exactly one dot.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::TurnStart {
+                    session_id: None,
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantDelta {
+                    session_id: None,
+                    delta: "chunk".into(),
+                    kind: "assistant".into(),
+                }),
+                window,
+                cx,
+            );
+            assert!(view.state.streaming);
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("run-header-status-dot").is_some(),
+        "status dot still renders while streaming",
+    );
+    assert!(
+        visual.debug_bounds("streaming-dot").is_none(),
+        "streaming state must NOT paint a second dot — one dot pulses in place",
+    );
+}
+
+#[gpui::test]
+fn sidebar_new_session_content_hugs_the_left_edge(cx: &mut TestAppContext) {
+    // ZETA-123 round 2, finding 3: the full-width Kit Button was
+    // centering its `+` glyph and label in the middle of the sidebar
+    // slot. The fix drops `.w_full()` and left-anchors the button in
+    // its slot. Guard: the button's LEFT edge lands inside the outer
+    // slot padding (SIDEBAR_ROW_PADDING_X), not in the slot's center.
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let slot = visual
+        .debug_bounds("sidebar-new-session")
+        .expect("new-session slot renders");
+    let button = visual
+        .debug_bounds("new-session-button")
+        .expect("new-session action button renders");
+    // The button's left edge sits within a couple of pixels of the
+    // slot's inner-left (slot.left + SIDEBAR_ROW_PADDING_X). A
+    // regression that re-adds `.w_full()` or `.justify_center()` on
+    // the slot puts the button center at slot.center().x — the button
+    // left edge would be roughly slot.left + (slot.width - button.width)/2,
+    // far to the right of the padding line.
+    let inner_left = slot.left() + theme::SIDEBAR_ROW_PADDING_X;
+    let left_gap = if button.left() >= inner_left {
+        button.left() - inner_left
+    } else {
+        inner_left - button.left()
+    };
+    assert!(
+        left_gap <= px(4.),
+        "new-session button left edge {:?} must sit near the slot's left padding {:?} (slot {:?})",
+        button.left(),
+        inner_left,
+        slot,
+    );
+    // Sanity: the button width must NOT span the whole slot minus
+    // padding — that would mean w_full is back and the button still
+    // centers its content internally.
+    let full_width_span = slot.size.width - theme::SIDEBAR_ROW_PADDING_X * 2.0;
+    assert!(
+        button.size.width < full_width_span - px(4.),
+        "new-session button width {:?} spans the full slot — content still centered",
+        button.size.width,
+    );
+}
+
+#[gpui::test]
 fn sidebar_new_session_reads_as_an_action_button(cx: &mut TestAppContext) {
     // ZETA-123: the top of the sidebar exposes a "New session" ACTION
     // — a ghost button with a `+` glyph, not a large centered heading.
@@ -5176,6 +5335,59 @@ fn sidebar_new_session_reads_as_an_action_button(cx: &mut TestAppContext) {
         button.size.height <= theme::SIDEBAR_ROW_HEIGHT + px(2.),
         "new-session button height {:?} must not exceed one sidebar row",
         button.size.height
+    );
+}
+
+#[gpui::test]
+fn sidebar_row_menu_reveals_when_the_row_takes_keyboard_focus(cx: &mut TestAppContext) {
+    // ZETA-123 round 2, finding 1: hover-only reveal leaves the `...`
+    // menu invisible for keyboard-only operators — Enter still fires
+    // the invisible control, which violates WCAG 2.4.7 focus-visible.
+    // The fix ties the wrapper's opacity to `focused` (row's focus
+    // handle). This test:
+    //   1. focuses a session row (simulates Tab landing),
+    //   2. reads back the wrapper's opacity through the debug-only
+    //      predicate on ZetaView,
+    //   3. asserts the opacity is 1.0 — the reveal fires.
+    // Without the focus branch (`rest_opacity = 0.` unconditionally)
+    // the predicate returns false and the test fails.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let target = session().session_id;
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::SessionManagement(true), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    // At rest (nothing focused) the reveal predicate reads false.
+    visual.update(|window, cx| window.blur(cx));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let unfocused =
+        visual.update(|window, cx| view.read(cx).sidebar_row_menu_revealed(&target, window));
+    assert!(
+        !unfocused,
+        "menu reveal must be gated — unfocused rows keep the wrapper at opacity 0",
+    );
+    // Focus the row and confirm the reveal fires.
+    let handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get(&target)
+                .cloned()
+        })
+        .expect("current session row focus handle exists after render");
+    visual.update(|window, cx| {
+        window.focus(&handle, cx);
+        window.draw(cx).clear(cx);
+    });
+    let focused_reveal =
+        visual.update(|window, cx| view.read(cx).sidebar_row_menu_revealed(&target, window));
+    assert!(
+        focused_reveal,
+        "focused row must reveal its menu — WCAG focus-visible requires the control to be seen",
     );
 }
 

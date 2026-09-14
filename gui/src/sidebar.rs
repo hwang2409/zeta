@@ -152,6 +152,21 @@ impl ZetaView {
             .children(self.render_branches(window, cx))
     }
 
+    /// Whether the per-row `...` menu reveals for the sidebar row keyed by
+    /// `id` — mirrors the render-time `rest_opacity = if focused { 1. }
+    /// else { 0. }` branch so tests can assert the reveal fires on
+    /// keyboard focus without racing the paint tree. Used by the
+    /// finding-1 probe (ZETA-123 round 2) to guard against a regression
+    /// that drops the focus branch and leaves an invisible menu on the
+    /// focused row.
+    #[cfg(any(test, feature = "smoke-test"))]
+    pub fn sidebar_row_menu_revealed(&self, id: &str, window: &Window) -> bool {
+        self.sidebar_row_focus
+            .borrow()
+            .get(id)
+            .is_some_and(|handle| handle.is_focused(window))
+    }
+
     /// Drop focus handles whose key (session id / `branch:<id>`) is no longer
     /// live. Called at the top of every `render_sidebar`. Without this the
     /// handle map is insert-only and grows unbounded — normal branch churn
@@ -214,13 +229,20 @@ impl ZetaView {
 
     fn render_sidebar_new_session(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         // The New Session control reads as an ACTION, not a centred
-        // heading: a `+` glyph + left-aligned label, ghost variant so it
-        // sits quiet at rest and fills on hover. Kit's `Button` centres
-        // its label, so the row wraps the button in a full-width slot and
-        // uses `.compact()` — the label + icon then hug the left edge
-        // like a menu action rather than looking like a modal CTA.
+        // heading: a `+` glyph + label hugging the LEFT edge of the
+        // sidebar, ghost variant so it sits quiet at rest and fills on
+        // hover. Kit's `Button` centres its inner content when the button
+        // is full-width, so instead we keep the button content-sized and
+        // anchor it left inside a `justify_start` slot — the `+` and
+        // "New session" then land in the same left column as the session
+        // rows below (contract line 5, ZETA-123). Content-width shape
+        // also matches the wiki agent-run sidebar's list-item rhythm
+        // (Laws of UX: Similarity, Proximity).
         div()
             .debug_selector(|| "sidebar-new-session".into())
+            .h_flex()
+            .items_center()
+            .justify_start()
             .px(theme::SIDEBAR_ROW_PADDING_X)
             .py(theme::SIDEBAR_ROW_PADDING_Y)
             .child(
@@ -230,7 +252,6 @@ impl ZetaView {
                     .compact()
                     .icon(IconName::Plus)
                     .label("New session")
-                    .w_full()
                     .h(theme::SIDEBAR_ROW_HEIGHT)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .disabled(!self.can_change_session())
@@ -284,6 +305,7 @@ impl ZetaView {
         let click_id = id.clone();
         let key_id = id.clone();
         let can_activate = can_switch && !active;
+        let menu_label: SharedString = format!("Session actions for {label}").into();
         let row = div()
             .id(("session-row", index))
             .debug_selector(|| "session-row".into())
@@ -351,13 +373,17 @@ impl ZetaView {
         }
         // Right-side dropdown for rename/delete. Kept as a Button so the
         // menu integration and keyboard accessibility come from Kit. The
-        // menu sits at opacity 0 at rest and reveals on row hover — the
-        // per-row `.group()` scopes hover reveal to THIS row so one
-        // pointer position never lights up every row's menu at once
-        // (contract lines 5-6, ZETA-123).
+        // menu sits at opacity 0 at rest and reveals on row hover OR
+        // when the row has keyboard focus — the per-row `.group()`
+        // scopes hover reveal to THIS row so one pointer position never
+        // lights up every row's menu at once (contract lines 5-6,
+        // ZETA-123). Focus-reveal keeps the control visible for
+        // keyboard-only operators; hitting Enter/Space on an invisible
+        // menu would violate WCAG 2.4.7 focus-visible.
         let entity = cx.entity().downgrade();
         let menu_id = id;
         let group = session_row_group(index);
+        let rest_opacity = if focused { 1.0 } else { 0.0 };
         div()
             .group(group.clone())
             .h_flex()
@@ -367,7 +393,7 @@ impl ZetaView {
             .child(
                 div()
                     .flex_shrink_0()
-                    .opacity(0.)
+                    .opacity(rest_opacity)
                     .group_hover(group.clone(), |style| style.opacity(1.))
                     .child(
                         Button::new(format!("session-menu-{menu_id}"))
@@ -375,6 +401,7 @@ impl ZetaView {
                             .ghost()
                             .compact()
                             .icon(IconName::Ellipsis)
+                            .accessibility_label(menu_label)
                             .tooltip("Session actions")
                             .h(theme::SIDEBAR_ROW_HEIGHT)
                             .flex_shrink_0()

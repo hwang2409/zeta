@@ -1687,7 +1687,7 @@ impl ZetaView {
                             .items_center()
                             .gap_1()
                             .min_w_0()
-                            .max_w(px(260.))
+                            .max_w(theme::COMPOSER_TARGET_MAX_WIDTH)
                             .truncate()
                             .debug_selector(|| "composer-target".into())
                             .child(div().text_color(roles.target_label).child("→"))
@@ -1984,7 +1984,7 @@ impl ZetaView {
             .unwrap_or_else(|| "No session".to_owned());
         let dot_color = self.status_dot_color(cx);
         let mode_word = self.footer_mode_word();
-        let show_streaming_dot = self.state.streaming || self.state.thinking;
+        let busy = self.state.streaming || self.state.thinking;
         let model_name = self
             .state
             .metrics
@@ -2004,77 +2004,97 @@ impl ZetaView {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                // Session title — the primary identity of the run. Mono
-                // 600 at the normal text tier; truncates before it hurts
-                // the metadata cluster on the right.
+                // Session title — the primary identity of the run. Grows
+                // to eat leftover space so the metadata cluster always
+                // hugs the right edge; truncates last when the window
+                // narrows because the cluster below shrinks first.
+                //
+                // No `max_w` cap: with `flex_1` (grow=1, shrink=1,
+                // basis=0) the title expands to fill leftover and the
+                // cluster hugs the right edge even when the model name
+                // is short — a max_w cap would leave dead space between
+                // title and metadata and the cluster would float left
+                // in the middle of the header.
+                //
+                // `min_w(px(80.))` keeps a scannable measure of the
+                // title on every window width — without it, a title
+                // with `flex-basis: 0` collapses to zero when the
+                // cluster's shrinkable siblings still add up to more
+                // than the row can hold (round-2 finding 2 repro at
+                // 760px).
                 div()
                     .debug_selector(|| "run-header-title".into())
                     .flex_1()
-                    .min_w_0()
+                    .min_w(theme::HEADER_TITLE_MIN_WIDTH)
                     .truncate()
-                    .max_w(px(320.))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(cx.theme().foreground)
                     .child(session_label),
             )
-            // Right-aligned metadata cluster. `flex_shrink_0` on each
-            // element and `min_w_0 truncate` on the tokens/model slots
-            // keeps every piece readable while the transcript column
-            // absorbs the reflow when the window narrows.
+            // Right-anchored metadata cluster. The cluster itself carries
+            // `min_w_0` so its shrinkable children (tokens, model) can
+            // truncate at narrow widths BEFORE the title has to. The
+            // status dot + word keeps `flex_shrink_0` — it's the header's
+            // single load-bearing signal and must not collapse.
             .child(
                 div()
-                    .flex_shrink_0()
-                    .max_w(px(240.))
-                    .min_w_0()
-                    .truncate()
-                    .text_color(theme::palette::text_faint())
-                    .debug_selector(|| "status-metrics".into())
-                    .child(polish::status_label(&self.state.metrics)),
-            )
-            .child(status_rule(cx))
-            .child(
-                // Compact state indicator: dot + word. Neutral states
-                // paint the dot in the accent hue; offline paints it in
-                // danger. This replaces the filled pill so the header
-                // reads as a quiet status band, not a call-to-action.
-                // The `footer-mode` selector stays so existing offline /
-                // pill-fill guards continue to bind here.
-                div()
-                    .debug_selector(|| "footer-mode".into())
-                    .flex_shrink_0()
                     .h_flex()
                     .items_center()
-                    .gap(px(6.))
-                    .text_color(cx.theme().muted_foreground)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(
-                        div()
-                            .debug_selector(|| "run-header-status-dot".into())
-                            .w(theme::STREAM_DOT_SIZE)
-                            .h(theme::STREAM_DOT_SIZE)
-                            .rounded_full()
-                            .bg(dot_color),
-                    )
-                    .child(mode_word),
-            )
-            .when(show_streaming_dot, |row| {
-                row.child(streaming_dot(cx.theme().primary))
-            })
-            .child(status_rule(cx))
-            .child(
-                // Model chip pinned right — same faint tier as the
-                // metrics slot so the two read as one metadata run.
-                // `max_w` caps the slice so a long model name truncates
-                // inside the chip rather than pushing the header past
-                // the window edge.
-                div()
-                    .flex_shrink_0()
-                    .max_w(px(200.))
+                    .gap(px(10.))
                     .min_w_0()
-                    .truncate()
-                    .text_color(theme::palette::text_faint())
-                    .debug_selector(|| "run-header-model".into())
-                    .child(model_name),
+                    .child(
+                        // Tokens/cache — quietest metadata. Shrinks and
+                        // truncates first when width drops (higher
+                        // shrink factor than the model slot).
+                        div()
+                            .flex_shrink(2.0)
+                            .min_w_0()
+                            .max_w(theme::HEADER_STATUS_METRICS_MAX_WIDTH)
+                            .truncate()
+                            .text_color(theme::palette::text_faint())
+                            .debug_selector(|| "status-metrics".into())
+                            .child(polish::status_label(&self.state.metrics)),
+                    )
+                    .child(status_rule(cx))
+                    .child(
+                        // Compact state indicator: dot + word. Neutral
+                        // states paint the dot in the accent hue;
+                        // offline paints it in danger. When the
+                        // assistant is streaming or thinking the SAME
+                        // dot pulses so the header carries ONE dot per
+                        // state, not a pair — the reader looks at one
+                        // place to know what's happening (Selective
+                        // Attention). The `footer-mode` selector stays
+                        // so existing offline / pill-fill guards
+                        // continue to bind here.
+                        div()
+                            .debug_selector(|| "footer-mode".into())
+                            .flex_shrink_0()
+                            .h_flex()
+                            .items_center()
+                            .gap(theme::HEADER_MODE_GAP)
+                            .text_color(cx.theme().muted_foreground)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(status_dot(dot_color, busy))
+                            .child(mode_word),
+                    )
+                    .child(status_rule(cx))
+                    .child(
+                        // Model chip pinned right — same faint tier as
+                        // the metrics slot so the two read as one
+                        // metadata run. Shrinks and truncates before
+                        // the title does; caps at
+                        // HEADER_MODEL_MAX_WIDTH so a very long model
+                        // id truncates inside the chip.
+                        div()
+                            .flex_shrink(1.0)
+                            .max_w(theme::HEADER_MODEL_MAX_WIDTH)
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme::palette::text_faint())
+                            .debug_selector(|| "run-header-model".into())
+                            .child(model_name),
+                    ),
             )
             .into_any_element()
     }
@@ -2214,30 +2234,37 @@ fn status_rule(cx: &App) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// Small pulsing dot rendered while the assistant is streaming or thinking.
-/// Opacity cycles 0.25 → 1 over ~1.2s in a synced loop so all zeta windows on
-/// screen breathe in phase — matches the wiki agent-run indicator.
-fn streaming_dot(color: gpui::Hsla) -> gpui::AnyElement {
-    div()
+/// Header status dot. Colour carries the run state (accent = neutral,
+/// danger = offline) and — when `busy` is true because the assistant is
+/// streaming or thinking — the SAME dot pulses its opacity in a synced
+/// 1.2s loop. One dot per state keeps the header signal in one place
+/// (Selective Attention / Von Restorff) and matches the wiki agent-run
+/// indicator that only ever paints a single breathing glyph.
+fn status_dot(color: gpui::Hsla, busy: bool) -> gpui::AnyElement {
+    let base = div()
+        .debug_selector(|| "run-header-status-dot".into())
         .w(theme::STREAM_DOT_SIZE)
         .h(theme::STREAM_DOT_SIZE)
         .rounded_full()
-        .bg(color)
-        .debug_selector(|| "streaming-dot".into())
-        .with_animation(
-            "streaming-dot",
+        .bg(color);
+    if busy {
+        base.with_animation(
+            "status-dot-busy",
             Animation::new(Duration::from_millis(1200))
                 .repeat_synced()
                 .with_easing(ease_in_out),
             |el, delta| {
-                // Delta 0..1: triangle wave 0..1..0 so we breathe up then down
-                // without the pop-back that a sawtooth would show.
+                // Delta 0..1: triangle wave 0..1..0 so the dot breathes
+                // up then down without the pop-back a sawtooth would show.
                 let triangle = 1.0 - (delta * 2.0 - 1.0).abs();
                 let alpha = 0.25 + triangle * 0.75;
                 el.opacity(alpha)
             },
         )
         .into_any_element()
+    } else {
+        base.into_any_element()
+    }
 }
 
 impl Render for ZetaView {
