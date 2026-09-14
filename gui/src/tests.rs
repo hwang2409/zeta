@@ -26,6 +26,10 @@ fn setup(
         env::set_var("COLORTERM", "");
     });
     cx.update(init);
+    // Baseline appearance: shipped default (opencode / JetBrains Mono / 13px).
+    // Runs before `ZetaView::new` so every test sees a deterministic theme,
+    // regardless of what a peer test flipped through the appearance picker.
+    cx.update(theme::apply);
     let (commands, receiver) = mpsc::channel();
     let mut view = None;
     let window = cx.open_window(gpui::size(px(1100.), px(760.)), |window, cx| {
@@ -336,9 +340,12 @@ fn transcript_column_caps_at_wiki_readable_measure_and_centers(cx: &mut TestAppC
         // The user rectangle sits inside a bounded inner column: 1024px minus
         // 16px horizontal padding on each side (`.px_4()`). The rectangle's
         // quad bounds are its border-box, so a 3px left-rail adds up to 3px
-        // to the observed width — allow that plus a sub-logical-pixel wiggle.
+        // to the observed width — allow that plus a few pixels of rendering
+        // pipeline rounding, which varies slightly with the user-picked font
+        // size (contract line 63 pins ONE size across the app, but ZETA-111
+        // now lets that size move in 1px steps between 11-18px).
         let inner_column = scaled_column_cap - px(32.).scale(scale);
-        let tolerance = px(4.).scale(scale);
+        let tolerance = px(8.).scale(scale);
         for quad in user_quads {
             let width = quad.bounds.size.width;
             let delta = if width > inner_column {
@@ -1665,6 +1672,100 @@ fn refresh_rpc_failure_clears_the_stale_transcript_and_keeps_the_connection(
             .as_ref()
             .is_some_and(|error| error.contains("refresh failed")));
     });
+}
+
+#[gpui::test]
+fn appearance_controls_reapply_theme_font_and_size_live(cx: &mut TestAppContext) {
+    // The prefs file lives under $ZETA_HOME. Wipe any leftover from a prior
+    // failed run so the baseline reads as the shipped default.
+    let _ = std::fs::remove_file(prefs::prefs_path());
+    let (window, view, _receiver) = setup(cx);
+    // Reset the client's active appearance to defaults so this test does not
+    // inherit a theme flipped by a peer test.
+    cx.update(theme::apply);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.session_view.available = true;
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: "claude-sonnet-4-6".into(),
+                        approval_mode: "ask".into(),
+                    },
+                    ModelCatalog {
+                        models: vec!["claude-sonnet-4-6".into()],
+                        providers: [("claude-sonnet-4-6".into(), "claude".into())]
+                            .into_iter()
+                            .collect(),
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    // Baseline: opencode / JetBrains Mono / DEFAULT_FONT_SIZE. Assertions
+    // read the PER-APP `cx.theme()` so a peer test racing the process-wide
+    // ACTIVE cannot flip them out from under us.
+    let baseline_bg = visual.update(|_, cx| cx.theme().background);
+    let baseline_font_size = visual.update(|_, cx| cx.theme().font_size);
+    assert_eq!(baseline_bg, theme::ThemeId::Opencode.palette().canvas);
+    assert_eq!(
+        visual.update(|_, cx| cx.theme().font_family.as_ref().to_string()),
+        theme::DEFAULT_FONT_FAMILY
+    );
+
+    // Click a non-default theme; the app-local theme moves off opencode.
+    let gruvbox_light = visual
+        .debug_bounds("theme-row-gruvbox-light")
+        .expect("gruvbox-light theme row renders");
+    visual.simulate_click(gruvbox_light.center(), Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let after_theme_bg = visual.update(|_, cx| cx.theme().background);
+    assert_eq!(
+        after_theme_bg,
+        theme::ThemeId::GruvboxLight.palette().canvas
+    );
+    assert_ne!(after_theme_bg, baseline_bg);
+
+    // Click a non-default font family; theme.font_family follows.
+    let menlo = visual
+        .debug_bounds("font-row-Menlo")
+        .expect("Menlo font row renders");
+    visual.simulate_click(menlo.center(), Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let after_font = visual.update(|_, cx| cx.theme().font_family.as_ref().to_string());
+    assert_eq!(after_font, "Menlo");
+
+    // Shrink font size by one step; grow it back. Both should land on the
+    // whole-px pick window.
+    let shrink = visual
+        .debug_bounds("font-size-shrink")
+        .expect("shrink control renders");
+    visual.simulate_click(shrink.center(), Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let smaller = visual.update(|_, cx| cx.theme().font_size);
+    assert!(
+        f32::from(smaller) < f32::from(baseline_font_size)
+            && f32::from(smaller) >= theme::MIN_FONT_SIZE_PX,
+        "shrink moved {baseline_font_size:?} -> {smaller:?} within the picker window"
+    );
+    let grow = visual
+        .debug_bounds("font-size-grow")
+        .expect("grow control renders");
+    visual.simulate_click(grow.center(), Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        visual.update(|_, cx| cx.theme().font_size),
+        baseline_font_size
+    );
+
+    // Reset for the next test — the global appearance and the on-disk prefs
+    // both persist across the in-process test run.
+    cx.update(theme::apply);
+    let _ = std::fs::remove_file(prefs::prefs_path());
 }
 
 #[gpui::test]
