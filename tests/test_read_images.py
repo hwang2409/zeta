@@ -10,6 +10,7 @@ from rich.console import Console
 
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
+from zeta.loop import _validated_tool_result
 from zeta.providers.anthropic import build_messages_payload
 from zeta.providers.codex import build_responses_payload
 from zeta.tools import ToolRegistry
@@ -17,6 +18,7 @@ from zeta.tools.read import IMAGE_MAX_BYTES
 from zeta.tui.checkpoints import CheckpointTranscriptMixin
 from zeta.tui.render import render_event
 from zeta.types import (
+    IMAGE_DEGRADATION_WARNING,
     ImageContent,
     Message,
     MessageRole,
@@ -34,13 +36,27 @@ PNG = bytes.fromhex(
 )
 IMAGE_FIXTURES = (
     ("png", "image/png", PNG),
-    ("jpeg", "image/jpeg", b"\xff\xd8\xff"),
-    ("gif", "image/gif", b"GIF89a\x01\x00\x01\x00"),
+    ("jpeg", "image/jpeg", b"\xff\xd8\xff\xd9"),
+    ("gif", "image/gif", b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"),
     (
         "webp",
         "image/webp",
         b"RIFF"
-        + (26).to_bytes(4, "little")
+        + (22).to_bytes(4, "little")
+        + b"WEBPVP8X"
+        + (10).to_bytes(4, "little")
+        + b"\x00" * 10,
+    ),
+)
+
+INVALID_IMAGE_FIXTURES = (
+    ("image/png", PNG[:24]),
+    ("image/jpeg", b"\xff\xd8\xff"),
+    ("image/gif", b"GIF89a\x01\x00\x01\x00"),
+    (
+        "image/webp",
+        b"RIFF"
+        + (23).to_bytes(4, "little")
         + b"WEBPVP8X"
         + (10).to_bytes(4, "little")
         + b"\x00" * 10,
@@ -106,6 +122,27 @@ def test_png_lookalike_fails_full_image_validation() -> None:
     assert detect_image_media_type(data, complete=True) is None
 
 
+@pytest.mark.parametrize(("mime_type", "data"), INVALID_IMAGE_FIXTURES)
+def test_complete_image_validation_requires_container_structure(
+    mime_type: str, data: bytes
+) -> None:
+    assert detect_image_media_type(data) == mime_type
+    assert detect_image_media_type(data, complete=True) is None
+
+
+def _oversized_webp() -> bytes:
+    chunk_size = IMAGE_MAX_BYTES
+    riff_size = chunk_size + 12
+    payload = b"\x2f\x00\x00\x00\x00" + b"x" * (chunk_size - 5)
+    return (
+        b"RIFF"
+        + riff_size.to_bytes(4, "little")
+        + b"WEBPVP8L"
+        + chunk_size.to_bytes(4, "little")
+        + payload
+    )
+
+
 @pytest.mark.asyncio
 async def test_read_rejects_oversized_images_with_size_and_cap(tmp_path: Path) -> None:
     path = tmp_path / "large.png"
@@ -118,6 +155,23 @@ async def test_read_rejects_oversized_images_with_size_and_cap(tmp_path: Path) -
     assert result["isError"] is True
     message = result["content"][0]["text"]
     assert "image is 4194374 bytes" in message
+    assert "cap is 4194304 bytes (4 MiB)" in message
+
+
+@pytest.mark.asyncio
+async def test_read_rejects_oversized_webp_before_sample_validation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "large.webp"
+    path.write_bytes(_oversized_webp())
+
+    result = await ToolRegistry(tmp_path).execute(
+        ToolCall("read-large-webp", "read", {"path": path.name})
+    )
+
+    assert result["isError"] is True
+    message = result["content"][0]["text"]
+    assert "image is 4194324 bytes" in message
     assert "cap is 4194304 bytes (4 MiB)" in message
 
 
@@ -274,12 +328,20 @@ def test_image_tool_result_persists_and_replays_byte_identically(tmp_path: Path)
     assert assembled[0].to_dict() == persisted
 
 
-def test_tui_renders_compact_image_read_card() -> None:
+@pytest.mark.asyncio
+async def test_tui_renders_compact_image_read_card(tmp_path: Path) -> None:
+    path = tmp_path / "screenshot.png"
+    path.write_bytes(PNG)
+    raw_result = await ToolRegistry(tmp_path).execute(
+        ToolCall("read-call", "read", {"path": path.name})
+    )
+    tool_result = _validated_tool_result(raw_result, "read-call")
+
     rendered = render_event(
         StreamEvent(
             StreamEventType.TOOL_EXECUTION_END,
             tool_call=ToolCall("read-call", "read", {"path": "screenshot.png"}),
-            tool_result=_image_tool_result(),
+            tool_result=tool_result,
         )
     )
     output = io.StringIO()
@@ -310,14 +372,23 @@ def test_corrupt_stored_image_block_keeps_receipt(
 
     result = reopened.messages()[0].tool_result
     assert result is not None
-    assert result.content == "filename=screenshot.png bytes=70 format=png"
+    assert result.content == (
+        "filename=screenshot.png bytes=70 format=png\n"
+        f"{IMAGE_DEGRADATION_WARNING}"
+    )
     assert result.content_blocks == [
         {
             "type": "text",
             "text": "filename=screenshot.png bytes=70 format=png",
             "truncated": False,
             "full_size": 43,
-        }
+        },
+        {
+            "type": "text",
+            "text": IMAGE_DEGRADATION_WARNING,
+            "truncated": False,
+            "full_size": len(IMAGE_DEGRADATION_WARNING.encode("utf-8")),
+        },
     ]
 
 
@@ -344,3 +415,6 @@ def test_tui_resume_renders_receipt_for_corrupt_stored_image(tmp_path: Path) -> 
     app._rebuild_transcript()
 
     assert len(printed) == 1
+    output = io.StringIO()
+    Console(file=output, width=100, force_terminal=False).print(printed[0])
+    assert IMAGE_DEGRADATION_WARNING in output.getvalue()

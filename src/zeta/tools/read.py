@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
 from ..core.abort import AbortSignal
-from ..types import StructuredToolResult, detect_image_media_type
+from ..types import (
+    StructuredToolResult,
+    detect_image_media_type,
+    image_validation_status,
+)
 from ._sandbox import open_target
 from .registry import (
     ToolRegistry,
@@ -146,6 +150,29 @@ async def _read(
                 )
                 if sniffed_type is not None:
                     data = handle.read(IMAGE_MAX_BYTES + 1)
+                    if file_size > IMAGE_MAX_BYTES:
+                        validation = image_validation_status(
+                            sniffed_type, data, total_size=file_size
+                        )
+                        if validation == "invalid":
+                            handle.seek(0)
+                            return await _read_handle(
+                                handle,
+                                resolved_path,
+                                offset,
+                                limit,
+                                output,
+                                digest,
+                                abort_signal,
+                            )
+                        if "offset" in arguments or "limit" in arguments:
+                            raise ValueError(
+                                "offset and limit are not supported for image reads"
+                            )
+                        raise ValueError(
+                            f"image is {file_size} bytes; cap is "
+                            f"{IMAGE_MAX_BYTES} bytes (4 MiB)"
+                        )
                     media_type = detect_image_media_type(data, complete=True)
                     if media_type is None:
                         handle.seek(0)
@@ -161,16 +188,6 @@ async def _read(
                     if "offset" in arguments or "limit" in arguments:
                         raise ValueError(
                             "offset and limit are not supported for image reads"
-                        )
-                    if file_size > IMAGE_MAX_BYTES:
-                        raise ValueError(
-                            f"image is {file_size} bytes; cap is "
-                            f"{IMAGE_MAX_BYTES} bytes (4 MiB)"
-                        )
-                    if len(data) > IMAGE_MAX_BYTES:
-                        raise ValueError(
-                            f"image is {len(data)} bytes; cap is "
-                            f"{IMAGE_MAX_BYTES} bytes (4 MiB)"
                         )
                     file_size = len(data)
                     format_name = media_type.removeprefix("image/")

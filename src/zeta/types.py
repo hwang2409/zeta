@@ -6,7 +6,7 @@ import base64
 import binascii
 import math
 import struct
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import (
@@ -407,6 +407,8 @@ def _validate_annotations(prefix: str, value: object) -> ToolAnnotations:
 SUPPORTED_IMAGE_MEDIA_TYPES = frozenset(
     {"image/png", "image/jpeg", "image/gif", "image/webp"}
 )
+ImageValidation = Literal["valid", "incomplete", "invalid"]
+IMAGE_DEGRADATION_WARNING = "[image block unavailable: invalid stored image data]"
 
 
 def detect_image_media_type(data: bytes, *, complete: bool = False) -> str | None:
@@ -424,7 +426,7 @@ def detect_image_media_type(data: bytes, *, complete: bool = False) -> str | Non
         mime_type = "image/webp"
     else:
         return None
-    if complete and not image_signature_matches(mime_type, data):
+    if complete and image_validation_status(mime_type, data) != "valid":
         return None
     return mime_type
 
@@ -448,6 +450,87 @@ def image_signature_matches(mime_type: str, data: bytes) -> bool:
     if mime_type == "image/webp":
         return _webp_dimensions(data) is not None
     return True
+
+
+def image_validation_status(
+    mime_type: str, data: bytes, *, total_size: int | None = None
+) -> ImageValidation:
+    """Classify a complete or capped image payload."""
+
+    total_size = len(data) if total_size is None else total_size
+    if total_size < len(data):
+        return "invalid"
+    validator = _IMAGE_VALIDATORS.get(mime_type)
+    return validator(data, total_size) if validator is not None else "invalid"
+
+
+def _png_validation_status(data: bytes, total_size: int) -> ImageValidation:
+    if len(data) < 8 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return "invalid"
+    offset = 8
+    saw_header = False
+    while True:
+        if offset + 8 > len(data):
+            return "incomplete" if len(data) < total_size else "invalid"
+        chunk_size = int.from_bytes(data[offset : offset + 4], "big")
+        chunk_type = data[offset + 4 : offset + 8]
+        chunk_end = offset + 12 + chunk_size
+        if chunk_end > total_size:
+            return "invalid"
+        if chunk_end > len(data):
+            return "incomplete"
+        if not saw_header and chunk_type != b"IHDR":
+            return "invalid"
+        if chunk_type == b"IHDR":
+            if saw_header or chunk_size != 13 or not all(
+                struct.unpack(">II", data[offset + 8 : offset + 16])
+            ):
+                return "invalid"
+            saw_header = True
+        if chunk_type == b"IEND":
+            return "valid" if saw_header and chunk_size == 0 else "invalid"
+        offset = chunk_end
+
+
+def _jpeg_validation_status(data: bytes, total_size: int) -> ImageValidation:
+    if len(data) < 2 or data[:2] != b"\xff\xd8":
+        return "invalid"
+    if len(data) < total_size:
+        return "incomplete"
+    return "valid" if len(data) >= 4 and data[-2:] == b"\xff\xd9" else "invalid"
+
+
+def _gif_validation_status(data: bytes, total_size: int) -> ImageValidation:
+    if len(data) < 6 or data[:6] not in {b"GIF87a", b"GIF89a"}:
+        return "invalid"
+    if len(data) < total_size:
+        return "incomplete"
+    return "valid" if len(data) >= 7 and data[-1] == 0x3B else "invalid"
+
+
+def _webp_validation_status(data: bytes, total_size: int) -> ImageValidation:
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return "invalid"
+    if int.from_bytes(data[4:8], "little") + 8 != total_size:
+        return "invalid"
+    if len(data) < 20:
+        return "incomplete" if len(data) < total_size else "invalid"
+    chunk_type = data[12:16]
+    chunk_size = int.from_bytes(data[16:20], "little")
+    if chunk_type not in {b"VP8 ", b"VP8L", b"VP8X"}:
+        return "invalid"
+    chunk_end = 20 + chunk_size
+    if chunk_end > total_size:
+        return "invalid"
+    return "valid" if chunk_end <= len(data) else "incomplete"
+
+
+_IMAGE_VALIDATORS: dict[str, Callable[[bytes, int], ImageValidation]] = {
+    "image/png": _png_validation_status,
+    "image/jpeg": _jpeg_validation_status,
+    "image/gif": _gif_validation_status,
+    "image/webp": _webp_validation_status,
+}
 
 
 def _webp_chunk(data: bytes) -> tuple[bytes, int, int] | None:
@@ -724,6 +807,7 @@ class ToolResult:
             if type(content_blocks) is not list:
                 raise ValueError("tool result content_blocks must be an array")
             normalized_blocks: list[ToolContentBlock] = []
+            dropped_image = False
             for index, block in enumerate(content_blocks):
                 try:
                     normalized_blocks.append(
@@ -734,11 +818,24 @@ class ToolResult:
                     # payload is no longer usable. New results stay strict in
                     # validate_tool_result before they reach this loader.
                     if isinstance(block, dict) and block.get("type") == "image":
+                        dropped_image = True
                         continue
                     raise ValueError(
                         f"tool result content block is invalid: {exc}"
                     ) from exc
             content_blocks = normalized_blocks
+            if dropped_image:
+                normalized_blocks.append(
+                    {
+                        "type": "text",
+                        "text": IMAGE_DEGRADATION_WARNING,
+                        "truncated": False,
+                        "full_size": len(IMAGE_DEGRADATION_WARNING.encode("utf-8")),
+                    }
+                )
+                content = "\n".join(
+                    part for part in (content, IMAGE_DEGRADATION_WARNING) if part
+                )
         if structured_content is not None and type(structured_content) is not dict:
             raise ValueError("tool result structured_content must be an object")
         return cls(
