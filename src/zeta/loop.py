@@ -57,6 +57,7 @@ from .mcp.commands import (
 )
 from .mcp.prompt_commands import SlashModelInput
 from .prompts import load_identity
+from .skill_catalog import SkillCatalog
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from .tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from .tools.agent_presets import (
@@ -189,6 +190,7 @@ class AgentLoop:
         store: ConversationStore,
         *,
         tools: Mapping[str, ToolHandler] | ToolRegistry | None = None,
+        skill_catalog: SkillCatalog,
         registry: ToolRegistry | None = None,
         approval_policy: ApprovalPolicy | None = None,
         tool_schemas: Sequence[ToolSchema] | None = None,
@@ -235,12 +237,15 @@ class AgentLoop:
         recover_agent_children(self)
         if registry is not None and tools is not None:
             raise ValueError("pass only one tool registry")
-        if registry is not None:
-            self.tool_registry = registry
-        elif isinstance(tools, ToolRegistry):
-            self.tool_registry = tools
+        selected_registry = registry if registry is not None else tools if isinstance(tools, ToolRegistry) else None
+        if selected_registry is not None:
+            if selected_registry.skill_catalog != skill_catalog:
+                raise ValueError("loop catalog must match the tool registry catalog")
+            self.tool_registry = selected_registry
         elif isinstance(tools, Mapping):
-            self.tool_registry = ToolRegistry(store.cwd, register_builtin=False)
+            self.tool_registry = ToolRegistry(
+                store.cwd, register_builtin=False, skill_catalog=skill_catalog
+            )
             schemas_by_name = {
                 schema.get("name"): schema
                 for schema in (tool_schemas or [])
@@ -266,7 +271,7 @@ class AgentLoop:
                     parameters=parameters,
                 )
         elif tools is None:
-            self.tool_registry = ToolRegistry(store.cwd)
+            self.tool_registry = ToolRegistry(store.cwd, skill_catalog=skill_catalog)
         else:
             raise TypeError("tools must be a mapping or ToolRegistry")
         self._mcp_mount: MCPMount | None = None
@@ -295,7 +300,7 @@ class AgentLoop:
         )
         self.max_turns = max_turns
         if system_prompt is None:
-            system_prompt = load_identity()
+            system_prompt = load_identity(catalog=self.tool_registry.skill_catalog)
         self.context_assembler = context_assembler or ContextAssembler(
             store,
             token_budget=token_budget,

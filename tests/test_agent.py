@@ -22,6 +22,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore, PendingPromptsClosedError
 from zeta.loop import AgentLoop
 from zeta.mcp import MCPMount
+from zeta.skill_catalog import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
 from zeta.tools.agent_presets import (
@@ -445,7 +446,7 @@ async def test_background_agent_returns_handle_and_parent_continues(
 ) -> None:
     backend = BackgroundBackend([_background_agent_call()])
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
     result = next(
@@ -475,7 +476,7 @@ async def test_background_completion_notification_waits_for_next_turn_boundary(
 ) -> None:
     backend = BackgroundBackend([_background_agent_call()])
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     background_events: list[StreamEvent] = []
     loop.set_background_event_sink(background_events.append)
 
@@ -509,7 +510,7 @@ async def test_background_multibyte_receipt_fits_persisted_limit(
     backend = BackgroundBackend([_background_agent_call()])
     backend.child_text = "😀" * 1_800
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     background_events: list[StreamEvent] = []
     loop.set_background_event_sink(background_events.append)
 
@@ -549,7 +550,7 @@ async def test_background_completion_during_setup_is_drained_at_turn_start(
 ) -> None:
     backend = BackgroundBackend([_background_agent_call()])
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1, skip_mcp_mount=True)
+    loop = AgentLoop(backend, store, max_turns=1, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
     setup_started = asyncio.Event()
@@ -578,7 +579,7 @@ async def test_background_completion_leaves_no_pending_abort_waiter(
     baseline = set(asyncio.all_tasks())
     backend = BackgroundBackend([_background_agent_call()])
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
     backend.release_child.set()
@@ -601,7 +602,7 @@ async def test_parent_abort_cancels_background_agent(tmp_path: Path) -> None:
     call = _background_agent_call()
     backend = BackgroundBackend([call])
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     background_events: list[StreamEvent] = []
     loop.set_background_event_sink(background_events.append)
 
@@ -638,7 +639,7 @@ async def test_parent_abort_cancels_background_grandchild(
 ) -> None:
     backend = NestedBackgroundBackend()
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
     await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
@@ -666,7 +667,7 @@ async def test_foreground_child_does_not_wait_for_background_grandchild(
 ) -> None:
     backend = ForegroundNestedBackgroundBackend()
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(_collect(loop.run_turn("start")))
     await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
@@ -694,7 +695,7 @@ async def test_background_and_foreground_tools_mix_in_one_turn(
     foreground = ToolCall("read-1", "read", {"path": "missing"})
     backend = BackgroundBackend([background, foreground])
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
     results = [message.tool_result for message in store.messages() if message.tool_result]
@@ -752,7 +753,7 @@ def test_resume_cancels_live_background_child(tmp_path: Path) -> None:
     )
 
     resumed = ConversationStore(tmp_path, session_id="parent")
-    AgentLoop(BackgroundBackend([]), resumed)
+    AgentLoop(BackgroundBackend([]), resumed, skill_catalog=SkillCatalog.empty())
 
     notification = resumed.agent_notifications()[0]
     assert notification.data["status"] == "canceled"
@@ -790,7 +791,7 @@ def test_resume_keeps_completed_unnotified_background_notification(
     )
 
     resumed = ConversationStore(tmp_path, session_id="parent")
-    AgentLoop(BackgroundBackend([]), resumed)
+    AgentLoop(BackgroundBackend([]), resumed, skill_catalog=SkillCatalog.empty())
 
     notification = resumed.agent_notifications()[0]
     assert notification.data["status"] == "completed"
@@ -821,7 +822,7 @@ def test_resume_cancels_adopted_background_grandchild(tmp_path: Path) -> None:
     )
 
     resumed = ConversationStore(tmp_path, session_id="root")
-    AgentLoop(FakeBackend([]), resumed)
+    AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
 
     notification = resumed.agent_notifications()[0]
     assert notification.data["status"] == "canceled"
@@ -862,7 +863,7 @@ def test_resume_keeps_same_id_adopted_background_grandchildren_separate(
     assert set(root.agent_children()) == {"root:2:1"}
 
     resumed = ConversationStore(tmp_path, session_id="root")
-    AgentLoop(FakeBackend([]), resumed)
+    AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
 
     notifications = resumed.agent_notifications(pending_only=False)
     assert [entry.data["child_instance_id"] for entry in notifications] == [
@@ -884,7 +885,7 @@ async def test_background_persistence_failure_does_not_block_close(
     call = _background_agent_call()
     backend = BackgroundBackend([call])
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
 
@@ -906,7 +907,7 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
     calls = _parallel_agent_calls()
     backend = ParallelChildrenBackend(calls)
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(_collect(loop.run_turn("start")))
     await asyncio.wait_for(backend.children_started.wait(), timeout=1)
@@ -935,6 +936,7 @@ async def test_parallel_nested_lifecycle_events_survive_large_batch(
         store,
         max_turns=1,
         agent_turn_budget=100,
+        skill_catalog=SkillCatalog.empty(),
     )
 
     events = await asyncio.wait_for(_collect(loop.run_turn("start")), timeout=30)
@@ -975,7 +977,7 @@ async def test_duplicate_parallel_agent_ids_fail_before_child_dispatch(
     store = ConversationStore(tmp_path)
 
     with pytest.raises(ValueError, match="duplicate tool call id"):
-        await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+        await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     assert not (store.session_dir / "agents").exists()
 
@@ -985,7 +987,7 @@ async def test_parent_abort_cancels_all_parallel_children(tmp_path: Path) -> Non
     calls = _parallel_agent_calls()
     backend = ParallelChildrenBackend(calls)
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(_collect(loop.run_turn("start")))
     await asyncio.wait_for(backend.children_started.wait(), timeout=1)
@@ -1017,7 +1019,7 @@ async def test_parallel_delegated_approvals_resolve_by_child_instance(
     backend = ParallelApprovalBackend(calls)
     store = ConversationStore(tmp_path)
     policy = ApprovalPolicy(store=store)
-    loop = AgentLoop(backend, store, approval_policy=policy, max_turns=1)
+    loop = AgentLoop(backend, store, approval_policy=policy, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(_collect(loop.run_turn("start")))
     for _ in range(100):
@@ -1044,7 +1046,7 @@ async def test_agent_returns_child_text_and_persists_child_session(tmp_path: Pat
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.content.startswith("done")
@@ -1071,9 +1073,9 @@ def test_agent_schema_uses_preset_registry(
         name="custom",  # type: ignore[arg-type]
     )
     monkeypatch.setitem(AGENT_PRESETS, "explore", custom)
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    AgentLoop(FakeBackend([]), store, registry=registry)
+    AgentLoop(FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty())
 
     agent_schema = next(schema for schema in registry.schemas if schema["name"] == "agent")
     agent_type_schema = agent_schema["parameters"]["properties"]["agent_type"]
@@ -1108,8 +1110,8 @@ async def test_general_agent_markers_keep_legacy_state_bytes(tmp_path: Path) -> 
         ]
     )
 
-    await _collect(AgentLoop(omitted_backend, omitted, max_turns=1).run_turn("start"))
-    await _collect(AgentLoop(explicit_backend, explicit, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(omitted_backend, omitted, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
+    await _collect(AgentLoop(explicit_backend, explicit, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     omitted_child_state = omitted.session_dir / "agents" / "1" / "session_state.json"
     explicit_child_state = explicit.session_dir / "agents" / "1" / "session_state.json"
@@ -1132,7 +1134,7 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     child_schemas = {schema["name"] for schema in backend.calls[1][1]}
     assert child_schemas == {
@@ -1203,7 +1205,7 @@ async def test_restricted_child_cannot_use_mounted_mcp_write_tool(
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     assert mount_calls == 1
     child_result = next(
@@ -1227,7 +1229,7 @@ async def test_plan_child_includes_todo_and_only_read_only_tools(tmp_path: Path)
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     assert {schema["name"] for schema in backend.calls[1][1]} == {
         "agent",
@@ -1262,7 +1264,7 @@ async def test_typed_child_turn_cap_is_enforced(
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -1287,7 +1289,7 @@ async def test_unknown_agent_type_returns_loud_error(tmp_path: Path) -> None:
     )
     backend = FakeBackend([])
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     result = await loop._run_agent_tool(
         call,
@@ -1317,6 +1319,7 @@ async def test_typed_preamble_composes_with_child_system_prompt(tmp_path: Path) 
             store,
             max_turns=1,
             system_prompt="existing child instructions",
+skill_catalog=SkillCatalog.empty(),
         ).run_turn("start")
     )
 
@@ -1346,8 +1349,8 @@ async def test_child_registry_preserves_parent_pre_execution_hook(tmp_path: Path
         return "denied by test hook" if name == "bash" else None
 
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(store.cwd, pre_execute_hook=deny_bash)
-    await _collect(AgentLoop(backend, store, registry=registry, max_turns=1).run_turn("start"))
+    registry = ToolRegistry(store.cwd, pre_execute_hook=deny_bash, skill_catalog=SkillCatalog.empty())
+    await _collect(AgentLoop(backend, store, registry=registry, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     assert observed[-1] == "bash"
     child_messages = ConversationStore(
@@ -1366,9 +1369,9 @@ async def test_child_registry_shares_todo_store_but_isolates_other_session_tools
     parent_store = ConversationStore(sessions, session_id="parent", cwd=tmp_path)
     child_store = ConversationStore(sessions, session_id="child", cwd=tmp_path)
     (tmp_path / "nested").mkdir()
-    registry = ToolRegistry(parent_store.cwd, session_store=parent_store)
+    registry = ToolRegistry(parent_store.cwd, session_store=parent_store, skill_catalog=SkillCatalog.empty())
     child_registry = registry.clone_for_session(child_store)
-    child_loop = AgentLoop(FakeBackend([]), child_store, registry=child_registry)
+    child_loop = AgentLoop(FakeBackend([]), child_store, registry=child_registry, skill_catalog=SkillCatalog.empty())
     widget = TodoWidget(parent_store)
 
     await child_loop.tool_registry.execute(
@@ -1502,7 +1505,7 @@ async def test_child_loop_inherits_argument_scoped_approval_rules(
     )
 
     await _collect(
-        AgentLoop(backend, store, approval_policy=policy, max_turns=1).run_turn("start")
+        AgentLoop(backend, store, approval_policy=policy, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start")
     )
 
     child_messages = ConversationStore(
@@ -1536,9 +1539,9 @@ async def test_child_abort_closes_all_loop_tasks(tmp_path: Path) -> None:
         ]
     )
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(store.cwd)
+    registry = ToolRegistry(store.cwd, skill_catalog=SkillCatalog.empty())
     registry.register("wait", wait_forever)
-    loop = AgentLoop(backend, store, registry=registry, max_turns=1)
+    loop = AgentLoop(backend, store, registry=registry, max_turns=1, skill_catalog=SkillCatalog.empty())
     baseline = set(asyncio.all_tasks())
     task = asyncio.create_task(_collect(loop.run_turn("start")))
     await started.wait()
@@ -1569,7 +1572,7 @@ async def test_agent_turn_cap_returns_loud_error(tmp_path: Path) -> None:
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.is_error
@@ -1592,7 +1595,7 @@ async def test_child_agent_call_allows_one_grandchild(tmp_path: Path) -> None:
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.content.startswith("child complete")
@@ -1624,7 +1627,7 @@ async def test_nested_typed_child_only_tightens_tools(tmp_path: Path) -> None:
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     child_tools = {schema["name"] for schema in backend.calls[1][1]}
     grandchild_tools = {schema["name"] for schema in backend.calls[2][1]}
@@ -1665,6 +1668,7 @@ async def test_shared_turn_budget_covers_generations(tmp_path: Path) -> None:
             store,
             max_turns=1,
             agent_turn_budget=1,
+skill_catalog=SkillCatalog.empty(),
         ).run_turn("start")
     )
 
@@ -1701,6 +1705,7 @@ async def test_shared_turn_budget_covers_parallel_grandchildren(tmp_path: Path) 
             store,
             max_turns=1,
             agent_turn_budget=2,
+skill_catalog=SkillCatalog.empty(),
         ).run_turn("start")
     )
 
@@ -1727,6 +1732,7 @@ def test_agent_loop_rejects_conflicting_turn_budget_inputs(tmp_path: Path) -> No
             ConversationStore(tmp_path),
             agent_turn_budget=1,
             agent_tree=AgentTree(),
+skill_catalog=SkillCatalog.empty(),
         )
 
 
@@ -1745,7 +1751,7 @@ async def test_top_level_agent_calls_get_fresh_shared_turn_budgets(
         ]
     )
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1)
+    loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
     await _collect(loop.run_turn("follow up"))
@@ -1774,7 +1780,7 @@ async def test_parallel_top_level_agent_invocations_have_independent_budgets(
             ]
         )
         store = ConversationStore(tmp_path / str(index))
-        loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1)
+        loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1, skill_catalog=SkillCatalog.empty())
         await _collect(loop.run_turn("start"))
         result = next(
             message.tool_result
@@ -1794,7 +1800,7 @@ async def test_adopted_background_child_keeps_origin_tree_budget(
 ) -> None:
     backend = ForegroundNestedBackgroundBackend()
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1)
+    loop = AgentLoop(backend, store, max_turns=1, agent_turn_budget=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
     notification = await _wait_for_notification(store, "error")
@@ -1821,7 +1827,7 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
     await _wait_for_notification(store, "completed")
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
@@ -1845,7 +1851,7 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
 async def test_abort_propagates_through_two_nested_levels(tmp_path: Path) -> None:
     backend = NestedBlockingBackend()
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(_collect(loop.run_turn("start")))
 
     await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
@@ -1888,7 +1894,7 @@ def test_resume_cancels_nested_tree_markers(tmp_path: Path) -> None:
     )
 
     resumed = ConversationStore(tmp_path, session_id="root")
-    AgentLoop(FakeBackend([]), resumed)
+    AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
 
     assert not resumed.agent_children()
     assert ConversationStore(
@@ -1933,7 +1939,7 @@ def test_resume_cancels_nested_background_tree_markers(tmp_path: Path) -> None:
     )
 
     resumed = ConversationStore(tmp_path, session_id="root")
-    AgentLoop(FakeBackend([]), resumed)
+    AgentLoop(FakeBackend([]), resumed, skill_catalog=SkillCatalog.empty())
 
     assert resumed.agent_notifications()[0].data["status"] == "canceled"
     resumed_child = ConversationStore(
@@ -1965,7 +1971,8 @@ async def test_child_approval_uses_parent_policy(tmp_path: Path) -> None:
     policy = ApprovalPolicy(store=store)
     events = []
     async for event in AgentLoop(
-        backend, store, approval_policy=policy, max_turns=1
+        backend, store, approval_policy=policy, max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
     ).run_turn("start"):
         events.append(event)
         if event.type is StreamEventType.TOOL_APPROVAL_START:
@@ -2024,7 +2031,7 @@ async def test_grandchild_approval_composes_with_parent_policy(
     )
     store = ConversationStore(tmp_path)
     policy = ApprovalPolicy(store=store)
-    loop = AgentLoop(backend, store, approval_policy=policy, max_turns=1)
+    loop = AgentLoop(backend, store, approval_policy=policy, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(_collect(loop.run_turn("start")))
     for _ in range(100):
@@ -2057,7 +2064,7 @@ async def test_agent_result_metadata_survives_parent_replay(tmp_path: Path) -> N
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     replayed = ConversationStore(tmp_path, session_id=store.session_id)
     result = next(message.tool_result for message in replayed.messages() if message.tool_result)
@@ -2082,7 +2089,7 @@ async def test_agent_normal_completion_reports_all_child_turns(tmp_path: Path) -
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.structured_content is not None
@@ -2099,7 +2106,7 @@ async def test_typed_child_type_survives_completion_and_reopen(tmp_path: Path) -
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     assert child.agent_type() == "explore"
@@ -2120,7 +2127,7 @@ async def test_empty_child_final_message_returns_error(tmp_path: Path) -> None:
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.is_error
@@ -2140,7 +2147,7 @@ async def test_child_answer_with_cancellation_prefix_is_success(
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -2159,7 +2166,7 @@ async def test_failed_agent_receipt_stats_match_is_error(tmp_path: Path) -> None
     )
     store = ConversationStore(tmp_path)
 
-    events = await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    events = await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -2190,6 +2197,7 @@ async def test_failed_background_receipt_matches_error_flag(
         FakeBackend([ScriptedTurn(tool_calls=[call]), ScriptedTurn()]),
         store,
         max_turns=1,
+skill_catalog=SkillCatalog.empty(),
     )
     background_events: list[StreamEvent] = []
     loop.set_background_event_sink(background_events.append)
@@ -2228,7 +2236,7 @@ async def test_multibyte_agent_receipt_stays_within_response_limit(
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     persisted = next(message for message in store.messages() if message.tool_result)
     result = persisted.tool_result
@@ -2253,7 +2261,7 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
         ]
     )
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(_collect(loop.run_turn("start")))
     await asyncio.sleep(0.05)
     loop.abort()
@@ -2301,7 +2309,7 @@ async def test_parent_abort_after_child_turn_reports_completed_turns(tmp_path: P
         ]
     )
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     async for event in loop.run_turn("start"):
         if (
@@ -2328,7 +2336,7 @@ async def test_typed_child_type_survives_cancellation_and_reopen(tmp_path: Path)
         ]
     )
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(_collect(loop.run_turn("start")))
     await asyncio.sleep(0.05)
     loop.abort()
@@ -2354,11 +2362,11 @@ async def test_parent_result_append_precedes_marker_cleanup(tmp_path: Path, monk
 
     monkeypatch.setattr(store, "finish_agent_child", fail_cleanup)
     with pytest.raises(RuntimeError, match="crash after parent result"):
-        await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+        await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     assert store.agent_children()
     replayed = ConversationStore(tmp_path, session_id=store.session_id)
-    AgentLoop(FakeBackend([]), replayed, max_turns=1)
+    AgentLoop(FakeBackend([]), replayed, max_turns=1, skill_catalog=SkillCatalog.empty())
     results = [message.tool_result for message in replayed.messages() if message.tool_result]
     assert len(results) == 1
     assert results[0].content.startswith("done")
@@ -2380,7 +2388,7 @@ def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
     )
     store.update_agent_child_turns(call.id, 2)
 
-    AgentLoop(FakeBackend([]), store, max_turns=1)
+    AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.content.startswith("tool execution canceled")
@@ -2409,7 +2417,7 @@ def test_resume_preserves_typed_child_receipt(tmp_path: Path) -> None:
     )
     store.update_agent_child_turns(call.id, 2)
 
-    AgentLoop(FakeBackend([]), store, max_turns=1)
+    AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     result = next(message.tool_result for message in store.messages() if message.tool_result)
     assert result.structured_content is not None
@@ -2494,9 +2502,9 @@ def test_provider_for_model_rejects_an_unknown_name() -> None:
 def test_agent_schema_offers_every_known_model(tmp_path: Path) -> None:
     from zeta.model_catalog import known_model_names
 
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    AgentLoop(FakeBackend([]), store, registry=registry)
+    AgentLoop(FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty())
 
     agent_schema = next(
         schema for schema in registry.schemas if schema["name"] == "agent"
@@ -2518,7 +2526,7 @@ async def test_agent_without_a_model_still_inherits_the_parent_backend(
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -2539,7 +2547,7 @@ async def test_agent_with_a_model_runs_the_child_on_that_provider(
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(parent_backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(parent_backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     assert requested == [("codex", "gpt-5.4")]
     result = next(
@@ -2559,7 +2567,7 @@ async def test_agent_model_implies_background(
     _stub_backend_factory(monkeypatch, child_backend)
     parent_backend = FakeBackend([ScriptedTurn(tool_calls=[_model_agent_call()])])
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(parent_backend, store, max_turns=1)
+    loop = AgentLoop(parent_backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
 
@@ -2580,7 +2588,7 @@ async def test_agent_rejects_an_unknown_model_before_spawning(tmp_path: Path) ->
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -2596,7 +2604,7 @@ def test_resolve_child_backend_guards_bad_models(tmp_path: Path) -> None:
     from zeta.agent_runner import resolve_child_backend
 
     parent_backend = FakeBackend([])
-    loop = AgentLoop(parent_backend, ConversationStore(tmp_path))
+    loop = AgentLoop(parent_backend, ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
 
     # No model at all keeps the parent's backend.
     assert resolve_child_backend(loop, None) == (parent_backend, None)
@@ -2627,7 +2635,7 @@ async def test_agent_reports_a_missing_provider_login(
     backend = FakeBackend([ScriptedTurn(tool_calls=[_model_agent_call()])])
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -2645,7 +2653,7 @@ def test_agent_loop_turn_cap_allows_long_runs(tmp_path: Path) -> None:
 
     default = inspect.signature(AgentLoop.__init__).parameters["max_turns"].default
     assert default == 150
-    assert AgentLoop(FakeBackend([]), ConversationStore(tmp_path)).max_turns == 150
+    assert AgentLoop(FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()).max_turns == 150
 
 
 @pytest.mark.asyncio
@@ -2654,7 +2662,7 @@ async def test_background_start_text_names_handle_and_polling_tools(
 ) -> None:
     backend = BackgroundBackend([_background_agent_call()])
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
     result = next(
@@ -2692,7 +2700,7 @@ async def test_max_turns_raises_shared_tree_budget(tmp_path: Path) -> None:
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     lifecycle = child_store.agent_lifecycle()
@@ -2711,7 +2719,7 @@ async def test_max_turns_hard_cap_rejects_oversized_request(tmp_path: Path) -> N
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -2731,7 +2739,7 @@ async def test_max_turns_rejected_by_schema_for_non_positive_input(
     call.arguments["max_turns"] = 0
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
     store = ConversationStore(tmp_path)
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
     )
@@ -2756,7 +2764,7 @@ async def test_max_turns_rejected_from_nested_agent_calls(tmp_path: Path) -> Non
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     nested = next(
@@ -2784,7 +2792,7 @@ async def test_budget_exhaustion_error_reports_used_and_allocated(
     )
     store = ConversationStore(tmp_path)
 
-    await _collect(AgentLoop(backend, store, max_turns=1).run_turn("start"))
+    await _collect(AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -2815,7 +2823,7 @@ async def test_child_transcript_survives_budget_exhaustion(tmp_path: Path) -> No
         ]
     )
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     await _collect(loop.run_turn("start"))
 
     result = next(
@@ -2915,9 +2923,9 @@ def test_run_preset_is_registered_with_a_long_cap(tmp_path: Path) -> None:
     assert RUN_PRESET.tool_names is None
     assert AGENT_PRESETS["run"] is RUN_PRESET
 
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    AgentLoop(FakeBackend([]), store, registry=registry)
+    AgentLoop(FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty())
     agent_schema = next(
         schema for schema in registry.schemas if schema["name"] == "agent"
     )
@@ -2941,7 +2949,7 @@ async def test_a_run_does_not_draw_on_the_shared_sibling_budget(
         ]
     )
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
     # The explore child sized its own tree at its 15-turn preset cap.
@@ -2963,7 +2971,7 @@ async def test_a_run_goes_to_the_background_without_being_asked(
 ) -> None:
     backend = RunBackend()
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
 
@@ -3176,7 +3184,7 @@ async def test_agent_send_waits_for_blocked_append_before_cancellation(
         return original_send(*args)
 
     monkeypatch.setattr(agent_send_module, "send_to_run", blocked_send)
-    registry = ToolRegistry(tmp_path, session_store=parent_store)
+    registry = ToolRegistry(tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
             ToolCall(
@@ -3234,7 +3242,7 @@ async def test_tool_registry_reports_agent_send_result_after_cleanup_cancellatio
         return await original_gather(*args, **kwargs)
 
     monkeypatch.setattr(execution_module.asyncio, "gather", blocked_cleanup)
-    registry = ToolRegistry(tmp_path, session_store=parent_store)
+    registry = ToolRegistry(tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
             ToolCall(
@@ -3276,7 +3284,7 @@ async def test_agent_send_aborts_before_append_when_store_lock_is_held(
         child_instance_id="parent:1",
     )
 
-    registry = ToolRegistry(tmp_path, session_store=parent_store)
+    registry = ToolRegistry(tmp_path, session_store=parent_store, skill_catalog=SkillCatalog.empty())
     lock = child_store._append_lock()
     lock.__enter__()
     try:
@@ -3311,7 +3319,7 @@ async def test_agent_send_reports_when_the_run_just_closed(tmp_path: Path) -> No
 
     backend = RunBackend()
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
@@ -3341,7 +3349,7 @@ async def test_a_queued_prompt_stays_out_of_the_run_context(tmp_path: Path) -> N
     store = ConversationStore(tmp_path, session_id="run")
     store.append_message(Message(MessageRole.USER, [TextContent("work the big task")]))
     store.append_pending_prompt("secret follow-up")
-    loop = AgentLoop(FakeBackend([]), store)
+    loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
 
     assembled = await loop.context_assembler.assemble()
 
@@ -3375,7 +3383,7 @@ def _run_handle_from_receipt(store: ConversationStore) -> str:
 async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> None:
     backend = RunBackend()
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
     await asyncio.wait_for(backend.child_started.wait(), timeout=2)
@@ -3396,7 +3404,7 @@ async def test_a_follow_up_reaches_the_run_at_its_next_turn(tmp_path: Path) -> N
 async def test_a_run_with_an_empty_queue_finishes_normally(tmp_path: Path) -> None:
     backend = RunBackend()
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start"))
     backend.release_child.set()
@@ -3447,7 +3455,7 @@ def test_send_to_run_rejects_non_run_children(tmp_path: Path) -> None:
 async def test_runs_and_send_commands_drive_a_live_run(tmp_path: Path) -> None:
     backend = RunBackend()
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     commands = _RunCommands(loop)
 
     explore_call = ToolCall(

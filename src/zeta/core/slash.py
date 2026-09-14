@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -14,6 +15,12 @@ from ..mcp.prompt_commands import (
     SlashModelInput,
     SlashPromptError,
     dispatch_prompt,
+)
+from ..skill_catalog import (
+    SkillCatalog,
+    SkillMeta,
+    is_slash_safe_name,
+    load_skill_prompt,
 )
 from ..types import Message, MessageRole, StreamEventType, TextContent
 from .commands.custom_commands import (
@@ -567,6 +574,7 @@ class SlashCommandRegistry:
     def __init__(self) -> None:
         self._commands: dict[str, SlashCommand] = {}
         self._custom_commands: dict[str, CustomCommand] = {}
+        self._skills: dict[str, SkillMeta] = {}
         self._notices: list[str] = []
         self._warning_notices: set[str] = set()
         self._mcp_prompts = MCPPromptCommands(
@@ -574,7 +582,7 @@ class SlashCommandRegistry:
         )
 
     def register(self, command: SlashCommand) -> None:
-        if not command.name or any(character.isspace() for character in command.name):
+        if not is_slash_safe_name(command.name):
             raise ValueError("slash command name must be one nonempty word")
         if command.name in self._commands:
             raise ValueError(f"slash command already registered: {command.name}")
@@ -610,8 +618,12 @@ class SlashCommandRegistry:
             (command.name, command.description, command.source)
             for command in self.custom_commands
         )
+        skills = tuple(
+            (skill.name, skill.description, skill.source)
+            for skill in self._skills.values()
+        )
         prompts = self._mcp_prompts.completion_entries()
-        return builtins + custom + prompts
+        return builtins + custom + skills + prompts
 
     def set_mcp_prompts(
         self, entries: Sequence[tuple[str, str, MCPPrompt]]
@@ -642,6 +654,24 @@ class SlashCommandRegistry:
             return
         self._custom_commands[command.name] = command
 
+    def register_skills(self, catalog: SkillCatalog) -> None:
+        """Register skills after built-ins and custom commands."""
+
+        self._notices.extend(catalog.notices)
+        self._warning_notices.update(catalog.notices)
+        for skill in catalog.skills:
+            if skill.name in self._commands:
+                notice = f"ignored skill {skill.path}: shadows built-in /{skill.name}"
+            elif skill.name in self._custom_commands:
+                notice = (
+                    f"ignored skill {skill.path}: shadows custom command /{skill.name}"
+                )
+            else:
+                self._skills[skill.name] = skill
+                continue
+            self._notices.append(notice)
+            self._warning_notices.add(notice)
+
     def _dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command from the first line, or pass the input through."""
 
@@ -651,15 +681,21 @@ class SlashCommandRegistry:
         parts = first_line[1:].split(maxsplit=1)
         if not parts:
             return None
-        command = self._commands.get(parts[0])
+        name = parts[0]
+        if not is_slash_safe_name(name):
+            return None
+        command = self._commands.get(name)
         if command is not None:
             return command.run(session, parts[1] if len(parts) == 2 else "")
-        custom = self._custom_commands.get(parts[0])
-        prompt = self._mcp_prompts.get(parts[0])
+        custom = self._custom_commands.get(name)
+        skill = self._skills.get(name)
+        if skill is not None:
+            return SlashModelInput(load_skill_prompt(skill))
+        prompt = self._mcp_prompts.get(name)
         if prompt is not None:
             return dispatch_prompt(
                 session,
-                parts[0],
+                name,
                 prompt[1],
                 parts[1] if len(parts) == 2 else "",
             )
@@ -712,6 +748,8 @@ class SlashCommandRegistry:
         if not parts:
             return None
         name = parts[0]
+        if not is_slash_safe_name(name):
+            return None
         command = self._custom_commands.get(name)
         return command if command is not None and command.kind == "exec" else None
 
@@ -731,6 +769,12 @@ class SlashCommandRegistry:
             lines.append(
                 f"  /{command.name}{kind}{description} (source: {command.path})"
             )
+        lines.append("skills:")
+        if not self._skills:
+            lines.append("  none")
+        for skill in self._skills.values():
+            description = f" — {skill.description}" if skill.description else ""
+            lines.append(f"  /{skill.name}{description} (source: {skill.path})")
         return "\n".join(lines)
 
 
@@ -938,9 +982,11 @@ def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
     project_dir: str | Path | None = None,
+    skill_catalog: SkillCatalog,
 ) -> SlashCommandRegistry:
     """Create the built-in registry."""
 
+    effective_home = zeta_home or os.environ.get("ZETA_HOME")
     registry = SlashCommandRegistry()
     registry.register(SlashCommand("status", _run_status, "show session status"))
     registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
@@ -998,10 +1044,11 @@ def create_slash_registry(
         SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")
     )
     result = load_custom_commands(
-        home=zeta_home,
+        home=effective_home,
         project_dir=project_dir or Path.cwd(),
     )
     registry._notices.extend(result.notices)
     for command in result.commands:
         registry.register_custom(command)
+    registry.register_skills(skill_catalog)
     return registry

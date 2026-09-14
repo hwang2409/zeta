@@ -11,6 +11,7 @@ import pytest
 
 from zeta.agent_receipt import build_agent_receipt, encode_json
 from zeta.core.store import ConversationStore
+from zeta.skill_catalog import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.registry import _apply_error_governance
 from zeta.types import ToolCall
@@ -18,7 +19,7 @@ from zeta.types import ToolCall
 
 def _registry(tmp_path: Path) -> ToolRegistry:
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    return ToolRegistry(tmp_path, session_store=store)
+    return ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
 
 
 @pytest.mark.asyncio
@@ -131,7 +132,7 @@ async def test_todo_accepts_multiple_in_progress(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_unknown_tool_error_carries_governance(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(ToolCall("call", "nope", {}))
 
@@ -227,7 +228,7 @@ async def test_every_registered_tool_error_carries_governance(
 ) -> None:
     """Governance is applied at the seam regardless of which tool errors."""
 
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     def broken(_arguments: object) -> dict:
         return {
@@ -256,7 +257,7 @@ async def test_every_registered_tool_error_carries_governance(
 async def test_governance_normalizes_unknown_kind_taxonomy(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     def rogue(_arguments: object) -> dict:
         return {
@@ -287,7 +288,7 @@ async def test_governance_normalizes_unknown_kind_taxonomy(
 async def test_governance_preserves_caller_provided_tool_label(
     tmp_path: Path,
 ) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     def labeled(_arguments: object) -> dict:
         return {

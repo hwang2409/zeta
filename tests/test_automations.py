@@ -4,6 +4,7 @@ from pathlib import Path
 
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
+from zeta.skill_catalog import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy
 from zeta.types import ToolCall
@@ -22,6 +23,7 @@ async def test_unattended_allow_list_gates_even_exempt_and_internal_calls(
         approval_policy=policy,
         approval_store=store,
         enforce_approvals=True,
+        skill_catalog=SkillCatalog.empty(),
     )
     calls = []
     for name in ("permitted", "forbidden"):
@@ -75,7 +77,9 @@ from zeta.core.session import SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.mcp.config import load_mcp_config, server_to_json
 from zeta.mcp.mount import MCPMount
+from zeta.prompts import load_identity
 from zeta.runtime.unattended import build_unattended_loop
+from zeta.skill_catalog import discover_session_skills
 from zeta.types import TextContent
 
 START = datetime(2026, 9, 9, 11, 0, tzinfo=UTC)
@@ -256,7 +260,7 @@ async def test_draft_approve_fire_deliver_inspect_and_resume_round_trip(
     origin = SessionManager(tmp_path).create(
         provider="fake", model="fake", cwd=tmp_path
     )
-    registry = ToolRegistry(tmp_path, session_store=origin.store)
+    registry = ToolRegistry(tmp_path, session_store=origin.store, skill_catalog=SkillCatalog.empty())
     job = _job(tmp_path)
     response = await registry.execute(
         ToolCall(
@@ -302,7 +306,7 @@ async def test_draft_approve_fire_deliver_inspect_and_resume_round_trip(
     assert "brief" in await commands.slash("", home=tmp_path, cwd=str(tmp_path))
     assert (
         "automations"
-        in create_slash_registry(zeta_home=tmp_path, project_dir=tmp_path).help_text()
+        in create_slash_registry(zeta_home=tmp_path, project_dir=tmp_path, skill_catalog=SkillCatalog.empty()).help_text()
     )
     await registry.close()
 
@@ -429,8 +433,13 @@ async def test_unattended_runtime_ignores_global_yolo_hooks_and_project_tools(
     (tmp_path / "settings.toml").write_text(
         'yolo = true\n[approval]\nallow = ["bash"]\n'
     )
+    catalog = discover_session_skills(home=tmp_path)
     session = SessionManager(tmp_path).create(
-        provider="fake", model="fake", cwd=tmp_path
+        provider="fake",
+        model="fake",
+        cwd=tmp_path,
+        system_prompt=load_identity(catalog=catalog),
+        skill_catalog=catalog,
     )
     loop = build_unattended_loop(
         session, home=tmp_path, allow=(), backend=FakeBackend([])
@@ -442,6 +451,43 @@ async def test_unattended_runtime_ignores_global_yolo_hooks_and_project_tools(
     assert loop.hooks is None
     assert loop._mcp_mount_attempted
     await loop.close()
+
+
+async def test_automation_catalog_excludes_project_skills_from_prompt_and_tool(
+    tmp_path: Path,
+) -> None:
+    project_skill = tmp_path / ".zeta" / "skills" / "project.md"
+    project_skill.parent.mkdir(parents=True)
+    project_skill.write_text(
+        "---\nname: project\ndescription: project skill\n---\n\nproject body\n",
+        encoding="utf-8",
+    )
+    catalog = discover_session_skills(home=tmp_path)
+    session = SessionManager(tmp_path).create(
+        provider="fake",
+        model="fake",
+        cwd=tmp_path,
+        system_prompt=load_identity(catalog=catalog),
+        skill_catalog=catalog,
+    )
+    loop = build_unattended_loop(
+        session,
+        home=tmp_path,
+        allow=("skill",),
+        backend=FakeBackend([]),
+    )
+    try:
+        loaded = await loop.tool_registry.execute(
+            ToolCall("project", "skill", {"name": "project"})
+        )
+        assert "project skill" not in session.metadata.system_prompt
+        assert [item["name"] for item in session.metadata.skill_catalog or []] == [
+            "review"
+        ]
+        assert loaded["isError"] is True
+        assert "available skills: review" in loaded["content"][0]["text"]
+    finally:
+        await loop.close()
 
 
 def test_import_keeps_project_grants_inert_and_isolates_malformed_entries(
@@ -523,7 +569,7 @@ def test_subjectless_mcp_scoped_allow_is_rejected_without_widening(
 ) -> None:
     job = replace(_job(tmp_path), allow=("slack__history(channel*)",))
     policy = ApprovalPolicy(default=ApprovalDecision.DENY, always_allow=job.allow)
-    registry = ToolRegistry(tmp_path, register_builtin=False, approval_policy=policy)
+    registry = ToolRegistry(tmp_path, register_builtin=False, approval_policy=policy, skill_catalog=SkillCatalog.empty())
     registry.register("slack__history", lambda args: "x")
     with pytest.raises(ValueError, match="no approval subject"):
         validate_permissions(job, registry)
@@ -777,6 +823,7 @@ async def test_only_selected_home_servers_mount_and_scoped_mcp_rules_work(
         approval_policy=policy,
         enforce_approvals=True,
         approval_store=ConversationStore(tmp_path / "session"),
+skill_catalog=SkillCatalog.empty(),
     )
     mount = await mount_services(job, registry, tmp_path)
     try:
@@ -877,7 +924,8 @@ def test_draft_defaults_are_explicit_and_invalid_types_are_rejected(
 
 async def test_automation_tool_has_no_arming_operation(tmp_path: Path) -> None:
     registry = ToolRegistry(
-        tmp_path, session_store=ConversationStore(tmp_path / "session")
+        tmp_path, session_store=ConversationStore(tmp_path / "session"),
+        skill_catalog=SkillCatalog.empty(),
     )
     result = await registry.execute(
         ToolCall("arm", "automation", {"action": "approve", "name": "job"})

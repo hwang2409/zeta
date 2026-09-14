@@ -9,6 +9,7 @@ from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
+from zeta.skill_catalog import SkillCatalog
 from zeta.tools.agent import MAX_AGENT_STATUS_RESULT, MAX_AGENT_STATUS_STEP
 from zeta.types import (
     Message,
@@ -55,7 +56,7 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
             ScriptedTurn([TextContent("background done")], delay=0.05),
         ]
     )
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     await _collect(loop.run_turn("start foreground"))
     foreground_result = next(
@@ -136,7 +137,7 @@ async def test_parent_ownership_survives_lifecycle_start_crash(
         "start_agent_lifecycle",
         crash_before_lifecycle,
     )
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1)
+    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
     with pytest.raises(RuntimeError, match="lifecycle start crashed"):
         await loop._run_agent_tool(
             call,
@@ -151,7 +152,7 @@ async def test_parent_ownership_survives_lifecycle_start_crash(
 
     monkeypatch.undo()
     resumed = ConversationStore(tmp_path, session_id=store.session_id)
-    AgentLoop(FakeBackend([]), resumed, max_turns=1)
+    AgentLoop(FakeBackend([]), resumed, max_turns=1, skill_catalog=SkillCatalog.empty())
     assert not resumed.agent_children()
     assert (
         ConversationStore(store.session_dir / "agents", session_id="1").agent_canceled()
@@ -268,7 +269,7 @@ async def test_elapsed_uses_monotonic_time_when_wall_clock_moves(
     _persist_finished_receipt(store, child, "agent-1", handle)
     monkeypatch.setattr("zeta.tools.agent.time.monotonic", lambda: 105.0)
 
-    status_loop = AgentLoop(FakeBackend([]), store, max_turns=1)
+    status_loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
     status = await _status(status_loop, handle)
     assert status["structuredContent"]["children"][0]["elapsed"] == 5.0
 
@@ -285,7 +286,7 @@ async def test_list_all_uses_active_branch_and_bounds_payload(tmp_path: Path) ->
     )
     _persist_finished_receipt(store, child, "agent-1", handle)
     store.append_fork(checkpoint.data["label"])
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1)
+    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     all_status = await _status(loop)
     assert all_status["structuredContent"]["children"] == []
@@ -303,7 +304,7 @@ async def test_list_all_stays_bounded_for_many_children(tmp_path: Path) -> None:
         )
         _persist_finished_receipt(store, child, f"agent-{index}", handle)
 
-    status = await _status(AgentLoop(FakeBackend([]), store, max_turns=1))
+    status = await _status(AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()))
     payload = json.dumps(status["structuredContent"])
     assert len(payload) < 100_000
     assert all(
@@ -322,7 +323,7 @@ async def test_requested_status_bounds_result_and_step(tmp_path: Path) -> None:
         step="s" * 2_000,
     )
     _persist_finished_receipt(store, child, "agent-1", handle)
-    status = await _status(AgentLoop(FakeBackend([]), store, max_turns=1), handle)
+    status = await _status(AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()), handle)
     item = status["structuredContent"]["children"][0]
     assert len(item["final_result"]) <= MAX_AGENT_STATUS_RESULT
     assert len(item["current_step"]) <= MAX_AGENT_STATUS_STEP

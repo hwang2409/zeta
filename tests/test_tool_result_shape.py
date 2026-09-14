@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta.skill_catalog import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.registry import validate_tool_result
 from zeta.types import (
@@ -126,7 +127,7 @@ def test_validate_tool_result_rejects_image_media_mismatch(
 
 @pytest.mark.asyncio
 async def test_success_result_uses_mcp_content_shape(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("echo", lambda arguments: "hello")
 
     result = await registry.execute(ToolCall("call-1", "echo", {}))
@@ -162,7 +163,7 @@ async def test_handler_errors_are_capped(
                 "structuredContent": None,
             }
 
-    registry = ToolRegistry(tmp_path, max_output_chars=4, register_builtin=False)
+    registry = ToolRegistry(tmp_path, max_output_chars=4, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("failure", handler)
 
     result = await registry.execute(ToolCall("failure-1", "failure", {}))
@@ -183,7 +184,7 @@ async def test_handler_errors_are_capped(
 
 @pytest.mark.asyncio
 async def test_result_cap_is_aggregate_across_text_blocks(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path, max_output_chars=5, register_builtin=False)
+    registry = ToolRegistry(tmp_path, max_output_chars=5, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register(
         "multi",
         lambda arguments: {
@@ -247,7 +248,7 @@ async def test_mixed_mcp_content_caps_text_and_preserves_other_blocks(
             "text": "resource body",
         },
     }
-    registry = ToolRegistry(tmp_path, max_output_chars=4, register_builtin=False)
+    registry = ToolRegistry(tmp_path, max_output_chars=4, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register(
         "mixed",
         lambda arguments: {
@@ -284,7 +285,7 @@ async def test_mixed_mcp_content_caps_text_and_preserves_other_blocks(
 
 @pytest.mark.asyncio
 async def test_failure_result_uses_mcp_error_shape(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(ToolCall("call-1", "missing", {}))
 
@@ -311,7 +312,7 @@ async def test_dispatch_rejects_cyclic_structured_content(tmp_path: Path) -> Non
         "isError": False,
         "structuredContent": structured_content,
     }
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("cycle", lambda arguments: handler_result)
 
     result = await registry.execute(ToolCall("cycle-1", "cycle", {}))
@@ -336,7 +337,7 @@ async def test_dispatch_accepts_aliased_structured_content(tmp_path: Path) -> No
         "isError": False,
         "structuredContent": structured_content,
     }
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("alias", lambda arguments: handler_result)
 
     result = await registry.execute(ToolCall("alias-1", "alias", {}))
@@ -360,7 +361,7 @@ async def test_dispatch_rejects_deep_structured_content(tmp_path: Path) -> None:
         "isError": False,
         "structuredContent": structured_content,
     }
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("deep", lambda arguments: handler_result)
 
     result = await registry.execute(ToolCall("deep-1", "deep", {}))
@@ -375,7 +376,7 @@ async def test_dispatch_rejects_deep_structured_content(tmp_path: Path) -> None:
 async def test_capped_text_exposes_truncation_metadata(tmp_path: Path) -> None:
     file_path = tmp_path / "large.txt"
     file_path.write_text("abcdefgh", encoding="utf-8")
-    registry = ToolRegistry(tmp_path, max_output_chars=4)
+    registry = ToolRegistry(tmp_path, max_output_chars=4, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("call-1", "read", {"path": file_path.name})
@@ -394,7 +395,7 @@ async def test_capped_text_exposes_truncation_metadata(tmp_path: Path) -> None:
 async def test_builtin_tools_populate_structured_content(tmp_path: Path) -> None:
     file_path = tmp_path / "note.txt"
     file_path.write_text("one\ntwo\n", encoding="utf-8")
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     read_result = await registry.execute(
         ToolCall("read-1", "read", {"path": "note.txt"})

@@ -16,6 +16,7 @@ from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.core.todo import TODO_STATUSES
 from zeta.loop import AgentLoop
+from zeta.skill_catalog import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools import todo as todo_tool
 from zeta.tui.app import TUIApp
@@ -25,7 +26,7 @@ from zeta.types import ToolCall
 
 def _registry(tmp_path: Path) -> tuple[ConversationStore, ToolRegistry]:
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    return store, ToolRegistry(tmp_path, session_store=store)
+    return store, ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
 
 
 def _todo_handler_argument_keys() -> set[str]:
@@ -117,7 +118,7 @@ async def test_todo_text_result_includes_canceled_count(tmp_path: Path) -> None:
 
 
 def test_todo_schema_matches_handler_contract(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     schema = next(schema for schema in registry.schemas if schema["name"] == "todo")
     parameters = schema["parameters"]
     properties = parameters["properties"]
@@ -425,7 +426,7 @@ async def test_todo_widget_keeps_overflow_summary_in_an_80_by_24_terminal(
         [{"content": f"task {index}", "status": "pending"} for index in range(8)]
     )
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store),
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -470,12 +471,12 @@ def test_todo_widget_uses_plain_status_glyphs_and_truncates_content(
 def test_status_includes_todo_counts_only_when_nonempty(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store),
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
     )
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     assert "todo:" not in registry.dispatch(app, "/status")
     store.set_todo_items([{"content": "one", "status": "completed"}])
@@ -489,7 +490,7 @@ def test_full_screen_layout_places_todo_between_transcript_and_composer(
     tmp_path: Path,
 ) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),

@@ -41,6 +41,7 @@ from zeta.providers.transport import (
     stall_watchdog,
 )
 from zeta.settings import Settings, load_settings, resolve
+from zeta.skill_catalog import SkillCatalog
 from zeta.types import (
     FAILED_TURN_MARKER,
     Message,
@@ -634,7 +635,7 @@ async def test_agent_loop_reset_on_stall_retry_drops_pre_stall_partial(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(_StallingBackend(), store)
+    loop = AgentLoop(_StallingBackend(), store, skill_catalog=SkillCatalog.empty())
     events = [event async for event in loop.run_turn("hi")]
 
     turn_end = next(
@@ -686,7 +687,7 @@ async def test_agent_loop_stall_after_message_end_keeps_completed_message(
     the completed message; the store keeps the first message, unmarked."""
 
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(_StallAfterCompletionBackend(), store)
+    loop = AgentLoop(_StallAfterCompletionBackend(), store, skill_catalog=SkillCatalog.empty())
     events = [event async for event in loop.run_turn("hi")]
 
     turn_end = next(
@@ -729,7 +730,7 @@ async def test_agent_loop_stall_exhaustion_persists_partial_as_failed_turn(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(_ExhaustingBackend(), store)
+    loop = AgentLoop(_ExhaustingBackend(), store, skill_catalog=SkillCatalog.empty())
     events = [event async for event in loop.run_turn("hi")]
 
     assert any(event.type is StreamEventType.ERROR for event in events)
@@ -747,7 +748,7 @@ async def test_agent_loop_stall_exhaustion_persists_partial_as_failed_turn(
 
 async def test_headless_text_mode_writes_retry_to_stderr(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(_StallingBackend(), store)
+    loop = AgentLoop(_StallingBackend(), store, skill_catalog=SkillCatalog.empty())
     stdout = io.StringIO()
     stderr = io.StringIO()
     code = await drive_turn(loop, "hi", format="text", stdout=stdout, stderr=stderr)
@@ -759,7 +760,7 @@ async def test_headless_text_mode_writes_retry_to_stderr(tmp_path: Path) -> None
 
 async def test_headless_json_mode_emits_stall_retry_event(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(_StallingBackend(), store)
+    loop = AgentLoop(_StallingBackend(), store, skill_catalog=SkillCatalog.empty())
     stdout = io.StringIO()
     stderr = io.StringIO()
     code = await drive_turn(loop, "hi", format="json", stdout=stdout, stderr=stderr)
@@ -849,6 +850,6 @@ async def test_fake_backend_completion_does_not_trigger_watchdog(tmp_path: Path)
     """Sanity: existing fake-backend flows are unaffected by the watchdog."""
 
     backend = FakeBackend([ScriptedTurn(content=[TextContent("hello")])])
-    loop = AgentLoop(backend, ConversationStore(tmp_path))
+    loop = AgentLoop(backend, ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
     events = [event async for event in loop.run_turn("hi")]
     assert any(event.type is StreamEventType.TURN_END for event in events)

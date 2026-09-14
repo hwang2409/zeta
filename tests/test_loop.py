@@ -16,6 +16,7 @@ from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.loop import _validated_tool_result
 from zeta.prompts import load_identity
+from zeta.skill_catalog import SkillCatalog
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 from zeta.types import (
     CompletionBackend,
@@ -113,7 +114,7 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
     store = ConversationStore(tmp_path)
 
-    events = await collect(AgentLoop(backend, store).run_turn("hi"))
+    events = await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi"))
 
     assert events[-1].type is StreamEventType.AGENT_END
     assert [message.role for message in store.messages()] == [
@@ -132,7 +133,7 @@ async def test_fake_usage_reports_cache_reads_on_consecutive_turns(tmp_path: Pat
         ],
         request_serializer=anthropic_request_bytes,
     )
-    loop = AgentLoop(backend, ConversationStore(tmp_path), tool_schemas=[])
+    loop = AgentLoop(backend, ConversationStore(tmp_path), tool_schemas=[], skill_catalog=SkillCatalog.empty())
 
     await collect(loop.run_turn("first prompt"))
     assert loop.context_assembler.cache_read_input_tokens_this_session == 0
@@ -200,7 +201,7 @@ async def test_unsigned_thinking_is_not_persisted_with_assistant_message(
     )
     store = ConversationStore(tmp_path)
 
-    await collect(AgentLoop(backend, store).run_turn("hi"))
+    await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi"))
 
     assert store.messages()[-1].content == [TextContent("answer")]
 
@@ -219,6 +220,7 @@ async def test_tool_lifecycle_events_separate_approval_from_execution(
         tools={"echo": lambda arguments: arguments["value"]},
         approval_policy=policy,
         max_turns=1,
+skill_catalog=SkillCatalog.empty(),
     )
 
     events: list[StreamEvent] = []
@@ -245,9 +247,9 @@ async def test_default_system_prompt_is_zeta_identity(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
     store = ConversationStore(tmp_path)
 
-    await collect(AgentLoop(backend, store).run_turn("hi"))
+    await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi"))
 
-    assert backend.calls[0][0][0].content[0].text == load_identity()
+    assert backend.calls[0][0][0].content[0].text == load_identity(catalog=SkillCatalog.empty())
 
 
 @pytest.mark.asyncio
@@ -255,7 +257,7 @@ async def test_empty_system_prompt_is_not_sent_to_backend(tmp_path: Path) -> Non
     backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
     store = ConversationStore(tmp_path)
 
-    await collect(AgentLoop(backend, store, system_prompt="").run_turn("hi"))
+    await collect(AgentLoop(backend, store, system_prompt="", skill_catalog=SkillCatalog.empty()).run_turn("hi"))
 
     assert all(
         message.role is not MessageRole.SYSTEM for message in backend.calls[0][0]
@@ -335,10 +337,10 @@ async def test_agent_loop_preserves_mixed_tool_blocks(tmp_path: Path) -> None:
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
     )
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("mixed", mixed)
 
-    await collect(AgentLoop(backend, store, registry=registry).run_turn("start"))
+    await collect(AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = store.messages()[2].tool_result
     assert result is not None
@@ -376,10 +378,10 @@ async def test_agent_loop_rejects_invalid_block_metadata_before_persistence(
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
     )
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("invalid", invalid)
 
-    await collect(AgentLoop(backend, store, registry=registry).run_turn("start"))
+    await collect(AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = store.messages()[2].tool_result
     assert result is not None
@@ -404,7 +406,7 @@ async def test_tool_call_then_next_completion(tmp_path: Path) -> None:
     async def echo(arguments: dict[str, str]) -> str:
         return arguments["value"]
 
-    events = await collect(AgentLoop(backend, store, tools={"echo": echo}).run_turn("start"))
+    events = await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     assert [event.type for event in events] == [
         StreamEventType.AGENT_START,
@@ -460,7 +462,7 @@ async def test_bash_streams_in_order_and_persists_one_result(tmp_path: Path) -> 
     )
     store = ConversationStore(tmp_path)
 
-    events = await collect(AgentLoop(backend, store).run_turn("start"))
+    events = await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     tool_events = [
         event
@@ -527,6 +529,7 @@ async def test_stream_publisher_closes_before_delayed_output(tmp_path: Path) -> 
         ConversationStore(tmp_path),
         tools={"stream": stream},
         max_turns=1,
+skill_catalog=SkillCatalog.empty(),
     )
     events = await collect(loop.run_turn("start"))
     await asyncio.gather(*late_tasks)
@@ -554,6 +557,7 @@ async def test_bash_streams_stdout_and_stderr_labels(tmp_path: Path) -> None:
             backend,
             ConversationStore(tmp_path),
             max_turns=1,
+skill_catalog=SkillCatalog.empty(),
         ).run_turn("start")
     )
 
@@ -579,6 +583,7 @@ async def test_bash_stream_preserves_split_utf8_code_points(tmp_path: Path) -> N
             backend,
             ConversationStore(tmp_path),
             max_turns=1,
+skill_catalog=SkillCatalog.empty(),
         ).run_turn("start")
     )
 
@@ -600,7 +605,7 @@ async def test_bash_cancel_stops_updates_before_terminal_event(tmp_path: Path) -
     )
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     events: list[StreamEvent] = []
 
     async for event in loop.run_turn("start"):
@@ -656,7 +661,7 @@ async def test_streamed_message_log_is_cadence_stable(tmp_path: Path) -> None:
         )
         store = ConversationStore(root)
         await collect(
-            AgentLoop(backend, store, tools={"stream": stream}).run_turn("start")
+            AgentLoop(backend, store, tools={"stream": stream}, skill_catalog=SkillCatalog.empty()).run_turn("start")
         )
         messages = [
             entry.data["message"]
@@ -699,6 +704,7 @@ async def test_stream_update_queue_drops_oldest_without_truncating_result(
         ConversationStore(tmp_path),
         tools={"stream": stream},
         max_turns=1,
+skill_catalog=SkillCatalog.empty(),
     )
     async for event in loop.run_turn("start"):
         events.append(event)
@@ -728,7 +734,7 @@ async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -
     second_call = ToolCall("call-2", "second", {})
     backend = FakeBackend([ScriptedTurn([], [first_call, second_call])])
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     async def first(arguments: dict[str, object]) -> str:
         return "one"
@@ -738,7 +744,7 @@ async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -
 
     registry.register("first", first, parallel_safe=True)
     registry.register("second", second, parallel_safe=True)
-    loop = AgentLoop(backend, store, registry=registry)
+    loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
 
     async def consume() -> None:
         async for event in loop.run_turn("start"):
@@ -781,7 +787,7 @@ async def test_parallel_cancellation_keeps_call_order(
     ]
     backend = FakeBackend([ScriptedTurn([], calls)])
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     started = [asyncio.Event(), asyncio.Event()]
     completed = asyncio.Event()
 
@@ -801,7 +807,7 @@ async def test_parallel_cancellation_keeps_call_order(
 
     registry.register("first", first, parallel_safe=True)
     registry.register("second", second, parallel_safe=True)
-    loop = AgentLoop(backend, store, registry=registry)
+    loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(collect(loop.run_turn("start")))
     await started[0].wait()
     await started[1].wait()
@@ -834,7 +840,7 @@ async def test_parallel_duplicate_ids_fail_before_dispatch(tmp_path: Path) -> No
     store = ConversationStore(tmp_path)
 
     with pytest.raises(ValueError, match="duplicate tool call id"):
-        await collect(AgentLoop(backend, store).run_turn("start"))
+        await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     assert not (store.session_dir / "agents").exists()
 
@@ -903,7 +909,7 @@ def test_finalize_tool_results(
     expected_contents: list[str],
     expected_errors: list[bool],
 ) -> None:
-    loop = AgentLoop(FakeBackend([]), ConversationStore(finalize_store_path))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(finalize_store_path), skill_catalog=SkillCatalog.empty())
 
     results = loop._finalize_tool_results(calls, slots)
 
@@ -923,7 +929,7 @@ async def test_parallel_results_persist_in_call_order(tmp_path: Path) -> None:
     second_call = ToolCall("call-2", "second", {})
     backend = FakeBackend([ScriptedTurn([], [first_call, second_call])])
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     first_started = asyncio.Event()
     second_started = asyncio.Event()
     first_release = asyncio.Event()
@@ -941,7 +947,7 @@ async def test_parallel_results_persist_in_call_order(tmp_path: Path) -> None:
 
     registry.register("first", first, parallel_safe=True)
     registry.register("second", second, parallel_safe=True)
-    loop = AgentLoop(backend, store, registry=registry)
+    loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(collect(loop.run_turn("start")))
     await first_started.wait()
@@ -973,7 +979,7 @@ async def test_tool_error_is_a_result_and_loop_continues(tmp_path: Path) -> None
     async def fail(arguments: dict[str, str]) -> str:
         raise RuntimeError("tool broke")
 
-    events = await collect(AgentLoop(backend, store, tools={"fail": fail}).run_turn("start"))
+    events = await collect(AgentLoop(backend, store, tools={"fail": fail}, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = store.messages()[2].tool_result
     assert result is not None and result.is_error
@@ -992,7 +998,7 @@ async def test_wrong_tool_result_id_becomes_expected_error_result(tmp_path: Path
     def echo(arguments: dict[str, object]) -> ToolResult:
         return ToolResult("wrong", "bad result")
 
-    await collect(AgentLoop(backend, store, tools={"echo": echo}).run_turn("start"))
+    await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = store.messages()[2].tool_result
     assert result is not None
@@ -1012,7 +1018,7 @@ async def test_wrong_typed_tool_result_becomes_valid_error_result(tmp_path: Path
     def echo(arguments: dict[str, object]) -> ToolResult:
         return ToolResult(call.id, 123)  # type: ignore[arg-type]
 
-    await collect(AgentLoop(backend, store, tools={"echo": echo}).run_turn("start"))
+    await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = store.messages()[2].tool_result
     assert result is not None
@@ -1037,7 +1043,7 @@ async def test_invalid_tool_handler_output_becomes_error_result(
     def echo(arguments: dict[str, object]) -> object:
         return output
 
-    await collect(AgentLoop(backend, store, tools={"echo": echo}).run_turn("start"))
+    await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     result = store.messages()[2].tool_result
     assert result is not None
@@ -1067,7 +1073,7 @@ async def test_aclose_after_message_update_persists_partial_state(tmp_path: Path
     )
     store = ConversationStore(tmp_path)
 
-    stream = AgentLoop(backend, store).run_turn("start")
+    stream = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")
     await close_after(
         stream,
         StreamEventType.MESSAGE_UPDATE,
@@ -1090,7 +1096,7 @@ async def test_aclose_after_message_end_persists_complete_state(tmp_path: Path) 
     store = ConversationStore(tmp_path)
 
     await close_after(
-        AgentLoop(backend, store).run_turn("start"),
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start"),
         StreamEventType.MESSAGE_END,
     )
 
@@ -1115,6 +1121,7 @@ async def test_aclose_during_active_tool_persists_canceled_result(tmp_path: Path
         store,
         tools={"blocked": blocked},
         max_turns=1,
+skill_catalog=SkillCatalog.empty(),
     ).run_turn("start")
     async for event in stream:
         if event.type is StreamEventType.TOOL_EXECUTION_START:
@@ -1167,7 +1174,7 @@ async def test_plain_async_iterator_completes_without_aclose(tmp_path: Path) -> 
             return PlainCompletion()
 
     events = await collect(
-        AgentLoop(PlainBackend(), ConversationStore(tmp_path)).run_turn("start")
+        AgentLoop(PlainBackend(), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()).run_turn("start")
     )
 
     assert all(event.type is not StreamEventType.ERROR for event in events)
@@ -1181,7 +1188,7 @@ async def test_cancellation_persists_partial_state(tmp_path: Path) -> None:
         close_error=RuntimeError("close failed"),
     )
     store = ConversationStore(tmp_path)
-    task = asyncio.create_task(collect(AgentLoop(backend, store).run_turn("start")))
+    task = asyncio.create_task(collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")))
     await asyncio.sleep(0.02)
     task.cancel()
 
@@ -1215,7 +1222,7 @@ async def test_cancellation_keeps_control_error_when_partial_persist_fails(
 
     backend = WaitingBackend()
     store = ConversationStore(tmp_path)
-    task = asyncio.create_task(collect(AgentLoop(backend, store).run_turn("start")))
+    task = asyncio.create_task(collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("start")))
     await backend.update_seen.wait()
 
     with patch.object(
@@ -1237,6 +1244,7 @@ async def test_aclose_keeps_control_error_when_partial_persist_fails(
     stream = AgentLoop(
         FakeBackend([ScriptedTurn([TextContent("partial")])]),
         store,
+skill_catalog=SkillCatalog.empty(),
     ).run_turn("start")
 
     async for event in stream:
@@ -1258,7 +1266,7 @@ async def test_max_turns_stops(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
 
     events = await collect(
-        AgentLoop(backend, store, tools={"echo": lambda arguments: "ok"}, max_turns=1).run_turn("start")
+        AgentLoop(backend, store, tools={"echo": lambda arguments: "ok"}, max_turns=1, skill_catalog=SkillCatalog.empty()).run_turn("start")
     )
 
     assert events[-2].type is StreamEventType.ERROR
@@ -1279,7 +1287,7 @@ async def test_backend_error_is_typed_and_user_state_is_persisted(tmp_path: Path
             yield
 
     store = ConversationStore(tmp_path)
-    events = await collect(AgentLoop(BrokenBackend(), store).run_turn("start"))
+    events = await collect(AgentLoop(BrokenBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     assert events[-2].type is StreamEventType.ERROR
     assert events[-2].error is not None
@@ -1311,7 +1319,7 @@ async def test_provider_error_event_persists_partial_state_and_ends_turn(
             )
 
     store = ConversationStore(tmp_path)
-    events = await collect(AgentLoop(ErrorEventBackend(), store).run_turn("start"))
+    events = await collect(AgentLoop(ErrorEventBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     assert [event.type for event in events][-2:] == [
         StreamEventType.ERROR,
@@ -1340,7 +1348,7 @@ async def test_clean_stream_exit_becomes_provider_failure(tmp_path: Path) -> Non
             )
 
     store = ConversationStore(tmp_path)
-    events = await collect(AgentLoop(IncompleteBackend(), store).run_turn("start"))
+    events = await collect(AgentLoop(IncompleteBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     assert events[-2].type is StreamEventType.ERROR
     assert events[-2].error == ErrorInfo(
@@ -1364,7 +1372,7 @@ async def test_no_output_failure_closes_turn_and_persists_marker(tmp_path: Path)
             yield
 
     store = ConversationStore(tmp_path)
-    await collect(AgentLoop(BrokenBackend(), store).run_turn("start"))
+    await collect(AgentLoop(BrokenBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start"))
 
     messages = store.messages()
     assert messages[-1].content == []
@@ -1376,7 +1384,7 @@ async def test_no_output_failure_closes_turn_and_persists_marker(tmp_path: Path)
 async def test_failed_child_returns_error_and_sibling_survives(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     events = await collect(
-        AgentLoop(ParallelChildFailureBackend(), store).run_turn("delegate")
+        AgentLoop(ParallelChildFailureBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("delegate")
     )
 
     assert events[-1].type is StreamEventType.AGENT_END
@@ -1403,7 +1411,7 @@ async def test_child_setup_failure_does_not_cancel_parallel_sibling(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(ParallelChildFailureBackend(), store)
+    loop = AgentLoop(ParallelChildFailureBackend(), store, skill_catalog=SkillCatalog.empty())
     original_ensure = AgentLoop._ensure_mcp_servers
     child_ids: list[str] = []
 

@@ -17,6 +17,7 @@ from rich.text import Text
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
+from zeta.skill_catalog import SkillCatalog
 from zeta.tui import app as app_module
 from zeta.tui import composer as composer_module
 from zeta.tui.app import TUIApp
@@ -242,7 +243,7 @@ def test_wheel_still_scrolls_and_other_buttons_pass_through() -> None:
 
 def _app(tmp_path: Path) -> TUIApp:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),

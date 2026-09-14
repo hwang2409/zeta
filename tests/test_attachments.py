@@ -15,6 +15,7 @@ from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
+from zeta.skill_catalog import SkillCatalog
 from zeta.tui import composer
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import (
@@ -222,7 +223,7 @@ async def test_ctrl_v_queues_one_image_and_preserves_composer_text(
 
     monkeypatch.setattr(composer.subprocess, "run", fake_run)
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -255,7 +256,7 @@ async def test_ctrl_v_numbers_multiple_images_without_renumbering(
 
     monkeypatch.setattr(composer.subprocess, "run", fake_run)
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -286,7 +287,7 @@ async def test_slash_paste_inserts_the_same_token_without_notice(
 
     monkeypatch.setattr(composer.subprocess, "run", fake_run)
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -326,7 +327,7 @@ def test_image_tokens_resolve_in_text_order_and_deleted_tokens_cancel(
     first.write_bytes(PNG)
     second.write_bytes(PNG)
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -357,7 +358,7 @@ def test_image_tokens_resolve_in_text_order_and_deleted_tokens_cancel(
 
 def test_unknown_image_token_is_plain_text(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -374,7 +375,7 @@ async def test_image_token_numbering_resets_after_send(tmp_path: Path) -> None:
     image.write_bytes(PNG)
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
-        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -398,7 +399,7 @@ async def test_cancelled_image_token_removes_staged_file_on_send(
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
-        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -422,7 +423,7 @@ async def test_cancelled_image_token_keeps_delivered_staged_file(
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
-        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -452,7 +453,7 @@ async def test_partial_image_token_cancellation_removes_staged_file(
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
-        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -472,7 +473,7 @@ async def test_partial_image_token_cancellation_removes_staged_file(
 @pytest.mark.asyncio
 async def test_paste_has_no_notice_or_pending_footer(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -506,7 +507,7 @@ async def test_ctrl_v_empty_clipboard_preserves_input_without_queueing(
         lambda _command, **_: SimpleNamespace(returncode=1),
     )
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -529,7 +530,7 @@ async def test_ctrl_v_non_macos_uses_paste_notice(
     monkeypatch.setenv("COLORTERM", "truecolor")
     monkeypatch.setattr(composer.platform, "system", lambda: "Linux")
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -551,7 +552,7 @@ async def test_app_submits_attachment_on_the_same_user_message(tmp_path: Path) -
     path.write_text("context", encoding="utf-8")
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -571,7 +572,7 @@ async def test_app_submits_attachment_on_the_same_user_message(tmp_path: Path) -
 async def test_missing_path_like_attachment_blocks_with_notice(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -593,7 +594,7 @@ async def test_missing_path_preserves_pending_paste_for_retry(tmp_path: Path) ->
     fixed = tmp_path / "fixed.txt"
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -635,7 +636,7 @@ async def test_deleted_pending_paste_is_dropped_once(tmp_path: Path) -> None:
     pending.write_bytes(PNG)
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store),
+        AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )

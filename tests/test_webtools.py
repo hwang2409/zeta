@@ -10,6 +10,7 @@ import pytest
 
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.store import ConversationStore
+from zeta.skill_catalog import SkillCatalog
 from zeta.tools import ToolRegistry, websearch
 from zeta.tools import fetch as fetch_tool
 from zeta.types import ToolCall, flatten_tool_content
@@ -71,7 +72,7 @@ async def _execute_fetch(
         return response
 
     _mock_client(monkeypatch, handler)
-    registry = ToolRegistry(tmp_path, max_output_chars=max_output_chars)
+    registry = ToolRegistry(tmp_path, max_output_chars=max_output_chars, skill_catalog=SkillCatalog.empty())
     return await registry.execute(
         ToolCall("fetch-1", "fetch", arguments or {"url": "example.com"})
     )
@@ -354,7 +355,7 @@ async def test_parallel_fetches_cancel_on_registry_abort(
         raise AssertionError("blocked transport was not canceled")
 
     _mock_client(monkeypatch, handler)
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     calls = [
         ToolCall("fetch-a", "fetch", {"url": "example.com/a"}),
         ToolCall("fetch-b", "fetch", {"url": "example.com/b"}),
@@ -404,7 +405,7 @@ async def test_fetch_validates_each_redirect_and_uses_final_url_notice(
         return response
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("fetch-1", "fetch", {"url": "https://example.com/start"})
     )
 
@@ -475,7 +476,7 @@ async def test_fetch_refuses_non_http_redirect(
         return response
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("fetch-1", "fetch", {"url": "https://example.com/start"})
     )
 
@@ -496,7 +497,7 @@ async def test_fetch_caps_manual_redirects(
         return response
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("fetch-1", "fetch", {"url": "https://example.com/start"})
     )
 
@@ -519,10 +520,10 @@ async def test_fetch_allows_private_target_with_notice_and_blocks_metadata(
             (fetch_tool.socket.AF_INET, fetch_tool.socket.SOCK_STREAM, 6, "", ("192.168.1.5", 0))
         ],
     )
-    allowed = await ToolRegistry(tmp_path).execute(
+    allowed = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("fetch-1", "fetch", {"url": "http://printer.local"})
     )
-    blocked = await ToolRegistry(tmp_path).execute(
+    blocked = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("fetch-2", "fetch", {"url": "http://169.254.169.254/"})
     )
 
@@ -605,7 +606,7 @@ async def test_fetch_pins_connection_to_first_validated_address(
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid")
     _mock_client(monkeypatch, handler, client_kwargs=client_kwargs)
     monkeypatch.setattr(fetch_tool.socket, "getaddrinfo", getaddrinfo)
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("fetch-1", "fetch", {"url": "https://example.com/"})
     )
 
@@ -728,7 +729,7 @@ async def test_fetch_pagination_repeats_notices_without_advancing_offset(
     body_pages: list[str] = []
 
     while True:
-        result = await ToolRegistry(tmp_path, max_output_chars=128).execute(
+        result = await ToolRegistry(tmp_path, max_output_chars=128, skill_catalog=SkillCatalog.empty()).execute(
             ToolCall(
                 "fetch-1",
                 "fetch",
@@ -800,7 +801,7 @@ async def test_fetch_pagination_rejects_cap_that_cannot_fit_notice(
             )
         ],
     )
-    result = await ToolRegistry(tmp_path, max_output_chars=34).execute(
+    result = await ToolRegistry(tmp_path, max_output_chars=34, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall(
             "fetch-1",
             "fetch",
@@ -829,7 +830,7 @@ async def test_fetch_timeout_and_redirect_errors(
         raise error
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("fetch-1", "fetch", {"url": "example.com"})
     )
 
@@ -887,7 +888,7 @@ async def test_websearch_parses_saved_duckduckgo_fixture(
         return httpx.Response(200, headers={"content-type": "text/html"}, text=body)
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("search-1", "websearch", {"query": "zeta", "max_results": 1})
     )
 
@@ -929,7 +930,7 @@ async def test_websearch_falls_back_to_lite_for_provider_challenge(
         return httpx.Response(200, headers={"content-type": "text/html"}, text=lite)
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("search-1", "websearch", {"query": "zeta", "max_results": 1})
     )
 
@@ -962,7 +963,7 @@ async def test_websearch_falls_back_to_lite_for_parser_failure(
         return httpx.Response(200, headers={"content-type": "text/html"}, text=lite)
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("search-1", "websearch", {"query": "zeta", "max_results": 1})
     )
 
@@ -1028,7 +1029,7 @@ async def test_websearch_output_keeps_registry_truncation_marker(
         return httpx.Response(200, headers={"content-type": "text/html"}, text=body)
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path, max_output_chars=64).execute(
+    result = await ToolRegistry(tmp_path, max_output_chars=64, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("search-1", "websearch", {"query": "zeta"})
     )
 
@@ -1073,6 +1074,7 @@ async def test_discovery_and_approval_gate_network_tools(
         tmp_path,
         approval_policy=policy,
         approval_store=store,
+skill_catalog=SkillCatalog.empty(),
     )
 
     assert {"fetch", "websearch"} <= registry.definitions_by_name.keys()
@@ -1178,7 +1180,7 @@ async def test_fetch_tool_recovers_from_bad_encoding_via_identity_retry(
         )
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("fetch-1", "fetch", {"url": "https://example.com/data"})
     )
 
@@ -1207,7 +1209,7 @@ async def test_fetch_tool_surfaces_decompression_error_after_retry(
         )
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("fetch-1", "fetch", {"url": "https://example.com/data"})
     )
 
@@ -1286,7 +1288,7 @@ async def test_websearch_tool_surface_includes_diagnostics(
         )
 
     _mock_client(monkeypatch, handler)
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("search-1", "websearch", {"query": "zeta"})
     )
 

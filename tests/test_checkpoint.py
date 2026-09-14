@@ -12,6 +12,7 @@ from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.loop import AgentLoop
+from zeta.skill_catalog import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.types import (
     Message,
@@ -174,7 +175,7 @@ def test_naive_checkpoint_timestamp_is_normalized_at_jsonl_boundary(
     assert listed[0][0].data["created_at"] == "2026-08-26T12:00:00+00:00"
 
     app = TUIApp(
-        AgentLoop(FakeBackend([]), reopened),
+        AgentLoop(FakeBackend([]), reopened, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
@@ -201,7 +202,7 @@ def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:
     store.append_message(message(MessageRole.ASSISTANT, "later"))
 
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store),
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
@@ -223,7 +224,7 @@ def test_fork_rejects_running_background_agents_then_allows_completion(
     store.append_message(message(MessageRole.ASSISTANT, "reply"))
     store.append_checkpoint("saved")
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store),
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
