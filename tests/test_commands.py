@@ -128,7 +128,9 @@ def test_completer_shows_description_and_source_badge(tmp_path: Path) -> None:
 
 def test_init_is_in_help_and_completion(tmp_path: Path) -> None:
     registry = create_slash_registry(
-        zeta_home=tmp_path / "home", project_dir=tmp_path
+        zeta_home=tmp_path / "home",
+        project_dir=tmp_path,
+        skill_catalog=SkillCatalog.empty(),
     )
 
     assert "/init — generate or improve project instructions" in registry.help_text()
@@ -144,18 +146,37 @@ def test_init_is_in_help_and_completion(tmp_path: Path) -> None:
     )
 
 
-def test_init_rejects_non_project_without_model_input(tmp_path: Path) -> None:
-    result = create_slash_registry(
-        zeta_home=tmp_path / "home", project_dir=tmp_path
-    ).dispatch(object(), "/init")
+@pytest.mark.asyncio
+async def test_init_rejects_non_project_without_model_input(tmp_path: Path) -> None:
+    output = StringIO()
+    backend = FakeBackend([])
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        zeta_home=tmp_path / "home",
+        console=Console(file=output, force_terminal=False),
+    )
 
-    assert result == "init error: not inside a project"
+    await app._handle_prompt_value("/init")
+
+    assert backend.calls == []
+    assert "init error: not inside a project" in output.getvalue()
+    await app.close()
 
 
 def test_init_returns_canned_prompt_inside_project(tmp_path: Path) -> None:
-    project = Path(__file__).parents[1]
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
     result = create_slash_registry(
-        zeta_home=tmp_path / "home", project_dir=project
+        zeta_home=tmp_path / "home",
+        project_dir=project,
+        skill_catalog=SkillCatalog.empty(),
     ).dispatch(object(), "/init")
 
     assert isinstance(result, SlashModelInput)
@@ -545,7 +566,7 @@ async def test_init_becomes_the_model_user_message(tmp_path: Path) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     store = ConversationStore(tmp_path / "sessions", cwd=project)
     app = TUIApp(
-        AgentLoop(backend, store),
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=tmp_path / "zeta-home",
