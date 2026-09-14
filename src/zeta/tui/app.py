@@ -61,8 +61,8 @@ from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ClipboardError,
     ComposerAttachmentMixin,
+    ComposerCompleter,
     FullScreenPromptSession,
-    SlashCompleter,
     SubmissionMixin,
     TurnConsumerMixin,
     UndoCandidate,
@@ -499,7 +499,7 @@ class TUIApp(
             placeholder=[("class:placeholder", "type a message...")],
             history=self._history,
             key_bindings=bindings,
-            completer=SlashCompleter(self._slash_commands),
+            completer=ComposerCompleter(self._slash_commands, self.loop.store.cwd),
             reserve_space_for_menu=0,
             multiline=True,
             mouse_support=True,
