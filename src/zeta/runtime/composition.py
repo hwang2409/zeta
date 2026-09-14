@@ -15,7 +15,7 @@ from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
 from ..loop import AgentLoop
 from ..settings import ResolvedConfig
-from ..skill_catalog import discover_session_skills
+from ..skill_catalog import SkillCatalog
 from ..tools._user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from ..types import CompletionBackend, StreamEvent
@@ -51,6 +51,7 @@ def compose_runtime(
     on_plan_mode_change: Callable[[bool], None] | None = None,
     max_turns: int | None = None,
     background_event_sink: BackgroundEventSink | None = None,
+    skill_catalog: SkillCatalog,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
 
@@ -74,6 +75,7 @@ def compose_runtime(
                 compaction_budget=effective_budget,
                 system_prompt=project_context.system_prompt,
                 context_files=[str(path) for path in project_context.files],
+                skill_catalog=skill_catalog,
                 budget_pinned=budget_pinned,
             )
             cleanup.enter_context(opened.store)
@@ -94,6 +96,9 @@ def compose_runtime(
                 )
 
         metadata = opened.metadata
+        if metadata.skill_catalog is None:
+            persisted = manager.persist_skill_catalog(metadata, skill_catalog)
+            skill_catalog = SkillCatalog.from_snapshot(persisted.skill_catalog)
         completion_callback = on_completion_success or (lambda: manager.touch(metadata))
         policy = ApprovalPolicy(
             store=opened.store,
@@ -113,13 +118,12 @@ def compose_runtime(
         }
         if max_turns is not None and max_turns > 0:
             loop_kwargs["max_turns"] = max_turns
-        repo_root = discover_repo_root(Path(metadata.cwd))
-        skill_catalog = discover_session_skills(home=home, project_dir=repo_root)
         registry = ToolRegistry(opened.store.cwd, skill_catalog=skill_catalog)
         cleanup.callback(registry.background_tasks.release_directory)
         loop = AgentLoop(backend, opened.store, registry=registry, **loop_kwargs)
         if metadata.plan_mode:
             loop.set_plan_mode(True)
+        repo_root = discover_repo_root(Path(metadata.cwd))
         loop.set_mcp_scope(home=home, project_dir=repo_root)
         external_tools = apply_external_tools(
             loop.tool_registry,

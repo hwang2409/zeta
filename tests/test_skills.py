@@ -58,6 +58,9 @@ def test_discover_packaged_skill() -> None:
         "name: '   '\ndescription: valid\nkeywords: [broken]\n",
         "name: broken\ndescription: '   '\nkeywords: [broken]\n",
         "name: broken\ndescription: valid\nkeywords: ['   ']\n",
+        "[]\n",
+        "- item\n",
+        "null\n",
     ],
 )
 def test_malformed_skill_frontmatter_is_skipped(
@@ -196,6 +199,53 @@ def test_directory_skill_and_claude_frontmatter(tmp_path: Path) -> None:
     assert skills[0].path == skill_dir.resolve()
     assert skills[0].keywords == []
     assert load_skill(skills[0]) == "bundle body"
+
+
+@pytest.mark.parametrize("layout", ["file", "directory", "document"])
+def test_symlinked_skill_documents_cannot_escape_root(
+    tmp_path: Path, layout: str
+) -> None:
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_skill = outside / "SKILL.md"
+    _write_skill(outside_skill, "escape", "outside body")
+
+    if layout == "file":
+        (skills_dir / "escape.md").symlink_to(outside_skill)
+    elif layout == "directory":
+        (skills_dir / "escape").symlink_to(outside, target_is_directory=True)
+    else:
+        skill_dir = skills_dir / "escape"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").symlink_to(outside_skill)
+
+    assert discover_skills(tmp_path) == []
+
+
+def test_symlinked_skills_root_can_point_to_a_complete_skills_tree(
+    tmp_path: Path,
+) -> None:
+    actual = tmp_path / "actual-skills"
+    _write_skill(actual / "review.md", "review", "review body")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "skills").symlink_to(actual, target_is_directory=True)
+
+    skills = discover_skills(home)
+
+    assert [skill.name for skill in skills] == ["review"]
+    assert load_skill(skills[0]) == "review body"
+
+
+def test_home_directory_named_skills_still_uses_nested_skills_directory(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "skills"
+    _write_skill(home / "skills" / "review.md", "review", "review body")
+
+    assert [skill.name for skill in discover_skills(home)] == ["review"]
 
 
 def test_malformed_skill_is_skipped_with_warning(

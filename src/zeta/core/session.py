@@ -20,6 +20,7 @@ from typing import Any, Mapping
 
 from rich.cells import cell_len
 
+from ..skill_catalog import SkillCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .store import ConversationStore
 from .session_files import SessionError, SessionInUseError, open_session_file, session_directory, session_root, child_directory, write_session_json
@@ -155,6 +156,7 @@ class SessionMetadata:
     override_audit: list[dict[str, Any]] = field(default_factory=list)
     system_prompt: str = ""
     context_files: list[str] = field(default_factory=list)
+    skill_catalog: list[dict[str, Any]] | None = None
     vim_mode: bool = True
     budget_pinned: bool = False
     plan_mode: bool = False
@@ -175,6 +177,7 @@ class SessionMetadata:
         compaction_budget: int,
         system_prompt: str = "",
         context_files: list[str] | tuple[str, ...] = (),
+        skill_catalog: SkillCatalog | None = None,
         vim_mode: bool = True,
         budget_pinned: bool = False,
         plan_mode: bool = False,
@@ -193,6 +196,9 @@ class SessionMetadata:
             compaction_budget=compaction_budget,
             system_prompt=system_prompt,
             context_files=list(context_files),
+            skill_catalog=skill_catalog.to_snapshot()
+            if skill_catalog is not None
+            else None,
             vim_mode=vim_mode,
             budget_pinned=budget_pinned,
             plan_mode=plan_mode,
@@ -241,6 +247,7 @@ class SessionMetadata:
         has_context_snapshot = "system_prompt" in value and "context_files" in value
         system_prompt = value.get("system_prompt", "") if has_context_snapshot else ""
         context_files = value.get("context_files", []) if has_context_snapshot else []
+        skill_catalog = value.get("skill_catalog")
         vim_mode = value.get("vim_mode", True)
         budget_pinned = value.get("budget_pinned", False)
         plan_mode = value.get("plan_mode", False)
@@ -249,6 +256,13 @@ class SessionMetadata:
             type(system_prompt) is not str
             or type(context_files) is not list
             or any(type(item) is not str for item in context_files)
+            or (
+                skill_catalog is not None
+                and (
+                    type(skill_catalog) is not list
+                    or any(type(item) is not dict for item in skill_catalog)
+                )
+            )
             or type(vim_mode) is not bool
             or type(budget_pinned) is not bool
             or type(plan_mode) is not bool
@@ -256,6 +270,11 @@ class SessionMetadata:
             or type(name) is not str
         ):
             raise SessionError(f"session metadata context is invalid: {path}")
+        if skill_catalog is not None:
+            try:
+                SkillCatalog.from_snapshot(skill_catalog)
+            except ValueError as exc:
+                raise SessionError(f"session metadata skill catalog is invalid: {path}") from exc
         return cls(
             version=value["version"],
             session_id=value["session_id"],
@@ -269,6 +288,9 @@ class SessionMetadata:
             override_audit=[dict(item) for item in audit],
             system_prompt=system_prompt,
             context_files=list(context_files),
+            skill_catalog=[dict(item) for item in skill_catalog]
+            if skill_catalog is not None
+            else None,
             vim_mode=vim_mode,
             budget_pinned=budget_pinned,
             plan_mode=plan_mode,
@@ -291,6 +313,7 @@ class SessionMetadata:
             "override_audit": self.override_audit,
             "system_prompt": self.system_prompt,
             "context_files": self.context_files,
+            "skill_catalog": self.skill_catalog,
             "vim_mode": self.vim_mode,
             "budget_pinned": self.budget_pinned,
             "plan_mode": self.plan_mode,
@@ -328,6 +351,7 @@ class SessionManager:
         compaction_budget: int = 200_000,
         system_prompt: str = "",
         context_files: list[str] | tuple[str, ...] = (),
+        skill_catalog: SkillCatalog | None = None,
         vim_mode: bool = True,
         budget_pinned: bool = False,
         name: str = "",
@@ -346,6 +370,7 @@ class SessionManager:
                 compaction_budget=compaction_budget,
                 system_prompt=system_prompt,
                 context_files=context_files,
+                skill_catalog=skill_catalog,
                 vim_mode=vim_mode,
                 budget_pinned=budget_pinned,
                 name=name,
@@ -490,6 +515,21 @@ class SessionManager:
                 return item
             item.system_prompt = system_prompt
             item.context_files = list(context_files)
+            return self._touch(item)
+
+        current = self._mutate(metadata.session_id, update)
+        self._copy_metadata(metadata, current)
+        return current
+
+    def persist_skill_catalog(
+        self, metadata: SessionMetadata, catalog: SkillCatalog
+    ) -> SessionMetadata:
+        """Snapshot the session catalog once so resumes do not rediscover it."""
+
+        def update(item: SessionMetadata) -> SessionMetadata:
+            if item.skill_catalog is not None:
+                return item
+            item.skill_catalog = catalog.to_snapshot()
             return self._touch(item)
 
         current = self._mutate(metadata.session_id, update)
@@ -742,6 +782,11 @@ class SessionManager:
         target.override_audit = [dict(item) for item in source.override_audit]
         target.system_prompt = source.system_prompt
         target.context_files = list(source.context_files)
+        target.skill_catalog = (
+            [dict(item) for item in source.skill_catalog]
+            if source.skill_catalog is not None
+            else None
+        )
         target.vim_mode = source.vim_mode
         target.budget_pinned = source.budget_pinned
         target.plan_mode = source.plan_mode

@@ -6,6 +6,7 @@ from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.session import OpenedSession, SessionManager
 from ..loop import AgentLoop
 from ..providers.factory import build_backend
+from ..skill_catalog import SkillCatalog, discover_session_skills
 from ..tools import ToolRegistry
 from ..types import CompletionBackend
 
@@ -16,6 +17,7 @@ def build_unattended_loop(
     home: Path,
     allow: tuple[str, ...],
     backend: CompletionBackend | None = None,
+    skill_catalog: SkillCatalog | None = None,
 ) -> AgentLoop:
     metadata, store = session.metadata, session.store
     if backend is None:
@@ -29,6 +31,11 @@ def build_unattended_loop(
         approval_store=store,
         approval_policy=policy,
         enforce_approvals=True,
+        skill_catalog=(
+            skill_catalog
+            if skill_catalog is not None
+            else discover_session_skills(home=home)
+        ),
     )
     return AgentLoop(
         backend,

@@ -295,6 +295,47 @@ def test_resume_without_flags_leaves_snapshot_untouched(
     assert resumed._startup_alerts == ()
 
 
+@pytest.mark.asyncio
+async def test_resume_reuses_one_persisted_skill_catalog_for_prompt_and_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    skills_dir = home / "skills"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "first.md").write_text(
+        "---\nname: first\ndescription: first skill\n---\n\nfirst body\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    (skills_dir / "second.md").write_text(
+        "---\nname: second\ndescription: second skill\n---\n\nsecond body\n",
+        encoding="utf-8",
+    )
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+    )
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+    loaded = await resumed.loop.tool_registry.execute(
+        ToolCall("skill", "skill", {"name": "first"}), _skip_approval=True
+    )
+    missing = await resumed.loop.tool_registry.execute(
+        ToolCall("skill-missing", "skill", {"name": "second"}),
+        _skip_approval=True,
+    )
+
+    assert "first: first skill" in prompt
+    assert "second: second skill" not in prompt
+    assert loaded["isError"] is False
+    assert loaded["content"][0]["text"] == "first body"
+    assert missing["isError"] is True
+    assert "available skills: review, first" in missing["content"][0]["text"]
+
+
 def test_second_resume_after_override_sees_overridden_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

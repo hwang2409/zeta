@@ -30,6 +30,7 @@ from html import escape
 from pathlib import Path
 
 from ..prompts import load_identity
+from ..skill_catalog import SkillCatalog
 from .process_env import subprocess_env
 
 AGENTS_FILENAME = "AGENTS.md"
@@ -178,6 +179,7 @@ def load_project_context(
     system_override: str | None = None,
     system_append: str | None = None,
     byte_cap: int = CONTEXT_BYTE_CAP,
+    catalog: SkillCatalog | None = None,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
 
@@ -206,7 +208,9 @@ def load_project_context(
     if system_override is not None:
         sections: list[str] = [system_override]
     else:
-        sections = [load_identity(home=home, project_dir=stop_at)]
+        sections = [
+            load_identity(home=home, project_dir=stop_at, catalog=catalog)
+        ]
         candidates: list[Path] = []
         home_agents = home / AGENTS_FILENAME
         if _present(home_agents):

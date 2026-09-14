@@ -14,6 +14,7 @@ from ..mcp.mount import MCPMount
 from ..prompts import load_identity
 from ..runtime.driver import drive_turn
 from ..runtime.unattended import build_unattended_loop
+from ..skill_catalog import discover_session_skills
 from ..tools import ToolRegistry
 from ..types import CompletionBackend, Message, MessageRole, TextContent
 from .delivery import Delivery, SlackDelivery
@@ -75,11 +76,13 @@ async def run_claimed(
         store.finish(run_id, "canceled", "approval changed before execution")
         return
     job = state.job
+    skill_catalog = discover_session_skills(home=home)
     session = SessionManager(home).create(
         provider=job.provider,
         model=job.model,
         cwd=job.cwd,
-        system_prompt=load_identity(),
+        system_prompt=load_identity(catalog=skill_catalog),
+        skill_catalog=skill_catalog,
         name=f"automation: {job.name}"[:60],
     )
     store.attach_session(run_id, session.metadata.session_id)
@@ -88,7 +91,11 @@ async def run_claimed(
     try:
         async with asyncio.timeout(timeout_seconds):
             loop = build_unattended_loop(
-                session, home=home, allow=job.allow, backend=backend
+                session,
+                home=home,
+                allow=job.allow,
+                backend=backend,
+                skill_catalog=skill_catalog,
             )
             mount = await mount_factory(job, loop.tool_registry, home)
             loop.attach_mcp_mount(mount)

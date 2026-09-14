@@ -17,6 +17,7 @@ from ..core.project_context import (
 from ..core.session import (
     SessionError,
     SessionManager,
+    SessionMetadata,
     SessionPreview,
     env_home,
     format_relative_age,
@@ -24,6 +25,7 @@ from ..core.session import (
 from ..runtime import compose_runtime
 from ..settings import ResolvedConfig
 from ..settings import resolve as resolve_settings
+from ..skill_catalog import SkillCatalog, discover_session_skills
 from . import theme as _theme
 from .key_bindings import KeybindingError, resolve_keybindings
 from .layout import content_width, resume_picker_line
@@ -85,7 +87,8 @@ def _create_app_with_root(
         )
     except PromptArgumentError as exc:
         raise SessionError(str(exc)) from exc
-    project_dir = discover_repo_root(Path.cwd()) / ".zeta"
+    repo_root = discover_repo_root(Path.cwd())
+    project_dir = repo_root / ".zeta"
     loaded_settings = _app.load_settings(home=home, project_dir=project_dir)
     config: ResolvedConfig = resolve_settings(
         loaded_settings.settings,
@@ -132,6 +135,7 @@ def _create_app_with_root(
             opened = manager.open(recent.session_id)
         cleanup.enter_context(opened.store)
         metadata = opened.metadata
+        skill_catalog = _session_skill_catalog(metadata, home, manager)
         cli_provider = getattr(args, "provider", None)
         cli_model = getattr(args, "model", None)
         provider_override = cli_provider or loaded_settings.settings.provider
@@ -172,6 +176,7 @@ def _create_app_with_root(
                 zeta_home=home,
                 system_override=system_prompt_override,
                 system_append=system_prompt_append,
+                catalog=skill_catalog,
             )
             persisted = manager.persist_context_snapshot(
                 metadata,
@@ -187,12 +192,14 @@ def _create_app_with_root(
     else:
         provider = config.provider
         model = config.model
+        skill_catalog = discover_session_skills(home=home, project_dir=repo_root)
         project_context = _app.load_project_context(
             cwd=Path.cwd(),
-            repo_root=discover_repo_root(Path.cwd()),
+            repo_root=repo_root,
             zeta_home=home,
             system_override=system_prompt_override,
             system_append=system_prompt_append,
+            catalog=skill_catalog,
         )
     pending_override = None
     if resuming and mismatches:
@@ -237,6 +244,7 @@ def _create_app_with_root(
         on_completion_success=completion_success,
         on_plan_mode_change=plan_mode_changed,
         max_turns=max_turns_override,
+        skill_catalog=skill_catalog,
     )
     if opened is None:
         cleanup.enter_context(composition.opened.store)
@@ -252,6 +260,7 @@ def _create_app_with_root(
     _validate_keybindings(config.keybindings)
     startup_notices = (
         tuple(loaded_settings.notices)
+        + skill_catalog.notices
         + project_context.notices
         + external_tools.notices
         + theme_notices
@@ -298,6 +307,24 @@ def _create_app_with_root(
         on_name_change=lambda label: manager.record_name(metadata, name=label),
         key_remap=config.keybindings,
     )
+
+
+def _session_skill_catalog(
+    metadata: SessionMetadata, home: Path, manager: SessionManager
+) -> SkillCatalog:
+    if metadata.skill_catalog is None:
+        catalog = discover_session_skills(
+            home=home, project_dir=discover_repo_root(Path(metadata.cwd))
+        )
+        persisted = manager.persist_skill_catalog(metadata, catalog)
+        try:
+            return SkillCatalog.from_snapshot(persisted.skill_catalog)
+        except ValueError as exc:
+            raise SessionError("session skill catalog is invalid") from exc
+    try:
+        return SkillCatalog.from_snapshot(metadata.skill_catalog)
+    except ValueError as exc:
+        raise SessionError("session skill catalog is invalid") from exc
 
 
 def _apply_startup_theme(name: str | None, home: Path) -> tuple[str, ...]:

@@ -66,9 +66,58 @@ class SkillCatalog:
     def load(self, name: str) -> str:
         return load_skill(self.find(name))
 
+    def to_snapshot(self) -> list[dict[str, object]]:
+        """Return the discovery result in a session-metadata-safe shape."""
+
+        return [
+            {
+                "name": skill.name,
+                "description": skill.description,
+                "keywords": list(skill.keywords),
+                "path": str(skill.path),
+                "source": skill.source,
+            }
+            for skill in self.skills
+        ]
+
+    @classmethod
+    def from_snapshot(cls, value: object) -> SkillCatalog:
+        """Restore a catalog snapshot without discovering the filesystem."""
+
+        if type(value) is not list:
+            raise ValueError("skill catalog snapshot must be a list")
+        skills: list[SkillMeta] = []
+        for item in value:
+            if type(item) is not dict:
+                raise ValueError("skill catalog snapshot entries must be mappings")
+            name = item.get("name")
+            description = item.get("description")
+            keywords = item.get("keywords")
+            path = item.get("path")
+            source = item.get("source", "")
+            if (
+                type(name) is not str
+                or type(description) is not str
+                or type(keywords) is not list
+                or any(type(keyword) is not str for keyword in keywords)
+                or type(path) is not str
+                or type(source) is not str
+            ):
+                raise ValueError("skill catalog snapshot entry is invalid")
+            skills.append(
+                SkillMeta(
+                    name=name,
+                    description=description,
+                    keywords=keywords,
+                    path=Path(path),
+                    source=source,
+                )
+            )
+        return cls(tuple(skills))
+
 
 def _skills_dir(home: Path) -> Path:
-    return home if home.name == "skills" else home / "skills"
+    return home / "skills"
 
 
 def _document_path(path: Path) -> Path:
@@ -77,21 +126,39 @@ def _document_path(path: Path) -> Path:
 
 def _candidate_paths(skills_dir: Path) -> list[Path]:
     flat = list(skills_dir.glob("*.md"))
-    directories = [
-        path
-        for path in skills_dir.iterdir()
-        if path.is_dir() and (path / "SKILL.md").is_file()
-    ]
+    directories = [path for path in skills_dir.iterdir() if path.is_dir()]
     return sorted(flat + directories, key=lambda path: path.name)
 
 
+def _contained_path(path: Path, skills_root: Path) -> Path:
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(skills_root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"skill document {path} resolves outside skills root {skills_root}"
+        ) from exc
+    return resolved
+
+
 def discover_skills(
-    home: Path, *, source: str = "", notices: list[str] | None = None
+    home: Path,
+    *,
+    source: str = "",
+    notices: list[str] | None = None,
+    skills_dir: Path | None = None,
 ) -> list[SkillMeta]:
     """Discover one tier of flat and Claude-Code-style skills."""
 
-    skills_dir = _skills_dir(home)
+    skills_dir = skills_dir or _skills_dir(home)
     if not skills_dir.is_dir():
+        return []
+    try:
+        skills_root = skills_dir.resolve()
+    except (OSError, RuntimeError) as exc:
+        notice = _warn_skill(skills_dir, exc)
+        if notices is not None:
+            notices.append(notice)
         return []
     discovered: list[SkillMeta] = []
     paths_by_name: dict[str, Path] = {}
@@ -105,7 +172,10 @@ def discover_skills(
     for path in paths:
         document = _document_path(path)
         try:
-            metadata, _ = _read_skill(document)
+            resolved_document = _contained_path(document, skills_root)
+            if path.is_dir() and not resolved_document.is_file():
+                continue
+            metadata, _ = _read_skill(resolved_document)
         except (
             OSError,
             UnicodeError,
@@ -144,7 +214,12 @@ def discover_session_skills(
 
     notices: list[str] = []
     tiers: list[list[SkillMeta]] = [
-        discover_skills(_PACKAGED_SKILLS_DIR, source="packaged", notices=notices)
+        discover_skills(
+            _PACKAGED_SKILLS_DIR.parent,
+            source="packaged",
+            notices=notices,
+            skills_dir=_PACKAGED_SKILLS_DIR,
+        )
     ]
     if home is not None:
         tiers.append(discover_skills(Path(home), source="home", notices=notices))
@@ -168,13 +243,23 @@ def discover_session_skills(
 def discover_packaged_skills() -> SkillCatalog:
     """Discover the skills shipped in the installed zeta package."""
 
-    return SkillCatalog(tuple(discover_skills(_PACKAGED_SKILLS_DIR, source="packaged")))
+    return SkillCatalog(
+        tuple(
+            discover_skills(
+                _PACKAGED_SKILLS_DIR.parent,
+                source="packaged",
+                skills_dir=_PACKAGED_SKILLS_DIR,
+            )
+        )
+    )
 
 
 def load_skill(meta: SkillMeta) -> str:
     """Load the prompt body for one discovered skill."""
 
-    _, body = _read_skill(_document_path(meta.path))
+    document = _document_path(meta.path)
+    resolved_document = _contained_path(document, meta.path.parent.resolve())
+    _, body = _read_skill(resolved_document)
     return body
 
 
@@ -208,7 +293,9 @@ def _parse_frontmatter(lines: list[str], path: Path) -> dict[str, str | list[str
     except yaml.YAMLError as exc:
         raise ValueError(f"skill {path} has invalid YAML frontmatter") from exc
     if not isinstance(values, dict):
-        raise TypeError(f"skill {path} frontmatter must be a mapping")
+        raise ValueError(  # noqa: TRY004 — malformed metadata is skipped
+            f"skill {path} frontmatter must be a mapping"
+        )
     missing = [key for key in ("name", "description") if key not in values]
     if missing:
         raise ValueError(f"skill {path} frontmatter is missing: {', '.join(missing)}")
