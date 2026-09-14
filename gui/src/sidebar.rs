@@ -74,6 +74,26 @@ fn row_focus_handle(view: &ZetaView, cx: &mut App, id: &str) -> FocusHandle {
     handle
 }
 
+/// Fetch or create a persistent focus handle for the wrapper that groups a
+/// session row with its `...` menu button. Stored on
+/// `ZetaView::sidebar_row_focus` under a `container:{id}` key so the existing
+/// prune sweep piggybacks on the session-id → focus-handle machinery. The
+/// handle is NOT a tab stop; it exists only as a dispatch-tree anchor so
+/// `contains_focused` sees BOTH the row's focus handle and the menu button's
+/// internal focus handle as descendants of a single container node. That
+/// container-level check is what keeps the menu revealed while Tab moves
+/// focus from the row to the menu button (contract lines 5-6, ZETA-123).
+fn container_focus_handle(view: &ZetaView, cx: &mut App, id: &str) -> FocusHandle {
+    let key = format!("container:{id}");
+    let mut map = view.sidebar_row_focus.borrow_mut();
+    if let Some(handle) = map.get(&key) {
+        return handle.clone();
+    }
+    let handle = cx.focus_handle();
+    map.insert(key, handle.clone());
+    handle
+}
+
 impl ZetaView {
     pub fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Prune stale focus handles keyed by session id / branch id. Each new
@@ -152,21 +172,6 @@ impl ZetaView {
             .children(self.render_branches(window, cx))
     }
 
-    /// Whether the per-row `...` menu reveals for the sidebar row keyed by
-    /// `id` — mirrors the render-time `rest_opacity = if focused { 1. }
-    /// else { 0. }` branch so tests can assert the reveal fires on
-    /// keyboard focus without racing the paint tree. Used by the
-    /// finding-1 probe (ZETA-123 round 2) to guard against a regression
-    /// that drops the focus branch and leaves an invisible menu on the
-    /// focused row.
-    #[cfg(any(test, feature = "smoke-test"))]
-    pub fn sidebar_row_menu_revealed(&self, id: &str, window: &Window) -> bool {
-        self.sidebar_row_focus
-            .borrow()
-            .get(id)
-            .is_some_and(|handle| handle.is_focused(window))
-    }
-
     /// Drop focus handles whose key (session id / `branch:<id>`) is no longer
     /// live. Called at the top of every `render_sidebar`. Without this the
     /// handle map is insert-only and grows unbounded — normal branch churn
@@ -174,6 +179,12 @@ impl ZetaView {
     /// its entry in the window focus map) for the app's lifetime.
     fn prune_sidebar_focus_handles(&self) {
         let branches_live = self.state.session_view.available;
+        let session_alive = |session_id: &str| {
+            self.state
+                .sessions
+                .iter()
+                .any(|session| session.session_id.as_str() == session_id)
+        };
         self.sidebar_row_focus.borrow_mut().retain(|key, _| {
             if let Some(branch_id) = key.strip_prefix("branch:") {
                 branches_live
@@ -183,11 +194,10 @@ impl ZetaView {
                         .branches
                         .iter()
                         .any(|branch| branch.id == branch_id)
+            } else if let Some(session_id) = key.strip_prefix("container:") {
+                session_alive(session_id)
             } else {
-                self.state
-                    .sessions
-                    .iter()
-                    .any(|session| session.session_id.as_str() == key)
+                session_alive(key)
             }
         });
     }
@@ -374,17 +384,28 @@ impl ZetaView {
         // Right-side dropdown for rename/delete. Kept as a Button so the
         // menu integration and keyboard accessibility come from Kit. The
         // menu sits at opacity 0 at rest and reveals on row hover OR
-        // when the row has keyboard focus — the per-row `.group()`
-        // scopes hover reveal to THIS row so one pointer position never
-        // lights up every row's menu at once (contract lines 5-6,
-        // ZETA-123). Focus-reveal keeps the control visible for
-        // keyboard-only operators; hitting Enter/Space on an invisible
-        // menu would violate WCAG 2.4.7 focus-visible.
+        // whenever keyboard focus is WITHIN the row+menu container — the
+        // per-row `.group()` scopes hover reveal to THIS row so one pointer
+        // position never lights up every row's menu at once (contract
+        // lines 5-6, ZETA-123).
+        //
+        // Focus-reveal must cover the menu button's OWN focus, not just
+        // the row's: Tab lands on the row, then Tab again lands on the
+        // menu button (its own tab stop) and the row's focus handle goes
+        // false. A row-only predicate would drop the wrapper back to
+        // opacity 0 and paint a focused Enter/Space target invisibly —
+        // WCAG 2.4.7 focus-visible. Anchoring the wrapper in the dispatch
+        // tree via `container_handle.track_focus` and reading
+        // `contains_focused` catches both focus targets (row + button)
+        // under a single container node.
         let entity = cx.entity().downgrade();
+        let container_handle = container_focus_handle(self, cx, &id);
+        let focus_within = container_handle.contains_focused(window, cx);
+        let rest_opacity = if focus_within { 1.0 } else { 0.0 };
         let menu_id = id;
         let group = session_row_group(index);
-        let rest_opacity = if focused { 1.0 } else { 0.0 };
         div()
+            .track_focus(&container_handle)
             .group(group.clone())
             .h_flex()
             .w_full()

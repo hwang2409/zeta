@@ -5339,38 +5339,40 @@ fn sidebar_new_session_reads_as_an_action_button(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn sidebar_row_menu_reveals_when_the_row_takes_keyboard_focus(cx: &mut TestAppContext) {
-    // ZETA-123 round 2, finding 1: hover-only reveal leaves the `...`
-    // menu invisible for keyboard-only operators — Enter still fires
-    // the invisible control, which violates WCAG 2.4.7 focus-visible.
-    // The fix ties the wrapper's opacity to `focused` (row's focus
-    // handle). This test:
-    //   1. focuses a session row (simulates Tab landing),
-    //   2. reads back the wrapper's opacity through the debug-only
-    //      predicate on ZetaView,
-    //   3. asserts the opacity is 1.0 — the reveal fires.
-    // Without the focus branch (`rest_opacity = 0.` unconditionally)
-    // the predicate returns false and the test fails.
+fn sidebar_row_menu_stays_visible_when_tab_moves_focus_from_the_row_to_the_menu_button(
+    cx: &mut TestAppContext,
+) {
+    // ZETA-123 round 3, finding 1 (second round). The wrapper reveal
+    // originally keyed on the row's OWN focus handle. Tab from the row
+    // lands on the menu button — its own tab stop — and row focus goes
+    // false. Under a row-only predicate the wrapper opacity returned to
+    // 0 and the focused menu button paints its focus ring at alpha 0.
+    // Enter still activates a control the user cannot see; WCAG 2.4.7
+    // focus-visible.
+    //
+    // The fix moves the wrapper's opacity to a container-level
+    // `contains_focused` check spanning both the row and the menu
+    // button. This test walks the real keyboard path with `focus_next`
+    // and asserts the menu button's focus ring paints as a VISIBLE
+    // quad, not a predicate that mirrors the render branch and passes
+    // tautologically. Two paint counts:
+    //   1. Tab lands on the row — visible-ring quad count = 0 (the
+    //      button is not focused, no ring drawn at all).
+    //   2. Tab lands on the menu button — visible-ring quad count > 0.
+    //      Under the pre-fix predicate the count would be 0 because
+    //      the wrapper's `.opacity(0.)` multiplies every descendant's
+    //      color alpha (including the ring border) to 0.
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    let target = session().session_id;
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.apply_worker_message(WorkerMessage::SessionManagement(true), window, cx);
         });
         window.draw(cx).clear(cx);
     });
-    // At rest (nothing focused) the reveal predicate reads false.
-    visual.update(|window, cx| window.blur(cx));
-    visual.update(|window, cx| window.draw(cx).clear(cx));
-    let unfocused =
-        visual.update(|window, cx| view.read(cx).sidebar_row_menu_revealed(&target, window));
-    assert!(
-        !unfocused,
-        "menu reveal must be gated — unfocused rows keep the wrapper at opacity 0",
-    );
-    // Focus the row and confirm the reveal fires.
-    let handle = visual
+
+    let target = session().session_id;
+    let row_handle = visual
         .update(|_, cx| {
             view.read(cx)
                 .sidebar_row_focus
@@ -5378,17 +5380,92 @@ fn sidebar_row_menu_reveals_when_the_row_takes_keyboard_focus(cx: &mut TestAppCo
                 .get(&target)
                 .cloned()
         })
-        .expect("current session row focus handle exists after render");
+        .expect("session row focus handle registered after render");
+
+    // Baseline: focus the row (simulates Tab landing on it). No focus
+    // ring is drawn — the ring lives on the menu button, and the
+    // button is not the focused element yet.
     visual.update(|window, cx| {
-        window.focus(&handle, cx);
+        window.focus(&row_handle, cx);
         window.draw(cx).clear(cx);
     });
-    let focused_reveal =
-        visual.update(|window, cx| view.read(cx).sidebar_row_menu_revealed(&target, window));
-    assert!(
-        focused_reveal,
-        "focused row must reveal its menu — WCAG focus-visible requires the control to be seen",
+    let menu = visual
+        .debug_bounds("session-menu")
+        .expect("session menu renders when session-management is enabled");
+    let (ring, row_focus_ring_hits) = visual.update(|window, cx| {
+        let ring = cx.theme().ring;
+        (ring, count_visible_ring_quads(window, menu, ring))
+    });
+    assert_eq!(
+        row_focus_ring_hits, 0,
+        "with the row focused the menu button is NOT focused — no ring \
+         should be painted (theme ring {ring:?})",
     );
+
+    // Advance one Tab: focus_next from the row's focus handle lands on
+    // the menu button (its own tab stop, same tab_index=0, inserted
+    // right after the row inside the wrapper).
+    visual.update(|window, cx| {
+        window.focus_next(cx);
+        window.draw(cx).clear(cx);
+    });
+    // Prove focus DID leave the row — that is the exact case the
+    // row-only predicate could not see, and the case the reviewer's
+    // probe (menu-button-focus visible paints = 0) caught in the bug.
+    let row_still_focused = visual.update(|window, _cx| row_handle.is_focused(window));
+    assert!(
+        !row_still_focused,
+        "focus_next from the row must move keyboard focus off the row \
+         — if it stays on the row the tab-order regressed and the \
+         menu-button-focus case would never be exercised",
+    );
+    // The failing case: menu button focused, wrapper reveal must
+    // cover its focus. Look for the button's focus-ring quad landing
+    // as a VISIBLE border (alpha > 0) near the menu bounds. Under the
+    // old row-only predicate the ring paints with alpha 0 → zero hits.
+    let menu = visual
+        .debug_bounds("session-menu")
+        .expect("session menu still renders after focus_next");
+    let menu_focus_ring_hits =
+        visual.update(|window, cx| count_visible_ring_quads(window, menu, cx.theme().ring));
+    assert!(
+        menu_focus_ring_hits > 0,
+        "menu button focus ring must paint visibly when Tab lands on it \
+         — the wrapper reveal must cover focus WITHIN the row+menu \
+         container, not just the row's own focus (theme ring {ring:?})",
+    );
+}
+
+/// Count painted quads whose border reads as the theme's focus ring on
+/// the menu bounds — the ring paints outside the button's own border
+/// (see gpui-component `focus_ring_style`) so widen the probe rectangle
+/// by a few device pixels. A quad only counts when its border alpha is
+/// above zero; under `.opacity(0.)` the wrapper multiplies every
+/// descendant color's alpha by 0, and the ring drops out of visible
+/// paint even though the primitive is still in the scene.
+fn count_visible_ring_quads(
+    window: &gpui::Window,
+    menu_bounds: gpui::Bounds<gpui::Pixels>,
+    ring: gpui::Hsla,
+) -> usize {
+    let scaled = menu_bounds.scale(window.scale_factor());
+    let slack = px(8.).scale(window.scale_factor());
+    window
+        .painted_quads()
+        .into_iter()
+        .filter(|quad| {
+            let overlaps = quad.bounds.right() >= scaled.left() - slack
+                && quad.bounds.left() <= scaled.right() + slack
+                && quad.bounds.bottom() >= scaled.top() - slack
+                && quad.bounds.top() <= scaled.bottom() + slack;
+            let border = quad.border_color;
+            overlaps
+                && border.h == ring.h
+                && border.s == ring.s
+                && border.l == ring.l
+                && border.a > 0.0
+        })
+        .count()
 }
 
 #[gpui::test]
