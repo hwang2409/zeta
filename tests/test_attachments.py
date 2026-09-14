@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -172,8 +173,10 @@ def test_image_attachment_round_trips_and_uses_provider_boundaries(tmp_path: Pat
     assert anthropic["messages"][0]["content"][1]["type"] == "image"
 
     codex = build_responses_payload([persisted], [], model="codex")
-    assert codex["input"][0]["content"][1]["type"] == "input_text"
-    assert "renamed.data" in codex["input"][0]["content"][1]["text"]
+    assert codex["input"][0]["content"][1] == {
+        "type": "input_image",
+        "image_url": "data:image/png;base64," + base64.b64encode(PNG).decode(),
+    }
 
 
 def test_paste_image_queues_a_session_attachment(
