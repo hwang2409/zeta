@@ -506,10 +506,13 @@ class TUIApp(
             on_plan_toggle=lambda: app.toggle_plan_mode(),
             on_scroll_up=self._transcript.scroll_up,
             on_scroll_down=self._transcript.scroll_down,
-            on_picker_move=self.model_picker_move,
-            on_picker_select=self.model_picker_select,
-            on_picker_cancel=self.model_picker_cancel,
-            picker_active=lambda: self.model_picker_active,
+            # Route through the weakref proxy like every callback above: a bound
+            # method on self would pin the app alive past close() and trip
+            # test_closed_tui_drops_callbacks_without_gc.
+            on_picker_move=lambda delta: app.model_picker_move(delta),
+            on_picker_select=lambda: app.model_picker_select(),
+            on_picker_cancel=lambda: app.model_picker_cancel(),
+            picker_active=lambda: app.model_picker_active,
             key_remap=self._key_remap,
         )
         session = FullScreenPromptSession(
@@ -519,8 +522,8 @@ class TUIApp(
             key_bindings=bindings,
             completer=SlashCompleter(
                 self._slash_commands,
-                model_choices=self.model_choices,
-                current_model=lambda: self.model,
+                model_choices=lambda: app.model_choices(),
+                current_model=lambda: app.model,
             ),
             reserve_space_for_menu=0,
             multiline=True,
