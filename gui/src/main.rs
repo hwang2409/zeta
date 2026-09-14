@@ -1,6 +1,7 @@
 extern crate gpui_kit as gpui;
 
 mod polish;
+mod prefs;
 mod session_management;
 mod sidebar;
 #[cfg(feature = "smoke-test")]
@@ -128,7 +129,12 @@ struct ZetaView {
 
 impl ZetaView {
     fn new(window: &mut Window, cx: &mut Context<Self>, commands: Sender<CommandMessage>) -> Self {
-        theme::apply(cx);
+        // Theme is applied before this call — `main()` reads the persisted
+        // appearance through `prefs::load` + `theme::apply_with`, tests run
+        // `theme::apply` inside `setup()` for a deterministic baseline. This
+        // keeps `ZetaView::new` free of disk I/O so a stray gui-prefs.json
+        // written by a peer test never leaks into an unrelated test's
+        // fixture.
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("Message zeta")
@@ -628,6 +634,61 @@ impl ZetaView {
         }
     }
 
+    /// Read the currently applied appearance out of the PER-APP theme,
+    /// not the process-wide `theme::current_appearance()`. Under parallel
+    /// gpui-test workers a peer test can race the ACTIVE slot; anchoring
+    /// on `cx.theme()` keeps `set_*`/`adjust_font_size` deterministic in
+    /// production AND in tests.
+    fn app_appearance(&self, cx: &App) -> theme::Appearance {
+        let theme = cx.theme();
+        let id = theme::ThemeId::ALL
+            .iter()
+            .copied()
+            .find(|id| id.palette().canvas == theme.background)
+            .unwrap_or_default();
+        theme::Appearance {
+            theme: id,
+            font_family: theme.font_family.clone(),
+            font_size: theme.font_size,
+        }
+    }
+
+    /// Apply a new theme id, commit the choice to gui-prefs.json, and
+    /// notify so every surface repaints from the fresh palette in the same
+    /// frame. The three appearance mutators share one shape so a future
+    /// change to persistence lands in one place.
+    fn set_theme(&mut self, id: theme::ThemeId, cx: &mut Context<Self>) {
+        let mut appearance = self.app_appearance(cx);
+        if appearance.theme == id {
+            return;
+        }
+        appearance.theme = id;
+        prefs::commit(cx, appearance);
+        cx.notify();
+    }
+
+    fn set_font_family(&mut self, family: &'static str, cx: &mut Context<Self>) {
+        let mut appearance = self.app_appearance(cx);
+        if appearance.font_family.as_ref() == family {
+            return;
+        }
+        appearance.font_family = gpui::SharedString::new_static(family);
+        prefs::commit(cx, appearance);
+        cx.notify();
+    }
+
+    fn adjust_font_size(&mut self, delta_px: f32, cx: &mut Context<Self>) {
+        let mut appearance = self.app_appearance(cx);
+        let target = f32::from(appearance.font_size) + delta_px;
+        let next = theme::clamp_font_size(target);
+        if appearance.font_size == next {
+            return;
+        }
+        appearance.font_size = next;
+        prefs::commit(cx, appearance);
+        cx.notify();
+    }
+
     fn move_settings_model(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = self.state.session_view.models.len();
         if count == 0 {
@@ -952,7 +1013,7 @@ impl ZetaView {
             .v_flex()
             .flex_1()
             .min_h_0()
-            .max_h(px(280.))
+            .max_h(px(220.))
             .overflow_y_scroll()
             .track_scroll(&self.model_scroll);
         for (index, model) in view.models.iter().enumerate() {
@@ -1010,6 +1071,82 @@ impl ZetaView {
                         cx.notify();
                     }))
             }));
+        let appearance = self.app_appearance(cx);
+        // Single horizontal strip with two-line wrap only when the picker
+        // outgrows the modal width. Padding is tight so each row stays 30px
+        // tall — the extra chrome from adding an Appearance section costs
+        // ~90px, which the modal accommodates without pushing Apply / Close
+        // past the window bottom in the default 760-tall test viewport.
+        let theme_row = div().h_flex().gap_1().flex_wrap().children(
+            theme::ThemeId::ALL
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, id)| {
+                    Button::new(("theme", index))
+                        .debug_selector(move || format!("theme-row-{}", id.slug()))
+                        .ghost()
+                        .compact()
+                        .selected(appearance.theme == id)
+                        .label(id.label())
+                        .on_click(cx.listener(move |view, _, _, cx| view.set_theme(id, cx)))
+                }),
+        );
+        let font_row = div().h_flex().gap_1().flex_wrap().children(
+            theme::FONT_FAMILIES
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, family)| {
+                    Button::new(("font", index))
+                        .debug_selector(move || format!("font-row-{family}"))
+                        .ghost()
+                        .compact()
+                        .selected(appearance.font_family.as_ref() == family)
+                        .label(family)
+                        .on_click(
+                            cx.listener(move |view, _, _, cx| view.set_font_family(family, cx)),
+                        )
+                }),
+        );
+        let size_px = f32::from(appearance.font_size);
+        let font_size_px = size_px.round() as i32;
+        let can_shrink = size_px > theme::MIN_FONT_SIZE_PX;
+        let can_grow = size_px < theme::MAX_FONT_SIZE_PX;
+        let size_row = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Button::new("font-size-shrink")
+                    .debug_selector(|| "font-size-shrink".into())
+                    .ghost()
+                    .compact()
+                    .label("−")
+                    .disabled(!can_shrink)
+                    .on_click(cx.listener(|view, _, _, cx| view.adjust_font_size(-1., cx))),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "font-size-value".into())
+                    .min_w(px(44.))
+                    .text_align(gpui::TextAlign::Center)
+                    .child(format!("{font_size_px}px")),
+            )
+            .child(
+                Button::new("font-size-grow")
+                    .debug_selector(|| "font-size-grow".into())
+                    .ghost()
+                    .compact()
+                    .label("+")
+                    .disabled(!can_grow)
+                    .on_click(cx.listener(|view, _, _, cx| view.adjust_font_size(1., cx))),
+            )
+            .child(div().text_color(cx.theme().muted_foreground).child(format!(
+                "range {}-{}px",
+                theme::MIN_FONT_SIZE_PX as i32,
+                theme::MAX_FONT_SIZE_PX as i32
+            )));
         let pending = self.pending_command;
         let error = self.settings_error.clone();
         div()
@@ -1046,6 +1183,16 @@ impl ZetaView {
                     .child(list)
                     .child(modal_field_label("Approval mode", cx))
                     .child(mode_row)
+                    .child(modal_field_label("Appearance", cx))
+                    .child(
+                        div()
+                            .debug_selector(|| "appearance-section".into())
+                            .v_flex()
+                            .gap_1()
+                            .child(theme_row)
+                            .child(font_row)
+                            .child(size_row),
+                    )
                     .children(self.login_providers.iter().map(|provider| {
                         self.render_login_provider(
                             provider,
@@ -1205,7 +1352,7 @@ impl ZetaView {
                                     .px_2()
                                     .py_1()
                                     .bg(cx.theme().sidebar)
-                                    .text_size(px(12.))
+                                    .text_size(theme::label_small(cx.theme().font_size))
                                     .debug_selector(|| "composer-chip".into())
                                     .child(format!("{} · {} bytes", image.name, image.size))
                                     .child(
@@ -1233,7 +1380,7 @@ impl ZetaView {
                     .items_center()
                     .gap_1()
                     .h(theme::COMPOSER_TARGET_HEIGHT)
-                    .text_size(px(12.))
+                    .text_size(theme::label_small(cx.theme().font_size))
                     .debug_selector(|| "composer-target".into())
                     .child(div().text_color(roles.target_label).child("→"))
                     .child(
@@ -1585,7 +1732,7 @@ pub(crate) fn modal_title(title: &'static str) -> gpui::AnyElement {
         .w_full()
         .child(
             div()
-                .text_size(theme::FONT_SIZE)
+                .text_size(theme::current_font_size())
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .child(title),
         )
@@ -1798,8 +1945,8 @@ impl Render for ZetaView {
             .relative()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .font_family("JetBrains Mono")
-            .text_size(theme::FONT_SIZE)
+            .font_family(theme::current_font_family())
+            .text_size(theme::current_font_size())
             .on_action(cx.listener(|view, _: &polish::NewSession, _, cx| view.new_session(cx)))
             .on_action(|_: &polish::About, window, cx| {
                 drop(window.prompt(
@@ -1880,6 +2027,11 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             init(cx);
+            // Load persisted appearance BEFORE opening the window so the
+            // first frame paints on the user's picked palette / font. A
+            // missing / corrupt prefs file resolves to the shipped default
+            // through `prefs::load`.
+            theme::apply_with(cx, &prefs::load());
             let bounds = Bounds::centered(None, gpui::size(px(1100.), px(760.)), cx);
             cx.open_window(
                 WindowOptions {
