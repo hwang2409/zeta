@@ -15,7 +15,7 @@ from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tui import composer
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import (

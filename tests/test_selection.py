@@ -17,7 +17,7 @@ from rich.text import Text
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tui import app as app_module
 from zeta.tui import composer as composer_module
 from zeta.tui.app import TUIApp

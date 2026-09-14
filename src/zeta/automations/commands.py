@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy
-from ..skill_catalog import discover_session_skills
+from ..skills import discover_session_skills
 from ..tools import ToolRegistry
 from .authoring import import_jobs, listing, show
 from .delivery import SlackDelivery

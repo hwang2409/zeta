@@ -1,4 +1,4 @@
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 
 import asyncio
 from dataclasses import dataclass, replace
@@ -34,7 +34,7 @@ from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.providers import PROVIDER_MODELS
 from zeta.providers.usage import normalize_usage
-from zeta.skill_catalog import discover_session_skills
+from zeta.skills import discover_session_skills
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings
 from zeta.tui.composer import SlashCompleter

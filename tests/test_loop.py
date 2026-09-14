@@ -16,7 +16,7 @@ from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
 from zeta.loop import _validated_tool_result
 from zeta.prompts import load_identity
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 from zeta.types import (
     CompletionBackend,

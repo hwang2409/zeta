@@ -20,7 +20,7 @@ from typing import Any, Mapping
 
 from rich.cells import cell_len
 
-from ..skill_catalog import SkillCatalog
+from ..skills import SkillCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .store import ConversationStore
 from .session_files import SessionError, SessionInUseError, open_session_file, session_directory, session_root, child_directory, write_session_json

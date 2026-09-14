@@ -12,7 +12,7 @@ from zeta.core.context import ContextAssembler
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.loop import AgentLoop
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.types import (
     Message,

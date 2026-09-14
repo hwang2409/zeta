@@ -1,4 +1,4 @@
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 
 import asyncio
 import base64

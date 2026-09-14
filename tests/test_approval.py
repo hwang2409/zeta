@@ -18,7 +18,7 @@ from zeta.core.approval import (
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationIntegrityError, ConversationStore
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.types import (
     Message,

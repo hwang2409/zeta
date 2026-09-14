@@ -26,7 +26,7 @@ from zeta.core.slash import (
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.mcp import MCPPrompt, MCPPromptArgument
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.exec import (
     INLINE_SHELL_BATCH_TIMEOUT_MESSAGE,

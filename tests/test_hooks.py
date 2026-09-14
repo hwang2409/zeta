@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 
 import asyncio
 import json

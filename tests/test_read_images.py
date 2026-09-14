@@ -14,6 +14,7 @@ from zeta.images import IMAGE_DEGRADATION_WARNING, detect_image_media_type
 from zeta.loop import _validated_tool_result
 from zeta.providers.anthropic import build_messages_payload
 from zeta.providers.codex import build_responses_payload
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.read import IMAGE_MAX_BYTES
 from zeta.tui.checkpoints import CheckpointTranscriptMixin
@@ -92,7 +93,7 @@ async def test_read_detects_images_by_magic_bytes(
     path = tmp_path / f"renamed.{format_name}.bin"
     path.write_bytes(data)
 
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("read-image", "read", {"path": path.name})
     )
 
@@ -110,7 +111,7 @@ async def test_read_keeps_text_behavior_for_non_images(tmp_path: Path) -> None:
     data = "one\r\ntwo\n三".encode()
     path.write_bytes(data)
 
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("read-text", "read", {"path": path.name})
     )
 
@@ -127,7 +128,7 @@ async def test_read_falls_back_for_webp_lookalike_text(tmp_path: Path) -> None:
     path = tmp_path / "note.bin"
     path.write_bytes(b"RIFFxxxxWEBPthis is UTF-8 text\n")
 
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("read-lookalike", "read", {"path": path.name})
     )
 
@@ -394,7 +395,7 @@ async def test_image_read_decision_table(
     path = tmp_path / f"{case_name}.bin"
     path.write_bytes(data)
 
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall(case_name, "read", {"path": path.name, **arguments})
     )
 
@@ -431,7 +432,7 @@ async def test_read_detects_webp_codecs(
     path = tmp_path / f"{case_name}.bin"
     path.write_bytes(data)
 
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall(f"read-{case_name}", "read", {"path": path.name})
     )
 
@@ -446,7 +447,7 @@ async def test_read_rejects_oversized_images_with_size_and_cap(tmp_path: Path) -
     path = tmp_path / "large.png"
     path.write_bytes(PNG + b"x" * (4 * 1024 * 1024))
 
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("read-large-image", "read", {"path": path.name})
     )
 
@@ -463,7 +464,7 @@ async def test_read_rejects_oversized_webp_before_sample_validation(
     path = tmp_path / "large.webp"
     path.write_bytes(_oversized_webp())
 
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("read-large-webp", "read", {"path": path.name})
     )
 
@@ -481,7 +482,7 @@ async def test_read_rejects_paging_arguments_for_images(
     path = tmp_path / "image.png"
     path.write_bytes(PNG)
 
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("read-paged-image", "read", {"path": path.name, argument: 1})
     )
 
@@ -496,7 +497,7 @@ async def test_read_image_near_cap_fits_default_context_budget(tmp_path: Path) -
     path = tmp_path / "near-cap.png"
     path.write_bytes(PNG + b"x" * (IMAGE_MAX_BYTES - len(PNG)))
 
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("read-near-cap", "read", {"path": path.name})
     )
     assert result["isError"] is False
@@ -630,7 +631,7 @@ def test_image_tool_result_persists_and_replays_byte_identically(tmp_path: Path)
 async def test_tui_renders_compact_image_read_card(tmp_path: Path) -> None:
     path = tmp_path / "screenshot.png"
     path.write_bytes(PNG)
-    raw_result = await ToolRegistry(tmp_path).execute(
+    raw_result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("read-call", "read", {"path": path.name})
     )
     tool_result = _validated_tool_result(raw_result, "read-call")

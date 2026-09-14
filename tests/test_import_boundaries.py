@@ -10,9 +10,9 @@ ROOT = Path(__file__).parents[1] / "src" / "zeta"
 FORBIDDEN = {
     "automations": {"tui", "cli"},
     "runtime": {"tui", "cli"},
-    "core": {"providers", "tools", "skills", "tui", "cli"},
-    "providers": {"tools", "skills", "tui", "cli"},
-    "tools": {"providers", "skills", "tui", "cli"},
+    "core": {"providers", "tools", "tui", "cli"},
+    "providers": {"tools", "tui", "cli"},
+    "tools": {"providers", "tui", "cli"},
     "skills": {"providers", "tui", "cli"},
     "server": {"tui"},
     "tui": {"server"},

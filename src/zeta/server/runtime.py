@@ -19,7 +19,7 @@ from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..settings import load_settings
 from ..settings import resolve as resolve_settings
-from ..skill_catalog import (
+from ..skills import (
     SkillCatalog,
     discover_session_skills,
     replace_skill_index,

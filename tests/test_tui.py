@@ -53,7 +53,7 @@ from zeta.providers.anthropic import (
     OAuthTokens,
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL, CodexBackend, CodexCredentialStore
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolStreamPublisher
 from zeta.tui.agent_card import AgentCard
 from zeta.tui.app import FullScreenPromptSession, TUIApp, background_notice
@@ -5405,7 +5405,7 @@ def test_full_stream_hostile_inline_markers_finish_within_timeout() -> None:
         from zeta.core.fake import FakeBackend
         from zeta.core.loop import AgentLoop
         from zeta.core.store import ConversationStore
-        from zeta.skill_catalog import SkillCatalog
+        from zeta.skills import SkillCatalog
         from zeta.tui.app import TUIApp
         from zeta.types import StreamEvent, StreamEventType, TextContent
 

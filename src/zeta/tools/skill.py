@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..skill_catalog import load_skill_prompt
+from ..skills import load_skill_prompt
 from .registry import ToolRegistry
 
 

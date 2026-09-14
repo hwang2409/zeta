@@ -25,7 +25,7 @@ from ..core.session import (
 from ..runtime import compose_runtime
 from ..settings import ResolvedConfig
 from ..settings import resolve as resolve_settings
-from ..skill_catalog import (
+from ..skills import (
     SkillCatalog,
     discover_session_skills,
     replace_skill_index,

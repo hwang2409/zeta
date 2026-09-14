@@ -42,7 +42,7 @@ from zeta.mcp.client import (
     translate_call_result,
 )
 from zeta.mcp.commands import rewrite_mcp_file
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.types import TextContent, ToolCall
 

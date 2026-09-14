@@ -24,7 +24,7 @@ from zeta.headless import run_headless
 from zeta.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.runtime import ServerRuntime
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp, create_app
 
 

@@ -1,6 +1,6 @@
 """Public compatibility surface for the session skill catalog."""
 
-from ..skill_catalog import (
+from .catalog import (
     SKILL_INDEX_BYTE_LIMIT,
     SkillCatalog,
     SkillMeta,

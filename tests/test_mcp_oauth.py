@@ -47,7 +47,7 @@ from zeta.mcp.resources import (
     format_resource_list,
     list_resources,
 )
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.types import TextContent
 
 

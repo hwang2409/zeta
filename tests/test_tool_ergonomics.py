@@ -11,7 +11,7 @@ import pytest
 
 from zeta.agent_receipt import build_agent_receipt, encode_json
 from zeta.core.store import ConversationStore
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.registry import _apply_error_governance
 from zeta.types import ToolCall

@@ -12,7 +12,7 @@ import pytest
 
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._process import BackgroundTaskRegistry, _group_exists
 from zeta.tui.render import format_status

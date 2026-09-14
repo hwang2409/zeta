@@ -20,7 +20,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
 from zeta.core.store import ConversationStore
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.types import MessageRole, StreamEventType, TextContent, ToolCall, ToolResult
 

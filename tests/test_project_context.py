@@ -12,7 +12,7 @@ from zeta.core.project_context import (
     resolve_prompt_argument,
 )
 from zeta.core.slash import SlashStatus, _format_status
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 
 
 def test_packaged_identity_loads_from_clean_wheel_install(
@@ -55,7 +55,7 @@ def test_packaged_identity_loads_from_clean_wheel_install(
             sys.executable,
             "-c",
             "from zeta.prompts import load_identity; "
-            "from zeta.skill_catalog import SkillCatalog; "
+            "from zeta.skills import SkillCatalog; "
             "from zeta.skills import discover_packaged_skills; "
             "print(load_identity(catalog=discover_packaged_skills())); "
             "print(discover_packaged_skills().load('review'))",

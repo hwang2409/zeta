@@ -30,7 +30,7 @@ from html import escape
 from pathlib import Path
 
 from ..prompts import load_identity
-from ..skill_catalog import SkillCatalog
+from ..skills import SkillCatalog
 from .process_env import subprocess_env
 
 AGENTS_FILENAME = "AGENTS.md"
