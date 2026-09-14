@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import CompleteEvent
+from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
@@ -17,6 +19,7 @@ from zeta.core.slash import (
     MODEL_PRICES,
     CompactionSummary,
     SlashStatus,
+    SlashModelInput,
     UNPRICED_MODEL_IDS,
     UsageTracker,
     UsageSnapshot,
@@ -31,6 +34,7 @@ from zeta.providers import PROVIDER_MODELS
 from zeta.providers.usage import normalize_usage
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings
+from zeta.tui.composer import SlashCompleter
 from zeta.types import (
     Message,
     MessageRole,
@@ -67,6 +71,56 @@ def session() -> FakeSlashSession:
             output_tokens_this_session=4,
         )
     )
+
+
+def _write_skill(path: Path, name: str, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nname: {name}\ndescription: {name} description\n---\n\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+def test_skill_slash_commands_follow_collision_precedence(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write_skill(home / "skills" / "review.md", "review", "home review")
+    _write_skill(home / "skills" / "custom.md", "custom", "home custom")
+    _write_skill(project / ".zeta" / "skills" / "review.md", "review", "project review")
+    _write_skill(project / ".zeta" / "skills" / "status.md", "status", "shadowed")
+    _write_skill(project / ".zeta" / "skills" / "unique.md", "unique", "unique body")
+    command_dir = home / "commands"
+    command_dir.mkdir(parents=True)
+    (command_dir / "custom.md").write_text("custom command", encoding="utf-8")
+
+    registry = create_slash_registry(zeta_home=home, project_dir=project)
+
+    result = registry.dispatch(session(), "/unique")
+    assert isinstance(result, SlashModelInput)
+    assert result.text == "unique body"
+    assert registry.dispatch(session(), "/status") is not None
+    assert registry.input_for_model("/custom") == "custom command"
+    assert "ignored skill" in "\n".join(registry.notices)
+    assert any("shadows built-in /status" in notice for notice in registry.notices)
+    assert any(
+        "shadows custom command /custom" in notice for notice in registry.notices
+    )
+
+
+def test_skill_commands_appear_in_completer_with_source_badge(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _write_skill(project / ".zeta" / "skills" / "unique.md", "unique", "unique body")
+    registry = create_slash_registry(project_dir=project)
+
+    completions = list(
+        SlashCompleter(registry).get_completions(
+            Document("/uni"), CompleteEvent(completion_requested=True)
+        )
+    )
+
+    assert len(completions) == 1
+    assert completions[0].text == "unique"
+    assert "[project] unique description" in str(completions[0].display_meta)
 
 
 @pytest.mark.asyncio
@@ -119,12 +173,10 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
     assert "vim_mode: on" in output
     assert f"retained_tail: {loop.context_assembler.retained_tail}" in output
     assert (
-        "tokens_used_this_session: "
-        f"{loop.context_assembler.tokens_used_this_session}"
+        f"tokens_used_this_session: {loop.context_assembler.tokens_used_this_session}"
     ) in output
     assert (
-        "tokens_in_current_context: "
-        f"{loop.context_assembler.token_count}"
+        f"tokens_in_current_context: {loop.context_assembler.token_count}"
     ) in output
     assert f"compaction_marker_count: {store.compaction_marker_count()}" in output
     assert "compaction_marker_count: 2" in output
@@ -185,13 +237,16 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
     ] == [(1, 10, 2), (2, 20, 5)]
     pricing = MODEL_PRICES["claude"]["claude-sonnet-4-6"]
     assert pricing is not None
-    expected_cost = sum(
-        snapshot.input_tokens * pricing.input
-        + snapshot.cache_read_input_tokens * pricing.cache_read
-        + snapshot.cache_creation_input_tokens * (pricing.cache_write or 0)
-        + snapshot.output_tokens * pricing.output
-        for snapshot in app.slash_status().usage_cost_by_model
-    ) / 1_000_000
+    expected_cost = (
+        sum(
+            snapshot.input_tokens * pricing.input
+            + snapshot.cache_read_input_tokens * pricing.cache_read
+            + snapshot.cache_creation_input_tokens * (pricing.cache_write or 0)
+            + snapshot.output_tokens * pricing.output
+            for snapshot in app.slash_status().usage_cost_by_model
+        )
+        / 1_000_000
+    )
     assert f"estimated_cost_usd: ${expected_cost:.6f}" in output
 
 
@@ -231,7 +286,9 @@ async def test_manual_compact_captures_summarization_cost(tmp_path: Path) -> Non
     baseline_tokens = assembler.uncached_input_tokens_this_session
     assert await app.slash_compact() != "compact: nothing to compact"
 
-    per_model = {snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model}
+    per_model = {
+        snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model
+    }
     snapshot = per_model["claude-sonnet-4-6"]
     assert snapshot.input_tokens >= baseline_tokens + 40
     assert snapshot.output_tokens >= 3
@@ -244,8 +301,16 @@ async def test_errored_turn_usage_does_not_leak_to_next_model(tmp_path: Path) ->
             self.calls.append((list(messages), list(tool_schemas)))
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
-                message=Message(role=MessageRole.ASSISTANT, content=[TextContent("boom")]),
-                data={"usage": {"input_tokens": 100, "output_tokens": 5, "total_tokens": 105}},
+                message=Message(
+                    role=MessageRole.ASSISTANT, content=[TextContent("boom")]
+                ),
+                data={
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 5,
+                        "total_tokens": 105,
+                    }
+                },
             )
             raise RuntimeError("backend exploded after usage")
 
@@ -257,7 +322,9 @@ async def test_errored_turn_usage_does_not_leak_to_next_model(tmp_path: Path) ->
     await app._consume_turn("first")
 
     app.model = "claude-opus-4-6"
-    per_model = {snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model}
+    per_model = {
+        snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model
+    }
     assert "claude-sonnet-4-6" in per_model
     assert "claude-opus-4-6" not in per_model
     assert per_model["claude-sonnet-4-6"].input_tokens == 100
@@ -385,9 +452,7 @@ def test_status_renders_compaction_history_and_empty_state() -> None:
         session().status,
         compaction_history=(CompactionSummary(3, 4, 120),),
     )
-    output = create_slash_registry().dispatch(
-        FakeSlashSession(status), "/status"
-    )
+    output = create_slash_registry().dispatch(FakeSlashSession(status), "/status")
     assert output is not None
     assert "compaction_history:\n  turn 3: 4 entries, 120 tokens saved" in output
 
@@ -603,9 +668,13 @@ def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> N
     )
     second_source = [
         store.append_message(Message(MessageRole.USER, [TextContent("new source")])),
-        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply")])),
+        store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("new reply")])
+        ),
         store.append_message(Message(MessageRole.USER, [TextContent("new source 2")])),
-        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply 2")])),
+        store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("new reply 2")])
+        ),
     ]
     store.append_compaction_marker(
         "second summary",
@@ -705,9 +774,7 @@ async def test_compact_command_uses_async_dispatch() -> None:
         async def slash_compact(self) -> str:
             return "compacted entries 1–2; tokens after: 3"
 
-    output = await create_slash_registry().dispatch_async(
-        CompactSession(), "/compact"
-    )
+    output = await create_slash_registry().dispatch_async(CompactSession(), "/compact")
 
     assert output == "compacted entries 1–2; tokens after: 3"
 

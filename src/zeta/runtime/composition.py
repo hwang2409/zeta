@@ -15,6 +15,7 @@ from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
 from ..loop import AgentLoop
 from ..settings import ResolvedConfig
+from ..skill_catalog import discover_session_skills
 from ..tools._user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from ..types import CompletionBackend, StreamEvent
@@ -112,12 +113,13 @@ def compose_runtime(
         }
         if max_turns is not None and max_turns > 0:
             loop_kwargs["max_turns"] = max_turns
-        registry = ToolRegistry(opened.store.cwd)
+        repo_root = discover_repo_root(Path(metadata.cwd))
+        skill_catalog = discover_session_skills(home=home, project_dir=repo_root)
+        registry = ToolRegistry(opened.store.cwd, skill_catalog=skill_catalog)
         cleanup.callback(registry.background_tasks.release_directory)
         loop = AgentLoop(backend, opened.store, registry=registry, **loop_kwargs)
         if metadata.plan_mode:
             loop.set_plan_mode(True)
-        repo_root = discover_repo_root(Path(metadata.cwd))
         loop.set_mcp_scope(home=home, project_dir=repo_root)
         external_tools = apply_external_tools(
             loop.tool_registry,

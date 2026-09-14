@@ -206,7 +206,7 @@ def load_project_context(
     if system_override is not None:
         sections: list[str] = [system_override]
     else:
-        sections = [load_identity()]
+        sections = [load_identity(home=home, project_dir=stop_at)]
         candidates: list[Path] = []
         home_agents = home / AGENTS_FILENAME
         if _present(home_agents):
