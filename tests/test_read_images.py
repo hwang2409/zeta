@@ -63,6 +63,27 @@ INVALID_IMAGE_FIXTURES = (
 )
 
 
+def _webp_data(chunk_type: bytes, chunk_data: bytes) -> bytes:
+    chunk = (
+        chunk_type
+        + len(chunk_data).to_bytes(4, "little")
+        + chunk_data
+        + (b"\x00" if len(chunk_data) % 2 else b"")
+    )
+    body = b"WEBP" + chunk
+    return b"RIFF" + len(body).to_bytes(4, "little") + body
+
+
+READ_WEBP_FIXTURES = (
+    (
+        "vp8",
+        _webp_data(b"VP8 ", b"\x00\x00\x00\x9d\x01\x2a\x01\x00\x01\x00"),
+    ),
+    ("vp8l", _webp_data(b"VP8L", b"/\x00\x00\x00\x00")),
+    ("animated-vp8x", _webp_data(b"VP8X", b"\x02" + b"\x00" * 9)),
+)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("format_name", "mime_type", "data"), IMAGE_FIXTURES)
 async def test_read_detects_images_by_magic_bytes(
@@ -184,15 +205,19 @@ def _malformed_webp_chunks() -> bytes:
     )
 
 
+def _leading_junk_webp() -> bytes:
+    junk = b"JUNK" + (0).to_bytes(4, "little")
+    codec = b"VP8X" + (10).to_bytes(4, "little") + b"\x00" * 10
+    body = b"WEBP" + junk + codec
+    return b"RIFF" + len(body).to_bytes(4, "little") + body
+
+
+def _oversized(data: bytes) -> bytes:
+    return data + b"x" * (IMAGE_MAX_BYTES + 1 - len(data))
+
+
 DECISION_TABLE_CASES = [
     pytest.param("row-1-text", b"plain text\n", {}, "text", id="row-1-text"),
-    pytest.param(
-        "row-2-oversized-valid-png",
-        PNG + b"x" * (IMAGE_MAX_BYTES + 1 - len(PNG)),
-        {},
-        "size",
-        id="row-2-oversized-valid-png",
-    ),
     pytest.param(
         "row-2-oversized-invalid-webp",
         _oversized_invalid_webp(),
@@ -214,14 +239,51 @@ DECISION_TABLE_CASES = [
         "size",
         id="row-2-oversized-lookalike",
     ),
+]
+DECISION_TABLE_CASES.extend(
     pytest.param(
-        "row-3-oversized-invalid-webp-with-paging",
-        _oversized_invalid_webp(),
+        f"row-2-oversized-valid-{format_name}",
+        _oversized(data),
+        {},
+        "size",
+        id=f"row-2-oversized-valid-{format_name}",
+    )
+    for format_name, _mime_type, data in IMAGE_FIXTURES
+)
+DECISION_TABLE_CASES.extend(
+    pytest.param(
+        f"row-2-oversized-invalid-{format_name}",
+        _oversized(invalid_data),
+        {},
+        "size",
+        id=f"row-2-oversized-invalid-{format_name}",
+    )
+    for (format_name, _mime_type, _valid_data), (_invalid_mime, invalid_data) in zip(
+        IMAGE_FIXTURES, INVALID_IMAGE_FIXTURES, strict=True
+    )
+)
+DECISION_TABLE_CASES.extend(
+    pytest.param(
+        f"row-3-oversized-valid-{format_name}-with-paging",
+        _oversized(data),
         {"offset": 1},
         "paging",
-        id="row-3-oversized-with-paging",
-    ),
-]
+        id=f"row-3-oversized-valid-{format_name}-with-paging",
+    )
+    for format_name, _mime_type, data in IMAGE_FIXTURES
+)
+DECISION_TABLE_CASES.extend(
+    pytest.param(
+        f"row-3-oversized-invalid-{format_name}-with-paging",
+        _oversized(invalid_data),
+        {"offset": 1},
+        "paging",
+        id=f"row-3-oversized-invalid-{format_name}-with-paging",
+    )
+    for (format_name, _mime_type, _valid_data), (_invalid_mime, invalid_data) in zip(
+        IMAGE_FIXTURES, INVALID_IMAGE_FIXTURES, strict=True
+    )
+)
 DECISION_TABLE_CASES.extend(
     pytest.param(
         f"row-4-{format_name}-with-paging",
@@ -307,6 +369,13 @@ DECISION_TABLE_CASES.extend(
             (False, _malformed_webp_chunks().decode()),
             id="row-6-malformed-webp-chunks",
         ),
+        pytest.param(
+            "row-6-leading-junk-webp",
+            _leading_junk_webp(),
+            {},
+            (False, _leading_junk_webp().decode()),
+            id="row-6-leading-junk-webp",
+        ),
     ]
 )
 
@@ -352,6 +421,25 @@ async def test_image_read_decision_table(
         expected_error, expected_text = expected
         assert result["isError"] is expected_error
         assert result["content"][0]["text"] == expected_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("case_name", "data"), READ_WEBP_FIXTURES)
+async def test_read_detects_webp_codecs(
+    tmp_path: Path, case_name: str, data: bytes
+) -> None:
+    path = tmp_path / f"{case_name}.bin"
+    path.write_bytes(data)
+
+    result = await ToolRegistry(tmp_path).execute(
+        ToolCall(f"read-{case_name}", "read", {"path": path.name})
+    )
+
+    assert result["isError"] is False
+    assert result["content"][1]["type"] == "image"
+    assert result["content"][1]["mimeType"] == "image/webp"
+    assert base64.b64decode(result["content"][1]["data"]) == data
+    assert result["structuredContent"]["format"] == "webp"
 
 @pytest.mark.asyncio
 async def test_read_rejects_oversized_images_with_size_and_cap(tmp_path: Path) -> None:

@@ -119,8 +119,14 @@ def png_block(*, caption: str | None = None, data: bytes | None = None) -> dict[
 
 
 def webp_data(chunk_type: bytes, chunk_data: bytes) -> bytes:
-    body = b"WEBP" + chunk_type + len(chunk_data).to_bytes(4, "little") + chunk_data
-    return b"RIFF" + (len(body) + 4).to_bytes(4, "little") + body
+    chunk = (
+        chunk_type
+        + len(chunk_data).to_bytes(4, "little")
+        + chunk_data
+        + (b"\x00" if len(chunk_data) % 2 else b"")
+    )
+    body = b"WEBP" + chunk
+    return b"RIFF" + len(body).to_bytes(4, "little") + body
 
 
 @pytest.mark.parametrize(

@@ -254,7 +254,7 @@ def _webp_chunk_dimensions(
 
 def _parse_webp(
     data: bytes, total_size: int
-) -> tuple[ImageValidation, tuple[int, int] | None]:
+) -> tuple[ImageValidation, tuple[bytes, int, int] | None]:
     if len(data) < 12:
         return ("incomplete" if len(data) < total_size else "invalid", None)
     if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
@@ -265,11 +265,13 @@ def _parse_webp(
     if len(data) < riff_end:
         return "incomplete", None
     offset = 12
-    image_dimensions: tuple[int, int] | None = None
+    codec_chunk: tuple[bytes, int, int] | None = None
     while offset < riff_end:
         if offset + 8 > riff_end:
             return "invalid", None
         chunk_type = data[offset : offset + 4]
+        if offset == 12 and chunk_type not in {b"VP8 ", b"VP8L", b"VP8X"}:
+            return "invalid", None
         chunk_size = int.from_bytes(data[offset + 4 : offset + 8], "little")
         payload_offset = offset + 8
         chunk_end = payload_offset + chunk_size
@@ -284,12 +286,12 @@ def _parse_webp(
             )
             if chunk_dimensions is None:
                 return "invalid", None
-            if image_dimensions is None:
-                image_dimensions = chunk_dimensions
+            if codec_chunk is None:
+                codec_chunk = (chunk_type, payload_offset, chunk_size)
         offset = padded_end
-    if image_dimensions is None:
+    if codec_chunk is None:
         return "invalid", None
-    return "valid", image_dimensions
+    return "valid", codec_chunk
 
 
 def _webp_validation_status(data: bytes, total_size: int) -> ImageValidation:
@@ -375,15 +377,11 @@ def image_dimensions(
 
 
 def _webp_dimensions(data: bytes) -> tuple[int, int] | None:
-    if len(data) < 20 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+    status, codec_chunk = _parse_webp(data, len(data))
+    if status != "valid" or codec_chunk is None:
         return None
-    chunk_type = data[12:16]
-    chunk_size = int.from_bytes(data[16:20], "little")
-    if chunk_type not in {b"VP8 ", b"VP8L", b"VP8X"}:
-        return None
-    if len(data) < 20 + chunk_size:
-        return None
-    return _webp_chunk_dimensions(data, chunk_type, 20, chunk_size)
+    chunk_type, payload_offset, chunk_size = codec_chunk
+    return _webp_chunk_dimensions(data, chunk_type, payload_offset, chunk_size)
 
 
 def image_description(
