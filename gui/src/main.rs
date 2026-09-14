@@ -15,7 +15,7 @@ use gpui::{
 };
 use gpui_kit::component::{
     alert::Alert,
-    button::{Button, ButtonCustomVariant, ButtonVariants},
+    button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
     input::{InputEvent, Textarea, TextareaState},
     message_scroller::{MessageScroller, MessageScrollerState},
@@ -1511,18 +1511,13 @@ impl ZetaView {
         } else {
             roles.fill_rest
         };
-        // Enabled send: inverted — text color on canvas, hover fades to muted.
-        let send_variant = ButtonCustomVariant::new(cx)
-            .color(cx.theme().foreground)
-            .foreground(cx.theme().background)
-            .hover(cx.theme().muted_foreground)
-            .active(cx.theme().muted_foreground);
         let model_target = self
             .state
             .metrics
             .model
             .clone()
             .unwrap_or_else(|| "no model".to_owned());
+        let composer_hint = self.composer_hint();
 
         let drop_enabled = can_send;
         // Overlay lights only when the drag is actually over the composer,
@@ -1589,26 +1584,6 @@ impl ZetaView {
             .when_some(self.composer_image_error.clone(), |composer, error| {
                 composer.child(div().mb_1().child(Alert::error("image-error", error)))
             })
-            // Target line above the input: mono muted with the model name in
-            // the accent tier. Reads as "which target this composer is pointed
-            // at" — the same role wiki's composer target-line plays.
-            .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap_1()
-                    .h(theme::COMPOSER_TARGET_HEIGHT)
-                    .text_size(theme::label_small(cx.theme().font_size))
-                    .debug_selector(|| "composer-target".into())
-                    .child(div().text_color(roles.target_label).child("→"))
-                    .child(
-                        div()
-                            .text_color(roles.target_value)
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .debug_selector(|| "composer-target-name".into())
-                            .child(model_target),
-                    ),
-            )
             // Inline row: textarea flows, action buttons sit inline — a compact
             // 64px grid rather than a 120px v_flex stack. min-height 44px keeps
             // the textarea legible without inflating the composer floor.
@@ -1649,9 +1624,15 @@ impl ZetaView {
                             })),
                     )
                     .child(if can_send {
+                        // Send now paints as the primary/accent action —
+                        // the composer's one bold surface. Sized to its
+                        // label with a modest floor so `Send` and, when
+                        // Kit paints a loading state, the spinner still
+                        // sit inside; paired with the 40x40 attach hit
+                        // area on the same row for a clean action row.
                         Button::new("send")
                             .debug_selector(|| "send-button".into())
-                            .custom(send_variant)
+                            .primary()
                             .label("Send")
                             .h(theme::SEND_BUTTON_HEIGHT)
                             .min_w(theme::SEND_BUTTON_MIN_WIDTH)
@@ -1659,12 +1640,12 @@ impl ZetaView {
                             .on_click(cx.listener(|view, _, _, cx| view.send_composer(cx)))
                             .into_any_element()
                     } else {
-                        // Disabled: paint the outline ourselves. Kit's Custom
-                        // variant derives the border color from the fill color
-                        // (button.rs:1011), so a transparent fill kills the
-                        // border too. A plain div sets fill and border
-                        // independently, with the whole presentation dimmed to
-                        // 0.55 opacity per contract line 85.
+                        // Disabled: paint the outline ourselves. Kit's
+                        // primary variant derives its border from its
+                        // fill, so a transparent fill kills the border
+                        // too. A plain div sets fill and border
+                        // independently, with the whole presentation
+                        // dimmed to 0.55 opacity per contract line 85.
                         div()
                             .debug_selector(|| "send-button".into())
                             .h_flex()
@@ -1682,6 +1663,49 @@ impl ZetaView {
                             .child("Send")
                             .into_any_element()
                     }),
+            )
+            // Composer footer: model on the left, kb hint on the right.
+            // Both quiet — the composer's role is the input row above;
+            // the footer only carries what the operator wants to glance
+            // at (the model this send will route to) plus the shortcut
+            // reminder. Proximity: metadata sits next to what it
+            // describes (laws-of-ux).
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .w_full()
+                    .mt_1()
+                    .h(theme::COMPOSER_TARGET_HEIGHT)
+                    .text_size(theme::label_small(cx.theme().font_size))
+                    .debug_selector(|| "composer-footer".into())
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap_1()
+                            .min_w_0()
+                            .max_w(px(260.))
+                            .truncate()
+                            .debug_selector(|| "composer-target".into())
+                            .child(div().text_color(roles.target_label).child("→"))
+                            .child(
+                                div()
+                                    .text_color(roles.target_value)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .debug_selector(|| "composer-target-name".into())
+                                    .child(model_target),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(cx.theme().muted_foreground)
+                            .debug_selector(|| "composer-hint".into())
+                            .child(composer_hint),
+                    ),
             )
             .when(drag_active, |composer| {
                 composer.child(self.render_drop_target(cx))
@@ -1940,27 +1964,12 @@ impl ZetaView {
     }
 
     fn render_run_header(&self, cx: &App) -> gpui::AnyElement {
-        // Two-band run header (contract line 83): band 1 (44px) carries the
-        // active session label + state pill + step text; band 2 (40px)
-        // carries the runtime metadata separated by 1x14 vertical rules.
-        // The step text mirrors the composer's own hint so the "what am I
-        // waiting for?" answer sits at both the top and the input row.
-        div()
-            .v_flex()
-            .flex_shrink_0()
-            .id("run-header")
-            .debug_selector(|| "run-header".into())
-            .child(self.render_run_header_band1(cx))
-            .child(self.render_run_header_band2(cx))
-            .into_any_element()
-    }
-
-    fn render_run_header_band1(&self, cx: &App) -> gpui::AnyElement {
-        // Band 1 shape (contract line 83): min-height 44, padding 7x14, a
-        // ticket-labeled title on the left, a state pill in the middle and
-        // the step/blocker text filling the rest. Session label = the
-        // sidebar's own preview so the operator never loses track of which
-        // conversation the pill and metrics belong to.
+        // Single-row run header (ZETA-123): session title on the left, a
+        // compact metadata cluster on the right — quiet tokens/cache, a
+        // dot + state word (glyph, not a filled pill), and the model
+        // name. The keyboard hint that used to sit here now lives in the
+        // composer footer, next to the send controls, so meta stays
+        // close to what it describes (laws-of-ux: Proximity).
         let session_label = self
             .state
             .active_session
@@ -1973,146 +1982,110 @@ impl ZetaView {
                     .map(|row| sidebar::session_label(row, Some(&self.state.transcript)))
             })
             .unwrap_or_else(|| "No session".to_owned());
-        let (pill_bg, pill_fg) = self.status_pill_colors(cx);
+        let dot_color = self.status_dot_color(cx);
         let mode_word = self.footer_mode_word();
         let show_streaming_dot = self.state.streaming || self.state.thinking;
-        let (step_text, step_color) = self.run_header_step(cx);
+        let model_name = self
+            .state
+            .metrics
+            .model
+            .clone()
+            .unwrap_or_else(|| "—".into());
         div()
-            .debug_selector(|| "run-header-band1".into())
+            .id("run-header")
+            .debug_selector(|| "run-header".into())
             .h_flex()
             .items_center()
-            .gap(px(10.))
             .flex_shrink_0()
+            .gap(px(10.))
             .min_h(theme::HEADER_BAND1_MIN_HEIGHT)
             .py(px(7.))
             .px(px(14.))
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                // The session label is the ticket-shaped anchor for the
-                // whole header — mono 600 at the normal text tier so it
-                // reads as the primary identity of the run.
+                // Session title — the primary identity of the run. Mono
+                // 600 at the normal text tier; truncates before it hurts
+                // the metadata cluster on the right.
                 div()
                     .debug_selector(|| "run-header-title".into())
-                    .flex_shrink_0()
-                    .max_w(px(320.))
+                    .flex_1()
+                    .min_w_0()
                     .truncate()
+                    .max_w(px(320.))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(cx.theme().foreground)
                     .child(session_label),
             )
+            // Right-aligned metadata cluster. `flex_shrink_0` on each
+            // element and `min_w_0 truncate` on the tokens/model slots
+            // keeps every piece readable while the transcript column
+            // absorbs the reflow when the window narrows.
             .child(
-                // State pill: solid fill + canvas text, mono 600 lowercase,
-                // near-square. Neutral states land on accent; the offline
-                // mode lands on danger for the scarce, load-bearing alarm
-                // signal. Kept as "footer-mode" for test stability.
                 div()
-                    .debug_selector(|| "footer-mode".into())
                     .flex_shrink_0()
-                    .py(theme::STATE_PILL_PADDING_Y)
-                    .px(theme::STATE_PILL_PADDING_X)
-                    .bg(pill_bg)
-                    .text_color(pill_fg)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(mode_word),
-            )
-            .when(show_streaming_dot, |row| {
-                row.child(streaming_dot(cx.theme().primary))
-            })
-            .child(
-                // Step text — the one-line explanation of what the run is
-                // waiting for. Reuses `composer_hint` so the header and
-                // composer never drift out of sync.
-                div()
-                    .flex_1()
+                    .max_w(px(240.))
                     .min_w_0()
                     .truncate()
-                    .debug_selector(|| "run-header-step".into())
-                    .text_color(step_color)
-                    .child(step_text),
-            )
-            .into_any_element()
-    }
-
-    fn render_run_header_band2(&self, cx: &App) -> gpui::AnyElement {
-        // Band 2 shape (contract line 83): min-height 40, metadata items
-        // separated by 1x14 vertical rules at the faint tier. The band is
-        // strictly RUNTIME metadata — usage on the left, model on the
-        // right — because band 1 already carries the composer hint / step
-        // text and the composer's own target line already prints the model
-        // above the input. Repeating either here paints the same text
-        // twice on every screen and pushes the right-hand slice off the
-        // window edge on wider model names.
-        //
-        // Left slice `flex_1 min_w_0 truncate` shrinks and ellipses before
-        // the model chip, so the model never clips at the window edge on
-        // any transcript width.
-        div()
-            .id("status-bar")
-            .debug_selector(|| "status-bar".into())
-            .h_flex()
-            .items_center()
-            .flex_shrink_0()
-            .gap(px(10.))
-            .px(px(14.))
-            .min_h(theme::HEADER_BAND2_MIN_HEIGHT)
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .text_color(theme::palette::text_faint())
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
+                    .text_color(theme::palette::text_faint())
                     .debug_selector(|| "status-metrics".into())
                     .child(polish::status_label(&self.state.metrics)),
             )
             .child(status_rule(cx))
             .child(
-                // Model chip pinned right. `max_w` caps the slice at a
-                // readable measure so an unusually long model name
-                // truncates INSIDE the chip rather than pushing the whole
-                // band past the right edge; `min_w_0 truncate` lets the
-                // ellipsis land cleanly on the chip's own boundary.
+                // Compact state indicator: dot + word. Neutral states
+                // paint the dot in the accent hue; offline paints it in
+                // danger. This replaces the filled pill so the header
+                // reads as a quiet status band, not a call-to-action.
+                // The `footer-mode` selector stays so existing offline /
+                // pill-fill guards continue to bind here.
+                div()
+                    .debug_selector(|| "footer-mode".into())
+                    .flex_shrink_0()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_color(cx.theme().muted_foreground)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(
+                        div()
+                            .debug_selector(|| "run-header-status-dot".into())
+                            .w(theme::STREAM_DOT_SIZE)
+                            .h(theme::STREAM_DOT_SIZE)
+                            .rounded_full()
+                            .bg(dot_color),
+                    )
+                    .child(mode_word),
+            )
+            .when(show_streaming_dot, |row| {
+                row.child(streaming_dot(cx.theme().primary))
+            })
+            .child(status_rule(cx))
+            .child(
+                // Model chip pinned right — same faint tier as the
+                // metrics slot so the two read as one metadata run.
+                // `max_w` caps the slice so a long model name truncates
+                // inside the chip rather than pushing the header past
+                // the window edge.
                 div()
                     .flex_shrink_0()
-                    .max_w(px(220.))
+                    .max_w(px(200.))
                     .min_w_0()
                     .truncate()
                     .text_color(theme::palette::text_faint())
                     .debug_selector(|| "run-header-model".into())
-                    .child(
-                        self.state
-                            .metrics
-                            .model
-                            .clone()
-                            .unwrap_or_else(|| "—".into()),
-                    ),
+                    .child(model_name),
             )
             .into_any_element()
     }
 
-    /// The one-line "step" text painted in band 1. Danger tier while the
-    /// connection is lost so the header carries its own blocker signal
-    /// before the transcript-level banner picks it up.
-    fn run_header_step(&self, cx: &App) -> (&'static str, gpui::Hsla) {
-        let color = match &self.state.connection {
-            ConnectionState::Lost(_) => cx.theme().danger,
-            _ => cx.theme().muted_foreground,
-        };
-        (self.composer_hint(), color)
-    }
-
-    fn status_pill_colors(&self, cx: &App) -> (gpui::Hsla, gpui::Hsla) {
-        // Offline lands on the negative pill (solid danger); every other
-        // mode paints as neutral accent. The wiki "positive" state (success
-        // fill) has no zeta equivalent today — the assistant never reports
-        // an explicit merge-ready state — so the pill only picks between
-        // neutral and negative, never surprising the eye with green chrome.
-        let theme = cx.theme();
+    /// Colour for the run-header status dot. Offline paints the dot in
+    /// danger — the scarce, load-bearing alarm signal; every other
+    /// state paints in the accent hue.
+    fn status_dot_color(&self, cx: &App) -> gpui::Hsla {
         match &self.state.connection {
-            ConnectionState::Lost(_) => (theme.danger, theme.danger_foreground),
-            _ => (theme.primary, theme.primary_foreground),
+            ConnectionState::Lost(_) => cx.theme().danger,
+            _ => cx.theme().primary,
         }
     }
 }

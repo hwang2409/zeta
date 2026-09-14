@@ -4385,27 +4385,43 @@ fn connection_lost_paints_a_blocker_row_with_a_danger_rail(cx: &mut TestAppConte
 }
 
 #[gpui::test]
-fn status_pill_paints_a_solid_fill_and_flips_to_danger_when_offline(cx: &mut TestAppContext) {
-    // Contract line 83: neutral state = solid accent, negative = solid
-    // danger. The pill carries the single load-bearing color on the strip;
-    // a regression that dropped the fill back to text-tone would erase the
-    // wiki-run recognisability.
+fn status_dot_paints_accent_at_rest_and_danger_when_offline(cx: &mut TestAppContext) {
+    // ZETA-123: the state indicator is a small dot next to a mode word,
+    // not a filled pill — the header reads as a quiet status band, not a
+    // call-to-action. The dot still carries the single load-bearing
+    // color on the strip: neutral = accent, offline = danger. A
+    // regression that dropped the color (or restored a full-width pill
+    // fill) would show up here.
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| window.draw(cx).clear(cx));
-    let pill = visual
+    let mode = visual
         .debug_bounds("footer-mode")
-        .expect("footer mode pill renders");
+        .expect("footer mode indicator renders");
+    let dot = visual
+        .debug_bounds("run-header-status-dot")
+        .expect("state dot renders");
+    // The dot lives inside the footer-mode cluster.
+    assert!(
+        mode.contains(&dot.center()),
+        "state dot must sit inside the footer-mode cluster"
+    );
+    // Dot is a small square (round via border-radius), not the wide
+    // filled pill it replaced.
+    assert!(
+        dot.size.width <= px(12.),
+        "state dot must stay a small glyph, saw width {:?}",
+        dot.size.width
+    );
     visual.update(|window, cx| {
         let theme = cx.theme();
-        let scaled_pill = pill.scale(window.scale_factor());
+        let scaled = dot.scale(window.scale_factor());
         let neutral = window.painted_quads().into_iter().find(|quad| {
             quad.background == theme.primary.into()
-                && quad.bounds.top() >= scaled_pill.top() - px(1.).scale(window.scale_factor())
-                && quad.bounds.bottom()
-                    <= scaled_pill.bottom() + px(1.).scale(window.scale_factor())
+                && quad.bounds.top() >= scaled.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom() <= scaled.bottom() + px(1.).scale(window.scale_factor())
         });
-        assert!(neutral.is_some(), "neutral pill paints a solid accent fill");
+        assert!(neutral.is_some(), "neutral state paints the dot in accent");
     });
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
@@ -4413,22 +4429,18 @@ fn status_pill_paints_a_solid_fill_and_flips_to_danger_when_offline(cx: &mut Tes
         });
         window.draw(cx).clear(cx);
     });
-    let pill = visual
-        .debug_bounds("footer-mode")
-        .expect("footer mode pill renders offline");
+    let dot = visual
+        .debug_bounds("run-header-status-dot")
+        .expect("state dot renders while offline");
     visual.update(|window, cx| {
         let theme = cx.theme();
-        let scaled_pill = pill.scale(window.scale_factor());
+        let scaled = dot.scale(window.scale_factor());
         let danger = window.painted_quads().into_iter().find(|quad| {
             quad.background == theme.danger.into()
-                && quad.bounds.top() >= scaled_pill.top() - px(1.).scale(window.scale_factor())
-                && quad.bounds.bottom()
-                    <= scaled_pill.bottom() + px(1.).scale(window.scale_factor())
+                && quad.bounds.top() >= scaled.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom() <= scaled.bottom() + px(1.).scale(window.scale_factor())
         });
-        assert!(
-            danger.is_some(),
-            "offline mode paints the negative pill in danger"
-        );
+        assert!(danger.is_some(), "offline state paints the dot in danger");
     });
 }
 
@@ -4701,36 +4713,37 @@ fn session_edit_modal_matches_the_wiki_flat_panel_shape(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
-fn footer_status_strip_paints_vertical_rules_between_metadata(cx: &mut TestAppContext) {
-    // The wiki header pattern rules adjacent metadata with 1x14 vertical
-    // separators. Band 2 now carries only two metadata slices — the usage
-    // strip on the left and the model chip pinned right — so a single
-    // rule sits between them. A regression that dropped the rule would
-    // fuse the strip into one uniform run; one that reintroduced the
-    // composer-hint duplicate would paint two rules again.
+fn run_header_rules_metadata_cluster_with_two_vertical_separators(cx: &mut TestAppContext) {
+    // The single-row header (ZETA-123) carries three right-aligned
+    // metadata pieces — tokens/cache, dot + state word, and the model
+    // chip — separated by two 1x14 vertical rules at the border tier.
+    // A regression that dropped a rule would fuse the metadata slots
+    // into one uniform run; one that added extra rules would paint
+    // over the strip. The old two-band strip is gone, so `run-header`
+    // now hosts these rules directly.
     let (window, _view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| window.draw(cx).clear(cx));
-    let bar = visual
-        .debug_bounds("status-bar")
-        .expect("status bar renders");
+    let header = visual
+        .debug_bounds("run-header")
+        .expect("run header renders");
     visual.update(|window, cx| {
         let theme = cx.theme();
-        let scaled_bar = bar.scale(window.scale_factor());
+        let scaled = header.scale(window.scale_factor());
         let rules: Vec<_> = window
             .painted_quads()
             .into_iter()
             .filter(|quad| {
                 quad.background == theme.border.into()
-                    && quad.bounds.top() >= scaled_bar.top()
-                    && quad.bounds.bottom() <= scaled_bar.bottom()
+                    && quad.bounds.top() >= scaled.top()
+                    && quad.bounds.bottom() <= scaled.bottom()
                     && quad.bounds.size.width <= px(2.).scale(window.scale_factor())
             })
             .collect();
         assert_eq!(
             rules.len(),
-            1,
-            "expected one rule between metrics and model chip, saw {}",
+            2,
+            "expected two vertical rules between metadata slots, saw {}",
             rules.len()
         );
     });
@@ -5055,65 +5068,157 @@ fn sidebar_right_rule_paints_the_subtle_border(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn run_header_paints_two_stacked_bands(cx: &mut TestAppContext) {
-    // Contract line 83 pins the run header at two stacked bands — band 1
-    // at 44px with the session label + state pill + step, band 2 at 40px
-    // with the metrics + rules. A regression that dropped either band
-    // (or merged them into one) would drift the header height and hide
-    // one signal.
+fn run_header_paints_a_single_row_without_the_keyboard_hint(cx: &mut TestAppContext) {
+    // ZETA-123: the run header collapses to ONE 44px row. The session
+    // title anchors the left; a right-aligned metadata cluster carries
+    // quiet tokens/cache, a dot + state word (not a filled pill), and
+    // the model name. The keyboard shortcut hint that used to sit here
+    // now lives in the composer footer — metadata sits next to what it
+    // describes (laws-of-ux: Proximity). A regression that reintroduced
+    // the second band, brought the "Enter sends" fallback back to the
+    // header, or dropped the model chip out of it would show up here.
     let (window, _view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| window.draw(cx).clear(cx));
-    let band1 = visual
-        .debug_bounds("run-header-band1")
-        .expect("run header band 1 renders");
-    // Band 2 keeps the "status-bar" selector for backwards compatibility
-    // with the existing status-strip guard so both share one paint probe.
-    let band2 = visual
-        .debug_bounds("status-bar")
-        .expect("run header band 2 (status-bar) renders");
-    // Bands stack — band 2 sits directly below band 1.
-    assert!(
-        band2.top() >= band1.bottom() - px(2.),
-        "band 2 must sit below band 1 (band1.bottom={:?}, band2.top={:?})",
-        band1.bottom(),
-        band2.top()
-    );
-    // Heights land on the contract floors within one logical pixel.
-    let h1_delta = if band1.size.height > theme::HEADER_BAND1_MIN_HEIGHT {
-        band1.size.height - theme::HEADER_BAND1_MIN_HEIGHT
+    let header = visual
+        .debug_bounds("run-header")
+        .expect("run header renders");
+    // The header is one row on the 44px floor — a second band would
+    // push its height past ~52px.
+    let delta = if header.size.height > theme::HEADER_BAND1_MIN_HEIGHT {
+        header.size.height - theme::HEADER_BAND1_MIN_HEIGHT
     } else {
-        theme::HEADER_BAND1_MIN_HEIGHT - band1.size.height
+        theme::HEADER_BAND1_MIN_HEIGHT - header.size.height
     };
     assert!(
-        h1_delta <= px(2.),
-        "band 1 height {:?} must land on the 44px floor",
-        band1.size.height
+        delta <= px(4.),
+        "run header height {:?} must land on the 44px floor",
+        header.size.height
     );
-    let h2_delta = if band2.size.height > theme::HEADER_BAND2_MIN_HEIGHT {
-        band2.size.height - theme::HEADER_BAND2_MIN_HEIGHT
-    } else {
-        theme::HEADER_BAND2_MIN_HEIGHT - band2.size.height
-    };
+    // Old two-band selectors must be gone.
     assert!(
-        h2_delta <= px(2.),
-        "band 2 height {:?} must land on the 40px floor",
-        band2.size.height
+        visual.debug_bounds("run-header-band1").is_none(),
+        "the two-band selector `run-header-band1` must be gone",
     );
-    // Band 1 carries the state pill and the step — both must render.
+    assert!(
+        visual.debug_bounds("status-bar").is_none(),
+        "the two-band selector `status-bar` must be gone",
+    );
+    assert!(
+        visual.debug_bounds("run-header-step").is_none(),
+        "step text must not sit in the header — the composer footer owns the hint",
+    );
+    // The single-row header carries the title, dot+word, and model chip.
+    assert!(
+        visual.debug_bounds("run-header-title").is_some(),
+        "header must render the session title"
+    );
     assert!(
         visual.debug_bounds("footer-mode").is_some(),
-        "band 1 must render the state pill"
+        "header must render the state indicator"
     );
     assert!(
-        visual.debug_bounds("run-header-step").is_some(),
-        "band 1 must render the step text"
+        visual.debug_bounds("run-header-status-dot").is_some(),
+        "state indicator must paint as a dot glyph, not a filled pill"
     );
-    // Band 2 carries the metrics rules.
     assert!(
         visual.debug_bounds("run-header-model").is_some(),
-        "band 2 must render the model chip"
+        "header must render the model chip"
     );
+    assert!(
+        visual.debug_bounds("status-metrics").is_some(),
+        "header must render the quiet metrics slot"
+    );
+    // The keyboard hint moved to the composer footer.
+    let footer = visual
+        .debug_bounds("composer-footer")
+        .expect("composer footer renders");
+    let hint = visual
+        .debug_bounds("composer-hint")
+        .expect("keyboard hint renders in the composer footer");
+    assert!(
+        footer.contains(&hint.center()),
+        "the keyboard hint must sit inside the composer footer, not the header"
+    );
+    // The model chip has moved out of the input row and now sits in
+    // the composer footer next to the hint.
+    let target = visual
+        .debug_bounds("composer-target")
+        .expect("composer target renders in the footer");
+    assert!(
+        footer.contains(&target.center()),
+        "the composer model target must sit in the footer, not above the input row"
+    );
+}
+
+#[gpui::test]
+fn sidebar_new_session_reads_as_an_action_button(cx: &mut TestAppContext) {
+    // ZETA-123: the top of the sidebar exposes a "New session" ACTION
+    // — a ghost button with a `+` glyph, not a large centered heading.
+    // Guards the button-affordance shape so a regression that drops the
+    // icon or reverts it to a plain label surfaces here.
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let button = visual
+        .debug_bounds("new-session-button")
+        .expect("new-session action button renders");
+    let slot = visual
+        .debug_bounds("sidebar-new-session")
+        .expect("new-session slot renders");
+    assert!(
+        slot.contains(&button.center()),
+        "the new-session button must sit inside its sidebar slot"
+    );
+    // Compact ghost action — height stays within one row of the
+    // sidebar rhythm, well under a modal CTA.
+    assert!(
+        button.size.height <= theme::SIDEBAR_ROW_HEIGHT + px(2.),
+        "new-session button height {:?} must not exceed one sidebar row",
+        button.size.height
+    );
+}
+
+#[gpui::test]
+fn sidebar_row_menu_stays_hidden_until_the_row_is_hovered(cx: &mut TestAppContext) {
+    // ZETA-123: the per-row `...` menu clutters the sidebar when it's
+    // permanently visible. It now sits at opacity 0 at rest, revealed
+    // by the row's own `.group()` hover — one pointer position only
+    // lights up ONE row's menu, never every row at once. A regression
+    // that dropped the `opacity(0)` gate (or the group scoping) would
+    // show every menu again.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::SessionManagement(true), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    let menu = visual
+        .debug_bounds("session-menu")
+        .expect("session menu renders when session-management is enabled");
+    // The menu paints inside the sidebar column so its hit target
+    // stays reachable, but must land under an opacity-0 wrapper at
+    // rest — the rendered ellipsis icon must NOT paint any visible
+    // foreground quad on the header/menu bounds before hover.
+    visual.update(|window, _cx| {
+        let scaled = menu.scale(window.scale_factor());
+        let opaque_paint = window.painted_quads().into_iter().any(|quad| {
+            let inside = quad.bounds.top() >= scaled.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom() <= scaled.bottom() + px(1.).scale(window.scale_factor())
+                && quad.bounds.left() >= scaled.left() - px(1.).scale(window.scale_factor())
+                && quad.bounds.right() <= scaled.right() + px(1.).scale(window.scale_factor());
+            // Any non-transparent background fill drawn tightly on the
+            // menu bounds fails this contract — the reveal-on-hover
+            // treatment must keep the menu invisible at rest.
+            inside && quad.background != gpui::transparent_black().into()
+        });
+        assert!(
+            !opaque_paint,
+            "session menu paints an opaque quad at rest — hover-reveal broke",
+        );
+    });
 }
 
 /// Probe view for the scrollbar guard. Renders a Kit `Scrollbar` in

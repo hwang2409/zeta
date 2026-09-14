@@ -109,16 +109,10 @@ pub const ATTENTION_RAIL_WIDTH: Pixels = px(2.);
 /// 8px lane so the transcript column keeps its readable measure.
 pub const SCROLLBAR_THUMB_WIDTH: Pixels = px(8.);
 
-/// Two-band header/status strip heights. Band 1 (title + state pill) sits at
-/// 44px; band 2 (metadata) sits at 40px so the strip is a compact 84px
-/// column rather than a fluid banner.
+/// Single-row run header height. Session title on the left, quiet metadata
+/// cluster (tokens/cache, dot + state word, model) pinned right. Contract
+/// line 83 (ZETA-123): one 44px row, not two stacked bands.
 pub const HEADER_BAND1_MIN_HEIGHT: Pixels = px(44.);
-pub const HEADER_BAND2_MIN_HEIGHT: Pixels = px(40.);
-
-/// State pill padding — near-square shape the wiki agent-run uses to carry a
-/// one-word state label ("ready", "streaming", "offline").
-pub const STATE_PILL_PADDING_X: Pixels = px(9.);
-pub const STATE_PILL_PADDING_Y: Pixels = px(3.);
 
 /// Vertical separator ruled between header/status metadata items. The rule
 /// is a 1x14px line, drawn as a thin div with a border color.
@@ -1625,9 +1619,6 @@ mod tests {
         assert_eq!(SCROLLBAR_THUMB_WIDTH, px(8.));
         assert_eq!(ATTENTION_RAIL_WIDTH, px(2.));
         assert_eq!(HEADER_BAND1_MIN_HEIGHT, px(44.));
-        assert_eq!(HEADER_BAND2_MIN_HEIGHT, px(40.));
-        assert_eq!(STATE_PILL_PADDING_X, px(9.));
-        assert_eq!(STATE_PILL_PADDING_Y, px(3.));
         assert_eq!(STATUS_RULE_HEIGHT, px(14.));
         assert_eq!(MODAL_WIDTH, px(480.));
         assert_eq!(MODAL_PADDING_TOP, px(12.));
