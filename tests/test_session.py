@@ -26,7 +26,7 @@ from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools.agent import ChildApprovalPolicy
 from zeta.tui.app import TUIApp, create_app
 from zeta.tui.layout import CONTENT_MARGIN, content_width

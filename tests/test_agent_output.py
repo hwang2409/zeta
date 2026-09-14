@@ -9,7 +9,7 @@ from zeta.agent_receipt import encode_json
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools.agent import agent_result
 from zeta.tui.render import render_event
 from zeta.types import (

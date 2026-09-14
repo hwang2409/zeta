@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 import zeta.tools as tools_package
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.types import ToolCall
 

@@ -15,7 +15,7 @@ from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
 from ..loop import AgentLoop
 from ..settings import ResolvedConfig
-from ..skill_catalog import SkillCatalog
+from ..skills import SkillCatalog
 from ..tools._user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from ..types import CompletionBackend, StreamEvent

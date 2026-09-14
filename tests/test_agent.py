@@ -22,7 +22,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore, PendingPromptsClosedError
 from zeta.loop import AgentLoop
 from zeta.mcp import MCPMount
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
 from zeta.tools.agent_presets import (

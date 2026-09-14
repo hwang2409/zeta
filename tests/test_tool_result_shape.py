@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.registry import validate_tool_result
 from zeta.types import (

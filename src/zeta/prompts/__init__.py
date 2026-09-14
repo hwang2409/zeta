@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from importlib.resources import files
 
-from ..skill_catalog import SkillCatalog
+from ..skills import SkillCatalog
 
 
 def load_identity(

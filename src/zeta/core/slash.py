@@ -16,7 +16,7 @@ from ..mcp.prompt_commands import (
     SlashPromptError,
     dispatch_prompt,
 )
-from ..skill_catalog import (
+from ..skills import (
     SkillCatalog,
     SkillMeta,
     is_slash_safe_name,

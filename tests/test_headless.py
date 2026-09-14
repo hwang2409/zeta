@@ -19,7 +19,7 @@ from zeta.core.session import SessionManager, env_home
 from zeta.core.store import ConversationStore
 from zeta.headless import DENIAL_MARKER, drive_turn, run_headless
 from zeta.loop import AgentLoop
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.types import TextContent, ToolCall
 

@@ -16,7 +16,7 @@ from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.core.todo import TODO_STATUSES
 from zeta.loop import AgentLoop
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools import todo as todo_tool
 from zeta.tui.app import TUIApp

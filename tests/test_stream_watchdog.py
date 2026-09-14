@@ -41,7 +41,7 @@ from zeta.providers.transport import (
     stall_watchdog,
 )
 from zeta.settings import Settings, load_settings, resolve
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.types import (
     FAILED_TURN_MARKER,
     Message,

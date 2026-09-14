@@ -21,7 +21,7 @@ from zeta.core.session import (
     normalize_session_name,
 )
 from zeta.core.slash import create_slash_registry
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tui.app import create_app, format_picker_row
 
 

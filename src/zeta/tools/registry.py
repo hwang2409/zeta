@@ -49,7 +49,7 @@ from ..execution import (
     build_execution_arguments,
     run_handler_with_abort,
 )
-from ..skill_catalog import SkillCatalog
+from ..skills import SkillCatalog
 from ..types import (
     StructuredContentValue,
     StructuredToolResult,

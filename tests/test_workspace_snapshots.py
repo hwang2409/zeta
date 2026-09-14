@@ -24,7 +24,7 @@ from zeta.core.checkpoints.workspace import (
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 
 

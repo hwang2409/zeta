@@ -57,7 +57,7 @@ from .mcp.commands import (
 )
 from .mcp.prompt_commands import SlashModelInput
 from .prompts import load_identity
-from .skill_catalog import SkillCatalog
+from .skills import SkillCatalog
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from .tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from .tools.agent_presets import (

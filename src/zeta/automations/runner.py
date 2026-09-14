@@ -14,7 +14,7 @@ from ..mcp.mount import MCPMount
 from ..prompts import load_identity
 from ..runtime.driver import drive_turn
 from ..runtime.unattended import build_unattended_loop
-from ..skill_catalog import discover_session_skills
+from ..skills import discover_session_skills
 from ..tools import ToolRegistry
 from ..types import CompletionBackend, Message, MessageRole, TextContent
 from .delivery import Delivery, SlackDelivery

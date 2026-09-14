@@ -6,7 +6,7 @@ from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.session import OpenedSession, SessionManager
 from ..loop import AgentLoop
 from ..providers.factory import build_backend
-from ..skill_catalog import SkillCatalog
+from ..skills import SkillCatalog
 from ..tools import ToolRegistry
 from ..types import CompletionBackend
 

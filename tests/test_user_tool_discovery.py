@@ -13,7 +13,7 @@ from zeta.core.fake import FakeBackend
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._user_discovery import (
     apply_external_tools,

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
-from zeta.skill_catalog import SkillCatalog
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy
 from zeta.types import ToolCall
@@ -79,7 +79,7 @@ from zeta.mcp.config import load_mcp_config, server_to_json
 from zeta.mcp.mount import MCPMount
 from zeta.prompts import load_identity
 from zeta.runtime.unattended import build_unattended_loop
-from zeta.skill_catalog import discover_session_skills
+from zeta.skills import discover_session_skills
 from zeta.types import TextContent
 
 START = datetime(2026, 9, 9, 11, 0, tzinfo=UTC)

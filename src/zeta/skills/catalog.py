@@ -11,7 +11,7 @@ import yaml
 
 _logger = logging.getLogger(__name__)
 SKILL_INDEX_BYTE_LIMIT = 32 * 1024
-_PACKAGED_SKILLS_DIR = Path(__file__).parent / "skills"
+_PACKAGED_SKILLS_DIR = Path(__file__).parent
 
 
 def is_slash_safe_name(name: str) -> bool:
