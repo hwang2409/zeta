@@ -5,16 +5,16 @@ from pathlib import Path
 import pytest
 
 from zeta import agent_runner
-from zeta.agent_catalog import (
-    AgentCatalog,
-    discover_packaged_agents,
-    discover_session_agents,
-)
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.runtime.unattended import build_unattended_loop
+from zeta.skills.agent_catalog import (
+    AgentCatalog,
+    discover_packaged_agents,
+    discover_session_agents,
+)
 from zeta.skills.catalog import SkillCatalog
 from zeta.types import TextContent, ToolCall
 

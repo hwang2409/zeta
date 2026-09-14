@@ -64,7 +64,7 @@ from ._process import BackgroundTaskRegistry
 from ._sandbox import SandboxPolicy
 
 if TYPE_CHECKING:
-    from ..agent_catalog import AgentCatalog
+    from ..skills.agent_catalog import AgentCatalog
 
 AbortSignal = ToolAbortSignal
 MAX_STRUCTURED_CONTENT_DEPTH = 32
@@ -472,7 +472,7 @@ class ToolRegistry:
         self._tools: dict[str, ToolDefinition] = {}
         self.skill_catalog = skill_catalog
         if agent_catalog is None:
-            from ..agent_catalog import discover_packaged_agents
+            from ..skills.agent_catalog import discover_packaged_agents
 
             agent_catalog = discover_packaged_agents()
         self.agent_catalog = agent_catalog

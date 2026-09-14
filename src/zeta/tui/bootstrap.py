@@ -8,7 +8,6 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..agent_catalog import AgentCatalog, discover_session_agents
 from ..core.project_context import (
     ProjectContext,
     PromptArgumentError,
@@ -31,6 +30,7 @@ from ..skills import (
     discover_session_skills,
     replace_skill_index,
 )
+from ..skills.agent_catalog import AgentCatalog, discover_session_agents
 from . import theme as _theme
 from .key_bindings import KeybindingError, resolve_keybindings
 from .layout import content_width, resume_picker_line

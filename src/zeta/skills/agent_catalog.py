@@ -8,9 +8,9 @@ from pathlib import Path
 
 import yaml
 
-from .model_catalog import known_model_names
-from .skills.catalog import is_slash_safe_name
-from .tools.agent_presets import AGENT_PRESETS, AgentPreset
+from ..model_catalog import known_model_names
+from ..tools.agent_presets import AGENT_PRESETS, AgentPreset
+from .catalog import is_slash_safe_name
 
 AgentMeta = AgentPreset
 

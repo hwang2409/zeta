@@ -9,13 +9,13 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 
-from ..agent_catalog import discover_packaged_agents
 from ..core.session import SessionManager
 from ..mcp.mount import MCPMount
 from ..prompts import load_identity
 from ..runtime.driver import drive_turn
 from ..runtime.unattended import build_unattended_loop
 from ..skills import discover_session_skills
+from ..skills.agent_catalog import discover_packaged_agents
 from ..tools import ToolRegistry
 from ..types import CompletionBackend, Message, MessageRole, TextContent
 from .delivery import Delivery, SlackDelivery

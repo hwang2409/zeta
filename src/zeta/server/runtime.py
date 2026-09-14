@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..agent_catalog import AgentCatalog, discover_session_agents
 from ..core.approval import ApprovalPolicy
 from ..core.project_context import (
     ProjectContext,
@@ -25,6 +24,7 @@ from ..skills import (
     discover_session_skills,
     replace_skill_index,
 )
+from ..skills.agent_catalog import AgentCatalog, discover_session_agents
 from ..types import CompletionBackend, StreamEvent
 from .fake_backend import ServerFakeBackend
 

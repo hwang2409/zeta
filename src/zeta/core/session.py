@@ -21,7 +21,7 @@ from typing import Any, Mapping
 from rich.cells import cell_len
 
 from ..skills import SkillCatalog
-from ..agent_catalog import AgentCatalog
+from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .store import ConversationStore
 from .session_files import SessionError, SessionInUseError, open_session_file, session_directory, session_root, child_directory, write_session_json

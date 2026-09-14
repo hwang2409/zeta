@@ -2,12 +2,12 @@
 
 from pathlib import Path
 
-from ..agent_catalog import discover_packaged_agents
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.session import OpenedSession, SessionManager
 from ..loop import AgentLoop
 from ..providers.factory import build_backend
 from ..skills import SkillCatalog
+from ..skills.agent_catalog import discover_packaged_agents
 from ..tools import ToolRegistry
 from ..types import CompletionBackend
 

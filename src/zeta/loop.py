@@ -23,7 +23,6 @@ from .agent_budget import (
     AgentTree,
     consume_turn,
 )
-from .agent_catalog import AgentCatalog
 from .agent_receipt import (
     TerminalState,
     finalize_agent_results,
@@ -59,6 +58,7 @@ from .mcp.commands import (
 from .mcp.prompt_commands import SlashModelInput
 from .prompts import load_identity
 from .skills import SkillCatalog
+from .skills.agent_catalog import AgentCatalog
 from .tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from .tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from .tools.agent_presets import (
@@ -246,12 +246,8 @@ class AgentLoop:
                 raise ValueError("loop agent catalog must match the tool registry catalog")
             self.tool_registry = selected_registry
         elif isinstance(tools, Mapping):
-            self.tool_registry = ToolRegistry(
-                store.cwd,
-                register_builtin=False,
-                skill_catalog=skill_catalog,
-                agent_catalog=agent_catalog,
-            )
+            self.tool_registry = ToolRegistry(store.cwd, register_builtin=False,
+                skill_catalog=skill_catalog, agent_catalog=agent_catalog)
             schemas_by_name = {
                 schema.get("name"): schema
                 for schema in (tool_schemas or [])
@@ -277,9 +273,8 @@ class AgentLoop:
                     parameters=parameters,
                 )
         elif tools is None:
-            self.tool_registry = ToolRegistry(
-                store.cwd, skill_catalog=skill_catalog, agent_catalog=agent_catalog
-            )
+            self.tool_registry = ToolRegistry(store.cwd, skill_catalog=skill_catalog,
+                agent_catalog=agent_catalog)
         else:
             raise TypeError("tools must be a mapping or ToolRegistry")
         self._mcp_mount: MCPMount | None = None
@@ -595,20 +590,13 @@ class AgentLoop:
                 status=status,
             )
         )
-        catalog_agent_name = None
-        if isinstance(agent_type, str):
-            catalog_agent_name = agent_type
-            try:
-                catalog_agent_name = self.tool_registry.agent_catalog.find(agent_type).name
-            except (AttributeError, ValueError):
-                pass
         return agent_result(
             content,
             tool_call_id=tool_call_id,
             error=result_status == "failed",
             turns_used=turns,
             child_session_path=path,
-            agent_type=catalog_agent_name,
+            agent_type=agent_type if isinstance(agent_type, str) else None,
             status=status if status == "running" else None,
             child_instance_id=child_instance_id,
             description=description,

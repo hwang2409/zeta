@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..agent_catalog import AgentCatalog
 from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.hooks import load_hooks_for_provider
 from ..core.project_context import ProjectContext, discover_repo_root
@@ -17,6 +16,7 @@ from ..core.slash import resolve_session_budget
 from ..loop import AgentLoop
 from ..settings import ResolvedConfig
 from ..skills import SkillCatalog
+from ..skills.agent_catalog import AgentCatalog
 from ..tools._user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from ..types import CompletionBackend, StreamEvent
