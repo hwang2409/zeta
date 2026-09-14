@@ -6,8 +6,13 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from ..types import (
+from ..images import (
     SUPPORTED_IMAGE_MEDIA_TYPES,
+    decoded_image_bytes,
+    image_description,
+    image_signature_matches,
+)
+from ..types import (
     ContentBlock,
     ImageContent,
     Message,
@@ -17,10 +22,7 @@ from ..types import (
     ToolImageBlock,
     ToolSchema,
     ToolUseContent,
-    decoded_image_bytes,
     flatten_tool_content,
-    image_description,
-    image_signature_matches,
 )
 from .codex_errors import CodexHTTPError
 

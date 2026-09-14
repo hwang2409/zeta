@@ -27,6 +27,7 @@ from zeta.providers.anthropic import (
     build_authorization_url,
     build_messages_payload,
 )
+from zeta.images import image_dimensions
 from zeta.types import (
     Message,
     MessageRole,
@@ -39,7 +40,6 @@ from zeta.types import (
     ToolCall,
     ToolResult,
     ToolUseContent,
-    image_dimensions,
 )
 
 SSE = """event: message_start

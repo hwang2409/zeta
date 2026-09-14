@@ -10,11 +10,8 @@ from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
 from ..core.abort import AbortSignal
-from ..types import (
-    StructuredToolResult,
-    detect_image_media_type,
-    image_validation_status,
-)
+from ..images import detect_image_media_type
+from ..types import StructuredToolResult
 from ._sandbox import open_target
 from .registry import (
     ToolRegistry,
@@ -150,27 +147,14 @@ async def _read(
                 )
                 if sniffed_type is not None:
                     data = handle.read(IMAGE_MAX_BYTES + 1)
-                    if file_size > IMAGE_MAX_BYTES:
-                        validation = image_validation_status(
-                            sniffed_type, data, total_size=file_size
-                        )
-                        if validation == "invalid":
-                            handle.seek(0)
-                            return await _read_handle(
-                                handle,
-                                resolved_path,
-                                offset,
-                                limit,
-                                output,
-                                digest,
-                                abort_signal,
-                            )
+                    observed_size = max(file_size, len(data))
+                    if observed_size > IMAGE_MAX_BYTES:
                         if "offset" in arguments or "limit" in arguments:
                             raise ValueError(
                                 "offset and limit are not supported for image reads"
                             )
                         raise ValueError(
-                            f"image is {file_size} bytes; cap is "
+                            f"image is {observed_size} bytes; cap is "
                             f"{IMAGE_MAX_BYTES} bytes (4 MiB)"
                         )
                     media_type = detect_image_media_type(data, complete=True)

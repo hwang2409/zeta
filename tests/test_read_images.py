@@ -10,6 +10,7 @@ from rich.console import Console
 
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
+from zeta.images import IMAGE_DEGRADATION_WARNING, detect_image_media_type
 from zeta.loop import _validated_tool_result
 from zeta.providers.anthropic import build_messages_payload
 from zeta.providers.codex import build_responses_payload
@@ -18,7 +19,6 @@ from zeta.tools.read import IMAGE_MAX_BYTES
 from zeta.tui.checkpoints import CheckpointTranscriptMixin
 from zeta.tui.render import render_event
 from zeta.types import (
-    IMAGE_DEGRADATION_WARNING,
     ImageContent,
     Message,
     MessageRole,
@@ -27,7 +27,6 @@ from zeta.types import (
     TextContent,
     ToolCall,
     ToolResult,
-    detect_image_media_type,
 )
 
 PNG = bytes.fromhex(
@@ -142,6 +141,144 @@ def _oversized_webp() -> bytes:
         + payload
     )
 
+
+def _oversized_lookalike() -> bytes:
+    prefix = b"RIFFxxxxWEBPthis is UTF-8 text\n"
+    return prefix + b"x" * (IMAGE_MAX_BYTES + 1 - len(prefix))
+
+
+def _oversized_invalid_webp() -> bytes:
+    data = _oversized_webp()
+    return data[:12] + b"NOPE" + data[16:]
+
+
+def _no_eoi_progressive_jpeg() -> bytes:
+    return b"\xff\xd8\xff\xc2\x00\x11" + b"progressive JPEG without EOI"
+
+
+DECISION_TABLE_CASES = [
+    pytest.param("row-1-text", b"plain text\n", {}, "text", id="row-1-text"),
+    pytest.param(
+        "row-2-oversized-valid-png",
+        PNG + b"x" * (IMAGE_MAX_BYTES + 1 - len(PNG)),
+        {},
+        "size",
+        id="row-2-oversized-valid-png",
+    ),
+    pytest.param(
+        "row-2-oversized-invalid-webp",
+        _oversized_invalid_webp(),
+        {},
+        "size",
+        id="row-2-oversized-invalid-webp",
+    ),
+    pytest.param(
+        "row-2-oversized-lookalike",
+        _oversized_lookalike(),
+        {},
+        "size",
+        id="row-2-oversized-lookalike",
+    ),
+    pytest.param(
+        "row-3-oversized-invalid-webp-with-paging",
+        _oversized_invalid_webp(),
+        {"offset": 1},
+        "paging",
+        id="row-3-oversized-with-paging",
+    ),
+]
+DECISION_TABLE_CASES.extend(
+    pytest.param(
+        f"row-4-{format_name}-with-paging",
+        data,
+        {"limit": 1},
+        "paging",
+        id=f"row-4-{format_name}-with-paging",
+    )
+    for format_name, _mime_type, data in IMAGE_FIXTURES
+)
+DECISION_TABLE_CASES.extend(
+    pytest.param(
+        f"row-5-{format_name}-trailing-data",
+        data + b"trailing metadata",
+        {},
+        "image",
+        id=f"row-5-{format_name}-trailing-data",
+    )
+    for format_name, _mime_type, data in IMAGE_FIXTURES
+)
+DECISION_TABLE_CASES.extend(
+    [
+        pytest.param(
+            "row-6-invalid-png",
+            PNG[:24],
+            {},
+            "fallback",
+            id="row-6-invalid-png",
+        ),
+        pytest.param(
+            "row-6-no-eoi-progressive-jpeg",
+            _no_eoi_progressive_jpeg(),
+            {},
+            "fallback",
+            id="row-6-no-eoi-progressive-jpeg",
+        ),
+        pytest.param(
+            "row-6-invalid-gif",
+            b"GIF89a\x01\x00\x01\x00lookalike",
+            {},
+            "fallback",
+            id="row-6-invalid-gif",
+        ),
+        pytest.param(
+            "row-6-invalid-webp-lookalike",
+            b"RIFFxxxxWEBPthis is UTF-8 text\n",
+            {},
+            "fallback",
+            id="row-6-invalid-webp-lookalike",
+        ),
+    ]
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case_name", "data", "arguments", "expected"), DECISION_TABLE_CASES
+)
+async def test_image_read_decision_table(
+    tmp_path: Path,
+    case_name: str,
+    data: bytes,
+    arguments: dict[str, int],
+    expected: str,
+) -> None:
+    path = tmp_path / f"{case_name}.bin"
+    path.write_bytes(data)
+
+    result = await ToolRegistry(tmp_path).execute(
+        ToolCall(case_name, "read", {"path": path.name, **arguments})
+    )
+
+    if expected == "size":
+        assert result["isError"] is True
+        assert result["content"][0]["text"] == (
+            f"image is {len(data)} bytes; cap is "
+            f"{IMAGE_MAX_BYTES} bytes (4 MiB)"
+        )
+    elif expected == "paging":
+        assert result["isError"] is True
+        assert result["content"][0]["text"] == (
+            "offset and limit are not supported for image reads"
+        )
+    elif expected == "image":
+        assert result["isError"] is False
+        assert result["content"][1]["type"] == "image"
+        assert base64.b64decode(result["content"][1]["data"]) == data
+    elif expected == "text":
+        assert result["isError"] is False
+        assert result["content"][0]["text"] == "plain text"
+    else:
+        assert all(block["type"] != "image" for block in result["content"])
 
 @pytest.mark.asyncio
 async def test_read_rejects_oversized_images_with_size_and_cap(tmp_path: Path) -> None:
@@ -350,7 +487,7 @@ async def test_tui_renders_compact_image_read_card(tmp_path: Path) -> None:
     assert output.getvalue().count("filename=screenshot.png bytes=70 format=png") == 1
 
 
-@pytest.mark.parametrize("corruption", ["missing", "invalid"])
+@pytest.mark.parametrize("corruption", ["missing", "invalid", "truncated"])
 def test_corrupt_stored_image_block_keeps_receipt(
     tmp_path: Path, corruption: str
 ) -> None:
@@ -363,8 +500,10 @@ def test_corrupt_stored_image_block_keeps_receipt(
     block = row["data"]["message"]["tool_result"]["content_blocks"][1]
     if corruption == "missing":
         del block["data"]
-    else:
+    elif corruption == "invalid":
         block["data"] = "not-base64"
+    else:
+        block["data"] = base64.b64encode(PNG[:24]).decode("ascii")
     rows[1] = json.dumps(row)
     store.path.write_text("\n".join(rows) + "\n")
 
