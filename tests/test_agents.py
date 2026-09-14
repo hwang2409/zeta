@@ -14,6 +14,7 @@ from zeta.skills.agent_catalog import (
     AgentCatalog,
     discover_packaged_agents,
     discover_session_agents,
+    load_agent,
 )
 from zeta.skills.catalog import SkillCatalog
 from zeta.types import TextContent, ToolCall
@@ -87,6 +88,44 @@ def test_agent_discovery_rejects_within_tier_duplicates_and_external_symlinks(
     catalog = discover_session_agents(home=symlink_home)
     assert "outside" not in catalog.names()
     assert any("outside agents root" in notice for notice in catalog.notices)
+
+
+def test_agent_discovery_accepts_official_claude_scalar_tools(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "home" / "agents" / "reader.md"
+    _write_agent(
+        path,
+        "reader",
+        "read-only child",
+        "body",
+        "tools: Read, Glob, Grep\n",
+    )
+
+    catalog = discover_session_agents(home=tmp_path / "home")
+
+    assert catalog.find("reader").tool_names == frozenset({"read"})
+    assert sum("unknown tool name" in notice for notice in catalog.notices) == 2
+
+
+def test_agent_snapshot_omits_body_and_loads_current_file(tmp_path: Path) -> None:
+    path = tmp_path / "home" / "agents" / "custom.md"
+    _write_agent(path, "custom", "custom", "original body")
+    catalog = discover_session_agents(home=tmp_path / "home")
+    snapshot = catalog.to_snapshot()
+    custom_snapshot = next(item for item in snapshot if item["name"] == "custom")
+
+    assert "prompt_suffix" not in custom_snapshot
+    assert "original body" not in str(custom_snapshot)
+
+    path.write_text(
+        "---\nname: custom\ndescription: custom\n---\nupdated body\n",
+        encoding="utf-8",
+    )
+    assert load_agent(catalog.find("custom")) == "updated body"
+    path.unlink()
+    with pytest.raises(ValueError, match="no longer exists"):
+        load_agent(AgentCatalog.from_snapshot(snapshot).find("custom"))
 
 
 def test_agent_snapshot_restores_the_same_set() -> None:

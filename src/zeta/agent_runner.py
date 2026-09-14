@@ -20,6 +20,7 @@ from .core.checkpoints import _now
 from .core.store import ConversationStore
 from .model_catalog import provider_for_model
 from .providers.factory import build_backend, credential_store
+from .skills.agent_catalog import load_agent
 from .tools import ToolStreamPublisher
 from .tools.agent import ChildApprovalPolicy, agent_stats
 from .tools.agent_presets import (
@@ -796,12 +797,13 @@ def _compose_child_system_prompt(
     """Apply the preset preamble and custom body to the child prompt."""
 
     composed = compose_system_prompt(system_prompt, preset.preamble)
-    if not preset.prompt_suffix:
+    body = load_agent(preset)
+    if not body:
         return composed
     if isinstance(composed, Message):
         return Message(
             MessageRole.SYSTEM,
-            [*composed.content, TextContent(preset.prompt_suffix)],
+            [*composed.content, TextContent(body)],
             metadata=dict(composed.metadata),
         )
-    return f"{composed}\n\n{preset.prompt_suffix}"
+    return f"{composed}\n\n{body}"

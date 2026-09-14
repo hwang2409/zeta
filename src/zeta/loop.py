@@ -64,6 +64,7 @@ from .tools.agent import MAX_AGENT_RESULT_BYTES, agent_result
 from .tools.agent_presets import (
     compose_system_prompt,
 )
+from .tools.loop_setup import select_tool_registry
 from .tools.plan_mode import (
     PLAN_MODE_PREAMBLE,
     PLAN_MODE_TOOLS,
@@ -236,47 +237,14 @@ class AgentLoop:
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
         recover_agent_children(self)
-        if registry is not None and tools is not None:
-            raise ValueError("pass only one tool registry")
-        selected_registry = registry if registry is not None else tools if isinstance(tools, ToolRegistry) else None
-        if selected_registry is not None:
-            if selected_registry.skill_catalog != skill_catalog:
-                raise ValueError("loop skill catalog must match the tool registry catalog")
-            if agent_catalog is not None and selected_registry.agent_catalog != agent_catalog:
-                raise ValueError("loop agent catalog must match the tool registry catalog")
-            self.tool_registry = selected_registry
-        elif isinstance(tools, Mapping):
-            self.tool_registry = ToolRegistry(store.cwd, register_builtin=False,
-                skill_catalog=skill_catalog, agent_catalog=agent_catalog)
-            schemas_by_name = {
-                schema.get("name"): schema
-                for schema in (tool_schemas or [])
-                if isinstance(schema.get("name"), str)
-            }
-            for name, handler in tools.items():
-                schema = schemas_by_name.get(name, {})
-                parameters = schema.get("parameters", schema.get("input_schema"))
-                if parameters is None:
-                    parameters = {
-                        key: value
-                        for key, value in schema.items()
-                        if key not in {"name", "description", "cache_control"}
-                    }
-                self.tool_registry.register(
-                    name,
-                    handler,
-                    description=(
-                        schema.get("description", "")
-                        if isinstance(schema.get("description", ""), str)
-                        else ""
-                    ),
-                    parameters=parameters,
-                )
-        elif tools is None:
-            self.tool_registry = ToolRegistry(store.cwd, skill_catalog=skill_catalog,
-                agent_catalog=agent_catalog)
-        else:
-            raise TypeError("tools must be a mapping or ToolRegistry")
+        self.tool_registry = select_tool_registry(
+            store,
+            tools=tools,
+            registry=registry,
+            skill_catalog=skill_catalog,
+            agent_catalog=agent_catalog,
+            tool_schemas=tool_schemas,
+        )
         self._mcp_mount: MCPMount | None = None
         self._mcp_mount_attempted = skip_mcp_mount
         self._mcp_mount_task: asyncio.Task[None] | None = None

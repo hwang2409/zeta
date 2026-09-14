@@ -2,20 +2,47 @@
 
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-
-import yaml
 
 from ..model_catalog import known_model_names
 from ..tools.agent_presets import AGENT_PRESETS, AgentPreset
-from .catalog import is_slash_safe_name
+from .discovery import (
+    MarkdownDocument,
+    contained_path,
+    discover_markdown,
+    read_markdown,
+    snapshot_metadata,
+    warn_discovery,
+)
 
 AgentMeta = AgentPreset
 
-_logger = logging.getLogger(__name__)
 _PACKAGED_AGENT_NAMES = frozenset(AGENT_PRESETS)
+_CLAUDE_TOOL_NAMES = {
+    "Read": "read",
+    "Edit": "edit",
+    "Write": "write",
+    "Bash": "bash",
+    "WebFetch": "fetch",
+    "WebSearch": "websearch",
+    "TodoWrite": "todo",
+}
+_ZETA_TOOL_NAMES = frozenset(
+    {
+        "agent",
+        "agent_output",
+        "agent_status",
+        "bash",
+        "edit",
+        "fetch",
+        "read",
+        "skill",
+        "todo",
+        "websearch",
+        "write",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,23 +73,30 @@ class AgentCatalog:
         return f"Choose one of: {choices}." if choices else "No agent presets are available."
 
     def to_snapshot(self) -> list[dict[str, object]]:
-        return [
-            {
-                "name": agent.name,
-                "description": agent.selection_guidance,
-                "turn_cap": agent.turn_cap,
-                "tools": list(agent.tool_names) if agent.tool_names is not None else None,
-                "model": agent.model,
-                "preamble": agent.preamble,
-                "prompt_suffix": agent.prompt_suffix,
-                "source": agent.source,
-                "path": str(agent.path) if agent.path is not None else None,
-                "agents_root": (
-                    str(agent.agents_root) if agent.agents_root is not None else None
-                ),
-            }
-            for agent in self.agents
-        ]
+        """Return agent metadata without embedding prompt bodies."""
+
+        snapshots = []
+        for agent in self.agents:
+            snapshot = snapshot_metadata(
+                name=agent.name,
+                description=agent.selection_guidance,
+                source=agent.source,
+                path=agent.path,
+                root_name="agents_root",
+                root=agent.agents_root,
+            )
+            snapshot.update(
+                {
+                    "turn_cap": agent.turn_cap,
+                    "tools": list(agent.tool_names)
+                    if agent.tool_names is not None
+                    else None,
+                    "model": agent.model,
+                    "preamble": agent.preamble,
+                }
+            )
+            snapshots.append(snapshot)
+        return snapshots
 
     @classmethod
     def from_snapshot(cls, value: object) -> AgentCatalog:
@@ -77,23 +111,26 @@ class AgentCatalog:
             turn_cap = item.get("turn_cap")
             tools = item.get("tools")
             model = item.get("model")
-            preamble = item.get("preamble")
-            prompt_suffix = item.get("prompt_suffix", "")
+            preamble = item.get("preamble", "")
             source = item.get("source", "")
             path = item.get("path")
             agents_root = item.get("agents_root")
+            if agents_root is None and type(path) is str:
+                agents_root = str(Path(path).parent)
             if (
                 type(name) is not str
                 or type(description) is not str
                 or type(turn_cap) is not int
                 or turn_cap < 1
-                or (tools is not None and (
-                    type(tools) is not list
-                    or any(type(tool) is not str for tool in tools)
-                ))
+                or (
+                    tools is not None
+                    and (
+                        type(tools) is not list
+                        or any(type(tool) is not str for tool in tools)
+                    )
+                )
                 or (model is not None and type(model) is not str)
                 or type(preamble) is not str
-                or type(prompt_suffix) is not str
                 or type(source) is not str
                 or (path is not None and type(path) is not str)
                 or (agents_root is not None and type(agents_root) is not str)
@@ -105,7 +142,7 @@ class AgentCatalog:
                     turn_cap=turn_cap,
                     tool_names=frozenset(tools) if tools is not None else None,
                     preamble=preamble,
-                    prompt_suffix=prompt_suffix,
+                    prompt_suffix="",
                     selection_guidance=description,
                     model=model,
                     source=source,
@@ -120,65 +157,70 @@ def _agents_dir(root: Path) -> Path:
     return root / "agents"
 
 
-def _contained_path(path: Path, agents_root: Path) -> Path:
-    try:
-        resolved = path.resolve()
-        resolved.relative_to(agents_root)
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise ValueError(
-            f"agent document {path} resolves outside agents root {agents_root}"
-        ) from exc
-    return resolved
+def _parse_tools(
+    value: object, path: Path, notices: list[str] | None
+) -> frozenset[str] | None:
+    if value is None:
+        return None
+    if type(value) is str:
+        names = [name.strip() for name in value.split(",")]
+    elif type(value) is list and all(type(name) is str for name in value):
+        names = [name.strip() for name in value]
+    else:
+        raise ValueError(f"agent {path} frontmatter tools must be a list or string")
+    if not names or any(not name for name in names):
+        raise ValueError(f"agent {path} frontmatter tools must contain names")
+
+    supported: set[str] = set()
+    for name in names:
+        zeta_name = _CLAUDE_TOOL_NAMES.get(name)
+        if zeta_name is None and name in _ZETA_TOOL_NAMES:
+            zeta_name = name
+        if zeta_name is None:
+            notice = warn_discovery(
+                path,
+                f"unknown tool name {name!r}; skipped from allowlist",
+                "agent",
+            )
+            if notices is not None:
+                notices.append(notice)
+            continue
+        supported.add(zeta_name)
+    return frozenset(supported)
 
 
-def _warn(path: Path, error: Exception | str) -> str:
-    message = f"ignored agent {path}: {error}"
-    _logger.warning(message)
-    return message
-
-
-def _read(path: Path) -> tuple[dict[str, object], str]:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    if not lines or lines[0].strip() != "---":
-        raise ValueError(f"agent {path} is missing YAML frontmatter")
-    try:
-        end = next(index for index, line in enumerate(lines[1:], 1) if line.strip() == "---")
-    except StopIteration as exc:
-        raise ValueError(f"agent {path} has unterminated YAML frontmatter") from exc
-    try:
-        values = yaml.safe_load("\n".join(lines[1:end]))
-    except yaml.YAMLError as exc:
-        raise ValueError(f"agent {path} has invalid YAML frontmatter") from exc
-    if not isinstance(values, dict):
-        raise ValueError(  # noqa: TRY004 — malformed metadata is skipped
-            f"agent {path} frontmatter must be a mapping"
-        )
-    missing = [key for key in ("name", "description") if key not in values]
-    if missing:
-        raise ValueError(f"agent {path} frontmatter is missing: {', '.join(missing)}")
-    name = values["name"]
-    if type(name) is not str or not name.strip():
-        raise ValueError(f"agent {path} frontmatter name must be a nonempty string")
-    if not is_slash_safe_name(name):
-        raise ValueError(f"agent {path} frontmatter name must be tool-argument-safe")
-    description = values["description"]
-    if type(description) is not str or not description.strip():
-        raise ValueError(f"agent {path} frontmatter description must be a nonempty string")
-    tools = values.get("tools")
-    if tools is not None and (
-        type(tools) is not list
-        or any(type(tool) is not str or not tool.strip() for tool in tools)
-    ):
-        raise ValueError(f"agent {path} frontmatter tools must be a list of strings")
-    model = values.get("model")
+def _build_agent(
+    document: MarkdownDocument, source: str, notices: list[str] | None
+) -> AgentPreset:
+    metadata = document.metadata
+    name = metadata["name"]
+    description = metadata["description"]
+    model = metadata.get("model")
     if model is not None and (type(model) is not str or not model.strip()):
-        raise ValueError(f"agent {path} frontmatter model must be a nonempty string")
-    return {
-        "name": name,
-        "description": description,
-        "tools": tools,
-        "model": model,
-    }, "\n".join(lines[end + 1 :]).strip()
+        raise ValueError(f"agent {document.path} frontmatter model must be a nonempty string")
+    if model is not None and model not in known_model_names():
+        notice = warn_discovery(
+            document.path,
+            f"unknown model {model!r}; agent will inherit the parent model",
+            "agent",
+        )
+        if notices is not None:
+            notices.append(notice)
+        model = None
+    assert isinstance(name, str)
+    assert isinstance(description, str)
+    return AgentPreset(
+        name=name,
+        turn_cap=AGENT_PRESETS["general"].turn_cap,
+        tool_names=_parse_tools(metadata.get("tools"), document.path, notices),
+        preamble="",
+        prompt_suffix=document.body,
+        selection_guidance=description,
+        model=model if isinstance(model, str) else None,
+        source=source,
+        path=document.entry_path.absolute(),
+        agents_root=document.root,
+    )
 
 
 def discover_agents(
@@ -188,59 +230,16 @@ def discover_agents(
     notices: list[str] | None = None,
     agents_dir: Path | None = None,
 ) -> list[AgentPreset]:
+    """Discover one tier of flat agent definitions."""
+
     agents_dir = agents_dir or _agents_dir(root)
-    if not agents_dir.is_dir():
-        return []
-    try:
-        agents_root = agents_dir.resolve()
-        paths = sorted(agents_dir.glob("*.md"), key=lambda path: path.name)
-    except (OSError, RuntimeError, UnicodeError) as exc:
-        notice = _warn(agents_dir, exc)
-        if notices is not None:
-            notices.append(notice)
-        return []
-    discovered: list[AgentPreset] = []
-    paths_by_name: dict[str, Path] = {}
-    for path in paths:
-        try:
-            resolved = _contained_path(path, agents_root)
-            metadata, body = _read(resolved)
-        except (OSError, UnicodeError, ValueError, RecursionError, yaml.YAMLError) as exc:
-            notice = _warn(path, exc)
-            if notices is not None:
-                notices.append(notice)
-            continue
-        name = metadata["name"]
-        assert isinstance(name, str)
-        previous = paths_by_name.get(name)
-        if previous is not None:
-            raise ValueError(f"duplicate agent name {name!r} in {previous} and {path}")
-        paths_by_name[name] = path
-        model = metadata["model"]
-        if model is not None and model not in known_model_names():
-            notice = _warn(path, f"unknown model {model!r}; agent will inherit the parent model")
-            if notices is not None:
-                notices.append(notice)
-            model = None
-        tools = metadata["tools"]
-        assert tools is None or isinstance(tools, list)
-        description = metadata["description"]
-        assert isinstance(description, str)
-        discovered.append(
-            AgentPreset(
-                name=name,
-                turn_cap=AGENT_PRESETS["general"].turn_cap,
-                tool_names=frozenset(tools) if tools is not None else None,
-                preamble="",
-                prompt_suffix=body,
-                selection_guidance=description,
-                model=model if isinstance(model, str) else None,
-                source=source,
-                path=path.absolute(),
-                agents_root=agents_root,
-            )
-        )
-    return discovered
+    return discover_markdown(
+        agents_dir,
+        source=source,
+        kind="agent",
+        build=lambda document: _build_agent(document, source, notices),
+        notices=notices,
+    )
 
 
 def discover_session_agents(
@@ -249,35 +248,25 @@ def discover_session_agents(
     """Discover packaged, home, and project agents for one session."""
 
     notices: list[str] = []
-    packaged = [
-        AgentPreset(
-            name=preset.name,
-            turn_cap=preset.turn_cap,
-            tool_names=preset.tool_names,
-            preamble=preset.preamble,
-            selection_guidance=preset.selection_guidance,
-            model=preset.model,
-            prompt_suffix=preset.prompt_suffix,
-            source="packaged",
-        )
-        for preset in AGENT_PRESETS.values()
-    ]
+    packaged = [replace(preset, source="packaged") for preset in AGENT_PRESETS.values()]
     tiers: list[list[AgentPreset]] = [packaged]
     if home is not None:
         tiers.append(discover_agents(Path(home), source="home", notices=notices))
     if project_dir is not None:
         tiers.append(
             discover_agents(
-                Path(project_dir) / ".zeta",
-                source="project",
-                notices=notices,
+                Path(project_dir) / ".zeta", source="project", notices=notices
             )
         )
     for tier in tiers[1:]:
         for agent in tier:
             if agent.name in _PACKAGED_AGENT_NAMES:
                 notices.append(
-                    _warn(agent.path or Path(agent.name), "custom definition overrides packaged preset")
+                    warn_discovery(
+                        agent.path or Path(agent.name),
+                        "custom definition overrides packaged preset",
+                        "agent",
+                    )
                 )
     selected: dict[str, AgentPreset] = {}
     for tier in tiers:
@@ -294,10 +283,17 @@ def discover_packaged_agents() -> AgentCatalog:
 
 
 def load_agent(meta: AgentPreset) -> str:
+    """Load an agent body at execution time from its pinned path."""
+
     if meta.path is None:
         return meta.prompt_suffix
     root = meta.agents_root or meta.path.parent
-    return _read(_contained_path(meta.path, root))[1]
+    resolved = contained_path(meta.path, root, "agent")
+    try:
+        _, body = read_markdown(resolved, "agent")
+    except FileNotFoundError as exc:
+        raise ValueError(f"agent definition {meta.path} no longer exists") from exc
+    return body
 
 
 __all__ = [
