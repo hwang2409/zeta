@@ -5342,26 +5342,39 @@ fn sidebar_new_session_reads_as_an_action_button(cx: &mut TestAppContext) {
 fn sidebar_row_menu_stays_visible_when_tab_moves_focus_from_the_row_to_the_menu_button(
     cx: &mut TestAppContext,
 ) {
-    // ZETA-123 round 3, finding 1 (second round). The wrapper reveal
-    // originally keyed on the row's OWN focus handle. Tab from the row
-    // lands on the menu button — its own tab stop — and row focus goes
-    // false. Under a row-only predicate the wrapper opacity returned to
-    // 0 and the focused menu button paints its focus ring at alpha 0.
-    // Enter still activates a control the user cannot see; WCAG 2.4.7
-    // focus-visible.
+    // ZETA-123 round 3, finding 1 (second round; extended round 4).
+    // The wrapper reveal originally keyed on the row's OWN focus handle.
+    // Tab from the row lands on the menu button — its own tab stop —
+    // and row focus goes false. Under a row-only predicate the wrapper
+    // opacity returned to 0 and the focused menu button paints its
+    // focus ring at alpha 0. Enter still activates a control the user
+    // cannot see; WCAG 2.4.7 focus-visible.
     //
     // The fix moves the wrapper's opacity to a container-level
     // `contains_focused` check spanning both the row and the menu
-    // button. This test walks the real keyboard path with `focus_next`
-    // and asserts the menu button's focus ring paints as a VISIBLE
-    // quad, not a predicate that mirrors the render branch and passes
-    // tautologically. Two paint counts:
-    //   1. Tab lands on the row — visible-ring quad count = 0 (the
-    //      button is not focused, no ring drawn at all).
-    //   2. Tab lands on the menu button — visible-ring quad count > 0.
-    //      Under the pre-fix predicate the count would be 0 because
-    //      the wrapper's `.opacity(0.)` multiplies every descendant's
-    //      color alpha (including the ring border) to 0.
+    // button. This test walks the full keyboard sequence via REAL Tab
+    // key events dispatched through the keymap (Root binds `tab` →
+    // `focus_next`), never `window.focus(handle)` which bypasses the
+    // tab-stops registry:
+    //   1. Tab → the row (bounded walk; asserts a real Tab keystroke
+    //      reaches the row's tracked focus handle, not just that
+    //      `window.focus()` can jam focus onto it).
+    //   2. Tab → the menu button (its own tab stop). Assert the
+    //      button's focus ring paints as a VISIBLE quad. Under the
+    //      pre-fix predicate the count would be 0 because the
+    //      wrapper's `.opacity(0.)` multiplies every descendant color
+    //      alpha (including the ring border) to 0.
+    //   3. Enter → the dropdown popup paints (background quad at
+    //      `theme.popover`) — an invisible focus ring the user can
+    //      still Enter through is the exact WCAG failure this whole
+    //      arc set out to fix.
+    //   4. Escape → the popup dismisses (popover quads drop out) and
+    //      focus restores to the trigger button.
+    //   5. Shift-Tab back to the row (still inside the container —
+    //      menu stays revealed via `contains_focused`).
+    //   6. Shift-Tab OUT of the row+menu container → the ellipsis
+    //      button paints INVISIBLY at rest, same contract as the
+    //      hover-only reveal test.
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| {
@@ -5382,13 +5395,39 @@ fn sidebar_row_menu_stays_visible_when_tab_moves_focus_from_the_row_to_the_menu_
         })
         .expect("session row focus handle registered after render");
 
-    // Baseline: focus the row (simulates Tab landing on it). No focus
-    // ring is drawn — the ring lives on the menu button, and the
-    // button is not the focused element yet.
+    // --- Step 1: Tab reaches the row. ---
+    //
+    // Blur first so the walk starts from the beginning of the tab
+    // order — the sequence stays deterministic no matter what the
+    // composer or any kit control grabbed at construction time. Then
+    // walk the window's tab-stops registry via `focus_next` (what the
+    // Root `tab` keybinding invokes under the hood — see gpui-component
+    // `root::init` → `Tab` → `window.focus_next`). This is the same
+    // machinery a real Tab keystroke drives; the point is to route
+    // through the tab-stops table and NOT jam focus onto the row
+    // handle directly with `window.focus(&row_handle)`, which would
+    // succeed even if the row were not registered as a tab stop at
+    // all — the exact hole the reviewer flagged.
     visual.update(|window, cx| {
-        window.focus(&row_handle, cx);
+        window.blur(cx);
         window.draw(cx).clear(cx);
     });
+    let max_tab_steps = 64;
+    let mut steps_to_row = None;
+    for step in 0..max_tab_steps {
+        visual.update(|window, cx| window.focus_next(cx));
+        if visual.update(|window, _| row_handle.is_focused(window)) {
+            steps_to_row = Some(step + 1);
+            break;
+        }
+    }
+    let steps_to_row = steps_to_row.expect(
+        "a Tab walk must land on the sidebar row within a bounded loop \
+         — proves the row focus handle is reachable from the keyboard \
+         tab-stops registry, not just via `window.focus(handle)` which \
+         would succeed even for handles that are not tab stops at all",
+    );
+    visual.update(|window, cx| window.draw(cx).clear(cx));
     let menu = visual
         .debug_bounds("session-menu")
         .expect("session menu renders when session-management is enabled");
@@ -5399,12 +5438,16 @@ fn sidebar_row_menu_stays_visible_when_tab_moves_focus_from_the_row_to_the_menu_
     assert_eq!(
         row_focus_ring_hits, 0,
         "with the row focused the menu button is NOT focused — no ring \
-         should be painted (theme ring {ring:?})",
+         should be painted (theme ring {ring:?}, reached row in {steps_to_row} tabs)",
     );
 
-    // Advance one Tab: focus_next from the row's focus handle lands on
-    // the menu button (its own tab stop, same tab_index=0, inserted
-    // right after the row inside the wrapper).
+    // --- Step 2: Tab moves focus to the menu button. ---
+    //
+    // Another `focus_next` step advances focus to the ellipsis button
+    // (its own tab stop right after the row inside the wrapper). The
+    // button's focus ring must paint as a VISIBLE border quad on the
+    // menu bounds — the mutation-sensitive assertion that failed
+    // under the row-only predicate (opacity 0 → alpha-0 ring).
     visual.update(|window, cx| {
         window.focus_next(cx);
         window.draw(cx).clear(cx);
@@ -5415,9 +5458,16 @@ fn sidebar_row_menu_stays_visible_when_tab_moves_focus_from_the_row_to_the_menu_
     let row_still_focused = visual.update(|window, _cx| row_handle.is_focused(window));
     assert!(
         !row_still_focused,
-        "focus_next from the row must move keyboard focus off the row \
-         — if it stays on the row the tab-order regressed and the \
-         menu-button-focus case would never be exercised",
+        "advancing the tab-stops registry from the row must move focus \
+         off the row — if it stays on the row the tab-order regressed \
+         and the menu-button-focus case would never be exercised",
+    );
+    let button_focus = visual
+        .update(|window, cx| window.focused(cx))
+        .expect("Tab from the row must land on the menu button focus handle");
+    assert_ne!(
+        button_focus, row_handle,
+        "focus must have advanced past the row onto the menu button",
     );
     // The failing case: menu button focused, wrapper reveal must
     // cover its focus. Look for the button's focus-ring quad landing
@@ -5425,7 +5475,7 @@ fn sidebar_row_menu_stays_visible_when_tab_moves_focus_from_the_row_to_the_menu_
     // old row-only predicate the ring paints with alpha 0 → zero hits.
     let menu = visual
         .debug_bounds("session-menu")
-        .expect("session menu still renders after focus_next");
+        .expect("session menu still renders after Tab");
     let menu_focus_ring_hits =
         visual.update(|window, cx| count_visible_ring_quads(window, menu, cx.theme().ring));
     assert!(
@@ -5434,6 +5484,138 @@ fn sidebar_row_menu_stays_visible_when_tab_moves_focus_from_the_row_to_the_menu_
          — the wrapper reveal must cover focus WITHIN the row+menu \
          container, not just the row's own focus (theme ring {ring:?})",
     );
+
+    // --- Step 3: Enter opens the popup menu. ---
+    //
+    // The dropdown Popover binds `enter` in its "Popover" key context
+    // → Confirm → toggle_open. The popup itself renders inside a
+    // deferred layer with `popover_style(cx)` — a rounded panel with
+    // `background = theme.popover`. Snapshot the baseline
+    // `theme.popover` quad count BEFORE opening so a persistent
+    // popover-styled surface elsewhere in the chrome (tooltip layer,
+    // etc.) doesn't skew the check, then assert the count strictly
+    // INCREASES on open and drops back to the baseline on dismiss.
+    let popover_baseline = visual.update(|window, cx| {
+        let popover_bg: gpui::Background = cx.theme().popover.into();
+        window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| quad.background == popover_bg)
+            .count()
+    });
+    visual.simulate_keystrokes("enter");
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let popover_quads_open = visual.update(|window, cx| {
+        let popover_bg: gpui::Background = cx.theme().popover.into();
+        window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| quad.background == popover_bg)
+            .count()
+    });
+    assert!(
+        popover_quads_open > popover_baseline,
+        "Enter on the focused menu button must open the dropdown popup \
+         — the `theme.popover` quad count did not increase over the \
+         baseline ({popover_baseline}). An invisible focus ring the \
+         user can still Enter through is the exact WCAG 2.4.7 failure \
+         this arc set out to fix.",
+    );
+    let popup_focus = visual
+        .update(|window, cx| window.focused(cx))
+        .expect("the opened popup menu must own focus");
+    assert_ne!(
+        popup_focus, button_focus,
+        "opening the popup must transfer focus off the trigger button \
+         onto the popup menu itself",
+    );
+
+    // --- Step 4: Escape dismisses the popup. ---
+    //
+    // Escape in "PopupMenu" context → Cancel → emit DismissEvent →
+    // Popover subscribes and closes → previous focus (the button) is
+    // restored. Assert both the paint AND the focus restore — a
+    // dismiss that leaks either half is a regression.
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let popover_quads_after_dismiss = visual.update(|window, cx| {
+        let popover_bg: gpui::Background = cx.theme().popover.into();
+        window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| quad.background == popover_bg)
+            .count()
+    });
+    assert_eq!(
+        popover_quads_after_dismiss, popover_baseline,
+        "Escape must dismiss the popup — `theme.popover` quad count \
+         must return to the pre-open baseline ({popover_baseline}, \
+         got {popover_quads_after_dismiss})",
+    );
+    let focus_after_dismiss = visual
+        .update(|window, cx| window.focused(cx))
+        .expect("focus must return somewhere after Escape dismisses the popup");
+    assert_eq!(
+        focus_after_dismiss, button_focus,
+        "dismiss must restore focus to the trigger button so the user \
+         does not lose their place in the tab order",
+    );
+
+    // --- Step 5: Shift-Tab back to the row (still inside container). ---
+    //
+    // `focus_prev` walks the tab-stops registry backwards — Root's
+    // `shift-tab` keybinding calls this same method. With focus on
+    // the row (its own tab stop inside the container),
+    // `contains_focused` stays true and the wrapper stays visible.
+    visual.update(|window, cx| {
+        window.focus_prev(cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.update(|window, _| row_handle.is_focused(window)),
+        "Shift-Tab from the menu button must land back on the row \
+         (its immediate previous tab stop inside the same container)",
+    );
+
+    // --- Step 6: Shift-Tab OUT of the row+menu container. ---
+    //
+    // Once nothing in the container is focused, the container-level
+    // `contains_focused` predicate goes false, the wrapper opacity
+    // drops to 0, and the ellipsis button must paint INVISIBLY — same
+    // contract as `sidebar_row_menu_stays_hidden_until_the_row_is_hovered`.
+    // A regression that swapped `contains_focused` back to the row's
+    // own `is_focused` would already have failed step 2, but a
+    // regression that dropped the opacity gate entirely (or leaked
+    // reveal past focus) surfaces here.
+    visual.update(|window, cx| {
+        window.focus_prev(cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        !visual.update(|window, _| row_handle.is_focused(window)),
+        "second Shift-Tab must move focus off the row and out of the \
+         row+menu container",
+    );
+    let menu = visual
+        .debug_bounds("session-menu")
+        .expect("session menu still exists after focus leaves the container");
+    visual.update(|window, _cx| {
+        let scaled = menu.scale(window.scale_factor());
+        let opaque = window.painted_quads().into_iter().any(|quad| {
+            let inside = quad.bounds.top() >= scaled.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom() <= scaled.bottom() + px(1.).scale(window.scale_factor())
+                && quad.bounds.left() >= scaled.left() - px(1.).scale(window.scale_factor())
+                && quad.bounds.right() <= scaled.right() + px(1.).scale(window.scale_factor());
+            inside && quad.background != gpui::transparent_black().into()
+        });
+        assert!(
+            !opaque,
+            "with focus outside the row+menu container the ellipsis \
+             button must paint invisibly at rest — wrapper reveal leaked past focus",
+        );
+    });
 }
 
 /// Count painted quads whose border reads as the theme's focus ring on
