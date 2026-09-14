@@ -1352,7 +1352,7 @@ impl ZetaView {
                                     .px_2()
                                     .py_1()
                                     .bg(cx.theme().sidebar)
-                                    .text_size(px(12.))
+                                    .text_size(theme::label_small(cx.theme().font_size))
                                     .debug_selector(|| "composer-chip".into())
                                     .child(format!("{} · {} bytes", image.name, image.size))
                                     .child(
@@ -1380,7 +1380,7 @@ impl ZetaView {
                     .items_center()
                     .gap_1()
                     .h(theme::COMPOSER_TARGET_HEIGHT)
-                    .text_size(px(12.))
+                    .text_size(theme::label_small(cx.theme().font_size))
                     .debug_selector(|| "composer-target".into())
                     .child(div().text_color(roles.target_label).child("→"))
                     .child(

@@ -2,9 +2,32 @@ use super::*;
 use gpui::{TestAppContext, VisualTestContext, WindowHandle};
 use gpui_kit::component::Theme;
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
+use std::sync::LazyLock;
 use zeta_gui::client::{ModelCatalog, ServerEvent, SessionMetadata, StatusResult, ToolCall};
 use zeta_gui::session::{Branch, ImageAttachment, SessionSettings};
+
+/// Isolated `ZETA_HOME` shared by every test in this file. Set once on first
+/// access via `LazyLock` so any test that reads or writes `prefs::prefs_path`
+/// (directly, or through `prefs::commit`/`prefs::save`) lands under a temp
+/// dir instead of the developer's real `~/.zeta`. The `prefs_path` guard
+/// panics if a test forgets to force this before touching the file.
+static SCOPED_ZETA_HOME: LazyLock<PathBuf> = LazyLock::new(|| {
+    let dir = env::temp_dir().join(format!("zeta-gui-tests-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scoped ZETA_HOME");
+    env::set_var("ZETA_HOME", &dir);
+    dir
+});
+
+/// Wipe any prefs file left by an earlier test. Forces the scoped
+/// `ZETA_HOME` first so `prefs::prefs_path()` never falls back to the real
+/// user home under `cargo test`.
+fn wipe_scoped_prefs() {
+    let _ = &*SCOPED_ZETA_HOME;
+    let _ = std::fs::remove_file(prefs::prefs_path());
+}
 
 fn session() -> SessionMetadata {
     serde_json::from_value(
@@ -25,6 +48,10 @@ fn setup(
         env::set_var("TERM", "dumb");
         env::set_var("COLORTERM", "");
     });
+    // Force the scoped ZETA_HOME BEFORE anything touches prefs::prefs_path().
+    // `theme::apply` below reads no disk, but any test that clicks the
+    // appearance picker will call `prefs::commit` and land here.
+    let _ = &*SCOPED_ZETA_HOME;
     cx.update(init);
     // Baseline appearance: shipped default (opencode / JetBrains Mono / 13px).
     // Runs before `ZetaView::new` so every test sees a deterministic theme,
@@ -1676,9 +1703,11 @@ fn refresh_rpc_failure_clears_the_stale_transcript_and_keeps_the_connection(
 
 #[gpui::test]
 fn appearance_controls_reapply_theme_font_and_size_live(cx: &mut TestAppContext) {
-    // The prefs file lives under $ZETA_HOME. Wipe any leftover from a prior
-    // failed run so the baseline reads as the shipped default.
-    let _ = std::fs::remove_file(prefs::prefs_path());
+    // The prefs file lives under the scoped $ZETA_HOME. Wipe any leftover
+    // from a prior failed run so the baseline reads as the shipped default.
+    // `wipe_scoped_prefs` forces the scoped home before deriving the path
+    // so `cargo test` never touches the developer's real ~/.zeta.
+    wipe_scoped_prefs();
     let (window, view, _receiver) = setup(cx);
     // Reset the client's active appearance to defaults so this test does not
     // inherit a theme flipped by a peer test.
@@ -1765,7 +1794,7 @@ fn appearance_controls_reapply_theme_font_and_size_live(cx: &mut TestAppContext)
     // Reset for the next test — the global appearance and the on-disk prefs
     // both persist across the in-process test run.
     cx.update(theme::apply);
-    let _ = std::fs::remove_file(prefs::prefs_path());
+    wipe_scoped_prefs();
 }
 
 #[gpui::test]

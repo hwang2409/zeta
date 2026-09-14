@@ -300,7 +300,7 @@ impl ZetaView {
                                     .debug_selector(|| sel::ATTACHMENT_CHIP.into())
                                     .px_2()
                                     .py_1()
-                                    .text_size(px(12.))
+                                    .text_size(theme::label_small(cx.theme().font_size))
                                     .bg(cx.theme().muted)
                                     .h_flex()
                                     .items_center()
@@ -439,7 +439,7 @@ impl ZetaView {
                                 .flex_shrink_0()
                                 .text_color(cx.theme().muted_foreground)
                                 .opacity(0.78)
-                                .text_size(px(12.))
+                                .text_size(theme::label_small(cx.theme().font_size))
                                 .child(label),
                         )
                     })
@@ -450,7 +450,7 @@ impl ZetaView {
                                 .text_color(cx.theme().muted_foreground)
                                 .opacity(0.)
                                 .group_hover(group.clone(), |style| style.opacity(0.78))
-                                .text_size(px(12.))
+                                .text_size(theme::label_small(cx.theme().font_size))
                                 .child(hint),
                         )
                     }),
@@ -592,7 +592,7 @@ impl ZetaView {
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(theme::label_small(cx.theme().font_size))
                     .whitespace_normal()
                     .text_color(cx.theme().muted_foreground)
                     .child(status_text),

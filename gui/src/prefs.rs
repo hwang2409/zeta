@@ -43,6 +43,17 @@ fn prefs_dir() -> PathBuf {
 
 /// Absolute path of the prefs file — exposed for tests and error messages.
 pub fn prefs_path() -> PathBuf {
+    // In test builds, hitting the real `~/.zeta/gui-prefs.json` would wipe a
+    // developer's actual preferences the moment `cargo test` runs. Refuse to
+    // resolve the path unless the caller has already scoped `ZETA_HOME` to
+    // an isolated temp dir. Tests set this in `setup()`; the internal prefs
+    // tests use `load_from` / `save_to` with an explicit path and never
+    // reach this helper.
+    #[cfg(test)]
+    assert!(
+        env::var_os("ZETA_HOME").is_some(),
+        "prefs_path() called without ZETA_HOME scoped to a temp dir — refusing to touch the real user prefs",
+    );
     prefs_dir().join(FILE_NAME)
 }
 

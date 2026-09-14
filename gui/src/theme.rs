@@ -140,6 +140,25 @@ pub fn clamp_font_size(px_value: f32) -> Pixels {
     px(clamped)
 }
 
+/// Floor for size roles derived from the base font size. Kept above browsers'
+/// unreadable-tier so shrinking the base to `MIN_FONT_SIZE_PX` still leaves
+/// chip / hint / preview labels legible.
+pub const MIN_LABEL_PX: f32 = 9.0;
+
+/// Small-tier label size derived from the current base font size. Attachment
+/// chips, composer target lines, tool hints, and login status paint with
+/// this — one step below body text at every base, floored at `MIN_LABEL_PX`.
+pub fn label_small(base: Pixels) -> Pixels {
+    px((f32::from(base) - 2.).max(MIN_LABEL_PX))
+}
+
+/// Micro-tier label size derived from the current base font size. Reserved
+/// for the smallest secondary text (thumbnail fallback captions). Sits one
+/// step below `label_small`, floored at `MIN_LABEL_PX`.
+pub fn label_micro(base: Pixels) -> Pixels {
+    px((f32::from(base) - 3.).max(MIN_LABEL_PX))
+}
+
 /// Named palettes the appearance picker exposes. Opencode ships as the
 /// default and mirrors the wiki agent-run look; the other four give the
 /// user a spread of dark and light options without leaving the flat,
@@ -250,10 +269,17 @@ pub struct Palette {
     pub composer_focus_fill: Hsla,
     /// Syntax color hex literals used to build the highlight theme JSON.
     pub syntax: SyntaxHex,
-    /// Extra text-on-accent color used when the accent is a light hue
-    /// (opencode paints canvas over accent; light themes and non-dark-canvas
-    /// themes may need a different tint to stay legible).
-    pub text_on_accent: Hsla,
+    /// Text painted ON each solid semantic fill (state pill, primary/danger
+    /// button, inverted badge). One foreground per semantic because a single
+    /// fg cannot clear WCAG AA against four different fills — a light warning
+    /// wants a dark label, a medium red danger may want a near-black label
+    /// on some themes, and the same white that works over a dark accent
+    /// fails over a light beige warning. Every pair is verified by
+    /// `every_solid_semantic_pair_clears_wcag_aa`.
+    pub accent_fg: Hsla,
+    pub success_fg: Hsla,
+    pub warning_fg: Hsla,
+    pub danger_fg: Hsla,
 }
 
 /// Syntax palette in raw hex-string form. The highlight-theme JSON is built
@@ -514,10 +540,20 @@ pub mod palette {
     pub fn danger_tint() -> Hsla {
         active_palette().danger_tint()
     }
-    /// Solid text color used over the primary/accent surface. Opencode
-    /// paints canvas here; light themes generally use white.
-    pub fn text_on_accent() -> Hsla {
-        active_palette().text_on_accent
+    /// Text painted over the solid accent / primary surface. Opencode paints
+    /// canvas here; light themes typically use a near-black so accent state
+    /// pills clear AA contrast.
+    pub fn accent_fg() -> Hsla {
+        active_palette().accent_fg
+    }
+    pub fn success_fg() -> Hsla {
+        active_palette().success_fg
+    }
+    pub fn warning_fg() -> Hsla {
+        active_palette().warning_fg
+    }
+    pub fn danger_fg() -> Hsla {
+        active_palette().danger_fg
     }
 }
 
@@ -545,7 +581,10 @@ static PALETTE_OPENCODE: LazyLock<Palette> = LazyLock::new(|| Palette {
     syntax_number: hex(0xe29a5c),
     syntax_type: hex(0x7fc9b8),
     composer_focus_fill: hex(0x333326),
-    text_on_accent: hex(0x1e1e17),
+    accent_fg: hex(0x1e1e17),
+    success_fg: hex(0x1e1e17),
+    warning_fg: hex(0x1e1e17),
+    danger_fg: hex(0x1e1e17),
     syntax: SyntaxHex {
         background: "#1e1e17",
         foreground: "#ece9d8",
@@ -607,7 +646,10 @@ static PALETTE_GRUVBOX_DARK: LazyLock<Palette> = LazyLock::new(|| Palette {
     syntax_number: hex(0xd3869b),
     syntax_type: hex(0xfabd2f),
     composer_focus_fill: hex(0x3a3835),
-    text_on_accent: hex(0x1d2021),
+    accent_fg: hex(0x1d2021),
+    success_fg: hex(0x1d2021),
+    warning_fg: hex(0x1d2021),
+    danger_fg: hex(0x1d2021),
     syntax: SyntaxHex {
         background: "#1d2021",
         foreground: "#ebdbb2",
@@ -669,7 +711,10 @@ static PALETTE_VSCODE_DARK_PLUS: LazyLock<Palette> = LazyLock::new(|| Palette {
     syntax_number: hex(0xb5cea8),
     syntax_type: hex(0x4ec9b0),
     composer_focus_fill: hex(0x2a2a2b),
-    text_on_accent: hex(0xffffff),
+    accent_fg: hex(0x1f1f1f),
+    success_fg: hex(0x1f1f1f),
+    warning_fg: hex(0x1f1f1f),
+    danger_fg: hex(0x1f1f1f),
     syntax: SyntaxHex {
         background: "#1f1f1f",
         foreground: "#d4d4d4",
@@ -731,7 +776,13 @@ static PALETTE_NORD: LazyLock<Palette> = LazyLock::new(|| Palette {
     syntax_number: hex(0xd08770),
     syntax_type: hex(0x8fbcbb),
     composer_focus_fill: hex(0x4a5364),
-    text_on_accent: hex(0x2e3440),
+    accent_fg: hex(0x2e3440),
+    success_fg: hex(0x2e3440),
+    warning_fg: hex(0x2e3440),
+    // Nord's danger #bf616a sits at mid-luminance where neither `canvas`
+    // (2.98:1) nor `text` (3.54:1) clears AA. A near-black label reaches
+    // ~4.6:1 against the same red.
+    danger_fg: hex(0x101010),
     syntax: SyntaxHex {
         background: "#2e3440",
         foreground: "#eceff4",
@@ -793,7 +844,15 @@ static PALETTE_GRUVBOX_LIGHT: LazyLock<Palette> = LazyLock::new(|| Palette {
     syntax_number: hex(0xaf3a03),
     syntax_type: hex(0x076678),
     composer_focus_fill: hex(0xf4e8bd),
-    text_on_accent: hex(0xfbf1c7),
+    // Gruvbox Light's three brighter solids (teal accent, olive success,
+    // amber warning) sit at mid-luminance where the canvas #fbf1c7 falls
+    // between 2.19:1 and 3.78:1 against them. A near-black label clears
+    // AA against all three; only danger #cc241d — the darkest solid —
+    // pairs with the light canvas.
+    accent_fg: hex(0x0a0a0a),
+    success_fg: hex(0x0a0a0a),
+    warning_fg: hex(0x0a0a0a),
+    danger_fg: hex(0xfbf1c7),
     syntax: SyntaxHex {
         background: "#fbf1c7",
         foreground: "#3c3836",
@@ -1050,10 +1109,10 @@ pub fn apply_with(cx: &mut App, appearance: &Appearance) {
     colors.muted_foreground = palette.text_muted;
 
     colors.accent = palette.accent;
-    colors.accent_foreground = palette.text_on_accent;
+    colors.accent_foreground = palette.accent_fg;
 
     colors.primary = palette.accent;
-    colors.primary_foreground = palette.text_on_accent;
+    colors.primary_foreground = palette.accent_fg;
     colors.primary_active = palette.accent;
     colors.primary_hover = palette.accent_hover;
 
@@ -1068,7 +1127,7 @@ pub fn apply_with(cx: &mut App, appearance: &Appearance) {
     colors.button_active = palette.panel;
 
     colors.button_primary = palette.accent;
-    colors.button_primary_foreground = palette.text_on_accent;
+    colors.button_primary_foreground = palette.accent_fg;
     colors.button_primary_hover = palette.accent_hover;
     colors.button_primary_active = palette.accent;
 
@@ -1078,22 +1137,22 @@ pub fn apply_with(cx: &mut App, appearance: &Appearance) {
     colors.button_secondary_active = palette.panel;
 
     colors.button_danger = palette.danger;
-    colors.button_danger_foreground = palette.text_on_accent;
+    colors.button_danger_foreground = palette.danger_fg;
     colors.button_danger_hover = palette.danger;
     colors.button_danger_active = palette.danger;
 
     colors.button_warning = palette.warning;
-    colors.button_warning_foreground = palette.text_on_accent;
+    colors.button_warning_foreground = palette.warning_fg;
     colors.button_warning_hover = palette.warning;
     colors.button_warning_active = palette.warning;
 
     colors.button_success = palette.success;
-    colors.button_success_foreground = palette.text_on_accent;
+    colors.button_success_foreground = palette.success_fg;
     colors.button_success_hover = palette.success;
     colors.button_success_active = palette.success;
 
     colors.button_info = palette.accent;
-    colors.button_info_foreground = palette.text_on_accent;
+    colors.button_info_foreground = palette.accent_fg;
     colors.button_info_hover = palette.accent_hover;
     colors.button_info_active = palette.accent;
 
@@ -1106,7 +1165,7 @@ pub fn apply_with(cx: &mut App, appearance: &Appearance) {
     colors.sidebar_accent = palette.active();
     colors.sidebar_accent_foreground = palette.text;
     colors.sidebar_primary = palette.accent;
-    colors.sidebar_primary_foreground = palette.text_on_accent;
+    colors.sidebar_primary_foreground = palette.accent_fg;
 
     colors.list = palette.panel;
     colors.list_hover = palette.hover();
@@ -1146,19 +1205,19 @@ pub fn apply_with(cx: &mut App, appearance: &Appearance) {
     colors.status_bar_border = palette.border;
 
     colors.danger = palette.danger;
-    colors.danger_foreground = palette.text_on_accent;
+    colors.danger_foreground = palette.danger_fg;
     colors.danger_active = palette.danger;
     colors.danger_hover = palette.danger;
     colors.warning = palette.warning;
-    colors.warning_foreground = palette.text_on_accent;
+    colors.warning_foreground = palette.warning_fg;
     colors.warning_hover = palette.warning;
     colors.warning_active = palette.warning;
     colors.success = palette.success;
-    colors.success_foreground = palette.text_on_accent;
+    colors.success_foreground = palette.success_fg;
     colors.success_hover = palette.success;
     colors.success_active = palette.success;
     colors.info = palette.accent;
-    colors.info_foreground = palette.text_on_accent;
+    colors.info_foreground = palette.accent_fg;
     colors.info_hover = palette.accent_hover;
     colors.info_active = palette.accent;
 
@@ -1708,6 +1767,65 @@ mod tests {
         assert_eq!(clamp_font_size(13.6), px(14.));
         assert_eq!(clamp_font_size(18.0), px(MAX_FONT_SIZE_PX));
         assert_eq!(clamp_font_size(999.0), px(MAX_FONT_SIZE_PX));
+    }
+
+    #[test]
+    fn every_solid_semantic_pair_clears_wcag_aa() {
+        // Text painted on a solid semantic fill (accent state pill, primary
+        // button, warning/danger button) must reach the WCAG AA normal-text
+        // ratio of 4.5:1. The regression this catches: routing one
+        // foreground onto every semantic drops several pairs below that bar
+        // (VSCode warning 1.73:1, Gruvbox Light warning 2.19:1, Nord danger
+        // 3.05:1 measured on the pre-fix single-fg palette). If someone
+        // collapses the four `*_fg` fields back into one shared value, this
+        // test fails on the same three pairs.
+        for id in ThemeId::ALL {
+            let p = id.palette();
+            for (label, bg, fg) in [
+                ("accent", p.accent, p.accent_fg),
+                ("success", p.success, p.success_fg),
+                ("warning", p.warning, p.warning_fg),
+                ("danger", p.danger, p.danger_fg),
+            ] {
+                let ratio = contrast_ratio(fg, bg);
+                assert!(
+                    ratio >= 4.5,
+                    "{} {label}: {ratio:.2}:1 fails WCAG AA (need >=4.5:1)",
+                    id.label(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn label_size_roles_scale_with_the_base_font_size() {
+        // Small / micro label roles derive from the base font size so
+        // attachment chips, composer target, tool hints, login status,
+        // and thumbnail-fallback captions reflow when the user picks a
+        // new base. Guards against re-introducing a hardcoded `px(12.)`
+        // that ignores the appearance picker.
+        let small_low = label_small(px(MIN_FONT_SIZE_PX));
+        let small_high = label_small(px(MAX_FONT_SIZE_PX));
+        assert_ne!(
+            small_low, small_high,
+            "small role must move when the base font size moves"
+        );
+        assert!(f32::from(small_low) < f32::from(small_high));
+
+        let micro_low = label_micro(px(MIN_FONT_SIZE_PX));
+        let micro_high = label_micro(px(MAX_FONT_SIZE_PX));
+        assert_ne!(
+            micro_low, micro_high,
+            "micro role must move when the base font size moves"
+        );
+        assert!(f32::from(micro_low) < f32::from(micro_high));
+
+        // Roles land below the base at both bounds, and never below the
+        // legibility floor.
+        assert!(f32::from(small_high) < MAX_FONT_SIZE_PX);
+        assert!(f32::from(micro_high) < MAX_FONT_SIZE_PX);
+        assert!(f32::from(small_low) >= MIN_LABEL_PX);
+        assert!(f32::from(micro_low) >= MIN_LABEL_PX);
     }
 
     #[test]
