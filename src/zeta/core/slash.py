@@ -32,6 +32,7 @@ from .commands.custom_commands import (
     render_custom_input,
     resolve_custom_input,
 )
+from .project_context import discover_project_root
 from .store import ConversationEntry
 
 
@@ -239,6 +240,12 @@ MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int | None]] = {
 # Used when a model has no published window: unrecognized names, and the
 # entries above that are deliberately None.
 DEFAULT_TOKEN_BUDGET = 200_000
+
+INIT_PROMPT = """Explore this repository with your existing tools. Inspect its build files, layout, test commands, and project conventions.
+
+Write or improve AGENTS.md at the repository root. If AGENTS.md exists, read it first and improve or extend it. Do not overwrite useful guidance. If only CLAUDE.md exists, use it as source material and produce AGENTS.md.
+
+Keep the file concise. Record useful commands, an architecture map, and project conventions. Do not add generic boilerplate. Zeta loads AGENTS.md files from the repository root through the current directory, with deeper nested files taking precedence. Place folder-specific guidance in nested AGENTS.md files when warranted."""
 
 
 def context_window(provider: str, model: str) -> int | None:
@@ -925,6 +932,16 @@ def _run_implement(session: SlashSession, args: str) -> str | SlashModelInput:
     return session.slash_implement(args.strip())
 
 
+def _run_init(
+    _session: SlashSession, args: str, project_root: Path | None
+) -> str | SlashModelInput:
+    if args.strip():
+        return "init unchanged: /init does not accept arguments"
+    if project_root is None:
+        return "init error: not inside a project"
+    return SlashModelInput(INIT_PROMPT)
+
+
 async def _run_compact(session: SlashSession, args: str) -> str:
     del args
     return await session.slash_compact()
@@ -988,6 +1005,7 @@ def create_slash_registry(
 
     effective_home = zeta_home or os.environ.get("ZETA_HOME")
     registry = SlashCommandRegistry()
+    project_root = discover_project_root(project_dir or Path.cwd())
     registry.register(SlashCommand("status", _run_status, "show session status"))
     registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
     registry.register(
@@ -1004,6 +1022,13 @@ def create_slash_registry(
     )
     registry.register(
         SlashCommand("implement", _run_implement, "implement the proposed plan")
+    )
+    registry.register(
+        SlashCommand(
+            "init",
+            lambda session, args: _run_init(session, args, project_root),
+            "generate or improve project instructions",
+        )
     )
     registry.register(SlashCommand("paste", _run_paste, "paste an image"))
     registry.register(SlashCommand("compact", _run_compact, "compact the context"))

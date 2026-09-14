@@ -18,6 +18,7 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.slash import (
     COMMAND_FILE_SIZE_LIMIT,
+    INIT_PROMPT,
     CustomCommand,
     SlashModelInput,
     create_slash_registry,
@@ -123,6 +124,66 @@ def test_completer_shows_description_and_source_badge(tmp_path: Path) -> None:
     assert len(completions) == 1
     assert completions[0].text == "review"
     assert completions[0].display_meta[0][1] == "[project] review the change"
+
+
+def test_init_is_in_help_and_completion(tmp_path: Path) -> None:
+    registry = create_slash_registry(
+        zeta_home=tmp_path / "home",
+        project_dir=tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    assert "/init — generate or improve project instructions" in registry.help_text()
+    completions = list(
+        SlashCompleter(registry).get_completions(
+            Document("/ini"), CompleteEvent(completion_requested=True)
+        )
+    )
+    assert len(completions) == 1
+    assert completions[0].text == "init"
+    assert completions[0].display_meta[0][1] == (
+        "generate or improve project instructions"
+    )
+
+
+@pytest.mark.asyncio
+async def test_init_rejects_non_project_without_model_input(tmp_path: Path) -> None:
+    output = StringIO()
+    backend = FakeBackend([])
+    app = TUIApp(
+        AgentLoop(
+            backend,
+            ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="fake",
+        model="offline",
+        zeta_home=tmp_path / "home",
+        console=Console(file=output, force_terminal=False),
+    )
+
+    await app._handle_prompt_value("/init")
+
+    assert backend.calls == []
+    assert "init error: not inside a project" in output.getvalue()
+    await app.close()
+
+
+def test_init_returns_canned_prompt_inside_project(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    result = create_slash_registry(
+        zeta_home=tmp_path / "home",
+        project_dir=project,
+        skill_catalog=SkillCatalog.empty(),
+    ).dispatch(object(), "/init")
+
+    assert isinstance(result, SlashModelInput)
+    assert result.text == INIT_PROMPT
+    assert "improve or extend" in result.text
+    assert "Do not overwrite" in result.text
+    assert "nested AGENTS.md" in result.text
 
 
 def test_completion_applies_to_a_real_buffer(tmp_path: Path) -> None:
@@ -493,6 +554,36 @@ async def test_custom_command_becomes_the_model_user_message(
         if message.role.value == "user"
     )
     assert user_message.content[0].text == "Review changes"
+
+
+@pytest.mark.asyncio
+async def test_init_becomes_the_model_user_message(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    await asyncio.to_thread(
+        subprocess.run, ["git", "init", "-q"], cwd=project, check=True
+    )
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    store = ConversationStore(tmp_path / "sessions", cwd=project)
+    app = TUIApp(
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
+        provider="fake",
+        model="offline",
+        zeta_home=tmp_path / "zeta-home",
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    await app._handle_prompt_value("/init")
+    assert app._active_task is not None
+    await app._active_task
+
+    user_message = next(
+        message
+        for message in backend.calls[0][0]
+        if message.role.value == "user"
+    )
+    assert user_message.content[0].text == INIT_PROMPT
+    await app.close()
 
 
 @pytest.mark.asyncio

@@ -53,8 +53,8 @@ class ProjectContext:
     notices: tuple[str, ...] = field(default_factory=tuple)
 
 
-def discover_repo_root(cwd: str | Path | None = None) -> Path:
-    """Resolve the git worktree root, or use cwd when it is not a repository."""
+def discover_project_root(cwd: str | Path | None = None) -> Path | None:
+    """Resolve the git worktree root, or return None outside a repository."""
 
     directory = Path(cwd or Path.cwd()).expanduser().resolve()
     try:
@@ -66,9 +66,16 @@ def discover_repo_root(cwd: str | Path | None = None) -> Path:
             env=subprocess_env(),
         )
     except (OSError, subprocess.CalledProcessError):
-        return directory
+        return None
     root = getattr(result, "stdout", "").strip()
-    return Path(root).expanduser().resolve() if root else directory
+    return Path(root).expanduser().resolve() if root else None
+
+
+def discover_repo_root(cwd: str | Path | None = None) -> Path:
+    """Resolve the git worktree root, or use cwd when it is not a repository."""
+
+    directory = Path(cwd or Path.cwd()).expanduser().resolve()
+    return discover_project_root(directory) or directory
 
 
 def _present(path: Path) -> bool:
@@ -283,6 +290,7 @@ __all__ = [
     "SYSTEM_FILENAME",
     "ProjectContext",
     "PromptArgumentError",
+    "discover_project_root",
     "discover_repo_root",
     "load_project_context",
     "resolve_prompt_argument",
