@@ -17,7 +17,6 @@ def build_unattended_loop(
     home: Path,
     allow: tuple[str, ...],
     backend: CompletionBackend | None = None,
-    skill_catalog: SkillCatalog | None = None,
 ) -> AgentLoop:
     metadata, store = session.metadata, session.store
     if backend is None:
@@ -25,10 +24,9 @@ def build_unattended_loop(
     policy = ApprovalPolicy(
         store=store, default=ApprovalDecision.DENY, always_allow=allow
     )
-    if skill_catalog is None:
-        if session.metadata.skill_catalog is None:
-            raise ValueError("unattended sessions require a skill catalog")
-        skill_catalog = SkillCatalog.from_snapshot(session.metadata.skill_catalog)
+    if session.metadata.skill_catalog is None:
+        raise ValueError("unattended sessions require a skill catalog")
+    skill_catalog = SkillCatalog.from_snapshot(session.metadata.skill_catalog)
     registry = ToolRegistry(
         metadata.cwd,
         session_store=store,
@@ -40,6 +38,7 @@ def build_unattended_loop(
     return AgentLoop(
         backend,
         store,
+        skill_catalog=skill_catalog,
         registry=registry,
         approval_policy=policy,
         max_turns=25,

@@ -270,6 +270,17 @@ def test_discovery_skips_names_that_cannot_be_invoked_as_slash_commands(
     assert "must be one nonempty word" in caplog.text
 
 
+def test_discovery_skips_leading_slash_names(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "skills" / "hidden.md"
+    path.parent.mkdir()
+    _write_skill(path, "/hidden", "body")
+
+    assert discover_skills(tmp_path) == []
+    assert "must be one nonempty word" in caplog.text
+
+
 def test_home_directory_named_skills_still_uses_nested_skills_directory(
     tmp_path: Path,
 ) -> None:

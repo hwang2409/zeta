@@ -16,7 +16,12 @@ from ..mcp.prompt_commands import (
     SlashPromptError,
     dispatch_prompt,
 )
-from ..skill_catalog import SkillCatalog, SkillMeta, load_skill_prompt
+from ..skill_catalog import (
+    SkillCatalog,
+    SkillMeta,
+    is_slash_safe_name,
+    load_skill_prompt,
+)
 from ..types import Message, MessageRole, StreamEventType, TextContent
 from .commands.custom_commands import (
     COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
@@ -577,7 +582,7 @@ class SlashCommandRegistry:
         )
 
     def register(self, command: SlashCommand) -> None:
-        if not command.name or any(character.isspace() for character in command.name):
+        if not is_slash_safe_name(command.name):
             raise ValueError("slash command name must be one nonempty word")
         if command.name in self._commands:
             raise ValueError(f"slash command already registered: {command.name}")
@@ -676,18 +681,21 @@ class SlashCommandRegistry:
         parts = first_line[1:].split(maxsplit=1)
         if not parts:
             return None
-        command = self._commands.get(parts[0])
+        name = parts[0]
+        if not is_slash_safe_name(name):
+            return None
+        command = self._commands.get(name)
         if command is not None:
             return command.run(session, parts[1] if len(parts) == 2 else "")
-        custom = self._custom_commands.get(parts[0])
-        skill = self._skills.get(parts[0])
+        custom = self._custom_commands.get(name)
+        skill = self._skills.get(name)
         if skill is not None:
             return SlashModelInput(load_skill_prompt(skill))
-        prompt = self._mcp_prompts.get(parts[0])
+        prompt = self._mcp_prompts.get(name)
         if prompt is not None:
             return dispatch_prompt(
                 session,
-                parts[0],
+                name,
                 prompt[1],
                 parts[1] if len(parts) == 2 else "",
             )
@@ -740,6 +748,8 @@ class SlashCommandRegistry:
         if not parts:
             return None
         name = parts[0]
+        if not is_slash_safe_name(name):
+            return None
         command = self._custom_commands.get(name)
         return command if command is not None and command.kind == "exec" else None
 
@@ -972,7 +982,7 @@ def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
     project_dir: str | Path | None = None,
-    skill_catalog: SkillCatalog | None = None,
+    skill_catalog: SkillCatalog,
 ) -> SlashCommandRegistry:
     """Create the built-in registry."""
 
@@ -1040,5 +1050,5 @@ def create_slash_registry(
     registry._notices.extend(result.notices)
     for command in result.commands:
         registry.register_custom(command)
-    registry.register_skills(skill_catalog or SkillCatalog(()))
+    registry.register_skills(skill_catalog)
     return registry

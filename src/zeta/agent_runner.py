@@ -490,6 +490,7 @@ async def run_agent_tool(
             child_backend,
             child_store,
             registry=child_registry,
+            skill_catalog=child_registry.skill_catalog,
             max_turns=child_turn_cap,
             token_budget=loop.context_assembler.token_budget,
             retained_tail=loop.context_assembler.retained_tail,

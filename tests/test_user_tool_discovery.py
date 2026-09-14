@@ -13,6 +13,7 @@ from zeta.core.fake import FakeBackend
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
+from zeta.skill_catalog import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._user_discovery import (
     apply_external_tools,
@@ -54,7 +55,7 @@ def _write_tool(directory: Path, filename: str, source: str) -> Path:
 
 def _new_registry(tmp_path: Path) -> ToolRegistry:
     (tmp_path / "cwd").mkdir(exist_ok=True)
-    return ToolRegistry(tmp_path / "cwd")
+    return ToolRegistry(tmp_path / "cwd", skill_catalog=SkillCatalog.empty())
 
 
 @pytest.mark.asyncio
@@ -296,7 +297,7 @@ def test_project_tool_reject_leaves_always_allow_policy_intact(
         always_allow=("read",),
     )
     (tmp_path / "cwd").mkdir(exist_ok=True)
-    registry = ToolRegistry(tmp_path / "cwd", approval_policy=policy)
+    registry = ToolRegistry(tmp_path / "cwd", approval_policy=policy, skill_catalog=SkillCatalog.empty())
     registry.bind_session_store(store)
     builtin_read = registry._tools["read"]
 
@@ -470,7 +471,7 @@ async def test_deny_list_applies_to_user_tool(tmp_path: Path) -> None:
         always_deny=("denied_tool",),
     )
     (tmp_path / "cwd").mkdir(exist_ok=True)
-    registry = ToolRegistry(tmp_path / "cwd", approval_policy=policy)
+    registry = ToolRegistry(tmp_path / "cwd", approval_policy=policy, skill_catalog=SkillCatalog.empty())
     registry.bind_session_store(store)
     apply_external_tools(registry, home=home, project_dir=None)
     assert "denied_tool" in registry.registered_names
@@ -498,7 +499,7 @@ async def test_allow_list_applies_to_project_tool_after_trust(
         always_allow=("allowed_tool",),
     )
     (tmp_path / "cwd").mkdir(exist_ok=True)
-    registry = ToolRegistry(tmp_path / "cwd", approval_policy=policy)
+    registry = ToolRegistry(tmp_path / "cwd", approval_policy=policy, skill_catalog=SkillCatalog.empty())
     registry.bind_session_store(store)
     discovery = apply_external_tools(
         registry, home=None, project_dir=project
@@ -536,7 +537,7 @@ def _build_tui_app(
 ) -> TUIApp:
     cwd = tmp_path / "cwd"
     cwd.mkdir(exist_ok=True)
-    registry = ToolRegistry(cwd)
+    registry = ToolRegistry(cwd, skill_catalog=SkillCatalog.empty())
     discovery = apply_external_tools(
         registry, home=home, project_dir=project_dir
     )
@@ -544,6 +545,7 @@ def _build_tui_app(
         FakeBackend([]),
         ConversationStore(tmp_path / "sessions", cwd=cwd),
         registry=registry,
+skill_catalog=SkillCatalog.empty(),
     )
     return TUIApp(
         loop,
@@ -558,7 +560,7 @@ def test_slash_tools_list_reports_pending_project_tools(tmp_path: Path) -> None:
     project = tmp_path / "project" / ".zeta"
     _write_tool(project / "tools", "proj_echo.py", _echo_source("proj_echo"))
     app = _build_tui_app(tmp_path, home=None, project_dir=project)
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     output = registry.dispatch(app, "/tools")
 
@@ -571,7 +573,7 @@ def test_slash_tools_trust_registers_project_tools(tmp_path: Path) -> None:
     project = tmp_path / "project" / ".zeta"
     _write_tool(project / "tools", "proj_echo.py", _echo_source("proj_echo"))
     app = _build_tui_app(tmp_path, home=None, project_dir=project)
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     output = registry.dispatch(app, "/tools trust")
 
@@ -585,7 +587,7 @@ def test_slash_tools_trust_registers_project_tools(tmp_path: Path) -> None:
 
 def test_slash_tools_trust_reports_no_pending(tmp_path: Path) -> None:
     app = _build_tui_app(tmp_path, home=None, project_dir=None)
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     output = registry.dispatch(app, "/tools trust")
 
@@ -594,7 +596,7 @@ def test_slash_tools_trust_reports_no_pending(tmp_path: Path) -> None:
 
 def test_slash_tools_rejects_unknown_subcommand(tmp_path: Path) -> None:
     app = _build_tui_app(tmp_path, home=None, project_dir=None)
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     output = registry.dispatch(app, "/tools revoke")
 

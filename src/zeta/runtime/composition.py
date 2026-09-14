@@ -97,8 +97,8 @@ def compose_runtime(
 
         metadata = opened.metadata
         if metadata.skill_catalog is None:
-            persisted = manager.persist_skill_catalog(metadata, skill_catalog)
-            skill_catalog = SkillCatalog.from_snapshot(persisted.skill_catalog)
+            raise ValueError("session has no persisted skill catalog")
+        skill_catalog = SkillCatalog.from_snapshot(metadata.skill_catalog)
         completion_callback = on_completion_success or (lambda: manager.touch(metadata))
         policy = ApprovalPolicy(
             store=opened.store,
@@ -120,7 +120,13 @@ def compose_runtime(
             loop_kwargs["max_turns"] = max_turns
         registry = ToolRegistry(opened.store.cwd, skill_catalog=skill_catalog)
         cleanup.callback(registry.background_tasks.release_directory)
-        loop = AgentLoop(backend, opened.store, registry=registry, **loop_kwargs)
+        loop = AgentLoop(
+            backend,
+            opened.store,
+            registry=registry,
+            skill_catalog=skill_catalog,
+            **loop_kwargs,
+        )
         if metadata.plan_mode:
             loop.set_plan_mode(True)
         repo_root = discover_repo_root(Path(metadata.cwd))

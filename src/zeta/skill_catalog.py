@@ -14,6 +14,14 @@ SKILL_INDEX_BYTE_LIMIT = 32 * 1024
 _PACKAGED_SKILLS_DIR = Path(__file__).parent / "skills"
 
 
+def is_slash_safe_name(name: str) -> bool:
+    """Return whether a name can be addressed by slash input."""
+
+    return bool(name) and not name.startswith("/") and not any(
+        character.isspace() for character in name
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SkillMeta:
     name: str
@@ -29,6 +37,12 @@ class SkillMeta:
 class SkillCatalog:
     skills: tuple[SkillMeta, ...]
     notices: tuple[str, ...] = ()
+
+    @classmethod
+    def empty(cls) -> SkillCatalog:
+        """Return an explicit empty catalog for isolated tests."""
+
+        return cls(())
 
     def index(self) -> str:
         """Render a bounded, deterministic skill index for the system prompt."""
@@ -296,7 +310,7 @@ def replace_skill_index(prompt: str, catalog: SkillCatalog) -> str:
         return prompt
     end = prompt.find(end_marker, start)
     if end < 0:
-        return prompt
+        raise ValueError("saved prompt has an unterminated skill index")
     end += len(end_marker)
     return prompt[:start] + catalog.index() + prompt[end:]
 
@@ -340,7 +354,7 @@ def _parse_frontmatter(lines: list[str], path: Path) -> dict[str, str | list[str
     name = values["name"]
     if type(name) is not str or not name.strip():
         raise ValueError(f"skill {path} frontmatter name must be a nonempty string")
-    if any(character.isspace() for character in name):
+    if not is_slash_safe_name(name):
         raise ValueError(
             f"skill {path} frontmatter name must be one nonempty word"
         )
@@ -364,6 +378,7 @@ __all__ = [
     "discover_packaged_skills",
     "discover_session_skills",
     "discover_skills",
+    "is_slash_safe_name",
     "load_skill",
     "load_skill_prompt",
     "replace_skill_index",

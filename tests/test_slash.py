@@ -1,3 +1,5 @@
+from zeta.skill_catalog import SkillCatalog
+
 import asyncio
 from dataclasses import dataclass, replace
 from io import StringIO
@@ -159,6 +161,7 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
         store,
         approval_policy=policy,
         retained_tail=17,
+skill_catalog=SkillCatalog.empty(),
     )
     await loop.context_assembler.assemble()
     loop.context_assembler.record_usage(
@@ -187,7 +190,7 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
         model="model-live",
         approval_policy=policy,
     )
-    output = create_slash_registry().dispatch(app, "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
 
     assert output is not None
     assert f"session_id: {store.session_id}" in output
@@ -244,13 +247,13 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
         retained_tail=1,
         token_counter=token_count,
     )
-    loop = AgentLoop(backend, store, context_assembler=assembler)
+    loop = AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty())
     app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
 
     await app._consume_turn("first")
     await app._consume_turn("second")
 
-    output = create_slash_registry().dispatch(app, "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
 
     assert output is not None
     assert "tokens_used_this_session: 70" in output
@@ -302,7 +305,7 @@ async def test_manual_compact_captures_summarization_cost(tmp_path: Path) -> Non
         retained_tail=1,
         token_counter=token_count,
     )
-    loop = AgentLoop(backend, store, context_assembler=assembler)
+    loop = AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty())
     app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
 
     await app._consume_turn("first")
@@ -339,7 +342,7 @@ async def test_errored_turn_usage_does_not_leak_to_next_model(tmp_path: Path) ->
 
     store = ConversationStore(tmp_path / "sessions")
     error_backend = _ErrorBackend([])
-    loop = AgentLoop(error_backend, store)
+    loop = AgentLoop(error_backend, store, skill_catalog=SkillCatalog.empty())
     app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
 
     await app._consume_turn("first")
@@ -373,7 +376,7 @@ def test_usage_cost_keeps_all_turns_outside_bounded_trend() -> None:
         usage_history=tracker.history,
         usage_cost_by_model=tracker.cost_by_model,
     )
-    output = create_slash_registry().dispatch(FakeSlashSession(status), "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(FakeSlashSession(status), "/status")
 
     assert output is not None
     assert len(tracker.history) == 8
@@ -389,14 +392,14 @@ def test_status_renders_cache_hit_rate_as_na_without_usage() -> None:
             uncached_input_tokens=0,
         )
     )
-    output = create_slash_registry().dispatch(empty_session, "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(empty_session, "/status")
 
     assert output is not None
     assert "prompt_cache_hit_rate: n/a" in output
 
 
 def test_status_renders_usage_trend_cost_and_context_gauge() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(
             replace(
                 session().status,
@@ -435,7 +438,7 @@ def test_status_renders_usage_trend_cost_and_context_gauge() -> None:
 
 
 def test_status_marks_unknown_model_cost_and_window() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(
             replace(
                 session().status,
@@ -467,7 +470,7 @@ def test_context_gauge_unknown_window_is_bounded() -> None:
 
 
 def test_status_renders_compaction_history_and_empty_state() -> None:
-    empty = create_slash_registry().dispatch(session(), "/status")
+    empty = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(session(), "/status")
     assert empty is not None
     assert "compaction_history:\n  none" in empty
 
@@ -475,7 +478,7 @@ def test_status_renders_compaction_history_and_empty_state() -> None:
         session().status,
         compaction_history=(CompactionSummary(3, 4, 120),),
     )
-    output = create_slash_registry().dispatch(FakeSlashSession(status), "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(FakeSlashSession(status), "/status")
     assert output is not None
     assert "compaction_history:\n  turn 3: 4 entries, 120 tokens saved" in output
 
@@ -518,7 +521,7 @@ def test_codex_cache_writes_use_existing_usage_categories() -> None:
 
 
 def test_cost_uses_the_model_for_each_turn() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(
             replace(
                 session().status,
@@ -546,7 +549,7 @@ def test_cost_uses_the_model_for_each_turn() -> None:
 
 
 def test_gpt_5_5_long_context_applies_published_multiplier() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(
             replace(
                 session().status,
@@ -570,7 +573,7 @@ def test_gpt_5_5_long_context_applies_published_multiplier() -> None:
 
 
 def test_gpt_5_5_below_long_context_threshold_uses_base_rates() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(
             replace(
                 session().status,
@@ -598,7 +601,7 @@ def test_gpt_5_5_window_matches_published_value() -> None:
 
 
 def test_codex_cache_write_is_free() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(
             replace(
                 session().status,
@@ -635,7 +638,7 @@ def test_compaction_history_counts_folded_messages_only(tmp_path: Path) -> None:
     store.append_compaction_marker("summary", 1, 6)
 
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store),
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -722,7 +725,7 @@ def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:
     store.append_compaction_marker("abandoned summary", 1, 5)
     store.append_fork(str(checkpoint.seq))
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store),
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -731,21 +734,21 @@ def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:
 
 
 def test_unknown_command_passes_through_unchanged() -> None:
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     assert registry.dispatch(session(), "/unknown arg") is None
     assert registry.input_for_model("/unknown arg") == "/unknown arg"
 
 
 def test_double_slash_escapes_registered_command() -> None:
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     assert registry.dispatch(session(), "//status") is None
     assert registry.input_for_model("//status") == "/status"
 
 
 def test_multiline_known_command_consumes_the_whole_message() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         session(), "/status\nmodel must not see this"
     )
 
@@ -754,7 +757,7 @@ def test_multiline_known_command_consumes_the_whole_message() -> None:
 
 
 def test_empty_message_does_nothing() -> None:
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     assert registry.dispatch(session(), "") is None
     assert registry.input_for_model("") == ""
@@ -778,7 +781,7 @@ def test_model_command_shows_and_changes_the_model() -> None:
             return "compact: nothing to compact"
 
     model_session = ModelSession()
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     assert registry.dispatch(model_session, "/model") == "model: offline"
     assert registry.dispatch(model_session, "/model faster") == "model: faster"
@@ -797,7 +800,7 @@ async def test_compact_command_uses_async_dispatch() -> None:
         async def slash_compact(self) -> str:
             return "compacted entries 1–2; tokens after: 3"
 
-    output = await create_slash_registry().dispatch_async(CompactSession(), "/compact")
+    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(CompactSession(), "/compact")
 
     assert output == "compacted entries 1–2; tokens after: 3"
 
@@ -808,7 +811,7 @@ async def test_mcp_command_dispatches_status_and_reconnect() -> None:
         async def slash_mcp(self, args: str) -> str:
             return f"mcp args: {args}"
 
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
     session_value = MCPTestSession()
 
     assert await registry.dispatch_async(session_value, "/mcp") == "mcp args: "
@@ -823,7 +826,7 @@ async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> N
     backend = FakeBackend([])
     output = StringIO()
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=output, force_terminal=False),

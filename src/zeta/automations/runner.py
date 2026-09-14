@@ -95,7 +95,6 @@ async def run_claimed(
                 home=home,
                 allow=job.allow,
                 backend=backend,
-                skill_catalog=skill_catalog,
             )
             mount = await mount_factory(job, loop.tool_registry, home)
             loop.attach_mcp_mount(mount)

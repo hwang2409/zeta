@@ -26,6 +26,7 @@ from zeta.core.slash import (
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.mcp import MCPPrompt, MCPPromptArgument
+from zeta.skill_catalog import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.exec import (
     INLINE_SHELL_BATCH_TIMEOUT_MESSAGE,
@@ -62,7 +63,7 @@ def test_loads_home_and_project_commands_with_project_precedence(tmp_path: Path)
     )
     _write_command(project / ".zeta" / "commands", "project-only", "project command")
 
-    registry = create_slash_registry(zeta_home=home, project_dir=project)
+    registry = create_slash_registry(zeta_home=home, project_dir=project, skill_catalog=SkillCatalog.empty())
 
     assert registry.input_for_model("/shared first second") == "project first"
     assert registry.input_for_model("/home-only") == "home command"
@@ -83,7 +84,7 @@ def test_substitution_uses_empty_missing_positions_and_keeps_raw_tail(
         "one=$1 two=$2 nine=$9 raw=[$ARGUMENTS]",
     )
 
-    registry = create_slash_registry(zeta_home=tmp_path, project_dir=tmp_path / "empty")
+    registry = create_slash_registry(zeta_home=tmp_path, project_dir=tmp_path / "empty", skill_catalog=SkillCatalog.empty())
 
     assert registry.input_for_model("/args alpha  beta") == (
         "one=alpha two=beta nine= raw=[alpha  beta]"
@@ -98,7 +99,7 @@ def test_builtin_shadow_is_ignored_and_notices_include_bad_files(tmp_path: Path)
     _write_command(project / ".zeta" / "commands", "status", "also ignored")
     _write_command(project / ".zeta" / "commands", "broken", "---\nnot: [yaml")
 
-    registry = create_slash_registry(zeta_home=home, project_dir=project)
+    registry = create_slash_registry(zeta_home=home, project_dir=project, skill_catalog=SkillCatalog.empty())
 
     assert registry.input_for_model("/status") == "/status"
     assert any("status.md" in notice for notice in registry.notices)
@@ -112,7 +113,7 @@ def test_completer_shows_description_and_source_badge(tmp_path: Path) -> None:
         "review",
         "---\ndescription: review the change\n---\nreview",
     )
-    registry = create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path)
+    registry = create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path, skill_catalog=SkillCatalog.empty())
     completions = list(
         SlashCompleter(registry).get_completions(
             Document("/rev"), CompleteEvent(completion_requested=True)
@@ -126,7 +127,7 @@ def test_completer_shows_description_and_source_badge(tmp_path: Path) -> None:
 
 def test_completion_applies_to_a_real_buffer(tmp_path: Path) -> None:
     _write_command(tmp_path / ".zeta" / "commands", "review", "review")
-    registry = create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path)
+    registry = create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path, skill_catalog=SkillCatalog.empty())
     buffer = Buffer(
         completer=SlashCompleter(registry),
         document=Document("/rev"),
@@ -147,6 +148,7 @@ async def test_mcp_prompt_completion_and_resolution() -> None:
     registry = create_slash_registry(
         zeta_home=Path("/does/not/exist"),
         project_dir=Path("/does/not/exist"),
+        skill_catalog=SkillCatalog.empty(),
     )
     registry.set_mcp_prompts(
         [
@@ -186,6 +188,7 @@ async def test_mcp_prompt_missing_required_argument_does_not_call_session() -> N
     registry = create_slash_registry(
         zeta_home=Path("/does/not/exist"),
         project_dir=Path("/does/not/exist"),
+            skill_catalog=SkillCatalog.empty(),
     )
     registry.set_mcp_prompts(
         [
@@ -217,7 +220,9 @@ def test_custom_colon_name_is_rejected_for_mcp_namespace(tmp_path: Path) -> None
     _write_command(tmp_path / "commands", "user:prompt", "body")
 
     registry = create_slash_registry(
-        zeta_home=tmp_path, project_dir=tmp_path / "project"
+        zeta_home=tmp_path,
+        project_dir=tmp_path / "project",
+        skill_catalog=SkillCatalog.empty(),
     )
 
     assert all(command.name != "user:prompt" for command in registry.custom_commands)
@@ -227,7 +232,7 @@ def test_custom_colon_name_is_rejected_for_mcp_namespace(tmp_path: Path) -> None
 async def test_completion_menu_arrows_do_not_navigate_history(tmp_path: Path) -> None:
     _write_command(tmp_path / ".zeta" / "commands", "rebase", "rebase")
     _write_command(tmp_path / ".zeta" / "commands", "review", "review")
-    registry = create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path)
+    registry = create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path, skill_catalog=SkillCatalog.empty())
     output_text = StringIO()
 
     with create_pipe_input() as pipe:
@@ -318,6 +323,7 @@ def test_tui_command_loading_uses_configured_home(
         AgentLoop(
             FakeBackend([]),
             ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",
@@ -354,6 +360,7 @@ def test_tui_command_loading_skips_host_home_without_configured_home(
         AgentLoop(
             FakeBackend([]),
             ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",
@@ -377,6 +384,7 @@ def test_tui_command_loading_uses_repository_root_from_nested_cwd(tmp_path: Path
         AgentLoop(
             FakeBackend([]),
             ConversationStore(tmp_path / "sessions", cwd=nested),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",
@@ -420,7 +428,7 @@ async def test_transcript_search_cancels_completion_before_up_navigation(
                 on_search_end=end_search,
             ),
             completer=SlashCompleter(
-                create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path)
+                create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path, skill_catalog=SkillCatalog.empty())
             ),
             multiline=True,
         )
@@ -468,7 +476,7 @@ async def test_custom_command_becomes_the_model_user_message(
         [ScriptedTurn(content=[TextContent("done")])]
     )
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions", cwd=tmp_path)),
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions", cwd=tmp_path), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -503,7 +511,7 @@ async def test_input_loop_control_commands_exclude_their_own_submission(
 ) -> None:
     output = StringIO()
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=output, force_terminal=False),
@@ -527,7 +535,7 @@ async def test_handler_failure_acknowledges_entry_and_advances_pipeline(
 ) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -566,7 +574,7 @@ async def test_provider_start_failure_rolls_back_and_advances_pipeline(
 ) -> None:
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=tmp_path / "home",
@@ -621,7 +629,7 @@ async def test_same_tick_provider_failure_dispatches_the_next_submission(
         ]
     )
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -671,7 +679,7 @@ async def test_failed_approval_action_acknowledges_waiter(
     )
     policy = ApprovalPolicy(store=store)
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=tmp_path / "home",
@@ -717,6 +725,7 @@ async def test_prompt_macro_resolves_inline_shell_and_template_attachments(
         AgentLoop(
             backend,
             ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",
@@ -752,7 +761,7 @@ async def test_inline_shell_approval_covers_the_complete_batch(tmp_path: Path) -
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     output = StringIO()
     app = TUIApp(
-        AgentLoop(backend, store, approval_policy=policy),
+        AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -800,7 +809,7 @@ async def test_preprocessing_timing_cannot_reorder_provider_submissions(
         ]
     )
     app = TUIApp(
-        AgentLoop(backend, store, approval_policy=policy),
+        AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -846,7 +855,7 @@ async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
-        AgentLoop(backend, store, approval_policy=policy),
+        AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -887,7 +896,7 @@ async def test_unmapped_durable_approval_is_finalized(
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
 
     app = TUIApp(
-        AgentLoop(backend, store, approval_policy=policy),
+        AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -973,6 +982,7 @@ async def test_resumed_durable_tool_abort_is_processed_by_submission_consumer(
             store,
             tools={"block": block},
             approval_policy=policy,
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",
@@ -1035,6 +1045,7 @@ async def test_submission_waits_for_resumed_durable_tool_result(
             store,
             tools={"block": block},
             approval_policy=policy,
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",
@@ -1080,7 +1091,7 @@ async def test_close_resolves_pending_submission_ack_and_rejects_new_sends(
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ALLOW)
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1113,7 +1124,7 @@ async def test_inline_approval_queues_unrelated_submission(
          ScriptedTurn(content=[TextContent("second reply")])]
     )
     app = TUIApp(
-        AgentLoop(backend, store, approval_policy=policy),
+        AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1172,7 +1183,7 @@ async def test_undo_second_inline_submission_keeps_first_alive(
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
-        AgentLoop(backend, store, approval_policy=policy),
+        AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1242,7 +1253,7 @@ async def test_scoped_inline_abort_keeps_other_submission_alive(
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
-        AgentLoop(backend, store, approval_policy=policy),
+        AgentLoop(backend, store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1303,6 +1314,7 @@ async def test_inline_shell_abort_stops_before_provider_dispatch(tmp_path: Path)
         AgentLoop(
             backend,
             ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",
@@ -1329,7 +1341,7 @@ async def test_inline_shell_abort_stops_before_provider_dispatch(tmp_path: Path)
 async def test_inline_shell_denial_prevents_later_commands(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
-    registry = ToolRegistry(tmp_path, approval_policy=policy)
+    registry = ToolRegistry(tmp_path, approval_policy=policy, skill_catalog=SkillCatalog.empty())
     marker = tmp_path / "must-not-execute"
     lifecycle_calls: list[str] = []
     task = asyncio.create_task(
@@ -1354,7 +1366,7 @@ async def test_inline_shell_denial_prevents_later_commands(tmp_path: Path) -> No
 
 
 async def test_capture_output_does_not_create_file_named_none(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     await registry.execute(
         ToolCall("capture", "exec", {"command": "printf output"}),
@@ -1365,7 +1377,7 @@ async def test_capture_output_does_not_create_file_named_none(tmp_path: Path) ->
 
 
 async def test_inline_shell_caps_spans_output_and_batch_time(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     marker = tmp_path / "span-cap-marker"
     span_output = await run_inline_shell_batch(
         registry,
@@ -1405,6 +1417,7 @@ async def test_inline_shell_failure_and_output_are_bounded(tmp_path: Path) -> No
         AgentLoop(
             backend,
             ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",
@@ -1422,7 +1435,7 @@ async def test_inline_shell_failure_and_output_are_bounded(tmp_path: Path) -> No
     assert "[inline shell failed: exit 4]" in user_message.content[0].text
     assert len(user_message.content[0].text) < 10_000
     assert await run_inline_shell_batch(
-        ToolRegistry(tmp_path),
+        ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()),
         ("sleep 1",),
         lifecycle_sink=lambda _kind, _call: None,
         timeout=0.01,
@@ -1442,7 +1455,7 @@ async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     output = StringIO()
     app = TUIApp(
-        AgentLoop(backend, store),
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1466,7 +1479,7 @@ async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
     )
     slow_store = ConversationStore(tmp_path / "slow-sessions", cwd=tmp_path)
     slow_app = TUIApp(
-        AgentLoop(FakeBackend([]), slow_store),
+        AgentLoop(FakeBackend([]), slow_store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=slow_home,
@@ -1543,7 +1556,7 @@ async def test_exec_macro_streams_receipt_writes_log_and_skips_provider(
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     output = StringIO()
     app = TUIApp(
-        AgentLoop(backend, store),
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1572,7 +1585,7 @@ async def test_exec_macro_approval_is_ephemeral_and_uses_substituted_script(
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
     output = StringIO()
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1652,7 +1665,7 @@ async def test_exec_macro_approval_card_shows_argv_via_trusted_display(
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
     output = StringIO()
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1687,7 +1700,7 @@ async def test_exec_macro_deny_renders_denied_receipt(tmp_path: Path) -> None:
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
     output = StringIO()
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1719,7 +1732,8 @@ async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
     output = StringIO()
     app = TUIApp(
         AgentLoop(
-            FakeBackend([]), ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+            FakeBackend([]), ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",
@@ -1752,7 +1766,7 @@ async def test_exec_macro_passes_special_arguments_as_shell_argv(tmp_path: Path)
         "home",
         "exec",
     )
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     call = ToolCall(
         "macro-args",
         "exec",
@@ -1783,7 +1797,7 @@ async def test_macro_input_loop_keeps_processing_approval_input(tmp_path: Path) 
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     policy = ApprovalPolicy(store=store, default=ApprovalDecision.ASK)
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1813,7 +1827,7 @@ async def test_macro_receipts_queue_until_the_next_provider_turn(tmp_path: Path)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(backend, store),
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1839,7 +1853,7 @@ async def test_macro_receipts_commit_in_submission_order_when_completion_reverse
     _write_command(home / "commands", "second", "---\nkind: exec\n---\nprintf second")
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1885,7 +1899,7 @@ async def test_queued_prompt_consumes_macro_receipt_at_provider_start(
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(backend, store),
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1930,7 +1944,7 @@ async def test_two_macros_queued_prompt_and_abort_keep_receipt_order(
     backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(backend, store),
+        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -1977,7 +1991,7 @@ async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> N
     home = tmp_path / "home"
     _write_command(home / "commands", "wait", "---\nkind: exec\n---\nsleep 30")
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions", cwd=tmp_path)),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions", cwd=tmp_path), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         zeta_home=home,
@@ -2018,7 +2032,8 @@ async def test_exec_macro_timeout_has_a_distinct_receipt_status(tmp_path: Path) 
     output = StringIO()
     app = TUIApp(
         AgentLoop(
-            FakeBackend([]), ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+            FakeBackend([]), ConversationStore(tmp_path / "sessions", cwd=tmp_path),
+            skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",

@@ -18,6 +18,7 @@ from zeta.core.approval import (
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationIntegrityError, ConversationStore
+from zeta.skill_catalog import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.types import (
     Message,
@@ -111,6 +112,7 @@ async def test_durable_pending_request_is_re_emitted_and_resolves_after_restart(
         approval_policy=first_policy,
         approval_store=store,
         register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
     )
     executed: list[str] = []
 
@@ -139,6 +141,7 @@ async def test_durable_pending_request_is_re_emitted_and_resolves_after_restart(
         approval_policy=restarted_policy,
         approval_store=restarted_store,
         register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
     )
     restarted_registry.register("echo", echo)
     result = await restarted_registry.execute(call)
@@ -158,6 +161,7 @@ async def test_ask_resolution_deny_returns_error_result(tmp_path: Path) -> None:
         approval_policy=policy,
         approval_store=store,
         register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
     )
     registry.register("echo", lambda arguments: "must not run")
     call = ToolCall("call-1", "echo", {})
@@ -186,7 +190,7 @@ async def test_deny_returns_error_and_loop_continues(tmp_path: Path) -> None:
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn(content=[TextContent("done")])]
     )
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("danger", lambda arguments: "must not run")
 
     await collect(
@@ -195,6 +199,7 @@ async def test_deny_returns_error_and_loop_continues(tmp_path: Path) -> None:
             store,
             registry=registry,
             approval_policy=ApprovalPolicy(always_deny={"danger"}),
+skill_catalog=SkillCatalog.empty(),
         ).run_turn("start")
     )
 
@@ -214,7 +219,7 @@ async def test_abort_pending_request_cancels_and_closes_tool_call_history(
     )
     store = ConversationStore(tmp_path)
     policy = ApprovalPolicy(default="ask")
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("step", lambda arguments: "ran")
     task = asyncio.create_task(
         collect(
@@ -223,6 +228,7 @@ async def test_abort_pending_request_cancels_and_closes_tool_call_history(
                 store,
                 registry=registry,
                 approval_policy=policy,
+skill_catalog=SkillCatalog.empty(),
             ).run_turn("start")
         )
     )
@@ -263,6 +269,7 @@ async def test_approval_and_pre_execution_hook_compose(tmp_path: Path) -> None:
         approval_policy=policy,
         approval_store=store,
         register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
     )
     registry.register("echo", lambda arguments: "ran")
 
@@ -281,7 +288,7 @@ async def test_torn_request_write_does_not_leave_a_tool_call_or_start_event(
     store = ConversationStore(approval_root)
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
     policy = ApprovalPolicy(default="ask", store=store)
-    registry = ToolRegistry(approval_root, approval_policy=policy, register_builtin=False)
+    registry = ToolRegistry(approval_root, approval_policy=policy, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("echo", lambda arguments: "must not run")
     original_write = store._write_line
 
@@ -303,6 +310,7 @@ async def test_torn_request_write_does_not_leave_a_tool_call_or_start_event(
             store,
             registry=registry,
             approval_policy=policy,
+skill_catalog=SkillCatalog.empty(),
         ).run_turn("start"):
             events.append(event)
 
@@ -414,6 +422,7 @@ async def test_early_exit_paths_close_pending_requests(approval_root: Path) -> N
             approval_store=store,
             abort_signal=signal,
             register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
         )
         if case == "invalid":
             registry.register(
@@ -453,6 +462,7 @@ async def test_abort_race_honors_an_approval_that_wins_atomically(
         approval_store=store,
         abort_signal=signal,
         register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
     )
     executed: list[str] = []
 
@@ -498,6 +508,7 @@ async def test_second_abort_reaches_handler_after_approval_wins(
         approval_policy=policy,
         approval_store=store,
         register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
     )
     started = asyncio.Event()
     observed_cancellation = asyncio.Event()
@@ -557,6 +568,7 @@ async def test_pre_aborted_approved_call_accepts_a_second_abort(
         approval_store=store,
         abort_signal=signal,
         register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
     )
     started = asyncio.Event()
     canceled = asyncio.Event()
@@ -607,6 +619,7 @@ async def test_execute_many_pre_aborted_approved_calls_share_one_abort_generatio
         approval_store=store,
         abort_signal=signal,
         register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
     )
     started = asyncio.Event()
     started_count = 0
@@ -655,6 +668,7 @@ async def test_execute_many_pending_parallel_approval_abort_wakes_every_waiter(
         approval_policy=policy,
         approval_store=store,
         register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
     )
     registry.register("echo", lambda arguments: "must not run", parallel_safe=True)
 
@@ -698,6 +712,7 @@ async def test_pending_request_wins_over_policy_change_after_restart(
         approval_policy=changed_policy,
         approval_store=restarted_store,
         register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
     )
     executed: list[bool] = []
     registry.register("echo", lambda arguments: executed.append(True) or "ran")
@@ -1125,6 +1140,7 @@ async def test_registry_declares_subjects_and_gates_on_real_arguments(
         approval_policy=policy,
         approval_store=store,
         register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
     )
     registry.register(
         "echo",
@@ -1151,7 +1167,7 @@ def test_registry_drops_scoped_rule_for_a_tool_without_a_subject(
     tmp_path: Path,
 ) -> None:
     policy = ApprovalPolicy(always_allow={"echo(*)", "echo"})
-    registry = ToolRegistry(tmp_path, approval_policy=policy, register_builtin=False)
+    registry = ToolRegistry(tmp_path, approval_policy=policy, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     registry.register("echo", lambda arguments: "x")
 
@@ -1161,7 +1177,7 @@ def test_registry_drops_scoped_rule_for_a_tool_without_a_subject(
 
 
 def test_set_approval_policy_declares_every_registered_tool(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register(
         "echo",
         lambda arguments: "x",
@@ -1180,7 +1196,7 @@ def test_set_approval_policy_declares_every_registered_tool(tmp_path: Path) -> N
 
 
 def test_builtin_tools_declare_the_documented_subjects(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     declared = {
         name: definition.approval_subject
@@ -1195,7 +1211,7 @@ def test_builtin_tools_declare_the_documented_subjects(tmp_path: Path) -> None:
 def test_register_rejects_a_subject_that_is_not_a_parameter(
     tmp_path: Path, subject: object
 ) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     with pytest.raises(ValueError, match="approval_subject"):
         registry.register(

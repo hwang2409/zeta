@@ -1,3 +1,5 @@
+from zeta.skill_catalog import SkillCatalog
+
 import asyncio
 import base64
 import json
@@ -326,14 +328,14 @@ async def test_agent_loop_sends_one_zeta_identity_after_oauth_spoof(
         token_store=store,
         base_url="https://test.invalid/v1/messages",
     )
-    loop = AgentLoop(backend, ConversationStore(tmp_path / "sessions"))
+    loop = AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty())
 
     async for _ in loop.run_turn("hi"):
         pass
 
     payload = json.loads(requests[0].content)
     assert payload["system"][0]["text"].startswith("You are Claude Code")
-    assert payload["system"][1]["text"] == load_identity()
+    assert payload["system"][1]["text"] == load_identity(catalog=SkillCatalog.empty())
     assert sum(block["text"].startswith("You are zeta") for block in payload["system"]) == 1
     await client.aclose()
 
@@ -2251,6 +2253,7 @@ async def test_two_turn_replay_omits_empty_salvaged_text_block(tmp_path: Path) -
         AnthropicBackend(client=client, token_store=token_store),
         store,
         tool_schemas=[],
+skill_catalog=SkillCatalog.empty(),
     )
 
     [event async for event in loop.run_turn("first")]
@@ -2643,7 +2646,7 @@ async def test_cancel_mid_thinking_drops_partial_block_before_resume(
     token_store = AnthropicCredentialStore(tmp_path / "zeta.json")
     token_store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
     backend = AnthropicBackend(client=Client(), token_store=token_store)
-    loop = AgentLoop(backend, store)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(
         consume_loop_turn(loop, thinking_started)

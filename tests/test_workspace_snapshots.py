@@ -24,6 +24,7 @@ from zeta.core.checkpoints.workspace import (
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
+from zeta.skill_catalog import SkillCatalog
 from zeta.tui.app import TUIApp
 
 
@@ -67,7 +68,7 @@ def git_repo(tmp_path: Path) -> Path:
 
 def _make_tui(store: ConversationStore) -> TUIApp:
     return TUIApp(
-        AgentLoop(FakeBackend([]), store),
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),

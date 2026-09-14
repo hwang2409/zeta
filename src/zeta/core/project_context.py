@@ -179,7 +179,7 @@ def load_project_context(
     system_override: str | None = None,
     system_append: str | None = None,
     byte_cap: int = CONTEXT_BYTE_CAP,
-    catalog: SkillCatalog | None = None,
+    catalog: SkillCatalog,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
 

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
+from zeta.skill_catalog import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import ChildApprovalPolicy
 from zeta.types import ToolCall
@@ -22,6 +23,7 @@ async def test_unattended_allow_list_gates_even_exempt_and_internal_calls(
         approval_policy=policy,
         approval_store=store,
         enforce_approvals=True,
+        skill_catalog=SkillCatalog.empty(),
     )
     calls = []
     for name in ("permitted", "forbidden"):
@@ -258,7 +260,7 @@ async def test_draft_approve_fire_deliver_inspect_and_resume_round_trip(
     origin = SessionManager(tmp_path).create(
         provider="fake", model="fake", cwd=tmp_path
     )
-    registry = ToolRegistry(tmp_path, session_store=origin.store)
+    registry = ToolRegistry(tmp_path, session_store=origin.store, skill_catalog=SkillCatalog.empty())
     job = _job(tmp_path)
     response = await registry.execute(
         ToolCall(
@@ -304,7 +306,7 @@ async def test_draft_approve_fire_deliver_inspect_and_resume_round_trip(
     assert "brief" in await commands.slash("", home=tmp_path, cwd=str(tmp_path))
     assert (
         "automations"
-        in create_slash_registry(zeta_home=tmp_path, project_dir=tmp_path).help_text()
+        in create_slash_registry(zeta_home=tmp_path, project_dir=tmp_path, skill_catalog=SkillCatalog.empty()).help_text()
     )
     await registry.close()
 
@@ -473,7 +475,6 @@ async def test_automation_catalog_excludes_project_skills_from_prompt_and_tool(
         home=tmp_path,
         allow=("skill",),
         backend=FakeBackend([]),
-        skill_catalog=catalog,
     )
     try:
         loaded = await loop.tool_registry.execute(
@@ -568,7 +569,7 @@ def test_subjectless_mcp_scoped_allow_is_rejected_without_widening(
 ) -> None:
     job = replace(_job(tmp_path), allow=("slack__history(channel*)",))
     policy = ApprovalPolicy(default=ApprovalDecision.DENY, always_allow=job.allow)
-    registry = ToolRegistry(tmp_path, register_builtin=False, approval_policy=policy)
+    registry = ToolRegistry(tmp_path, register_builtin=False, approval_policy=policy, skill_catalog=SkillCatalog.empty())
     registry.register("slack__history", lambda args: "x")
     with pytest.raises(ValueError, match="no approval subject"):
         validate_permissions(job, registry)
@@ -822,6 +823,7 @@ async def test_only_selected_home_servers_mount_and_scoped_mcp_rules_work(
         approval_policy=policy,
         enforce_approvals=True,
         approval_store=ConversationStore(tmp_path / "session"),
+skill_catalog=SkillCatalog.empty(),
     )
     mount = await mount_services(job, registry, tmp_path)
     try:
@@ -922,7 +924,8 @@ def test_draft_defaults_are_explicit_and_invalid_types_are_rejected(
 
 async def test_automation_tool_has_no_arming_operation(tmp_path: Path) -> None:
     registry = ToolRegistry(
-        tmp_path, session_store=ConversationStore(tmp_path / "session")
+        tmp_path, session_store=ConversationStore(tmp_path / "session"),
+        skill_catalog=SkillCatalog.empty(),
     )
     result = await registry.execute(
         ToolCall("arm", "automation", {"action": "approve", "name": "job"})
