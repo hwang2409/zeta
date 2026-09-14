@@ -2127,6 +2127,103 @@ fn header_valid_but_undecodable_bytes_demote_to_an_error_chip(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+fn text_send_with_lingering_invalid_chips_clears_them_on_worker_ack(cx: &mut TestAppContext) {
+    // A user can type text into the composer AND have a leftover invalid chip
+    // (a corrupt paste, a wrong-format drop). `send_composer` filters the
+    // invalid entry out of the outgoing payload — so the worker path is
+    // `Send(text)`, not `SendImages` — but until r4 the acknowledgment left
+    // the invalid chip stranded beside the landed turn. `WorkerMessage::Sent`
+    // must now clear the pending strip AND the chip row so the composer
+    // resets to empty, matching the `ImagesSent` branch.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.add_pending_attachments(
+                vec![Err((
+                    "corrupt.png".into(),
+                    "could not decode this image".into(),
+                ))],
+                cx,
+            );
+            view.composer
+                .update(cx, |input, cx| input.set_value("hello", window, cx));
+            view.send_composer(cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    let dispatched = receiver.try_recv().expect("text send fires");
+    assert!(
+        matches!(&dispatched, CommandMessage::Send(text) if text == "hello"),
+        "invalid chip must be filtered out — expected Send, got {dispatched:?}",
+    );
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.invalid_attachment_count(), 1);
+        assert_eq!(view.valid_attachment_count(), 0);
+    });
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::Sent("hello".into()), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, cx| {
+        assert!(
+            view.composer_attachments.is_empty(),
+            "Sent must clear leftover invalid chips, not just the text",
+        );
+        assert!(
+            view.composer.read(cx).value().is_empty(),
+            "Sent still clears the composer text",
+        );
+        assert!(
+            view.pending_user_turn.is_none(),
+            "Sent still clears the queued dashed strip",
+        );
+    });
+    assert!(
+        visual.debug_bounds("composer-chip-error-0").is_none(),
+        "the leftover error chip must be gone from the paint",
+    );
+}
+
+#[gpui::test]
+fn error_chip_advertises_alert_role_and_full_label(cx: &mut TestAppContext) {
+    // Screen readers need the chip to announce as an alert AND carry the
+    // filename + full error text, since the visible label truncates at the
+    // chip's max width. A regression that dropped either would silently
+    // ship an inaccessible chip.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.add_pending_attachments(
+                vec![Err((
+                    "notes.bmp".into(),
+                    "choose a PNG, JPEG, GIF, or WebP image".into(),
+                ))],
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    visual.update(|window, _cx| {
+        use gpui_kit::test::TestWindowExt as _;
+        let snapshot = window.find(("composer-chip-error", 0usize));
+        assert_eq!(
+            snapshot.role(),
+            Some(gpui::Role::Alert),
+            "error chip must advertise the Alert role for screen readers",
+        );
+        assert_eq!(
+            snapshot.label(),
+            Some("Attachment error: notes.bmp — choose a PNG, JPEG, GIF, or WebP image"),
+            "chip label must pair the filename with the full error text",
+        );
+    });
+}
+
+#[gpui::test]
 fn attachment_cap_counts_only_valid_chips(cx: &mut TestAppContext) {
     // The 4-image cap gates PAYLOADS THAT WILL SHIP. An invalid chip is
     // visible but never ships, so a mixed batch — three valid + two invalid
@@ -2597,7 +2694,7 @@ fn removing_and_clearing_pending_chips_evict_thumbnail_assets(cx: &mut TestAppCo
         window.draw(cx).clear(cx);
         view.update(cx, |view, cx| {
             let handle = match &view.composer_attachments[0] {
-                PendingAttachment::Valid { thumbnail, .. } => thumbnail.clone().expect("decoded"),
+                PendingAttachment::Valid { thumbnail, .. } => thumbnail.clone(),
                 PendingAttachment::Invalid { .. } => panic!("expected valid attachment"),
             };
             handle.clone().get_render_image(window, cx);
@@ -2618,7 +2715,7 @@ fn removing_and_clearing_pending_chips_evict_thumbnail_assets(cx: &mut TestAppCo
         window.draw(cx).clear(cx);
         view.update(cx, |view, cx| {
             let handle = match &view.composer_attachments[0] {
-                PendingAttachment::Valid { thumbnail, .. } => thumbnail.clone().expect("decoded"),
+                PendingAttachment::Valid { thumbnail, .. } => thumbnail.clone(),
                 PendingAttachment::Invalid { .. } => panic!("expected valid attachment"),
             };
             handle.clone().get_render_image(window, cx);

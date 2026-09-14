@@ -21,6 +21,7 @@ use gpui_kit::component::{
     message_scroller::{MessageScroller, MessageScrollerState},
     ActiveTheme, Disableable, Icon, IconName, Root, Selectable, StyledExt, WindowExt,
 };
+use gpui_kit::TestSupportExt as _;
 use std::{
     borrow::Cow,
     env,
@@ -59,15 +60,15 @@ const MAX_ATTACHMENTS: usize = 4;
 /// One pending composer attachment. Each entry renders as its own chip so a
 /// mixed batch of good and bad files never fails whole-batch — the valid
 /// siblings stay attached and each invalid file surfaces its own inline
-/// error, never sendable.
+/// error, never sendable. A valid chip always carries a decoded thumbnail:
+/// `add_pending_attachments` runs `polish::image_source` up front and demotes
+/// a decode failure straight to `Invalid`, so the render path never sees a
+/// half-valid entry.
 #[derive(Debug, Clone)]
 enum PendingAttachment {
     Valid {
         image: ImageAttachment,
-        /// Cached preview handle; `None` means preview decode failed and the
-        /// chip falls back to a file glyph. Independent from `Invalid` — the
-        /// attachment is still sendable.
-        thumbnail: Option<std::sync::Arc<gpui::Image>>,
+        thumbnail: std::sync::Arc<gpui::Image>,
     },
     Invalid {
         name: String,
@@ -423,6 +424,11 @@ impl ZetaView {
                 let index = self.state.transcript.len();
                 self.state.transcript.push(TranscriptEntry::User(text));
                 edits.push(TranscriptEdit::Insert(index));
+                // Text-only send: `send_composer` filters out invalid chips
+                // from the outgoing payload, but leaves them in the composer.
+                // Clear here (mirroring the `ImagesSent` branch) so a text
+                // send never leaves stray error chips beside a landed turn.
+                self.clear_composer_images(cx);
                 self.composer
                     .update(cx, |input, cx| input.set_value("", window, cx));
             }
@@ -842,10 +848,7 @@ impl ZetaView {
             .into_iter()
             .map(|item| match item {
                 Ok(image) => match polish::image_source(&image) {
-                    Some(thumbnail) => PendingAttachment::Valid {
-                        image,
-                        thumbnail: Some(thumbnail),
-                    },
+                    Some(thumbnail) => PendingAttachment::Valid { image, thumbnail },
                     None => PendingAttachment::Invalid {
                         name: image.name,
                         error: chrome::ATTACH_DECODE_ERROR.to_string(),
@@ -924,11 +927,7 @@ impl ZetaView {
     fn remove_attached_image(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.composer_attachments.len() {
             let removed = self.composer_attachments.remove(index);
-            if let PendingAttachment::Valid {
-                thumbnail: Some(thumbnail),
-                ..
-            } = removed
-            {
+            if let PendingAttachment::Valid { thumbnail, .. } = removed {
                 thumbnail.remove_asset(cx);
             }
             self.composer_image_error = None;
@@ -941,11 +940,7 @@ impl ZetaView {
     /// cache so repeated attach → clear cycles do not leak GPU storage.
     fn clear_composer_images(&mut self, cx: &mut Context<Self>) {
         for pending in std::mem::take(&mut self.composer_attachments) {
-            if let PendingAttachment::Valid {
-                thumbnail: Some(thumbnail),
-                ..
-            } = pending
-            {
+            if let PendingAttachment::Valid { thumbnail, .. } = pending {
                 thumbnail.remove_asset(cx);
             }
         }
@@ -1735,15 +1730,17 @@ impl ZetaView {
         &self,
         index: usize,
         image: &ImageAttachment,
-        thumbnail: Option<std::sync::Arc<gpui::Image>>,
+        thumbnail: std::sync::Arc<gpui::Image>,
         label_size: gpui::Pixels,
         meta_size: gpui::Pixels,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         // Thumbnail area: token-sized rectangle with the same subtle
         // black/white outline the transcript thumbnails use, so the pending
-        // chip and the sent-turn thumbnail read as one family. Falls back to
-        // a file glyph when the base64 payload fails to decode.
+        // chip and the sent-turn thumbnail read as one family. `Valid`
+        // attachments always carry a decoded thumbnail — a decode failure
+        // demotes the entry to `Invalid` at attach time, so this branch never
+        // has to reason about a missing preview.
         let base_size = cx.theme().font_size;
         let (thumb_w, thumb_h) = theme::chip_thumbnail_size(base_size);
         let control_size = theme::chip_control_size(base_size);
@@ -1764,30 +1761,15 @@ impl ZetaView {
         // check but fail the render_log sample.
         self.chip_frame(padding_y, cx)
             .debug_selector(|| "composer-chip".into())
-            .child(match thumbnail {
-                Some(image) => gpui::img(image)
+            .child(
+                gpui::img(thumbnail)
                     .w(thumb_w)
                     .h(thumb_h)
                     .object_fit(gpui::ObjectFit::Cover)
                     .border_1()
                     .border_color(thumb_border)
-                    .debug_selector(move || format!("composer-chip-thumbnail-{index}"))
-                    .into_any_element(),
-                None => div()
-                    .w(thumb_w)
-                    .h(thumb_h)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(cx.theme().background)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .text_size(meta_size)
-                    .text_color(cx.theme().muted_foreground)
-                    .debug_selector(move || format!("composer-chip-thumbnail-{index}"))
-                    .child(Icon::new(IconName::File).size(meta_size))
-                    .into_any_element(),
-            })
+                    .debug_selector(move || format!("composer-chip-thumbnail-{index}")),
+            )
             .child(
                 div()
                     .flex()
@@ -1827,12 +1809,27 @@ impl ZetaView {
         // Error chip: same frame as a valid chip so the row rhythm holds,
         // but a danger-tinted glyph + the parser's per-file error message in
         // place of the thumbnail + byte-size line. Never included in Send.
+        //
+        // Accessibility: the chip advertises the `Alert` role so screen
+        // readers announce it as a live error, an `aria_label` that pairs
+        // the filename with the full error text (the visible label truncates
+        // on narrow chips), and a tooltip carrying the same full error text
+        // for sighted users who hover a truncated chip.
         let base_size = cx.theme().font_size;
         let (thumb_w, thumb_h) = theme::chip_thumbnail_size(base_size);
         let control_size = theme::chip_control_size(base_size);
         let padding_y = theme::chip_padding_y(base_size);
         let label_max = theme::chip_label_max_width(base_size);
+        let aria_label: gpui::SharedString = format!("Attachment error: {name} — {error}").into();
+        let tooltip_text: gpui::SharedString = format!("{name}: {error}").into();
         self.chip_frame(padding_y, cx)
+            .id(("composer-chip-error", index))
+            .test_support()
+            .role(gpui::Role::Alert)
+            .aria_label(aria_label)
+            .tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(tooltip_text.clone()).build(window, cx)
+            })
             .debug_selector(move || format!("composer-chip-error-{index}"))
             .child(
                 div()

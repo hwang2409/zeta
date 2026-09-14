@@ -4,7 +4,9 @@ use gpui_kit::test::TestWindowExt;
 
 /// Encode a tiny checkerboard PNG for the ZETA-112 attachment-chrome shot.
 /// A one-shot helper — the smoke driver seeds a real attachment so the
-/// thumbnail slot decodes rather than falling back to the file glyph.
+/// chip decodes into a Valid variant with a live thumbnail (the only path
+/// that paints a preview; a decode failure would surface as an error chip
+/// instead).
 fn png_seed_bytes() -> Vec<u8> {
     let pixels = image::RgbaImage::from_fn(48, 32, |x, y| {
         if ((x / 8) + (y / 8)) % 2 == 0 {
@@ -108,12 +110,15 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                             }
                             3 => {
                                 // ZETA-112 attachment capture — seed a mixed
-                                // batch (valid decoded thumbnail, valid fallback
-                                // glyph, and one error chip surfaced by a per
-                                // file parse failure) so the shot proves the
-                                // typed pending model. Clear before the modal
-                                // shot below so the primary after-screenshot
-                                // stays unchanged.
+                                // batch (one valid chip with a real decoded
+                                // thumbnail, one decode-failure chip whose
+                                // header parses but whose body cannot decode,
+                                // and one format-reject chip) so the shot
+                                // proves the typed pending model: a valid
+                                // chip always paints a thumbnail, and every
+                                // failure mode surfaces its own error chip.
+                                // Clear before the modal shot below so the
+                                // primary after-screenshot stays unchanged.
                                 if let Some(ref attach_path) = attachment_path {
                                     entity.update(cx, |view, cx| {
                                         // The `add_pending_attachments` guard
