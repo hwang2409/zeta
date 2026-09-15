@@ -8833,17 +8833,18 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
     // the clip would otherwise slice mid-caption. The mask carries a 1px
     // top edge line as the scroll cue.
     //
-    // Round-6 tightens the boundary math: a settings row is the FULL
-    // `settings_row` element (label/control header + description caption
-    // + inter-row gap) — the reviewer flagged the round-5 shot at 18px
-    // where the mask covered only the header and cut off inside the Font
-    // row's description. So this test walks every picker base (11 / 13 /
-    // 18) and asserts, for every row, that no row straddles the mask's
-    // top edge — either the row's description bottom sits above the mask
-    // (fully visible) or the row's top sits below the mask edge (fully
-    // masked). Row = whatever `debug_bounds("settings-row-*")` returns,
-    // which includes the description because `settings_row` composes
-    // header + description as one v_flex.
+    // Round-7 tightens the boundary math to the FULL `settings_row`
+    // element (label/control header + description caption + inter-row
+    // gap): round-6 flagged the round-5 shot at 18px where the mask
+    // covered only the header and cut off inside the Font row's
+    // description. A vertical mask offset could still slice a row
+    // HEADER while every description stayed clear, so this test walks
+    // every picker base (11 / 13 / 18) and asserts, for every row,
+    // that no row straddles the mask's top edge — either the row's
+    // bottom sits above the mask (fully visible) or the row's top sits
+    // at/below the mask edge (fully masked). Row =
+    // `debug_bounds("settings-row-*")`, which spans header +
+    // description because `settings_row` composes them as one v_flex.
     wipe_scoped_prefs();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
@@ -8872,36 +8873,33 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
             cue.left() >= panel.left() - px(1.) && cue.right() <= panel.right() + px(1.),
             "scroll-cue {cue:?} at {base_px}px must sit inside the panel {panel:?}"
         );
-        // Row-description invariant: for every rendered settings row's
-        // description caption, its extent must be either wholly above
-        // the mask top edge OR wholly at/below it — the mask cannot end
-        // INSIDE a description. That was the round-5 defect the reviewer
-        // flagged at 18px: the Font row's caption was clipped mid-line by
-        // the mask top edge. The reviewer's ideal is FULL-row alignment
-        // (header + description together), but with a mask that paints
-        // absolutely at the wrapper's bottom the header can only be
-        // guaranteed row-aligned via a scroll snap the settings wrapper
-        // does not carry. Description alignment is the achievable
-        // invariant here and directly guards the "cue ends inside a
-        // caption" shape the finding named. `settings-row-*-description`
-        // debug_bounds return the caption element's own bounds.
+        // Whole-row invariant: for every rendered settings row, its FULL
+        // `settings-row-*` bounds (header + description composed as one
+        // v_flex) must be either wholly above the mask top edge OR
+        // wholly at/below it — the mask cannot end INSIDE a row. This
+        // guarantees (a) the last visible row's bottom sits above the
+        // mask edge and (b) the first masked row's top sits at/below
+        // it. Round-6 checked descriptions only; a vertical mask offset
+        // could still slice a row header while every description
+        // stayed clear, so round-7 upgrades to the full-row bounds
+        // (which include the header) directly.
         let mask_top = cue.top();
-        for desc_sel in [
-            "settings-row-approval-description",
-            "settings-row-theme-description",
-            "settings-row-font-description",
-            "settings-row-size-description",
+        for row_sel in [
+            "settings-row-approval",
+            "settings-row-theme",
+            "settings-row-font",
+            "settings-row-size",
         ] {
-            let desc = visual
-                .debug_bounds(desc_sel)
-                .unwrap_or_else(|| panic!("{desc_sel} renders at {base_px}px"));
-            let fully_visible = desc.bottom() <= mask_top + px(1.);
-            let fully_masked = desc.top() >= mask_top - px(1.);
+            let row = visual
+                .debug_bounds(row_sel)
+                .unwrap_or_else(|| panic!("{row_sel} renders at {base_px}px"));
+            let fully_visible = row.bottom() <= mask_top + px(1.);
+            let fully_masked = row.top() >= mask_top - px(1.);
             assert!(
                 fully_visible || fully_masked,
-                "{desc_sel} at {base_px}px straddles the scroll-cue mask top: \
-                 description {desc:?}, mask top {mask_top:?} \
-                 (caption must be fully visible or fully masked — never sliced)"
+                "{row_sel} at {base_px}px straddles the scroll-cue mask top: \
+                 row {row:?}, mask top {mask_top:?} \
+                 (row must be fully visible or fully masked — never sliced)"
             );
         }
     }
