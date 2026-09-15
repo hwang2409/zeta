@@ -184,7 +184,25 @@ fn scan_native_gutter(
     let window_width = f32::from(window.bounds().size.width);
     let main_left = f32::from(theme::SIDEBAR_WIDTH);
     let main_width = (window_width - main_left).max(0.);
-    let column_width = f32::from(theme::prose_max_width(font_size)).min(main_width);
+    // Content_right is derived from the TRANSCRIPT_MAX_WIDTH column, not
+    // the narrower prose cap. Per ZETA-#165 the prose measure cap
+    // centers assistant/user/thinking text at a comfortable ~88ch
+    // measure, but tool receipts and fenced code blocks are ALLOWED
+    // wider — up to `TRANSCRIPT_MAX_WIDTH`. Scanning against the prose
+    // cap would flag every receipt paint at wide centered viewports as
+    // a glyph escape; scanning against the wider receipt/code cap
+    // matches the design's contract that a legal wider row paints
+    // inside that column.
+    //
+    // Tradeoff (documented, not a defect): at wide centered viewports
+    // where the receipt column is strictly wider than the prose
+    // column, PROSE-specific overshoots into the receipt-only strip
+    // (between prose_content_right and content_right) are under-scanned
+    // here. At narrow viewports the prose column and the receipt
+    // column coincide (both capped by main_width), so the original
+    // orphan-glyph defect class stays covered — the ZETA-127 bug and
+    // r3 acceptance mutation both trip at the narrow viewport.
+    let column_width = f32::from(theme::TRANSCRIPT_MAX_WIDTH).min(main_width);
     let content_right =
         main_left + (main_width - column_width) / 2. + column_width - theme::PROSE_ROW_PADDING_X;
     let x_start = (content_right * scale).ceil() as u32;
