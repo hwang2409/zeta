@@ -26,6 +26,15 @@ impl ToolReceiptKey {
     }
 }
 
+// The `Tool` variant carries a `Card` inline — expanded state, output
+// tail (bounded at 16 KiB), agent label, child id, and now a per-turn
+// stamp. The size disparity between variants is acknowledged: boxing
+// the card would ripple auto-deref through dozens of pattern matches
+// across the state / render / row_text seams and pay heap traffic for
+// every receipt in the transcript. The enum is not clone-hot on any
+// path (transcripts hold entries by owned index, not by value copies),
+// so the inline layout stays.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptEntry {
     User(String),
@@ -1099,9 +1108,7 @@ fn redact_url_token(token: &str) -> String {
     };
     let auth_start = scheme_end + 3;
     let rest = &token[auth_start..];
-    let auth_end = rest
-        .find(|ch: char| matches!(ch, '/' | '?' | '#'))
-        .unwrap_or(rest.len());
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..auth_end];
     let after_auth = &rest[auth_end..];
     let mut out = String::with_capacity(token.len() + REDACTED_MARKER.len());
