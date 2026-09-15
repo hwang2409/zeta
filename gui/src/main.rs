@@ -2707,10 +2707,19 @@ pub(crate) fn settings_row(
         .gap(theme::SETTINGS_ROW_DESCRIPTION_GAP)
         .child(header);
     if let Some(text) = description {
+        // Description spans the full row width, not just the label column,
+        // so short captions ("Whole pixels, 11 to 18.") stay on a single
+        // line at 13px. Constraining the caption to `column` (140px at
+        // 13px) wrapped every caption to two or three lines and pushed the
+        // Font-size row's caption below the sections wrapper's clip in
+        // the shipped after-screenshot ("Whole pixels, 11 to..." with the
+        // "18." sliced off). Row width still keeps the caption aligned
+        // under its own row's header, so the visual "subordinate line"
+        // shape reads the same.
         row = row.child(
             div()
                 .debug_selector(move || format!("{selector}-description"))
-                .w(column)
+                .w_full()
                 .text_size(theme::label_small(base))
                 .text_color(cx.theme().muted_foreground)
                 .child(text),

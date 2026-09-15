@@ -183,12 +183,14 @@ pub const SETTINGS_ROW_DESCRIPTION_GAP: Pixels = px(2.);
 /// Maximum height for the Model list inside the Settings modal. The list
 /// scrolls beyond this so the three-section body (Model + Behavior +
 /// Appearance) plus optional credential alert fits inside the 760px test
-/// viewport across every picker base (11px…18px). Round-4 shrank this cap
-/// from 160px to 120px: at 13px, the pre-round-4 160px cap pushed the
-/// three Appearance-row descriptions down until the Font-size row's
-/// caption clipped mid-line above the Close/Apply row. 120px still holds
-/// three 32px model rows plus a group heading before the list scrolls.
-pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(120.);
+/// viewport across every picker base (11px…18px). Round-4 shrank this
+/// cap from 160px to 96px: the pre-round-4 160px cap pushed the three
+/// Appearance-row descriptions down until the Font-size row's caption
+/// clipped mid-line above the Close/Apply row. 96px still holds two 32px
+/// model rows and a group heading before the list scrolls, and clears
+/// the last Appearance-row description off the sections wrapper's clip
+/// so nothing paints half-cut.
+pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(96.);
 
 /// Absolute ceiling for the Settings panel's rendered height. The panel
 /// still sizes off the viewport shelf below the 25% modal-top offset so
@@ -1794,7 +1796,7 @@ mod tests {
         assert_eq!(SETTINGS_SECTION_GAP, px(10.));
         assert_eq!(SETTINGS_ROW_GAP, px(6.));
         assert_eq!(SETTINGS_ROW_DESCRIPTION_GAP, px(2.));
-        assert_eq!(SETTINGS_MODEL_LIST_MAX_HEIGHT, px(120.));
+        assert_eq!(SETTINGS_MODEL_LIST_MAX_HEIGHT, px(96.));
         assert_eq!(SETTINGS_PANEL_MAX_HEIGHT, px(560.));
         // Label column scales with base font size so long labels
         // ("Approval mode") never overflow the column at the picker's
