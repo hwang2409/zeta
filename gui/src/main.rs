@@ -1618,13 +1618,15 @@ impl ZetaView {
                                             &behavior_focus,
                                             cx,
                                         )
-                                        .child(settings_row(
-                                            "settings-row-approval",
-                                            "Approval mode",
-                                            Some("How the agent handles risky actions."),
-                                            mode_segmented,
-                                            cx,
-                                        )),
+                                        .child(
+                                            settings_row(
+                                                "settings-row-approval",
+                                                "Approval mode",
+                                                Some("How the agent handles risky actions."),
+                                                mode_segmented,
+                                                cx,
+                                            ),
+                                        ),
                                     )
                                     .child(
                                         settings_section(
@@ -1647,13 +1649,15 @@ impl ZetaView {
                                             font_cycler,
                                             cx,
                                         ))
-                                        .child(settings_row(
-                                            "settings-row-size",
-                                            "Font size",
-                                            Some("Whole pixels, 11 to 18."),
-                                            size_stepper,
-                                            cx,
-                                        )),
+                                        .child(
+                                            settings_row(
+                                                "settings-row-size",
+                                                "Font size",
+                                                Some("Whole pixels, 11 to 18."),
+                                                size_stepper,
+                                                cx,
+                                            ),
+                                        ),
                                     )
                                     // Trailing spacer: reserves a full
                                     // scroll-cue-height's worth of blank
@@ -1662,11 +1666,7 @@ impl ZetaView {
                                     // the bottom mask paint over real
                                     // content — it always paints over
                                     // this spacer.
-                                    .child(
-                                        div()
-                                            .h(cue_h)
-                                            .flex_shrink_0(),
-                                    ),
+                                    .child(div().h(cue_h).flex_shrink_0()),
                             )
                             .child(
                                 // Bottom mask + scroll cue. Paints on top
