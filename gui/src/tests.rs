@@ -8856,6 +8856,13 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
             font_size: theme::clamp_font_size(base_px),
         };
         visual.update(|_, cx| theme::apply_with(cx, &appearance));
+        // First draw measures every row; the sections wrapper's
+        // `on_children_prepainted` hook then updates the snapped mask
+        // height for the second draw so the mask top edge always lands
+        // on a row boundary (never inside a row). Two draws let the
+        // convergence complete inside a single test iteration without
+        // touching the round-7 assertion below.
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         visual.update(|window, cx| window.draw(cx).clear(cx));
         let panel = visual
             .debug_bounds("settings-panel")
@@ -8866,8 +8873,9 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
         let cue_height = cue.bottom() - cue.top();
         let expected = theme::settings_scroll_cue_height(px(base_px));
         assert!(
-            (cue_height - expected).abs() <= px(1.),
-            "scroll-cue height {cue_height:?} at {base_px}px must match the token {expected:?}"
+            cue_height + px(1.) >= expected,
+            "scroll-cue height {cue_height:?} at {base_px}px must be at least the token \
+             {expected:?} (the runtime snap may extend it upward to a row boundary)"
         );
         assert!(
             cue.left() >= panel.left() - px(1.) && cue.right() <= panel.right() + px(1.),

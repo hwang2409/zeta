@@ -237,6 +237,23 @@ struct ZetaView {
     /// Enter/Space activation survive redraws.
     pub(crate) tool_group_focus:
         std::cell::RefCell<std::collections::HashMap<String, gpui::FocusHandle>>,
+    /// Rendered bounds of every settings-row painted in the current frame.
+    /// Each `settings_row` element pushes its own layed-out `Bounds<Pixels>`
+    /// via an absolute-inset canvas during prepaint; the sections wrapper's
+    /// `on_children_prepainted` hook reads the vec and updates
+    /// `settings_scroll_cue_snapped_h` for the next frame. Cleared at the
+    /// start of every settings render.
+    pub(crate) settings_row_bounds:
+        std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<gpui::Pixels>>>>,
+    /// Height the scroll-cue mask should paint at, snapped so its top edge
+    /// falls on a settings-row boundary (never inside a row). Written by
+    /// the sections-wrapper `on_children_prepainted` hook after every
+    /// frame from the measured row bounds; read on the NEXT frame by
+    /// `render_settings_overlay` to size the mask. `None` on the first
+    /// frame after opening the modal — the fallback in that case is
+    /// `theme::settings_scroll_cue_height`.
+    pub(crate) settings_scroll_cue_snapped_h:
+        std::rc::Rc<std::cell::Cell<Option<gpui::Pixels>>>,
     login_providers: Vec<LoginProvider>,
     settings_error: Option<String>,
     /// Pending composer attachments (valid + invalid). Each entry paints as
@@ -334,6 +351,8 @@ impl ZetaView {
             settings_model_row_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             sidebar_row_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             tool_group_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
+            settings_row_bounds: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            settings_scroll_cue_snapped_h: std::rc::Rc::new(std::cell::Cell::new(None)),
             login_providers: Vec::new(),
             settings_error: None,
             composer_attachments: Vec::new(),
@@ -1312,6 +1331,10 @@ impl ZetaView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        // Fresh recording buffer per frame — every settings_row canvas
+        // pushes its layed-out bounds during prepaint, and the scroll-cue
+        // mask reads the vec later in the same frame.
+        self.settings_row_bounds.borrow_mut().clear();
         let view = &self.state.session_view;
         let providers = &view.model_providers;
         let group_of = |model: &str| providers.get(model).cloned().unwrap_or_default();
@@ -1582,7 +1605,17 @@ impl ZetaView {
                     // the "content continues" edge line (scroll cue).
                     .child({
                         let base = cx.theme().font_size;
-                        let cue_h = theme::settings_scroll_cue_height(base);
+                        let raw_cue_h = theme::settings_scroll_cue_height(base);
+                        // Snapped height from the previous frame's row
+                        // measurements, if any. First frame after opening
+                        // the modal falls back to the raw token height —
+                        // one extra draw converges to the row-aligned
+                        // height before the visible mask can straddle a
+                        // row.
+                        let cue_h = self
+                            .settings_scroll_cue_snapped_h
+                            .get()
+                            .unwrap_or(raw_cue_h);
                         let model_focus = self.settings_section_focus_handle("model", cx);
                         let behavior_focus = self.settings_section_focus_handle("behavior", cx);
                         let appearance_focus = self.settings_section_focus_handle("appearance", cx);
@@ -1606,10 +1639,54 @@ impl ZetaView {
                         if let Some(ix) = focused_section {
                             self.settings_sections_scroll.scroll_to_item(ix);
                         }
+                        let row_bounds = self.settings_row_bounds.clone();
+                        let snapped_cell = self.settings_scroll_cue_snapped_h.clone();
                         div()
                             .relative()
                             .flex_1()
                             .min_h_0()
+                            // After the sections wrapper and mask prepaint,
+                            // walk the measured row bounds and compute the
+                            // row-snapped mask height for the NEXT frame.
+                            // The first child's bounds (the scroll wrapper)
+                            // carry `wrapper.bottom`; the recorded row
+                            // bounds carry every row's top/bottom in the
+                            // same coordinate space. Snap upward from the
+                            // raw cue edge to the top of any row that
+                            // straddles it — the round-7 assertion's
+                            // "row must be fully visible or fully masked"
+                            // invariant.
+                            .on_children_prepainted(move |children, window, _cx| {
+                                let Some(wrapper_bounds) = children.first().copied() else {
+                                    return;
+                                };
+                                let rows = row_bounds.borrow();
+                                if rows.is_empty() {
+                                    return;
+                                }
+                                let wrapper_bottom = wrapper_bounds.bottom();
+                                let mut mask_top = wrapper_bottom - raw_cue_h;
+                                // Repeat until no row straddles: extending
+                                // the mask upward may itself expose a new
+                                // straddle with the row above (gaps are
+                                // narrower than rows, so a single upward
+                                // snap could still leave a straddle if two
+                                // rows abut closely).
+                                loop {
+                                    let straddler = rows.iter().find(|row| {
+                                        row.top() < mask_top && mask_top < row.bottom()
+                                    });
+                                    match straddler {
+                                        Some(row) => mask_top = row.top(),
+                                        None => break,
+                                    }
+                                }
+                                let snapped = (wrapper_bottom - mask_top).max(raw_cue_h);
+                                if snapped_cell.get() != Some(snapped) {
+                                    snapped_cell.set(Some(snapped));
+                                    window.refresh();
+                                }
+                            })
                             .child(
                                 div()
                                     .id("settings-sections")
@@ -1640,6 +1717,7 @@ impl ZetaView {
                                                 "Approval mode",
                                                 Some("How the agent handles risky actions."),
                                                 mode_segmented,
+                                                &self.settings_row_bounds,
                                                 cx,
                                             ),
                                         ),
@@ -1656,6 +1734,7 @@ impl ZetaView {
                                             "Theme",
                                             Some("Click to cycle themes."),
                                             theme_cycler,
+                                            &self.settings_row_bounds,
                                             cx,
                                         ))
                                         .child(settings_row(
@@ -1663,6 +1742,7 @@ impl ZetaView {
                                             "Font",
                                             Some("Click to cycle monospace families."),
                                             font_cycler,
+                                            &self.settings_row_bounds,
                                             cx,
                                         ))
                                         .child(
@@ -1671,6 +1751,7 @@ impl ZetaView {
                                                 "Font size",
                                                 Some("Whole pixels, 11 to 18."),
                                                 size_stepper,
+                                                &self.settings_row_bounds,
                                                 cx,
                                             ),
                                         ),
@@ -2735,6 +2816,7 @@ pub(crate) fn settings_row(
     label: &'static str,
     description: Option<&'static str>,
     control: impl gpui::IntoElement,
+    bounds_recorder: &std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<gpui::Pixels>>>>,
     cx: &App,
 ) -> gpui::Div {
     let base = cx.theme().font_size;
@@ -2764,6 +2846,7 @@ pub(crate) fn settings_row(
         );
     let mut row = div()
         .debug_selector(move || selector.into())
+        .relative()
         .v_flex()
         .gap(theme::SETTINGS_ROW_DESCRIPTION_GAP)
         .child(header);
@@ -2786,7 +2869,26 @@ pub(crate) fn settings_row(
                 .child(text),
         );
     }
-    row
+    // Invisible measurement canvas: stretches to cover the row (absolute
+    // inset_0) so its prepaint bounds equal the row's rendered bounds.
+    // Pushes those bounds into the shared recorder so the scroll-cue
+    // mask canvas can snap its top edge to the top of any row that
+    // would otherwise straddle the raw mask edge (ZETA-128 round 7).
+    // Paints nothing.
+    let recorder = bounds_recorder.clone();
+    row.child(
+        gpui::canvas(
+            move |bounds, _, _| {
+                recorder.borrow_mut().push(bounds);
+            },
+            |_, _: (), _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left_0()
+        .right_0(),
+    )
 }
 
 /// Thin vertical separator between status-strip items. One-pixel wide, 14px
