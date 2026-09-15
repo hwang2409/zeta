@@ -1725,9 +1725,6 @@ impl ZetaView {
     /// inline error message. Every dimension routes through theme tokens so
     /// the whole row scales with the appearance picker.
     fn render_attachment_chips(&self, cx: &Context<Self>) -> gpui::AnyElement {
-        let base_size = cx.theme().font_size;
-        let label_size = theme::label_small(base_size);
-        let meta_size = theme::label_micro(base_size);
         div()
             .mb_1()
             .h_flex()
@@ -1737,19 +1734,10 @@ impl ZetaView {
             .children(self.composer_attachments.iter().enumerate().map(
                 |(index, item)| match item {
                     PendingAttachment::Valid { image, thumbnail } => {
-                        self.render_valid_attachment_chip(
-                            index,
-                            image,
-                            thumbnail.clone(),
-                            label_size,
-                            meta_size,
-                            cx,
-                        )
+                        self.render_valid_attachment_chip(index, image, thumbnail.clone(), cx)
                     }
                     PendingAttachment::Invalid { name, error } => {
-                        self.render_invalid_attachment_chip(
-                            index, name, error, label_size, meta_size, cx,
-                        )
+                        self.render_invalid_attachment_chip(index, name, error, cx)
                     }
                 },
             ))
@@ -1761,8 +1749,6 @@ impl ZetaView {
         index: usize,
         image: &ImageAttachment,
         thumbnail: std::sync::Arc<gpui::Image>,
-        label_size: gpui::Pixels,
-        meta_size: gpui::Pixels,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         // Thumbnail area: token-sized rectangle with the same subtle
@@ -1809,7 +1795,7 @@ impl ZetaView {
                     .child(
                         div()
                             .truncate()
-                            .text_size(label_size)
+                            .text_size(theme::label_small(base_size))
                             .text_color(record_state(
                                 || format!("chip-name-{index}"),
                                 cx.theme().foreground,
@@ -1818,7 +1804,7 @@ impl ZetaView {
                     )
                     .child(
                         div()
-                            .text_size(meta_size)
+                            .text_size(theme::label_micro(base_size))
                             .text_color(cx.theme().muted_foreground)
                             .child(size_label),
                     ),
@@ -1832,8 +1818,6 @@ impl ZetaView {
         index: usize,
         name: &str,
         error: &str,
-        label_size: gpui::Pixels,
-        meta_size: gpui::Pixels,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         // Error chip: same frame as a valid chip so the row rhythm holds,
@@ -1872,7 +1856,7 @@ impl ZetaView {
                     .border_1()
                     .border_color(cx.theme().border)
                     .text_color(cx.theme().foreground)
-                    .child(Icon::new(IconName::TriangleAlert).size(meta_size)),
+                    .child(Icon::new(IconName::TriangleAlert).size(theme::label_micro(base_size))),
             )
             .child(
                 div()
@@ -1883,14 +1867,14 @@ impl ZetaView {
                     .child(
                         div()
                             .truncate()
-                            .text_size(label_size)
+                            .text_size(theme::label_small(base_size))
                             .text_color(cx.theme().foreground)
                             .child(name.to_string()),
                     )
                     .child(
                         div()
                             .truncate()
-                            .text_size(meta_size)
+                            .text_size(theme::label_micro(base_size))
                             .text_color(cx.theme().foreground)
                             .child(error.to_string()),
                     ),

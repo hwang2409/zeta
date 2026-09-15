@@ -210,8 +210,12 @@ pub fn label_micro(base: Pixels) -> Pixels {
 
 /// Reading-measure target for transcript prose, in characters of the base
 /// mono font. Sits inside the "comfortable measure" window (~66-90ch for
-/// readability); 90 gives room without letting the column sprawl.
-pub const PROSE_MEASURE_CH: f32 = 90.0;
+/// readability). Chosen at 88 (not 90) so `prose_max_width` — which now
+/// includes the row's 32px horizontal padding — still lands strictly
+/// under `TRANSCRIPT_MAX_WIDTH` at the picker's MAX 18px base
+/// (18 * 0.62 * 88 + 32 ≈ 1014 < 1024). Gives ~88ch of shaped mono text
+/// inside the padding at every picker step.
+pub const PROSE_MEASURE_CH: f32 = 88.0;
 
 /// Monospace glyph advance as a fraction of the font size. JetBrains Mono
 /// (and every family the appearance picker filters to) advances ~0.6em per
@@ -219,13 +223,35 @@ pub const PROSE_MEASURE_CH: f32 = 90.0;
 /// last glyph past the column edge on subpixel rounding.
 pub const MONO_CH_ADVANCE: f32 = 0.62;
 
+/// Horizontal padding on each side of a transcript prose row (from the row
+/// wrapper's `.px_4()`). The prose cap includes this so the effective TEXT
+/// measure inside the padding is `PROSE_MEASURE_CH` chars, not that minus
+/// the ~4 chars 32px would otherwise steal at the shipped base.
+pub const PROSE_ROW_PADDING_X: f32 = 16.0;
+
 /// Reading-measure cap for transcript PROSE rows (user, assistant,
 /// thinking) — the row-kind narrower column that keeps assistant lines
 /// scannable. Tool receipts and framed error blocks keep
 /// `TRANSCRIPT_MAX_WIDTH` so a wide command line or code block does not
 /// re-wrap at the prose measure. Scales with the appearance picker's base
 /// so an 18px reader keeps their character measure.
+///
+/// The cap is `PROSE_MEASURE_CH` characters of shaped mono text PLUS the
+/// row's horizontal padding on each side, so a caller that pipes this
+/// through `.max_w(...).px_4()` lands the TEXT area at exactly
+/// `PROSE_MEASURE_CH` glyph advances — the value the picker's base font
+/// promises. Without the padding term the effective measure at 13px base
+/// would be ~86ch (32 / (0.62 * 13) ≈ 4ch shorter than advertised).
 pub fn prose_max_width(base: Pixels) -> Pixels {
+    px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH + 2.0 * PROSE_ROW_PADDING_X)
+}
+
+/// Effective text measure INSIDE the prose row's horizontal padding —
+/// `prose_max_width(base)` minus 2× `PROSE_ROW_PADDING_X`. Tests that
+/// need to check the actual text area (not the outer cap) route through
+/// this so a padding change lands in ONE place.
+#[cfg(test)]
+pub fn prose_text_measure(base: Pixels) -> Pixels {
     px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH)
 }
 

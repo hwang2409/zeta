@@ -131,11 +131,11 @@ impl ZetaView {
                     )
             }
             SessionEdit::Delete { label, id } => {
-                let small = theme::label_small(cx.theme().font_size);
+                let base = cx.theme().font_size;
                 div().v_flex().gap_3()
                     .child(div().truncate().child(label.clone()))
-                    .child(div().text_size(small).text_color(cx.theme().muted_foreground).child("Delete this conversation and its stored files? This cannot be undone."))
-                    .when(self.state.active_session.as_ref() == Some(id), |view| view.child(div().text_size(small).text_color(cx.theme().danger).child("This conversation is active. Cancel and select another session before deleting it.")))
+                    .child(div().text_size(theme::label_small(base)).text_color(cx.theme().muted_foreground).child("Delete this conversation and its stored files? This cannot be undone."))
+                    .when(self.state.active_session.as_ref() == Some(id), |view| view.child(div().text_size(theme::label_small(base)).text_color(cx.theme().danger).child("This conversation is active. Cancel and select another session before deleting it.")))
             }
         };
         let title = if rename {

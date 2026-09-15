@@ -336,7 +336,7 @@ fn valid_png_bytes() -> Vec<u8> {
 #[gpui::test]
 fn transcript_prose_column_caps_at_reading_measure_and_centers(cx: &mut TestAppContext) {
     // ZETA-124 narrowed the prose measure: user / assistant / thinking rows
-    // now cap at `prose_max_width(base)` — ~90ch of the base font — while
+    // now cap at `prose_max_width(base)` — ~88ch of the base font — while
     // tool receipts and errors keep the wider `TRANSCRIPT_MAX_WIDTH`. The
     // default 1100px window minus the 216px sidebar leaves ~884px of
     // transcript viewport — WIDER than the prose measure at the shipped 13px
@@ -6604,7 +6604,7 @@ fn role_scale_lands_on_an_ordered_ladder() {
     assert!(f32::from(theme::label_small(base)) > f32::from(theme::label_micro(base)));
 }
 
-/// Prose measure caps assistant reading rows at ~90ch of the base font,
+/// Prose measure caps assistant reading rows at ~88ch of the base font,
 /// scaling with the picker: an 18px reader keeps a wider column than an
 /// 11px reader, but both stay narrower than `TRANSCRIPT_MAX_WIDTH`.
 #[test]
@@ -6618,7 +6618,7 @@ fn prose_max_width_scales_with_the_appearance_picker() {
          picker size — otherwise the reading measure is a no-op",
     );
     // Approx guard: at the shipped default (13px) the measure lands in a
-    // 500-800px window — a scannable ~90ch column. A regression that
+    // 500-800px window — a scannable ~88ch column. A regression that
     // dropped the multiplier past 0.5 or above 0.75 fails here.
     let default = f32::from(theme::prose_max_width(theme::DEFAULT_FONT_SIZE));
     assert!(
@@ -6629,13 +6629,19 @@ fn prose_max_width_scales_with_the_appearance_picker() {
 }
 
 /// Every `.text_size(...)` call in the run-UI source (main.rs, sidebar.rs,
-/// transcript_render.rs, session_management.rs, polish.rs) must feed a
-/// `theme::` role function — never a raw `px(N.)`. Sweeping the sources at
-/// test time so a peer landing a hardcoded size regresses immediately.
+/// transcript_render.rs, session_management.rs, polish.rs) must feed one
+/// of the FIVE verified type roles — `theme::title(`, `theme::body(`,
+/// `theme::label(`, `theme::label_small(`, `theme::label_micro(`. Anything
+/// else — a raw `px(N.)`, an ambient alias like `label_size` / `meta_size`
+/// / `small` / `fallback_size` / `base_size`, a leaked `current_font_size(`,
+/// or a `prose_max_width(` fed as a font size — fails the sweep.
 ///
-/// The guard is intentionally permissive on argument shape (`theme::foo(...)`
-/// works no matter what the inner expression looks like) but strict on the
-/// leading token — a bare `px(` inside a `text_size(...)` fails.
+/// The allowlist deliberately does NOT include `theme::current_font_size(`
+/// (r2 finding 2: the picker's raw pixel value is not a role — sites that
+/// need the "normal reading text" tier must route through `theme::body`)
+/// or `theme::prose_max_width(` (a WIDTH cap in pixels; feeding a width
+/// into `.text_size(...)` was the r2 finding 2 loophole where an unrelated
+/// pixel value looked like a valid role call).
 #[test]
 fn every_text_size_call_routes_through_a_named_theme_role() {
     let sources: &[(&str, &str)] = &[
@@ -6648,20 +6654,16 @@ fn every_text_size_call_routes_through_a_named_theme_role() {
         ),
         ("polish.rs", include_str!("polish.rs")),
     ];
+    // ONLY the five type roles are accepted. `theme::body(theme::current_font_size())`
+    // still starts with `theme::body(` so ambient-context sites (no `cx` in
+    // scope) can route through `body` explicitly — that is the r2 fix for
+    // the last raw `current_font_size()` call at the root text_size site.
     let allowed = [
         "theme::title(",
         "theme::body(",
         "theme::label(",
         "theme::label_small(",
         "theme::label_micro(",
-        "theme::current_font_size(",
-        "theme::prose_max_width(",
-        "fallback_size",
-        "label_size",
-        "meta_size",
-        "base_size",
-        "meta_size,",
-        "small)",
     ];
     let mut offenders = Vec::new();
     for (name, src) in sources {
@@ -6683,8 +6685,10 @@ fn every_text_size_call_routes_through_a_named_theme_role() {
     }
     assert!(
         offenders.is_empty(),
-        "text_size sites must feed a theme::<role>(...) function, not a raw \
-         px literal or ambient identifier:\n  - {}",
+        "text_size sites must feed one of theme::{{title,body,label,\
+         label_small,label_micro}}(...) — no raw px literal, no ambient \
+         alias (label_size / meta_size / small / fallback_size / base_size), \
+         no current_font_size(), no prose_max_width():\n  - {}",
         offenders.join("\n  - ")
     );
 }
@@ -6791,24 +6795,230 @@ fn tool_rows_keep_the_wide_transcript_column(cx: &mut TestAppContext) {
     );
 }
 
+/// Fenced code blocks INSIDE an assistant markdown row ride the same prose
+/// cap as the surrounding prose. The r2 finding 4 review flagged that the
+/// PR body implied code fences kept the wide `TRANSCRIPT_MAX_WIDTH` column;
+/// they do not, and the accepted r2 shape is the narrower cap so the
+/// reading rhythm around the fence stays intact. A refactor that hoists a
+/// per-block splitter (fence → wide, prose → narrow) fails this test and
+/// forces the change to update the review note in
+/// `transcript_render.rs` at the same time.
+#[gpui::test]
+fn assistant_code_fence_rides_the_prose_cap(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_resize(gpui::size(px(1600.), px(760.)));
+    // Assistant turn with a paragraph plus a fenced code block. At a
+    // 1600px viewport the row would otherwise fit the whole content on a
+    // wide column; the prose cap must clamp it back to the reading
+    // measure regardless.
+    let source = "\
+Here is a code block:\n\
+\n\
+```rust\n\
+fn main() {\n\
+    println!(\"a long line to prove the code fence never widens the row\");\n\
+}\n\
+```\n\
+\n\
+And a paragraph after the fence.";
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::Assistant(source.into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let column = visual
+        .debug_bounds("transcript-column")
+        .expect("assistant column draws");
+    let base = visual.update(|_, cx| cx.theme().font_size);
+    let prose_cap = f32::from(theme::prose_max_width(base));
+    assert!(
+        f32::from(column.size.width) <= prose_cap + 4.0,
+        "assistant column width {:?} exceeded prose cap {prose_cap} — a \
+         per-block splitter that gave code fences the wide cap regressed \
+         the r2 accepted shape",
+        column.size.width,
+    );
+    // Tool rows keep the wider cap — reasserted here to guard the flip
+    // side of the choice: if a future refactor merged prose and tool
+    // rows onto the same cap, both would end up at whichever was wider.
+    assert!(
+        f32::from(column.size.width) < f32::from(theme::TRANSCRIPT_MAX_WIDTH),
+        "prose cap {prose_cap} must sit strictly below TRANSCRIPT_MAX_WIDTH \
+         {:?} — otherwise the split gate for tool receipts is a no-op",
+        theme::TRANSCRIPT_MAX_WIDTH,
+    );
+}
+
+/// Full-layout bounds at the picker's MIN 11px and MAX 18px extremes.
+/// The five ZETA-123 chrome regions — run header, sidebar, modal panel,
+/// composer, transcript viewport — must all sit inside the viewport
+/// and not overlap each other at either extreme. This is the r2
+/// finding 3 gate: the existing chip-scale test proved that individual
+/// chip sub-parts scale with the picker, but it never asked whether the
+/// WHOLE chrome still fits at 11px (tighter mono → composer footer risks
+/// stealing header space) or at 18px (wider glyphs → sidebar rows risk
+/// pushing transcript-column into the sidebar). Runs the layout at both
+/// extremes and reads every debug bound; a regression that clips one of
+/// the regions inside another fails here.
+#[gpui::test]
+fn full_layout_regions_fit_at_11px_and_18px(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Wide + tall viewport so the 18px case has room; the extremes case
+    // proves each region computes its own size correctly, not that the
+    // window is huge. 1600x900 is a common laptop shape.
+    visual.simulate_resize(gpui::size(px(1600.), px(900.)));
+    // Seed a transcript row so `transcript-viewport` paints and the
+    // composer sits above pending work rather than clinging to the top.
+    // Also open Settings later per extreme to reach `settings-panel`.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::User("hello".into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let mut appearance = theme::Appearance::default();
+    let mut assert_regions_at = |base_px: f32, visual: &mut VisualTestContext| {
+        appearance.font_size = theme::clamp_font_size(base_px);
+        let viewport_size = visual.update(|window, cx| {
+            theme::apply_with(cx, &appearance);
+            view.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear(cx);
+            window.viewport_size()
+        });
+        // Viewport bounds in gpui-content coordinates (origin at 0,0).
+        let viewport = gpui::Bounds {
+            origin: gpui::point(px(0.), px(0.)),
+            size: viewport_size,
+        };
+        let header = visual
+            .debug_bounds("run-header")
+            .unwrap_or_else(|| panic!("run-header at {base_px}px"));
+        let sidebar = visual
+            .debug_bounds("sidebar-header")
+            .unwrap_or_else(|| panic!("sidebar-header at {base_px}px"));
+        let transcript = visual
+            .debug_bounds("transcript-viewport")
+            .unwrap_or_else(|| panic!("transcript-viewport at {base_px}px"));
+        let composer = visual
+            .debug_bounds("composer")
+            .unwrap_or_else(|| panic!("composer at {base_px}px"));
+        // Every region sits inside the window viewport at both extremes.
+        for (name, region) in [
+            ("run-header", &header),
+            ("sidebar-header", &sidebar),
+            ("transcript-viewport", &transcript),
+            ("composer", &composer),
+        ] {
+            assert!(
+                region.left() >= viewport.left() - px(1.)
+                    && region.right() <= viewport.right() + px(1.)
+                    && region.top() >= viewport.top() - px(1.)
+                    && region.bottom() <= viewport.bottom() + px(1.),
+                "{name} at {base_px}px leaks outside viewport {viewport:?}: {region:?}"
+            );
+            assert!(
+                region.size.width > px(0.) && region.size.height > px(0.),
+                "{name} at {base_px}px has zero size {:?}",
+                region.size,
+            );
+        }
+        // Header sits above the transcript; transcript sits above composer;
+        // composer sits inside the main column (right of sidebar). At the
+        // picker extremes a broken layout typically manifests as the
+        // header stealing composer space or the sidebar bleeding into the
+        // transcript viewport, both of which fail here.
+        assert!(
+            header.bottom() <= transcript.top() + px(1.),
+            "run-header overlaps transcript at {base_px}px (header {header:?}, transcript {transcript:?})",
+        );
+        assert!(
+            transcript.bottom() <= composer.top() + px(1.),
+            "transcript overlaps composer at {base_px}px (transcript {transcript:?}, composer {composer:?})",
+        );
+        assert!(
+            sidebar.right() <= transcript.left() + px(1.),
+            "sidebar bleeds into transcript at {base_px}px (sidebar {sidebar:?}, transcript {transcript:?})",
+        );
+        assert!(
+            sidebar.right() <= composer.left() + px(1.),
+            "sidebar bleeds into composer at {base_px}px (sidebar {sidebar:?}, composer {composer:?})",
+        );
+        // Modal panel: open Settings by flipping the state flag directly
+        // (peer tests do the same — the panel gate depends on session
+        // state we do not model here) and re-read. The modal must sit
+        // inside the viewport at both extremes; at 18px a modal that
+        // hardcodes its inner text size (rather than routing through the
+        // roles) could push the panel past the viewport bottom.
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.settings_open = true;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let modal = visual
+            .debug_bounds("settings-panel")
+            .unwrap_or_else(|| panic!("settings-panel at {base_px}px"));
+        assert!(
+            modal.left() >= viewport.left() - px(1.)
+                && modal.right() <= viewport.right() + px(1.)
+                && modal.top() >= viewport.top() - px(1.)
+                && modal.bottom() <= viewport.bottom() + px(1.),
+            "settings-panel at {base_px}px leaks outside viewport {viewport:?}: {modal:?}",
+        );
+        // Close the modal so the next extreme starts from the same state.
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.settings_open = false;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+    };
+    assert_regions_at(theme::MIN_FONT_SIZE_PX, &mut visual);
+    assert_regions_at(theme::MAX_FONT_SIZE_PX, &mut visual);
+}
+
 /// Regression harness for the ZETA-124 wedge list content: an assistant
 /// markdown row carrying a numbered list where one item's paragraph
 /// combines inline code chips (`meta.json` / `conversation.jsonl`) with a
-/// long hanging-indent continuation. The critique screenshot showed a
-/// stray `n` shaping past the row column edge; the narrower prose measure
-/// applied here changes the wrap point so no glyph lands past the row
-/// bounds. Rendering to a native context is expensive, so the test uses a
-/// draw pass and asserts the row bounds land inside the transcript column.
+/// long hanging-indent continuation. The r1 critique screenshot at
+/// 2204x1608 showed a stray `n` shaping past the row column edge.
+///
+/// The r2 fix here is at the RENDERER's wrap-boundary math: `prose_max_width`
+/// now includes the row's `.px_4()` horizontal padding on each side, so
+/// the effective TEXT area lands at exactly `PROSE_MEASURE_CH` glyph
+/// advances rather than that minus ~4 chars the padding used to steal.
+/// The regression harness runs at the exact 2204x1608 shape the critique
+/// captured and asserts (a) glyph containment — every painted quad
+/// inside the row sits inside the row's inner text column, so a
+/// subpixel-rounded wrap that pokes a glyph rectangle past the edge
+/// fails here — and (b) hanging-indent continuation — the row wraps
+/// onto multiple lines, so a regression that widens the column past the
+/// prose cap collapses it back to a single line and fails.
 #[gpui::test]
 fn wedge_list_item_wraps_inside_the_prose_column(cx: &mut TestAppContext) {
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    visual.simulate_resize(gpui::size(px(1600.), px(760.)));
+    // The critique shot: 2204x1608, the shape that put a stray `n` past
+    // the row edge under the r1 prose cap. Any regression to a wider column
+    // (or a padding-not-in-cap variant that shortens the effective measure)
+    // shifts the wrap point relative to this shape, so glyphs land in
+    // different places — the containment check below catches that.
+    visual.simulate_resize(gpui::size(px(2204.), px(1608.)));
     let wedge = "\
 2. `zeta serve` session hardening — half-written session dirs \
 (`conversation.jsonl` without `meta.json`) wedge status/list. Atomic dir \
 creation via `meta.json` tmp+rename.\n\
-3. Follow-up work with additional wrapping to exercise the hanging indent.";
+3. Follow-up work with additional wrapping to exercise the hanging indent \
+so the paragraph reliably breaks onto a continuation line even at 2204px.";
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.state.transcript = vec![TranscriptEntry::Assistant(wedge.into())];
@@ -6817,6 +7027,9 @@ creation via `meta.json` tmp+rename.\n\
         });
         window.draw(cx).clear(cx);
     });
+    let row = visual
+        .debug_bounds("transcript-row")
+        .expect("wedge row draws");
     let column = visual
         .debug_bounds("transcript-column")
         .expect("wedge column draws");
@@ -6825,6 +7038,7 @@ creation via `meta.json` tmp+rename.\n\
         .expect("transcript viewport draws");
     let base = visual.update(|_, cx| cx.theme().font_size);
     let prose_cap = f32::from(theme::prose_max_width(base));
+    let text_measure = f32::from(theme::prose_text_measure(base));
     // The wedge assistant is a prose row — its inner column must sit at
     // the narrower measure so the hanging-indent list content wraps at a
     // scannable width. `+4` guards against the pipeline's subpixel rounding.
@@ -6849,4 +7063,76 @@ creation via `meta.json` tmp+rename.\n\
         f32::from(drift) < 8.0,
         "wedge column not centered inside transcript viewport: drift {drift:?}",
     );
+    // Glyph containment: every quad painted inside the row bounds sits
+    // inside the inner text column (column bounds minus the row's
+    // horizontal padding). GPUI does not expose glyph-level bounds, but
+    // rich text paints backgrounds/rails/underlines as quads inside the
+    // same wrap path, so a glyph that shapes past the edge takes its
+    // painted rectangle with it. A tolerance of 4 scaled pixels covers
+    // the pipeline's subpixel rounding without letting a whole glyph
+    // slip past.
+    visual.update(|window, _cx| {
+        let scale = window.scale_factor();
+        let scaled_row = row.scale(scale);
+        let scaled_column = column.scale(scale);
+        let pad_scaled = px(theme::PROSE_ROW_PADDING_X).scale(scale);
+        let inner_left = scaled_column.left() + pad_scaled;
+        let inner_right = scaled_column.right() - pad_scaled;
+        let tolerance = px(4.).scale(scale);
+        // Quads inside the row's vertical AND the transcript column's
+        // horizontal band: this excludes the sidebar / composer strips
+        // that paint at the same y-range but on the other side of the
+        // window. A quad that starts left of the column left edge is
+        // outside the transcript column entirely and cannot regress the
+        // wrap boundary this test guards.
+        let row_quads: Vec<_> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| {
+                quad.bounds.top() >= scaled_row.top()
+                    && quad.bounds.bottom() <= scaled_row.bottom() + tolerance
+                    && quad.bounds.left() >= scaled_column.left() - tolerance
+                    && quad.bounds.size.width > gpui::ScaledPixels::default()
+            })
+            .collect();
+        // At least one quad should have been painted inside the row — a
+        // hard zero would mean the assertion body below is vacuous. The
+        // wedge content paints the assistant row's markdown, which shapes
+        // at least one primitive per line.
+        assert!(
+            !row_quads.is_empty(),
+            "no quads observed inside wedge row bounds {scaled_row:?} — the \
+             draw pass never landed a primitive inside the row",
+        );
+        for quad in row_quads {
+            assert!(
+                quad.bounds.left() >= inner_left - tolerance,
+                "quad {:?} started left of the inner text column {inner_left:?}",
+                quad.bounds,
+            );
+            assert!(
+                quad.bounds.right() <= inner_right + tolerance,
+                "quad {:?} shaped past the inner text column {inner_right:?} \
+                 — the wrap boundary regressed",
+                quad.bounds,
+            );
+        }
+        // Hanging-indent continuation: the wedge content is long enough
+        // that at the 90ch prose measure it wraps onto multiple visible
+        // lines. Assert the row is taller than a single line at the
+        // current base — this catches a regression that reverts to
+        // `TRANSCRIPT_MAX_WIDTH` (which would let the whole paragraph fit
+        // on one line at 2204px) and it catches a padding-included cap
+        // that quietly grew the measure back past 90ch on this shape.
+        let single_line = f32::from(base) * 1.65;
+        let row_height = f32::from(row.size.height);
+        assert!(
+            row_height > single_line * 2.5,
+            "wedge row height {row_height} did not exceed 2.5 line-heights \
+             ({}) — the hanging-indent continuation did not paint on \
+             separate lines (prose_cap {prose_cap}, text_measure \
+             {text_measure})",
+            single_line * 2.5,
+        );
+    });
 }

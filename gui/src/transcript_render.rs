@@ -144,11 +144,27 @@ impl ZetaView {
 
         let inner = self.render_row_inner(index, view, cx);
         // Prose rows (user, assistant, thinking) cap at the narrower reading
-        // measure so long assistant lines wrap at a comfortable ~90ch. Tool
+        // measure so long assistant lines wrap at a comfortable ~88ch. Tool
         // receipts, error blocks, and any other row keep the wider
-        // `TRANSCRIPT_MAX_WIDTH` so a long command line or a code fence has
-        // room. The measure scales with the appearance picker's base font
-        // so an 18px reader keeps the same character budget on screen.
+        // `TRANSCRIPT_MAX_WIDTH` so a long tool command line or an error
+        // stack has room.
+        //
+        // r2 clarification (ZETA-124 finding 4): a fenced code block INSIDE
+        // an assistant markdown row rides the SAME prose cap as the prose
+        // around it — the cap sits on the row wrapper, not on the child
+        // markdown segments, so a wider fenced block would need a per-block
+        // split renderer we deliberately do not add here. Split rendering
+        // would give code fences a second column boundary of their own and
+        // fight the reading rhythm the prose cap is here to establish;
+        // tool receipts / error blocks already carry the wide cap for the
+        // shell / stack output that actually benefits from horizontal
+        // room. See `assistant_code_fence_rides_the_prose_cap` for the
+        // test that pins this shape so a peer refactor that quietly
+        // reintroduces block-aware sizing lands next to the review note
+        // rather than as a surprise.
+        //
+        // The measure scales with the appearance picker's base font so an
+        // 18px reader keeps the same character budget on screen.
         let prose_row = matches!(
             self.state.transcript[index],
             TranscriptEntry::User(_) | TranscriptEntry::Assistant(_) | TranscriptEntry::Thinking
