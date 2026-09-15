@@ -8886,15 +8886,14 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
         // caption" shape the finding named. `settings-row-*-description`
         // debug_bounds return the caption element's own bounds.
         let mask_top = cue.top();
-        for row_sel in [
-            "settings-row-approval",
-            "settings-row-theme",
-            "settings-row-font",
-            "settings-row-size",
+        for desc_sel in [
+            "settings-row-approval-description",
+            "settings-row-theme-description",
+            "settings-row-font-description",
+            "settings-row-size-description",
         ] {
-            let desc_sel = format!("{row_sel}-description");
             let desc = visual
-                .debug_bounds(&desc_sel)
+                .debug_bounds(desc_sel)
                 .unwrap_or_else(|| panic!("{desc_sel} renders at {base_px}px"));
             let fully_visible = desc.bottom() <= mask_top + px(1.);
             let fully_masked = desc.top() >= mask_top - px(1.);
