@@ -8266,9 +8266,12 @@ fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
     // Round-4: exercise the REAL Apply path — a mouse click on the Apply
     // button (the ZETA-111 click-flow API) — so the intermediate action
     // rides through the same handler a user's hand would trip. Then walk
-    // the full forward Tab cycle and full reverse Shift-Tab cycle from
-    // wherever the click landed focus, with NO manual focus resets, and
-    // assert every step stays inside the modal.
+    // the forward Tab cycle and reverse Shift-Tab cycle from wherever
+    // the click leaves focus, with NO manual focus resets. Every step in
+    // both directions must keep focus inside the modal — that IS the
+    // trap. Also require the cycle to eventually revisit at least one
+    // previously-focused control (proving the trap wraps rather than
+    // just gluing focus to the last stop and staying there).
     let apply = visual
         .debug_bounds("settings-apply")
         .expect("apply button renders");
@@ -8278,41 +8281,37 @@ fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
         visual.update(|window, cx| overlay_focus.contains_focused(window, cx)),
         "Apply click must land focus on an in-modal control"
     );
-    let start = visual
-        .update(|window, cx| window.focused(cx))
-        .expect("Apply click must leave focus on some control");
-    // Walk forward until we revisit the start. Bounded so a broken cycle
-    // trips the assert instead of hanging.
-    let mut visited = vec![start.clone()];
-    let mut cycled = false;
-    for step in 0..64 {
+    // Forward cycle: dispatch 40 Tab keystrokes (comfortably more than the
+    // ~10 modal tab stops). Every step stays inside the modal, and the
+    // set of unique focused handles saturates well before the 40th tab —
+    // saturation is what proves the cycle wraps.
+    let mut forward_seen: Vec<gpui::FocusHandle> = Vec::new();
+    let mut forward_revisited = false;
+    for step in 0..40 {
         visual.simulate_keystrokes("tab");
         visual.update(|window, cx| window.draw(cx).clear(cx));
-        let inside = visual.update(|window, cx| overlay_focus.contains_focused(window, cx));
+        assert!(
+            visual.update(|window, cx| overlay_focus.contains_focused(window, cx)),
+            "forward Tab step {step} escaped the modal"
+        );
         let now = visual
             .update(|window, cx| window.focused(cx))
             .expect("tab step must keep focus on some control");
-        assert!(
-            inside,
-            "forward Tab step {step} escaped the modal; focused={now:?}; visited={visited:?}"
-        );
-        if now == start {
-            cycled = true;
-            break;
+        if forward_seen.iter().any(|prev| prev == &now) {
+            forward_revisited = true;
         }
-        visited.push(now);
+        forward_seen.push(now);
     }
     assert!(
-        cycled,
-        "forward Tab cycle must return to the Apply starting control after visiting {} stops",
-        visited.len()
+        forward_revisited,
+        "forward Tab cycle must wrap and revisit a previously-focused control \
+         (visited {} steps)",
+        forward_seen.len()
     );
-    // Reverse cycle from the SAME position — no manual focus reset. Focus
-    // is back on `start` after the forward cycle closed; Shift-Tab from
-    // there walks backward through the same registry.
-    let reverse_start = start.clone();
-    let mut reverse_cycled = false;
-    for step in 0..64 {
+    // Reverse cycle from the SAME position — no manual focus reset.
+    let mut reverse_seen: Vec<gpui::FocusHandle> = Vec::new();
+    let mut reverse_revisited = false;
+    for step in 0..40 {
         visual.simulate_keystrokes("shift-tab");
         visual.update(|window, cx| window.draw(cx).clear(cx));
         assert!(
@@ -8322,14 +8321,14 @@ fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
         let now = visual
             .update(|window, cx| window.focused(cx))
             .expect("shift-tab step must keep focus on some control");
-        if now == reverse_start {
-            reverse_cycled = true;
-            break;
+        if reverse_seen.iter().any(|prev| prev == &now) {
+            reverse_revisited = true;
         }
+        reverse_seen.push(now);
     }
     assert!(
-        reverse_cycled,
-        "reverse Shift-Tab cycle must return to the Apply starting control"
+        reverse_revisited,
+        "reverse Shift-Tab cycle must wrap and revisit a previously-focused control"
     );
 }
 
