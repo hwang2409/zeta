@@ -53,9 +53,32 @@ fn rgb8(color: gpui::Hsla) -> [u8; 3] {
     ]
 }
 
+/// Pixel rectangle in image coordinates. Used to punch holes in the scan
+/// band for painted overlays (currently just the transcript scrollbar
+/// thumb) that render inside the column's padding zone. Every hole
+/// records the ACTUAL painted rect — no blanket tolerance on
+/// `content_right` — so a real glyph escape adjacent to the overlay still
+/// trips the guard.
+#[derive(Debug, Clone, Copy)]
+struct PixelRect {
+    x_start: u32,
+    x_end: u32,
+    y_start: u32,
+    y_end: u32,
+}
+
+impl PixelRect {
+    fn contains(&self, x: u32, y: u32) -> bool {
+        x >= self.x_start && x < self.x_end && y >= self.y_start && y < self.y_end
+    }
+}
+
 /// Return the first x range with at least two adjacent pixels that differ
 /// from the active canvas token. One isolated anti-aliased pixel is noise;
 /// adjacent pixels are the minimum evidence for an escaped glyph stroke.
+/// Pixels inside any `exclude` rect are treated as background — this is
+/// how the scan skips the scrollbar-thumb overlay without loosening the
+/// content-right coordinate for every other paint.
 fn escaped_glyph_range(
     image: &image::RgbaImage,
     x_start: u32,
@@ -63,14 +86,20 @@ fn escaped_glyph_range(
     y_start: u32,
     y_end: u32,
     background: [u8; 3],
+    exclude: &[PixelRect],
 ) -> Option<(u32, u32)> {
     for y in y_start..y_end {
         let mut run_start = None;
         for x in x_start..x_end {
-            let pixel = image.get_pixel(x, y).0;
-            let over_threshold = pixel[..3].iter().zip(background).any(|(actual, expected)| {
-                actual.abs_diff(expected) >= NATIVE_GUARD_COLOR_THRESHOLD
-            });
+            let masked = exclude.iter().any(|rect| rect.contains(x, y));
+            let over_threshold = if masked {
+                false
+            } else {
+                let pixel = image.get_pixel(x, y).0;
+                pixel[..3].iter().zip(background).any(|(actual, expected)| {
+                    actual.abs_diff(expected) >= NATIVE_GUARD_COLOR_THRESHOLD
+                })
+            };
             if over_threshold {
                 run_start.get_or_insert(x);
             } else if let Some(start) = run_start.take() {
@@ -86,6 +115,47 @@ fn escaped_glyph_range(
         }
     }
     None
+}
+
+/// Identify the transcript scrollbar-thumb rectangles the current frame
+/// painted, so the pixel-gutter scan can skip them without loosening its
+/// content-right coordinate. Filters `painted_quads()` to narrow (≤
+/// `SCROLLBAR_THUMB_WIDTH` scaled + 2px slack), tall (≥ 24px scaled)
+/// quads whose x-range overlaps the scan gutter. The narrow-and-tall
+/// signature is unique to the scrollbar thumb — every other painted quad
+/// in the transcript column is either full-width (rows, backgrounds) or
+/// short (chevrons, dots, focus rings).
+fn scrollbar_scan_masks(window: &Window, gutter_x_start: u32, gutter_x_end: u32) -> Vec<PixelRect> {
+    let scale = window.scale_factor();
+    let max_width_scaled = (f32::from(theme::SCROLLBAR_THUMB_WIDTH) * scale).ceil() as u32 + 2;
+    let min_height_scaled = (24.0 * scale) as u32;
+    window
+        .painted_quads()
+        .into_iter()
+        .filter_map(|quad| {
+            let width = quad.bounds.size.width.0.ceil() as u32;
+            let height = quad.bounds.size.height.0.ceil() as u32;
+            if width == 0 || width > max_width_scaled || height < min_height_scaled {
+                return None;
+            }
+            let x_start = quad.bounds.origin.x.0.floor() as u32;
+            let x_end = x_start + width;
+            let y_start = quad.bounds.origin.y.0.floor() as u32;
+            let y_end = y_start + height;
+            // Only mask quads whose x-range actually overlaps the gutter
+            // — a narrow icon painted elsewhere on the row does not need
+            // exclusion because the scan does not visit its columns.
+            if x_end <= gutter_x_start || x_start >= gutter_x_end {
+                return None;
+            }
+            Some(PixelRect {
+                x_start,
+                x_end,
+                y_start,
+                y_end,
+            })
+        })
+        .collect()
 }
 
 fn scan_native_gutter(
@@ -117,19 +187,29 @@ fn scan_native_gutter(
         .height()
         .saturating_sub((f32::from(NATIVE_GUARD_COMPOSER_HEIGHT) * scale).ceil() as u32 + 1);
     let background = rgb8(theme::palette::canvas());
-    if let Some((escape_start, escape_end)) =
-        escaped_glyph_range(image, x_start, x_end, y_start, y_end, background)
-    {
+    let scrollbar_masks = scrollbar_scan_masks(window, x_start, x_end);
+    if let Some((escape_start, escape_end)) = escaped_glyph_range(
+        image,
+        x_start,
+        x_end,
+        y_start,
+        y_end,
+        background,
+        &scrollbar_masks,
+    ) {
         panic!(
             "native pixel gutter guard failed: shape={shape} size={font_size:?} \
              x_range={escape_start}..={escape_end} gutter={x_start}..{x_end} \
              window_width={window_width} scale={scale} column_width={column_width} \
-             content_right={content_right} y_range={y_start}..{y_end} background={background:?}"
+             content_right={content_right} y_range={y_start}..{y_end} background={background:?} \
+             masked={scrollbar_masks:?}"
         );
     }
     println!(
         "NATIVE-GUARD-PASS: shape={shape} size={font_size:?} \
-         viewport={achieved_width}x{achieved_height} gutter={x_start}..{x_end}"
+         viewport={achieved_width}x{achieved_height} gutter={x_start}..{x_end} \
+         scrollbar_masks={}",
+        scrollbar_masks.len()
     );
 }
 
@@ -214,8 +294,20 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
                 cx.update(|window, cx| {
                     view.update(cx, |view, cx| {
                         view.state.connection = ConnectionState::Connected;
-                        view.state.transcript = vec![TranscriptEntry::Assistant(source.into())];
-                        view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                        // r3 finding 7: seed grouped + ungrouped tool
+                        // receipts alongside the wrap-prose so glyph
+                        // escapes in the tool-receipt paint paths ride
+                        // the same pixel gutter. The taller-transcript
+                        // shape entry keeps the SCROLLBAR-PRESENT path
+                        // exercised at 18px — `scrollbar_scan_masks`
+                        // punches ONLY the scrollbar rect out of the
+                        // scan band, so a real overshoot adjacent to
+                        // the scrollbar (or on any other row) still
+                        // trips the guard cleanly.
+                        view.state.transcript = native_guard_transcript(source);
+                        let count = view.state.transcript.len();
+                        view.transcript
+                            .update(cx, |scroll, cx| scroll.reset(count, cx));
                         cx.notify();
                     });
                     window.render_frame(cx);
@@ -259,6 +351,59 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
         .collect::<Vec<_>>()
         .join(",");
     println!("NATIVE-GUARD-PASS: matrix={matrix_entries} achieved_viewports={achieved_list}");
+}
+
+/// Build the transcript the native pixel-gutter guard renders for one
+/// shape entry. The assistant row carries the wrapping prose the guard
+/// was originally designed to stress. Alongside it we seed a 3-receipt
+/// grouped run AND a solo receipt so glyph escapes in the tool-receipt
+/// paint paths ride the same pixel gutter — the r3 review flagged that
+/// receipt rows were previously invisible to the guard. The transcript
+/// is deliberately tall enough to trigger the scrollbar at 18px on the
+/// smaller viewport (717x474), so the scrollbar-mask code path stays
+/// exercised — a future change that regresses scrollbar geometry (moves
+/// its thumb OUT of the mask zone, or paints extra chrome next to it)
+/// still shows up in CI here rather than passing silently.
+fn native_guard_transcript(source: &str) -> Vec<TranscriptEntry> {
+    use zeta_gui::cards::{Card, OutputTail};
+    use zeta_gui::state::{tool_excerpt, ToolReceiptKey, TranscriptEntry};
+    let tool = |id: &str, name: &str, key: &str, value: &str, bytes: usize| -> TranscriptEntry {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(key.into(), serde_json::Value::String(value.into()));
+        TranscriptEntry::Tool {
+            key: ToolReceiptKey {
+                session_id: None,
+                agent_instance_id: None,
+                tool_call_id: id.into(),
+            },
+            name: name.into(),
+            excerpt: tool_excerpt(name, &arguments),
+            summary: String::new(),
+            complete: true,
+            error: false,
+            canceled: false,
+            card: Card {
+                tail: OutputTail {
+                    text: "x".repeat(bytes),
+                    truncated: false,
+                    bytes_seen: bytes,
+                },
+                ..Default::default()
+            },
+        }
+    };
+    vec![
+        TranscriptEntry::Assistant(source.into()),
+        // Grouped run (3 receipts, same-turn adjacent) — collapses to
+        // one header row when expansion is unset.
+        tool("g1", "bash", "command", "grep -rn TODO src/", 900),
+        tool("g2", "read", "path", "src/main.rs", 3_940),
+        tool("g3", "read", "path", "src/lib.rs", 1_180),
+        // Second assistant row splits the run so the ungrouped tool
+        // below paints as its own individual receipt row.
+        TranscriptEntry::Assistant("Spot-checking one more.".into()),
+        tool("s1", "read", "path", "Cargo.toml", 252),
+    ]
 }
 
 /// Encode a tiny checkerboard PNG for the ZETA-112 attachment-chrome shot.

@@ -25,3 +25,33 @@ gui-native-guards:
 	done; \
 	grep -q '^ready$$' "$$server_log" || { cat "$$server_log"; exit 1; }; \
 	ZETA_HOME="$$tmp_dir/home" ZETA_GUI_NATIVE_GUARDS=1 cargo run --manifest-path gui/Cargo.toml --features smoke-test -- --socket "$$socket"
+
+# Poison-canary: the native pixel-gutter guard MUST still fail when a
+# real prose-column overflow is introduced. The `NATIVE_GUARD_FORCE_TEXT_WIDTH`
+# knob widens the assistant TextView beyond its prose column so glyphs
+# actually escape into the gutter. This target inverts the exit code —
+# the guard is expected to panic. A green run here would prove the guard
+# has been silenced (by e.g. a masking regression); we exit non-zero.
+.PHONY: gui-native-guards-mutation
+gui-native-guards-mutation:
+	@set -eu; \
+	tmp_dir=$$(mktemp -d); \
+	mkdir "$$tmp_dir/home"; \
+	socket="$$tmp_dir/smoke.sock"; \
+	server_log="$$tmp_dir/server.log"; \
+	ZETA_HOME="$$tmp_dir/home" uv run --frozen python gui/tests/smoke_server.py --socket "$$socket" >"$$server_log" 2>&1 & \
+	server_pid=$$!; \
+	trap 'kill "$$server_pid" 2>/dev/null || true; wait "$$server_pid" 2>/dev/null || true; rm -rf "$$tmp_dir"' EXIT INT TERM; \
+	for attempt in $$(seq 1 100); do \
+		if grep -q '^ready$$' "$$server_log"; then break; fi; \
+		if ! kill -0 "$$server_pid" 2>/dev/null; then cat "$$server_log"; exit 1; fi; \
+		sleep 0.1; \
+	done; \
+	grep -q '^ready$$' "$$server_log" || { cat "$$server_log"; exit 1; }; \
+	if ZETA_HOME="$$tmp_dir/home" ZETA_GUI_NATIVE_GUARDS=1 ZETA_GUI_NATIVE_GUARDS_FORCE_TEXT_WIDTH=1 \
+	  cargo run --manifest-path gui/Cargo.toml --features smoke-test -- --socket "$$socket"; then \
+		echo "FAIL: guard mutation PASSED (guard has been silenced — masking regressed)"; \
+		exit 1; \
+	else \
+		echo "OK: guard mutation FAILED the guard as required"; \
+	fi
