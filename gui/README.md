@@ -113,3 +113,24 @@ In another:
 ZETA_HOME="$(mktemp -d)" ZETA_GUI_SMOKE_IMAGE=/tmp/zeta-smoke.png \
   cargo run --manifest-path gui/Cargo.toml --features smoke-test -- --socket /tmp/zeta-smoke.sock
 ```
+
+The native pixel-gutter guard is a separate, explicit arm. It derives two
+display-safe window sizes, waits for each native resize, and records the
+achieved capture dimensions. Duplicate achieved sizes emit a warning and are
+not counted twice. It renders the wrap-shape matrix at 11px, 13px, and 18px
+for each distinct viewport. Two adjacent non-background pixels fail the run.
+
+```sh
+make gui-native-guards
+```
+
+The arm uses the default theme and an isolated `ZETA_HOME`. Plain `cargo test`
+does not open a native window. Set
+`ZETA_GUI_NATIVE_GUARDS_FORCE_TEXT_WIDTH=1` with the arm to reproduce the
+round-3 wide-TextView mutation; the guard must fail before the mutation is
+removed.
+
+The macOS runner can clamp a requested window to its available display. The
+guard derives both requests below that display limit, validates every capture
+dimension, and fails unless it achieves two distinct rendered widths. The
+restored macOS CI step is the authoritative guard run.

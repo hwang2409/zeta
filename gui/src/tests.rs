@@ -7213,7 +7213,7 @@ same column even when the marker indent has consumed a few characters.";
     let long_token = "\
 Prose leading up to a very long unbroken token that the wrap engine \
 cannot break: \
-supercalifragilisticexpialidocious_but_much_longer_than_any_column_should_ever_be \
+supercalifragilisticexpialidocious_but_much_longer_than_any_column_should_ever_be_aaaaaaaaaaaaaaaaaaaa \
 and then some trailing prose after it.";
     let shapes: &[(&str, &str)] = &[
         ("wedge", wedge),
