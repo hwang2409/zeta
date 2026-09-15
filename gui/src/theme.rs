@@ -257,6 +257,23 @@ pub fn prose_text_measure(base: Pixels) -> Pixels {
     px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH)
 }
 
+/// Wrap budget the prose row hands to its `TextView` via `.max_w(...)`.
+/// Derived from `prose_max_width` minus the row's 2× horizontal padding
+/// and a 2px safety margin, then FLOORED so a fractional budget cannot
+/// let the painter's rounding push one glyph's advance past
+/// `content_right`. The r3 pixel-gutter guard flagged that pattern at
+/// 11px on the 922×610 viewport — glyphs, not quads, painting one
+/// column past the content edge; the floor pins the boundary integer.
+pub fn prose_wrap_budget(base: Pixels) -> Pixels {
+    px((f32::from(prose_max_width(base)) - 2.0 * PROSE_ROW_PADDING_X - 2.0).floor())
+}
+
+/// Vertical floor for tool-receipt and tool-group summary rows. Kept as
+/// a token so the two row renderers share ONE height and a picker step
+/// (or a peer refactor of the receipt shape) lands here rather than in
+/// scattered `px(20.)` literals — r4 finding 7.
+pub const TOOL_ROW_MIN_HEIGHT: Pixels = px(20.);
+
 /// Pending-attachment chip thumbnail size. Base 13px keeps parity with the
 /// original 32x24 rectangle; other sizes scale proportionally so the chip
 /// row rhythm matches the appearance picker's base font.

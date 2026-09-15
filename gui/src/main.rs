@@ -7,6 +7,7 @@ mod sidebar;
 #[cfg(feature = "smoke-test")]
 mod smoke;
 mod theme;
+mod tool_receipts;
 mod transcript_render;
 
 use gpui::{
@@ -199,6 +200,12 @@ struct ZetaView {
     // handle up by the same key the renderer uses.
     pub(crate) sidebar_row_focus:
         std::cell::RefCell<std::collections::HashMap<String, gpui::FocusHandle>>,
+    /// One persistent focus handle per tool-group summary row, keyed by the
+    /// first-tool-call id of the group (ZETA-125). Populated lazily in the
+    /// transcript renderer and reused across paints so keyboard focus and
+    /// Enter/Space activation survive redraws.
+    pub(crate) tool_group_focus:
+        std::cell::RefCell<std::collections::HashMap<String, gpui::FocusHandle>>,
     login_providers: Vec<LoginProvider>,
     settings_error: Option<String>,
     /// Pending composer attachments (valid + invalid). Each entry paints as
@@ -275,6 +282,7 @@ impl ZetaView {
             session_edit_focus: cx.focus_handle(),
             settings_focus: cx.focus_handle(),
             sidebar_row_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
+            tool_group_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             login_providers: Vec::new(),
             settings_error: None,
             composer_attachments: Vec::new(),
@@ -483,7 +491,7 @@ impl ZetaView {
                         row.model.clone_from(&session.model);
                     }
                 }
-                self.state.apply_status(status);
+                edits = self.state.apply_status(status);
             }
             WorkerMessage::Rejected(error) => {
                 self.pending_command = false;

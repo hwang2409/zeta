@@ -27,14 +27,14 @@ use gpui_kit::component::{
     alert::Alert,
     button::{Button, ButtonVariants},
     text::TextView,
-    ActiveTheme, Disableable, Icon, IconName, StyledExt,
+    ActiveTheme, Disableable, StyledExt,
 };
 
-use super::{record_state, state_text, tool_state_color, ZetaView};
+use super::{state_text, ZetaView};
 use crate::{polish, theme};
 use zeta_gui::row_text::{
     self, sel, AssistantRowText, ErrorRowText, LoginActionText, LoginErrorText, LoginRowText,
-    RowText, ThinkingRowText, ToolRowText, UserRowText,
+    RowText, ThinkingRowText, UserRowText,
 };
 use zeta_gui::state::TranscriptEntry;
 
@@ -216,6 +216,62 @@ impl ZetaView {
         cx: &App,
     ) -> AnyElement {
         let entry = &self.state.transcript[index];
+        // Tool receipts that sit inside a run of 3+ collapse into one
+        // group summary row on the FIRST index; the interior indices paint
+        // an empty spacer so the virtual-list index math stays 1:1 with
+        // `TranscriptEntry` indices. See `AppState::tool_group_position`
+        // and `row_text::build_tool_group`.
+        // Grouping dispatch (ZETA-125 r2 fix):
+        //  * collapsed + first index -> paint the group summary row.
+        //  * collapsed + interior    -> paint nothing (zero-height spacer).
+        //  * expanded + first index  -> paint the group header ABOVE the
+        //    first receipt, stacked in the same virtual-list slot. This
+        //    keeps the header (its tab stop, its Enter/Space toggle, and
+        //    its accessible label) on screen while the group is expanded
+        //    — the r2 review flagged the pre-fix behaviour where the
+        //    header vanished on expansion and keyboard-only users lost
+        //    the ability to collapse it.
+        //  * expanded + interior     -> paint the receipt normally.
+        if let Some(group) = self.state.tool_group_position(index) {
+            let expanded = self.state.is_tool_group_expanded(&group);
+            if !expanded && !group.is_start(index) {
+                return self.render_tool_group_hidden(index, cx);
+            }
+            if group.is_start(index) {
+                let excerpts: Vec<&str> = (group.first_index..=group.last_index)
+                    .filter_map(|i| match self.state.transcript.get(i) {
+                        Some(TranscriptEntry::Tool { excerpt, .. }) => Some(excerpt.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let total_bytes = self.state.tool_group_output_bytes(&group);
+                let text = row_text::build_tool_group(
+                    &excerpts,
+                    total_bytes,
+                    zeta_gui::state::TOOL_GROUP_PREVIEW_MAX,
+                    expanded,
+                );
+                let header =
+                    self.render_tool_group_row(index, group, text, expanded, view.clone(), cx);
+                if !expanded {
+                    return header;
+                }
+                let receipt = self.render_tool_row_from_entry(index, entry, view, cx);
+                // Wrapper stacks header + first receipt in ONE virtual-list
+                // slot. It carries no debug selector — the header keeps
+                // `sel::tool_group_row(index)` and the receipt keeps
+                // `sel::tool_receipt(index)` so tests locate each element
+                // by its own selector.
+                return gpui::div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .child(receipt)
+                    .into_any_element();
+            }
+        }
         let text = row_text::build(
             entry,
             index,
@@ -232,6 +288,9 @@ impl ZetaView {
                     unreachable!("row-text Error variant maps to TranscriptEntry::Error")
                 };
                 self.render_error_row(index, text, login_provider.as_deref(), view, cx)
+            }
+            RowText::ToolGroup(_) | RowText::ToolGroupHidden => {
+                unreachable!("group variants are dispatched by render_row_inner directly")
             }
         }
     }
@@ -389,6 +448,12 @@ impl ZetaView {
         let text_view = TextView::markdown(sel::message(index), source)
             .selectable(true)
             .style(assistant_markdown_style(cx));
+        // The wrap budget the prose row hands to the TextView is
+        // FLOORED (see `theme::prose_wrap_budget`). Fractional widths
+        // would let the painter's rounding push one glyph's advance
+        // one pixel past the column content edge — the r3 pixel-gutter
+        // guard flagged that pattern at 11px on the 922×610 viewport.
+        let text_wrap_budget = theme::prose_wrap_budget(cx.theme().font_size);
         #[cfg(feature = "smoke-test")]
         let text_view =
             if std::env::var_os(row_text::sel::NATIVE_GUARD_FORCE_TEXT_WIDTH_ENV).is_some() {
@@ -396,17 +461,10 @@ impl ZetaView {
                 // available width while its prose column remains narrow.
                 text_view.w(px(1200.))
             } else {
-                // Leave a small layout margin for fractional glyph advances. This
-                // changes the wrap budget; it does not clip painted pixels.
-                text_view.max_w(px(f32::from(theme::prose_max_width(cx.theme().font_size))
-                    - 2. * theme::PROSE_ROW_PADDING_X
-                    - 2.))
+                text_view.max_w(text_wrap_budget)
             };
         #[cfg(not(feature = "smoke-test"))]
-        let text_view = text_view
-            .max_w(px(f32::from(theme::prose_max_width(cx.theme().font_size))
-                - 2. * theme::PROSE_ROW_PADDING_X
-                - 2.));
+        let text_view = text_view.max_w(text_wrap_budget);
         div()
             .py(px(2.))
             .w_full()
@@ -417,142 +475,13 @@ impl ZetaView {
             .into_any_element()
     }
 
-    fn render_tool_row(
-        &self,
-        index: usize,
-        text: ToolRowText<'_>,
-        entry: &TranscriptEntry,
-        view: WeakEntity<Self>,
-        cx: &App,
-    ) -> AnyElement {
-        let ToolRowText {
-            verb,
-            detail,
-            output_size_label,
-            hover_hint,
-            tail_omitted_hint,
-            body,
-        } = text;
-        let verb = verb.to_owned();
-        let detail = detail.to_owned();
-        let body = body.map(str::to_owned);
-        let is_error = entry.unsuccessful();
-        // State is signalled by COLOR ONLY. Running sits at normal text tier;
-        // done fades to muted; failed/canceled land on danger. The wiki
-        // contract forbids any textual state marker — the color helper hands
-        // us the token, and the render below applies it through `state_text`
-        // / `record_state` on the verb, detail, and chevron elements. A
-        // mutation that swaps the color argument at any call site records
-        // the wrong color and fails the sample check.
-        let state_color = tool_state_color(entry.tool_state(), cx);
-        let group = sel::tool_row_group(index);
-        let expanded = body.is_some();
-
-        div()
-            .group(group.clone())
-            .id((sel::TOOL_RECEIPT_TAG, index))
-            .debug_selector(move || sel::tool_receipt(index))
-            .relative()
-            .w_full()
-            .min_w_0()
-            .cursor_pointer()
-            .hover(|style| style.bg(cx.theme().list_hover))
-            .on_click(move |_, _, cx| {
-                let _ = view.update(cx, |view, cx| {
-                    view.state.toggle_card(index);
-                    view.transcript.update(cx, |scroll, cx| {
-                        scroll.remeasure_items(index..index + 1, cx);
-                    });
-                    cx.notify();
-                });
-            })
-            .child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .items_center()
-                    .min_h(px(20.))
-                    .child(
-                        Icon::new(if expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(theme::label_small(cx.theme().font_size))
-                        .text_color(record_state(|| sel::tool_chevron(index), state_color)),
-                    )
-                    .child(
-                        // Verb + detail route their state color through the
-                        // recorder so a swap on this single call is caught
-                        // by the render_log sample check.
-                        state_text(|| sel::tool_verb(index), state_color)
-                            .debug_selector(move || sel::tool_verb(index))
-                            .flex_shrink_0()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(verb),
-                    )
-                    .child(
-                        state_text(|| sel::tool_detail(index), state_color)
-                            .debug_selector(move || sel::tool_detail(index))
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .opacity(0.78)
-                            .child(detail),
-                    )
-                    // Collapsed rows carry the output size at faint tier and a
-                    // hover-fade hint at hover — the visible affordance for
-                    // the click-to-expand behaviour.
-                    .when_some(output_size_label, |row, label| {
-                        row.child(
-                            div()
-                                .flex_shrink_0()
-                                .text_color(cx.theme().muted_foreground)
-                                .opacity(0.78)
-                                .text_size(theme::label_small(cx.theme().font_size))
-                                .child(label),
-                        )
-                    })
-                    .when_some(hover_hint, |row, hint| {
-                        row.child(
-                            div()
-                                .flex_shrink_0()
-                                .text_color(cx.theme().muted_foreground)
-                                .opacity(0.)
-                                .group_hover(group.clone(), |style| style.opacity(0.78))
-                                .text_size(theme::label_small(cx.theme().font_size))
-                                .child(hint),
-                        )
-                    }),
-            )
-            .when_some(body, |row, body| {
-                row.child(
-                    div()
-                        .debug_selector(move || sel::tool_output(index))
-                        // Indent rail: margin 3/0/5, padding-left 8, 1px rail,
-                        // panel fill — reads as a subordinate body without
-                        // fighting the row's leading verb. Vertical padding sits
-                        // at 2px per the wiki contract, not the 4px `.py_1()`.
-                        .mt(px(3.))
-                        .mb(px(5.))
-                        .pl_2()
-                        .py(px(2.))
-                        .border_l(theme::RAIL_WIDTH_THIN)
-                        .border_color(if is_error {
-                            cx.theme().danger
-                        } else {
-                            cx.theme().border
-                        })
-                        .bg(cx.theme().sidebar)
-                        .text_color(cx.theme().muted_foreground)
-                        .when_some(tail_omitted_hint, |output, hint| {
-                            output.child(div().opacity(0.7).child(hint))
-                        })
-                        .child(div().whitespace_normal().child(body)),
-                )
-            })
-            .into_any_element()
-    }
+    // Tool-receipt and tool-group renderers moved to
+    // `crate::tool_receipts` in r4 (finding 6). See that module for
+    // `render_tool_row_from_entry`, `render_tool_row`,
+    // `render_tool_group_row`, and `render_tool_group_hidden`. The
+    // fence's scanned set (see `renderer_literal_fence_*` tests) was
+    // extended to include the extracted module so the split cannot
+    // smuggle a literal past the ZETA-109 guard.
 
     fn render_error_row(
         &self,

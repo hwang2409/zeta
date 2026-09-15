@@ -6,11 +6,32 @@ const TAIL_CHARS: usize = 16_000;
 pub struct OutputTail {
     pub text: String,
     pub truncated: bool,
+    // Cumulative bytes flowed through this tail since the receipt began.
+    // Grows unbounded across truncations so the row's size label reads as
+    // "total output produced" rather than "bytes currently retained on
+    // screen" — a group summary that sums `bytes_seen` across its members
+    // stays consistent with each row's own label even after the 20-line /
+    // 16k-char tail budgets clipped some of the bytes off screen.
+    pub bytes_seen: usize,
 }
 
 impl OutputTail {
     pub fn append(&mut self, text: &str) {
+        self.bytes_seen = self.bytes_seen.saturating_add(text.len());
         self.text.push_str(text);
+        self.enforce_bounds();
+    }
+
+    /// Overwrite the visible tail text WITHOUT touching `bytes_seen`. Used
+    /// by the `ToolEnd` handler for every streamed tool final payload.
+    pub fn replace_visible(&mut self, text: &str) {
+        self.text.clear();
+        self.truncated = false;
+        self.text.push_str(text);
+        self.enforce_bounds();
+    }
+
+    fn enforce_bounds(&mut self) {
         let lines: Vec<_> = self.text.split_inclusive('\n').collect();
         if lines.len() > TAIL_LINES {
             self.text = lines[lines.len() - TAIL_LINES..].concat();
@@ -31,6 +52,21 @@ pub struct Card {
     pub tail: OutputTail,
     pub agent_label: Option<String>,
     pub child_instance_id: Option<String>,
+    // The server turn this receipt was created in. Tool grouping never
+    // spans a turn boundary, so a run of receipts across two turns paints
+    // as two separate groups even when the receipts sit adjacent in the
+    // transcript. See `AppState::tool_group_position`. Default is 0 which
+    // matches the pre-tracking behaviour: single-turn tests all read as
+    // one turn.
+    pub turn: u64,
+    // True once a `ServerEvent::ToolOutput` has fed the tail. The
+    // `ToolEnd` handler reads this to skip re-appending the final result
+    // for tools whose end payload repeats the streamed stdout (e.g. bash
+    // per src/zeta/tools/bash.py:202). Without the flag, `bytes_seen` and
+    // the on-screen tail double-count the same bytes. Agent-style tools
+    // that only use `ToolEnd` (no `ToolOutput`) keep their content path
+    // unchanged because `streamed` stays false.
+    pub streamed: bool,
 }
 
 impl Card {
@@ -70,5 +106,27 @@ mod tests {
         assert_eq!(card.tail.text.chars().count(), TAIL_CHARS);
         card.toggle();
         assert!(!card.expanded);
+    }
+
+    #[test]
+    fn bytes_seen_tracks_cumulative_input_across_truncation() {
+        // Every appended byte grows `bytes_seen`, even after the on-screen
+        // tail clips to the 20-line / 16k-char budgets. This is what lets a
+        // group summary sum "total output produced" instead of "bytes still
+        // on screen"; the ZETA-125 review flagged the mismatch when the
+        // group total silently under-counted after truncation.
+        let mut tail = OutputTail::default();
+        tail.append("first line\n");
+        assert_eq!(tail.bytes_seen, 11);
+        for n in 1..40 {
+            tail.append(&format!("line {n}\n"));
+        }
+        assert!(tail.truncated);
+        // After truncation the on-screen text is shorter, but bytes_seen
+        // still reflects every byte we ever appended.
+        assert!(tail.bytes_seen > tail.text.len());
+        let before = tail.bytes_seen;
+        tail.append("more");
+        assert_eq!(tail.bytes_seen, before + 4);
     }
 }

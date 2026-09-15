@@ -134,3 +134,6 @@ jobs:
       - name: Run native GUI guards
         working-directory: .
         run: make gui-native-guards
+      - name: Guard acceptance mutation (must fail the guard)
+        working-directory: .
+        run: make gui-native-guards-mutation

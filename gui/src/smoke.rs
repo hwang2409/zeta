@@ -53,9 +53,32 @@ fn rgb8(color: gpui::Hsla) -> [u8; 3] {
     ]
 }
 
+/// Pixel rectangle in image coordinates. Used to punch holes in the scan
+/// band for painted overlays (currently just the transcript scrollbar
+/// thumb) that render inside the column's padding zone. Every hole
+/// records the ACTUAL painted rect — no blanket tolerance on
+/// `content_right` — so a real glyph escape adjacent to the overlay still
+/// trips the guard.
+#[derive(Debug, Clone, Copy)]
+struct PixelRect {
+    x_start: u32,
+    x_end: u32,
+    y_start: u32,
+    y_end: u32,
+}
+
+impl PixelRect {
+    fn contains(&self, x: u32, y: u32) -> bool {
+        x >= self.x_start && x < self.x_end && y >= self.y_start && y < self.y_end
+    }
+}
+
 /// Return the first x range with at least two adjacent pixels that differ
 /// from the active canvas token. One isolated anti-aliased pixel is noise;
 /// adjacent pixels are the minimum evidence for an escaped glyph stroke.
+/// Pixels inside any `exclude` rect are treated as background — this is
+/// how the scan skips the scrollbar-thumb overlay without loosening the
+/// content-right coordinate for every other paint.
 fn escaped_glyph_range(
     image: &image::RgbaImage,
     x_start: u32,
@@ -63,14 +86,20 @@ fn escaped_glyph_range(
     y_start: u32,
     y_end: u32,
     background: [u8; 3],
+    exclude: &[PixelRect],
 ) -> Option<(u32, u32)> {
     for y in y_start..y_end {
         let mut run_start = None;
         for x in x_start..x_end {
-            let pixel = image.get_pixel(x, y).0;
-            let over_threshold = pixel[..3].iter().zip(background).any(|(actual, expected)| {
-                actual.abs_diff(expected) >= NATIVE_GUARD_COLOR_THRESHOLD
-            });
+            let masked = exclude.iter().any(|rect| rect.contains(x, y));
+            let over_threshold = if masked {
+                false
+            } else {
+                let pixel = image.get_pixel(x, y).0;
+                pixel[..3].iter().zip(background).any(|(actual, expected)| {
+                    actual.abs_diff(expected) >= NATIVE_GUARD_COLOR_THRESHOLD
+                })
+            };
             if over_threshold {
                 run_start.get_or_insert(x);
             } else if let Some(start) = run_start.take() {
@@ -88,6 +117,61 @@ fn escaped_glyph_range(
     None
 }
 
+/// Identify the transcript scrollbar-thumb rectangles the current frame
+/// painted, so the pixel-gutter scan can skip them without loosening its
+/// content-right coordinate. The scrollbar THUMB is proportional to the
+/// viewport / content ratio — at the taller 922x610 viewport it can be
+/// only a few dozen pixels tall — so this filter identifies it by
+/// **X-BAND** signature: left edge at (or immediately at) the gutter
+/// start AND width matching the `SCROLLBAR_THUMB_WIDTH` token
+/// (± 2px slack for subpixel rounding). Height is unbounded so a short
+/// proportional thumb is still masked.
+///
+/// Real glyph escapes are unmaskable by construction: glyphs paint as
+/// text sprites (a separate scene primitive), NOT as quads, so this
+/// filter cannot accidentally cover a real prose overshoot even if a
+/// future refactor were to add a narrow chrome quad in the same x-band.
+/// The `gui-native-guards-mutation` poison-canary pins that
+/// non-masking property in CI.
+fn scrollbar_scan_masks(window: &Window, gutter_x_start: u32, gutter_x_end: u32) -> Vec<PixelRect> {
+    let scale = window.scale_factor();
+    let scrollbar_width_scaled = f32::from(theme::SCROLLBAR_THUMB_WIDTH) * scale;
+    let min_width_scaled = (scrollbar_width_scaled - 1.0).max(0.0);
+    let max_width_scaled = scrollbar_width_scaled + 2.0;
+    window
+        .painted_quads()
+        .into_iter()
+        .filter_map(|quad| {
+            let width_scaled = quad.bounds.size.width.0;
+            if width_scaled < min_width_scaled || width_scaled > max_width_scaled {
+                return None;
+            }
+            let x_start = quad.bounds.origin.x.0.floor() as u32;
+            let x_end = x_start + width_scaled.ceil() as u32;
+            let y_start = quad.bounds.origin.y.0.floor() as u32;
+            let y_end = y_start + quad.bounds.size.height.0.ceil() as u32;
+            // Left edge must sit at or PAST the gutter start — narrow
+            // chrome painted inside the content area (icons, focus
+            // rings, chip borders) is never at content_right, so we
+            // never mask it. Allow 1px of subpixel slack on the left
+            // to accept a thumb that landed just before the ceil-ed
+            // gutter start.
+            if x_start + 1 < gutter_x_start {
+                return None;
+            }
+            if x_end <= gutter_x_start || x_start >= gutter_x_end {
+                return None;
+            }
+            Some(PixelRect {
+                x_start,
+                x_end,
+                y_start,
+                y_end,
+            })
+        })
+        .collect()
+}
+
 fn scan_native_gutter(
     image: &image::RgbaImage,
     window: &Window,
@@ -100,7 +184,25 @@ fn scan_native_gutter(
     let window_width = f32::from(window.bounds().size.width);
     let main_left = f32::from(theme::SIDEBAR_WIDTH);
     let main_width = (window_width - main_left).max(0.);
-    let column_width = f32::from(theme::prose_max_width(font_size)).min(main_width);
+    // Content_right is derived from the TRANSCRIPT_MAX_WIDTH column, not
+    // the narrower prose cap. Per ZETA-#165 the prose measure cap
+    // centers assistant/user/thinking text at a comfortable ~88ch
+    // measure, but tool receipts and fenced code blocks are ALLOWED
+    // wider — up to `TRANSCRIPT_MAX_WIDTH`. Scanning against the prose
+    // cap would flag every receipt paint at wide centered viewports as
+    // a glyph escape; scanning against the wider receipt/code cap
+    // matches the design's contract that a legal wider row paints
+    // inside that column.
+    //
+    // Tradeoff (documented, not a defect): at wide centered viewports
+    // where the receipt column is strictly wider than the prose
+    // column, PROSE-specific overshoots into the receipt-only strip
+    // (between prose_content_right and content_right) are under-scanned
+    // here. At narrow viewports the prose column and the receipt
+    // column coincide (both capped by main_width), so the original
+    // orphan-glyph defect class stays covered — the ZETA-127 bug and
+    // r3 acceptance mutation both trip at the narrow viewport.
+    let column_width = f32::from(theme::TRANSCRIPT_MAX_WIDTH).min(main_width);
     let content_right =
         main_left + (main_width - column_width) / 2. + column_width - theme::PROSE_ROW_PADDING_X;
     let x_start = (content_right * scale).ceil() as u32;
@@ -117,19 +219,29 @@ fn scan_native_gutter(
         .height()
         .saturating_sub((f32::from(NATIVE_GUARD_COMPOSER_HEIGHT) * scale).ceil() as u32 + 1);
     let background = rgb8(theme::palette::canvas());
-    if let Some((escape_start, escape_end)) =
-        escaped_glyph_range(image, x_start, x_end, y_start, y_end, background)
-    {
+    let scrollbar_masks = scrollbar_scan_masks(window, x_start, x_end);
+    if let Some((escape_start, escape_end)) = escaped_glyph_range(
+        image,
+        x_start,
+        x_end,
+        y_start,
+        y_end,
+        background,
+        &scrollbar_masks,
+    ) {
         panic!(
             "native pixel gutter guard failed: shape={shape} size={font_size:?} \
              x_range={escape_start}..={escape_end} gutter={x_start}..{x_end} \
              window_width={window_width} scale={scale} column_width={column_width} \
-             content_right={content_right} y_range={y_start}..{y_end} background={background:?}"
+             content_right={content_right} y_range={y_start}..{y_end} background={background:?} \
+             masked={scrollbar_masks:?}"
         );
     }
     println!(
         "NATIVE-GUARD-PASS: shape={shape} size={font_size:?} \
-         viewport={achieved_width}x{achieved_height} gutter={x_start}..{x_end}"
+         viewport={achieved_width}x{achieved_height} gutter={x_start}..{x_end} \
+         scrollbar_masks={} rects={scrollbar_masks:?}",
+        scrollbar_masks.len()
     );
 }
 
@@ -214,8 +326,20 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
                 cx.update(|window, cx| {
                     view.update(cx, |view, cx| {
                         view.state.connection = ConnectionState::Connected;
-                        view.state.transcript = vec![TranscriptEntry::Assistant(source.into())];
-                        view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                        // r3 finding 7: seed grouped + ungrouped tool
+                        // receipts alongside the wrap-prose so glyph
+                        // escapes in the tool-receipt paint paths ride
+                        // the same pixel gutter. The taller-transcript
+                        // shape entry keeps the SCROLLBAR-PRESENT path
+                        // exercised at 18px — `scrollbar_scan_masks`
+                        // punches ONLY the scrollbar rect out of the
+                        // scan band, so a real overshoot adjacent to
+                        // the scrollbar (or on any other row) still
+                        // trips the guard cleanly.
+                        view.state.transcript = native_guard_transcript(source);
+                        let count = view.state.transcript.len();
+                        view.transcript
+                            .update(cx, |scroll, cx| scroll.reset(count, cx));
                         cx.notify();
                     });
                     window.render_frame(cx);
@@ -261,11 +385,148 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
     println!("NATIVE-GUARD-PASS: matrix={matrix_entries} achieved_viewports={achieved_list}");
 }
 
+/// Build the transcript the native pixel-gutter guard renders for one
+/// shape entry. The assistant row carries the wrapping prose the guard
+/// was originally designed to stress. Alongside it we seed a 3-receipt
+/// grouped run AND a solo receipt so glyph escapes in the tool-receipt
+/// paint paths ride the same pixel gutter — the r3 review flagged that
+/// receipt rows were previously invisible to the guard. The transcript
+/// is deliberately tall enough to trigger the scrollbar at 18px on the
+/// smaller viewport (717x474), so the scrollbar-mask code path stays
+/// exercised — a future change that regresses scrollbar geometry (moves
+/// its thumb OUT of the mask zone, or paints extra chrome next to it)
+/// still shows up in CI here rather than passing silently.
+fn native_guard_transcript(source: &str) -> Vec<TranscriptEntry> {
+    use zeta_gui::cards::{Card, OutputTail};
+    use zeta_gui::state::{tool_excerpt, ToolReceiptKey, TranscriptEntry};
+    let tool = |id: &str, name: &str, key: &str, value: &str, bytes: usize| -> TranscriptEntry {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(key.into(), serde_json::Value::String(value.into()));
+        TranscriptEntry::Tool {
+            key: ToolReceiptKey {
+                session_id: None,
+                agent_instance_id: None,
+                tool_call_id: id.into(),
+            },
+            name: name.into(),
+            excerpt: tool_excerpt(name, &arguments),
+            summary: String::new(),
+            complete: true,
+            error: false,
+            canceled: false,
+            card: Card {
+                tail: OutputTail {
+                    text: "x".repeat(bytes),
+                    truncated: false,
+                    bytes_seen: bytes,
+                },
+                ..Default::default()
+            },
+        }
+    };
+    vec![
+        TranscriptEntry::Assistant(source.into()),
+        // Grouped run (3 receipts, same-turn adjacent) — collapses to
+        // one header row when expansion is unset.
+        tool("g1", "bash", "command", "grep -rn TODO src/", 900),
+        tool("g2", "read", "path", "src/main.rs", 3_940),
+        tool("g3", "read", "path", "src/lib.rs", 1_180),
+        // Second assistant row splits the run so the ungrouped tool
+        // below paints as its own individual receipt row.
+        TranscriptEntry::Assistant("Spot-checking one more.".into()),
+        tool("s1", "read", "path", "Cargo.toml", 252),
+    ]
+}
+
 /// Encode a tiny checkerboard PNG for the ZETA-112 attachment-chrome shot.
 /// A one-shot helper — the smoke driver seeds a real attachment so the
 /// chip decodes into a Valid variant with a live thumbnail (the only path
 /// that paints a preview; a decode failure would surface as an error chip
 /// instead).
+/// Seed a mixed run of tool receipts for the ZETA-125 shot. Five receipts
+/// in a row so they collapse into one summary row on paint, followed by an
+/// assistant reply and two more receipts (below the grouping threshold) so
+/// the shot demonstrates BOTH the redesigned individual receipt and the
+/// collapsed-group summary in one image. Every excerpt runs through
+/// `tool_excerpt` so the shot exercises the same derivation path the
+/// production render uses.
+fn seed_zeta_125_tool_run(state: &mut zeta_gui::state::AppState) {
+    use zeta_gui::cards::{Card, OutputTail};
+    use zeta_gui::state::{tool_excerpt, ToolReceiptKey, TranscriptEntry};
+    let build_tool =
+        |id: &str, name: &str, key: &str, value: &str, bytes: usize| -> TranscriptEntry {
+            let mut arguments = serde_json::Map::new();
+            arguments.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+            let excerpt = tool_excerpt(name, &arguments);
+            TranscriptEntry::Tool {
+                key: ToolReceiptKey {
+                    session_id: None,
+                    agent_instance_id: None,
+                    tool_call_id: id.to_string(),
+                },
+                name: name.to_string(),
+                excerpt,
+                summary: String::new(),
+                complete: true,
+                error: false,
+                canceled: false,
+                card: Card {
+                    tail: OutputTail {
+                        text: "x".repeat(bytes),
+                        truncated: false,
+                        bytes_seen: bytes,
+                    },
+                    ..Default::default()
+                },
+            }
+        };
+    state
+        .transcript
+        .push(TranscriptEntry::User("Do a repo sweep.".into()));
+    state.transcript.push(TranscriptEntry::Assistant(
+        "Checking the source tree.".into(),
+    ));
+    state.transcript.push(build_tool(
+        "t1",
+        "bash",
+        "command",
+        "grep -rn TODO src/",
+        900,
+    ));
+    state
+        .transcript
+        .push(build_tool("t2", "read", "path", "src/main.rs", 3_940));
+    state
+        .transcript
+        .push(build_tool("t3", "read", "path", "src/lib.rs", 1_180));
+    state
+        .transcript
+        .push(build_tool("t4", "edit", "path", "src/main.rs", 820));
+    state.transcript.push(build_tool(
+        "t5",
+        "bash",
+        "command",
+        "cargo check --workspace",
+        7_800,
+    ));
+    state.transcript.push(TranscriptEntry::Assistant(
+        "Spot-checking a couple of files.".into(),
+    ));
+    state
+        .transcript
+        .push(build_tool("t6", "read", "path", "Cargo.toml", 252));
+    state.transcript.push(build_tool(
+        "t7",
+        "bash",
+        "command",
+        "cargo test --lib -q",
+        7_800,
+    ));
+}
+
 fn png_seed_bytes() -> Vec<u8> {
     let pixels = image::RgbaImage::from_fn(48, 32, |x, y| {
         if ((x / 8) + (y / 8)) % 2 == 0 {
@@ -297,6 +558,13 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     // the attachment/settings seeding but before `view.settings_open`
     // fires, so the transcript column stays visible.
     let composer_path = env::var_os("ZETA_GUI_SMOKE_COMPOSER_IMAGE");
+    // Optional ZETA-125 capture — a mixed sequence of tool receipts (one
+    // grouped run of 5, plus 2 individual receipts after an assistant
+    // reply) so the after-shot proves the new receipt layout, the
+    // metadata-adjacency rule, AND the collapsed-group summary row all at
+    // once. Saved before the settings-modal shot so the transcript column
+    // stays visible.
+    let tools_path = env::var_os("ZETA_GUI_SMOKE_TOOLS_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -455,6 +723,23 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         .expect("native renderer capture")
                                         .save(PathBuf::from(composer_path))
                                         .expect("save composer screenshot");
+                                }
+                                if let Some(ref tools_path) = tools_path {
+                                    entity.update(cx, |view, cx| {
+                                        view.state.connection = ConnectionState::Connected;
+                                        seed_zeta_125_tool_run(&mut view.state);
+                                        let count = view.state.transcript.len();
+                                        view.transcript.update(cx, |scroll, cx| {
+                                            scroll.reset(count, cx);
+                                        });
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer capture")
+                                        .save(PathBuf::from(tools_path))
+                                        .expect("save tools screenshot");
                                 }
                                 entity.update(cx, |view, cx| {
                                     view.state.connection = ConnectionState::Connected;
