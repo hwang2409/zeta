@@ -38,6 +38,13 @@ pub enum TranscriptEntry {
     Tool {
         key: ToolReceiptKey,
         name: String,
+        /// One-line excerpt of what the tool actually ran, derived from
+        /// `tool_call.arguments` at construction and stable for the lifetime
+        /// of the receipt. Bash/exec → first line of the command; read/write
+        /// /edit → the file path; fetch → the URL; anything else → the first
+        /// primitive argument, else the tool name. This becomes the row's
+        /// primary text; the tool name becomes a small leading label.
+        excerpt: String,
         summary: String,
         complete: bool,
         error: bool,
@@ -71,6 +78,40 @@ impl TranscriptEntry {
         } else {
             ToolState::Running
         }
+    }
+}
+
+/// Minimum consecutive tool receipts that collapse into a single group
+/// summary row. Below this threshold the receipts render one per row. The
+/// contract pins this at "3+ consecutive"; keeping the constant on
+/// `state.rs` places it next to the code that reads it.
+pub const TOOL_GROUP_MIN_LEN: usize = 3;
+
+/// Cap on the number of excerpts previewed on a collapsed group's summary
+/// row. The contract asks for "the first 1-2 excerpts previewed"; two
+/// keeps the row readable at the 11px scale.
+pub const TOOL_GROUP_PREVIEW_MAX: usize = 2;
+
+/// Where in a run of consecutive tool receipts a given transcript index
+/// sits. Returned by `AppState::tool_group_position` and consumed by the
+/// render layer, which dispatches the group summary row on `Start` and
+/// skips interior rows on `Interior` when the group is collapsed. `None`
+/// means the row is not part of a 3+ run (either not a tool row, or in a
+/// shorter run that renders one row per receipt).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolGroupPosition {
+    pub first_index: usize,
+    pub last_index: usize,
+    pub first_id: String,
+}
+
+impl ToolGroupPosition {
+    pub fn count(&self) -> usize {
+        self.last_index - self.first_index + 1
+    }
+
+    pub fn is_start(&self, index: usize) -> bool {
+        index == self.first_index
     }
 }
 
@@ -148,6 +189,15 @@ pub struct AppState {
     turn_start: usize,
     pub metrics: StatusMetrics,
     pub metrics_boundary: bool,
+    /// Per-group expansion override, keyed by the `tool_call_id` of the
+    /// group's FIRST tool receipt. Default is collapsed; the map holds
+    /// `true` when the user has explicitly expanded a group. Groups form
+    /// dynamically as consecutive tool rows accumulate (see
+    /// `AppState::tool_group_of`), so keying by the first row's stable id
+    /// keeps state pinned across a group that grows a new tail.
+    /// Streaming turns force the last group expanded regardless of the
+    /// map — see `AppState::tool_group_expanded`.
+    pub tool_group_expanded: HashMap<String, bool>,
 }
 
 impl Default for AppState {
@@ -167,6 +217,7 @@ impl Default for AppState {
             turn_start: 0,
             metrics: StatusMetrics::default(),
             metrics_boundary: true,
+            tool_group_expanded: HashMap::new(),
         }
     }
 }
@@ -536,6 +587,104 @@ impl AppState {
         }
     }
 
+    /// Locate the tool-receipt group that contains `index`, if any. A run
+    /// of `TOOL_GROUP_MIN_LEN` or more consecutive `TranscriptEntry::Tool`
+    /// rows counts as a group; below that threshold each receipt renders
+    /// on its own row. Returns `None` when the row is not a Tool, or when
+    /// the surrounding run is too short to group.
+    pub fn tool_group_position(&self, index: usize) -> Option<ToolGroupPosition> {
+        if !matches!(
+            self.transcript.get(index),
+            Some(TranscriptEntry::Tool { .. })
+        ) {
+            return None;
+        }
+        let mut first = index;
+        while first > 0
+            && matches!(
+                self.transcript.get(first - 1),
+                Some(TranscriptEntry::Tool { .. })
+            )
+        {
+            first -= 1;
+        }
+        let mut last = index;
+        while last + 1 < self.transcript.len()
+            && matches!(
+                self.transcript.get(last + 1),
+                Some(TranscriptEntry::Tool { .. })
+            )
+        {
+            last += 1;
+        }
+        if last - first + 1 < TOOL_GROUP_MIN_LEN {
+            return None;
+        }
+        let first_id = match &self.transcript[first] {
+            TranscriptEntry::Tool { key, .. } => key.tool_call_id.clone(),
+            _ => return None,
+        };
+        Some(ToolGroupPosition {
+            first_index: first,
+            last_index: last,
+            first_id,
+        })
+    }
+
+    /// Is the given group currently expanded on screen? Groups default to
+    /// collapsed; the map holds `true` for groups the user opened. While
+    /// streaming, the LAST group in the transcript is forced expanded so
+    /// live tool activity stays visible without a click — the contract's
+    /// "expanded while streaming" rule.
+    pub fn is_tool_group_expanded(&self, group: &ToolGroupPosition) -> bool {
+        if self.streaming && self.is_last_tool_group(group) {
+            return true;
+        }
+        self.tool_group_expanded
+            .get(&group.first_id)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Flip a group's expansion override. Groups default to collapsed
+    /// (absent from the map); the first toggle stores `true`, the next
+    /// removes the entry, keeping the map small over a long session.
+    pub fn toggle_tool_group(&mut self, first_id: &str) {
+        if self
+            .tool_group_expanded
+            .get(first_id)
+            .copied()
+            .unwrap_or(false)
+        {
+            self.tool_group_expanded.remove(first_id);
+        } else {
+            self.tool_group_expanded.insert(first_id.to_owned(), true);
+        }
+    }
+
+    fn is_last_tool_group(&self, group: &ToolGroupPosition) -> bool {
+        // The group is "last" when no Tool row follows it. A trailing
+        // non-Tool row (e.g. an assistant reply that landed after the run
+        // of receipts) still counts as last — the streaming turn has
+        // moved past the tool activity. Only a later Tool row would open
+        // a fresh group ahead of this one.
+        (group.last_index + 1..self.transcript.len())
+            .all(|i| !matches!(self.transcript.get(i), Some(TranscriptEntry::Tool { .. })))
+    }
+
+    /// Sum the on-screen output bytes across every receipt in the group.
+    /// Used by the render layer to compose the summary row's total-size
+    /// metadata; matches the per-row size accounting each collapsed
+    /// receipt shows already.
+    pub fn tool_group_output_bytes(&self, group: &ToolGroupPosition) -> usize {
+        (group.first_index..=group.last_index)
+            .filter_map(|i| match self.transcript.get(i) {
+                Some(TranscriptEntry::Tool { card, .. }) => Some(card.tail.text.len()),
+                _ => None,
+            })
+            .sum()
+    }
+
     fn tool_receipt(
         &mut self,
         tool_call: &ToolCall,
@@ -576,6 +725,7 @@ impl AppState {
                         tool_call_id: String::new(),
                     },
                     name: "agent".into(),
+                    excerpt: "agent".into(),
                     summary: String::new(),
                     complete: false,
                     error: false,
@@ -790,11 +940,67 @@ impl StatusMetrics {
 
 const SUMMARY_CHARS: usize = 240;
 
+/// Character cap on the excerpt shown on a tool receipt. Anything longer
+/// truncates with a single-character ellipsis so a wide command still fits
+/// on one row at the transcript's reading measure.
+pub const EXCERPT_CHARS: usize = 160;
+
 fn bounded_summary(text: &str) -> String {
     text.chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .take(SUMMARY_CHARS)
         .collect()
+}
+
+/// One-line excerpt of what a tool call actually ran. Contract line "each
+/// tool receipt shows what actually ran": bash/exec use the command's first
+/// line; read/write/edit use the file path; fetch uses the URL; other tools
+/// fall through to the first primitive argument, else the tool name alone.
+/// The excerpt is stripped of control chars, truncated at `EXCERPT_CHARS`
+/// with a horizontal-ellipsis marker, and never empty.
+pub fn tool_excerpt(name: &str, arguments: &serde_json::Map<String, serde_json::Value>) -> String {
+    let key = match name.to_ascii_lowercase().as_str() {
+        "bash" | "exec" | "shell" => Some("command"),
+        "read" | "write" | "edit" | "list" => Some("path"),
+        "fetch" | "webfetch" => Some("url"),
+        _ => None,
+    };
+    let raw = key
+        .and_then(|k| arguments.get(k))
+        .and_then(argument_text)
+        .or_else(|| arguments.values().find_map(argument_text));
+    let first_line = raw
+        .as_deref()
+        .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
+        .unwrap_or("");
+    if first_line.is_empty() {
+        return name.to_owned();
+    }
+    let cleaned: String = first_line
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    truncate_excerpt(&cleaned)
+}
+
+fn argument_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => (!s.is_empty()).then(|| s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn truncate_excerpt(text: &str) -> String {
+    for (char_count, (index, _)) in text.char_indices().enumerate() {
+        if char_count == EXCERPT_CHARS {
+            let mut out = text[..index].trim_end().to_owned();
+            out.push('…');
+            return out;
+        }
+    }
+    text.to_owned()
 }
 
 fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey) -> TranscriptEntry {
@@ -818,6 +1024,7 @@ fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey) -> TranscriptEntry {
         },
         key,
         name: tool_call.name.clone(),
+        excerpt: tool_excerpt(&tool_call.name, &tool_call.arguments),
         summary: bounded_summary(
             &serde_json::to_string(&tool_call.arguments)
                 .unwrap_or_else(|_| "arguments unavailable".to_owned()),

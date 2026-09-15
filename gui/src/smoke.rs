@@ -266,6 +266,89 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
 /// chip decodes into a Valid variant with a live thumbnail (the only path
 /// that paints a preview; a decode failure would surface as an error chip
 /// instead).
+/// Seed a mixed run of tool receipts for the ZETA-125 shot. Five receipts
+/// in a row so they collapse into one summary row on paint, followed by an
+/// assistant reply and two more receipts (below the grouping threshold) so
+/// the shot demonstrates BOTH the redesigned individual receipt and the
+/// collapsed-group summary in one image. Every excerpt runs through
+/// `tool_excerpt` so the shot exercises the same derivation path the
+/// production render uses.
+fn seed_zeta_125_tool_run(state: &mut zeta_gui::state::AppState) {
+    use zeta_gui::cards::{Card, OutputTail};
+    use zeta_gui::state::{tool_excerpt, ToolReceiptKey, TranscriptEntry};
+    let build_tool =
+        |id: &str, name: &str, key: &str, value: &str, bytes: usize| -> TranscriptEntry {
+            let mut arguments = serde_json::Map::new();
+            arguments.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+            let excerpt = tool_excerpt(name, &arguments);
+            TranscriptEntry::Tool {
+                key: ToolReceiptKey {
+                    session_id: None,
+                    agent_instance_id: None,
+                    tool_call_id: id.to_string(),
+                },
+                name: name.to_string(),
+                excerpt,
+                summary: String::new(),
+                complete: true,
+                error: false,
+                canceled: false,
+                card: Card {
+                    tail: OutputTail {
+                        text: "x".repeat(bytes),
+                        truncated: false,
+                    },
+                    ..Default::default()
+                },
+            }
+        };
+    state
+        .transcript
+        .push(TranscriptEntry::User("Do a repo sweep.".into()));
+    state.transcript.push(TranscriptEntry::Assistant(
+        "Checking the source tree.".into(),
+    ));
+    state.transcript.push(build_tool(
+        "t1",
+        "bash",
+        "command",
+        "grep -rn TODO src/",
+        900,
+    ));
+    state
+        .transcript
+        .push(build_tool("t2", "read", "path", "src/main.rs", 3_940));
+    state
+        .transcript
+        .push(build_tool("t3", "read", "path", "src/lib.rs", 1_180));
+    state
+        .transcript
+        .push(build_tool("t4", "edit", "path", "src/main.rs", 820));
+    state.transcript.push(build_tool(
+        "t5",
+        "bash",
+        "command",
+        "cargo check --workspace",
+        7_800,
+    ));
+    state.transcript.push(TranscriptEntry::Assistant(
+        "Spot-checking a couple of files.".into(),
+    ));
+    state
+        .transcript
+        .push(build_tool("t6", "read", "path", "Cargo.toml", 252));
+    state.transcript.push(build_tool(
+        "t7",
+        "bash",
+        "command",
+        "cargo test --lib -q",
+        7_800,
+    ));
+}
+
 fn png_seed_bytes() -> Vec<u8> {
     let pixels = image::RgbaImage::from_fn(48, 32, |x, y| {
         if ((x / 8) + (y / 8)) % 2 == 0 {
@@ -297,6 +380,13 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     // the attachment/settings seeding but before `view.settings_open`
     // fires, so the transcript column stays visible.
     let composer_path = env::var_os("ZETA_GUI_SMOKE_COMPOSER_IMAGE");
+    // Optional ZETA-125 capture — a mixed sequence of tool receipts (one
+    // grouped run of 5, plus 2 individual receipts after an assistant
+    // reply) so the after-shot proves the new receipt layout, the
+    // metadata-adjacency rule, AND the collapsed-group summary row all at
+    // once. Saved before the settings-modal shot so the transcript column
+    // stays visible.
+    let tools_path = env::var_os("ZETA_GUI_SMOKE_TOOLS_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -455,6 +545,23 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         .expect("native renderer capture")
                                         .save(PathBuf::from(composer_path))
                                         .expect("save composer screenshot");
+                                }
+                                if let Some(ref tools_path) = tools_path {
+                                    entity.update(cx, |view, cx| {
+                                        view.state.connection = ConnectionState::Connected;
+                                        seed_zeta_125_tool_run(&mut view.state);
+                                        let count = view.state.transcript.len();
+                                        view.transcript.update(cx, |scroll, cx| {
+                                            scroll.reset(count, cx);
+                                        });
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer capture")
+                                        .save(PathBuf::from(tools_path))
+                                        .expect("save tools screenshot");
                                 }
                                 entity.update(cx, |view, cx| {
                                     view.state.connection = ConnectionState::Connected;

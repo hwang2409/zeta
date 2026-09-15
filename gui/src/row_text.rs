@@ -36,6 +36,21 @@ pub mod chrome {
     pub const ASSISTANT_TRUNCATED: &str = "Showing the latest streamed text…";
     pub const TOOL_HOVER_HINT: &str = "show output";
     pub const TOOL_TAIL_OMITTED: &str = "Earlier output omitted";
+    /// Singular unit painted after the count in a tool-group summary
+    /// row ("1 tool call").
+    pub const TOOL_GROUP_CALL: &str = " tool call";
+    /// Plural unit painted after the count in a tool-group summary row
+    /// ("N tool calls" for N != 1).
+    pub const TOOL_GROUP_CALLS: &str = " tool calls";
+    /// Separator that precedes the total-size metadata inside the summary
+    /// row (" · 12.4KB").
+    pub const TOOL_GROUP_META_SEPARATOR: &str = " · ";
+    /// Suffix on the accessible label announcing that the group is
+    /// currently collapsed (Enter/Space expands).
+    pub const TOOL_GROUP_ARIA_COLLAPSED: &str = ", collapsed";
+    /// Suffix on the accessible label announcing that the group is
+    /// currently expanded (Enter/Space collapses).
+    pub const TOOL_GROUP_ARIA_EXPANDED: &str = ", expanded";
     pub const OUTPUT_SIZE_UNIT_B: &str = "B";
     pub const OUTPUT_SIZE_UNIT_KB: &str = "KB";
     pub const OUTPUT_SIZE_UNIT_MB: &str = "MB";
@@ -52,6 +67,11 @@ pub mod chrome {
         ASSISTANT_TRUNCATED,
         TOOL_HOVER_HINT,
         TOOL_TAIL_OMITTED,
+        TOOL_GROUP_CALL,
+        TOOL_GROUP_CALLS,
+        TOOL_GROUP_META_SEPARATOR,
+        TOOL_GROUP_ARIA_COLLAPSED,
+        TOOL_GROUP_ARIA_EXPANDED,
         OUTPUT_SIZE_UNIT_B,
         OUTPUT_SIZE_UNIT_KB,
         OUTPUT_SIZE_UNIT_MB,
@@ -76,6 +96,8 @@ pub mod sel {
     pub const ATTACHMENT_CHIP: &str = "attachment-chip";
     pub const FORK_BUTTON_TAG: &str = "fork";
     pub const TOOL_RECEIPT_TAG: &str = "tool-receipt";
+    pub const TOOL_GROUP_TAG: &str = "tool-group";
+    pub const TOOL_GROUP_HIDDEN_TAG: &str = "tool-group-hidden";
     pub const ERROR_SETTINGS_TAG: &str = "error-settings";
 
     pub fn thinking_header(i: usize) -> String {
@@ -99,14 +121,42 @@ pub mod sel {
     pub fn tool_chevron(i: usize) -> String {
         format!("tool-chevron-{i}")
     }
-    pub fn tool_verb(i: usize) -> String {
-        format!("tool-verb-{i}")
+    /// Selector for the compact tool-name label. Small, dim, sits to the
+    /// LEFT of the excerpt so a reader sees "which tool ran" before
+    /// "what it ran" without the label stealing weight from the primary
+    /// text — the ZETA-125 hierarchy inversion of the pre-fix layout.
+    pub fn tool_label(i: usize) -> String {
+        format!("tool-label-{i}")
     }
-    pub fn tool_detail(i: usize) -> String {
-        format!("tool-detail-{i}")
+    pub fn tool_excerpt(i: usize) -> String {
+        format!("tool-excerpt-{i}")
+    }
+    pub fn tool_metadata(i: usize) -> String {
+        format!("tool-metadata-{i}")
+    }
+    pub fn tool_hover_hint(i: usize) -> String {
+        format!("tool-hover-hint-{i}")
     }
     pub fn tool_output(i: usize) -> String {
         format!("tool-output-{i}")
+    }
+    pub fn tool_group_row(i: usize) -> String {
+        format!("tool-group-{i}")
+    }
+    pub fn tool_group_chevron(i: usize) -> String {
+        format!("tool-group-chevron-{i}")
+    }
+    pub fn tool_group_count(i: usize) -> String {
+        format!("tool-group-count-{i}")
+    }
+    pub fn tool_group_preview(i: usize) -> String {
+        format!("tool-group-preview-{i}")
+    }
+    pub fn tool_group_metadata(i: usize) -> String {
+        format!("tool-group-metadata-{i}")
+    }
+    pub fn tool_group_focus_key(first_id: &str) -> String {
+        format!("tool-group:{first_id}")
     }
     pub fn error_block(i: usize) -> String {
         format!("error-block-{i}")
@@ -146,6 +196,14 @@ pub enum RowText<'a> {
     Assistant(AssistantRowText<'a>),
     Thinking(ThinkingRowText),
     Tool(ToolRowText<'a>),
+    /// A collapsed run of 3+ consecutive tool receipts, painted as one row
+    /// so a long run does not eat the transcript with near-identical
+    /// receipts. See `ToolGroupRowText`.
+    ToolGroup(ToolGroupRowText<'a>),
+    /// An interior row of a collapsed tool group: paints nothing so the
+    /// virtual-list index math stays 1:1 with `TranscriptEntry` indices
+    /// without introducing a projection layer.
+    ToolGroupHidden,
     Error(ErrorRowText<'a>),
 }
 
@@ -191,17 +249,29 @@ pub struct ThinkingRowText {
 /// Tool row: the receipt line plus optional collapsed peek and expanded
 /// body. Every state variant flows through the same model — running, done,
 /// failed, canceled — because state is signalled by COLOR only, not text.
+///
+/// ZETA-125 redesign: the receipt line reads as `<tool_label> <excerpt>
+/// <metadata_label>`, where the excerpt names what the tool actually ran
+/// (bash command, read/edit path, fetch URL) rather than the first line of
+/// its output. The label is small and dim, the excerpt is the row's primary
+/// text, and the metadata sits DIRECTLY next to the excerpt end so a run of
+/// receipts reads as one column instead of the pre-ZETA-125 "eight
+/// identical `bash stdout:` rows with a huge right-aligned gap".
 #[derive(Debug, Clone)]
 pub struct ToolRowText<'a> {
-    /// Tool name — the leading semibold verb.
-    pub verb: &'a str,
-    /// One-line argument summary — the dim detail after the verb.
-    pub detail: &'a str,
+    /// Small dim tool-name label (bash, read, edit, fetch, ...).
+    pub tool_label: &'a str,
+    /// Primary text — the excerpt of what ran (bash command's first line,
+    /// read/write/edit path, fetch URL). Comes from
+    /// `TranscriptEntry::Tool::excerpt` which was derived from the tool
+    /// call's arguments at construction, so it is stable across streaming.
+    pub excerpt: &'a str,
     /// `Some(...)` while the row is collapsed AND the tail carries bytes:
-    /// the compact byte-count peek. `None` when expanded or empty.
-    pub output_size_label: Option<String>,
+    /// the compact byte-count peek, painted DIRECTLY after the excerpt
+    /// (laws-of-ux proximity). `None` when expanded or empty.
+    pub metadata_label: Option<String>,
     /// `Some(chrome::TOOL_HOVER_HINT)` under the same condition as
-    /// `output_size_label`; `None` otherwise.
+    /// `metadata_label`; `None` otherwise.
     pub hover_hint: Option<&'static str>,
     /// `Some(chrome::TOOL_TAIL_OMITTED)` when the expanded body was
     /// clipped; `None` when the tail is complete or the row is collapsed.
@@ -209,6 +279,31 @@ pub struct ToolRowText<'a> {
     /// The expanded output body. `Some(&tail)` when the row is expanded,
     /// `None` when collapsed.
     pub body: Option<&'a str>,
+}
+
+/// Collapsed tool-group row: a run of 3+ consecutive tool receipts that
+/// paints as one summary line ("`N` tool calls · `<total>`") with the first
+/// 1-2 excerpts previewed. Expanding the group reveals each row unchanged;
+/// state, output, and expansion of individual receipts survive across the
+/// group toggle. The typed model owns the composed count/total strings, the
+/// preview excerpts, and the composed accessible label so the render layer
+/// paints ONLY through this struct.
+#[derive(Debug, Clone)]
+pub struct ToolGroupRowText<'a> {
+    /// Composed count string — e.g. "5 tool calls" (dynamic).
+    pub count_label: String,
+    /// Composed total-size string — e.g. "12.4KB" (dynamic); `None` when
+    /// every receipt in the group finished with empty output.
+    pub total_label: Option<String>,
+    /// The first up-to-two excerpts, previewed on the summary row so the
+    /// group's contents remain recognisable without expanding it. Borrowed
+    /// from the underlying transcript entries.
+    pub preview_excerpts: Vec<&'a str>,
+    /// Composed accessible label — the same visible text a screen reader
+    /// hears when the summary row receives focus, including expansion
+    /// state (`… collapsed` / `… expanded`) so keyboard-only users hear the
+    /// state that changes on Enter/Space.
+    pub aria_label: String,
 }
 
 /// Error row: the header, the message body, and the optional settings
@@ -310,20 +405,33 @@ impl<'a> RowText<'a> {
             }
             Self::Tool(text) => {
                 let ToolRowText {
-                    verb,
-                    detail,
-                    output_size_label,
+                    tool_label,
+                    excerpt,
+                    metadata_label,
                     hover_hint,
                     tail_omitted_hint,
                     body,
                 } = text;
-                out.push(verb);
-                out.push(detail);
-                out.extend(output_size_label.as_deref());
+                out.push(tool_label);
+                out.push(excerpt);
+                out.extend(metadata_label.as_deref());
                 out.extend(hover_hint.iter().copied());
                 out.extend(tail_omitted_hint.iter().copied());
                 out.extend(body.iter().copied());
             }
+            Self::ToolGroup(text) => {
+                let ToolGroupRowText {
+                    count_label,
+                    total_label,
+                    preview_excerpts,
+                    aria_label,
+                } = text;
+                out.push(count_label.as_str());
+                out.extend(total_label.as_deref());
+                out.extend(preview_excerpts.iter().copied());
+                out.push(aria_label.as_str());
+            }
+            Self::ToolGroupHidden => {}
             Self::Error(text) => {
                 let ErrorRowText {
                     header,
@@ -386,7 +494,7 @@ pub fn build<'a>(
         }),
         TranscriptEntry::Tool {
             name,
-            summary,
+            excerpt,
             card,
             ..
         } => {
@@ -394,9 +502,9 @@ pub fn build<'a>(
             let has_output = output_size > 0;
             let collapsed_with_output = !card.expanded && has_output;
             RowText::Tool(ToolRowText {
-                verb: name,
-                detail: summary,
-                output_size_label: collapsed_with_output.then(|| format_output_size(output_size)),
+                tool_label: name,
+                excerpt,
+                metadata_label: collapsed_with_output.then(|| format_output_size(output_size)),
                 hover_hint: collapsed_with_output.then_some(chrome::TOOL_HOVER_HINT),
                 tail_omitted_hint: (card.expanded && card.tail.truncated)
                     .then_some(chrome::TOOL_TAIL_OMITTED),
@@ -458,6 +566,51 @@ pub fn build_login(
         cancel,
         status_text: provider.status(),
         error,
+    }
+}
+
+/// Compose the summary text for a collapsed tool-group row. Called by the
+/// render layer once per group; the returned `ToolGroupRowText` carries the
+/// composed count/total strings, the preview excerpts borrowed from the
+/// underlying entries, and the accessible label (including expansion
+/// state).
+///
+/// `preview_count` is capped at 2 by the caller per the contract; keeping
+/// the cap in the render layer makes tests grep-able and avoids a
+/// row_text-side constant that would need its own home in `chrome`.
+pub fn build_tool_group<'a>(
+    excerpts: &[&'a str],
+    total_output_bytes: usize,
+    preview_count: usize,
+    expanded: bool,
+) -> ToolGroupRowText<'a> {
+    let count = excerpts.len();
+    let unit = if count == 1 {
+        chrome::TOOL_GROUP_CALL
+    } else {
+        chrome::TOOL_GROUP_CALLS
+    };
+    let count_label = format!("{count}{unit}");
+    let total_label = (total_output_bytes > 0).then(|| format_output_size(total_output_bytes));
+    let take = preview_count.min(2).min(excerpts.len());
+    let preview_excerpts: Vec<&'a str> = excerpts.iter().take(take).copied().collect();
+    let state_suffix = if expanded {
+        chrome::TOOL_GROUP_ARIA_EXPANDED
+    } else {
+        chrome::TOOL_GROUP_ARIA_COLLAPSED
+    };
+    let mut aria_label = String::new();
+    aria_label.push_str(&count_label);
+    if let Some(total) = &total_label {
+        aria_label.push_str(chrome::TOOL_GROUP_META_SEPARATOR);
+        aria_label.push_str(total);
+    }
+    aria_label.push_str(state_suffix);
+    ToolGroupRowText {
+        count_label,
+        total_label,
+        preview_excerpts,
+        aria_label,
     }
 }
 
@@ -557,6 +710,7 @@ mod tests {
                     tool_call_id: "id".into(),
                 },
                 name: "bash".into(),
+                excerpt: "echo hello".into(),
                 summary: "echo".into(),
                 complete,
                 error,
@@ -677,6 +831,7 @@ mod tests {
                     tool_call_id: "id".into(),
                 },
                 name: "bash".into(),
+                excerpt: "echo hi".into(),
                 summary: "".into(),
                 complete: true,
                 error: false,
@@ -687,7 +842,7 @@ mod tests {
             let RowText::Tool(text) = row else {
                 panic!("tool entry must build a Tool row")
             };
-            assert_eq!(text.output_size_label, expected, "at {bytes}B");
+            assert_eq!(text.metadata_label, expected, "at {bytes}B");
         }
     }
 

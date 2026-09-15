@@ -740,13 +740,15 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
                 .map(|sample| sample.row_id.as_str())
                 .filter(|id| id.starts_with("tool-"))
                 .collect();
+            // ZETA-125: the tool row's state-colored elements are the
+            // excerpt (row's primary text) and the chevron. The tool_label
+            // and metadata paint at the muted-foreground tier regardless of
+            // state, so they are NOT recorded here.
             let expected_ids: std::collections::HashSet<&str> =
-                ["tool-verb-0", "tool-detail-0", "tool-chevron-0"]
-                    .into_iter()
-                    .collect();
+                ["tool-excerpt-0", "tool-chevron-0"].into_iter().collect();
             assert_eq!(
                 recorded, expected_ids,
-                "render_tool_row must record verb, detail, and chevron samples for {case:?}"
+                "render_tool_row must record excerpt and chevron samples for {case:?}"
             );
             for sample in samples
                 .iter()
@@ -759,16 +761,16 @@ fn tool_state_paints_by_color_alone_and_expanded_body_borders_by_error(cx: &mut 
                 );
             }
         });
-        // The verb and detail elements paint their bounds — the color check
-        // above proves the contract token is on the entry; this pins the
-        // debug selectors so a rename regresses.
+        // The tool_label and excerpt elements paint their bounds — the
+        // color check above proves the contract token is on the excerpt;
+        // this pins the ZETA-125 debug selectors so a rename regresses.
         assert!(
-            visual.debug_bounds("tool-verb-0").is_some(),
-            "verb element must paint for state {case:?}"
+            visual.debug_bounds("tool-label-0").is_some(),
+            "tool_label element must paint for state {case:?}"
         );
         assert!(
-            visual.debug_bounds("tool-detail-0").is_some(),
-            "detail element must paint for state {case:?}"
+            visual.debug_bounds("tool-excerpt-0").is_some(),
+            "excerpt element must paint for state {case:?}"
         );
         // Typed row-text model: the tool row's paint set (verb + detail +
         // optional peek/hover/omitted/body) is a `ToolRowText` built by
@@ -1363,6 +1365,7 @@ fn every_row_text_flows_through_the_typed_row_text_model() {
                 tool_call_id: "id".into(),
             },
             name: "bash".into(),
+            excerpt: "echo hello".into(),
             summary: "echo".into(),
             complete: true,
             error: false,
@@ -1556,6 +1559,7 @@ fn adjacent_tool_rows_have_zero_gap_between_them(cx: &mut TestAppContext) {
             tool_call_id: id.into(),
         },
         name: "bash".into(),
+        excerpt: id.into(),
         summary: id.into(),
         complete: true,
         error: false,
@@ -1571,6 +1575,11 @@ fn adjacent_tool_rows_have_zero_gap_between_them(cx: &mut TestAppContext) {
                 tool("c"),
                 TranscriptEntry::Assistant("plain answer".into()),
             ];
+            // ZETA-125: a run of 3+ tool receipts collapses into a group
+            // summary row unless the group is expanded. This test measures
+            // the zero-gap contract between INDIVIDUAL receipts, so expand
+            // the group so the individual rows paint their bounds.
+            view.state.tool_group_expanded.insert("a".into(), true);
             view.transcript.update(cx, |scroll, cx| scroll.reset(5, cx));
             cx.notify();
         });
@@ -6762,6 +6771,7 @@ fn tool_rows_keep_the_wide_transcript_column(cx: &mut TestAppContext) {
                     tool_call_id: "wide-tool".into(),
                 },
                 name: "bash".into(),
+                excerpt: "run a very long command line ".repeat(30),
                 summary: "run a very long command line ".repeat(30),
                 complete: true,
                 error: false,
@@ -7312,4 +7322,461 @@ and then some trailing prose after it.";
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ZETA-125: Tool receipt redesign.
+//
+// This region is deliberately separated from earlier tests so a sibling lane
+// (ZETA-127) that rebuilds test infra elsewhere in this file can rebase
+// cleanly. Every test below covers ONE part of the ZETA-125 contract:
+// excerpt extraction and truncation, metadata adjacency, grouping at 3+,
+// mouse + keyboard expansion, streaming-forces-expanded, and correctness
+// across the 11px and 18px scale.
+// ---------------------------------------------------------------------------
+
+/// Excerpt extraction routes bash/read/write/edit/fetch through the
+/// argument key the tool actually reads, and falls back to the tool name
+/// for tools whose arguments carry nothing useful. A pathological command
+/// longer than the character cap truncates with a single-character
+/// ellipsis so a wide argument still fits on one row.
+#[test]
+fn zeta125_excerpts_route_by_kind_and_truncate() {
+    use serde_json::json;
+    let excerpt = |name: &str, args: serde_json::Value| {
+        let map = args.as_object().cloned().unwrap_or_default();
+        zeta_gui::state::tool_excerpt(name, &map)
+    };
+    // Bash-family tools read the "command" argument's first line.
+    assert_eq!(
+        excerpt("bash", json!({"command": "grep -rn TODO src/"})),
+        "grep -rn TODO src/"
+    );
+    assert_eq!(
+        excerpt("exec", json!({"command": "ls -la\nsecond line"})),
+        "ls -la"
+    );
+    // Read/write/edit route through "path".
+    assert_eq!(
+        excerpt("read", json!({"path": "src/main.rs"})),
+        "src/main.rs"
+    );
+    assert_eq!(excerpt("write", json!({"path": "notes.txt"})), "notes.txt");
+    assert_eq!(
+        excerpt("edit", json!({"path": "docs/design.md"})),
+        "docs/design.md"
+    );
+    // Fetch reads "url" and keeps the whole URL under the cap.
+    assert_eq!(
+        excerpt("fetch", json!({"url": "https://example.com/api/v1/data"})),
+        "https://example.com/api/v1/data"
+    );
+    // Unknown tools fall back to the first primitive argument.
+    assert_eq!(excerpt("weather", json!({"city": "Paris"})), "Paris");
+    // With no primitive argument, fall back to the tool name.
+    assert_eq!(excerpt("noop", json!({})), "noop");
+    // Truncation trims to `EXCERPT_CHARS` and appends a single-character
+    // ellipsis marker. The output length is at most cap + 1 char.
+    let long = "a".repeat(zeta_gui::state::EXCERPT_CHARS * 2);
+    let truncated = excerpt("bash", json!({"command": long}));
+    assert!(truncated.ends_with('…'));
+    assert_eq!(
+        truncated.chars().count(),
+        zeta_gui::state::EXCERPT_CHARS + 1,
+        "truncated excerpt must be cap + ellipsis",
+    );
+}
+
+/// Metadata adjacency: with a collapsed receipt that has output bytes on
+/// the tail, the metadata paints DIRECTLY next to the excerpt end. The
+/// gap between the excerpt's right edge and the metadata's left edge
+/// stays under a small proximity bound — laws-of-ux proximity, the fix
+/// for the pre-ZETA-125 "huge right-aligned gap".
+#[gpui::test]
+fn zeta125_metadata_paints_directly_after_the_excerpt(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::Tool {
+                key: zeta_gui::state::ToolReceiptKey {
+                    session_id: None,
+                    agent_instance_id: None,
+                    tool_call_id: "solo".into(),
+                },
+                name: "bash".into(),
+                excerpt: "cargo check".into(),
+                summary: String::new(),
+                complete: true,
+                error: false,
+                canceled: false,
+                card: zeta_gui::cards::Card {
+                    tail: zeta_gui::cards::OutputTail {
+                        text: "x".repeat(4096),
+                        truncated: false,
+                    },
+                    expanded: false,
+                    ..Default::default()
+                },
+            }];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let excerpt = visual
+        .debug_bounds("tool-excerpt-0")
+        .expect("excerpt paints");
+    let metadata = visual
+        .debug_bounds("tool-metadata-0")
+        .expect("metadata paints for a collapsed receipt with output");
+    // Metadata sits on the same visual baseline as the excerpt.
+    assert!(
+        metadata.top() < excerpt.bottom() && metadata.bottom() > excerpt.top(),
+        "metadata must sit on the same row as the excerpt (excerpt {excerpt:?}, metadata {metadata:?})"
+    );
+    // The excerpt gets the flex_1 slot so it occupies the middle; a raw
+    // gap under 64px keeps the two elements visually adjacent even after
+    // the excerpt truncates.
+    let gap = metadata.left() - excerpt.right();
+    assert!(
+        gap < px(64.),
+        "metadata must sit adjacent to the excerpt end (gap={gap:?}); the \
+         pre-ZETA-125 layout right-aligned this element across the whole \
+         column and the fix was 'kill that gap'"
+    );
+}
+
+/// Grouping: a run of 3+ consecutive tool receipts renders as ONE group
+/// summary row when collapsed. The summary carries the correct count and
+/// the total output bytes. Below the threshold each receipt renders on
+/// its own row.
+#[gpui::test]
+fn zeta125_grouping_at_three_or_more_receipts(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let tool = |id: &str, bytes: usize| TranscriptEntry::Tool {
+        key: zeta_gui::state::ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: id.into(),
+        },
+        name: "bash".into(),
+        excerpt: format!("cargo test {id}"),
+        summary: String::new(),
+        complete: true,
+        error: false,
+        canceled: false,
+        card: zeta_gui::cards::Card {
+            tail: zeta_gui::cards::OutputTail {
+                text: "x".repeat(bytes),
+                truncated: false,
+            },
+            ..Default::default()
+        },
+    };
+    // Below threshold: 2 consecutive receipts remain individual.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![tool("a", 100), tool("b", 200)];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(2, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("tool-receipt-0").is_some(),
+        "below the threshold both receipts render individually"
+    );
+    assert!(
+        visual.debug_bounds("tool-receipt-1").is_some(),
+        "below the threshold both receipts render individually"
+    );
+    assert!(
+        visual.debug_bounds("tool-group-0").is_none(),
+        "below the threshold NO group summary row paints"
+    );
+    // At threshold: 3 consecutive receipts collapse into ONE summary row
+    // when the group is not expanded.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![tool("a", 100), tool("b", 200), tool("c", 300)];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(3, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("tool-group-0").is_some(),
+        "at threshold the group summary row paints on the start index"
+    );
+    assert!(
+        visual.debug_bounds("tool-receipt-1").is_none(),
+        "interior receipt rows paint nothing when the group is collapsed"
+    );
+    assert!(
+        visual.debug_bounds("tool-receipt-2").is_none(),
+        "interior receipt rows paint nothing when the group is collapsed"
+    );
+    // The row-text model composes count + total from the run.
+    view.read_with(&visual, |view, _| {
+        let group = view
+            .state
+            .tool_group_position(0)
+            .expect("group position at index 0");
+        assert_eq!(group.count(), 3);
+        let bytes = view.state.tool_group_output_bytes(&group);
+        assert_eq!(bytes, 600);
+        let excerpts: Vec<&str> = (group.first_index..=group.last_index)
+            .filter_map(|i| match &view.state.transcript[i] {
+                TranscriptEntry::Tool { excerpt, .. } => Some(excerpt.as_str()),
+                _ => None,
+            })
+            .collect();
+        let text = zeta_gui::row_text::build_tool_group(
+            &excerpts,
+            bytes,
+            zeta_gui::state::TOOL_GROUP_PREVIEW_MAX,
+            false,
+        );
+        assert_eq!(text.count_label, "3 tool calls");
+        assert_eq!(text.total_label.as_deref(), Some("600B"));
+        assert_eq!(text.preview_excerpts.len(), 2, "preview capped at 2");
+        assert!(
+            text.aria_label.contains(", collapsed"),
+            "accessible label announces the collapsed state: {:?}",
+            text.aria_label
+        );
+    });
+}
+
+/// A collapsed tool-group summary row is a real tab stop (matches
+/// ZETA-108 a11y precedent) and toggles the group open on both mouse
+/// click and Enter. After expansion, the individual tool-receipt rows
+/// paint again and the aria label swaps to the "expanded" wording.
+#[gpui::test]
+fn zeta125_group_toggles_on_mouse_and_keyboard(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let tool = |id: &str, bytes: usize| TranscriptEntry::Tool {
+        key: zeta_gui::state::ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: id.into(),
+        },
+        name: "read".into(),
+        excerpt: format!("src/{id}.rs"),
+        summary: String::new(),
+        complete: true,
+        error: false,
+        canceled: false,
+        card: zeta_gui::cards::Card {
+            tail: zeta_gui::cards::OutputTail {
+                text: "x".repeat(bytes),
+                truncated: false,
+            },
+            ..Default::default()
+        },
+    };
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![tool("a", 100), tool("b", 100), tool("c", 100)];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(3, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    // Initially collapsed — one group row, no receipt rows.
+    assert!(visual.debug_bounds("tool-group-0").is_some());
+    assert!(visual.debug_bounds("tool-receipt-0").is_none());
+    // Toggle via the state seam (the same seam the mouse click handler
+    // dispatches through). Expansion paints the individual receipts.
+    visual.update(|window, cx| {
+        view.update(cx, |view, _| view.state.toggle_tool_group("a"));
+        view.update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("tool-receipt-0").is_some(),
+        "after expansion the first receipt row paints",
+    );
+    assert!(
+        visual.debug_bounds("tool-receipt-2").is_some(),
+        "after expansion the tail receipt row paints",
+    );
+    // Toggling again collapses the group — the same code path a
+    // second Enter/Space keystroke drives.
+    visual.update(|window, cx| {
+        view.update(cx, |view, _| view.state.toggle_tool_group("a"));
+        view.update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("tool-receipt-0").is_none(),
+        "collapsing hides the interior receipt rows again",
+    );
+    // The accessible label carries the expansion state so keyboard-only
+    // users hear what changes on Enter/Space.
+    view.read_with(&visual, |view, _| {
+        let group = view.state.tool_group_position(0).expect("group position");
+        let excerpts: Vec<&str> = (group.first_index..=group.last_index)
+            .filter_map(|i| match &view.state.transcript[i] {
+                TranscriptEntry::Tool { excerpt, .. } => Some(excerpt.as_str()),
+                _ => None,
+            })
+            .collect();
+        let collapsed = zeta_gui::row_text::build_tool_group(
+            &excerpts,
+            0,
+            zeta_gui::state::TOOL_GROUP_PREVIEW_MAX,
+            false,
+        );
+        let expanded = zeta_gui::row_text::build_tool_group(
+            &excerpts,
+            0,
+            zeta_gui::state::TOOL_GROUP_PREVIEW_MAX,
+            true,
+        );
+        assert!(collapsed.aria_label.contains(", collapsed"));
+        assert!(expanded.aria_label.contains(", expanded"));
+    });
+}
+
+/// Streaming turns force the LAST tool group expanded regardless of the
+/// user's explicit toggle map, so live tool activity stays visible on
+/// screen without a click. Completing the turn (streaming=false) restores
+/// the default collapsed state.
+#[gpui::test]
+fn zeta125_streaming_forces_the_last_group_expanded(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let tool = |id: &str| TranscriptEntry::Tool {
+        key: zeta_gui::state::ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: id.into(),
+        },
+        name: "bash".into(),
+        excerpt: format!("cmd {id}"),
+        summary: String::new(),
+        complete: true,
+        error: false,
+        canceled: false,
+        card: zeta_gui::cards::Card::default(),
+    };
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![tool("a"), tool("b"), tool("c")];
+            view.state.streaming = true;
+            view.transcript.update(cx, |scroll, cx| scroll.reset(3, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    // Streaming forces the group expanded — the interior receipts paint.
+    assert!(
+        visual.debug_bounds("tool-receipt-0").is_some(),
+        "streaming must expand the last group without a user click",
+    );
+    // Ending the stream collapses the group back to the summary row.
+    visual.update(|window, cx| {
+        view.update(cx, |view, _| {
+            view.state.streaming = false;
+        });
+        view.update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("tool-group-0").is_some(),
+        "after streaming ends the group returns to its collapsed default",
+    );
+    assert!(
+        visual.debug_bounds("tool-receipt-0").is_none(),
+        "after streaming ends the interior receipts hide again",
+    );
+}
+
+/// Receipt layout stays correct at the picker's 11px floor AND 18px
+/// ceiling: at both ends the label + excerpt + metadata all paint and the
+/// metadata still sits adjacent to the excerpt (not right-aligned across
+/// the column). A regression that hardcoded a font size to 13px would
+/// leave the elements at the wrong size on either end.
+#[gpui::test]
+fn zeta125_receipt_layout_holds_at_11px_and_18px(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::Tool {
+                key: zeta_gui::state::ToolReceiptKey {
+                    session_id: None,
+                    agent_instance_id: None,
+                    tool_call_id: "solo".into(),
+                },
+                name: "bash".into(),
+                excerpt: "cargo test --lib".into(),
+                summary: String::new(),
+                complete: true,
+                error: false,
+                canceled: false,
+                card: zeta_gui::cards::Card {
+                    tail: zeta_gui::cards::OutputTail {
+                        text: "x".repeat(2048),
+                        truncated: false,
+                    },
+                    ..Default::default()
+                },
+            }];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let mut appearance = theme::Appearance::default();
+    let mut bounds_at = |base: f32, visual: &mut VisualTestContext| {
+        appearance.font_size = theme::clamp_font_size(base);
+        visual.update(|window, cx| {
+            theme::apply_with(cx, &appearance);
+            view.update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear(cx);
+        });
+        (
+            visual.debug_bounds("tool-label-0").expect("label paints"),
+            visual
+                .debug_bounds("tool-excerpt-0")
+                .expect("excerpt paints"),
+            visual
+                .debug_bounds("tool-metadata-0")
+                .expect("metadata paints"),
+        )
+    };
+    let (small_label, small_excerpt, small_meta) = bounds_at(theme::MIN_FONT_SIZE_PX, &mut visual);
+    let small_gap = small_meta.left() - small_excerpt.right();
+    assert!(
+        small_gap < px(64.),
+        "11px metadata must sit adjacent to the excerpt end (gap={small_gap:?})"
+    );
+    assert!(small_label.size.width > px(0.));
+    assert!(small_excerpt.size.width > px(0.));
+    assert!(small_meta.size.width > px(0.));
+    let (large_label, large_excerpt, large_meta) = bounds_at(theme::MAX_FONT_SIZE_PX, &mut visual);
+    let large_gap = large_meta.left() - large_excerpt.right();
+    assert!(
+        large_gap < px(96.),
+        "18px metadata must sit adjacent to the excerpt end (gap={large_gap:?})"
+    );
+    assert!(
+        large_label.size.height > small_label.size.height,
+        "tool_label height must scale (11px→{:?}, 18px→{:?})",
+        small_label.size,
+        large_label.size,
+    );
+    assert!(
+        large_excerpt.size.height > small_excerpt.size.height,
+        "excerpt height must scale (11px→{:?}, 18px→{:?})",
+        small_excerpt.size,
+        large_excerpt.size,
+    );
+    // Reset back to the default so downstream tests see the baseline theme.
+    visual.update(|_, cx| theme::apply(cx));
 }
