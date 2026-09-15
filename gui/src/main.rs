@@ -252,8 +252,7 @@ struct ZetaView {
     /// `render_settings_overlay` to size the mask. `None` on the first
     /// frame after opening the modal — the fallback in that case is
     /// `theme::settings_scroll_cue_height`.
-    pub(crate) settings_scroll_cue_snapped_h:
-        std::rc::Rc<std::cell::Cell<Option<gpui::Pixels>>>,
+    pub(crate) settings_scroll_cue_snapped_h: std::rc::Rc<std::cell::Cell<Option<gpui::Pixels>>>,
     login_providers: Vec<LoginProvider>,
     settings_error: Option<String>,
     /// Pending composer attachments (valid + invalid). Each entry paints as
