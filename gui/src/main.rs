@@ -1479,17 +1479,22 @@ impl ZetaView {
                     .v_flex()
                     .w(theme::MODAL_WIDTH)
                     .max_w_full()
-                    // Panel caps at 75% of viewport height — the same
-                    // budget the 25% modal-top shelf leaves — so at ANY
-                    // font-picker base (11px…18px) the title and the
-                    // Close/Apply action row stay clickable. The sections
-                    // body inside the panel is a scrollable flex slot; any
-                    // overflow beyond the cap scrolls through the sections
-                    // rather than pushing Close past the viewport bottom.
-                    .max_h(
+                    // Panel size STRICTLY equals the viewport shelf below the
+                    // 25% modal-top offset (minus one MODAL_PADDING_X so it
+                    // never kisses the viewport bottom). `.h(...)` — not
+                    // `.max_h(...)` — because gpui's flex system needs a
+                    // definite parent height to resolve `flex_1 + min_h_0`
+                    // on the sections wrapper; a max-only bound lets the
+                    // sections wrapper grow past the cap at the 18px picker
+                    // base and the last row (Font size stepper) paints
+                    // outside the viewport. `.overflow_hidden()` is the
+                    // belt-and-suspenders clip so a layout bug elsewhere
+                    // still cannot leak past the panel edge.
+                    .h(
                         window.viewport_size().height * (1.0 - theme::MODAL_TOP_FRACTION)
                             - theme::MODAL_PADDING_X,
                     )
+                    .overflow_hidden()
                     .pt(theme::MODAL_PADDING_TOP)
                     .pb(theme::MODAL_PADDING_BOTTOM)
                     .px(theme::MODAL_PADDING_X)
