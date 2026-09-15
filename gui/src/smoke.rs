@@ -88,7 +88,14 @@ fn escaped_glyph_range(
     None
 }
 
-fn scan_native_gutter(image: &image::RgbaImage, window: &Window, font_size: Pixels, shape: &str) {
+fn scan_native_gutter(
+    image: &image::RgbaImage,
+    window: &Window,
+    font_size: Pixels,
+    shape: &str,
+    achieved_width: u32,
+    achieved_height: u32,
+) {
     let scale = window.scale_factor();
     let window_width = f32::from(window.bounds().size.width);
     let main_left = f32::from(theme::SIDEBAR_WIDTH);
@@ -120,53 +127,138 @@ fn scan_native_gutter(image: &image::RgbaImage, window: &Window, font_size: Pixe
              content_right={content_right} y_range={y_start}..{y_end} background={background:?}"
         );
     }
-    println!("NATIVE-GUARD-PASS: shape={shape} size={font_size:?} gutter={x_start}..{x_end}");
+    println!(
+        "NATIVE-GUARD-PASS: shape={shape} size={font_size:?} \
+         viewport={achieved_width}x{achieved_height} gutter={x_start}..{x_end}"
+    );
 }
 
-fn run_native_wrap_guards(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
-    let viewports = [(px(2204.), px(1608.)), (px(1600.), px(760.))];
+fn native_guard_viewports(window: &Window, cx: &App) -> [gpui::Size<Pixels>; 2] {
+    let display_size = window
+        .display(cx)
+        .map(|display| display.visible_bounds().size)
+        .unwrap_or(window.bounds().size);
+    let maximum = gpui::size(
+        display_size.width.min(px(2204.)),
+        display_size.height.min(px(1608.)),
+    );
+    [
+        gpui::size(maximum.width * 0.7, maximum.height * 0.7),
+        gpui::size(maximum.width * 0.9, maximum.height * 0.9),
+    ]
+}
+
+async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWindowContext) {
+    let viewports = cx
+        .update(|window, cx| native_guard_viewports(window, cx))
+        .expect("native guard window remains open");
     let font_sizes = [
         px(theme::MIN_FONT_SIZE_PX),
         theme::DEFAULT_FONT_SIZE,
         px(theme::MAX_FONT_SIZE_PX),
     ];
+    let mut achieved_viewports = Vec::new();
+    let mut matrix_entries = 0;
     let mut appearance = theme::Appearance::default();
-    view.update(cx, |view, cx| {
-        view.state.streaming = false;
-        view.pending_command = false;
-        cx.notify();
-    });
-    for (width, height) in viewports {
-        window.resize(gpui::size(width, height));
-        window.bounds_changed(cx);
-        for font_size in font_sizes {
-            appearance.font_size = font_size;
-            theme::apply_with(cx, &appearance);
-            for &(shape, source) in NATIVE_GUARD_SHAPES {
-                view.update(cx, |view, cx| {
-                    view.state.connection = ConnectionState::Connected;
-                    view.state.transcript = vec![TranscriptEntry::Assistant(source.into())];
-                    view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
-                    cx.notify();
-                });
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.state.streaming = false;
+            view.pending_command = false;
+            cx.notify();
+        });
+    })
+    .expect("native guard window remains open");
+    for requested in viewports {
+        cx.update(|window, _| window.resize(requested))
+            .expect("native guard window remains open");
+        // macOS delivers setContentSize_ on the foreground executor. Yield so
+        // the capture observes the native size instead of the prior frame.
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+        let achieved = cx
+            .update(|window, cx| {
+                window.bounds_changed(cx);
                 window.render_frame(cx);
                 let image = window
                     .render_to_image()
-                    .expect("native renderer capture for pixel guard");
-                if let Some(dir) = env::var_os("ZETA_GUI_NATIVE_GUARDS_CAPTURE_DIR") {
-                    let path = PathBuf::from(dir).join(format!(
-                        "{shape}-{}-{}x{}.png",
-                        f32::from(font_size),
-                        f32::from(width),
-                        f32::from(height)
-                    ));
-                    image.save(path).expect("save native guard capture");
-                }
-                scan_native_gutter(&image, window, font_size, shape);
+                    .expect("native renderer viewport capture");
+                (image.width(), image.height())
+            })
+            .expect("native guard window remains open");
+        assert!(
+            achieved.0 > 0 && achieved.1 > 0,
+            "native guard produced an empty capture for requested viewport {requested:?}"
+        );
+        if let Some(previous) = achieved_viewports
+            .iter()
+            .find(|previous| **previous == achieved)
+        {
+            eprintln!(
+                "NATIVE-GUARD-WARN: requested viewport {requested:?} achieved duplicate \
+                 capture {}x{}; skipping duplicate matrix entry (first was {}x{})",
+                achieved.0, achieved.1, previous.0, previous.1
+            );
+            continue;
+        }
+        achieved_viewports.push(achieved);
+        println!(
+            "NATIVE-GUARD-VIEWPORT: requested={requested:?} achieved={}x{}",
+            achieved.0, achieved.1
+        );
+        for font_size in font_sizes {
+            appearance.font_size = font_size;
+            cx.update(|_, cx| theme::apply_with(cx, &appearance))
+                .expect("native guard window remains open");
+            for &(shape, source) in NATIVE_GUARD_SHAPES {
+                cx.update(|window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.state.connection = ConnectionState::Connected;
+                        view.state.transcript = vec![TranscriptEntry::Assistant(source.into())];
+                        view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                        cx.notify();
+                    });
+                    window.render_frame(cx);
+                    let image = window
+                        .render_to_image()
+                        .expect("native renderer capture for pixel guard");
+                    assert_eq!(
+                        (image.width(), image.height()),
+                        achieved,
+                        "native guard viewport changed during matrix for requested \
+                             {requested:?}"
+                    );
+                    if let Some(dir) = env::var_os("ZETA_GUI_NATIVE_GUARDS_CAPTURE_DIR") {
+                        let path = PathBuf::from(dir).join(format!(
+                            "{shape}-{}-{}x{}.png",
+                            f32::from(font_size),
+                            achieved.0,
+                            achieved.1
+                        ));
+                        image.save(path).expect("save native guard capture");
+                    }
+                    scan_native_gutter(&image, window, font_size, shape, achieved.0, achieved.1);
+                })
+                .expect("native guard window remains open");
+                matrix_entries += 1;
             }
         }
     }
-    println!("NATIVE-GUARD-PASS: matrix=24");
+    assert_eq!(
+        achieved_viewports.len(),
+        2,
+        "native guard requires two distinct achieved viewports, got {achieved_viewports:?}"
+    );
+    assert_ne!(
+        achieved_viewports[0].0, achieved_viewports[1].0,
+        "native guard requires two distinct achieved viewport widths"
+    );
+    let achieved_list = achieved_viewports
+        .iter()
+        .map(|(width, height)| format!("{width}x{height}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("NATIVE-GUARD-PASS: matrix={matrix_entries} achieved_viewports={achieved_list}");
 }
 
 /// Encode a tiny checkerboard PNG for the ZETA-112 attachment-chrome shot.
@@ -212,7 +304,7 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                 cx.background_executor()
                     .timer(Duration::from_millis(50))
                     .await;
-                let finished = cx
+                let (finished, run_guard) = cx
                     .update(|window, cx| {
                         let entity = view.upgrade().expect("smoke view remains alive");
                         let (ready, active, idle, ready_to_capture) = {
@@ -285,9 +377,8 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                             }
                             3 => {
                                 if guard {
-                                    run_native_wrap_guards(&entity, window, cx);
-                                    cx.quit();
-                                    return true;
+                                    phase = 4;
+                                    return (false, true);
                                 }
                                 // ZETA-112 attachment capture — seed a mixed
                                 // batch (one valid chip with a real decoded
@@ -398,13 +489,20 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                     println!("SMOKE-PASS: {}", PathBuf::from(path).display());
                                 }
                                 cx.quit();
-                                return true;
+                                return (true, false);
                             }
                             _ => {}
                         }
-                        false
+                        (false, false)
                     })
                     .expect("smoke window update");
+                if run_guard {
+                    let entity = view.upgrade().expect("smoke view remains alive");
+                    run_native_wrap_guards(entity, &mut cx).await;
+                    cx.update(|_, cx| cx.quit())
+                        .expect("smoke window remains open");
+                    return;
+                }
                 if finished {
                     return;
                 }
