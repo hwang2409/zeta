@@ -46,6 +46,14 @@ pub struct Card {
     // matches the pre-tracking behaviour: single-turn tests all read as
     // one turn.
     pub turn: u64,
+    // True once a `ServerEvent::ToolOutput` has fed the tail. The
+    // `ToolEnd` handler reads this to skip re-appending the final result
+    // for tools whose end payload repeats the streamed stdout (e.g. bash
+    // per src/zeta/tools/bash.py:202). Without the flag, `bytes_seen` and
+    // the on-screen tail double-count the same bytes. Agent-style tools
+    // that only use `ToolEnd` (no `ToolOutput`) keep their content path
+    // unchanged because `streamed` stays false.
+    pub streamed: bool,
 }
 
 impl Card {

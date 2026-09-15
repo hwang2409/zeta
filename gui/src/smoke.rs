@@ -214,8 +214,16 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
                 cx.update(|window, cx| {
                     view.update(cx, |view, cx| {
                         view.state.connection = ConnectionState::Connected;
-                        view.state.transcript = vec![TranscriptEntry::Assistant(source.into())];
-                        view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                        // r3 finding 7: the guard's matrix used to hold a
+                        // single Assistant row per shape, so glyph escapes
+                        // in the tool-receipt render paths were never
+                        // scanned. Seed BOTH grouped and ungrouped
+                        // receipts alongside the wrapping prose so
+                        // receipt-row escapes ride the same pixel gutter.
+                        view.state.transcript = native_guard_transcript(source);
+                        let count = view.state.transcript.len();
+                        view.transcript
+                            .update(cx, |scroll, cx| scroll.reset(count, cx));
                         cx.notify();
                     });
                     window.render_frame(cx);
@@ -259,6 +267,56 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
         .collect::<Vec<_>>()
         .join(",");
     println!("NATIVE-GUARD-PASS: matrix={matrix_entries} achieved_viewports={achieved_list}");
+}
+
+/// Build the transcript the native pixel-gutter guard renders for one
+/// shape entry. The assistant row carries the wrapping prose the guard
+/// was originally designed to stress. Alongside it we seed a 3-receipt
+/// grouped run AND a solo receipt so glyph escapes in the tool-receipt
+/// paint paths ride the same pixel gutter — the r3 review flagged that
+/// receipt rows were previously invisible to the guard.
+fn native_guard_transcript(source: &str) -> Vec<TranscriptEntry> {
+    use zeta_gui::cards::{Card, OutputTail};
+    use zeta_gui::state::{tool_excerpt, ToolReceiptKey, TranscriptEntry};
+    let tool = |id: &str, name: &str, key: &str, value: &str, bytes: usize| -> TranscriptEntry {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(key.into(), serde_json::Value::String(value.into()));
+        TranscriptEntry::Tool {
+            key: ToolReceiptKey {
+                session_id: None,
+                agent_instance_id: None,
+                tool_call_id: id.into(),
+            },
+            name: name.into(),
+            excerpt: tool_excerpt(name, &arguments),
+            summary: String::new(),
+            complete: true,
+            error: false,
+            canceled: false,
+            card: Card {
+                tail: OutputTail {
+                    text: "x".repeat(bytes),
+                    truncated: false,
+                    bytes_seen: bytes,
+                },
+                ..Default::default()
+            },
+        }
+    };
+    vec![
+        TranscriptEntry::Assistant(source.into()),
+        // Grouped run (3 receipts, same-turn adjacent) — collapses to
+        // one header row when expansion is unset; expands to three
+        // interior rows if streaming forces expansion. Both shapes are
+        // in play depending on state at scan time.
+        tool("g1", "bash", "command", "grep -rn TODO src/", 900),
+        tool("g2", "read", "path", "src/main.rs", 3_940),
+        tool("g3", "read", "path", "src/lib.rs", 1_180),
+        // Second assistant row splits the run — the ungrouped tool
+        // below paints as its own individual receipt row.
+        TranscriptEntry::Assistant("Spot-checking one more.".into()),
+        tool("s1", "read", "path", "Cargo.toml", 252),
+    ]
 }
 
 /// Encode a tiny checkerboard PNG for the ZETA-112 attachment-chrome shot.

@@ -7599,17 +7599,42 @@ fn zeta125_group_header_persists_when_expanded_and_toggles_via_real_keystrokes(
         visual.debug_bounds("tool-group-0").is_some(),
         "collapsed group paints its header row",
     );
-    // Focus the group's tab stop, then send a real Enter keystroke.
+    // r3 finding 3: reach the group header through a REAL tab walk —
+    // `window.focus_next` is the same code path the Root keymap's
+    // `tab` -> `focus_next` binding drives (gpui-component
+    // `root::init` -> `Tab` -> `window.focus_next`). Jamming focus
+    // onto the handle via `window.focus(&handle)` succeeds even for
+    // handles that are not real tab stops; the tab-walk proves the
+    // header is reachable from the keyboard tab-stops registry.
     let focus_key = zeta_gui::row_text::sel::tool_group_focus_key("a");
-    visual.update(|window, cx| {
-        let handle = view.update(cx, |view, _| {
-            view.tool_group_focus
+    let group_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .tool_group_focus
                 .borrow()
                 .get(&focus_key)
                 .cloned()
-                .expect("group focus handle registered on first paint")
-        });
-        window.focus(&handle, cx);
+        })
+        .expect("group focus handle registered on first paint");
+    visual.update(|window, cx| {
+        window.blur(cx);
+        window.draw(cx).clear(cx);
+    });
+    let max_tab_steps = 64;
+    let mut steps_to_group = None;
+    for step in 0..max_tab_steps {
+        visual.update(|window, cx| window.focus_next(cx));
+        if visual.update(|window, _| group_handle.is_focused(window)) {
+            steps_to_group = Some(step + 1);
+            break;
+        }
+    }
+    let _ = steps_to_group.expect(
+        "a Tab walk must land on the tool-group header within a bounded loop \
+         — proves the header is a real tab stop reachable from the keyboard \
+         registry, not just via `window.focus(handle)`",
+    );
+    visual.update(|window, cx| {
         view.update(cx, |_, cx| cx.notify());
         window.draw(cx).clear(cx);
     });
@@ -7739,12 +7764,12 @@ fn zeta125_group_toggles_on_mouse_and_keyboard(cx: &mut TestAppContext) {
     });
 }
 
-/// Streaming turns force the LAST tool group expanded regardless of the
-/// user's explicit toggle map, so live tool activity stays visible on
-/// screen without a click. Completing the turn (streaming=false) restores
-/// the default collapsed state.
+/// Streaming turns force EVERY tool group in the current turn expanded
+/// regardless of the user's explicit toggle map, so live tool activity
+/// stays visible on screen without a click. Completing the turn
+/// (streaming=false) restores the default collapsed state.
 #[gpui::test]
-fn zeta125_streaming_forces_the_last_group_expanded(cx: &mut TestAppContext) {
+fn zeta125_streaming_forces_current_turn_groups_expanded(cx: &mut TestAppContext) {
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let tool = |id: &str| TranscriptEntry::Tool {
@@ -7770,10 +7795,11 @@ fn zeta125_streaming_forces_the_last_group_expanded(cx: &mut TestAppContext) {
         });
         window.draw(cx).clear(cx);
     });
-    // Streaming forces the group expanded — the interior receipts paint.
+    // Streaming forces every current-turn group expanded — the interior
+    // receipts paint.
     assert!(
         visual.debug_bounds("tool-receipt-0").is_some(),
-        "streaming must expand the last group without a user click",
+        "streaming must expand every current-turn group without a user click",
     );
     // Ending the stream collapses the group back to the summary row.
     visual.update(|window, cx| {
