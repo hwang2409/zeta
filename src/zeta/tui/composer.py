@@ -873,6 +873,9 @@ class SubmissionMixin:
         return await self.loop.slash_mcp_prompt(name, arguments)
 
     def _submit_input(self, value: str) -> None:
+        # Any submission retires an open model picker: its card would otherwise
+        # linger with keys that no longer do anything.
+        self._dismiss_model_picker()
         if (
             self._submissions._approval_action_for(value) is not None
             and not self._submissions.active

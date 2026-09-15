@@ -49,6 +49,22 @@ transcript, so long sessions stay responsive under the pointer. A plain click
 clears the highlight and the wheel still scrolls. Provider errors now wrap
 their full reason instead of cutting it off at the card edge.
 
+## picking a model
+
+`/model` opens a picker card listing the models the current provider serves:
+the built-in table plus the live catalog once it loads, with the current
+model marked. `↑`/`↓` move, `enter` selects, and `esc` cancels; the keys only
+act while the composer is empty. `/model <text>` switches directly when the
+text names a known model or matches exactly one, and otherwise narrows the
+picker to the matches, so `/model opus` shows the opus family instead of
+sending `opus` to the provider. Text that matches nothing is still sent as
+typed, so a brand-new id keeps working. Typing after `/model ` also completes
+model names inline.
+
+Typing `/` opens the command menu above the composer in the theme's colors,
+with the highlighted row on the accent and up to twelve entries visible.
+Arrow keys move, `tab` or `enter` accepts, and a mouse click picks an entry.
+
 ## exec macro example
 
 Create `~/.zeta/commands/rebuild.md` for a local `/rebuild` macro:

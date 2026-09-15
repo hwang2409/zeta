@@ -19,7 +19,8 @@ from ...core.todo import todo_count_tuple
 from ...mcp.prompt_commands import SlashModelInput
 from ...tools._user_discovery import trust_project_tools
 from .. import theme as _theme
-from ..models import validate_model_name
+from ..models import known_models, match_models, validate_model_name
+from .model_picker import ModelPicker
 
 
 def _validate_model_name(provider: str, model: str) -> None:
@@ -65,20 +66,108 @@ class SlashHandlerMixin:
             mcp_summary=self.loop.mcp_summary,
         )
 
-    def slash_model(self, args: str) -> str:
-        """Show or change the model for future completions."""
+    def model_choices(self) -> tuple[str, ...]:
+        """Models the picker and the composer completer offer for this provider."""
 
-        if not args:
-            return f"model: {self.model}"
-        if self.active or self.pending_approvals:
+        return known_models(self.provider, self._model_catalog)
+
+    @property
+    def model_picker_active(self) -> bool:
+        return self._model_picker is not None
+
+    def slash_model(self, args: str) -> str:
+        """Pick a model from a card, or switch straight to a named one."""
+
+        requested = args.strip()
+        if not self._model_catalog_loaded:
+            self._start_model_catalog_load()
+        busy = bool(self.active or self.pending_approvals)
+        if not requested:
+            if busy:
+                return (
+                    f"model: {self.model} (cannot change model while a turn or "
+                    "approval is active)"
+                )
+            return self._open_model_picker(self.model_choices(), query="")
+        if busy:
             return "model unchanged: cannot change model while a turn or approval is active"
-        model = args.strip()
+        choices = self.model_choices()
+        if requested not in choices:
+            matches = match_models(requested, choices)
+            if len(matches) == 1:
+                requested = matches[0]
+            elif matches:
+                return self._open_model_picker(matches, query=requested)
+        return self._switch_model(requested)
+
+    def _open_model_picker(self, choices: tuple[str, ...], *, query: str) -> str:
+        """Draw the picker card; its keys take over while the composer is empty."""
+
+        self._dismiss_model_picker()
+        picker = ModelPicker(self.provider, choices, self.model, query)
+        self._model_picker = picker
+        self._model_picker_unit = self._presenter.print_unit(picker.render())
+        self._invalidate_prompt()
+        return ""
+
+    def _repaint_model_picker(self) -> None:
+        picker = self._model_picker
+        if picker is None:
+            return
+        unit = self._model_picker_unit
+        if unit is not None:
+            self._model_picker_unit = self._transcript.replace(unit, picker.render())
+        self._invalidate_prompt()
+
+    def _dismiss_model_picker(self) -> None:
+        unit = self._model_picker_unit
+        self._model_picker = None
+        self._model_picker_unit = None
+        if unit is not None:
+            self._transcript.remove(unit, leading_blank=True)
+
+    def model_picker_move(self, delta: int) -> None:
+        picker = self._model_picker
+        if picker is None:
+            return
+        picker.move(delta)
+        self._repaint_model_picker()
+
+    def model_picker_select(self) -> None:
+        """Run the highlighted choice through the normal ``/model`` path."""
+
+        picker = self._model_picker
+        if picker is None:
+            return
+        choice = picker.selected
+        self._dismiss_model_picker()
+        self._submit_input(f"/model {choice}")
+
+    def model_picker_cancel(self) -> None:
+        if self._model_picker is None:
+            return
+        self._dismiss_model_picker()
+        self._invalidate_prompt()
+
+    def refresh_model_picker(self) -> None:
+        """Fold a freshly loaded catalog into an open picker."""
+
+        picker = self._model_picker
+        if picker is None:
+            return
+        choices = self.model_choices()
+        if picker.query:
+            choices = match_models(picker.query, choices)
+        if not choices or choices == picker.choices:
+            return
+        self._model_picker = picker.with_choices(choices)
+        self._repaint_model_picker()
+
+    def _switch_model(self, model: str) -> str:
         try:
             _validate_model_name(self.provider, model)
         except ValueError as exc:
             return f"model unchanged: {exc}"
-        if not self._model_catalog_loaded:
-            self._start_model_catalog_load()
         if self._model_catalog is None:
             catalog_warning = (
                 f"model catalog unavailable for {self.provider} — using anyway"
