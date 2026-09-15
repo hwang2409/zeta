@@ -194,7 +194,18 @@ impl ZetaView {
                     .min_w_0()
                     .max_w(max_width)
                     .px_4()
-                    .child(inner),
+                    // Safety layer for the fractional-glyph off-by-one:
+                    // even after flooring the wrap budget above, a
+                    // future refactor that widens the row without
+                    // updating the budget would let a glyph land past
+                    // the column content edge. Wrapping `inner` in an
+                    // unpadded `overflow_hidden` div INSIDE the
+                    // padded column puts the clip exactly at the
+                    // padding-inner edge — the same coordinate the
+                    // guard's `content_right` scans — so any future
+                    // stray column-crossing pixel is clipped before
+                    // it can reach the gutter.
+                    .child(div().w_full().min_w_0().overflow_hidden().child(inner)),
             )
             .into_any_element()
     }
@@ -448,6 +459,17 @@ impl ZetaView {
         let text_view = TextView::markdown(sel::message(index), source)
             .selectable(true)
             .style(assistant_markdown_style(cx));
+        // Floor() the wrap budget so a fractional `prose_max_width`
+        // (base * 0.62 * 88 + 32 evaluates to a non-integer at almost
+        // every picker step) does not let the painter's rounding push
+        // one glyph's advance one pixel past the column content edge.
+        // The r3 pixel-gutter guard flagged exactly this pattern at
+        // 11px on the 922x610 viewport — glyphs, not quads, painting
+        // one column past `content_right`.
+        let text_wrap_budget = px((f32::from(theme::prose_max_width(cx.theme().font_size))
+            - 2. * theme::PROSE_ROW_PADDING_X
+            - 2.)
+            .floor());
         #[cfg(feature = "smoke-test")]
         let text_view =
             if std::env::var_os(row_text::sel::NATIVE_GUARD_FORCE_TEXT_WIDTH_ENV).is_some() {
@@ -455,17 +477,10 @@ impl ZetaView {
                 // available width while its prose column remains narrow.
                 text_view.w(px(1200.))
             } else {
-                // Leave a small layout margin for fractional glyph advances. This
-                // changes the wrap budget; it does not clip painted pixels.
-                text_view.max_w(px(f32::from(theme::prose_max_width(cx.theme().font_size))
-                    - 2. * theme::PROSE_ROW_PADDING_X
-                    - 2.))
+                text_view.max_w(text_wrap_budget)
             };
         #[cfg(not(feature = "smoke-test"))]
-        let text_view = text_view
-            .max_w(px(f32::from(theme::prose_max_width(cx.theme().font_size))
-                - 2. * theme::PROSE_ROW_PADDING_X
-                - 2.));
+        let text_view = text_view.max_w(text_wrap_budget);
         div()
             .py(px(2.))
             .w_full()
