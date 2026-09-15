@@ -8516,22 +8516,35 @@ fn settings_tab_stops_stay_visible_inside_the_viewport_at_18px(cx: &mut TestAppC
     visual.update(|_, cx| theme::apply_with(cx, &appearance));
     visual.update(|window, cx| window.draw(cx).clear(cx));
     let viewport = visual.update(|window, _| window.viewport_size());
-    // The controls that expose a stable debug selector at the section-body
-    // level. Each is one tab stop (the model list has its own internal
-    // scroll — its focus safety net is subsumed by the sections wrapper's
-    // scroll-into-view mechanism).
-    let checked = [
-        "mode-row-ask",
-        "mode-row-allow",
-        "mode-row-deny",
-        "settings-theme-cycler",
-        "settings-font-cycler",
-        "font-size-shrink",
-        "font-size-grow",
-        "settings-close",
-        "settings-apply",
+    // Each labeled control below is one tab stop. For every stop, focus
+    // the section that owns it (Behavior for approval-mode buttons,
+    // Appearance for cyclers + stepper primitives) so the modal's
+    // scroll-into-view safety net fires, then assert the resulting
+    // rendered bounds sit inside the viewport. Close / Apply live outside
+    // the sections wrapper and are always at the panel bottom.
+    let checked: &[(&str, Option<&str>)] = &[
+        ("mode-row-ask", Some("behavior")),
+        ("mode-row-allow", Some("behavior")),
+        ("mode-row-deny", Some("behavior")),
+        ("settings-theme-cycler", Some("appearance")),
+        ("settings-font-cycler", Some("appearance")),
+        ("font-size-shrink", Some("appearance")),
+        ("font-size-grow", Some("appearance")),
+        ("settings-close", None),
+        ("settings-apply", None),
     ];
-    for sel in checked {
+    for (sel, section) in checked.iter().copied() {
+        if let Some(section) = section {
+            visual.update(|window, cx| {
+                let handle = view.read_with(cx, |view, _| {
+                    view.settings_section_focus.borrow().get(section).cloned()
+                });
+                if let Some(handle) = handle {
+                    window.focus(&handle, cx);
+                }
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
         let bounds = visual
             .debug_bounds(sel)
             .unwrap_or_else(|| panic!("{sel} must render at 18px"));
