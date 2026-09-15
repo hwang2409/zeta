@@ -26,6 +26,7 @@ impl OutputTail {
     /// by the `ToolEnd` handler for every streamed tool final payload.
     pub fn replace_visible(&mut self, text: &str) {
         self.text.clear();
+        self.truncated = false;
         self.text.push_str(text);
         self.enforce_bounds();
     }
