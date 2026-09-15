@@ -128,3 +128,6 @@ does not open a native window. Set
 `ZETA_GUI_NATIVE_GUARDS_FORCE_TEXT_WIDTH=1` with the arm to reproduce the
 round-3 wide-TextView mutation; the guard must fail before the mutation is
 removed.
+
+GitHub's macOS runner has no usable window server for this arm, so run it as a
+pre-merge orchestrator or reviewer gate on a macOS desktop session.
