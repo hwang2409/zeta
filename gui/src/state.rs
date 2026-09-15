@@ -2993,9 +2993,12 @@ mod tests {
                 tool_result: None,
             },
         ];
-        let mut state = AppState::default();
-        // Simulate the mid-turn resume the finding calls out.
-        state.streaming = true;
+        // Simulate the mid-turn resume the finding calls out — the
+        // history payload arrives while `streaming` is already true.
+        let mut state = AppState {
+            streaming: true,
+            ..AppState::default()
+        };
         state.apply_history(history, true);
         assert!(state.streaming, "resume keeps streaming=true");
         let group = state
