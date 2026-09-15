@@ -154,17 +154,12 @@ pub const MODAL_PADDING_BOTTOM: Pixels = px(14.);
 pub const MODAL_BUTTON_HEIGHT: Pixels = px(30.);
 pub const MODAL_TOP_FRACTION: f32 = 0.25;
 
-/// Fixed-width label column for a Settings row at the SHIPPED 13px base so
-/// labels stack on a common left edge. Kept as a public token for the
-/// backing test — production callers use `settings_label_column(base)` so
-/// the column widens with the picker's base size and long labels (e.g.
-/// "Approval mode") never shape wider than the column at 18px.
-pub const SETTINGS_LABEL_COLUMN: Pixels = px(140.);
-
-/// Label-column width derived from the current base font size. The column
-/// scales linearly (`base * 10.8`) so at 11px it is 118.8px, at 13px 140px,
-/// at 18px 194px. Wide enough to hold "Approval mode" without wrapping into
-/// a stacked block at any picker base.
+/// Label-column width for a Settings row, derived from the current base
+/// font size. The column scales linearly (`base * 10.8`) so at 11px it is
+/// 119px, at the shipped 13px base 140px, and at the picker's MAX 18px
+/// base 194px. Wide enough to hold "Approval mode" without wrapping into a
+/// stacked block at any picker base — the fixed 120px column the pre-
+/// round-2 shape carried wrapped the label at 18px.
 pub fn settings_label_column(base: Pixels) -> Pixels {
     let scale = f32::from(base) * 10.8;
     px(scale.round())
@@ -1784,7 +1779,6 @@ mod tests {
         assert_eq!(MODAL_PADDING_BOTTOM, px(14.));
         assert_eq!(MODAL_BUTTON_HEIGHT, px(30.));
         assert!((MODAL_TOP_FRACTION - 0.25).abs() < f32::EPSILON);
-        assert_eq!(SETTINGS_LABEL_COLUMN, px(140.));
         assert_eq!(SETTINGS_SECTION_GAP, px(10.));
         assert_eq!(SETTINGS_ROW_GAP, px(6.));
         assert_eq!(SETTINGS_ROW_DESCRIPTION_GAP, px(2.));
@@ -1794,7 +1788,7 @@ mod tests {
         // MAX 18px base — the pre-ZETA-128-round-2 fixed 120px column
         // wrapped the label at 18px, leaving the row shaped wrong.
         assert_eq!(settings_label_column(px(11.)), px(119.));
-        assert_eq!(settings_label_column(px(13.)), SETTINGS_LABEL_COLUMN);
+        assert_eq!(settings_label_column(px(13.)), px(140.));
         assert_eq!(settings_label_column(px(18.)), px(194.));
 
         let tint = opencode().danger_tint();
