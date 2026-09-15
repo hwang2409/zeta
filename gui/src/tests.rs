@@ -8263,17 +8263,24 @@ fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     open_settings_with_default_catalog(&view, &mut visual);
     let overlay_focus = view.read_with(&visual, |view, _| view.settings_focus.clone());
-    // Tab away from the overlay so focus first lands on a real control.
-    visual.update(|window, cx| window.focus(&overlay_focus, cx));
-    visual.simulate_keystrokes("tab");
+    // Round-4: exercise the REAL Apply path — a mouse click on the Apply
+    // button (the ZETA-111 click-flow API) — so the intermediate action
+    // rides through the same handler a user's hand would trip. Then walk
+    // the full forward Tab cycle and full reverse Shift-Tab cycle from
+    // wherever the click landed focus, with NO manual focus resets, and
+    // assert every step stays inside the modal.
+    let apply = visual
+        .debug_bounds("settings-apply")
+        .expect("apply button renders");
+    visual.simulate_click(apply.center(), Default::default());
     visual.update(|window, cx| window.draw(cx).clear(cx));
-    let start = visual
-        .update(|window, cx| window.focused(cx))
-        .expect("first tab must land on a modal control");
     assert!(
         visual.update(|window, cx| overlay_focus.contains_focused(window, cx)),
-        "first Tab must land inside the modal, not on background chrome"
+        "Apply click must land focus on an in-modal control"
     );
+    let start = visual
+        .update(|window, cx| window.focused(cx))
+        .expect("Apply click must leave focus on some control");
     // Walk forward until we revisit the start. Bounded so a broken cycle
     // trips the assert instead of hanging.
     let mut visited = vec![start.clone()];
@@ -8297,25 +8304,13 @@ fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
     }
     assert!(
         cycled,
-        "forward Tab cycle must return to the starting control after visiting {} stops",
+        "forward Tab cycle must return to the Apply starting control after visiting {} stops",
         visited.len()
     );
-    // Apply mid-cycle: focus must stay inside the modal (settings stay open
-    // if the pending apply succeeds — the test just proves the trap holds
-    // even after an intermediate control click).
-    visual.update(|window, cx| {
-        view.update(cx, |view, cx| view.apply_settings(cx));
-        window.draw(cx).clear(cx);
-    });
-    // Walk backward and prove Shift-Tab is trapped as well. Start from a
-    // fresh Tab so focus lives on a modal control regardless of Apply's
-    // internal focus moves.
-    visual.update(|window, cx| window.focus(&overlay_focus, cx));
-    visual.simulate_keystrokes("tab");
-    visual.update(|window, cx| window.draw(cx).clear(cx));
-    let reverse_start = visual
-        .update(|window, cx| window.focused(cx))
-        .expect("post-apply Tab must land on a modal control");
+    // Reverse cycle from the SAME position — no manual focus reset. Focus
+    // is back on `start` after the forward cycle closed; Shift-Tab from
+    // there walks backward through the same registry.
+    let reverse_start = start.clone();
     let mut reverse_cycled = false;
     for step in 0..64 {
         visual.simulate_keystrokes("shift-tab");
@@ -8334,7 +8329,7 @@ fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
     }
     assert!(
         reverse_cycled,
-        "reverse Shift-Tab cycle must return to the starting control"
+        "reverse Shift-Tab cycle must return to the Apply starting control"
     );
 }
 
@@ -8668,13 +8663,15 @@ fn settings_tab_stops_stay_visible_inside_the_viewport_at_18px(cx: &mut TestAppC
 #[gpui::test]
 fn settings_model_list_scrolls_focused_row_into_view_at_18px(cx: &mut TestAppContext) {
     // Round-3 promise: the inner model list scrolls whichever row is
-    // KEYBOARD-focused into view, not just the SELECTED row. The pre-round-3
-    // shape only called `scroll_to_item(selected)` — Tab-focusing a row past
-    // the model list's 160px cap left the focus ring painting outside the
-    // list's clipped viewport. This test seeds a many-model catalog (more
-    // rows than the cap can show at 18px), focuses each row through its
-    // persistent wrapper handle, redraws, and asserts each focused row's
-    // bounds sit inside the modal panel and the window viewport.
+    // KEYBOARD-focused into view, not just the SELECTED row. Round-4
+    // rewrite exercises REAL Tab keystrokes (the same `dispatch_keystroke`
+    // path Enter/Space activations use) instead of the pre-round-4 shortcut
+    // that focused each row's wrapper handle directly. Each Tab from the
+    // overlay lands on the next model-row Button; the wrapper div's tracked
+    // focus contains that Button's focus, drives `scroll_to_item(child_ix)`,
+    // and the CLIPPED `model-list` bounds must contain the row's painted
+    // ring — not the whole panel (the panel is wider than the list's cap
+    // so a leaked ring outside the list still fits inside the panel).
     wipe_scoped_prefs();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
@@ -8706,33 +8703,38 @@ fn settings_model_list_scrolls_focused_row_into_view_at_18px(cx: &mut TestAppCon
     };
     visual.update(|_, cx| theme::apply_with(cx, &appearance));
     visual.update(|window, cx| window.draw(cx).clear(cx));
-    let viewport = visual.update(|window, _| window.viewport_size());
+    // Seed focus on the overlay handle so the first Tab lands on the
+    // first modal tab stop — the model-row-0 Button. Each subsequent Tab
+    // walks one row down the list.
+    let overlay_focus = view.read_with(&visual, |v, _| v.settings_focus.clone());
+    visual.update(|window, cx| window.focus(&overlay_focus, cx));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
     for (index, sel) in selectors.iter().copied().enumerate() {
-        let row_focus = view.read_with(&visual, |view, _| {
-            view.settings_model_row_focus
+        visual.simulate_keystrokes("tab");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let row_focus = view.read_with(&visual, |v, _| {
+            v.settings_model_row_focus
                 .borrow()
                 .get(&index)
                 .cloned()
                 .expect("row focus handle allocated")
         });
-        visual.update(|window, cx| window.focus(&row_focus, cx));
-        visual.update(|window, cx| window.draw(cx).clear(cx));
-        let bounds = visual
+        assert!(
+            visual.update(|window, cx| row_focus.contains_focused(window, cx)),
+            "Tab step {} must land on model-row-{index}",
+            index + 1,
+        );
+        let row_bounds = visual
             .debug_bounds(sel)
             .unwrap_or_else(|| panic!("row {index} must render at 18px"));
-        let panel = visual
-            .debug_bounds("settings-panel")
-            .expect("panel renders while any row is focused");
+        let list_bounds = visual
+            .debug_bounds("model-list")
+            .expect("model list renders while a row is focused");
         assert!(
-            bounds.top() >= px(0.)
-                && bounds.bottom() <= viewport.height
-                && bounds.left() >= px(0.)
-                && bounds.right() <= viewport.width,
-            "row {index}: focused bounds {bounds:?} leaked outside viewport {viewport:?}"
-        );
-        assert!(
-            bounds.top() >= panel.top() - px(1.) && bounds.bottom() <= panel.bottom() + px(1.),
-            "row {index}: focused bounds {bounds:?} leaked outside the modal panel {panel:?}"
+            row_bounds.top() >= list_bounds.top() - px(1.)
+                && row_bounds.bottom() <= list_bounds.bottom() + px(1.),
+            "row {index}: focused bounds {row_bounds:?} leaked outside the clipped \
+             model-list viewport {list_bounds:?}"
         );
     }
     visual.update(|_, cx| theme::apply(cx));

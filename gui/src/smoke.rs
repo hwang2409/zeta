@@ -609,11 +609,27 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                 phase = 1;
                             }
                             1 if active && idle => {
-                                let focus = entity.read(cx).composer.focus_handle(cx);
-                                window.focus(&focus, cx);
-                                window
-                                    .input("Show the core chat loop and a small Rust example.", cx);
-                                window.press("enter", cx);
+                                // Seed the composer value directly and submit via
+                                // `send_composer`, rather than dispatching per-character
+                                // keystrokes. The native `.input(...)` helper spends the
+                                // whole message duration listening on the real macOS
+                                // window; any stray character typed at the terminal
+                                // during the capture flight lands on the focused
+                                // composer and rides through to the transcript. That
+                                // capture-time input leak surfaced as a stray leading
+                                // "j" in the shipped ZETA-128 after-screenshots
+                                // ("jShow the core chat loop..."). Direct state assignment
+                                // keeps the rendered turn deterministic on any dev machine.
+                                entity.update(cx, |view, cx| {
+                                    view.composer.update(cx, |input, cx| {
+                                        input.set_value(
+                                            "Show the core chat loop and a small Rust example.",
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    view.send_composer(cx);
+                                });
                                 phase = 2;
                             }
                             // Once the transcript carries the "+ Thought"
