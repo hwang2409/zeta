@@ -194,20 +194,7 @@ impl ZetaView {
                     .min_w_0()
                     .max_w(max_width)
                     .px_4()
-                    // Clip at the content-area right edge (inside the
-                    // wrapper's px_4 padding). `overflow_hidden` on the
-                    // padded wrapper itself clips at the border box —
-                    // OUTSIDE the padding — so a shaped-glyph tail that
-                    // stroked past its cell but stayed within the row's
-                    // padding zone would slip past. Wrapping `inner` in
-                    // an unpadded `overflow_hidden` div positions the
-                    // clip exactly at the guard's `content_right`. The
-                    // r3 native pixel-gutter guard flagged this at the
-                    // 18px picker step under a narrow viewport; without
-                    // the nested clip the shaped tail lands 4-7px past
-                    // the padding-inner edge into the guard's scan
-                    // band.
-                    .child(div().w_full().min_w_0().overflow_hidden().child(inner)),
+                    .child(inner),
             )
             .into_any_element()
     }
