@@ -622,15 +622,35 @@ impl AppState {
                     if let Some(result) = tool_result.filter(|result| !result.content.is_empty()) {
                         if card.streamed {
                             // Streamed tools already fed `bytes_seen` from
-                            // ToolOutput. The final ToolEnd payload can
-                            // reshape the visible text — bash wraps stdout
-                            // in `"stdout:\n…\nstderr:\n…"` sections
-                            // (src/zeta/tools/bash.py:194), so a suffix
-                            // check misses the duplicate and appending
-                            // would double-count the same bytes. Replace
-                            // the visible tail from the final payload;
-                            // the streamed byte count stays authoritative.
-                            card.tail.replace_visible(&result.content);
+                            // ToolOutput. NEVER count the final payload's
+                            // bytes — the streamed count is authoritative
+                            // (r4 finding 1). What the visible tail does
+                            // with the final payload depends on shape:
+                            //
+                            //   * Wrapped: bash returns
+                            //     `"stdout:\n…\nstderr:\n…"` around the
+                            //     streamed stdout (src/zeta/tools/bash.py:194).
+                            //     The streamed tail is a SUBSTRING of the
+                            //     final payload; the payload's wrapped
+                            //     shape reads better than the raw stdout,
+                            //     so replace the visible tail with it.
+                            //   * Distinct summary: agent-style tools
+                            //     stream progress and return a completion
+                            //     message that does NOT contain the
+                            //     streamed content (see
+                            //     `delegated_cards_keep_separate_tails_disclosure_and_failures`).
+                            //     Preserve both signals by appending the
+                            //     summary without touching bytes_seen.
+                            let final_wraps_streamed = !card.tail.text.is_empty()
+                                && result.content.contains(card.tail.text.as_str());
+                            if final_wraps_streamed {
+                                card.tail.replace_visible(&result.content);
+                            } else if card.tail.text != result.content {
+                                if !card.tail.text.is_empty() && !card.tail.text.ends_with('\n') {
+                                    card.tail.push_visible("\n");
+                                }
+                                card.tail.push_visible(&result.content);
+                            }
                         } else if card.tail.text != result.content {
                             // Non-streamed tools (delegated agents that
                             // only emit ToolEnd) count the final content
@@ -3213,14 +3233,21 @@ mod tests {
         // unrelated edit forces a resize. This test drives the exact
         // shape and asserts every group row in the live turn rides the
         // ordered edit list, matching what `AgentEnd` emits.
-        let mut state = AppState::default();
+        //
+        // Pin `active_session` upfront so `select_session` on the first
+        // status call is a no-op — otherwise the session switch clears
+        // the transcript before we can observe the remeasure emission.
+        let mut state = AppState {
+            active_session: Some("one".to_owned()),
+            ..AppState::default()
+        };
         state.apply(ServerEvent::TurnStart {
-            session_id: None,
+            session_id: Some("one".to_owned()),
             data: json!({}),
         });
         for id in ["a", "b", "c"] {
             state.apply(ServerEvent::ToolStart {
-                session_id: None,
+                session_id: Some("one".to_owned()),
                 tool_call: ordered_call(id),
                 data: json!({}),
             });
@@ -3242,6 +3269,11 @@ mod tests {
         assert!(
             state.streaming,
             "sanity: running status leaves state streaming"
+        );
+        assert_eq!(
+            state.transcript.len(),
+            3,
+            "sanity: the same-session status keeps the transcript intact"
         );
 
         // The resumed-completion signal: state flips to idle via a status
