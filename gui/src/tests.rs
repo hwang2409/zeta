@@ -7414,6 +7414,7 @@ fn zeta125_metadata_paints_directly_after_the_excerpt(cx: &mut TestAppContext) {
                     tail: zeta_gui::cards::OutputTail {
                         text: "x".repeat(4096),
                         truncated: false,
+                        bytes_seen: 4096,
                     },
                     expanded: false,
                     ..Default::default()
@@ -7471,6 +7472,7 @@ fn zeta125_grouping_at_three_or_more_receipts(cx: &mut TestAppContext) {
             tail: zeta_gui::cards::OutputTail {
                 text: "x".repeat(bytes),
                 truncated: false,
+                bytes_seen: bytes,
             },
             ..Default::default()
         },
@@ -7550,6 +7552,100 @@ fn zeta125_grouping_at_three_or_more_receipts(cx: &mut TestAppContext) {
     });
 }
 
+/// r2 review finding 4: the group header/button must remain painted
+/// while the group is EXPANDED so keyboard-only users can still collapse
+/// it. Before the r2 fix the header disappeared on expansion and only
+/// individual receipts remained — a keyboard user had no target to focus.
+/// This test drives real Enter keystrokes against the tab-stop header,
+/// verifies the header keeps painting after expansion, and drives a
+/// second Enter to collapse the group again. Enter/Space are the two
+/// activation keys the on_key_down handler accepts.
+#[gpui::test]
+fn zeta125_group_header_persists_when_expanded_and_toggles_via_real_keystrokes(
+    cx: &mut TestAppContext,
+) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let tool = |id: &str, bytes: usize| TranscriptEntry::Tool {
+        key: zeta_gui::state::ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: id.into(),
+        },
+        name: "read".into(),
+        excerpt: format!("src/{id}.rs"),
+        summary: String::new(),
+        complete: true,
+        error: false,
+        canceled: false,
+        card: zeta_gui::cards::Card {
+            tail: zeta_gui::cards::OutputTail {
+                text: "x".repeat(bytes),
+                truncated: false,
+                bytes_seen: bytes,
+            },
+            ..Default::default()
+        },
+    };
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![tool("a", 100), tool("b", 100), tool("c", 100)];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(3, cx));
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("tool-group-0").is_some(),
+        "collapsed group paints its header row",
+    );
+    // Focus the group's tab stop, then send a real Enter keystroke.
+    let focus_key = zeta_gui::row_text::sel::tool_group_focus_key("a");
+    visual.update(|window, cx| {
+        let handle = view.update(cx, |view, _| {
+            view.tool_group_focus
+                .borrow()
+                .get(&focus_key)
+                .cloned()
+                .expect("group focus handle registered on first paint")
+        });
+        window.focus(&handle, cx);
+        view.update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    });
+    visual.simulate_keystrokes("enter");
+    visual.update(|window, cx| {
+        view.update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    });
+    // Header must PERSIST when expanded so the tab stop and toggle
+    // remain reachable. The chevron flips to Down and the aria label
+    // announces the expanded state; both are covered by the aria label
+    // assertions further down.
+    assert!(
+        visual.debug_bounds("tool-group-0").is_some(),
+        "expanded group KEEPS the header row visible — a keyboard user \
+         needs a target to collapse back",
+    );
+    // The individual receipts also paint under the expanded header.
+    assert!(visual.debug_bounds("tool-receipt-0").is_some());
+    assert!(visual.debug_bounds("tool-receipt-2").is_some());
+    // Space collapses the group again through the same key path.
+    visual.simulate_keystrokes("space");
+    visual.update(|window, cx| {
+        view.update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("tool-group-0").is_some(),
+        "collapsed group still paints its header row",
+    );
+    assert!(
+        visual.debug_bounds("tool-receipt-0").is_none(),
+        "space toggles the group back to collapsed",
+    );
+}
+
 /// A collapsed tool-group summary row is a real tab stop (matches
 /// ZETA-108 a11y precedent) and toggles the group open on both mouse
 /// click and Enter. After expansion, the individual tool-receipt rows
@@ -7574,6 +7670,7 @@ fn zeta125_group_toggles_on_mouse_and_keyboard(cx: &mut TestAppContext) {
             tail: zeta_gui::cards::OutputTail {
                 text: "x".repeat(bytes),
                 truncated: false,
+                bytes_seen: bytes,
             },
             ..Default::default()
         },
@@ -7723,6 +7820,7 @@ fn zeta125_receipt_layout_holds_at_11px_and_18px(cx: &mut TestAppContext) {
                     tail: zeta_gui::cards::OutputTail {
                         text: "x".repeat(2048),
                         truncated: false,
+                        bytes_seen: 2048,
                     },
                     ..Default::default()
                 },

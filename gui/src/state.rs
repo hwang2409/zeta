@@ -103,6 +103,11 @@ pub struct ToolGroupPosition {
     pub first_index: usize,
     pub last_index: usize,
     pub first_id: String,
+    /// The turn every receipt in this group belongs to. Grouping never
+    /// crosses turns (see `AppState::tool_group_position`), so a receipt
+    /// from a later turn opens a NEW group even when it sits directly
+    /// after this one in the transcript.
+    pub turn: u64,
 }
 
 impl ToolGroupPosition {
@@ -187,6 +192,16 @@ pub struct AppState {
     /// own) never merges into the previous turn's rows, and a resumed
     /// in-flight message after a history replay never edits restored rows.
     turn_start: usize,
+    /// Monotonic counter that increments on every `TurnStart`. Every tool
+    /// receipt created inside a turn stamps its `Card::turn` with this
+    /// value; `tool_group_position` compares turns before joining
+    /// receipts into a group so a run of tool rows that spans a turn
+    /// boundary paints as two groups instead of one. Streaming forces
+    /// the CURRENT turn's groups expanded — every group whose turn
+    /// matches `current_turn` while `streaming` is true, not just the
+    /// trailing one — so a mid-turn assistant message that lands between
+    /// two tool bursts still leaves both bursts on screen without a click.
+    pub current_turn: u64,
     pub metrics: StatusMetrics,
     pub metrics_boundary: bool,
     /// Per-group expansion override, keyed by the `tool_call_id` of the
@@ -195,8 +210,8 @@ pub struct AppState {
     /// dynamically as consecutive tool rows accumulate (see
     /// `AppState::tool_group_of`), so keying by the first row's stable id
     /// keeps state pinned across a group that grows a new tail.
-    /// Streaming turns force the last group expanded regardless of the
-    /// map — see `AppState::tool_group_expanded`.
+    /// Streaming turns force every group in the active turn expanded
+    /// regardless of the map — see `AppState::tool_group_expanded`.
     pub tool_group_expanded: HashMap<String, bool>,
 }
 
@@ -215,6 +230,7 @@ impl Default for AppState {
             thinking: false,
             assistant_started: false,
             turn_start: 0,
+            current_turn: 0,
             metrics: StatusMetrics::default(),
             metrics_boundary: true,
             tool_group_expanded: HashMap::new(),
@@ -377,6 +393,12 @@ impl AppState {
                 // streamed rows and the final AssistantMessage merge here
                 // without folding into the previous turn's rows.
                 self.turn_start = self.transcript.len();
+                // Every tool receipt in the new turn stamps this counter on
+                // its `Card::turn`, so `tool_group_position` refuses to fold
+                // a tool row from the previous turn into a group with the
+                // fresh turn's tools. `saturating_add` keeps the counter safe
+                // under a synthetic pathological session.
+                self.current_turn = self.current_turn.saturating_add(1);
             }
             ServerEvent::AgentEnd { .. } | ServerEvent::TurnAborted { .. } => {
                 self.streaming = false;
@@ -444,6 +466,7 @@ impl AppState {
                 self.transcript.push(tool_entry(
                     &tool_call,
                     ToolReceiptKey::new(session_id, &data, &tool_call),
+                    self.current_turn,
                 ));
                 if let Some(index) = self.transcript.len().checked_sub(1) {
                     edits.push(TranscriptEdit::Insert(index));
@@ -589,32 +612,30 @@ impl AppState {
 
     /// Locate the tool-receipt group that contains `index`, if any. A run
     /// of `TOOL_GROUP_MIN_LEN` or more consecutive `TranscriptEntry::Tool`
-    /// rows counts as a group; below that threshold each receipt renders
-    /// on its own row. Returns `None` when the row is not a Tool, or when
-    /// the surrounding run is too short to group.
+    /// rows FROM THE SAME TURN counts as a group; below that threshold
+    /// each receipt renders on its own row. A turn boundary between two
+    /// adjacent tool rows breaks the run — the reviewer's r2 scenario
+    /// (2 tools in turn A followed by 1 tool in turn B) paints as two
+    /// separate units, never a 3-group. Returns `None` when the row is
+    /// not a Tool, or when the surrounding same-turn run is too short to
+    /// group.
     pub fn tool_group_position(&self, index: usize) -> Option<ToolGroupPosition> {
-        if !matches!(
-            self.transcript.get(index),
-            Some(TranscriptEntry::Tool { .. })
-        ) {
-            return None;
-        }
-        let mut first = index;
-        while first > 0
-            && matches!(
-                self.transcript.get(first - 1),
-                Some(TranscriptEntry::Tool { .. })
+        let turn = match self.transcript.get(index) {
+            Some(TranscriptEntry::Tool { card, .. }) => card.turn,
+            _ => return None,
+        };
+        let same_turn_tool = |i: usize| -> bool {
+            matches!(
+                self.transcript.get(i),
+                Some(TranscriptEntry::Tool { card, .. }) if card.turn == turn
             )
-        {
+        };
+        let mut first = index;
+        while first > 0 && same_turn_tool(first - 1) {
             first -= 1;
         }
         let mut last = index;
-        while last + 1 < self.transcript.len()
-            && matches!(
-                self.transcript.get(last + 1),
-                Some(TranscriptEntry::Tool { .. })
-            )
-        {
+        while last + 1 < self.transcript.len() && same_turn_tool(last + 1) {
             last += 1;
         }
         if last - first + 1 < TOOL_GROUP_MIN_LEN {
@@ -628,16 +649,19 @@ impl AppState {
             first_index: first,
             last_index: last,
             first_id,
+            turn,
         })
     }
 
     /// Is the given group currently expanded on screen? Groups default to
     /// collapsed; the map holds `true` for groups the user opened. While
-    /// streaming, the LAST group in the transcript is forced expanded so
-    /// live tool activity stays visible without a click — the contract's
-    /// "expanded while streaming" rule.
+    /// streaming, EVERY group in the current turn (`group.turn ==
+    /// self.current_turn`) is forced expanded so live tool activity stays
+    /// visible without a click — the reviewer's r2 scenario (mid-turn
+    /// assistant text splits one turn into two tool bursts) expands both
+    /// bursts, not only the trailing one.
     pub fn is_tool_group_expanded(&self, group: &ToolGroupPosition) -> bool {
-        if self.streaming && self.is_last_tool_group(group) {
+        if self.streaming && group.turn == self.current_turn {
             return true;
         }
         self.tool_group_expanded
@@ -662,24 +686,16 @@ impl AppState {
         }
     }
 
-    fn is_last_tool_group(&self, group: &ToolGroupPosition) -> bool {
-        // The group is "last" when no Tool row follows it. A trailing
-        // non-Tool row (e.g. an assistant reply that landed after the run
-        // of receipts) still counts as last — the streaming turn has
-        // moved past the tool activity. Only a later Tool row would open
-        // a fresh group ahead of this one.
-        (group.last_index + 1..self.transcript.len())
-            .all(|i| !matches!(self.transcript.get(i), Some(TranscriptEntry::Tool { .. })))
-    }
-
-    /// Sum the on-screen output bytes across every receipt in the group.
+    /// Sum the cumulative bytes flowed through every receipt in the group.
     /// Used by the render layer to compose the summary row's total-size
-    /// metadata; matches the per-row size accounting each collapsed
-    /// receipt shows already.
+    /// metadata. Reads `bytes_seen` on each receipt's tail — the total
+    /// output the tool produced — so the summary stays consistent with
+    /// each row's own size label even after the per-tail 20-line /
+    /// 16k-char truncation clipped some bytes off screen.
     pub fn tool_group_output_bytes(&self, group: &ToolGroupPosition) -> usize {
         (group.first_index..=group.last_index)
             .filter_map(|i| match self.transcript.get(i) {
-                Some(TranscriptEntry::Tool { card, .. }) => Some(card.tail.text.len()),
+                Some(TranscriptEntry::Tool { card, .. }) => Some(card.tail.bytes_seen),
                 _ => None,
             })
             .sum()
@@ -696,7 +712,8 @@ impl AppState {
         let (index, inserted) = match existing {
             Some(index) => (index, false),
             None => {
-                self.transcript.push(tool_entry(tool_call, key));
+                self.transcript
+                    .push(tool_entry(tool_call, key, self.current_turn));
                 (self.transcript.len() - 1, true)
             }
         };
@@ -732,6 +749,7 @@ impl AppState {
                     canceled: false,
                     card: Card {
                         child_instance_id: Some(receipt.child_instance_id.clone()),
+                        turn: self.current_turn,
                         ..Default::default()
                     },
                 });
@@ -956,8 +974,12 @@ fn bounded_summary(text: &str) -> String {
 /// tool receipt shows what actually ran": bash/exec use the command's first
 /// line; read/write/edit use the file path; fetch uses the URL; other tools
 /// fall through to the first primitive argument, else the tool name alone.
-/// The excerpt is stripped of control chars, truncated at `EXCERPT_CHARS`
-/// with a horizontal-ellipsis marker, and never empty.
+/// The excerpt is stripped of control chars, run through `redact_secrets`
+/// so no secret material ever lands in the persisted transcript, and
+/// truncated at `EXCERPT_CHARS` with a horizontal-ellipsis marker. Never
+/// empty. Redaction happens BEFORE truncation so a secret that would sit
+/// beyond the cap is still masked in the retained prefix rather than
+/// preserved in whatever ends up displayed.
 pub fn tool_excerpt(name: &str, arguments: &serde_json::Map<String, serde_json::Value>) -> String {
     let key = match name.to_ascii_lowercase().as_str() {
         "bash" | "exec" | "shell" => Some("command"),
@@ -980,7 +1002,150 @@ pub fn tool_excerpt(name: &str, arguments: &serde_json::Map<String, serde_json::
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect();
-    truncate_excerpt(&cleaned)
+    let redacted = redact_secrets(&cleaned);
+    truncate_excerpt(&redacted)
+}
+
+/// Placeholder that replaces a redacted secret in a stored excerpt. Not a
+/// chrome literal — the redaction runs BEFORE the row_text model composes
+/// its visible strings, so this string travels inside `excerpt` and rides
+/// the same fence path the raw excerpt does. Kept short so an assignment
+/// like `KEY=[redacted]` remains legible.
+pub const REDACTED_MARKER: &str = "[redacted]";
+
+/// Case-insensitive substring patterns matched against the LEFT side of an
+/// `=` or a URL query-param key. A hit triggers value redaction. The set is
+/// deliberately broad — a false positive (e.g. `PACK_KEY_LOG=verbose`)
+/// only masks a debug value, while a false negative persists a secret. The
+/// ordering matches the review's list: token / key / secret / password
+/// families, plus their common aliases (auth, bearer, credential,
+/// signature/sig, session).
+const SECRET_KEY_PATTERNS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "credential",
+    "auth",
+    "bearer",
+    "apikey",
+    "api_key",
+    "access_key",
+    "session_key",
+    "signature",
+    "sig",
+    "key",
+];
+
+/// Does an assignment key or query-param key smell like a secret? Match is
+/// substring on the lowercased name so `ANTHROPIC_API_KEY`,
+/// `x-github-token`, `Session-Auth`, and `AWS_SECRET_ACCESS_KEY` all light
+/// up. Empty keys are never secrets (an equals sign with no left side is
+/// not an assignment).
+fn key_is_secret(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    SECRET_KEY_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+}
+
+/// Redact secret material from a one-line command / URL / path excerpt
+/// BEFORE it lands in `TranscriptEntry::Tool::excerpt`. Three shapes are
+/// covered:
+///
+///   * URL userinfo: `scheme://user:pass@host/...` -> `scheme://[redacted]@host/...`
+///   * URL query params whose key matches `SECRET_KEY_PATTERNS`:
+///     `?token=abc&filter=x` -> `?token=[redacted]&filter=x`
+///   * Env-token assignments in any whitespace-separated token whose key
+///     matches `SECRET_KEY_PATTERNS`: `ANTHROPIC_API_KEY=sk-ant-xxx` ->
+///     `ANTHROPIC_API_KEY=[redacted]`
+///
+/// The excerpt is a display preview, not a runnable command, so this pass
+/// collapses runs of whitespace to a single space. That is acceptable —
+/// the excerpt already truncates at `EXCERPT_CHARS` and control chars are
+/// scrubbed by the caller before redaction runs.
+pub(crate) fn redact_secrets(input: &str) -> String {
+    let mut pieces: Vec<String> = Vec::new();
+    for token in input.split_whitespace() {
+        pieces.push(redact_token(token));
+    }
+    pieces.join(" ")
+}
+
+fn redact_token(token: &str) -> String {
+    if token.contains("://") {
+        return redact_url_token(token);
+    }
+    if let Some(eq_ix) = token.find('=') {
+        let key = &token[..eq_ix];
+        if key_is_secret(key) {
+            let mut out = String::with_capacity(key.len() + REDACTED_MARKER.len() + 1);
+            out.push_str(key);
+            out.push('=');
+            out.push_str(REDACTED_MARKER);
+            return out;
+        }
+    }
+    token.to_owned()
+}
+
+fn redact_url_token(token: &str) -> String {
+    let scheme_end = match token.find("://") {
+        Some(ix) => ix,
+        None => return token.to_owned(),
+    };
+    let auth_start = scheme_end + 3;
+    let rest = &token[auth_start..];
+    let auth_end = rest
+        .find(|ch: char| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let after_auth = &rest[auth_end..];
+    let mut out = String::with_capacity(token.len() + REDACTED_MARKER.len());
+    out.push_str(&token[..auth_start]);
+    if let Some(at_ix) = authority.rfind('@') {
+        out.push_str(REDACTED_MARKER);
+        out.push('@');
+        out.push_str(&authority[at_ix + 1..]);
+    } else {
+        out.push_str(authority);
+    }
+    // Query and fragment: redact each `?key=value` / `&key=value` pair whose
+    // key matches the secret-shaped set. Fragment (`#...`) is preserved
+    // as-is; secrets in a fragment are unusual and the fragment layout
+    // varies too much across services for a per-pair rewrite to be safe.
+    if let Some(q_rel) = after_auth.find('?') {
+        out.push_str(&after_auth[..=q_rel]);
+        let tail = &after_auth[q_rel + 1..];
+        let (query, fragment) = match tail.find('#') {
+            Some(hash) => (&tail[..hash], &tail[hash..]),
+            None => (tail, ""),
+        };
+        let mut first_pair = true;
+        for pair in query.split('&') {
+            if !first_pair {
+                out.push('&');
+            }
+            first_pair = false;
+            if let Some(eq_ix) = pair.find('=') {
+                let key = &pair[..eq_ix];
+                if key_is_secret(key) {
+                    out.push_str(key);
+                    out.push('=');
+                    out.push_str(REDACTED_MARKER);
+                    continue;
+                }
+            }
+            out.push_str(pair);
+        }
+        out.push_str(fragment);
+    } else {
+        out.push_str(after_auth);
+    }
+    out
 }
 
 fn argument_text(value: &serde_json::Value) -> Option<String> {
@@ -1003,7 +1168,7 @@ fn truncate_excerpt(text: &str) -> String {
     text.to_owned()
 }
 
-fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey) -> TranscriptEntry {
+fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey, turn: u64) -> TranscriptEntry {
     let agent_label = if tool_call.name.eq_ignore_ascii_case("agent") {
         Some(
             tool_call
@@ -1020,6 +1185,7 @@ fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey) -> TranscriptEntry {
     TranscriptEntry::Tool {
         card: Card {
             agent_label,
+            turn,
             ..Default::default()
         },
         key,
@@ -1381,7 +1547,7 @@ mod tests {
             ..call()
         };
         assert!(
-            matches!(tool_entry(&huge, ToolReceiptKey::new(None, &json!({}), &huge)), TranscriptEntry::Tool { summary, .. } if summary.chars().count() == SUMMARY_CHARS)
+            matches!(tool_entry(&huge, ToolReceiptKey::new(None, &json!({}), &huge), 0), TranscriptEntry::Tool { summary, .. } if summary.chars().count() == SUMMARY_CHARS)
         );
     }
 
@@ -2236,5 +2402,285 @@ mod tests {
         assert!(matches!(state.connection, ConnectionState::Lost(_)));
         state.begin_reconnect();
         assert_eq!(state.connection, ConnectionState::Reconnecting);
+    }
+
+    // ---------- excerpt redaction (ZETA-125 privacy) ------------------------
+
+    #[test]
+    fn excerpt_redacts_env_token_assignments_by_key_shape() {
+        // Every secret-shaped assignment MUST land in the persisted excerpt
+        // with the value replaced by REDACTED_MARKER. Values differ across
+        // real sessions but the key names do not; matching on the key
+        // catches the whole class. A friendly, non-secret assignment like
+        // NODE_ENV=production stays intact so the receipt still names what
+        // ran.
+        for command in [
+            "export ANTHROPIC_API_KEY=sk-ant-abc123 && node build.js",
+            "GITHUB_TOKEN=ghp_xyz curl example.com",
+            "AWS_SECRET_ACCESS_KEY=wJalrXUt aws s3 ls",
+            "PASSWORD=hunter2 psql",
+            "X_AUTH=bearer-xyz curl",
+            "STRIPE_SIGNATURE=v1,t=1 verify.sh",
+        ] {
+            let excerpt = tool_excerpt(
+                "bash",
+                &[("command".to_owned(), json!(command))]
+                    .into_iter()
+                    .collect(),
+            );
+            assert!(
+                excerpt.contains(REDACTED_MARKER),
+                "excerpt for {command:?} did not redact: {excerpt:?}"
+            );
+            for secret in [
+                "sk-ant-abc123",
+                "ghp_xyz",
+                "wJalrXUt",
+                "hunter2",
+                "bearer-xyz",
+                "v1,t=1",
+            ] {
+                assert!(
+                    !excerpt.contains(secret),
+                    "excerpt for {command:?} leaked {secret:?}: {excerpt:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn excerpt_preserves_non_secret_assignments() {
+        // A false-positive redaction would blank a benign env var and make
+        // the receipt harder to read. NODE_ENV / DEBUG / VERBOSE all stay
+        // intact — none of them match the secret-shaped patterns.
+        let excerpt = tool_excerpt(
+            "bash",
+            &[(
+                "command".to_owned(),
+                json!("NODE_ENV=production DEBUG=1 node app.js"),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert!(
+            !excerpt.contains(REDACTED_MARKER),
+            "false positive: {excerpt:?}"
+        );
+        assert!(excerpt.contains("NODE_ENV=production"));
+        assert!(excerpt.contains("DEBUG=1"));
+    }
+
+    #[test]
+    fn excerpt_redacts_url_userinfo() {
+        // Credentials in the userinfo portion (`user:pass@host`) MUST never
+        // land in the persisted excerpt. The rest of the URL — scheme,
+        // host, path, non-secret query — remains legible so the receipt
+        // still identifies what got hit.
+        let excerpt = tool_excerpt(
+            "fetch",
+            &[(
+                "url".to_owned(),
+                json!("https://alice:hunter2@api.example.com/v1/data"),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert!(
+            !excerpt.contains("alice") && !excerpt.contains("hunter2"),
+            "userinfo leaked: {excerpt:?}"
+        );
+        assert!(excerpt.contains("api.example.com/v1/data"));
+        assert!(excerpt.contains("[redacted]@"));
+    }
+
+    #[test]
+    fn excerpt_redacts_secret_query_params() {
+        // Token-bearing query params (token=, api_key=, secret=, sig=, ...)
+        // land redacted while benign params stay intact. Values differ per
+        // session; keys do not.
+        let url = "https://api.example.com/read?filter=all&token=secret123&limit=10&api_key=xyz";
+        let excerpt = tool_excerpt(
+            "fetch",
+            &[("url".to_owned(), json!(url))].into_iter().collect(),
+        );
+        assert!(!excerpt.contains("secret123"), "token leaked: {excerpt:?}");
+        assert!(!excerpt.contains("=xyz"), "api_key leaked: {excerpt:?}");
+        assert!(excerpt.contains("filter=all"));
+        assert!(excerpt.contains("limit=10"));
+        assert!(excerpt.contains("token=[redacted]"));
+        assert!(excerpt.contains("api_key=[redacted]"));
+    }
+
+    #[test]
+    fn excerpt_redacts_secrets_from_a_curl_bash_line() {
+        // Composite scenario from the r2 review: an inline curl with the
+        // credentials in userinfo AND a token query param AND a leading
+        // env-var assignment. All three redactions must fire together.
+        let cmd = "GITHUB_TOKEN=ghp_secret curl https://alice:hunter2@api.example.com/data?token=abc&filter=x";
+        let excerpt = tool_excerpt(
+            "bash",
+            &[("command".to_owned(), json!(cmd))].into_iter().collect(),
+        );
+        for leak in ["ghp_secret", "alice", "hunter2", "token=abc"] {
+            assert!(
+                !excerpt.contains(leak),
+                "excerpt leaked {leak:?}: {excerpt:?}"
+            );
+        }
+    }
+
+    // ---------- turn-scoped tool groups (ZETA-125 r2 review) ---------------
+
+    fn ordered_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_owned(),
+            name: "bash".to_owned(),
+            arguments: [("command".to_owned(), json!(format!("echo {id}")))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn tool_groups_never_span_a_turn_boundary() {
+        // r2 reviewer's regression probe: two tools in turn A followed by
+        // ONE tool in turn B must paint as two separate units — never a
+        // three-member group. `tool_group_position` refuses to cross a
+        // turn boundary even when the receipts sit adjacent in the
+        // transcript.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        for id in ["a", "b"] {
+            state.apply(ServerEvent::ToolStart {
+                session_id: None,
+                tool_call: ordered_call(id),
+                data: json!({}),
+            });
+        }
+        state.apply(ServerEvent::TurnEnd {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: ordered_call("c"),
+            data: json!({}),
+        });
+        // 3 receipts total, but split 2 + 1 across two turns. Neither run
+        // clears the TOOL_GROUP_MIN_LEN=3 floor within its own turn, so
+        // NO group forms.
+        for i in 0..3 {
+            assert_eq!(
+                state.tool_group_position(i),
+                None,
+                "receipt {i} joined a cross-turn group"
+            );
+        }
+        // Confirm the turns on the receipts differ — the guarantee the
+        // grouping guard rides on.
+        let turns: Vec<u64> = state
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Tool { card, .. } => Some(card.turn),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(turns[0], turns[1], "turn A receipts share a turn id");
+        assert_ne!(turns[1], turns[2], "turn B receipt has a fresh turn id");
+    }
+
+    #[test]
+    fn streaming_expands_every_group_in_the_active_turn() {
+        // r2 reviewer's scenario: mid-turn assistant text splits one turn
+        // into two runs of tool receipts. While the turn streams, BOTH
+        // groups must stay expanded — not just the trailing one — so live
+        // tool activity in either burst is visible without a click.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        for id in ["a", "b", "c"] {
+            state.apply(ServerEvent::ToolStart {
+                session_id: None,
+                tool_call: ordered_call(id),
+                data: json!({}),
+            });
+        }
+        // A mid-turn assistant message splits the run of receipts...
+        state.apply(ServerEvent::AssistantMessage {
+            session_id: None,
+            message: Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "checking...".into(),
+                }],
+            },
+        });
+        for id in ["d", "e", "f"] {
+            state.apply(ServerEvent::ToolStart {
+                session_id: None,
+                tool_call: ordered_call(id),
+                data: json!({}),
+            });
+        }
+        // Two 3-member groups now exist within the same turn.
+        let first = state.tool_group_position(0).expect("first group");
+        let second = state
+            .tool_group_position(state.transcript.len() - 1)
+            .expect("second group");
+        assert_ne!(first.first_index, second.first_index);
+        assert_eq!(first.turn, second.turn, "both groups share the turn");
+        // With streaming ON, both should read as expanded.
+        assert!(state.streaming);
+        assert!(state.is_tool_group_expanded(&first));
+        assert!(state.is_tool_group_expanded(&second));
+        // Turn ends -> streaming stops -> both fall back to the map (empty)
+        // and read as collapsed.
+        state.apply(ServerEvent::AgentEnd {
+            session_id: None,
+            data: json!({}),
+        });
+        assert!(!state.streaming);
+        assert!(!state.is_tool_group_expanded(&first));
+        assert!(!state.is_tool_group_expanded(&second));
+    }
+
+    #[test]
+    fn tool_group_total_bytes_reads_cumulative_output() {
+        // The group summary total tracks `bytes_seen` on each receipt's
+        // tail, not the on-screen retained bytes. A tail that truncated
+        // some of its history STILL contributes every byte that ever
+        // flowed through it, so the total matches "total output produced"
+        // — what an operator counting bytes would expect — rather than
+        // "bytes currently retained on screen".
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        for id in ["a", "b", "c"] {
+            state.apply(ServerEvent::ToolStart {
+                session_id: None,
+                tool_call: ordered_call(id),
+                data: json!({}),
+            });
+            state.apply(ServerEvent::ToolOutput {
+                session_id: None,
+                tool_call: ordered_call(id),
+                output: "x".repeat(100),
+                data: json!({}),
+            });
+        }
+        let group = state.tool_group_position(0).expect("group");
+        assert_eq!(state.tool_group_output_bytes(&group), 300);
     }
 }

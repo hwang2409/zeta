@@ -296,9 +296,18 @@ pub struct ToolGroupRowText<'a> {
     /// every receipt in the group finished with empty output.
     pub total_label: Option<String>,
     /// The first up-to-two excerpts, previewed on the summary row so the
-    /// group's contents remain recognisable without expanding it. Borrowed
-    /// from the underlying transcript entries.
+    /// group's contents remain recognisable without expanding it. Each
+    /// entry is a borrow from the underlying transcript entry — paired
+    /// with the row-level `chrome::TOOL_GROUP_META_SEPARATOR` in the
+    /// render layer so the summary reads
+    /// "N tool calls · preview · preview · total".
     pub preview_excerpts: Vec<&'a str>,
+    /// Chrome separator painted between the count / preview / total
+    /// clusters. Sourced from `chrome::TOOL_GROUP_META_SEPARATOR` so a
+    /// wording change has one home; the render layer paints it once
+    /// before each preview excerpt and once before the total when either
+    /// is present.
+    pub separator: &'static str,
     /// Composed accessible label — the same visible text a screen reader
     /// hears when the summary row receives focus, including expansion
     /// state (`… collapsed` / `… expanded`) so keyboard-only users hear the
@@ -424,11 +433,13 @@ impl<'a> RowText<'a> {
                     count_label,
                     total_label,
                     preview_excerpts,
+                    separator,
                     aria_label,
                 } = text;
                 out.push(count_label.as_str());
                 out.extend(total_label.as_deref());
                 out.extend(preview_excerpts.iter().copied());
+                out.push(separator);
                 out.push(aria_label.as_str());
             }
             Self::ToolGroupHidden => {}
@@ -498,7 +509,12 @@ pub fn build<'a>(
             card,
             ..
         } => {
-            let output_size = card.tail.text.len();
+            // Metadata reads cumulative bytes flowed through the tail
+            // (`bytes_seen`), not just the on-screen retained bytes. That
+            // keeps the receipt's size label consistent with a group
+            // summary that sums the same field across its members — the
+            // r2 review flagged the mismatch when tails truncated.
+            let output_size = card.tail.bytes_seen;
             let has_output = output_size > 0;
             let collapsed_with_output = !card.expanded && has_output;
             RowText::Tool(ToolRowText {
@@ -594,6 +610,11 @@ pub fn build_tool_group<'a>(
     let total_label = (total_output_bytes > 0).then(|| format_output_size(total_output_bytes));
     let take = preview_count.min(2).min(excerpts.len());
     let preview_excerpts: Vec<&'a str> = excerpts.iter().take(take).copied().collect();
+    // The separator glyph rides on the row unconditionally so the
+    // render layer never has to reason about a missing value; it only
+    // paints the separator when it also paints a preview or the total,
+    // so an orphan separator cannot end up on a chromeless row.
+    let separator = chrome::TOOL_GROUP_META_SEPARATOR;
     let state_suffix = if expanded {
         chrome::TOOL_GROUP_ARIA_EXPANDED
     } else {
@@ -601,6 +622,10 @@ pub fn build_tool_group<'a>(
     };
     let mut aria_label = String::new();
     aria_label.push_str(&count_label);
+    for preview in &preview_excerpts {
+        aria_label.push_str(chrome::TOOL_GROUP_META_SEPARATOR);
+        aria_label.push_str(preview);
+    }
     if let Some(total) = &total_label {
         aria_label.push_str(chrome::TOOL_GROUP_META_SEPARATOR);
         aria_label.push_str(total);
@@ -610,6 +635,7 @@ pub fn build_tool_group<'a>(
         count_label,
         total_label,
         preview_excerpts,
+        separator,
         aria_label,
     }
 }

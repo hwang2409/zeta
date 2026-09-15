@@ -300,6 +300,7 @@ fn seed_zeta_125_tool_run(state: &mut zeta_gui::state::AppState) {
                     tail: OutputTail {
                         text: "x".repeat(bytes),
                         truncated: false,
+                        bytes_seen: bytes,
                     },
                     ..Default::default()
                 },
