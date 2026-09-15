@@ -143,6 +143,37 @@ impl ZetaView {
         };
 
         let inner = self.render_row_inner(index, view, cx);
+        // Prose rows (user, assistant, thinking) cap at the narrower reading
+        // measure so long assistant lines wrap at a comfortable ~88ch. Tool
+        // receipts, error blocks, and any other row keep the wider
+        // `TRANSCRIPT_MAX_WIDTH` so a long tool command line or an error
+        // stack has room.
+        //
+        // r2 clarification (ZETA-124 finding 4): a fenced code block INSIDE
+        // an assistant markdown row rides the SAME prose cap as the prose
+        // around it — the cap sits on the row wrapper, not on the child
+        // markdown segments, so a wider fenced block would need a per-block
+        // split renderer we deliberately do not add here. Split rendering
+        // would give code fences a second column boundary of their own and
+        // fight the reading rhythm the prose cap is here to establish;
+        // tool receipts / error blocks already carry the wide cap for the
+        // shell / stack output that actually benefits from horizontal
+        // room. See `assistant_code_fence_rides_the_prose_cap` for the
+        // test that pins this shape so a peer refactor that quietly
+        // reintroduces block-aware sizing lands next to the review note
+        // rather than as a surprise.
+        //
+        // The measure scales with the appearance picker's base font so an
+        // 18px reader keeps the same character budget on screen.
+        let prose_row = matches!(
+            self.state.transcript[index],
+            TranscriptEntry::User(_) | TranscriptEntry::Assistant(_) | TranscriptEntry::Thinking
+        );
+        let max_width = if prose_row {
+            theme::prose_max_width(cx.theme().font_size)
+        } else {
+            theme::TRANSCRIPT_MAX_WIDTH
+        };
         div()
             .debug_selector(|| sel::TRANSCRIPT_ROW.into())
             .w_full()
@@ -158,9 +189,10 @@ impl ZetaView {
             .pb(row_gap)
             .child(
                 div()
+                    .debug_selector(|| sel::TRANSCRIPT_COLUMN.into())
                     .w_full()
                     .min_w_0()
-                    .max_w(theme::TRANSCRIPT_MAX_WIDTH)
+                    .max_w(max_width)
                     .px_4()
                     .child(inner),
             )
@@ -332,6 +364,27 @@ impl ZetaView {
             source,
             truncated_hint,
         } = text;
+        // Text-run recorder: shape the raw source at the same wrap width
+        // the prose row hands to the text system, and record the widest
+        // wrap-line. See `crate::record_text_geometry` for why this seam
+        // is needed — `painted_quads()` cannot observe glyph sprites, so
+        // a shape that produces a line wider than the column's content
+        // box is invisible to every earlier fix pass. Gated behind test /
+        // smoke-test so release builds pay nothing.
+        #[cfg(any(test, feature = "smoke-test"))]
+        {
+            let font_size = cx.theme().font_size;
+            let wrap_width = theme::prose_text_measure(font_size);
+            let font = gpui::font(theme::current_font_family());
+            crate::record_text_geometry(
+                cx,
+                || sel::message(index),
+                source,
+                font,
+                font_size,
+                wrap_width,
+            );
+        }
         let source = source.to_owned();
         div()
             .py(px(2.))
@@ -408,7 +461,7 @@ impl ZetaView {
                         } else {
                             IconName::ChevronRight
                         })
-                        .size(px(12.))
+                        .size(theme::label_small(cx.theme().font_size))
                         .text_color(record_state(|| sel::tool_chevron(index), state_color)),
                     )
                     .child(

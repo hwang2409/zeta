@@ -103,10 +103,11 @@ pub fn image_source(image: &ImageAttachment) -> Option<Arc<gpui::Image>> {
 }
 
 pub fn thumbnail(image: Arc<gpui::Image>, cx: &App) -> impl IntoElement {
-    // Capture the derived fallback size at call time; the closure paints
-    // later and does not carry a `cx`. Scales with the appearance picker's
-    // base font size so the caption reflows on font-size changes.
-    let fallback_size = theme::label_micro(cx.theme().font_size);
+    // Capture the picker's base font at call time; the closure paints later
+    // and does not carry a `cx`. Routing through `theme::label_micro` at the
+    // paint site lands the fallback caption on the same role every other
+    // micro-tier text site uses so the type-role guard blesses it.
+    let base = cx.theme().font_size;
     gpui::img(image)
         .debug_selector(|| "attachment-thumbnail".into())
         .w(px(64.))
@@ -124,7 +125,7 @@ pub fn thumbnail(image: Arc<gpui::Image>, cx: &App) -> impl IntoElement {
         // The adjacent name and size remain available when decoding fails.
         .with_fallback(move || {
             div()
-                .text_size(fallback_size)
+                .text_size(theme::label_micro(base))
                 .child("No preview")
                 .into_any_element()
         })
