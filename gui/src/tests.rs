@@ -8856,13 +8856,23 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
             font_size: theme::clamp_font_size(base_px),
         };
         visual.update(|_, cx| theme::apply_with(cx, &appearance));
-        // First draw measures every row; the sections wrapper's
-        // `on_children_prepainted` hook then updates the snapped mask
-        // height for the second draw so the mask top edge always lands
-        // on a row boundary (never inside a row). Two draws let the
-        // convergence complete inside a single test iteration without
-        // touching the round-7 assertion below.
+        // One external draw is all a real client provides: prepaint
+        // measures the rows, computes the row-snapped mask height, and
+        // when it changes schedules a follow-up frame via
+        // `on_next_frame` (Window::refresh is a no-op during a draw, so
+        // the previous in-draw refresh() silently dropped until an
+        // unrelated event dirtied the window). Tests have no platform
+        // frame loop, so `simulate_next_frame` delivers the queued
+        // callback exactly the way the platform would — the second
+        // draw below stands in for the redraw the platform performs
+        // once the callback marks the window dirty.
         visual.update(|window, cx| window.draw(cx).clear(cx));
+        let scheduled = visual.update(|window, cx| window.simulate_next_frame(cx));
+        assert!(
+            scheduled > 0,
+            "prepaint should schedule a follow-up frame at {base_px}px \
+             so the row-snapped mask converges without a second external draw"
+        );
         visual.update(|window, cx| window.draw(cx).clear(cx));
         let panel = visual
             .debug_bounds("settings-panel")
@@ -8910,6 +8920,15 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
                  (row must be fully visible or fully masked — never sliced)"
             );
         }
+        // Settled-state property: with the snapped value now equal to
+        // the prepaint measurement, the equality guard must stop
+        // scheduling frames — otherwise every draw would queue a
+        // follow-up, spinning the frame loop forever.
+        let extra = visual.update(|window, cx| window.simulate_next_frame(cx));
+        assert_eq!(
+            extra, 0,
+            "settled snap value at {base_px}px must not schedule extra frames"
+        );
     }
     // Reset for peer tests.
     visual.update(|_, cx| theme::apply(cx));

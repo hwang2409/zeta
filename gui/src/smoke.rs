@@ -785,6 +785,16 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                     view.state.mark_connection_lost("socket closed");
                                     cx.notify();
                                 });
+                                // Two frames: the first opens the modal and
+                                // its `on_children_prepainted` hook measures
+                                // rows to compute the row-snapped scroll-cue
+                                // height, which is queued for the next
+                                // frame via `on_next_frame`. The second draw
+                                // paints the mask at its settled height so
+                                // the captured pixels show the final
+                                // geometry (a single frame would capture
+                                // the raw, un-snapped mask).
+                                window.render_frame(cx);
                                 window.render_frame(cx);
                                 if let Some(path) = &path {
                                     window
@@ -811,6 +821,13 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         };
                                         theme::apply_with(cx, &appearance);
                                     });
+                                    // Two frames for the same reason as the
+                                    // 13px capture above: the appearance
+                                    // change re-measures the rows at the
+                                    // new base font, and the snapped
+                                    // scroll-cue height only lands after
+                                    // the `on_next_frame` follow-up draw.
+                                    window.render_frame(cx);
                                     window.render_frame(cx);
                                     window
                                         .render_to_image()

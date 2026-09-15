@@ -1683,7 +1683,20 @@ impl ZetaView {
                                 let snapped = (wrapper_bottom - mask_top).max(raw_cue_h);
                                 if snapped_cell.get() != Some(snapped) {
                                     snapped_cell.set(Some(snapped));
-                                    window.refresh();
+                                    // Window::refresh() is a no-op while a
+                                    // draw is in flight (checks
+                                    // `invalidator.not_drawing()`), so
+                                    // requesting a redraw from inside the
+                                    // prepaint would silently drop until an
+                                    // unrelated event dirtied the window.
+                                    // Defer to on_next_frame so the platform
+                                    // loop picks up the follow-up frame after
+                                    // this draw completes. Once the snapped
+                                    // value settles, the equality guard above
+                                    // stops scheduling further frames.
+                                    window.on_next_frame(|window, _cx| {
+                                        window.refresh();
+                                    });
                                 }
                             })
                             .child(
