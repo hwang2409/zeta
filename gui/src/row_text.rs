@@ -850,6 +850,11 @@ mod tests {
                 ..Default::default()
             };
             card.tail.text = "x".repeat(bytes);
+            // Metadata reads `bytes_seen` (the cumulative-output field
+            // that survives tail truncation), so populate it to match
+            // the on-screen text length. The label formatter picks its
+            // unit off `bytes_seen`, not `text.len()`.
+            card.tail.bytes_seen = bytes;
             let entry = TranscriptEntry::Tool {
                 key: ToolReceiptKey {
                     session_id: None,
