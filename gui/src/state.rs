@@ -624,33 +624,10 @@ impl AppState {
                             // Streamed tools already fed `bytes_seen` from
                             // ToolOutput. NEVER count the final payload's
                             // bytes — the streamed count is authoritative
-                            // (r4 finding 1). What the visible tail does
-                            // with the final payload depends on shape:
-                            //
-                            //   * Wrapped: bash returns
-                            //     `"stdout:\n…\nstderr:\n…"` around the
-                            //     streamed stdout (src/zeta/tools/bash.py:194).
-                            //     The streamed tail is a SUBSTRING of the
-                            //     final payload; the payload's wrapped
-                            //     shape reads better than the raw stdout,
-                            //     so replace the visible tail with it.
-                            //   * Distinct summary: agent-style tools
-                            //     stream progress and return a completion
-                            //     message that does NOT contain the
-                            //     streamed content (see
-                            //     `delegated_cards_keep_separate_tails_disclosure_and_failures`).
-                            //     Preserve both signals by appending the
-                            //     summary without touching bytes_seen.
-                            let final_wraps_streamed = !card.tail.text.is_empty()
-                                && result.content.contains(card.tail.text.as_str());
-                            if final_wraps_streamed {
-                                card.tail.replace_visible(&result.content);
-                            } else if card.tail.text != result.content {
-                                if !card.tail.text.is_empty() && !card.tail.text.ends_with('\n') {
-                                    card.tail.push_visible("\n");
-                                }
-                                card.tail.push_visible(&result.content);
-                            }
+                            // (r4 finding 1). The final payload always
+                            // replaces the visible tail, whether it wraps
+                            // the streamed output or is a distinct summary.
+                            card.tail.replace_visible(&result.content);
                         } else if card.tail.text != result.content {
                             // Non-streamed tools (delegated agents that
                             // only emit ToolEnd) count the final content
@@ -1247,41 +1224,54 @@ pub(crate) fn redact_secrets(input: &str) -> String {
 /// not a runnable command, and keeping the quotes makes it obvious that a
 /// value spanned whitespace before redaction ran.
 ///
-/// Backslash outside quotes ESCAPES the next character: `PASSWORD=correct\ horse`
-/// stays one token whose value carries the escaped space. Without this the
-/// naive whitespace split would leak the tail of an unquoted-with-escape
-/// secret — the r4 review flagged that exact bypass alongside the r3
-/// quoted-secret class.
+/// Backslash escapes the next character in unquoted and double-quoted states:
+/// `PASSWORD=correct\ horse` and `PASSWORD="correct\ horse"` each stay one
+/// token. Single-quoted backslashes are literal, per POSIX shell rules.
 fn shell_split(input: &str) -> Vec<String> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Unquoted,
+        SingleQuoted,
+        DoubleQuoted,
+    }
+
     let mut words: Vec<String> = Vec::new();
     let mut current = String::new();
-    let mut quote: Option<char> = None;
+    let mut state = State::Unquoted;
     let mut chars = input.chars();
     while let Some(ch) = chars.next() {
-        match (quote, ch) {
-            (None, '\\') => {
-                // Backslash outside quotes joins the next char into the
-                // current word without splitting — POSIX shell escape.
+        match (state, ch) {
+            (State::Unquoted, '\\') | (State::DoubleQuoted, '\\') => {
                 // A trailing backslash with no follower keeps the current
                 // word intact and drops the stray escape.
                 if let Some(next) = chars.next() {
                     current.push(next);
                 }
             }
-            (None, c) if c.is_whitespace() => {
+            (State::Unquoted, c) if c.is_whitespace() => {
                 if !current.is_empty() {
                     words.push(std::mem::take(&mut current));
                 }
             }
-            (None, '\'' | '"') => {
-                quote = Some(ch);
+            (State::Unquoted, '\'') => {
+                state = State::SingleQuoted;
                 current.push(ch);
             }
-            (Some(q), c) if c == q => {
-                quote = None;
+            (State::Unquoted, '"') => {
+                state = State::DoubleQuoted;
                 current.push(ch);
             }
-            _ => current.push(ch),
+            (State::SingleQuoted, '\'') => {
+                state = State::Unquoted;
+                current.push(ch);
+            }
+            (State::DoubleQuoted, '"') => {
+                state = State::Unquoted;
+                current.push(ch);
+            }
+            (State::SingleQuoted | State::DoubleQuoted, c) | (State::Unquoted, c) => {
+                current.push(c)
+            }
         }
     }
     if !current.is_empty() {
@@ -2817,6 +2807,39 @@ mod tests {
     }
 
     #[test]
+    fn excerpt_redacts_escaped_double_quoted_secret_values() {
+        // Backslash escapes remain inside a double-quoted shell word. The
+        // whole assignment must stay one token so none of its value leaks.
+        for (cmd, leaks) in [
+            (
+                r#"PASSWORD="correct\" horse" psql"#,
+                &["correct", "horse"][..],
+            ),
+            (r#"PASSWORD="correct\"" psql"#, &["correct"][..]),
+            (
+                r#"PASSWORD="correct\ horse" psql"#,
+                &["correct", "horse"][..],
+            ),
+            (r#"PASSWORD="a"'b' psql"#, &["a", "b"][..]),
+        ] {
+            let excerpt = tool_excerpt(
+                "bash",
+                &[("command".to_owned(), json!(cmd))].into_iter().collect(),
+            );
+            assert!(
+                excerpt.contains(REDACTED_MARKER),
+                "excerpt for {cmd:?} did not redact: {excerpt:?}"
+            );
+            for leak in leaks {
+                assert!(
+                    !excerpt.contains(leak),
+                    "excerpt for {cmd:?} leaked {leak:?}: {excerpt:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn excerpt_secret_key_match_is_word_boundary_not_substring() {
         // r3 finding 2: the substring predicate matched `monkey=banana`
         // (contains "key") and `design=modern` (contains "sig"). Both are
@@ -3190,6 +3213,51 @@ mod tests {
             "visible tail must reflect the final payload's shape, not the \
              streamed stdout alone; got {tail_text:?}",
         );
+    }
+
+    #[test]
+    fn streamed_final_replaces_tail_when_payload_diverges() {
+        // A streamed tool's final result replaces the visible progress even
+        // when the final text does not contain that progress.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        let call = ordered_call("divergent");
+        state.apply(ServerEvent::ToolStart {
+            session_id: None,
+            tool_call: call.clone(),
+            data: json!({}),
+        });
+        let streamed = "progress output\n";
+        state.apply(ServerEvent::ToolOutput {
+            session_id: None,
+            tool_call: call.clone(),
+            output: streamed.into(),
+            data: json!({}),
+        });
+        let final_payload = "completed summary";
+        state.apply(ServerEvent::ToolEnd {
+            session_id: None,
+            tool_call: call.clone(),
+            tool_result: Some(crate::client::ToolResult {
+                tool_call_id: call.id.clone(),
+                content: final_payload.into(),
+                is_error: false,
+                is_canceled: false,
+                content_blocks: vec![],
+                structured_content: None,
+            }),
+            data: json!({}),
+        });
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { card, .. } => {
+                assert_eq!(card.tail.text, final_payload);
+                assert_eq!(card.tail.bytes_seen, streamed.len());
+            }
+            _ => panic!("expected a tool row"),
+        }
     }
 
     #[test]

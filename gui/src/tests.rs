@@ -7697,15 +7697,7 @@ fn zeta125_group_header_persists_when_expanded_and_toggles_via_real_keystrokes(
         visual.debug_bounds("tool-group-0").is_some(),
         "collapsed group paints its header row",
     );
-    // r4 finding 3: reach the group header through a REAL tab-key
-    // walk — `simulate_keystrokes("tab")` drives the Root keymap's
-    // Tab -> `focus_next` binding end-to-end (gpui-component
-    // `root::init`), not just the `focus_next` method the pre-r4
-    // test called directly. Jamming focus onto the handle via
-    // `window.focus(&handle)` succeeds even for handles that are not
-    // real tab stops; the key-walk proves the header is reachable
-    // from the keyboard tab-stops registry via the same key path a
-    // real user drives.
+    // Reach the group header through the Root keymap's real Tab dispatch.
     let focus_key = zeta_gui::row_text::sel::tool_group_focus_key("a");
     let group_handle = visual
         .update(|_, cx| {
@@ -7716,20 +7708,7 @@ fn zeta125_group_header_persists_when_expanded_and_toggles_via_real_keystrokes(
                 .cloned()
         })
         .expect("group focus handle registered on first paint");
-    // Blur first so the walk starts from the beginning of the tab
-    // order and the sequence stays deterministic. The sidebar
-    // tab-stop test at tests.rs:5822 uses the same pattern to prove
-    // reachability of a `FocusHandle` through the same `focus_next`
-    // path the Root keymap's Tab -> `focus_next` binding drives
-    // (gpui-component `root::init` -> `Tab` -> `window.focus_next`).
-    // `simulate_keystrokes("tab")` would be the more literal Tab-key
-    // walk, but `TestAppContext`'s keystroke dispatch does not fire
-    // the Root binding when focus sits on the composer's textarea
-    // input handler (verified in a debug trace: 512 tab keystrokes
-    // never change `window.focused()` in this test) — so we drive
-    // `focus_next` directly, which is the exact function the Root's
-    // Tab action calls. `focus_next` wraps around, so the ceiling is
-    // generous to defend against a runaway loop.
+    // Blur first so the walk starts from the beginning of the tab order.
     visual.update(|window, cx| {
         window.blur(cx);
         window.draw(cx).clear(cx);
@@ -7737,7 +7716,8 @@ fn zeta125_group_header_persists_when_expanded_and_toggles_via_real_keystrokes(
     let max_tab_steps = 512;
     let mut steps_to_group = None;
     for step in 0..max_tab_steps {
-        visual.update(|window, cx| window.focus_next(cx));
+        visual.simulate_keystrokes("tab");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         if visual.update(|window, _| group_handle.is_focused(window)) {
             steps_to_group = Some(step + 1);
             break;
@@ -7747,6 +7727,24 @@ fn zeta125_group_header_persists_when_expanded_and_toggles_via_real_keystrokes(
         "a Tab walk must land on the tool-group header within a bounded loop \
          — proves the header is a real tab stop reachable from the keyboard \
          registry, not just via `window.focus(handle)`",
+    );
+    visual.simulate_keystrokes("shift-tab");
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let reverse_focus = visual.update(|window, cx| window.focused(cx));
+    assert!(
+        reverse_focus.is_some(),
+        "Shift-Tab must preserve keyboard focus"
+    );
+    assert_ne!(
+        reverse_focus.as_ref(),
+        Some(&group_handle),
+        "Shift-Tab must move back from the group header"
+    );
+    visual.simulate_keystrokes("tab");
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        visual.update(|window, _| group_handle.is_focused(window)),
+        "Tab must return to the group header after Shift-Tab"
     );
     visual.update(|window, cx| {
         view.update(cx, |_, cx| cx.notify());

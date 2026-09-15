@@ -23,24 +23,9 @@ impl OutputTail {
     }
 
     /// Overwrite the visible tail text WITHOUT touching `bytes_seen`. Used
-    /// by the `ToolEnd` handler for streamed tools whose final payload
-    /// is a reshaped version of the streamed content (bash wraps the
-    /// streamed stdout in `"stdout:\n…\nstderr:\n…"` sections per
-    /// `src/zeta/tools/bash.py:194`). A suffix check misses that
-    /// duplicate and appending would double-count the same bytes.
+    /// by the `ToolEnd` handler for every streamed tool final payload.
     pub fn replace_visible(&mut self, text: &str) {
         self.text.clear();
-        self.text.push_str(text);
-        self.enforce_bounds();
-    }
-
-    /// Push text to the visible tail WITHOUT touching `bytes_seen`. Used
-    /// by the `ToolEnd` handler for streamed tools whose final payload
-    /// is a DISTINCT summary (agent tools that stream progress and
-    /// return a completion message) — the streamed bytes stay
-    /// authoritative for the size label while the visible tail still
-    /// carries both the streamed progress and the final summary.
-    pub fn push_visible(&mut self, text: &str) {
         self.text.push_str(text);
         self.enforce_bounds();
     }
