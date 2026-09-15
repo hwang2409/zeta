@@ -607,14 +607,20 @@ impl AppState {
                     if let Some(result) = tool_result.filter(|result| !result.content.is_empty()) {
                         // Bash-shaped tools stream stdout via `ToolOutput`
                         // AND repeat the whole thing in the final result
-                        // (src/zeta/tools/bash.py:202). Once `streamed`
-                        // is set, the streamed chunks are already the
-                        // authoritative content — skip the append so
-                        // `bytes_seen` and the on-screen tail don't
-                        // double-count. Agent-style tools that only
-                        // report through `ToolEnd` keep `streamed=false`
-                        // and still append here.
-                        if !card.streamed && card.tail.text != result.content {
+                        // (src/zeta/tools/bash.py:202). If the retained
+                        // tail is a suffix of that final content, the
+                        // stream already carried those bytes and a fresh
+                        // append would double `bytes_seen` plus paste
+                        // the same content twice. Detect the duplicate
+                        // via a suffix match rather than a blanket
+                        // `streamed` skip so tools that stream partial
+                        // progress and then return a DIFFERENT final
+                        // payload (see the delegated-receipt worker
+                        // test) still capture their end summary.
+                        let duplicate_of_stream = card.streamed
+                            && !card.tail.text.is_empty()
+                            && result.content.ends_with(&card.tail.text);
+                        if !duplicate_of_stream && card.tail.text != result.content {
                             if !card.tail.text.is_empty() && !card.tail.text.ends_with('\n') {
                                 card.tail.append("\n");
                             }
