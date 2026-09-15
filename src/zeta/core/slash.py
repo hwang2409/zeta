@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -15,6 +16,12 @@ from ..mcp.prompt_commands import (
     SlashPromptError,
     dispatch_prompt,
 )
+from ..skills import (
+    SkillCatalog,
+    SkillMeta,
+    is_slash_safe_name,
+    load_skill_prompt,
+)
 from ..types import Message, MessageRole, StreamEventType, TextContent
 from .commands.custom_commands import (
     COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
@@ -25,6 +32,7 @@ from .commands.custom_commands import (
     render_custom_input,
     resolve_custom_input,
 )
+from .project_context import discover_project_root
 from .store import ConversationEntry
 
 
@@ -232,6 +240,12 @@ MODEL_CONTEXT_WINDOWS: dict[str, dict[str, int | None]] = {
 # Used when a model has no published window: unrecognized names, and the
 # entries above that are deliberately None.
 DEFAULT_TOKEN_BUDGET = 200_000
+
+INIT_PROMPT = """Explore this repository with your existing tools. Inspect its build files, layout, test commands, and project conventions.
+
+Write or improve AGENTS.md at the repository root. If AGENTS.md exists, read it first and improve or extend it. Do not overwrite useful guidance. If only CLAUDE.md exists, use it as source material and produce AGENTS.md.
+
+Keep the file concise. Record useful commands, an architecture map, and project conventions. Do not add generic boilerplate. Zeta loads AGENTS.md files from the repository root through the current directory, with deeper nested files taking precedence. Place folder-specific guidance in nested AGENTS.md files when warranted."""
 
 
 def context_window(provider: str, model: str) -> int | None:
@@ -567,6 +581,7 @@ class SlashCommandRegistry:
     def __init__(self) -> None:
         self._commands: dict[str, SlashCommand] = {}
         self._custom_commands: dict[str, CustomCommand] = {}
+        self._skills: dict[str, SkillMeta] = {}
         self._notices: list[str] = []
         self._warning_notices: set[str] = set()
         self._mcp_prompts = MCPPromptCommands(
@@ -574,7 +589,7 @@ class SlashCommandRegistry:
         )
 
     def register(self, command: SlashCommand) -> None:
-        if not command.name or any(character.isspace() for character in command.name):
+        if not is_slash_safe_name(command.name):
             raise ValueError("slash command name must be one nonempty word")
         if command.name in self._commands:
             raise ValueError(f"slash command already registered: {command.name}")
@@ -610,8 +625,12 @@ class SlashCommandRegistry:
             (command.name, command.description, command.source)
             for command in self.custom_commands
         )
+        skills = tuple(
+            (skill.name, skill.description, skill.source)
+            for skill in self._skills.values()
+        )
         prompts = self._mcp_prompts.completion_entries()
-        return builtins + custom + prompts
+        return builtins + custom + skills + prompts
 
     def set_mcp_prompts(
         self, entries: Sequence[tuple[str, str, MCPPrompt]]
@@ -642,6 +661,24 @@ class SlashCommandRegistry:
             return
         self._custom_commands[command.name] = command
 
+    def register_skills(self, catalog: SkillCatalog) -> None:
+        """Register skills after built-ins and custom commands."""
+
+        self._notices.extend(catalog.notices)
+        self._warning_notices.update(catalog.notices)
+        for skill in catalog.skills:
+            if skill.name in self._commands:
+                notice = f"ignored skill {skill.path}: shadows built-in /{skill.name}"
+            elif skill.name in self._custom_commands:
+                notice = (
+                    f"ignored skill {skill.path}: shadows custom command /{skill.name}"
+                )
+            else:
+                self._skills[skill.name] = skill
+                continue
+            self._notices.append(notice)
+            self._warning_notices.add(notice)
+
     def _dispatch(self, session: SlashSession, value: str) -> SlashResult | None:
         """Run a known command from the first line, or pass the input through."""
 
@@ -651,15 +688,21 @@ class SlashCommandRegistry:
         parts = first_line[1:].split(maxsplit=1)
         if not parts:
             return None
-        command = self._commands.get(parts[0])
+        name = parts[0]
+        if not is_slash_safe_name(name):
+            return None
+        command = self._commands.get(name)
         if command is not None:
             return command.run(session, parts[1] if len(parts) == 2 else "")
-        custom = self._custom_commands.get(parts[0])
-        prompt = self._mcp_prompts.get(parts[0])
+        custom = self._custom_commands.get(name)
+        skill = self._skills.get(name)
+        if skill is not None:
+            return SlashModelInput(load_skill_prompt(skill))
+        prompt = self._mcp_prompts.get(name)
         if prompt is not None:
             return dispatch_prompt(
                 session,
-                parts[0],
+                name,
                 prompt[1],
                 parts[1] if len(parts) == 2 else "",
             )
@@ -712,6 +755,8 @@ class SlashCommandRegistry:
         if not parts:
             return None
         name = parts[0]
+        if not is_slash_safe_name(name):
+            return None
         command = self._custom_commands.get(name)
         return command if command is not None and command.kind == "exec" else None
 
@@ -731,6 +776,12 @@ class SlashCommandRegistry:
             lines.append(
                 f"  /{command.name}{kind}{description} (source: {command.path})"
             )
+        lines.append("skills:")
+        if not self._skills:
+            lines.append("  none")
+        for skill in self._skills.values():
+            description = f" — {skill.description}" if skill.description else ""
+            lines.append(f"  /{skill.name}{description} (source: {skill.path})")
         return "\n".join(lines)
 
 
@@ -881,6 +932,16 @@ def _run_implement(session: SlashSession, args: str) -> str | SlashModelInput:
     return session.slash_implement(args.strip())
 
 
+def _run_init(
+    _session: SlashSession, args: str, project_root: Path | None
+) -> str | SlashModelInput:
+    if args.strip():
+        return "init unchanged: /init does not accept arguments"
+    if project_root is None:
+        return "init error: not inside a project"
+    return SlashModelInput(INIT_PROMPT)
+
+
 async def _run_compact(session: SlashSession, args: str) -> str:
     del args
     return await session.slash_compact()
@@ -938,10 +999,13 @@ def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
     project_dir: str | Path | None = None,
+    skill_catalog: SkillCatalog,
 ) -> SlashCommandRegistry:
     """Create the built-in registry."""
 
+    effective_home = zeta_home or os.environ.get("ZETA_HOME")
     registry = SlashCommandRegistry()
+    project_root = discover_project_root(project_dir or Path.cwd())
     registry.register(SlashCommand("status", _run_status, "show session status"))
     registry.register(SlashCommand("mcp", _run_mcp, "show MCP server status"))
     registry.register(
@@ -960,6 +1024,13 @@ def create_slash_registry(
     )
     registry.register(
         SlashCommand("implement", _run_implement, "implement the proposed plan")
+    )
+    registry.register(
+        SlashCommand(
+            "init",
+            lambda session, args: _run_init(session, args, project_root),
+            "generate or improve project instructions",
+        )
     )
     registry.register(SlashCommand("paste", _run_paste, "paste an image"))
     registry.register(SlashCommand("compact", _run_compact, "compact the context"))
@@ -1000,10 +1071,11 @@ def create_slash_registry(
         SlashCommand("help", lambda _session, _args: registry.help_text(), "list commands")
     )
     result = load_custom_commands(
-        home=zeta_home,
+        home=effective_home,
         project_dir=project_dir or Path.cwd(),
     )
     registry._notices.extend(result.notices)
     for command in result.commands:
         registry.register_custom(command)
+    registry.register_skills(skill_catalog)
     return registry

@@ -24,6 +24,7 @@ from zeta.headless import run_headless
 from zeta.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.runtime import ServerRuntime
+from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp, create_app
 
 
@@ -357,7 +358,7 @@ def test_recovery_and_send_release_borrowed_child_stores(
 
     manager = SessionManager(tmp_path / "home")
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
-    loop = AgentLoop(FakeBackend([]), opened.store)
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     call = ToolCall("child", "agent", {"prompt": "hello", "description": "child"})
     with ConversationStore(opened.store.session_dir / "agents", session_id="1") as child:
         with ConversationStore(child.session_dir / "agents", session_id="1") as nested:

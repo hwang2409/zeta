@@ -21,6 +21,7 @@ from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.model_catalog import PROVIDER_MODELS
+from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import SlashCompleter, build_key_bindings
 from zeta.tui.models import known_models, match_models
@@ -59,7 +60,11 @@ def _app(
 ) -> tuple[TUIApp, StringIO]:
     output = StringIO()
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider=provider,
         model=model,
         console=Console(file=output, force_terminal=False, width=100),
@@ -90,7 +95,7 @@ def test_model_without_arguments_opens_a_picker_on_the_current_model(
 ) -> None:
     app, output = _app(tmp_path)
 
-    assert create_slash_registry().dispatch(app, "/model") == ""
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model") == ""
 
     picker = app._model_picker
     assert picker is not None
@@ -109,7 +114,7 @@ def test_model_without_arguments_opens_a_picker_on_the_current_model(
 def test_model_substring_with_several_matches_narrows_the_picker(tmp_path: Path) -> None:
     app, output = _app(tmp_path)
 
-    assert create_slash_registry().dispatch(app, "/model opus") == ""
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model opus") == ""
 
     picker = app._model_picker
     assert picker is not None
@@ -123,7 +128,7 @@ def test_model_substring_with_several_matches_narrows_the_picker(tmp_path: Path)
 def test_model_unique_substring_switches_directly(tmp_path: Path) -> None:
     app, _ = _app(tmp_path, provider="fake", model="offline")
 
-    assert create_slash_registry().dispatch(app, "/model fast") == "model: faster"
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model fast") == "model: faster"
     assert app.model == "faster"
     assert app._model_picker is None
 
@@ -131,7 +136,7 @@ def test_model_unique_substring_switches_directly(tmp_path: Path) -> None:
 def test_model_exact_name_bypasses_the_picker(tmp_path: Path) -> None:
     app, _ = _app(tmp_path)
 
-    output = create_slash_registry().dispatch(app, "/model claude-opus-4-8")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-opus-4-8")
 
     assert output.startswith("model: claude-opus-4-8")
     assert app.model == "claude-opus-4-8"
@@ -141,7 +146,7 @@ def test_model_exact_name_bypasses_the_picker(tmp_path: Path) -> None:
 def test_model_name_matching_nothing_is_still_used_as_typed(tmp_path: Path) -> None:
     app, _ = _app(tmp_path)
 
-    output = create_slash_registry().dispatch(app, "/model claude-brand-new")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-brand-new")
 
     assert output == (
         "model: claude-brand-new (model catalog unavailable for claude — using anyway)"
@@ -156,7 +161,7 @@ async def test_picker_does_not_open_while_a_turn_is_active(tmp_path: Path) -> No
     app._active_task = asyncio.create_task(asyncio.sleep(1))
 
     try:
-        output = create_slash_registry().dispatch(app, "/model")
+        output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
     finally:
         app._active_task.cancel()
         await asyncio.gather(app._active_task, return_exceptions=True)
@@ -172,7 +177,7 @@ async def test_picker_navigation_wraps_and_select_switches_the_model(
     tmp_path: Path,
 ) -> None:
     app, output = _app(tmp_path, provider="fake", model="offline")
-    create_slash_registry().dispatch(app, "/model")
+    create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
     picker = app._model_picker
     assert picker is not None and picker.selected == "offline"
 
@@ -199,7 +204,7 @@ def test_picker_cancel_removes_the_card_and_its_spacer_in_full_screen(
     app._print_system("hello")
     before = len(app._transcript._units)
 
-    create_slash_registry().dispatch(app, "/model")
+    create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
 
     assert len(app._transcript._units) == before + 2
     assert app._model_picker_unit is app._transcript._units[-1]
@@ -216,7 +221,7 @@ def test_picker_cancel_removes_the_card_and_its_spacer_in_full_screen(
 
 def test_picker_moves_repaint_the_card_in_full_screen(tmp_path: Path) -> None:
     app, _ = _app(tmp_path, provider="fake", model="offline", full_screen=True)
-    create_slash_registry().dispatch(app, "/model")
+    create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
     unit = app._model_picker_unit
     assert "❯ offline" in _plain(unit.value)
 
@@ -231,7 +236,7 @@ async def test_open_picker_folds_in_the_catalog_when_it_arrives(tmp_path: Path) 
     dated = "claude-opus-4-1-20250805"
     app, _ = _app(tmp_path, loader=lambda provider: frozenset({dated}))
 
-    create_slash_registry().dispatch(app, "/model opus")
+    create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model opus")
     picker = app._model_picker
     assert picker is not None and dated not in picker.choices
 
@@ -247,7 +252,7 @@ async def test_open_picker_folds_in_the_catalog_when_it_arrives(tmp_path: Path) 
 @pytest.mark.asyncio
 async def test_any_other_submission_dismisses_an_open_picker(tmp_path: Path) -> None:
     app, output = _app(tmp_path, provider="fake", model="offline")
-    create_slash_registry().dispatch(app, "/model")
+    create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model")
     assert app._model_picker is not None
 
     app._submit_input("/name")
@@ -342,7 +347,7 @@ async def test_picker_keys_only_fire_on_an_empty_composer() -> None:
 
 
 def test_slash_completer_offers_model_names_after_model() -> None:
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
     completer = SlashCompleter(
         registry,
         model_choices=lambda: ("claude-opus-4-8", "claude-sonnet-4-6"),
@@ -366,3 +371,21 @@ def test_slash_completer_offers_model_names_after_model() -> None:
 
     plain = SlashCompleter(registry)
     assert list(plain.get_completions(Document("/model op"), event)) == []
+
+
+def test_session_completes_models_and_paths(tmp_path: Path) -> None:
+    (tmp_path / "file.txt").touch()
+    app, _ = _app(tmp_path)
+    app.loop.store.cwd = str(tmp_path)
+    session = app._make_session()
+    event = CompleteEvent(completion_requested=True)
+
+    def complete(text: str):
+        return list(session.completer.get_completions(Document(text), event))
+
+    assert [item.text for item in complete("/mod")] == ["model"]
+    models = complete("/model sonnet-4-6")
+    assert [item.text for item in models] == ["claude-sonnet-4-6"]
+    assert models[0].display_meta_text == "current"
+    assert [item.text for item in complete("read @fi")] == ["file.txt"]
+    assert [item.text for item in complete("/review @fi")] == ["file.txt"]

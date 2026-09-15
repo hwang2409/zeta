@@ -11,7 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Mapping
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -20,7 +20,6 @@ from uuid import uuid4
 
 from prompt_toolkit.application import get_app
 from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import FormattedText
@@ -36,8 +35,8 @@ from ..core.session_files import (
     session_root,
     write_session_file,
 )
-from ..core.slash import SlashCommandRegistry
 from ..core.store import ConversationStore
+from ..images import image_signature_matches
 from ..types import (
     ErrorInfo,
     ImageContent,
@@ -46,15 +45,14 @@ from ..types import (
     StreamEvent,
     StreamEventType,
     TextContent,
-    image_signature_matches,
 )
 from . import theme
+from .completion import ComposerCompleter, PathCompleter, SlashCompleter
 from .key_bindings import (
     FullScreenPromptSession,
     VimCursorShapeConfig,
     build_key_bindings,
 )
-from .models import match_models
 from .render import is_retryable_error, render_event
 
 ATTACHMENT_MAX_TEXT_BYTES = 200 * 1024
@@ -63,7 +61,9 @@ SPINNER_INTERVAL = 0.2
 CLIPBOARD_TIMEOUT = 5.0
 
 __all__ = [
+    "ComposerCompleter",
     "FullScreenPromptSession",
+    "PathCompleter",
     "SlashCompleter",
     "VimCursorShapeConfig",
     "build_key_bindings",
@@ -221,63 +221,6 @@ class TurnConsumerMixin:
 
 class AttachmentError(ValueError):
     """Raised when a composer attachment cannot be read or decoded."""
-
-
-class SlashCompleter(Completer):
-    """Complete slash commands, and model names after ``/model``."""
-
-    def __init__(
-        self,
-        registry: SlashCommandRegistry,
-        *,
-        model_choices: Callable[[], Sequence[str]] | None = None,
-        current_model: Callable[[], str] | None = None,
-    ) -> None:
-        self.registry = registry
-        self._model_choices = model_choices
-        self._current_model = current_model
-
-    def get_completions(
-        self, document: Document, complete_event: CompleteEvent
-    ) -> Iterator[Completion]:
-        del complete_event
-        before_cursor = document.text_before_cursor
-        if not before_cursor.startswith("/"):
-            return
-        if any(character.isspace() for character in before_cursor):
-            yield from self._model_completions(before_cursor)
-            return
-        prefix = before_cursor[1:]
-        for name, description, source in self.registry.completion_entries:
-            if not name.startswith(prefix):
-                continue
-            meta = description
-            if source:
-                meta = f"[{source}] {description}".strip()
-            yield Completion(
-                name,
-                start_position=-len(prefix),
-                display=f"/{name}",
-                display_meta=meta,
-            )
-
-    def _model_completions(self, before_cursor: str) -> Iterator[Completion]:
-        """Offer provider models while the argument to ``/model`` is being typed."""
-
-        if self._model_choices is None or "\n" in before_cursor:
-            return
-        parts = before_cursor[1:].split(maxsplit=1)
-        argument = parts[1] if len(parts) == 2 else ""
-        if parts[0] != "model" or any(character.isspace() for character in argument):
-            return
-        current = self._current_model() if self._current_model is not None else None
-        for name in match_models(argument, self._model_choices()):
-            yield Completion(
-                name,
-                start_position=-len(argument),
-                display=name,
-                display_meta="current" if name == current else "",
-            )
 
 
 @dataclass(frozen=True, slots=True)

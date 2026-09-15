@@ -19,6 +19,12 @@ from ..runtime import RuntimeComposition, compose_runtime
 from ..runtime.cleanup import close_session
 from ..settings import load_settings
 from ..settings import resolve as resolve_settings
+from ..skills import (
+    SkillCatalog,
+    discover_session_skills,
+    replace_skill_index,
+)
+from ..skills.agent_catalog import AgentCatalog, discover_session_agents
 from ..types import CompletionBackend, StreamEvent
 from .fake_backend import ServerFakeBackend
 
@@ -193,16 +199,22 @@ class ServerRuntime:
         self, *, provider: str | None = None, model: str | None = None
     ) -> SessionMetadata:
         config = self._config(provider, model)
+        repo_root = discover_repo_root(self.cwd)
+        skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
+        agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
         context = load_project_context(
             cwd=self.cwd,
-            repo_root=discover_repo_root(self.cwd),
+            repo_root=repo_root,
             zeta_home=self.home,
+            catalog=skill_catalog,
         )
         composition = self._compose(
             config=config,
             provider=config.provider,
             model=config.model,
             project_context=context,
+            skill_catalog=skill_catalog,
+            agent_catalog=agent_catalog,
         )
         await self._replace(composition)
         return self.metadata
@@ -219,6 +231,32 @@ class ServerRuntime:
             )
         opened = self.manager.open(session_id)
         try:
+            if opened.metadata.skill_catalog is None:
+                skill_catalog = discover_session_skills(
+                    home=self.home,
+                    project_dir=discover_repo_root(Path(opened.metadata.cwd)),
+                )
+                self.manager.persist_skill_catalog(
+                    opened.metadata,
+                    skill_catalog,
+                    system_prompt=(
+                        replace_skill_index(opened.metadata.system_prompt, skill_catalog)
+                        if opened.metadata.system_prompt
+                        else None
+                    ),
+                )
+            else:
+                skill_catalog = SkillCatalog.from_snapshot(
+                    opened.metadata.skill_catalog
+                )
+            if opened.metadata.agent_catalog is None:
+                agent_catalog = discover_session_agents(
+                    home=self.home,
+                    project_dir=discover_repo_root(Path(opened.metadata.cwd)),
+                )
+                self.manager.persist_agent_catalog(opened.metadata, agent_catalog)
+            else:
+                agent_catalog = AgentCatalog.from_snapshot(opened.metadata.agent_catalog)
             context = ProjectContext(
                 opened.metadata.system_prompt,
                 tuple(Path(path) for path in opened.metadata.context_files),
@@ -229,6 +267,8 @@ class ServerRuntime:
                 provider=opened.metadata.provider,
                 model=opened.metadata.model,
                 project_context=context,
+                skill_catalog=skill_catalog,
+                agent_catalog=agent_catalog,
                 opened=opened,
             )
         except BaseException:

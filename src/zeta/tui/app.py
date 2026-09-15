@@ -61,8 +61,8 @@ from .checkpoints import CheckpointTranscriptMixin
 from .composer import (
     ClipboardError,
     ComposerAttachmentMixin,
+    ComposerCompleter,
     FullScreenPromptSession,
-    SlashCompleter,
     SubmissionMixin,
     TurnConsumerMixin,
     UndoCandidate,
@@ -232,7 +232,13 @@ class TUIApp(
         self._zeta_home: Path | None = (
             Path(zeta_home).resolve() if zeta_home is not None else None
         )
-        self._slash_commands = create_slash_registry(zeta_home=self._zeta_home, project_dir=discover_repo_root(Path(self.loop.store.cwd)))
+        repo_root = discover_repo_root(Path(self.loop.store.cwd))
+        skill_catalog = self.loop.tool_registry.skill_catalog
+        self._slash_commands = create_slash_registry(
+            zeta_home=self._zeta_home,
+            project_dir=repo_root,
+            skill_catalog=skill_catalog,
+        )
         self.loop.set_mcp_prompt_refresh(
             lambda mount: app._slash_commands.set_mcp_prompts(mount.prompt_entries)
         )
@@ -520,8 +526,9 @@ class TUIApp(
             placeholder=[("class:placeholder", "type a message...")],
             history=self._history,
             key_bindings=bindings,
-            completer=SlashCompleter(
+            completer=ComposerCompleter(
                 self._slash_commands,
+                self.loop.store.cwd,
                 model_choices=lambda: app.model_choices(),
                 current_model=lambda: app.model,
             ),

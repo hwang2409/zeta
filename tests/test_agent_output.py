@@ -9,6 +9,7 @@ from zeta.agent_receipt import encode_json
 from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
+from zeta.skills import SkillCatalog
 from zeta.tools.agent import agent_result
 from zeta.tui.render import render_event
 from zeta.types import (
@@ -47,6 +48,7 @@ async def test_agent_setup_exception_uses_failed_receipt(tmp_path: Path) -> None
         FakeBackend([ScriptedTurn(tool_calls=[call])]),
         ConversationStore(tmp_path),
         max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
     )
     setup_calls = 0
 
@@ -85,6 +87,7 @@ async def test_agent_setup_failure_finishes_child_lifecycle(
         FakeBackend([ScriptedTurn(tool_calls=[call])]),
         store,
         max_turns=1,
+skill_catalog=SkillCatalog.empty(),
     )
 
     def fail_clone(*args: object, **kwargs: object) -> None:
@@ -125,7 +128,7 @@ async def test_agent_output_reads_finished_child_with_roles_and_pages(
             ScriptedTurn([TextContent("child answer")]),
         ]
     )
-    loop = AgentLoop(backend, store, max_turns=1)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     await _collect(loop.run_turn("start"))
     handle = _result(store, call.id).structured_content["child_instance_id"]
 
@@ -154,7 +157,7 @@ async def test_agent_output_reads_finished_child_with_roles_and_pages(
 @pytest.mark.asyncio
 async def test_agent_output_rejects_handle_not_on_active_branch(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1)
+    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     result = await loop.tool_registry.execute(
         ToolCall("output-missing", "agent_output", {"handle": "old:1"})
@@ -203,7 +206,7 @@ async def test_agent_output_rejects_forged_and_out_of_tree_receipts(
             ),
         )
     )
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1)
+    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     forged = await loop.tool_registry.execute(
         ToolCall("output-forged", "agent_output", {"handle": "other:1"})
@@ -244,7 +247,7 @@ async def test_agent_output_reads_new_live_tail_on_each_call(tmp_path: Path) -> 
             ),
         )
     )
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1)
+    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     before = await loop.tool_registry.execute(
         ToolCall("output-live-1", "agent_output", {"handle": "parent:1"})
@@ -316,7 +319,8 @@ async def test_agent_stats_are_in_provider_visible_receipt_and_status_text(
     assert "canceled=false" in receipt_text
 
     status = await AgentLoop(
-        FakeBackend([]), parent, max_turns=1
+        FakeBackend([]), parent, max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
     ).tool_registry.execute(ToolCall("status-call", "agent_status", {"handle": handle}))
     status_text = status["content"][0]["text"]
     assert "2 turns" in status_text
@@ -342,6 +346,7 @@ async def test_background_notification_carries_structured_stats(tmp_path: Path) 
         ),
         store,
         max_turns=1,
+skill_catalog=SkillCatalog.empty(),
     )
 
     await _collect(loop.run_turn("start"))
@@ -424,7 +429,7 @@ async def test_agent_output_response_has_one_total_byte_bound(tmp_path: Path) ->
             ),
         )
     )
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1)
+    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     result = await loop.tool_registry.execute(
         ToolCall("output-large", "agent_output", {"handle": "parent:1"})
@@ -456,7 +461,7 @@ async def test_agent_output_pages_unicode_with_persistence_size(
             ),
         )
     )
-    loop = AgentLoop(FakeBackend([]), store, max_turns=1)
+    loop = AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     offset = 0
     pages: list[dict[str, object]] = []
@@ -512,7 +517,7 @@ async def test_agent_output_reads_adopted_background_descendant_notification(
         status="completed",
         text="grandchild complete",
     )
-    loop = AgentLoop(FakeBackend([]), root, max_turns=1)
+    loop = AgentLoop(FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     result = await loop.tool_registry.execute(
         ToolCall(
@@ -563,7 +568,7 @@ async def test_agent_output_reads_snapshot_without_lock_or_mutation(
 
     monkeypatch.setattr(ConversationStore, "_append_lock", lock_is_forbidden)
     started = time.monotonic()
-    result = await AgentLoop(FakeBackend([]), store, max_turns=1).tool_registry.execute(
+    result = await AgentLoop(FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()).tool_registry.execute(
         ToolCall("output-snapshot", "agent_output", {"handle": "parent:1"})
     )
     elapsed = time.monotonic() - started
@@ -580,7 +585,7 @@ async def test_agent_output_reads_snapshot_without_lock_or_mutation(
 async def test_agent_output_error_total_cap_handles_multibyte_handle(
     tmp_path: Path,
 ) -> None:
-    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path), max_turns=1)
+    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path), max_turns=1, skill_catalog=SkillCatalog.empty())
     result = await loop.tool_registry.execute(
         ToolCall("output-emoji", "agent_output", {"handle": "😀" * 20_000})
     )

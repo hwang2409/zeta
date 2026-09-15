@@ -12,6 +12,7 @@ import pytest
 
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._process import BackgroundTaskRegistry, _group_exists
 from zeta.tui.render import format_status
@@ -28,7 +29,7 @@ async def _wait_for_exit(registry: BackgroundTaskRegistry, task_id: str) -> None
 
 @pytest.mark.asyncio
 async def test_background_start_poll_and_kill_round_trip(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     started = await registry.execute(
         ToolCall("start", "run_background", {"command": _python("print('hello')")})
     )
@@ -94,7 +95,7 @@ async def test_background_output_ring_trims_at_utf8_boundary(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_background_output_cursor_tracks_outer_tool_cap(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path, max_output_chars=10_000)
+    registry = ToolRegistry(tmp_path, max_output_chars=10_000, skill_catalog=SkillCatalog.empty())
     started = await registry.execute(
         ToolCall(
             "start",
@@ -190,6 +191,7 @@ async def test_background_approval_cap_and_session_cleanup(tmp_path: Path) -> No
             always_deny={"run_background"},
             default=ApprovalDecision.ALLOW,
         ),
+skill_catalog=SkillCatalog.empty(),
     )
     result = await denied.execute(
         ToolCall("deny", "run_background", {"command": "sleep 30"})
@@ -208,7 +210,7 @@ async def test_background_approval_cap_and_session_cleanup(tmp_path: Path) -> No
 @pytest.mark.asyncio
 async def test_background_resume_marks_old_task_exited(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    first = ToolRegistry(store.cwd, session_store=store)
+    first = ToolRegistry(store.cwd, session_store=store, skill_catalog=SkillCatalog.empty())
     started = await first.execute(
         ToolCall("start", "run_background", {"command": "sleep 30"})
     )
@@ -218,7 +220,7 @@ async def test_background_resume_marks_old_task_exited(tmp_path: Path) -> None:
     resumed_store = ConversationStore(
         tmp_path / "sessions", session_id=store.session_id
     )
-    resumed = ToolRegistry(resumed_store.cwd, session_store=resumed_store)
+    resumed = ToolRegistry(resumed_store.cwd, session_store=resumed_store, skill_catalog=SkillCatalog.empty())
     output = await resumed.execute(
         ToolCall("output", "task_output", {"task_id": task_id})
     )
@@ -241,7 +243,7 @@ def test_background_footer_segment_degrades_as_a_whole() -> None:
 
 
 def test_background_tools_are_discovered() -> None:
-    registry = ToolRegistry(Path("."))
+    registry = ToolRegistry(Path("."), skill_catalog=SkillCatalog.empty())
     assert {schema["name"] for schema in registry.schemas} >= {
         "run_background",
         "task_output",
@@ -260,7 +262,7 @@ async def test_registry_setup_ignores_corrupt_background_state(
     store = ConversationStore(tmp_path / "sessions")
     path = store.session_dir / "background_tasks.json"
     path.write_bytes(payload)
-    registry = ToolRegistry(tmp_path, session_store=store)
+    registry = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
     assert registry.background_tasks.running_count == 0
     assert path.read_bytes() == payload
     await registry.close()

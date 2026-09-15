@@ -1,3 +1,5 @@
+from zeta.skills import SkillCatalog
+
 import asyncio
 from dataclasses import dataclass, replace
 from io import StringIO
@@ -5,6 +7,8 @@ from pathlib import Path
 
 import pytest
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import CompleteEvent
+from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
@@ -17,6 +21,7 @@ from zeta.core.slash import (
     MODEL_PRICES,
     CompactionSummary,
     SlashStatus,
+    SlashModelInput,
     UNPRICED_MODEL_IDS,
     UsageTracker,
     UsageSnapshot,
@@ -29,8 +34,10 @@ from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.providers import PROVIDER_MODELS
 from zeta.providers.usage import normalize_usage
+from zeta.skills import discover_session_skills
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import build_key_bindings
+from zeta.tui.composer import SlashCompleter
 from zeta.types import (
     Message,
     MessageRole,
@@ -69,6 +76,78 @@ def session() -> FakeSlashSession:
     )
 
 
+def _write_skill(path: Path, name: str, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nname: {name}\ndescription: {name} description\n---\n\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+def test_skill_slash_commands_follow_collision_precedence(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write_skill(home / "skills" / "review.md", "review", "home review")
+    _write_skill(home / "skills" / "custom.md", "custom", "home custom")
+    _write_skill(project / ".zeta" / "skills" / "review.md", "review", "project review")
+    _write_skill(project / ".zeta" / "skills" / "status.md", "status", "shadowed")
+    _write_skill(project / ".zeta" / "skills" / "unique.md", "unique", "unique body")
+    command_dir = home / "commands"
+    command_dir.mkdir(parents=True)
+    (command_dir / "custom.md").write_text("custom command", encoding="utf-8")
+
+    registry = create_slash_registry(
+        zeta_home=home,
+        project_dir=project,
+        skill_catalog=discover_session_skills(home=home, project_dir=project),
+    )
+
+    result = registry.dispatch(session(), "/unique")
+    assert isinstance(result, SlashModelInput)
+    assert result.text == "unique body"
+    assert registry.dispatch(session(), "/status") is not None
+    assert registry.input_for_model("/custom") == "custom command"
+    assert "ignored skill" in "\n".join(registry.notices)
+    assert any("shadows built-in /status" in notice for notice in registry.notices)
+    assert any(
+        "shadows custom command /custom" in notice for notice in registry.notices
+    )
+
+
+def test_skill_commands_appear_in_completer_with_source_badge(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _write_skill(project / ".zeta" / "skills" / "unique.md", "unique", "unique body")
+    registry = create_slash_registry(
+        project_dir=project,
+        skill_catalog=discover_session_skills(project_dir=project),
+    )
+
+    completions = list(
+        SlashCompleter(registry).get_completions(
+            Document("/uni"), CompleteEvent(completion_requested=True)
+        )
+    )
+
+    assert len(completions) == 1
+    assert completions[0].text == "unique"
+    assert "[project] unique description" in str(completions[0].display_meta)
+
+
+def test_directory_skill_slash_load_reports_resource_directory(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / "bundle"
+    _write_skill(skill_dir / "SKILL.md", "bundle", "bundle body")
+    catalog = discover_session_skills(home=tmp_path)
+    registry = create_slash_registry(skill_catalog=catalog)
+
+    result = registry.dispatch(session(), "/bundle")
+
+    assert isinstance(result, SlashModelInput)
+    assert result.text == (
+        "bundle body\n\nSkill resources directory: "
+        f"{skill_dir.resolve()}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="test-xyz-123")
@@ -82,6 +161,7 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
         store,
         approval_policy=policy,
         retained_tail=17,
+skill_catalog=SkillCatalog.empty(),
     )
     await loop.context_assembler.assemble()
     loop.context_assembler.record_usage(
@@ -110,7 +190,7 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
         model="model-live",
         approval_policy=policy,
     )
-    output = create_slash_registry().dispatch(app, "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
 
     assert output is not None
     assert f"session_id: {store.session_id}" in output
@@ -119,12 +199,10 @@ async def test_status_returns_live_required_fields(tmp_path: Path) -> None:
     assert "vim_mode: on" in output
     assert f"retained_tail: {loop.context_assembler.retained_tail}" in output
     assert (
-        "tokens_used_this_session: "
-        f"{loop.context_assembler.tokens_used_this_session}"
+        f"tokens_used_this_session: {loop.context_assembler.tokens_used_this_session}"
     ) in output
     assert (
-        "tokens_in_current_context: "
-        f"{loop.context_assembler.token_count}"
+        f"tokens_in_current_context: {loop.context_assembler.token_count}"
     ) in output
     assert f"compaction_marker_count: {store.compaction_marker_count()}" in output
     assert "compaction_marker_count: 2" in output
@@ -169,13 +247,13 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
         retained_tail=1,
         token_counter=token_count,
     )
-    loop = AgentLoop(backend, store, context_assembler=assembler)
+    loop = AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty())
     app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
 
     await app._consume_turn("first")
     await app._consume_turn("second")
 
-    output = create_slash_registry().dispatch(app, "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
 
     assert output is not None
     assert "tokens_used_this_session: 70" in output
@@ -185,13 +263,16 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
     ] == [(1, 10, 2), (2, 20, 5)]
     pricing = MODEL_PRICES["claude"]["claude-sonnet-4-6"]
     assert pricing is not None
-    expected_cost = sum(
-        snapshot.input_tokens * pricing.input
-        + snapshot.cache_read_input_tokens * pricing.cache_read
-        + snapshot.cache_creation_input_tokens * (pricing.cache_write or 0)
-        + snapshot.output_tokens * pricing.output
-        for snapshot in app.slash_status().usage_cost_by_model
-    ) / 1_000_000
+    expected_cost = (
+        sum(
+            snapshot.input_tokens * pricing.input
+            + snapshot.cache_read_input_tokens * pricing.cache_read
+            + snapshot.cache_creation_input_tokens * (pricing.cache_write or 0)
+            + snapshot.output_tokens * pricing.output
+            for snapshot in app.slash_status().usage_cost_by_model
+        )
+        / 1_000_000
+    )
     assert f"estimated_cost_usd: ${expected_cost:.6f}" in output
 
 
@@ -224,14 +305,16 @@ async def test_manual_compact_captures_summarization_cost(tmp_path: Path) -> Non
         retained_tail=1,
         token_counter=token_count,
     )
-    loop = AgentLoop(backend, store, context_assembler=assembler)
+    loop = AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty())
     app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
 
     await app._consume_turn("first")
     baseline_tokens = assembler.uncached_input_tokens_this_session
     assert await app.slash_compact() != "compact: nothing to compact"
 
-    per_model = {snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model}
+    per_model = {
+        snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model
+    }
     snapshot = per_model["claude-sonnet-4-6"]
     assert snapshot.input_tokens >= baseline_tokens + 40
     assert snapshot.output_tokens >= 3
@@ -244,20 +327,30 @@ async def test_errored_turn_usage_does_not_leak_to_next_model(tmp_path: Path) ->
             self.calls.append((list(messages), list(tool_schemas)))
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
-                message=Message(role=MessageRole.ASSISTANT, content=[TextContent("boom")]),
-                data={"usage": {"input_tokens": 100, "output_tokens": 5, "total_tokens": 105}},
+                message=Message(
+                    role=MessageRole.ASSISTANT, content=[TextContent("boom")]
+                ),
+                data={
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 5,
+                        "total_tokens": 105,
+                    }
+                },
             )
             raise RuntimeError("backend exploded after usage")
 
     store = ConversationStore(tmp_path / "sessions")
     error_backend = _ErrorBackend([])
-    loop = AgentLoop(error_backend, store)
+    loop = AgentLoop(error_backend, store, skill_catalog=SkillCatalog.empty())
     app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
 
     await app._consume_turn("first")
 
     app.model = "claude-opus-4-6"
-    per_model = {snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model}
+    per_model = {
+        snapshot.model: snapshot for snapshot in app.slash_status().usage_cost_by_model
+    }
     assert "claude-sonnet-4-6" in per_model
     assert "claude-opus-4-6" not in per_model
     assert per_model["claude-sonnet-4-6"].input_tokens == 100
@@ -283,7 +376,7 @@ def test_usage_cost_keeps_all_turns_outside_bounded_trend() -> None:
         usage_history=tracker.history,
         usage_cost_by_model=tracker.cost_by_model,
     )
-    output = create_slash_registry().dispatch(FakeSlashSession(status), "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(FakeSlashSession(status), "/status")
 
     assert output is not None
     assert len(tracker.history) == 8
@@ -299,14 +392,14 @@ def test_status_renders_cache_hit_rate_as_na_without_usage() -> None:
             uncached_input_tokens=0,
         )
     )
-    output = create_slash_registry().dispatch(empty_session, "/status")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(empty_session, "/status")
 
     assert output is not None
     assert "prompt_cache_hit_rate: n/a" in output
 
 
 def test_status_renders_usage_trend_cost_and_context_gauge() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(
             replace(
                 session().status,
@@ -345,7 +438,7 @@ def test_status_renders_usage_trend_cost_and_context_gauge() -> None:
 
 
 def test_status_marks_unknown_model_cost_and_window() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(
             replace(
                 session().status,
@@ -377,7 +470,7 @@ def test_context_gauge_unknown_window_is_bounded() -> None:
 
 
 def test_status_renders_compaction_history_and_empty_state() -> None:
-    empty = create_slash_registry().dispatch(session(), "/status")
+    empty = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(session(), "/status")
     assert empty is not None
     assert "compaction_history:\n  none" in empty
 
@@ -385,9 +478,7 @@ def test_status_renders_compaction_history_and_empty_state() -> None:
         session().status,
         compaction_history=(CompactionSummary(3, 4, 120),),
     )
-    output = create_slash_registry().dispatch(
-        FakeSlashSession(status), "/status"
-    )
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(FakeSlashSession(status), "/status")
     assert output is not None
     assert "compaction_history:\n  turn 3: 4 entries, 120 tokens saved" in output
 
@@ -430,7 +521,7 @@ def test_codex_cache_writes_use_existing_usage_categories() -> None:
 
 
 def test_cost_uses_the_model_for_each_turn() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(
             replace(
                 session().status,
@@ -458,7 +549,7 @@ def test_cost_uses_the_model_for_each_turn() -> None:
 
 
 def test_gpt_5_5_long_context_applies_published_multiplier() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(
             replace(
                 session().status,
@@ -482,7 +573,7 @@ def test_gpt_5_5_long_context_applies_published_multiplier() -> None:
 
 
 def test_gpt_5_5_below_long_context_threshold_uses_base_rates() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(
             replace(
                 session().status,
@@ -510,7 +601,7 @@ def test_gpt_5_5_window_matches_published_value() -> None:
 
 
 def test_codex_cache_write_is_free() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         FakeSlashSession(
             replace(
                 session().status,
@@ -547,7 +638,7 @@ def test_compaction_history_counts_folded_messages_only(tmp_path: Path) -> None:
     store.append_compaction_marker("summary", 1, 6)
 
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store),
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -603,9 +694,13 @@ def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> N
     )
     second_source = [
         store.append_message(Message(MessageRole.USER, [TextContent("new source")])),
-        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply")])),
+        store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("new reply")])
+        ),
         store.append_message(Message(MessageRole.USER, [TextContent("new source 2")])),
-        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply 2")])),
+        store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("new reply 2")])
+        ),
     ]
     store.append_compaction_marker(
         "second summary",
@@ -630,7 +725,7 @@ def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:
     store.append_compaction_marker("abandoned summary", 1, 5)
     store.append_fork(str(checkpoint.seq))
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store),
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
@@ -639,21 +734,21 @@ def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:
 
 
 def test_unknown_command_passes_through_unchanged() -> None:
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     assert registry.dispatch(session(), "/unknown arg") is None
     assert registry.input_for_model("/unknown arg") == "/unknown arg"
 
 
 def test_double_slash_escapes_registered_command() -> None:
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     assert registry.dispatch(session(), "//status") is None
     assert registry.input_for_model("//status") == "/status"
 
 
 def test_multiline_known_command_consumes_the_whole_message() -> None:
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         session(), "/status\nmodel must not see this"
     )
 
@@ -662,7 +757,7 @@ def test_multiline_known_command_consumes_the_whole_message() -> None:
 
 
 def test_empty_message_does_nothing() -> None:
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     assert registry.dispatch(session(), "") is None
     assert registry.input_for_model("") == ""
@@ -686,7 +781,7 @@ def test_model_command_shows_and_changes_the_model() -> None:
             return "compact: nothing to compact"
 
     model_session = ModelSession()
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
     assert registry.dispatch(model_session, "/model") == "model: offline"
     assert registry.dispatch(model_session, "/model faster") == "model: faster"
@@ -705,9 +800,7 @@ async def test_compact_command_uses_async_dispatch() -> None:
         async def slash_compact(self) -> str:
             return "compacted entries 1–2; tokens after: 3"
 
-    output = await create_slash_registry().dispatch_async(
-        CompactSession(), "/compact"
-    )
+    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(CompactSession(), "/compact")
 
     assert output == "compacted entries 1–2; tokens after: 3"
 
@@ -718,7 +811,7 @@ async def test_mcp_command_dispatches_status_and_reconnect() -> None:
         async def slash_mcp(self, args: str) -> str:
             return f"mcp args: {args}"
 
-    registry = create_slash_registry()
+    registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
     session_value = MCPTestSession()
 
     assert await registry.dispatch_async(session_value, "/mcp") == "mcp args: "
@@ -733,7 +826,7 @@ async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> N
     backend = FakeBackend([])
     output = StringIO()
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=output, force_terminal=False),

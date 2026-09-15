@@ -21,7 +21,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortGenerationRegistry
 from ..core.abort import AbortSignal as ToolAbortSignal
@@ -49,6 +49,7 @@ from ..execution import (
     build_execution_arguments,
     run_handler_with_abort,
 )
+from ..skills import SkillCatalog
 from ..types import (
     StructuredContentValue,
     StructuredToolResult,
@@ -61,6 +62,9 @@ from ..types import (
 )
 from ._process import BackgroundTaskRegistry
 from ._sandbox import SandboxPolicy
+
+if TYPE_CHECKING:
+    from ..skills.agent_catalog import AgentCatalog
 
 AbortSignal = ToolAbortSignal
 MAX_STRUCTURED_CONTENT_DEPTH = 32
@@ -413,6 +417,8 @@ class ToolRegistry:
         max_output_chars: int = 10_000,
         register_builtin: bool = True,
         enforce_approvals: bool = False,
+        skill_catalog: SkillCatalog,
+        agent_catalog: AgentCatalog | None = None,
     ) -> None:
         if enforce_approvals and approval_policy is None:
             raise ValueError("enforced approvals require a policy")
@@ -464,6 +470,12 @@ class ToolRegistry:
             session_store.bash_cwd if session_store is not None else str(self.cwd)
         )
         self._tools: dict[str, ToolDefinition] = {}
+        self.skill_catalog = skill_catalog
+        if agent_catalog is None:
+            from ..skills.agent_catalog import discover_packaged_agents
+
+            agent_catalog = discover_packaged_agents()
+        self.agent_catalog = agent_catalog
         self._register_builtin = register_builtin
         if register_builtin:
             _register_discovered_tools(self)
@@ -593,6 +605,7 @@ class ToolRegistry:
             clone.pre_execute_hook,
         )
         clone._agent_runner = None
+        clone.agent_catalog = self.agent_catalog
         return clone
     def abort(self) -> None:
         self.abort_signal.abort()

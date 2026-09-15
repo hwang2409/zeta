@@ -15,6 +15,7 @@ from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
 from zeta.mcp.prompt_commands import SlashModelInput
+from zeta.skills import SkillCatalog
 from zeta.tools.plan_mode import PLAN_MODE_PREAMBLE, PLAN_MODE_TOOLS
 from zeta.tui.app import create_app
 from zeta.tui.render import format_status
@@ -39,6 +40,7 @@ def build_loop(tmp_path: Path, turns: list[ScriptedTurn]) -> AgentLoop:
             store=store, default=ApprovalDecision.ALLOW, always_ask=()
         ),
         skip_mcp_mount=True,
+skill_catalog=SkillCatalog.empty(),
     )
 
 
@@ -286,6 +288,7 @@ async def test_allowed_sub_agents_complete_a_turn_in_plan_mode(
         approval_policy=ApprovalPolicy(
             store=store, default=ApprovalDecision.ALLOW
         ),
+skill_catalog=SkillCatalog.empty(),
     )
     loop.set_plan_mode(True)
 
@@ -323,6 +326,7 @@ async def test_late_mounted_tool_is_rejected_in_plan_mode(
         backend,
         store,
         approval_policy=ApprovalPolicy(store=store, default=approval_default),
+skill_catalog=SkillCatalog.empty(),
     )
     loop.set_plan_mode(True)
     loop.tool_registry.register(
@@ -362,7 +366,7 @@ class PlanSession:
 
 
 def dispatch(session: object, value: str) -> str | SlashModelInput | None:
-    return create_slash_registry().dispatch(session, value)
+    return create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(session, value)
 
 
 def test_plan_command_reports_and_toggles() -> None:
@@ -465,8 +469,8 @@ async def test_plan_command_refuses_running_background_process_then_allows_entry
 
 
 def test_plan_command_is_listed_in_help() -> None:
-    assert "/plan" in create_slash_registry().help_text()
-    assert "/implement" in create_slash_registry().help_text()
+    assert "/plan" in create_slash_registry(skill_catalog=SkillCatalog.empty()).help_text()
+    assert "/implement" in create_slash_registry(skill_catalog=SkillCatalog.empty()).help_text()
 
 
 def test_implement_exits_and_submits_the_explicit_request() -> None:

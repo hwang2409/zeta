@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 import zeta.tools as tools_package
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.types import ToolCall
 
@@ -48,7 +49,7 @@ def register(registry):
     )
     _use_tool_path(monkeypatch, tmp_path)
 
-    registry = ToolRegistry(tmp_path, max_output_chars=4)
+    registry = ToolRegistry(tmp_path, max_output_chars=4, skill_catalog=SkillCatalog.empty())
     result = await registry.execute(
         ToolCall("fixture-call", "fixture", {"value": "oversized"})
     )
@@ -81,7 +82,7 @@ def test_registry_ignores_helpers_and_discovers_in_name_order(
     )
     _use_tool_path(monkeypatch, tmp_path)
 
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     assert [definition.name for definition in registry.definitions] == ["a", "z"]
     assert "helper" not in registry.definitions_by_name
@@ -97,4 +98,4 @@ def test_registry_names_malformed_tool_module(
     _use_tool_path(monkeypatch, tmp_path)
 
     with pytest.raises(TypeError, match=module_name):
-        ToolRegistry(tmp_path)
+        ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())

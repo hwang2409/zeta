@@ -20,6 +20,7 @@ from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.fake import FakeBackend
 from zeta.core.loop import AgentLoop
 from zeta.core.store import ConversationStore
+from zeta.skills import SkillCatalog
 from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.composer import build_key_bindings, parse_submission
 from zeta.tui.key_bindings import DEFAULTS, resolve_keybindings
@@ -133,13 +134,13 @@ def test_open_editor_binding_can_be_remapped() -> None:
 
 
 def test_agent_loop_rejects_non_user_steering(tmp_path: Path) -> None:
-    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
     with pytest.raises(ValueError, match="user role"):
         loop.steer(Message(MessageRole.ASSISTANT, [TextContent("bad")]))
 
 
 def test_agent_loop_abort_clears_steering(tmp_path: Path) -> None:
-    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
     loop.steer(Message(MessageRole.USER, [TextContent("later")]))
     assert loop.has_pending_steering is True
     loop.abort()
@@ -170,7 +171,7 @@ async def test_steer_delivers_between_tool_pair_and_next_provider_call(
 
     backend = SteerToolBackend(tool_call)
     store = ConversationStore(tmp_path / "sessions")
-    loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3)
+    loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty())
 
     async def run() -> None:
         async for _event in loop.run_turn("prompt"):
@@ -222,7 +223,7 @@ async def test_multiple_steers_deliver_in_order_at_one_boundary(
 
     backend = SteerToolBackend(tool_call)
     store = ConversationStore(tmp_path / "sessions")
-    loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3)
+    loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty())
 
     async def run() -> None:
         async for _event in loop.run_turn("prompt"):
@@ -269,7 +270,7 @@ async def test_pipeline_routes_default_submission_as_steer(tmp_path: Path) -> No
     backend = SteerToolBackend(tool_call)
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
-        AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3),
+        AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -313,7 +314,7 @@ async def test_backslash_prefix_defers_to_after_turn_end(tmp_path: Path) -> None
     backend = SteerToolBackend(tool_call)
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
-        AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3),
+        AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -357,7 +358,7 @@ async def test_abort_drops_pending_steering(tmp_path: Path) -> None:
     backend = SteerToolBackend(tool_call)
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
-        AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3),
+        AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -417,7 +418,7 @@ async def test_toolless_turn_drops_orphan_steer_and_notifies(
     store = ConversationStore(tmp_path / "sessions")
     output = StringIO()
     app = TUIApp(
-        AgentLoop(backend, store, max_turns=3),
+        AgentLoop(backend, store, max_turns=3, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=output, force_terminal=False),
@@ -484,7 +485,7 @@ async def test_steering_preserves_cache_prefix_of_running_turn(
 
     backend = SteerToolBackend(tool_call)
     store = ConversationStore(tmp_path / "sessions")
-    loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3)
+    loop = AgentLoop(backend, store, tools={"noop": noop_tool}, max_turns=3, skill_catalog=SkillCatalog.empty())
 
     async def run() -> None:
         async for _event in loop.run_turn("prompt"):
@@ -597,7 +598,7 @@ async def test_passthrough_runs_shell_without_provider_call(tmp_path: Path) -> N
     backend = FakeBackend([])
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
-        AgentLoop(backend, store, max_turns=1),
+        AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -627,7 +628,7 @@ async def test_passthrough_repeat_uses_last_command(tmp_path: Path) -> None:
     backend = FakeBackend([])
     store = ConversationStore(tmp_path / "sessions")
     app = TUIApp(
-        AgentLoop(backend, store, max_turns=1),
+        AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
@@ -654,7 +655,7 @@ async def test_passthrough_repeat_without_history_notes_error(tmp_path: Path) ->
     store = ConversationStore(tmp_path / "sessions")
     output = StringIO()
     app = TUIApp(
-        AgentLoop(backend, store, max_turns=1),
+        AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         console=Console(file=output, force_terminal=False),
@@ -678,7 +679,7 @@ async def test_passthrough_respects_approval_policy(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     policy = ApprovalPolicy(default=ApprovalDecision.DENY, store=store)
     app = TUIApp(
-        AgentLoop(backend, store, approval_policy=policy, max_turns=1),
+        AgentLoop(backend, store, approval_policy=policy, max_turns=1, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         approval_policy=policy,

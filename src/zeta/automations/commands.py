@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..core.approval import ApprovalDecision, ApprovalPolicy
+from ..skills import discover_session_skills
 from ..tools import ToolRegistry
 from .authoring import import_jobs, listing, show
 from .delivery import SlackDelivery
@@ -30,7 +31,10 @@ async def review_job(store: SQLiteStore, name: str, home: Path) -> Review:
     state = store.get(name)
     policy = ApprovalPolicy(default=ApprovalDecision.DENY, always_allow=state.job.allow)
     registry = ToolRegistry(
-        state.job.cwd, approval_policy=policy, enforce_approvals=True
+        state.job.cwd,
+        approval_policy=policy,
+        enforce_approvals=True,
+        skill_catalog=discover_session_skills(home=home),
     )
     mount = None
     try:

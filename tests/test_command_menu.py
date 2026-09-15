@@ -19,6 +19,7 @@ from rich.console import Console
 from zeta.core.fake import FakeBackend
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
+from zeta.skills import SkillCatalog
 from zeta.tui import theme
 from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.layout import COMMAND_MENU_ROWS, CommandMenuFloat
@@ -28,7 +29,11 @@ WIDTH, HEIGHT = 80, 24
 
 def _app(tmp_path: Path) -> tuple[TUIApp, FullScreenPromptSession]:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="fake",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),

@@ -30,6 +30,7 @@ from html import escape
 from pathlib import Path
 
 from ..prompts import load_identity
+from ..skills import SkillCatalog
 from .process_env import subprocess_env
 
 AGENTS_FILENAME = "AGENTS.md"
@@ -52,8 +53,8 @@ class ProjectContext:
     notices: tuple[str, ...] = field(default_factory=tuple)
 
 
-def discover_repo_root(cwd: str | Path | None = None) -> Path:
-    """Resolve the git worktree root, or use cwd when it is not a repository."""
+def discover_project_root(cwd: str | Path | None = None) -> Path | None:
+    """Resolve the git worktree root, or return None outside a repository."""
 
     directory = Path(cwd or Path.cwd()).expanduser().resolve()
     try:
@@ -65,9 +66,16 @@ def discover_repo_root(cwd: str | Path | None = None) -> Path:
             env=subprocess_env(),
         )
     except (OSError, subprocess.CalledProcessError):
-        return directory
+        return None
     root = getattr(result, "stdout", "").strip()
-    return Path(root).expanduser().resolve() if root else directory
+    return Path(root).expanduser().resolve() if root else None
+
+
+def discover_repo_root(cwd: str | Path | None = None) -> Path:
+    """Resolve the git worktree root, or use cwd when it is not a repository."""
+
+    directory = Path(cwd or Path.cwd()).expanduser().resolve()
+    return discover_project_root(directory) or directory
 
 
 def _present(path: Path) -> bool:
@@ -178,6 +186,7 @@ def load_project_context(
     system_override: str | None = None,
     system_append: str | None = None,
     byte_cap: int = CONTEXT_BYTE_CAP,
+    catalog: SkillCatalog,
 ) -> ProjectContext:
     """Load the composed system prompt for one session.
 
@@ -206,7 +215,9 @@ def load_project_context(
     if system_override is not None:
         sections: list[str] = [system_override]
     else:
-        sections = [load_identity()]
+        sections = [
+            load_identity(catalog=catalog)
+        ]
         candidates: list[Path] = []
         home_agents = home / AGENTS_FILENAME
         if _present(home_agents):
@@ -279,6 +290,7 @@ __all__ = [
     "SYSTEM_FILENAME",
     "ProjectContext",
     "PromptArgumentError",
+    "discover_project_root",
     "discover_repo_root",
     "load_project_context",
     "resolve_prompt_argument",

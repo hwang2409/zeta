@@ -19,6 +19,7 @@ from zeta.core.session import SessionManager, env_home
 from zeta.core.store import ConversationStore
 from zeta.headless import DENIAL_MARKER, drive_turn, run_headless
 from zeta.loop import AgentLoop
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.types import TextContent, ToolCall
 
@@ -78,7 +79,7 @@ def test_print_mode_runs_session_hook_inside_async_activation(
 async def test_text_mode_prints_final_message_and_exits_zero(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("hello world")])])
-    loop = AgentLoop(backend, store)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
 
     code, out, err = await _drive(loop, "greet", "text")
 
@@ -97,7 +98,7 @@ async def test_json_mode_streams_documented_lifecycle(tmp_path: Path) -> None:
             )
         ]
     )
-    loop = AgentLoop(backend, store)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
 
     code, out, err = await _drive(loop, "hi", "json")
 
@@ -125,9 +126,9 @@ async def test_json_mode_records_tool_call_and_result(tmp_path: Path) -> None:
         ]
     )
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("echo", lambda arguments: f"got {arguments['value']}")
-    loop = AgentLoop(backend, store, registry=registry)
+    loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
 
     code, out, _err = await _drive(loop, "run", "json")
 
@@ -156,10 +157,10 @@ async def test_json_mode_bounds_large_tool_result(tmp_path: Path) -> None:
         ]
     )
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     big = "a" * 20_000
     registry.register("spam", lambda arguments: big)
-    loop = AgentLoop(backend, store, registry=registry)
+    loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
 
     code, out, _err = await _drive(loop, "go", "json")
 
@@ -181,12 +182,12 @@ async def test_json_mode_tool_result_bound_is_byte_based(tmp_path: Path) -> None
         ]
     )
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     # Four-byte UTF-8 emoji: char count is well under the limit, byte count is
     # well over it. Char-based bounds would silently ship the whole payload.
     big = "\U0001f600" * (TOOL_RESULT_MAX_BYTES // 2)
     registry.register("wide", lambda arguments: big)
-    loop = AgentLoop(backend, store, registry=registry)
+    loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
 
     code, out, _err = await _drive(loop, "go", "json")
 
@@ -209,9 +210,9 @@ async def test_json_mode_bounds_large_tool_call_arguments(tmp_path: Path) -> Non
         ]
     )
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("sink", lambda arguments: "ok")
-    loop = AgentLoop(backend, store, registry=registry)
+    loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
 
     code, out, _err = await _drive(loop, "go", "json")
 
@@ -233,10 +234,10 @@ async def test_headless_hook_rejection_does_not_show_yolo_hint(tmp_path: Path) -
         ]
     )
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("vetoed", lambda arguments: "must not run")
     registry.set_pre_execute_hook(lambda name, arguments: False)
-    loop = AgentLoop(backend, store, registry=registry)
+    loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
 
     code, out, err = await _drive(loop, "start", "text")
 
@@ -456,9 +457,9 @@ async def test_headless_denies_ask_tool_and_writes_stderr_note(tmp_path: Path) -
     )
     store = ConversationStore(tmp_path)
     policy = ApprovalPolicy(default=ApprovalDecision.DENY, store=store)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("danger", lambda arguments: "must not run")
-    loop = AgentLoop(backend, store, registry=registry, approval_policy=policy)
+    loop = AgentLoop(backend, store, registry=registry, approval_policy=policy, skill_catalog=SkillCatalog.empty())
 
     code, out, err = await _drive(loop, "start", "text")
 
@@ -478,9 +479,9 @@ async def test_max_turns_error_returns_exit_one(tmp_path: Path) -> None:
         ]
     )
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("loop", lambda arguments: "again")
-    loop = AgentLoop(backend, store, registry=registry, max_turns=1)
+    loop = AgentLoop(backend, store, registry=registry, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     code, out, err = await _drive(loop, "start", "text")
 
@@ -497,9 +498,9 @@ async def test_json_mode_surfaces_error_event(tmp_path: Path) -> None:
         ]
     )
     store = ConversationStore(tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("loop", lambda arguments: "again")
-    loop = AgentLoop(backend, store, registry=registry, max_turns=1)
+    loop = AgentLoop(backend, store, registry=registry, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     code, out, err = await _drive(loop, "start", "json")
 

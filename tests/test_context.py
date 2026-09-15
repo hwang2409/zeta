@@ -241,7 +241,7 @@ async def test_compaction_strips_thinking_from_input_and_summary(context_root: P
 async def test_compaction_summary_replaces_image_base64_with_placeholder(
     context_root: Path,
 ) -> None:
-    image_data = base64.b64encode(b"\xff\xd8\xff").decode()
+    image_data = base64.b64encode(b"\xff\xd8\xff\xd9").decode()
     store = ConversationStore(context_root)
     store.append_message(
         Message(
@@ -275,7 +275,7 @@ async def test_compaction_summary_replaces_image_base64_with_placeholder(
     summary_prompt = backend.calls[0][0][0].content[0].text
     assert image_data not in summary_prompt
     assert (
-        "[image block] media_type=image/jpeg bytes=3 caption=a test image"
+        "[image block] media_type=image/jpeg bytes=4 caption=a test image"
         in summary_prompt
     )
 

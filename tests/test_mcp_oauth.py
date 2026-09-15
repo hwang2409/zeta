@@ -47,6 +47,7 @@ from zeta.mcp.resources import (
     format_resource_list,
     list_resources,
 )
+from zeta.skills import SkillCatalog
 from zeta.types import TextContent
 
 
@@ -589,7 +590,7 @@ async def test_resources_list_and_attach_round_trip(
         return _ResourceClient(config)
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
     await loop.slash_mcp("add live --http https://mcp.example")
 
@@ -708,7 +709,7 @@ async def test_tokens_do_not_appear_in_conversation_store(
     project.mkdir()
     store = ConversationStore(project)
     backend = FakeBackend([ScriptedTurn([TextContent("hello")])])
-    loop = AgentLoop(backend, store, skip_mcp_mount=True)
+    loop = AgentLoop(backend, store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty())
     events = [event async for event in loop.run_turn("please answer")]
     await loop.close()
 
@@ -737,7 +738,7 @@ async def test_slash_mcp_status_shows_oauth_state(
         return []
 
     monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
 
     await loop.slash_mcp("add live --http https://mcp.example --oauth")
@@ -778,7 +779,7 @@ async def test_slash_mcp_auth_runs_flow_and_persists_token(
     recorder = _RecordingAuthorize()
     monkeypatch.setattr(commands_module, "authorize", recorder)
 
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
     await loop.slash_mcp("add live --http https://mcp.example --oauth")
 
@@ -809,7 +810,7 @@ async def test_slash_mcp_auth_reports_flow_failure(
         raise MCPOAuthError("consent denied")
 
     monkeypatch.setattr(commands_module, "authorize", boom)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
     await loop.slash_mcp("add live --http https://mcp.example --oauth")
 
@@ -840,7 +841,7 @@ async def test_slash_mcp_auth_rejects_stdio_server(
         async def close(self) -> None: ...
 
     monkeypatch.setattr(mount_module, "_build_client", lambda config: _NoopClient(config))
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
     await loop.slash_mcp("add local --stdio command")
 

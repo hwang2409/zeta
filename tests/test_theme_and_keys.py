@@ -15,6 +15,7 @@ from rich.text import Text
 from zeta.core.session import SessionError
 from zeta.core.store import ConversationStore
 from zeta.loop import AgentLoop
+from zeta.skills import SkillCatalog
 from zeta.tui import theme as theme_module
 from zeta.tui.app import TUIApp
 from zeta.tui.bootstrap import _apply_startup_theme, _validate_keybindings
@@ -273,6 +274,7 @@ def test_slash_theme_switches_and_rebuilds(tmp_path: Path) -> None:
             FakeInteractiveBackend(model="offline"),
             ConversationStore(session_dir),
             skip_mcp_mount=True,
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",
@@ -302,6 +304,7 @@ def test_slash_theme_lists_available(tmp_path: Path) -> None:
             FakeInteractiveBackend(model="offline"),
             ConversationStore(session_dir),
             skip_mcp_mount=True,
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",
@@ -321,6 +324,7 @@ def test_slash_theme_unknown_name_is_not_applied(tmp_path: Path) -> None:
             FakeInteractiveBackend(model="offline"),
             ConversationStore(session_dir),
             skip_mcp_mount=True,
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",

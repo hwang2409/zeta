@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import threading
 import time
@@ -25,6 +26,7 @@ from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
+from zeta.skills import SkillCatalog
 from zeta.tools.agent import ChildApprovalPolicy
 from zeta.tui.app import TUIApp, create_app
 from zeta.tui.layout import CONTENT_MARGIN, content_width
@@ -138,6 +140,83 @@ def test_legacy_resume_persists_context_snapshot(
 
     assert saved["system_prompt"] == resumed.loop.context_assembler.system_prompt.content[0].text
     assert saved["context_files"] == [str(context_file.resolve())]
+
+
+def test_legacy_resume_migrates_prompt_index_with_skill_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    skill_path = home / "skills" / "legacy.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text(
+        "---\nname: legacy\ndescription: legacy skill\n---\n\nlegacy body\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    legacy_prompt = (
+        "legacy prompt\n\n<zeta-skills>\nAvailable skills:\n- old: old skill\n"
+        "</zeta-skills>\n\nlegacy tail"
+    )
+    opened = SessionManager(home).create(
+        provider="fake",
+        model="offline",
+        cwd=tmp_path,
+        system_prompt=legacy_prompt,
+    )
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", opened.store.session_id, "--provider", "fake"])
+    )
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+
+    assert "legacy prompt" in prompt
+    assert "legacy: legacy skill" in prompt
+    assert "- old: old skill" not in prompt
+    assert "legacy tail" in prompt
+
+
+def test_legacy_resume_rejects_unterminated_skill_index_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    opened = SessionManager(home).create(
+        provider="fake",
+        model="offline",
+        cwd=tmp_path,
+        system_prompt="legacy\n<zeta-skills>\nAvailable skills:\n- old: old",
+    )
+    metadata_path = home / "sessions" / opened.store.session_id / "meta.json"
+    original = metadata_path.read_bytes()
+
+    with pytest.raises(ValueError, match="unterminated skill index"):
+        create_app(
+            build_parser().parse_args(
+                ["--resume", opened.store.session_id, "--provider", "fake"]
+            )
+        )
+
+    assert metadata_path.read_bytes() == original
+
+
+def test_catalog_boundaries_require_explicit_catalog() -> None:
+    from zeta.core.project_context import load_project_context
+    from zeta.prompts import load_identity, load_skill
+    from zeta.runtime.composition import compose_runtime
+    from zeta.tools import ToolRegistry
+
+    for callable_, parameter in (
+        (AgentLoop, "skill_catalog"),
+        (ToolRegistry, "skill_catalog"),
+        (create_slash_registry, "skill_catalog"),
+        (load_identity, "catalog"),
+        (load_skill, "catalog"),
+        (load_project_context, "catalog"),
+        (compose_runtime, "skill_catalog"),
+    ):
+        assert inspect.signature(callable_).parameters[parameter].default is inspect.Parameter.empty
 
 
 def test_legacy_resume_uses_persisted_snapshot_on_second_resume(
@@ -293,6 +372,47 @@ def test_resume_without_flags_leaves_snapshot_untouched(
     assert saved["system_prompt"] == original["system_prompt"]
     assert saved["context_files"] == original["context_files"]
     assert resumed._startup_alerts == ()
+
+
+@pytest.mark.asyncio
+async def test_resume_reuses_one_persisted_skill_catalog_for_prompt_and_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    skills_dir = home / "skills"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "first.md").write_text(
+        "---\nname: first\ndescription: first skill\n---\n\nfirst body\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    first = create_app(_args())
+    session_id = first.loop.store.session_id
+    (skills_dir / "second.md").write_text(
+        "---\nname: second\ndescription: second skill\n---\n\nsecond body\n",
+        encoding="utf-8",
+    )
+
+    resumed = create_app(
+        build_parser().parse_args(["--resume", session_id, "--provider", "fake"])
+    )
+    prompt = resumed.loop.context_assembler.system_prompt.content[0].text
+    loaded = await resumed.loop.tool_registry.execute(
+        ToolCall("skill", "skill", {"name": "first"}), _skip_approval=True
+    )
+    missing = await resumed.loop.tool_registry.execute(
+        ToolCall("skill-missing", "skill", {"name": "second"}),
+        _skip_approval=True,
+    )
+
+    assert "first: first skill" in prompt
+    assert "second: second skill" not in prompt
+    assert loaded["isError"] is False
+    assert loaded["content"][0]["text"] == "first body"
+    assert missing["isError"] is True
+    assert "available skills: review, first" in missing["content"][0]["text"]
 
 
 def test_second_resume_after_override_sees_overridden_snapshot(
@@ -454,7 +574,7 @@ def test_model_swap_persists_and_restores_on_resume(
     monkeypatch.setenv("ZETA_HOME", str(home))
     first = create_app(_args())
 
-    output = create_slash_registry().dispatch(first, "/model faster")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(first, "/model faster")
     assert output == "model: faster"
     assert first.model == "faster"
     assert SessionManager(home).open(first.loop.store.session_id).metadata.model == "faster"
@@ -475,7 +595,7 @@ def test_vim_mode_defaults_on_and_persists_on_resume(
     first = create_app(_args())
 
     assert first.vim_mode is True
-    assert create_slash_registry().dispatch(first, "/vim off") == "vim mode: off"
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(first, "/vim off") == "vim mode: off"
     assert first.vim_mode is False
     assert (
         SessionManager(home).open(first.loop.store.session_id).metadata.vim_mode
@@ -513,13 +633,13 @@ def test_legacy_session_metadata_defaults_vim_mode_on(
 async def test_unknown_model_swap_warns_and_changes_the_model(tmp_path: Path) -> None:
     backend = FakeBackend([])
     app = TUIApp(
-        AgentLoop(backend, ConversationStore(tmp_path / "sessions")),
+        AgentLoop(backend, ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         model_catalog_loader=lambda provider: frozenset({"claude-sonnet-4-6"}),
     )
 
-    output = create_slash_registry().dispatch(app, "/model offline")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model offline")
     await wait_until(lambda: app._model_catalog_loaded)
 
     assert output == "model: offline (model catalog unavailable for claude — using anyway)"
@@ -534,13 +654,13 @@ async def test_unknown_model_with_provider_prefix_warns_before_state_change(
     manager = SessionManager(home)
     opened = manager.create(provider="claude", model="claude-sonnet-4-6", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(FakeBackend([]), opened.store),
+        AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         model_catalog_loader=lambda provider: frozenset({"claude-sonnet-4-6"}),
     )
 
-    output = create_slash_registry().dispatch(
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
         app, "/model claude-definitely-not-real"
     )
     await wait_until(lambda: app._model_catalog_loaded)
@@ -556,15 +676,15 @@ async def test_unknown_model_with_provider_prefix_warns_before_state_change(
 @pytest.mark.asyncio
 async def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         model_catalog_loader=lambda provider: frozenset({"claude-opus-4-7"}),
     )
 
-    first = create_slash_registry().dispatch(app, "/model claude-opus-4-7")
+    first = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-opus-4-7")
     await wait_until(lambda: app._model_catalog_loaded)
-    output = create_slash_registry().dispatch(app, "/model claude-opus-4-7")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-opus-4-7")
 
     assert first == (
         "model: claude-opus-4-7 "
@@ -582,15 +702,15 @@ async def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
         return frozenset({"claude-opus-4-7"})
 
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         model_catalog_loader=load_catalog,
     )
 
-    first = create_slash_registry().dispatch(app, "/model claude-new")
+    first = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-new")
     await wait_until(lambda: app._model_catalog_loaded)
-    second = create_slash_registry().dispatch(app, "/model claude-other")
+    second = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-other")
 
     assert first == (
         "model: claude-new "
@@ -614,14 +734,14 @@ async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
         return frozenset({"claude-opus-4-7"})
 
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         model_catalog_loader=load_catalog,
     )
 
     began = time.monotonic()
-    first = create_slash_registry().dispatch(app, "/model claude-opus-4-7")
+    first = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-opus-4-7")
     elapsed = time.monotonic() - began
 
     try:
@@ -635,7 +755,7 @@ async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
         release.set()
 
     await wait_until(lambda: app._model_catalog_loaded)
-    assert create_slash_registry().dispatch(app, "/model claude-opus-4-7") == (
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-opus-4-7") == (
         "model: claude-opus-4-7"
     )
 
@@ -643,13 +763,13 @@ async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="gpt-5.4",
         model_catalog_loader=lambda provider: None,
     )
 
-    output = create_slash_registry().dispatch(app, "/model gpt-5.6-sol")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model gpt-5.6-sol")
     await wait_until(lambda: app._model_catalog_loaded)
 
     assert output == "model: gpt-5.6-sol (model catalog unavailable for codex — using anyway)"
@@ -657,13 +777,13 @@ async def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
 
 def test_wrong_provider_model_prefix_is_rejected(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="claude",
         model="claude-sonnet-4-6",
         model_catalog_loader=lambda provider: frozenset(),
     )
 
-    output = create_slash_registry().dispatch(app, "/model gpt-5.6-sol")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model gpt-5.6-sol")
 
     assert output == "model unchanged: model 'gpt-5.6-sol' has a wrong-provider prefix for claude"
 
@@ -671,14 +791,14 @@ def test_wrong_provider_model_prefix_is_rejected(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_model_swap_is_rejected_during_active_turn(tmp_path: Path) -> None:
     app = TUIApp(
-        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
     app._active_task = asyncio.create_task(asyncio.sleep(1))
 
     try:
-        output = create_slash_registry().dispatch(app, "/model faster")
+        output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model faster")
     finally:
         app._active_task.cancel()
         await asyncio.gather(app._active_task, return_exceptions=True)
@@ -696,13 +816,13 @@ def test_model_swap_is_rejected_with_pending_approval(tmp_path: Path) -> None:
         [(call.id, call)],
     )
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, approval_policy=policy),
+        AgentLoop(FakeBackend([]), store, approval_policy=policy, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
         approval_policy=policy,
     )
 
-    output = create_slash_registry().dispatch(app, "/model faster")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model faster")
 
     assert output == "model unchanged: cannot change model while a turn or approval is active"
     assert app.model == "offline"
@@ -723,12 +843,12 @@ async def test_compact_command_forces_the_existing_compaction_path(tmp_path: Pat
         token_counter=lambda message: 10,
     )
     app = TUIApp(
-        AgentLoop(backend, store, context_assembler=assembler),
+        AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty()),
         provider="fake",
         model="offline",
     )
 
-    output = await create_slash_registry().dispatch_async(app, "/compact")
+    output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(app, "/compact")
 
     assert output is not None
     assert output.startswith("compacted entries ")
@@ -1036,7 +1156,7 @@ async def test_forced_override_commits_after_first_successful_request(
             ]
         )
     )
-    assert create_slash_registry().dispatch(app, "/model claude-opus-4-1") == (
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-opus-4-1") == (
         "model: claude-opus-4-1 "
         "(model catalog unavailable for claude — using anyway; "
         "context budget 1,000,000 -> 200,000)"
@@ -1192,7 +1312,7 @@ async def test_tui_resolves_colliding_child_approvals_by_unique_key(
 ) -> None:
     parent_store = ConversationStore(tmp_path / "sessions", session_id="parent")
     policy = ApprovalPolicy(store=parent_store)
-    loop = AgentLoop(FakeBackend([]), parent_store, approval_policy=policy)
+    loop = AgentLoop(FakeBackend([]), parent_store, approval_policy=policy, skill_catalog=SkillCatalog.empty())
     app = TUIApp(
         loop,
         provider="fake",
@@ -1249,6 +1369,7 @@ async def test_cancel_then_approve_does_not_resume_tool(tmp_path: Path) -> None:
             tools={"echo": echo},
             approval_policy=policy,
             max_turns=1,
+skill_catalog=SkillCatalog.empty(),
         ),
         provider="fake",
         model="offline",
@@ -1290,6 +1411,7 @@ async def test_resume_pending_tool_executes_and_persists_result(
         opened.store,
         tools={"echo": echo},
         approval_policy=policy,
+skill_catalog=SkillCatalog.empty(),
     )
     call = ToolCall("approval-tool", "echo", {"value": "done"})
     opened.store.append_message_with_approval_requests(
@@ -1332,6 +1454,7 @@ async def test_resumed_tool_abort_active_persists_canceled_result(tmp_path: Path
         opened.store,
         tools={"block": block},
         approval_policy=policy,
+skill_catalog=SkillCatalog.empty(),
     )
     call = ToolCall("approval-abort", "block", {})
     opened.store.append_message_with_approval_requests(
@@ -1371,6 +1494,7 @@ async def test_resumed_tool_direct_cancel_persists_canceled_result(tmp_path: Pat
         opened.store,
         tools={"block": block},
         approval_policy=policy,
+skill_catalog=SkillCatalog.empty(),
     )
     call = ToolCall("approval-cancel", "block", {})
     opened.store.append_message_with_approval_requests(
@@ -1410,6 +1534,7 @@ async def test_resumed_tool_immediate_abort_persists_canceled_result(
         opened.store,
         tools={"never": never_runs},
         approval_policy=policy,
+skill_catalog=SkillCatalog.empty(),
     )
     call = ToolCall("approval-immediate-abort", "never", {})
     opened.store.append_message_with_approval_requests(
@@ -1430,7 +1555,7 @@ async def test_resumed_tool_immediate_abort_persists_canceled_result(
 def test_finalize_canceled_is_idempotent(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
-    loop = AgentLoop(FakeBackend([]), opened.store)
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     call = ToolCall("approval-idempotent-cancel", "never", {})
     opened.store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -1453,7 +1578,7 @@ def test_finalize_canceled_is_idempotent(tmp_path: Path) -> None:
 def test_completion_edge_idempotence_preserves_success(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
-    loop = AgentLoop(FakeBackend([]), opened.store)
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     call = ToolCall("approval-completion-edge", "never", {})
     opened.store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -1495,6 +1620,7 @@ async def test_resume_pending_tool_rejects_existing_result(tmp_path: Path) -> No
         opened.store,
         tools={"echo": echo},
         approval_policy=policy,
+skill_catalog=SkillCatalog.empty(),
     )
     call = ToolCall("approval-existing-result", "echo", {"value": "done"})
     opened.store.append_message_with_approval_requests(
@@ -1537,6 +1663,7 @@ async def test_strict_pre_start_parent_cancellation_persists_canceled_result(
         opened.store,
         tools={"never": never_runs},
         approval_policy=policy,
+skill_catalog=SkillCatalog.empty(),
     )
     call = ToolCall("approval-parent-cancel", "never", {})
     opened.store.append_message_with_approval_requests(
@@ -1599,6 +1726,7 @@ async def test_parent_cancellation_after_child_start_persists_result(
         opened.store,
         tools={"block": blocks},
         approval_policy=policy,
+skill_catalog=SkillCatalog.empty(),
     )
     call = ToolCall("approval-parent-after-start", "block", {})
     opened.store.append_message_with_approval_requests(
@@ -1801,7 +1929,7 @@ async def test_resume_replays_the_same_context_branch(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path / "zeta-home")
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
     backend = FakeBackend([ScriptedTurn(content=[TextContent("first")])])
-    loop = AgentLoop(backend, opened.store)
+    loop = AgentLoop(backend, opened.store, skill_catalog=SkillCatalog.empty())
     [event async for event in loop.run_turn("hello")]
 
     resumed = manager.open(opened.store.session_id)
@@ -1946,7 +2074,7 @@ def test_model_command_leaves_a_pinned_budget_alone(
             ]
         )
     )
-    assert create_slash_registry().dispatch(app, "/model claude-sonnet-4-6") == (
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/model claude-sonnet-4-6") == (
         "model: claude-sonnet-4-6 "
         "(model catalog unavailable for claude — using anyway)"
     )

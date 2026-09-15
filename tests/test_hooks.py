@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from zeta.skills import SkillCatalog
+
 import asyncio
 import json
 import os
@@ -103,7 +105,7 @@ async def test_pre_hook_deny_reason_reaches_tool_result(tmp_path: Path) -> None:
     _write_config(tmp_path, f'[[hook]]\nevent = "pre_tool"\ncommand = {json.dumps(deny)}\n')
     manager = load_hooks(tmp_path)
     manager.bind_session("session-1")
-    registry = ToolRegistry(tmp_path, pre_execute_hook=manager.pre_tool, register_builtin=False)
+    registry = ToolRegistry(tmp_path, pre_execute_hook=manager.pre_tool, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("exec", lambda arguments: "ran")
 
     result = await registry.execute(ToolCall("call-1", "exec", {}))

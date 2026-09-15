@@ -6,6 +6,8 @@ from ..core.approval import ApprovalDecision, ApprovalPolicy
 from ..core.session import OpenedSession, SessionManager
 from ..loop import AgentLoop
 from ..providers.factory import build_backend
+from ..skills import SkillCatalog
+from ..skills.agent_catalog import discover_packaged_agents
 from ..tools import ToolRegistry
 from ..types import CompletionBackend
 
@@ -23,16 +25,26 @@ def build_unattended_loop(
     policy = ApprovalPolicy(
         store=store, default=ApprovalDecision.DENY, always_allow=allow
     )
+    if session.metadata.skill_catalog is None:
+        raise ValueError("unattended sessions require a skill catalog")
+    skill_catalog = SkillCatalog.from_snapshot(session.metadata.skill_catalog)
+    # Automation sessions never mount user-defined agents, even if metadata
+    # was modified outside the restricted runner.
+    agent_catalog = discover_packaged_agents()
     registry = ToolRegistry(
         metadata.cwd,
         session_store=store,
         approval_store=store,
         approval_policy=policy,
         enforce_approvals=True,
+        skill_catalog=skill_catalog,
+        agent_catalog=agent_catalog,
     )
     return AgentLoop(
         backend,
         store,
+        skill_catalog=skill_catalog,
+        agent_catalog=agent_catalog,
         registry=registry,
         approval_policy=policy,
         max_turns=25,

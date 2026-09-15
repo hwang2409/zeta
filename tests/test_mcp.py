@@ -42,6 +42,7 @@ from zeta.mcp.client import (
     translate_call_result,
 )
 from zeta.mcp.commands import rewrite_mcp_file
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.types import TextContent, ToolCall
 
@@ -364,7 +365,7 @@ def test_config_override_and_malformed_json(tmp_path: Path, monkeypatch: pytest.
 @pytest.mark.asyncio
 async def test_missing_config_mount_is_a_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZETA_MCP_CONFIG", str(tmp_path / "missing.json"))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(registry)
     assert registry.schemas == []
     await mount.close()
@@ -389,7 +390,7 @@ async def test_agent_loop_bootstrap_checks_missing_mcp_config(
 
     monkeypatch.setattr("zeta.loop.mount_mcp_servers", observe_mount)
     backend = FakeBackend([ScriptedTurn([TextContent("booted")])])
-    loop = AgentLoop(backend, ConversationStore(tmp_path))
+    loop = AgentLoop(backend, ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
     events = [event async for event in loop.run_turn("hello")]
     await loop.close()
 
@@ -486,7 +487,7 @@ async def test_stdio_abort_marks_mount_failed(
     )
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     config = MCPServerConfig("abort", "stdio", sys.executable, ("-u", "-c", source))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"abort": config}),
@@ -706,7 +707,7 @@ async def test_json_rpc_prompt_error_does_not_notify_transport_sink() -> None:
 @pytest.mark.asyncio
 async def test_mount_registers_prefixed_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(registry, MCPConfig(tmp_path / "mcp.json", {"fake": _stdio_config()}))
     result = await registry.execute(ToolCall("call", "fake__echo", {"value": "mounted"}))
     assert result["content"][0]["text"] == "mounted"
@@ -727,7 +728,7 @@ async def test_mounted_tool_names_satisfy_the_anthropic_name_pattern(
     """
 
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"fake": _stdio_config()})
     )
@@ -760,7 +761,7 @@ async def test_mount_discovers_and_resolves_prompts(
         ],
     )
     monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"fake": config})
     )
@@ -781,7 +782,7 @@ async def test_prompt_list_failure_keeps_tools_and_notifies(
     client = _PromptClient(config, [], fail_list=True)
     monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
     notices: list[str] = []
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"fake": config}),
@@ -801,7 +802,7 @@ async def test_prompt_only_mount_skips_tool_discovery(
     config = MCPServerConfig("prompt-only", "stdio", "unused")
     client = _PromptClient(config, [MCPPrompt("review")])
     monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"prompt-only": config})
@@ -822,7 +823,7 @@ async def test_prompt_get_timeout_degrades_without_blocking_actor(
     client = _BlockingPromptClient(config)
     monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
     monkeypatch.setattr(mount_module, "SERVER_SETUP_TIMEOUT_SECONDS", 0.01)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"hung": config})
     )
@@ -842,7 +843,7 @@ async def test_prompt_request_error_keeps_server_mounted(
     config = MCPServerConfig("rejected", "stdio", "unused")
     client = _PromptRequestErrorClient(config, [MCPPrompt("review")])
     monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"rejected": config})
     )
@@ -862,7 +863,7 @@ async def test_prompt_transport_error_degrades_and_removes_prompts(
     config = MCPServerConfig("dropped", "stdio", "unused")
     client = _PromptTransportErrorClient(config, [MCPPrompt("review")])
     monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"dropped": config})
     )
@@ -883,7 +884,7 @@ async def test_empty_capabilities_skip_tool_discovery(
     client = _ListedClient(config, [])
     client.capabilities = {}
     monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"empty": config})
     )
@@ -900,7 +901,7 @@ async def test_cancelled_prompt_get_cleans_up_actor_request(
     config = MCPServerConfig("cancel", "stdio", "unused")
     client = _BlockingPromptClient(config)
     monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"cancel": config})
     )
@@ -946,7 +947,7 @@ async def test_mount_reports_states_and_notices(
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
     monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     config = load_mcp_config(config_path)
     mount = await mount_mcp_servers(registry, config, notice_sink=notices.append)
 
@@ -979,7 +980,7 @@ async def test_mount_reconnects_one_server_and_rejects_unknown(
         "recover": MCPServerConfig("recover", "stdio", sys.executable),
         "healthy": MCPServerConfig("healthy", "stdio", sys.executable),
     }
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(registry, MCPConfig(tmp_path / "mcp.json", configs))
 
     assert mount.statuses["recover"].state == "failed"
@@ -997,7 +998,7 @@ async def test_removed_handler_rejects_a_readded_same_name_server(
 ) -> None:
     config = MCPServerConfig("same", "stdio", "unused")
     monkeypatch.setattr(mount_module, "_build_client", lambda config: _LifecycleClient(config))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"same": config})
     )
@@ -1036,7 +1037,7 @@ async def test_canceled_add_does_not_clean_up_a_new_same_name_server(
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
     monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = MCPMount(registry, {}, {})
     rollback_calls = 0
 
@@ -1089,7 +1090,7 @@ async def test_canceled_replacement_does_not_mark_a_new_same_name_server_failed(
         return await client.list_tools()
 
     monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"same": initial_config}),
@@ -1131,7 +1132,7 @@ async def test_hung_tool_call_does_not_block_reconnect(
     replacement = _LifecycleClient(config)
     clients = iter((initial, replacement))
     monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
@@ -1154,7 +1155,7 @@ async def test_completed_call_children_are_removed(
     config = MCPServerConfig("server", "stdio", "unused")
     client = _CallTrackingClient(config, [])
     monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
@@ -1181,7 +1182,7 @@ async def test_call_after_close_does_not_start_a_replacement(
         return client
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
@@ -1204,7 +1205,7 @@ async def test_failed_manual_reconnect_preserves_degraded_recovery(
     replacement = _LifecycleClient(config)
     clients = iter((initial, failed, replacement))
     monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"recover": config})
     )
@@ -1243,7 +1244,7 @@ async def test_canceled_degraded_reconnect_propagates_and_preserves_degraded(
         return await client.list_tools()
 
     monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"recover": config}),
@@ -1274,7 +1275,7 @@ async def test_remount_replaces_the_full_tool_set(
     )
     clients = iter((initial, replacement))
     monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
@@ -1297,7 +1298,7 @@ async def test_old_tool_lease_cannot_call_replacement_client(
     replacement = _CallTrackingClient(config, new_calls)
     clients = iter((initial, replacement))
     monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
@@ -1323,7 +1324,7 @@ async def test_auto_remount_backoff_caps_at_large_failure_count(
     monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
     monkeypatch.setattr(mount_module, "AUTO_RECONNECT_BASE_DELAY_SECONDS", 1.0)
     monkeypatch.setattr(mount_module, "AUTO_RECONNECT_MAX_DELAY_SECONDS", 30.0)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"retry": config})
     )
@@ -1352,7 +1353,7 @@ async def test_failed_auto_remount_drops_client_before_next_attempt(
     replacement = _LifecycleClient(config)
     clients = iter((initial, failed, replacement))
     monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"retry": config})
     )
@@ -1379,7 +1380,7 @@ async def test_delayed_auto_remount_rejects_a_stale_same_name_generation(
     new_client = _LifecycleClient(new_config)
     clients = iter((initial, new_client))
     monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"same": config}),
@@ -1420,7 +1421,7 @@ async def test_abandoned_completed_auto_remount_closes_stale_client(
         return await client.list_tools()
 
     monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"same": config}),
@@ -1475,7 +1476,7 @@ async def test_completed_reconnect_closes_are_not_retained(
     monkeypatch.setattr(
         mount_module, "_build_client", lambda config: next(client_iter)
     )
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
@@ -1504,7 +1505,7 @@ async def test_degraded_tool_call_auto_remounts_once(
         return client
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"recover": initial.config}),
@@ -1542,7 +1543,7 @@ async def test_degraded_calls_use_bounded_auto_remount_backoff(
     monkeypatch.setattr(mount_module, "_build_client", build_client)
     monkeypatch.setattr(mount_module, "AUTO_RECONNECT_BASE_DELAY_SECONDS", 0.05)
     monkeypatch.setattr(mount_module, "AUTO_RECONNECT_MAX_DELAY_SECONDS", 0.1)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"retry": initial.config}),
@@ -1589,7 +1590,7 @@ async def test_parallel_degraded_calls_do_not_start_two_remounts(
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
     monkeypatch.setattr(mount_module, "_connect_and_list", slow_connect_and_list)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"race": initial.config}),
@@ -1634,7 +1635,7 @@ async def test_canceled_reconnect_keeps_mount_state_consistent(
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
     monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"server": initial.config}),
@@ -1670,7 +1671,7 @@ async def test_canceled_reconnect_during_client_close_marks_mount_failed(
     clients = iter((initial, replacement))
 
     monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"server": initial.config}),
@@ -1698,7 +1699,7 @@ async def test_reconnect_queued_behind_remove_does_not_mount_ghost_client(
     client = _LifecycleClient(MCPServerConfig("server", "stdio", "unused"))
 
     monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"server": client.config}),
@@ -1729,7 +1730,7 @@ async def test_stdio_exit_updates_mount_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"dead": _stdio_config("dead")}),
@@ -1777,7 +1778,7 @@ async def test_mount_arms_failure_handler_during_sibling_setup(
         "early": MCPServerConfig("early", "stdio", "unused"),
         "sibling": MCPServerConfig("sibling", "stdio", "unused"),
     }
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         mount_mcp_servers(registry, MCPConfig(tmp_path / "mcp.json", configs))
     )
@@ -1815,7 +1816,7 @@ async def test_mount_cancellation_closes_clients_created_during_setup(
         tmp_path / "mcp.json",
         {"blocked": MCPServerConfig("blocked", "stdio", "unused")},
     )
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(mount_mcp_servers(registry, config))
     await started.wait()
     task.cancel()
@@ -1834,7 +1835,7 @@ async def test_mount_close_waits_for_active_client_cleanup(
     config = MCPServerConfig("server", "stdio", "unused")
     client = _BlockingCloseClient(config, close_started, release_close)
     monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
@@ -1858,7 +1859,7 @@ async def test_mount_close_tracks_actor_removed_during_cleanup(
     config = MCPServerConfig("server", "stdio", "unused")
     client = _BlockingCloseClient(config, close_started, release_close)
     monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
@@ -1882,7 +1883,7 @@ async def test_canceled_remove_keeps_cleanup_owned_by_mount(
     config = MCPServerConfig("server", "stdio", "unused")
     client = _BlockingCloseClient(config, close_started, release_close)
     monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
@@ -1917,7 +1918,7 @@ async def test_mount_close_waits_for_same_name_removed_actors(
     second = _BlockingCloseClient(config, second_started, second_release)
     clients = iter((first, second))
     monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"same": config})
     )
@@ -1950,7 +1951,7 @@ async def test_crashed_actor_is_replaced_by_reconnect(
     callback_armed = False
 
     monkeypatch.setattr(mount_module, "_build_client", lambda config: next(clients))
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
@@ -1995,7 +1996,7 @@ async def test_crashed_actor_reconnect_uses_replaced_config_and_source(
         return next(clients)
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     old_source = tmp_path / "old.json"
     new_source = tmp_path / "new.json"
     mount = MCPMount(
@@ -2055,7 +2056,7 @@ async def test_close_captures_terminal_replacement_created_by_reconnect(
         return next(clients)
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
     )
@@ -2107,7 +2108,7 @@ async def test_close_captures_terminal_replacement_created_by_reconnect(
 async def test_mcp_application_error_keeps_server_mounted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     client = _ApplicationErrorClient(
         MCPServerConfig("app", "stdio", "unused")
     )
@@ -2137,6 +2138,7 @@ async def test_mcp_failure_refreshes_agent_loop_tool_schemas(
         FakeBackend([]),
         ConversationStore(tmp_path),
         tool_schemas=[{"name": "dead__echo", "description": "", "parameters": {}}],
+skill_catalog=SkillCatalog.empty(),
     )
 
     await loop.ensure_mcp_servers()
@@ -2160,7 +2162,7 @@ async def test_mount_continues_when_failed_server_cleanup_raises(
         return _FakeClient(config, fail_connect=config.name == "bad", fail_close=config.name == "bad")
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(registry, MCPConfig(tmp_path / "mcp.json", configs))
 
     assert "good__echo" in {schema["name"] for schema in registry.schemas}
@@ -2174,7 +2176,7 @@ async def test_mount_isolates_bad_server_from_good_server(
     monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
     bad = MCPServerConfig("bad", "stdio", str(tmp_path / "does-not-exist"))
     config = MCPConfig(tmp_path / "mcp.json", {"bad": bad, "good": _stdio_config("good")})
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(registry, config)
     assert "good__echo" in {schema["name"] for schema in registry.schemas}
     await mount.close()
@@ -2189,7 +2191,7 @@ async def test_mcp_application_error_does_not_affect_other_server(
         tmp_path / "mcp.json",
         {"fail": _failing_stdio_config(), "good": _stdio_config("good")},
     )
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(registry, config)
     failed = await registry.execute(ToolCall("failed", "fail__echo", {"value": "x"}))
     healthy = await registry.execute(ToolCall("healthy", "good__echo", {"value": "ok"}))
@@ -2220,7 +2222,7 @@ async def test_mcp_status_waits_for_one_shared_initial_mount(
         return MCPMount(registry, {}, {})
 
     monkeypatch.setattr("zeta.loop.mount_mcp_servers", delayed_mount)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
     ensure_task = asyncio.create_task(loop.ensure_mcp_servers())
     await started.wait()
     status_task = asyncio.create_task(loop.slash_mcp(""))
@@ -2380,7 +2382,7 @@ async def test_slash_mcp_add_stdio_writes_project_file_and_mounts(
         return _FakeClient(config)
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
 
     output = await loop.slash_mcp("add live --stdio server-cmd arg1 arg2")
@@ -2413,7 +2415,7 @@ async def test_slash_mcp_add_http_writes_and_registers(
         return [MCPTool("ping", "", {"type": "object"})]
 
     monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
 
     output = await loop.slash_mcp("add remote --http https://mcp.example")
@@ -2437,7 +2439,7 @@ async def test_slash_mcp_add_rejects_duplicate_and_bad_flags(
         return []
 
     monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
 
     await loop.slash_mcp("add remote --http https://mcp.example")
@@ -2464,7 +2466,7 @@ async def test_slash_mcp_remove_deletes_entry_and_unmounts(
         return [MCPTool("ping", "", {"type": "object"})]
 
     monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
 
     await loop.slash_mcp("add live --http https://mcp.example")
@@ -2505,7 +2507,7 @@ async def test_slash_mcp_remove_project_entry_unshadows_home_entry(
         return [MCPTool("ping", "", {"type": "object"})]
 
     monkeypatch.setattr(mount_module, "_connect_and_list", fake_connect_and_list)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
 
     await loop.ensure_mcp_servers()
@@ -2537,7 +2539,7 @@ async def test_slash_mcp_lists_malformed_with_reason(
         home_config_path(home),
         {"broken": {"transport": "carrier-pigeon", "command": "nope"}},
     )
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
 
     output = await loop.slash_mcp("")
@@ -2552,7 +2554,7 @@ async def test_slash_mcp_rejects_unmatched_quotes_before_writing(
 ) -> None:
     project = tmp_path / "proj"
     project.mkdir()
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
 
     output = await loop.slash_mcp('add bad --stdio command "unterminated')
@@ -2578,7 +2580,7 @@ async def test_malformed_project_config_does_not_fall_back_to_ambient_home(
     monkeypatch.setenv("ZETA_HOME", str(ambient))
     monkeypatch.delenv("ZETA_MCP_CONFIG", raising=False)
 
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=ambient, project_dir=project)
 
     output = await loop.slash_mcp("")
@@ -2606,7 +2608,7 @@ async def test_slash_mcp_add_interpolates_only_the_live_config(
         return _FakeClient(config)
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
 
     await loop.slash_mcp(
@@ -2635,7 +2637,7 @@ async def test_slash_mcp_add_skips_missing_live_env_without_spawning(
         return _FakeClient(config)
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
 
     output = await loop.slash_mcp(
@@ -2667,7 +2669,7 @@ async def test_canceled_mcp_add_leaves_no_ghost_state(
 
     monkeypatch.setattr(mount_module, "_build_client", _FakeClient)
     monkeypatch.setattr(mount_module, "_connect_and_list", slow_connect_and_list)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
     task = asyncio.create_task(loop.slash_mcp("add ghost --stdio command"))
     await started.wait()
@@ -2703,7 +2705,7 @@ async def test_canceled_mcp_add_preserves_concurrent_replacement(
 
     monkeypatch.setattr(mount_module, "_build_client", _FakeClient)
     monkeypatch.setattr(mount_module, "_connect_and_list", slow_connect_and_list)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
     task = asyncio.create_task(loop.slash_mcp("add ghost --stdio original"))
     await started.wait()
@@ -2762,7 +2764,7 @@ async def test_canceled_mcp_unshadow_keeps_failed_home_fallback(
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
     monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
     await loop.ensure_mcp_servers()
 
@@ -2821,7 +2823,7 @@ async def test_concurrent_mcp_removes_do_not_remount_removed_home_entry(
 
     monkeypatch.setattr(mount_module, "_build_client", build_client)
     monkeypatch.setattr(mount_module, "_connect_and_list", connect_and_list)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=home, project_dir=project)
     await loop.ensure_mcp_servers()
 
@@ -2855,7 +2857,7 @@ async def test_concurrent_mcp_adds_keep_both_disk_entries(
 
     monkeypatch.setattr(mount_module, "_build_client", _FakeClient)
     monkeypatch.setattr(mount_module, "_connect_and_list", yield_then_list)
-    loop = AgentLoop(FakeBackend([]), ConversationStore(project))
+    loop = AgentLoop(FakeBackend([]), ConversationStore(project), skill_catalog=SkillCatalog.empty())
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
 
     await asyncio.gather(
@@ -2917,6 +2919,7 @@ async def test_mcp_remove_clears_provider_schema_after_unmount(
         FakeBackend([]),
         ConversationStore(project),
         tool_schemas=[{"name": "dead__echo", "description": "", "parameters": {}}],
+skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=project)
 
@@ -2941,6 +2944,7 @@ async def test_mcp_schema_refresh_does_not_duplicate_current_provider_schema(
         FakeBackend([]),
         ConversationStore(tmp_path),
         tool_schemas=[{"name": "live__echo", "description": "", "parameters": {}}],
+skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "project")
 
@@ -2957,7 +2961,7 @@ async def test_late_failure_from_removed_client_is_ignored(
 ) -> None:
     client = _LifecycleClient(MCPServerConfig("dead", "stdio", "unused"))
     monkeypatch.setattr(mount_module, "_build_client", lambda config: client)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     mount = await mount_mcp_servers(
         registry,
         MCPConfig(tmp_path / "mcp.json", {"dead": client.config}),

@@ -6,6 +6,7 @@ import pytest
 
 import zeta.tools._sandbox as sandbox_module
 import zeta.tools.read as read_module
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.types import ToolCall
 
@@ -18,7 +19,7 @@ async def test_write_rejects_hard_link_target(tmp_path: Path) -> None:
     sandbox.mkdir()
     os.link(outside, sandbox / "target")
 
-    result = await ToolRegistry(sandbox).execute(
+    result = await ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("hard-link", "write", {"path": "target", "content": "changed"})
     )
 
@@ -35,7 +36,7 @@ async def test_read_allows_hard_link_target(tmp_path: Path) -> None:
     sandbox.mkdir()
     os.link(outside, sandbox / "target")
 
-    result = await ToolRegistry(sandbox).execute(
+    result = await ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("hard-link-read", "read", {"path": "target"})
     )
 
@@ -53,7 +54,7 @@ async def test_read_uses_verified_fd_after_rename(
     target = sandbox / "target"
     target.write_text("original", encoding="utf-8")
     moved = sandbox / "moved"
-    registry = ToolRegistry(sandbox)
+    registry = ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty())
     real_open_target = read_module.open_target
 
     @contextmanager
@@ -113,7 +114,7 @@ def test_ancestor_symlink_is_rejected(tmp_path: Path) -> None:
     with (
         pytest.raises(ValueError, match="escaped session cwd"),
         sandbox_module.open_target(
-            ToolRegistry(sandbox),
+            ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty()),
             "dir/file",
             flags=os.O_RDONLY | os.O_CLOEXEC,
         ),
@@ -131,7 +132,7 @@ async def test_post_walk_ancestry_check_rejects_rename(
     inner.mkdir(parents=True)
     (inner / "target").write_text("inside", encoding="utf-8")
     moved = tmp_path / "inner-moved"
-    registry = ToolRegistry(sandbox)
+    registry = ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty())
     real_verify = sandbox_module._verify_ancestry
     calls = 0
 
@@ -205,7 +206,7 @@ async def test_write_expands_tilde_home_in_target_path(
     monkeypatch.setenv("HOME", str(home))
     session_cwd = tmp_path / "session"
     session_cwd.mkdir()
-    registry = ToolRegistry(session_cwd)
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("write-tilde", "write", {"path": "~/hello.txt", "content": "hi"})
@@ -226,7 +227,7 @@ async def test_edit_expands_tilde_home_in_target_path(
     (home / "note.txt").write_text("old", encoding="utf-8")
     session_cwd = tmp_path / "session"
     session_cwd.mkdir()
-    registry = ToolRegistry(session_cwd)
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -250,7 +251,7 @@ async def test_read_expands_tilde_home_in_target_path(
     (home / "greeting.txt").write_text("hi", encoding="utf-8")
     session_cwd = tmp_path / "session"
     session_cwd.mkdir()
-    registry = ToolRegistry(session_cwd)
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("read-tilde", "read", {"path": "~/greeting.txt"})
@@ -269,7 +270,7 @@ async def test_bash_cwd_expands_tilde_home(
     monkeypatch.setenv("HOME", str(home))
     session_cwd = tmp_path / "session"
     session_cwd.mkdir()
-    registry = ToolRegistry(session_cwd)
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("bash-tilde-cwd", "bash", {"cmd": "pwd", "cwd": "~"})
@@ -291,7 +292,7 @@ async def test_write_cross_root_allow_regression_pin_for_audit(
     outside_dir = tmp_path / "elsewhere"
     outside_dir.mkdir()
     target = outside_dir / "artifact.html"
-    registry = ToolRegistry(session_cwd)
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -312,7 +313,7 @@ async def test_write_cross_root_can_create_parents_outside_cwd(
     session_cwd = tmp_path / "session"
     session_cwd.mkdir()
     target = tmp_path / "new" / "sub" / "artifact.txt"
-    registry = ToolRegistry(session_cwd)
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -336,7 +337,7 @@ async def test_symlink_escape_error_names_session_cwd(tmp_path: Path) -> None:
     outside.mkdir()
     (outside / "note").write_text("outside", encoding="utf-8")
     (sandbox / "dir").symlink_to(outside, target_is_directory=True)
-    registry = ToolRegistry(sandbox)
+    registry = ToolRegistry(sandbox, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -362,7 +363,7 @@ async def test_read_cross_root_absolute_path_regression_pin(
     session_cwd.mkdir()
     outside = tmp_path / "elsewhere.txt"
     outside.write_text("outside content", encoding="utf-8")
-    registry = ToolRegistry(session_cwd)
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("read-cross-root", "read", {"path": str(outside)})

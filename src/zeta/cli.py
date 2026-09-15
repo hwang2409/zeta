@@ -8,6 +8,7 @@ import sys
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
+from .core.commands.completion import completion_script
 from .core.login_flow import run_login
 from .core.session import SessionError, env_home
 from .providers.login import build_login_provider, pkce_values
@@ -15,7 +16,10 @@ from .tui.app import create_app
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="chat with the zeta harness")
+    parser = argparse.ArgumentParser(
+        description="chat with the zeta harness",
+        epilog="install shell completion with: zeta completion zsh > ~/.zsh/completions/_zeta",
+    )
     parser.add_argument(
         "--provider",
         choices=("fake", "claude", "codex"),
@@ -135,6 +139,13 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--provider", dest="serve_provider", choices=("fake", "claude", "codex"))
     serve_parser.add_argument("--model", dest="serve_model")
     serve_parser.add_argument("--cwd", help="working directory for new sessions")
+    completion_parser = commands.add_parser(
+        "completion",
+        help="print a static shell completion script",
+        description="print a static shell completion script",
+        epilog="example: zeta completion zsh > ~/.zsh/completions/_zeta",
+    )
+    completion_parser.add_argument("shell", choices=("zsh", "bash"))
     return parser
 
 
@@ -193,6 +204,9 @@ def main(argv: list[str] | None = None) -> int:
             asyncio.run(run_server(server))
         except KeyboardInterrupt:
             return 130
+        return 0
+    if args.command == "completion":
+        print(completion_script(args.shell), end="")
         return 0
     if args.prompt is not None:
         from .headless import run_headless

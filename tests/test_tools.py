@@ -20,6 +20,7 @@ from zeta.core.fake import FakeBackend, ScriptedTurn
 from zeta.core.loop import AgentLoop
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
 from zeta.core.store import ConversationStore
+from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.types import MessageRole, StreamEventType, TextContent, ToolCall, ToolResult
 
@@ -53,7 +54,7 @@ async def test_registry_validates_arguments_before_running_handler(tmp_path: Pat
         called = True
         return "ran"
 
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register(
         "typed",
         handler,
@@ -73,7 +74,7 @@ async def test_registry_validates_arguments_before_running_handler(tmp_path: Pat
 
 
 def test_registry_rejects_unsupported_schema_constructs(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     with pytest.raises(ValueError, match="unsupported schema type"):
         registry.register(
@@ -115,7 +116,7 @@ async def test_paths_outside_session_cwd_are_allowed(tmp_path: Path) -> None:
     link.symlink_to(outside)
     dir_link = tmp_path / "outside-dir-link"
     dir_link.symlink_to(outside_dir, target_is_directory=True)
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     absolute_result = await registry.execute(
         ToolCall("read-1", "read", {"path": str(outside)})
@@ -134,7 +135,7 @@ async def test_paths_outside_session_cwd_are_allowed(tmp_path: Path) -> None:
 async def test_builtin_tools_read_and_exec_use_session_cwd(tmp_path: Path) -> None:
     (tmp_path / "nested").mkdir()
     (tmp_path / "nested" / "note.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     read_result = await registry.execute(
         ToolCall("read-1", "read", {"path": "nested/note.txt", "offset": 1, "limit": 1})
@@ -152,7 +153,7 @@ async def test_builtin_tools_read_and_exec_use_session_cwd(tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 async def test_bash_captures_stdout_stderr_and_exit_code(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -176,7 +177,7 @@ async def test_bash_captures_stdout_stderr_and_exit_code(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_bash_persists_cwd_across_calls(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     changed = await registry.execute(
         ToolCall("bash-cd", "bash", {"cmd": "cd /tmp"})
@@ -191,11 +192,11 @@ async def test_bash_persists_cwd_across_calls(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_bash_persistent_cwd_isolated_between_sessions(tmp_path: Path) -> None:
     first_store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    first = ToolRegistry(tmp_path, session_store=first_store)
+    first = ToolRegistry(tmp_path, session_store=first_store, skill_catalog=SkillCatalog.empty())
     await first.execute(ToolCall("first-cd", "bash", {"cmd": "cd /tmp"}))
 
     second_store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    second = ToolRegistry(tmp_path, session_store=second_store)
+    second = ToolRegistry(tmp_path, session_store=second_store, skill_catalog=SkillCatalog.empty())
     result = await second.execute(ToolCall("second-pwd", "bash", {"cmd": "pwd"}))
 
     assert result["structuredContent"]["stdout"].strip() == str(tmp_path)
@@ -203,7 +204,7 @@ async def test_bash_persistent_cwd_isolated_between_sessions(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_bash_cwd_channel_rejects_user_forgery(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -222,7 +223,7 @@ async def test_bash_failed_persistence_keeps_registry_state_on_replace_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    registry = ToolRegistry(tmp_path, session_store=store)
+    registry = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
     before_state = store.state_path.read_bytes()
 
     def fail_replace(source: object, destination: object) -> None:
@@ -249,7 +250,7 @@ async def test_bash_failed_persistence_keeps_registry_state_on_replace_error(
 async def test_bash_accepts_per_call_cwd_outside_sandbox(tmp_path: Path) -> None:
     outside = tmp_path.parent
     marker = outside / f"zeta-bash-outside-{tmp_path.name}"
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     try:
         result = await registry.execute(
@@ -270,7 +271,7 @@ async def test_bash_accepts_per_call_cwd_outside_sandbox(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_bash_persists_cwd_after_failed_command(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     failed = await registry.execute(
         ToolCall("bash-failed-cd", "bash", {"cmd": "cd /tmp; exit 3"})
@@ -292,7 +293,7 @@ async def test_bash_persists_cwd_after_failed_command(tmp_path: Path) -> None:
 async def test_bash_persists_explicit_cd_from_override(tmp_path: Path) -> None:
     nested = tmp_path / "nested"
     nested.mkdir()
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("bash-explicit-cd", "bash", {"cmd": "cd /tmp", "cwd": str(nested)})
@@ -307,7 +308,7 @@ async def test_bash_persists_explicit_cd_from_override(tmp_path: Path) -> None:
 async def test_bash_abort_kills_process_group_and_reaps_descendants(tmp_path: Path) -> None:
     marker = tmp_path / "child-alive"
     abort_signal = ToolAbortSignal()
-    registry = ToolRegistry(tmp_path, abort_signal=abort_signal)
+    registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
             ToolCall("bash-abort", "bash", {"cmd": _descendant_command(marker)})
@@ -329,7 +330,7 @@ async def test_bash_task_cancellation_kills_process_group(
     tmp_path: Path,
 ) -> None:
     marker = tmp_path / "child-canceled"
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
             ToolCall("bash-cancel", "bash", {"cmd": _descendant_command(marker)})
@@ -350,7 +351,7 @@ async def test_bash_invalid_start_cwd_falls_back_without_persisting(
     tmp_path: Path,
 ) -> None:
     missing = tmp_path / "missing"
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.bash_cwd = str(missing)
 
     result = await registry.execute(ToolCall("bash-missing-cwd", "bash", {"cmd": "pwd"}))
@@ -364,7 +365,7 @@ async def test_bash_invalid_start_cwd_falls_back_without_persisting(
 async def test_bash_cwd_override_does_not_persist_without_cd(tmp_path: Path) -> None:
     nested = tmp_path / "nested"
     nested.mkdir()
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("bash-override", "bash", {"cmd": "pwd", "cwd": str(nested)})
@@ -391,7 +392,7 @@ async def test_bash_rejects_malformed_arguments(
     tmp_path: Path,
     arguments: dict[str, object],
 ) -> None:
-    result = await ToolRegistry(tmp_path).execute(
+    result = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("bash-invalid", "bash", arguments)
     )
 
@@ -404,13 +405,13 @@ async def test_bash_rejects_malformed_arguments(
 
 
 def test_list_is_not_registered(tmp_path: Path) -> None:
-    assert "list" not in ToolRegistry(tmp_path).definitions_by_name
+    assert "list" not in ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).definitions_by_name
 
 
 @pytest.mark.asyncio
 async def test_write_creates_file_with_structured_result(tmp_path: Path) -> None:
     content = "héllo\n"
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("write-new", "write", {"path": "note.txt", "content": content})
@@ -433,7 +434,7 @@ async def test_write_creates_file_with_structured_result(tmp_path: Path) -> None
 async def test_write_reports_overwrite(tmp_path: Path) -> None:
     file_path = tmp_path / "note.txt"
     file_path.write_text("old", encoding="utf-8")
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("write-overwrite", "write", {"path": "note.txt", "content": "new"})
@@ -454,7 +455,7 @@ async def test_write_reports_overwrite(tmp_path: Path) -> None:
 async def test_edit_replaces_unique_string_with_structured_result(tmp_path: Path) -> None:
     file_path = tmp_path / "note.txt"
     file_path.write_text("before: old\n", encoding="utf-8")
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -498,7 +499,7 @@ async def test_edit_requires_one_match(
 ) -> None:
     file_path = tmp_path / "note.txt"
     file_path.write_text(content, encoding="utf-8")
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -518,7 +519,7 @@ async def test_edit_requires_one_match(
 async def test_edit_rejects_overlapping_matches(tmp_path: Path) -> None:
     file_path = tmp_path / "note.txt"
     file_path.write_text("aaa", encoding="utf-8")
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -539,7 +540,7 @@ async def test_edit_rejects_overlapping_matches(tmp_path: Path) -> None:
 async def test_edit_preserves_utf8_and_reports_byte_lengths(tmp_path: Path) -> None:
     file_path = tmp_path / "unicode.txt"
     file_path.write_text("café: 世界\n", encoding="utf-8")
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -566,7 +567,7 @@ async def test_edit_allows_path_outside_session_cwd(tmp_path: Path) -> None:
     session_cwd.mkdir()
     outside = tmp_path / "outside.txt"
     outside.write_text("old", encoding="utf-8")
-    registry = ToolRegistry(session_cwd)
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -599,7 +600,7 @@ async def test_registry_rejects_malformed_edit_arguments(
     tmp_path: Path,
     arguments: dict[str, object],
 ) -> None:
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(ToolCall("edit-invalid", "edit", arguments))
 
@@ -611,7 +612,7 @@ async def test_registry_rejects_malformed_edit_arguments(
 async def test_write_getpath_failure_does_not_truncate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "getpath-failure.txt"
     target.write_text("original", encoding="utf-8")
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     def fail_getpath(file_descriptor: int) -> str:
         raise OSError("injected F_GETPATH failure")
@@ -631,7 +632,7 @@ async def test_write_fdopen_failure_closes_raw_fd(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "fdopen-failure.txt"
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     raw_fds: list[int] = []
 
     def fail_fdopen(file_descriptor: int, mode: str) -> object:
@@ -653,7 +654,7 @@ async def test_write_fdopen_failure_closes_raw_fd(
 @pytest.mark.asyncio
 async def test_write_rejects_missing_parent_by_default(tmp_path: Path) -> None:
     target = tmp_path / "missing" / "note.txt"
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("write-missing-parent", "write", {"path": str(target), "content": "x"})
@@ -668,7 +669,7 @@ async def test_write_rejects_missing_parent_by_default(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_write_can_create_missing_parents(tmp_path: Path) -> None:
     target = tmp_path / "missing" / "note.txt"
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -696,7 +697,7 @@ async def test_write_race_reports_overwrite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "raced.txt"
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     original_open = write_module.os.open
 
     def racing_open(
@@ -754,7 +755,7 @@ async def test_write_overwrite_symlink_race_stays_in_sandbox(tmp_path: Path) -> 
     swapper = threading.Thread(target=swap_target)
     swapper.start()
     try:
-        registry = ToolRegistry(tmp_path)
+        registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
         for index in range(50):
             result = await registry.execute(
                 ToolCall(
@@ -848,7 +849,7 @@ async def test_write_create_parents_symlink_race_stays_in_sandbox(
     swapper = threading.Thread(target=swap_intermediate)
     swapper.start()
     try:
-        registry = ToolRegistry(tmp_path)
+        registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
         for index in range(50):
             result = await registry.execute(
                 ToolCall(
@@ -876,7 +877,7 @@ async def test_write_allows_path_outside_session_cwd(tmp_path: Path) -> None:
     session_cwd = tmp_path / "session"
     session_cwd.mkdir()
     outside = tmp_path / "outside.txt"
-    registry = ToolRegistry(session_cwd)
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("write-outside", "write", {"path": str(outside), "content": "x"})
@@ -892,7 +893,7 @@ async def test_write_rejects_replaced_session_cwd(tmp_path: Path) -> None:
     session_cwd.mkdir()
     attack = tmp_path / "attack"
     attack.mkdir()
-    registry = ToolRegistry(session_cwd)
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
 
     os.rename(session_cwd, tmp_path / "session-original")
     session_cwd.symlink_to(attack, target_is_directory=True)
@@ -917,7 +918,7 @@ async def test_write_rejects_replaced_session_cwd(tmp_path: Path) -> None:
 async def test_write_rejects_replaced_session_cwd_identity(tmp_path: Path) -> None:
     session_cwd = tmp_path / "session"
     session_cwd.mkdir()
-    registry = ToolRegistry(session_cwd)
+    registry = ToolRegistry(session_cwd, skill_catalog=SkillCatalog.empty())
 
     os.rename(session_cwd, tmp_path / "session-original")
     session_cwd.mkdir()
@@ -943,7 +944,7 @@ async def test_write_rejects_invalid_utf8_content_before_writing(
     tmp_path: Path,
 ) -> None:
     target = tmp_path / "invalid.txt"
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -969,7 +970,7 @@ async def test_registry_rejects_malformed_write_arguments(
     tmp_path: Path,
     arguments: dict[str, object],
 ) -> None:
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(ToolCall("write-invalid", "write", arguments))
 
@@ -991,7 +992,7 @@ async def test_exec_retains_only_bounded_output_from_large_command(
             captures.append(self)
 
     monkeypatch.setattr(exec_module, "_BoundedOutput", TrackingCapture)
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     result = await registry.execute(
         ToolCall(
             "exec-large",
@@ -1016,10 +1017,10 @@ async def test_exec_retains_only_bounded_output_from_large_command(
 @pytest.mark.asyncio
 async def test_exec_full_size_is_stable_for_capped_utf8_output(tmp_path: Path) -> None:
     command = _python_command("import sys; sys.stdout.write('é')")
-    uncapped = await ToolRegistry(tmp_path).execute(
+    uncapped = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall("exec-utf8-full", "exec", {"command": command})
     )
-    capped = await ToolRegistry(tmp_path).execute(
+    capped = await ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty()).execute(
         ToolCall(
             "exec-utf8-capped",
             "exec",
@@ -1062,7 +1063,7 @@ async def test_read_retains_only_bounded_output_from_large_file(
         return real_fdopen(file_descriptor, mode, *args, **kwargs)
 
     monkeypatch.setattr(read_module.os, "fdopen", tracking_fdopen)
-    registry = ToolRegistry(tmp_path, max_output_chars=64)
+    registry = ToolRegistry(tmp_path, max_output_chars=64, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("read-large", "read", {"path": "large.txt"})
@@ -1085,6 +1086,7 @@ async def test_read_abort_returns_canceled_result_during_scan(tmp_path: Path) ->
         tmp_path,
         abort_signal=abort_signal,
         max_output_chars=3_000_000,
+skill_catalog=SkillCatalog.empty(),
     )
 
     async def abort_soon() -> None:
@@ -1102,7 +1104,7 @@ async def test_read_abort_returns_canceled_result_during_scan(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_exec_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
     marker = tmp_path / "timeout-child-alive"
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall(
@@ -1124,7 +1126,7 @@ async def test_exec_timeout_kills_and_reaps_descendants(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_exec_cancellation_kills_and_reaps_descendants(tmp_path: Path) -> None:
     marker = tmp_path / "cancel-child-alive"
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
             ToolCall(
@@ -1150,7 +1152,7 @@ async def test_exec_abort_kills_process_group_and_returns_canceled_result(
 ) -> None:
     marker = tmp_path / "abort-child-alive"
     abort_signal = ToolAbortSignal()
-    registry = ToolRegistry(tmp_path, abort_signal=abort_signal)
+    registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         registry.execute(
             ToolCall(
@@ -1173,7 +1175,7 @@ async def test_exec_abort_kills_process_group_and_returns_canceled_result(
 
 @pytest.mark.asyncio
 async def test_exec_output_cap_includes_final_content_boundary(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("exec-cap", "exec", {"command": "printf 1234567890", "max_output": 5})
@@ -1190,7 +1192,7 @@ async def test_exec_abort_wins_when_completion_and_abort_are_ready_together(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     abort_signal = ToolAbortSignal()
-    registry = ToolRegistry(tmp_path, abort_signal=abort_signal)
+    registry = ToolRegistry(tmp_path, abort_signal=abort_signal, skill_catalog=SkillCatalog.empty())
     real_wait = exec_module.asyncio.wait
 
     async def forced_tie(tasks, *, return_when):
@@ -1220,7 +1222,7 @@ async def test_exec_abort_wins_when_completion_and_abort_are_ready_together(
 async def test_argument_finiteness_covers_undeclared_and_default_fields(
     tmp_path: Path,
 ) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register(
         "permissive",
         lambda arguments: "ran",
@@ -1248,7 +1250,7 @@ async def test_registered_schema_copies_cannot_disable_validation(tmp_path: Path
         called = True
         return "ran"
 
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     definition = registry.register(
         "typed",
         handler,
@@ -1273,7 +1275,7 @@ async def test_registered_schema_copies_cannot_disable_validation(tmp_path: Path
 async def test_numeric_validation_rejects_nonfinite_and_bool_enum_values(
     tmp_path: Path,
 ) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register(
         "number",
         lambda arguments: "number",
@@ -1315,6 +1317,7 @@ async def test_abort_cancels_calls_after_the_signal_is_set(tmp_path: Path) -> No
         tmp_path,
         abort_signal=abort_signal,
         register_builtin=False,
+skill_catalog=SkillCatalog.empty(),
     )
 
     async def handler(
@@ -1345,7 +1348,7 @@ async def test_abort_cancels_calls_after_the_signal_is_set(tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 async def test_abort_signal_stays_set_for_an_active_handler(tmp_path: Path) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     started = asyncio.Event()
     observed: list[bool] = []
 
@@ -1385,7 +1388,7 @@ async def test_abort_signal_stays_set_for_an_active_handler(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_parallel_safe_calls_overlap_and_keep_call_order(tmp_path: Path) -> None:
     finished: list[str] = []
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     async def worker(arguments: dict[str, str]) -> str:
         if arguments["value"] == "slow":
@@ -1417,7 +1420,7 @@ async def test_parallel_safe_calls_overlap_and_keep_call_order(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_execute_many_rejects_duplicate_ids_before_dispatch(tmp_path: Path) -> None:
     called = False
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 
     async def handler(arguments: dict[str, object]) -> str:
         nonlocal called
@@ -1442,7 +1445,7 @@ async def test_execute_many_rejects_duplicate_ids_before_dispatch(tmp_path: Path
 async def test_execute_many_abort_cancels_every_parallel_handler(
     tmp_path: Path,
 ) -> None:
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     calls = [ToolCall("parallel-a", "wait", {}), ToolCall("parallel-b", "wait", {})]
     started = asyncio.Event()
     started_count = 0
@@ -1493,7 +1496,7 @@ async def test_pre_execution_hook_can_allow_and_deny(tmp_path: Path) -> None:
         seen.append((name, arguments))
         return arguments.get("allow") is True
 
-    registry = ToolRegistry(tmp_path, pre_execute_hook=hook, register_builtin=False)
+    registry = ToolRegistry(tmp_path, pre_execute_hook=hook, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register(
         "gated",
         lambda arguments: "allowed",
@@ -1524,11 +1527,11 @@ async def test_agent_loop_executes_tool_calls_through_registry(tmp_path: Path) -
         ]
     )
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     events = [
         event
-        async for event in AgentLoop(backend, store, registry=registry).run_turn("read it")
+        async for event in AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("read it")
     ]
 
     result_message = store.messages()[2]
@@ -1573,6 +1576,7 @@ async def test_agent_loop_mapping_tools_still_validate_through_registry(
             store,
             tools={"typed": typed},
             tool_schemas=[schema],
+skill_catalog=SkillCatalog.empty(),
         ).run_turn("go")
     ]
 
@@ -1602,6 +1606,7 @@ async def test_agent_loop_mapping_tools_do_not_expose_builtins(tmp_path: Path) -
             store,
             tools={"safe_only": lambda arguments: "safe"},
             tool_schemas=[{"name": "safe_only"}],
+skill_catalog=SkillCatalog.empty(),
         )
     )
 
@@ -1620,11 +1625,11 @@ async def test_agent_loop_keeps_boundary_abort_for_pending_tools(tmp_path: Path)
         ]
     )
     store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    registry = ToolRegistry(tmp_path, register_builtin=False)
+    registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
     registry.register("step", lambda arguments: "ran")
     aborted = False
 
-    async for event in AgentLoop(backend, store, registry=registry).run_turn("go"):
+    async for event in AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("go"):
         if event.type is StreamEventType.MESSAGE_END and not aborted:
             registry.abort()
             aborted = True
@@ -1659,7 +1664,7 @@ async def test_agent_loop_refreshes_abort_signal_each_turn(tmp_path: Path) -> No
         return arguments["value"]
 
     await _collect_loop(
-        AgentLoop(backend, store, tools={"step": step})
+        AgentLoop(backend, store, tools={"step": step}, skill_catalog=SkillCatalog.empty())
     )
 
     results = [message.tool_result for message in store.messages() if message.tool_result]
@@ -1691,8 +1696,8 @@ async def test_registry_abort_cancels_loop_batch_and_next_tool(tmp_path: Path) -
             started.set()
         return True
 
-    registry = ToolRegistry(tmp_path, pre_execute_hook=hook)
-    task = asyncio.create_task(_collect_loop(AgentLoop(backend, store, registry=registry)))
+    registry = ToolRegistry(tmp_path, pre_execute_hook=hook, skill_catalog=SkillCatalog.empty())
+    task = asyncio.create_task(_collect_loop(AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())))
     await started.wait()
     await asyncio.sleep(0.05)
     registry.abort()
@@ -1798,7 +1803,7 @@ async def test_bash_scrubs_credentials_from_child_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _seed_env(monkeypatch)
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("bash-env-dump", "bash", {"cmd": "/usr/bin/env"})
@@ -1813,7 +1818,7 @@ async def test_exec_scrubs_credentials_from_child_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _seed_env(monkeypatch)
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     result = await registry.execute(
         ToolCall("exec-env-dump", "exec", {"command": "/usr/bin/env"})
@@ -1828,7 +1833,7 @@ async def test_run_background_scrubs_credentials_from_child_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _seed_env(monkeypatch)
-    registry = ToolRegistry(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
 
     started = await registry.execute(
         ToolCall(

@@ -21,6 +21,7 @@ from zeta.core.session import (
     normalize_session_name,
 )
 from zeta.core.slash import create_slash_registry
+from zeta.skills import SkillCatalog
 from zeta.tui.app import create_app, format_picker_row
 
 
@@ -70,15 +71,15 @@ def test_slash_name_persists_label_and_shows_current(
     monkeypatch.setenv("ZETA_HOME", str(home))
     app = create_app(_args())
 
-    assert create_slash_registry().dispatch(app, "/name") == "session name: (unnamed)"
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/name") == "session name: (unnamed)"
     assert (
-        create_slash_registry().dispatch(app, "/name  planning  ")
+        create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/name  planning  ")
         == "session name: planning"
     )
     assert SessionManager(home).open(app.loop.store.session_id).metadata.name == (
         "planning"
     )
-    assert create_slash_registry().dispatch(app, "/name") == "session name: planning"
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/name") == "session name: planning"
 
 
 def test_slash_name_rejects_empty_or_control_only(
@@ -88,7 +89,7 @@ def test_slash_name_rejects_empty_or_control_only(
     monkeypatch.setenv("ZETA_HOME", str(home))
     app = create_app(_args())
 
-    output = create_slash_registry().dispatch(app, "/name \x1b[31m\x1b[0m")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/name \x1b[31m\x1b[0m")
     assert output.startswith("session name unchanged")
 
 
@@ -99,12 +100,12 @@ def test_slash_new_requests_restart_only_when_idle(
     monkeypatch.setenv("ZETA_HOME", str(home))
     app = create_app(_args())
 
-    assert create_slash_registry().dispatch(app, "/new arg") == (
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/new arg") == (
         "new unchanged: /new does not accept arguments"
     )
     assert app.new_session_requested is False
 
-    result = create_slash_registry().dispatch(app, "/new")
+    result = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/new")
     assert result == "starting a fresh session..."
     assert app.new_session_requested is True
     assert app._exit_requested is True
@@ -118,13 +119,13 @@ def test_slash_new_rejected_during_active_turn(tmp_path: Path) -> None:
         from zeta.tui.app import TUIApp
 
         app = TUIApp(
-            AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions")),
+            AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
             provider="fake",
             model="offline",
         )
         app._active_task = asyncio.create_task(asyncio.sleep(1))
         try:
-            output = create_slash_registry().dispatch(app, "/new")
+            output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/new")
         finally:
             app._active_task.cancel()
             await asyncio.gather(app._active_task, return_exceptions=True)

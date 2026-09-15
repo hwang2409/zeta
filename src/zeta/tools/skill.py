@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from ..prompts import load_skill
+from ..skills import load_skill_prompt
 from .registry import ToolRegistry
+
+
+def _load(registry: ToolRegistry, arguments: dict[str, str]) -> str:
+    meta = registry.skill_catalog.find(arguments["name"])
+    return load_skill_prompt(meta)
 
 
 def register(registry: ToolRegistry) -> None:
     registry.register(
         "skill",
-        lambda arguments, abort_signal: load_skill(arguments["name"]),
+        lambda arguments, abort_signal: _load(registry, arguments),
         description="Load a skill prompt by name.",
         parameters={
             "type": "object",
