@@ -113,3 +113,18 @@ In another:
 ZETA_HOME="$(mktemp -d)" ZETA_GUI_SMOKE_IMAGE=/tmp/zeta-smoke.png \
   cargo run --manifest-path gui/Cargo.toml --features smoke-test -- --socket /tmp/zeta-smoke.sock
 ```
+
+The native pixel-gutter guard is a separate, explicit arm. It renders the
+wrap-shape matrix at 11px, 13px, and 18px in both target window sizes. It
+captures each native frame and scans the gutter between the prose content edge
+and the scrollbar rail. Two adjacent non-background pixels fail the run.
+
+```sh
+make gui-native-guards
+```
+
+The arm uses the default theme and an isolated `ZETA_HOME`. Plain `cargo test`
+does not open a native window. Set
+`ZETA_GUI_NATIVE_GUARDS_FORCE_TEXT_WIDTH=1` with the arm to reproduce the
+round-3 wide-TextView mutation; the guard must fail before the mutation is
+removed.

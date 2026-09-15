@@ -69,6 +69,8 @@ pub mod chrome {
 /// has no bare `format!` fragments in its bodies — the AST fence stays
 /// strict on "no literal outside debug_selector/id/aria_label/role args".
 pub mod sel {
+    #[cfg(feature = "smoke-test")]
+    pub const NATIVE_GUARD_FORCE_TEXT_WIDTH_ENV: &str = "ZETA_GUI_NATIVE_GUARDS_FORCE_TEXT_WIDTH";
     pub const TRANSCRIPT_ROW: &str = "transcript-row";
     pub const TRANSCRIPT_COLUMN: &str = "transcript-column";
     pub const ATTACHMENT_CHIP: &str = "attachment-chip";

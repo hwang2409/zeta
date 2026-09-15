@@ -386,17 +386,34 @@ impl ZetaView {
             );
         }
         let source = source.to_owned();
+        let text_view = TextView::markdown(sel::message(index), source)
+            .selectable(true)
+            .style(assistant_markdown_style(cx));
+        #[cfg(feature = "smoke-test")]
+        let text_view =
+            if std::env::var_os(row_text::sel::NATIVE_GUARD_FORCE_TEXT_WIDTH_ENV).is_some() {
+                // Recreate the round-3 evasion: give the live TextView a wider
+                // available width while its prose column remains narrow.
+                text_view.w(px(1200.))
+            } else {
+                // Leave a small layout margin for fractional glyph advances. This
+                // changes the wrap budget; it does not clip painted pixels.
+                text_view.max_w(px(f32::from(theme::prose_max_width(cx.theme().font_size))
+                    - 2. * theme::PROSE_ROW_PADDING_X
+                    - 2.))
+            };
+        #[cfg(not(feature = "smoke-test"))]
+        let text_view = text_view
+            .max_w(px(f32::from(theme::prose_max_width(cx.theme().font_size))
+                - 2. * theme::PROSE_ROW_PADDING_X
+                - 2.));
         div()
             .py(px(2.))
             .w_full()
             .min_w_0()
             .line_height(gpui::rems(1.65))
             .when_some(truncated_hint, |row, hint| row.child(hint))
-            .child(
-                TextView::markdown(sel::message(index), source)
-                    .selectable(true)
-                    .style(assistant_markdown_style(cx)),
-            )
+            .child(text_view)
             .into_any_element()
     }
 

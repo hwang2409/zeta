@@ -1,6 +1,173 @@
 //! Opt-in smoke driver: real input events, real worker/socket, native Metal pixels.
 use super::*;
+use gpui::{px, Pixels};
 use gpui_kit::test::TestWindowExt;
+
+const NATIVE_GUARD_COLOR_THRESHOLD: u8 = 10;
+const NATIVE_GUARD_MIN_CONSECUTIVE: usize = 2;
+const NATIVE_GUARD_SCROLLBAR_WIDTH: Pixels = px(8.);
+const NATIVE_GUARD_COMPOSER_HEIGHT: Pixels = px(80.);
+const NATIVE_GUARD_SHAPES: &[(&str, &str)] = &[
+    (
+        "wedge",
+        "2. `zeta serve` session hardening — half-written session dirs \
+         (`conversation.jsonl` without `meta.json`) wedge status/list. Atomic dir \
+         creation via `meta.json` tmp+rename.\n3. Follow-up work with additional \
+         wrapping to exercise the hanging indent so the paragraph reliably breaks \
+         onto a continuation line even at 2204px.",
+    ),
+    (
+        "adjacent",
+        "1. Outer numbered item with plenty of prose to force wrapping onto multiple \
+         continuation lines at every picker step.\n2. Second outer numbered item \
+         to prove the second sibling wraps in the same column geometry as the first \
+         with more filler prose here now.",
+    ),
+    (
+        "nested",
+        "1. Outer item with room to spare.\n   - Nested bullet A that itself carries \
+         enough hanging-indent text to force wrap boundaries near the prose cap at \
+         every base picker step.\n   - Nested bullet B with more prose — deeper \
+         nesting stays inside the same column even when the marker indent has \
+         consumed a few characters.",
+    ),
+    (
+        "long_token",
+        "Prose leading up to a very long unbroken token that the wrap engine cannot \
+         break: \
+         supercalifragilisticexpialidocious_but_much_longer_than_any_column_should_ever_be_aaaaaaaaaaaaaaaaaaaa \
+         and then some trailing prose after it.",
+    ),
+];
+
+fn native_guard_enabled() -> bool {
+    env::var_os("ZETA_GUI_NATIVE_GUARDS").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
+fn rgb8(color: gpui::Hsla) -> [u8; 3] {
+    let color = color.to_rgb();
+    [
+        (color.r * 255.).round() as u8,
+        (color.g * 255.).round() as u8,
+        (color.b * 255.).round() as u8,
+    ]
+}
+
+/// Return the first x range with at least two adjacent pixels that differ
+/// from the active canvas token. One isolated anti-aliased pixel is noise;
+/// adjacent pixels are the minimum evidence for an escaped glyph stroke.
+fn escaped_glyph_range(
+    image: &image::RgbaImage,
+    x_start: u32,
+    x_end: u32,
+    y_start: u32,
+    y_end: u32,
+    background: [u8; 3],
+) -> Option<(u32, u32)> {
+    for y in y_start..y_end {
+        let mut run_start = None;
+        for x in x_start..x_end {
+            let pixel = image.get_pixel(x, y).0;
+            let over_threshold = pixel[..3].iter().zip(background).any(|(actual, expected)| {
+                actual.abs_diff(expected) >= NATIVE_GUARD_COLOR_THRESHOLD
+            });
+            if over_threshold {
+                run_start.get_or_insert(x);
+            } else if let Some(start) = run_start.take() {
+                if x - start >= NATIVE_GUARD_MIN_CONSECUTIVE as u32 {
+                    return Some((start, x - 1));
+                }
+            }
+        }
+        if let Some(start) = run_start {
+            if x_end - start >= NATIVE_GUARD_MIN_CONSECUTIVE as u32 {
+                return Some((start, x_end - 1));
+            }
+        }
+    }
+    None
+}
+
+fn scan_native_gutter(image: &image::RgbaImage, window: &Window, font_size: Pixels, shape: &str) {
+    let scale = window.scale_factor();
+    let window_width = f32::from(window.bounds().size.width);
+    let main_left = f32::from(theme::SIDEBAR_WIDTH);
+    let main_width = (window_width - main_left).max(0.);
+    let column_width = f32::from(theme::prose_max_width(font_size)).min(main_width);
+    let content_right =
+        main_left + (main_width - column_width) / 2. + column_width - theme::PROSE_ROW_PADDING_X;
+    let x_start = (content_right * scale).ceil() as u32;
+    let x_end = image
+        .width()
+        .saturating_sub((f32::from(NATIVE_GUARD_SCROLLBAR_WIDTH) * scale).ceil() as u32);
+    // Larger picker sizes can make the header's content-driven height exceed
+    // its 44px minimum. Leave the scan below that dynamic edge.
+    let y_start = ((f32::from(theme::HEADER_BAND1_MIN_HEIGHT) + 8.) * scale).ceil() as u32;
+    // The live composer stays visible during the guard. Its fixed children
+    // occupy 8px top padding + 44px input row + 4px gap + 16px footer + 8px
+    // bottom padding, so stop before composer chrome can look like a glyph.
+    let y_end = image
+        .height()
+        .saturating_sub((f32::from(NATIVE_GUARD_COMPOSER_HEIGHT) * scale).ceil() as u32 + 1);
+    let background = rgb8(theme::palette::canvas());
+    if let Some((escape_start, escape_end)) =
+        escaped_glyph_range(image, x_start, x_end, y_start, y_end, background)
+    {
+        panic!(
+            "native pixel gutter guard failed: shape={shape} size={font_size:?} \
+             x_range={escape_start}..={escape_end} gutter={x_start}..{x_end} \
+             window_width={window_width} scale={scale} column_width={column_width} \
+             content_right={content_right} y_range={y_start}..{y_end} background={background:?}"
+        );
+    }
+    println!("NATIVE-GUARD-PASS: shape={shape} size={font_size:?} gutter={x_start}..{x_end}");
+}
+
+fn run_native_wrap_guards(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
+    let viewports = [(px(2204.), px(1608.)), (px(1600.), px(760.))];
+    let font_sizes = [
+        px(theme::MIN_FONT_SIZE_PX),
+        theme::DEFAULT_FONT_SIZE,
+        px(theme::MAX_FONT_SIZE_PX),
+    ];
+    let mut appearance = theme::Appearance::default();
+    view.update(cx, |view, cx| {
+        view.state.streaming = false;
+        view.pending_command = false;
+        cx.notify();
+    });
+    for (width, height) in viewports {
+        window.resize(gpui::size(width, height));
+        window.bounds_changed(cx);
+        for font_size in font_sizes {
+            appearance.font_size = font_size;
+            theme::apply_with(cx, &appearance);
+            for &(shape, source) in NATIVE_GUARD_SHAPES {
+                view.update(cx, |view, cx| {
+                    view.state.connection = ConnectionState::Connected;
+                    view.state.transcript = vec![TranscriptEntry::Assistant(source.into())];
+                    view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                    cx.notify();
+                });
+                window.render_frame(cx);
+                let image = window
+                    .render_to_image()
+                    .expect("native renderer capture for pixel guard");
+                if let Some(dir) = env::var_os("ZETA_GUI_NATIVE_GUARDS_CAPTURE_DIR") {
+                    let path = PathBuf::from(dir).join(format!(
+                        "{shape}-{}-{}x{}.png",
+                        f32::from(font_size),
+                        f32::from(width),
+                        f32::from(height)
+                    ));
+                    image.save(path).expect("save native guard capture");
+                }
+                scan_native_gutter(&image, window, font_size, shape);
+            }
+        }
+    }
+    println!("NATIVE-GUARD-PASS: matrix=24");
+}
 
 /// Encode a tiny checkerboard PNG for the ZETA-112 attachment-chrome shot.
 /// A one-shot helper — the smoke driver seeds a real attachment so the
@@ -23,9 +190,11 @@ fn png_seed_bytes() -> Vec<u8> {
 }
 
 pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
-    let Some(path) = env::var_os("ZETA_GUI_SMOKE_IMAGE") else {
+    let path = env::var_os("ZETA_GUI_SMOKE_IMAGE");
+    let guard = native_guard_enabled();
+    if path.is_none() && !guard {
         return;
-    };
+    }
     // Optional second capture — the ZETA-112 composer chrome with pending
     // attachment chips visible, before the settings modal covers them. Emits
     // a separate PNG so the primary shot stays comparable with prior tickets.
@@ -115,6 +284,11 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                 phase = 3;
                             }
                             3 => {
+                                if guard {
+                                    run_native_wrap_guards(&entity, window, cx);
+                                    cx.quit();
+                                    return true;
+                                }
                                 // ZETA-112 attachment capture — seed a mixed
                                 // batch (one valid chip with a real decoded
                                 // thumbnail, one decode-failure chip whose
@@ -215,12 +389,14 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                     cx.notify();
                                 });
                                 window.render_frame(cx);
-                                window
-                                    .render_to_image()
-                                    .expect("native renderer capture")
-                                    .save(PathBuf::from(&path))
-                                    .expect("save smoke screenshot");
-                                println!("SMOKE-PASS: {}", PathBuf::from(&path).display());
+                                if let Some(path) = &path {
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer capture")
+                                        .save(PathBuf::from(path))
+                                        .expect("save smoke screenshot");
+                                    println!("SMOKE-PASS: {}", PathBuf::from(path).display());
+                                }
                                 cx.quit();
                                 return true;
                             }
