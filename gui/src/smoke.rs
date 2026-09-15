@@ -157,7 +157,7 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
         theme::DEFAULT_FONT_SIZE,
         px(theme::MAX_FONT_SIZE_PX),
     ];
-    let mut achieved_viewports = Vec::new();
+    let mut achieved_viewports: Vec<(u32, u32)> = Vec::new();
     let mut matrix_entries = 0;
     let mut appearance = theme::Appearance::default();
     cx.update(|_, cx| {
@@ -498,7 +498,7 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                     .expect("smoke window update");
                 if run_guard {
                     let entity = view.upgrade().expect("smoke view remains alive");
-                    run_native_wrap_guards(entity, &mut cx).await;
+                    run_native_wrap_guards(entity, &mut *cx).await;
                     cx.update(|_, cx| cx.quit())
                         .expect("smoke window remains open");
                     return;
