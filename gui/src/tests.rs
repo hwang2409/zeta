@@ -6929,6 +6929,28 @@ fn full_layout_regions_fit_at_11px_and_18px(cx: &mut TestAppContext) {
                 region.size,
             );
         }
+        // Run-header-title content-visibility floor (r3 finding 2).
+        // Container-bounds checks above pass even when a caller clips
+        // the title to 1px, so a paint-time regression that hides the
+        // session identity slips through. Assert the title's rendered
+        // width lands AT LEAST at `HEADER_TITLE_MIN_WIDTH` — the floor
+        // the layout hands the title before flex 1 grows it. A caller
+        // that sets `.max_w(px(1.))` over the title, or drops the
+        // `min_w(HEADER_TITLE_MIN_WIDTH)` guard, collapses the title to
+        // a hairline and fails here. (See r3 attestation: the same
+        // mutation reproduced in-code drops this assertion to 1.0 vs
+        // the current floor of 80px.)
+        let title = visual
+            .debug_bounds("run-header-title")
+            .unwrap_or_else(|| panic!("run-header-title at {base_px}px"));
+        assert!(
+            title.size.width >= theme::HEADER_TITLE_MIN_WIDTH - px(1.),
+            "run-header-title collapsed to {:?} at {base_px}px — the title \
+             content is clipped below the {:?} floor (r3 finding 2: bounds \
+             checks alone are blind to a 1px clip mutation)",
+            title.size.width,
+            theme::HEADER_TITLE_MIN_WIDTH,
+        );
         // Header sits above the transcript; transcript sits above composer;
         // composer sits inside the main column (right of sidebar). At the
         // picker extremes a broken layout typically manifests as the
@@ -7135,4 +7157,159 @@ so the paragraph reliably breaks onto a continuation line even at 2204px.";
             single_line * 2.5,
         );
     });
+}
+
+/// Text-run recorder acceptance: closes the r3 review's blind-fix gap
+/// on the wedge defect. `painted_quads()` reports rectangles only, so
+/// laid-out glyphs paint as sprite primitives no test accessor exposes.
+/// The recorder (`super::record_text_geometry`) closes that gap by
+/// shaping the assistant row's source through `shape_line` +
+/// `LineWrapper::wrap_line` at the SAME wrap width the row hands to the
+/// text system, and reporting each wrap segment's shaped extent —
+/// exactly the measurement `painted_quads()` cannot see.
+///
+/// The acceptance bar the r3 review pinned: "no laid-out text extends
+/// past the column's content box." The test reads the row's ACTUAL
+/// inner text column (column bounds minus the row's horizontal padding)
+/// and asserts every recorder sample's `max_wrap_segment_width` fits
+/// inside it — so a formula regression that shrinks the row past the
+/// promised prose measure (r0/r1 shape: `prose_max_width` did NOT
+/// include the row's `.px_4()` padding, leaving the effective text
+/// column ~4ch short of the promised 88ch) shows up here as an overflow
+/// even though `painted_quads` sees nothing wrong.
+///
+/// Runs across the r3 SHAPE MATRIX: the r1 critique wedge, the
+/// reviewer's adjacent numbered-list shape, a deeper-nesting list, and
+/// long-token content that stresses the wrap engine's unbreakable-token
+/// path. Each shape is drawn at BOTH the r1 shot (2204x1608) and the
+/// setup shape (1600x760) AND at 11px / 13px / 18px so a width tweak
+/// that passes ONE cell but fails the matrix (the exact way r0 and r1
+/// slipped through) fails here.
+#[gpui::test]
+fn zeta124_wrap_segments_fit_inside_the_prose_column_across_the_matrix(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+
+    // Shape matrix — every entry the r3 review named. Together they
+    // cover the wedge critique, the reviewer's adjacent list, deeper
+    // nesting, and the wrap engine's unbreakable-token path.
+    let wedge = "\
+2. `zeta serve` session hardening — half-written session dirs \
+(`conversation.jsonl` without `meta.json`) wedge status/list. Atomic dir \
+creation via `meta.json` tmp+rename.\n\
+3. Follow-up work with additional wrapping to exercise the hanging indent \
+so the paragraph reliably breaks onto a continuation line even at 2204px.";
+    let adjacent = "\
+1. Outer numbered item with plenty of prose to force wrapping onto \
+multiple continuation lines at every picker step.\n\
+2. Second outer numbered item to prove the second sibling wraps in the \
+same column geometry as the first with more filler prose here now.";
+    let nested = "\
+1. Outer item with room to spare.\n\
+   - Nested bullet A that itself carries enough hanging-indent text to \
+force wrap boundaries near the prose cap at every base picker step.\n\
+   - Nested bullet B with more prose — deeper nesting stays inside the \
+same column even when the marker indent has consumed a few characters.";
+    let long_token = "\
+Prose leading up to a very long unbroken token that the wrap engine \
+cannot break: \
+supercalifragilisticexpialidocious_but_much_longer_than_any_column_should_ever_be \
+and then some trailing prose after it.";
+    let shapes: &[(&str, &str)] = &[
+        ("wedge", wedge),
+        ("adjacent", adjacent),
+        ("nested", nested),
+        ("long_token", long_token),
+    ];
+    let viewports = &[(px(1600.), px(760.)), (px(2204.), px(1608.))];
+    let bases = &[
+        theme::MIN_FONT_SIZE_PX,
+        f32::from(theme::DEFAULT_FONT_SIZE),
+        theme::MAX_FONT_SIZE_PX,
+    ];
+    let mut appearance = theme::Appearance::default();
+    for &(vw, vh) in viewports {
+        visual.simulate_resize(gpui::size(vw, vh));
+        for &base_px in bases {
+            appearance.font_size = theme::clamp_font_size(base_px);
+            for &(label, source) in shapes {
+                visual.update(|window, cx| {
+                    theme::apply_with(cx, &appearance);
+                    view.update(cx, |view, cx| {
+                        view.state.transcript = vec![TranscriptEntry::Assistant(source.into())];
+                        view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                        cx.notify();
+                    });
+                    window.draw(cx).clear(cx);
+                });
+                let column = visual.debug_bounds("transcript-column").unwrap_or_else(|| {
+                    panic!("assistant column at {label} {vw:?}x{vh:?} {base_px}")
+                });
+                // Inner text column = column bounds minus row .px_4() on
+                // each side. This is the ACTUAL width the TextView had
+                // to wrap into, regardless of what `prose_max_width`
+                // promised at this base. A formula that shrinks the
+                // column past the promised measure exposes the gap here
+                // because recorder samples are shaped at the PROMISED
+                // wrap width (`prose_text_measure(base)`), not at the
+                // row's actual inner width — so a shape-vs-column drift
+                // lands as an overflow the assertion catches.
+                let inner_width = f32::from(column.size.width) - 2.0 * theme::PROSE_ROW_PADDING_X;
+                let samples = super::text_run_log::samples();
+                assert!(
+                    !samples.is_empty(),
+                    "text_run_log must record an assistant sample at {label} \
+                     {vw:?}x{vh:?} {base_px}px",
+                );
+                for sample in &samples {
+                    let wrap = f32::from(sample.wrap_width);
+                    let seg = f32::from(sample.max_wrap_segment_width);
+                    let unwrapped = f32::from(sample.max_unwrapped_line_width);
+                    // Assertion 1: wrap width promised at THIS base must
+                    // equal the row's actual inner text width. A caller
+                    // that hands `prose_text_measure(base)` to the text
+                    // system while giving the row a narrower inner
+                    // column produces glyph overflow no matter how the
+                    // wrap engine breaks the source.
+                    assert!(
+                        (wrap - inner_width).abs() < 2.0,
+                        "prose row's inner width {inner_width} does not match \
+                         wrap width {wrap} at {label} {vw:?}x{vh:?} {base_px}px \
+                         — the r2 formula gap is back (row {:?})",
+                        sample.row_id,
+                    );
+                    // Assertion 2: every wrap segment's shaped extent
+                    // fits inside the wrap width. An unbreakable token
+                    // wider than the column is the only shape that can
+                    // trip this; when it happens, the recorder catches
+                    // exactly the class of defect painted_quads misses.
+                    assert!(
+                        seg <= wrap + 1.0,
+                        "wrap segment shaped past the wrap width at {label} \
+                         {vw:?}x{vh:?} {base_px}px on row {:?}: \
+                         max_wrap_segment_width={seg} > wrap_width={wrap} \
+                         (max unwrapped line width {unwrapped}, wrap segments \
+                         {segs}, source_len {source_len})",
+                        sample.row_id,
+                        source_len = sample.source_len,
+                        segs = sample.wrap_segment_count,
+                    );
+                    // Assertion 3: every wrap segment fits inside the
+                    // row's ACTUAL inner text column. This is the r3
+                    // acceptance bar — "no laid-out text extends past
+                    // the column's content box" — restated as a
+                    // recorder-based check. Any drift between wrap
+                    // width and column geometry surfaces here.
+                    assert!(
+                        seg <= inner_width + 1.0,
+                        "wrap segment shaped past the row's inner column at \
+                         {label} {vw:?}x{vh:?} {base_px}px on row {:?}: \
+                         max_wrap_segment_width={seg} > inner_width \
+                         {inner_width}",
+                        sample.row_id,
+                    );
+                }
+            }
+        }
+    }
 }

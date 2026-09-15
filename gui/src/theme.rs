@@ -247,10 +247,12 @@ pub fn prose_max_width(base: Pixels) -> Pixels {
 }
 
 /// Effective text measure INSIDE the prose row's horizontal padding —
-/// `prose_max_width(base)` minus 2× `PROSE_ROW_PADDING_X`. Tests that
-/// need to check the actual text area (not the outer cap) route through
-/// this so a padding change lands in ONE place.
-#[cfg(test)]
+/// `prose_max_width(base)` minus 2× `PROSE_ROW_PADDING_X`. Tests and the
+/// render-time text-run recorder both route through this so a padding
+/// change lands in ONE place. Gated on `test` + `smoke-test` because
+/// both callers are cfg-gated; a release build never needs the measure
+/// separately from `prose_max_width`.
+#[cfg(any(test, feature = "smoke-test"))]
 pub fn prose_text_measure(base: Pixels) -> Pixels {
     px(f32::from(base) * MONO_CH_ADVANCE * PROSE_MEASURE_CH)
 }

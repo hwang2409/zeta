@@ -364,6 +364,27 @@ impl ZetaView {
             source,
             truncated_hint,
         } = text;
+        // Text-run recorder: shape the raw source at the same wrap width
+        // the prose row hands to the text system, and record the widest
+        // wrap-line. See `crate::record_text_geometry` for why this seam
+        // is needed — `painted_quads()` cannot observe glyph sprites, so
+        // a shape that produces a line wider than the column's content
+        // box is invisible to every earlier fix pass. Gated behind test /
+        // smoke-test so release builds pay nothing.
+        #[cfg(any(test, feature = "smoke-test"))]
+        {
+            let font_size = cx.theme().font_size;
+            let wrap_width = theme::prose_text_measure(font_size);
+            let font = gpui::font(theme::current_font_family());
+            crate::record_text_geometry(
+                cx,
+                || sel::message(index),
+                source,
+                font,
+                font_size,
+                wrap_width,
+            );
+        }
         let source = source.to_owned();
         div()
             .py(px(2.))

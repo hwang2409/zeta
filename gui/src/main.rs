@@ -2186,6 +2186,154 @@ pub(crate) mod render_log {
     }
 }
 
+/// Text-run geometry recorder. Parallel to the ZETA-107/108 `render_log`
+/// color recorder, but captures WRAP GEOMETRY. `painted_quads()` reports
+/// rectangles only — background quads, borders, rails; laid-out glyphs
+/// paint as sprite primitives that no test accessor exposes. That means
+/// a wrapping defect where the text system produces a line whose glyphs
+/// shape past the row's inner text column is INVISIBLE to painted_quads.
+/// The r0-r2 fix rounds for the ZETA-124 orphan-glyph defect ran blind
+/// against exactly that gap.
+///
+/// The recorder closes it by shaping the source text through
+/// `cx.text_system().shape_text` with the same wrap width the renderer
+/// hands to the text system, and recording the maximum wrap-line width
+/// the shaping produced. A caller that chose a wrap width larger than
+/// the column's content box widens `max_line_width` past that column;
+/// a caller that chose one smaller shows a `max_line_width` under the
+/// column — both are observable failures at the call site.
+///
+/// The record path is gated behind `cfg(any(test, feature = "smoke-test"))`
+/// exactly like `render_log`, so the release-build cost is zero: the
+/// hook site in `render_assistant_row` compiles out entirely and the
+/// module isn't linked.
+#[cfg(any(test, feature = "smoke-test"))]
+pub(crate) fn record_text_geometry<F>(
+    cx: &App,
+    row_id: F,
+    source: &str,
+    font: gpui::Font,
+    font_size: gpui::Pixels,
+    wrap_width: gpui::Pixels,
+) where
+    F: FnOnce() -> String,
+{
+    let text_system = cx.text_system().clone();
+    // `cx.text_system()` returns `Arc<TextSystem>`, which does not own the
+    // line-layout cache `shape_text` / `shape_line` need. Every call site
+    // of shaping in gpui goes through `WindowTextSystem` — the layout
+    // cache lives on the window. `WindowTextSystem::new(text_system)`
+    // produces a one-shot layout system that shares the crate-level
+    // fonts / metrics and paints identically at the same wrap_width,
+    // which is what we need for the recorder: same wrap decisions as
+    // the live TextView.
+    let window_text_system = gpui::WindowTextSystem::new(text_system.clone());
+    let mut max_unwrapped_line_width = gpui::px(0.);
+    let mut max_wrap_segment_width = gpui::px(0.);
+    let mut wrap_segment_count = 0usize;
+    for line_text in source.split('\n') {
+        if line_text.is_empty() {
+            wrap_segment_count += 1;
+            continue;
+        }
+        let run = gpui::TextRun {
+            len: line_text.len(),
+            font: font.clone(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line_shared: gpui::SharedString = line_text.to_owned().into();
+        let shaped =
+            window_text_system.shape_line(line_shared, font_size, std::slice::from_ref(&run), None);
+        let unwrapped_width = shaped.width();
+        if unwrapped_width > max_unwrapped_line_width {
+            max_unwrapped_line_width = unwrapped_width;
+        }
+        // Compute per-wrap-segment widths using LineWrapper on the same
+        // byte offsets, then map each segment's [start_ix..end_ix] to
+        // `LineLayout::x_for_index` on the shaped line's unwrapped layout.
+        // That gives the SHAPED extent of each wrap segment — the exact
+        // measurement `painted_quads()` cannot see for glyphs. A segment
+        // whose extent exceeds `wrap_width` is an unbreakable token
+        // wider than the column, or a shape-vs-wrap divergence in the
+        // caller — both are the class of defect this seam exists to
+        // catch.
+        let mut handle = text_system.line_wrapper(font.clone(), font_size);
+        let mut prev_ix: usize = 0;
+        let boundaries: Vec<_> = handle
+            .wrap_line(&[gpui::LineFragment::text(line_text)], wrap_width)
+            .collect();
+        for boundary in &boundaries {
+            wrap_segment_count += 1;
+            let end_ix = boundary.ix;
+            let seg_x_start = shaped.x_for_index(prev_ix);
+            let seg_x_end = shaped.x_for_index(end_ix);
+            let seg_width = if seg_x_end > seg_x_start {
+                seg_x_end - seg_x_start
+            } else {
+                gpui::px(0.)
+            };
+            if seg_width > max_wrap_segment_width {
+                max_wrap_segment_width = seg_width;
+            }
+            prev_ix = end_ix;
+        }
+        // Trailing segment from the last boundary to end of line.
+        wrap_segment_count += 1;
+        let tail_x_start = shaped.x_for_index(prev_ix);
+        let tail_width = if unwrapped_width > tail_x_start {
+            unwrapped_width - tail_x_start
+        } else {
+            gpui::px(0.)
+        };
+        if tail_width > max_wrap_segment_width {
+            max_wrap_segment_width = tail_width;
+        }
+    }
+    text_run_log::record(text_run_log::Sample {
+        row_id: row_id(),
+        wrap_width,
+        max_unwrapped_line_width,
+        max_wrap_segment_width,
+        wrap_segment_count,
+        source_len: source.len(),
+    });
+}
+
+#[cfg(any(test, feature = "smoke-test"))]
+pub(crate) mod text_run_log {
+    use gpui::Pixels;
+    use std::cell::RefCell;
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct Sample {
+        pub(crate) row_id: String,
+        pub(crate) wrap_width: Pixels,
+        pub(crate) max_unwrapped_line_width: Pixels,
+        pub(crate) max_wrap_segment_width: Pixels,
+        pub(crate) wrap_segment_count: usize,
+        pub(crate) source_len: usize,
+    }
+
+    thread_local! {
+        static SAMPLES: RefCell<Vec<Sample>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn clear() {
+        SAMPLES.with(|slot| slot.borrow_mut().clear());
+    }
+
+    pub(crate) fn record(sample: Sample) {
+        SAMPLES.with(|slot| slot.borrow_mut().push(sample));
+    }
+
+    pub(crate) fn samples() -> Vec<Sample> {
+        SAMPLES.with(|slot| slot.borrow().clone())
+    }
+}
+
 /// Modal title band: title-tier semibold on the left, a small-label `esc`
 /// hint at the right. Contract line 91 pins this shape for every wiki-run
 /// modal; the title role rides the same +2 step every promoted header takes.
@@ -2273,9 +2421,14 @@ impl Render for ZetaView {
         // Reset the state-color recorder at the start of every render so
         // tests observe only the samples produced by the draw they trigger,
         // and no test needs a manual `render_log::clear()` before drawing.
-        // Compiled out in production alongside the recorder itself.
+        // The text-run geometry recorder resets on the same beat so a
+        // wrap-containment test reads only this frame's shaped lines.
+        // Compiled out in production alongside the recorders themselves.
         #[cfg(any(test, feature = "smoke-test"))]
-        render_log::clear();
+        {
+            render_log::clear();
+            text_run_log::clear();
+        }
         let needs_login = !self.login_providers.is_empty()
             && self
                 .login_providers
