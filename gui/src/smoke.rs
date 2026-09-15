@@ -119,32 +119,46 @@ fn escaped_glyph_range(
 
 /// Identify the transcript scrollbar-thumb rectangles the current frame
 /// painted, so the pixel-gutter scan can skip them without loosening its
-/// content-right coordinate. Filters `painted_quads()` to narrow (≤
-/// `SCROLLBAR_THUMB_WIDTH` scaled + 2px slack), tall (≥ 24px scaled)
-/// quads whose x-range overlaps the scan gutter. The narrow-and-tall
-/// signature is unique to the scrollbar thumb — every other painted quad
-/// in the transcript column is either full-width (rows, backgrounds) or
-/// short (chevrons, dots, focus rings).
+/// content-right coordinate. The scrollbar THUMB is proportional to the
+/// viewport / content ratio — at the taller 922x610 viewport it can be
+/// only a few dozen pixels tall — so this filter identifies it by
+/// **X-BAND** signature: left edge at (or immediately at) the gutter
+/// start AND width matching the `SCROLLBAR_THUMB_WIDTH` token
+/// (± 2px slack for subpixel rounding). Height is unbounded so a short
+/// proportional thumb is still masked.
+///
+/// Real glyph escapes are unmaskable by construction: glyphs paint as
+/// text sprites (a separate scene primitive), NOT as quads, so this
+/// filter cannot accidentally cover a real prose overshoot even if a
+/// future refactor were to add a narrow chrome quad in the same x-band.
+/// The `gui-native-guards-mutation` poison-canary pins that
+/// non-masking property in CI.
 fn scrollbar_scan_masks(window: &Window, gutter_x_start: u32, gutter_x_end: u32) -> Vec<PixelRect> {
     let scale = window.scale_factor();
-    let max_width_scaled = (f32::from(theme::SCROLLBAR_THUMB_WIDTH) * scale).ceil() as u32 + 2;
-    let min_height_scaled = (24.0 * scale) as u32;
+    let scrollbar_width_scaled = f32::from(theme::SCROLLBAR_THUMB_WIDTH) * scale;
+    let min_width_scaled = (scrollbar_width_scaled - 1.0).max(0.0);
+    let max_width_scaled = scrollbar_width_scaled + 2.0;
     window
         .painted_quads()
         .into_iter()
         .filter_map(|quad| {
-            let width = quad.bounds.size.width.0.ceil() as u32;
-            let height = quad.bounds.size.height.0.ceil() as u32;
-            if width == 0 || width > max_width_scaled || height < min_height_scaled {
+            let width_scaled = quad.bounds.size.width.0;
+            if width_scaled < min_width_scaled || width_scaled > max_width_scaled {
                 return None;
             }
             let x_start = quad.bounds.origin.x.0.floor() as u32;
-            let x_end = x_start + width;
+            let x_end = x_start + width_scaled.ceil() as u32;
             let y_start = quad.bounds.origin.y.0.floor() as u32;
-            let y_end = y_start + height;
-            // Only mask quads whose x-range actually overlaps the gutter
-            // — a narrow icon painted elsewhere on the row does not need
-            // exclusion because the scan does not visit its columns.
+            let y_end = y_start + quad.bounds.size.height.0.ceil() as u32;
+            // Left edge must sit at or PAST the gutter start — narrow
+            // chrome painted inside the content area (icons, focus
+            // rings, chip borders) is never at content_right, so we
+            // never mask it. Allow 1px of subpixel slack on the left
+            // to accept a thumb that landed just before the ceil-ed
+            // gutter start.
+            if x_start + 1 < gutter_x_start {
+                return None;
+            }
             if x_end <= gutter_x_start || x_start >= gutter_x_end {
                 return None;
             }
@@ -208,7 +222,7 @@ fn scan_native_gutter(
     println!(
         "NATIVE-GUARD-PASS: shape={shape} size={font_size:?} \
          viewport={achieved_width}x{achieved_height} gutter={x_start}..{x_end} \
-         scrollbar_masks={}",
+         scrollbar_masks={} rects={scrollbar_masks:?}",
         scrollbar_masks.len()
     );
 }
