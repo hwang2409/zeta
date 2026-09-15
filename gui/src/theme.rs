@@ -186,6 +186,14 @@ pub const SETTINGS_ROW_DESCRIPTION_GAP: Pixels = px(2.);
 /// viewport across every picker base (11px…18px).
 pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(160.);
 
+/// Absolute ceiling for the Settings panel's rendered height. The panel
+/// still sizes off the viewport shelf below the 25% modal-top offset so
+/// short viewports pack the sections tight, but a tall viewport must not
+/// stretch the panel: a 1200px viewport shelf is 884px, which would grow
+/// the flat panel to full-page proportions and break the wiki-modal
+/// silhouette. Sections still scroll inside the panel when the cap bites.
+pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(560.);
+
 /// Clamp a candidate font size to the appearance picker's whole-px window.
 pub fn clamp_font_size(px_value: f32) -> Pixels {
     let clamped = px_value.round().clamp(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX);
@@ -1783,6 +1791,7 @@ mod tests {
         assert_eq!(SETTINGS_ROW_GAP, px(6.));
         assert_eq!(SETTINGS_ROW_DESCRIPTION_GAP, px(2.));
         assert_eq!(SETTINGS_MODEL_LIST_MAX_HEIGHT, px(160.));
+        assert_eq!(SETTINGS_PANEL_MAX_HEIGHT, px(560.));
         // Label column scales with base font size so long labels
         // ("Approval mode") never overflow the column at the picker's
         // MAX 18px base — the pre-ZETA-128-round-2 fixed 120px column

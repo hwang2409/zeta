@@ -216,6 +216,15 @@ struct ZetaView {
     /// the current focus.
     pub(crate) settings_section_focus:
         std::cell::RefCell<std::collections::HashMap<&'static str, gpui::FocusHandle>>,
+    /// One persistent focus handle per model row (keyed by row index). Each
+    /// row's Button carries its own internal focus handle for tab-stop
+    /// mechanics; a wrapper `div().track_focus(&handle)` around the button
+    /// gives us a stable per-row handle we can query on every paint with
+    /// `contains_focused`, so the inner model list scrolls whichever row is
+    /// keyboard-focused into view (not just the SELECTED row). Same lazy
+    /// allocate-on-paint pattern as `sidebar_row_focus`.
+    pub(crate) settings_model_row_focus:
+        std::cell::RefCell<std::collections::HashMap<usize, gpui::FocusHandle>>,
     // One persistent focus handle per sidebar row id — a session id or a
     // branch id. Populated lazily in the sidebar render and reused across
     // paints so tab focus survives redraws and tests can look a row's
@@ -306,6 +315,7 @@ impl ZetaView {
             settings_return_focus: None,
             settings_sections_scroll: gpui::ScrollHandle::new(),
             settings_section_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
+            settings_model_row_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             sidebar_row_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             tool_group_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             login_providers: Vec::new(),
@@ -1246,25 +1256,13 @@ impl ZetaView {
         if !self.settings_open {
             return;
         }
-        // Tab / Shift-Tab walk the modal's tab-stop registry so keyboard
-        // users reach every control (segmented pickers, stepper, Close,
-        // Apply) without touching the mouse. `focus_next` / `focus_prev`
-        // are the same helpers Root's Tab/Shift-Tab bindings call — see
-        // the sidebar row focus tests. Every other key is swallowed so a
-        // typed letter can't fall through to the composer.
+        // Tab / Shift-Tab are handled by Root's action bindings; combined
+        // with the `.focus_trap(...)` container below, the built-in trap
+        // manager keeps the focus cycle inside the modal (see
+        // `gpui_base::focus_trap`). Every other key is swallowed here so a
+        // typed letter can't fall through to the composer under the scrim.
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
-        if key == "tab" && !modifiers.control && !modifiers.alt && !modifiers.platform {
-            if modifiers.shift {
-                window.focus_prev(cx);
-            } else {
-                window.focus_next(cx);
-            }
-            window.prevent_default();
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
         if !modifiers.modified() {
             match key {
                 "escape" => self.close_settings(window, cx),
@@ -1320,7 +1318,33 @@ impl ZetaView {
                 child_index += 1;
             }
         }
-        if let Some(child_ix) = model_child_indices.get(selected).copied() {
+        // Per-row focus handles: allocate lazily, reuse across paints so
+        // `contains_focused` compares against stable handles. Prune entries
+        // for indices that no longer exist (catalog rebind can shrink the
+        // list). Each row's wrapper div calls `.track_focus(&handle)` so
+        // the button's internal focus (the true tab stop) still drives
+        // `contains_focused` on our persistent handle.
+        {
+            let mut map = self.settings_model_row_focus.borrow_mut();
+            map.retain(|k, _| *k < view.models.len());
+            for index in 0..view.models.len() {
+                map.entry(index).or_insert_with(|| cx.focus_handle());
+            }
+        }
+        // Scroll destination priority: focused row wins over selected row.
+        // Tab lands on a row's internal button focus; the wrapper div's
+        // handle contains that focus and drives the scroll so the ring
+        // paints inside the visible slice. Fall back to selected so an
+        // unfocused open still centers on the current model.
+        let focused_row = {
+            let map = self.settings_model_row_focus.borrow();
+            (0..view.models.len()).find(|index| {
+                map.get(index)
+                    .is_some_and(|handle| handle.contains_focused(window, cx))
+            })
+        };
+        let scroll_target = focused_row.unwrap_or(selected);
+        if let Some(child_ix) = model_child_indices.get(scroll_target).copied() {
             self.model_scroll.scroll_to_item(child_ix);
         }
         let mut list = div()
@@ -1351,32 +1375,43 @@ impl ZetaView {
                         .child(group),
                 );
             }
+            let row_focus = self
+                .settings_model_row_focus
+                .borrow()
+                .get(&index)
+                .cloned()
+                .expect("row focus handle allocated above");
             list = list.child(
-                Button::new(("model", index))
-                    .debug_selector(move || format!("model-row-{index}"))
-                    .ghost()
-                    .selected(index == selected)
-                    .w_full()
-                    .h(px(32.))
+                div()
+                    .debug_selector(move || format!("model-row-{index}-slot"))
+                    .track_focus(&row_focus)
                     .child(
-                        div()
-                            .h_flex()
+                        Button::new(("model", index))
+                            .debug_selector(move || format!("model-row-{index}"))
+                            .ghost()
+                            .selected(index == selected)
                             .w_full()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(div().flex_1().min_w_0().truncate().child(model.clone()))
-                            .when(model == &view.current_model, |row| {
-                                row.child(
-                                    div()
-                                        .text_size(theme::label_small(cx.theme().font_size))
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("current"),
-                                )
-                            }),
-                    )
-                    .on_click(
-                        cx.listener(move |view, _, _, cx| view.select_settings_model(index, cx)),
+                            .h(px(32.))
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(div().flex_1().min_w_0().truncate().child(model.clone()))
+                                    .when(model == &view.current_model, |row| {
+                                        row.child(
+                                            div()
+                                                .text_size(theme::label_small(cx.theme().font_size))
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("current"),
+                                        )
+                                    }),
+                            )
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.select_settings_model(index, cx)
+                            })),
                     ),
             );
         }
@@ -1456,11 +1491,18 @@ impl ZetaView {
             );
         let pending = self.pending_command;
         let error = self.settings_error.clone();
+        // Focus trap: `.focus_trap(...)` registers the overlay in the
+        // gpui_base focus-trap manager and calls `.track_focus` under the
+        // hood. Root's `Tab` / `TabPrev` actions consult the manager and
+        // cycle focus back inside the modal when a step escapes to a
+        // background tab stop (composer, sidebar). Behavior lives entirely
+        // in the container declaration — no custom Tab handling in
+        // `settings_key` needed.
+        use gpui_kit::base::FocusTrapElement as _;
         div()
             .absolute()
             .inset_0()
             .debug_selector(|| "settings-overlay".into())
-            .track_focus(&self.settings_focus)
             .occlude()
             .bg(cx.theme().overlay)
             .v_flex()
@@ -1479,21 +1521,31 @@ impl ZetaView {
                     .v_flex()
                     .w(theme::MODAL_WIDTH)
                     .max_w_full()
-                    // Panel size STRICTLY equals the viewport shelf below the
-                    // 25% modal-top offset (minus one MODAL_PADDING_X so it
-                    // never kisses the viewport bottom). `.h(...)` — not
-                    // `.max_h(...)` — because gpui's flex system needs a
-                    // definite parent height to resolve `flex_1 + min_h_0`
-                    // on the sections wrapper; a max-only bound lets the
-                    // sections wrapper grow past the cap at the 18px picker
-                    // base and the last row (Font size stepper) paints
-                    // outside the viewport. `.overflow_hidden()` is the
+                    // Panel size is `min(shelf, cap)`:
+                    //  - `shelf` = viewport height below the 25% modal-top
+                    //    offset (minus one MODAL_PADDING_X so it never
+                    //    kisses the viewport bottom). Small viewports
+                    //    (760px test window at 18px picker) leave the panel
+                    //    shelf-sized so `flex_1 + min_h_0` on the sections
+                    //    wrapper can resolve against a definite height.
+                    //  - `cap` = SETTINGS_PANEL_MAX_HEIGHT (560px). Tall
+                    //    viewports (1200px+) would otherwise stretch the
+                    //    flat panel to 884px+ and break the wiki-modal
+                    //    silhouette — cap the growth here so the panel
+                    //    always reads as a modal, not a page.
+                    // `.h(...)` (not `.max_h(...)`) because gpui's flex
+                    // resolver needs a definite parent height; a max-only
+                    // bound at 18px lets the sections wrapper grow past
+                    // the panel and the Font-size stepper paints outside
+                    // the viewport. `.overflow_hidden()` is the
                     // belt-and-suspenders clip so a layout bug elsewhere
                     // still cannot leak past the panel edge.
-                    .h(
-                        window.viewport_size().height * (1.0 - theme::MODAL_TOP_FRACTION)
-                            - theme::MODAL_PADDING_X,
-                    )
+                    .h({
+                        let shelf = window.viewport_size().height
+                            * (1.0 - theme::MODAL_TOP_FRACTION)
+                            - theme::MODAL_PADDING_X;
+                        std::cmp::min(shelf, theme::SETTINGS_PANEL_MAX_HEIGHT)
+                    })
                     .overflow_hidden()
                     .pt(theme::MODAL_PADDING_TOP)
                     .pb(theme::MODAL_PADDING_BOTTOM)
@@ -1633,6 +1685,7 @@ impl ZetaView {
                             ),
                     ),
             )
+            .focus_trap("settings-modal", &self.settings_focus)
             .into_any_element()
     }
 }

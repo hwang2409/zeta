@@ -565,6 +565,11 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     // once. Saved before the settings-modal shot so the transcript column
     // stays visible.
     let tools_path = env::var_os("ZETA_GUI_SMOKE_TOOLS_IMAGE");
+    // Optional ZETA-128 capture — the same settings modal after switching
+    // to the 18px picker MAX so the after-screenshot pair proves the
+    // layout holds at both extremes of the appearance picker. Saved
+    // AFTER the primary capture, then the driver quits.
+    let modal_18px_path = env::var_os("ZETA_GUI_SMOKE_MODAL_18PX_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -772,6 +777,30 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         .save(PathBuf::from(path))
                                         .expect("save smoke screenshot");
                                     println!("SMOKE-PASS: {}", PathBuf::from(path).display());
+                                }
+                                // Optional second modal capture at the 18px
+                                // picker MAX. Same panel, larger type — a
+                                // reviewer can walk the before/after pair at
+                                // the picker extreme without a second run.
+                                if let Some(modal_18px) = &modal_18px_path {
+                                    entity.update(cx, |_, cx| {
+                                        let appearance = theme::Appearance {
+                                            theme: theme::ThemeId::default(),
+                                            font_family: gpui::SharedString::new_static(
+                                                theme::DEFAULT_FONT_FAMILY,
+                                            ),
+                                            font_size: theme::clamp_font_size(
+                                                theme::MAX_FONT_SIZE_PX,
+                                            ),
+                                        };
+                                        theme::apply_with(cx, &appearance);
+                                    });
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer 18px capture")
+                                        .save(PathBuf::from(modal_18px))
+                                        .expect("save 18px modal screenshot");
                                 }
                                 cx.quit();
                                 return (true, false);
