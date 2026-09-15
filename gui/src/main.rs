@@ -7,6 +7,7 @@ mod sidebar;
 #[cfg(feature = "smoke-test")]
 mod smoke;
 mod theme;
+mod tool_receipts;
 mod transcript_render;
 
 use gpui::{
@@ -490,7 +491,7 @@ impl ZetaView {
                         row.model.clone_from(&session.model);
                     }
                 }
-                self.state.apply_status(status);
+                edits = self.state.apply_status(status);
             }
             WorkerMessage::Rejected(error) => {
                 self.pending_command = false;

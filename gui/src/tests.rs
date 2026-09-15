@@ -74,6 +74,57 @@ fn setup(
 }
 
 #[test]
+fn prose_wrap_budget_floors_fractional_widths_and_fits_the_content_box() {
+    // r4 finding 5: the wrap budget MUST be floor()-ed so a fractional
+    // `prose_max_width` cannot let the painter's rounding push a glyph
+    // one pixel past `content_right`. The r3 pixel-gutter guard flagged
+    // that pattern at 11px on the 922×610 viewport — glyphs, not quads,
+    // painting one column past the column content edge.
+    //
+    // This is a headless mutation-sensitive test: it hard-fails if the
+    // `.floor()` call in `theme::prose_wrap_budget` is removed or swapped
+    // for `.ceil()` / `.round()` / a bare cast. It does NOT rely on the
+    // wide-viewport pixel guard, which under-scans the fractional strip
+    // by design.
+    let base = gpui::px(11.);
+    let pre_floor =
+        f32::from(theme::prose_max_width(base)) - 2.0 * theme::PROSE_ROW_PADDING_X - 2.0;
+    // Premise: 11 * 0.62 * 88 + 32 - 32 - 2 = 597.68 — must be fractional
+    // so the floor()/no-floor split is observable.
+    assert!(
+        (pre_floor - pre_floor.floor()).abs() > f32::EPSILON,
+        "test premise: pre-floor budget for {base:?} is {pre_floor} — must \
+         be fractional to make the floor mutation observable"
+    );
+    let budget = theme::prose_wrap_budget(base);
+    let budget_f = f32::from(budget);
+    assert!(
+        (budget_f - budget_f.round()).abs() < f32::EPSILON,
+        "wrap budget must be integer-valued (floored) but is {budget_f}"
+    );
+    assert!(
+        (budget_f - pre_floor.floor()).abs() < f32::EPSILON,
+        "wrap budget {budget_f} must equal floor(pre_floor) {} — a \
+         mutation that removed .floor() or swapped it for .ceil()/.round() \
+         would trip here",
+        pre_floor.floor(),
+    );
+    // Synthetic fractional-width layout: the row's inner content box is
+    // `prose_max_width - 2 * padding` (fractional at this base). The
+    // wrap budget must fit inside that box strictly — a caller that
+    // stopped flooring would sit at 597.68 and pass the box check by
+    // luck, but the integer-valued assertion above catches it. A caller
+    // that ceil()-ed to 598 would push the row's advertised wrap width
+    // above the content box and glyphs shape past `content_right`.
+    let content_box_right =
+        f32::from(theme::prose_max_width(base)) - 2.0 * theme::PROSE_ROW_PADDING_X;
+    assert!(
+        budget_f <= content_box_right,
+        "wrap budget {budget_f} must fit inside the content box {content_box_right}"
+    );
+}
+
+#[test]
 fn sidebar_uses_name_then_preview_and_never_session_id() {
     let mut session = session();
     assert_eq!(sidebar::session_label(&session, None), "New conversation");
@@ -6092,11 +6143,23 @@ fn sidebar_row_focus_map_prunes_removed_rows_and_keeps_survivors(cx: &mut TestAp
 /// test flags that regression.
 #[test]
 fn renderer_literal_fence_rejects_literals_outside_allowed_contexts() {
-    const SOURCE: &str = include_str!("transcript_render.rs");
-    let failures = fence::run(SOURCE);
+    // r4 finding 6: the tool-receipt and group renderers moved to
+    // `tool_receipts.rs`. The fence's scanned set MUST include the
+    // extracted module or a stray literal there slips past the ZETA-109
+    // guard silently. Both files ride the same fence rules.
+    const SOURCES: &[(&str, &str)] = &[
+        ("transcript_render.rs", include_str!("transcript_render.rs")),
+        ("tool_receipts.rs", include_str!("tool_receipts.rs")),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (name, source) in SOURCES {
+        for failure in fence::run(source) {
+            failures.push(format!("{name}: {failure}"));
+        }
+    }
     assert!(
         failures.is_empty(),
-        "renderer_literal_fence tripped on transcript_render.rs:\n  - {}",
+        "renderer_literal_fence tripped on the render source set:\n  - {}",
         failures.join("\n  - "),
     );
 }
@@ -6290,6 +6353,41 @@ fn renderer_literal_fence_mutation_battery_against_the_real_module() {
         ran += 1;
     }
     assert_eq!(ran, 9, "battery must exercise every review-named probe");
+}
+
+#[test]
+fn renderer_literal_fence_scans_the_extracted_tool_receipts_module() {
+    // r4 finding 6: the tool-receipt and group renderers moved to
+    // `tool_receipts.rs`. If the fence's scanned set does not include
+    // the new module, a stray literal there silently regresses the
+    // ZETA-109 guard. This mutation proves the extracted module is
+    // scanned: injecting a `.child("x")` literal into tool_receipts.rs
+    // MUST trip the fence — the same rule the parent module enforces.
+    const SOURCE: &str = include_str!("tool_receipts.rs");
+    // Anchor on a stable render-time call the module actually emits so
+    // this test does not go stale on unrelated refactors of the tool
+    // renderers.
+    let needle = ".into_any_element()\n    }";
+    assert!(
+        SOURCE.contains(needle),
+        "mutation anchor {needle:?} not found in tool_receipts.rs — the \
+         mutation battery has drifted from the module's actual shape",
+    );
+    let mutated = SOURCE.replacen(needle, ".child(\"x\").into_any_element()\n    }", 1);
+    let failures = fence::run(&mutated);
+    assert!(
+        !failures.is_empty(),
+        "injecting `.child(\"x\")` into tool_receipts.rs MUST trip the fence — \
+         got failures: {failures:?}. The fence's scanned set is not covering \
+         the extracted module.",
+    );
+    // Also prove the unmodified tool_receipts.rs is CLEAN so a real fence
+    // trip would not blend into background failures.
+    let baseline = fence::run(SOURCE);
+    assert!(
+        baseline.is_empty(),
+        "tool_receipts.rs must pass the fence unmodified — baseline failures: {baseline:?}",
+    );
 }
 
 #[test]
@@ -7599,13 +7697,15 @@ fn zeta125_group_header_persists_when_expanded_and_toggles_via_real_keystrokes(
         visual.debug_bounds("tool-group-0").is_some(),
         "collapsed group paints its header row",
     );
-    // r3 finding 3: reach the group header through a REAL tab walk —
-    // `window.focus_next` is the same code path the Root keymap's
-    // `tab` -> `focus_next` binding drives (gpui-component
-    // `root::init` -> `Tab` -> `window.focus_next`). Jamming focus
-    // onto the handle via `window.focus(&handle)` succeeds even for
-    // handles that are not real tab stops; the tab-walk proves the
-    // header is reachable from the keyboard tab-stops registry.
+    // r4 finding 3: reach the group header through a REAL tab-key
+    // walk — `simulate_keystrokes("tab")` drives the Root keymap's
+    // Tab -> `focus_next` binding end-to-end (gpui-component
+    // `root::init`), not just the `focus_next` method the pre-r4
+    // test called directly. Jamming focus onto the handle via
+    // `window.focus(&handle)` succeeds even for handles that are not
+    // real tab stops; the key-walk proves the header is reachable
+    // from the keyboard tab-stops registry via the same key path a
+    // real user drives.
     let focus_key = zeta_gui::row_text::sel::tool_group_focus_key("a");
     let group_handle = visual
         .update(|_, cx| {
@@ -7623,7 +7723,7 @@ fn zeta125_group_header_persists_when_expanded_and_toggles_via_real_keystrokes(
     let max_tab_steps = 64;
     let mut steps_to_group = None;
     for step in 0..max_tab_steps {
-        visual.update(|window, cx| window.focus_next(cx));
+        visual.simulate_keystrokes("tab");
         if visual.update(|window, _| group_handle.is_focused(window)) {
             steps_to_group = Some(step + 1);
             break;

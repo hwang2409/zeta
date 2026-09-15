@@ -390,7 +390,7 @@ impl AppState {
         self.metrics_boundary = true;
     }
 
-    pub fn apply_status(&mut self, status: StatusResult) {
+    pub fn apply_status(&mut self, status: StatusResult) -> Vec<TranscriptEdit> {
         self.select_session(
             status
                 .session
@@ -401,11 +401,26 @@ impl AppState {
             self.metrics = StatusMetrics::from_status(&status);
             self.metrics_boundary = false;
         }
-        self.streaming = status.state != "idle";
+        let was_streaming = self.streaming;
+        let now_streaming = status.state != "idle";
+        self.streaming = now_streaming;
         if !self.streaming {
             self.thinking = false;
         }
         self.approvals = status.pending_approvals;
+        // r4 finding 4: a resumed approval finishes a tool through a
+        // status poll (worker.rs:358) — no AgentEnd, no TurnAborted.
+        // The current turn's tool groups collapse back from their
+        // streaming-forced-open shape here, and every row in each
+        // affected group changes render shape. Emit the SAME remeasure
+        // edits AgentEnd emits so the virtual list picks up the shape
+        // change; skipping them leaves resumed groups stuck in their
+        // expanded shape until the next unrelated edit.
+        if was_streaming && !now_streaming {
+            self.remeasure_current_turn_groups()
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn apply(&mut self, event: ServerEvent) -> Vec<TranscriptEdit> {
@@ -605,22 +620,22 @@ impl AppState {
                     }
                     *error = failed;
                     if let Some(result) = tool_result.filter(|result| !result.content.is_empty()) {
-                        // Bash-shaped tools stream stdout via `ToolOutput`
-                        // AND repeat the whole thing in the final result
-                        // (src/zeta/tools/bash.py:202). If the retained
-                        // tail is a suffix of that final content, the
-                        // stream already carried those bytes and a fresh
-                        // append would double `bytes_seen` plus paste
-                        // the same content twice. Detect the duplicate
-                        // via a suffix match rather than a blanket
-                        // `streamed` skip so tools that stream partial
-                        // progress and then return a DIFFERENT final
-                        // payload (see the delegated-receipt worker
-                        // test) still capture their end summary.
-                        let duplicate_of_stream = card.streamed
-                            && !card.tail.text.is_empty()
-                            && result.content.ends_with(&card.tail.text);
-                        if !duplicate_of_stream && card.tail.text != result.content {
+                        if card.streamed {
+                            // Streamed tools already fed `bytes_seen` from
+                            // ToolOutput. The final ToolEnd payload can
+                            // reshape the visible text — bash wraps stdout
+                            // in `"stdout:\n…\nstderr:\n…"` sections
+                            // (src/zeta/tools/bash.py:194), so a suffix
+                            // check misses the duplicate and appending
+                            // would double-count the same bytes. Replace
+                            // the visible tail from the final payload;
+                            // the streamed byte count stays authoritative.
+                            card.tail.replace_visible(&result.content);
+                        } else if card.tail.text != result.content {
+                            // Non-streamed tools (delegated agents that
+                            // only emit ToolEnd) count the final content
+                            // once. Newline-separate so a follow-up final
+                            // does not glue onto the prior tail.
                             if !card.tail.text.is_empty() && !card.tail.text.ends_with('\n') {
                                 card.tail.append("\n");
                             }
@@ -1211,12 +1226,28 @@ pub(crate) fn redact_secrets(input: &str) -> String {
 /// characters are RETAINED in the output word — the excerpt is a preview,
 /// not a runnable command, and keeping the quotes makes it obvious that a
 /// value spanned whitespace before redaction ran.
+///
+/// Backslash outside quotes ESCAPES the next character: `PASSWORD=correct\ horse`
+/// stays one token whose value carries the escaped space. Without this the
+/// naive whitespace split would leak the tail of an unquoted-with-escape
+/// secret — the r4 review flagged that exact bypass alongside the r3
+/// quoted-secret class.
 fn shell_split(input: &str) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
-    for ch in input.chars() {
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
         match (quote, ch) {
+            (None, '\\') => {
+                // Backslash outside quotes joins the next char into the
+                // current word without splitting — POSIX shell escape.
+                // A trailing backslash with no follower keeps the current
+                // word intact and drops the stray escape.
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
             (None, c) if c.is_whitespace() => {
                 if !current.is_empty() {
                     words.push(std::mem::take(&mut current));
@@ -2729,6 +2760,43 @@ mod tests {
     }
 
     #[test]
+    fn excerpt_redacts_escaped_unquoted_multi_word_secret_values() {
+        // r4 BLOCKER: `PASSWORD=correct\ horse` uses a POSIX backslash
+        // escape to keep the space inside the token WITHOUT quoting. The
+        // pre-r4 tokenizer split on whitespace and leaked " horse". The
+        // shell_split extension honors backslash escapes so the entire
+        // escaped value redacts as one unit. Sits alongside the quoted
+        // classes so a peer refactor of the tokenizer keeps this bypass
+        // in sight.
+        for (cmd, leaks) in [
+            ("PASSWORD=correct\\ horse psql", &["correct", "horse"][..]),
+            (
+                "GITHUB_TOKEN=ghp\\ secret\\ staple gh api",
+                &["ghp", "secret", "staple"][..],
+            ),
+            (
+                "AUTH=alpha\\ bravo PASSWORD=charlie\\ delta node app.js",
+                &["alpha", "bravo", "charlie", "delta"][..],
+            ),
+        ] {
+            let excerpt = tool_excerpt(
+                "bash",
+                &[("command".to_owned(), json!(cmd))].into_iter().collect(),
+            );
+            assert!(
+                excerpt.contains(REDACTED_MARKER),
+                "excerpt for {cmd:?} did not redact: {excerpt:?}"
+            );
+            for leak in leaks {
+                assert!(
+                    !excerpt.contains(leak),
+                    "excerpt for {cmd:?} leaked {leak:?}: {excerpt:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn excerpt_secret_key_match_is_word_boundary_not_substring() {
         // r3 finding 2: the substring predicate matched `monkey=banana`
         // (contains "key") and `design=modern` (contains "sig"). Both are
@@ -3042,12 +3110,14 @@ mod tests {
 
     #[test]
     fn streamed_bash_result_bytes_are_counted_exactly_once() {
-        // r3 finding 5: bash streams stdout via `ToolOutput` and repeats
-        // the whole thing in the final `ToolEnd` payload. Before the fix
-        // the tail's `bytes_seen` counted BOTH sources — the size label
-        // on the receipt overstated the stdout by 2x. Counting once means
-        // the streamed bytes are authoritative and the final payload
-        // does not re-increment `bytes_seen`.
+        // r3 finding 5 / r4 finding 1: bash streams stdout via `ToolOutput`
+        // and returns a SECTION-formatted final payload
+        // (`"stdout:\n<stdout>\nstderr:\n<stderr>"` — see
+        // `src/zeta/tools/bash.py:194`). The old suffix guard NEVER matched
+        // that shape, so `bytes_seen` double-counted the same stdout. This
+        // test drives the real bash payload shape and pins the fix: streamed
+        // tools count exactly the streamed bytes and REPLACE the visible
+        // tail from the final payload.
         let mut state = AppState::default();
         state.apply(ServerEvent::TurnStart {
             session_id: None,
@@ -3066,12 +3136,15 @@ mod tests {
             output: stdout.clone(),
             data: json!({}),
         });
+        // Real bash-shaped final payload — stdout wrapped in "stdout:\n…\n
+        // stderr:\n…" sections. The pre-fix suffix guard NEVER caught this.
+        let final_payload = format!("stdout:\n{stdout}\nstderr:\n");
         state.apply(ServerEvent::ToolEnd {
             session_id: None,
             tool_call: call.clone(),
             tool_result: Some(crate::client::ToolResult {
                 tool_call_id: call.id.clone(),
-                content: stdout.clone(),
+                content: final_payload.clone(),
                 is_error: false,
                 is_canceled: false,
                 content_blocks: vec![],
@@ -3079,14 +3152,23 @@ mod tests {
             }),
             data: json!({}),
         });
-        let bytes = match &state.transcript[0] {
-            TranscriptEntry::Tool { card, .. } => card.tail.bytes_seen,
+        let (bytes, tail_text) = match &state.transcript[0] {
+            TranscriptEntry::Tool { card, .. } => (card.tail.bytes_seen, card.tail.text.clone()),
             _ => panic!("expected a tool row"),
         };
         assert_eq!(
             bytes,
             stdout.len(),
-            "streamed bash stdout must count once, not twice",
+            "streamed bash stdout must count once, not the streamed bytes \
+             plus the wrapped final payload",
+        );
+        // The visible tail carries the final payload's shape (section-
+        // wrapped stdout), even though bytes_seen still reads the streamed
+        // total — the two roles are separated cleanly.
+        assert!(
+            tail_text.contains("stderr:"),
+            "visible tail must reflect the final payload's shape, not the \
+             streamed stdout alone; got {tail_text:?}",
         );
     }
 
@@ -3118,5 +3200,85 @@ mod tests {
         }
         let group = state.tool_group_position(0).expect("group");
         assert_eq!(state.tool_group_output_bytes(&group), 300);
+    }
+
+    #[test]
+    fn resumed_completion_via_status_emits_remeasure_edits_for_the_turn_groups() {
+        // r4 finding 4: a resumed approval finishes its tool through a
+        // status poll (worker.rs:358) — no AgentEnd, no TurnAborted. The
+        // current turn's tool groups collapse back from the
+        // streaming-forced-open shape at that moment, so every row in
+        // each affected group changes render shape. Without remeasure
+        // edits the virtual list stays wedged in the old shape until an
+        // unrelated edit forces a resize. This test drives the exact
+        // shape and asserts every group row in the live turn rides the
+        // ordered edit list, matching what `AgentEnd` emits.
+        let mut state = AppState::default();
+        state.apply(ServerEvent::TurnStart {
+            session_id: None,
+            data: json!({}),
+        });
+        for id in ["a", "b", "c"] {
+            state.apply(ServerEvent::ToolStart {
+                session_id: None,
+                tool_call: ordered_call(id),
+                data: json!({}),
+            });
+        }
+        // Live turn's group must exist so remeasure has something to emit.
+        let group = state
+            .tool_group_position(state.transcript.len() - 1)
+            .expect("live turn group");
+        let running_status: StatusResult = serde_json::from_value(json!({
+            "session": {"session_id": "one", "model": "test"},
+            "state": "running",
+            "usage": {},
+        }))
+        .expect("running status");
+        assert!(
+            state.apply_status(running_status).is_empty(),
+            "status polls that keep streaming produce no remeasure edits"
+        );
+        assert!(
+            state.streaming,
+            "sanity: running status leaves state streaming"
+        );
+
+        // The resumed-completion signal: state flips to idle via a status
+        // poll only — NO AgentEnd, NO TurnAborted. This is the exact code
+        // path worker.rs:358 drives after a resumed approval finishes.
+        let idle_status: StatusResult = serde_json::from_value(json!({
+            "session": {"session_id": "one", "model": "test"},
+            "state": "idle",
+            "usage": {},
+        }))
+        .expect("idle status");
+        let edits = state.apply_status(idle_status);
+        assert!(
+            !state.streaming,
+            "status-only completion must clear the streaming flag",
+        );
+        let expected: Vec<_> = (group.first_index..=group.last_index)
+            .map(TranscriptEdit::Remeasure)
+            .collect();
+        assert_eq!(
+            edits, expected,
+            "resumed status-only completion must emit the SAME remeasure \
+             edits AgentEnd would emit — one per row in each of the live \
+             turn's tool groups",
+        );
+
+        // A second idle status is a no-op: streaming is already false, so
+        // no fresh remeasures fire and the transcript stays stable.
+        let idle_again: StatusResult = serde_json::from_value(json!({
+            "session": {"session_id": "one", "model": "test"},
+            "state": "idle",
+            "usage": {},
+        }))
+        .expect("idle status");
+        assert!(
+            state.apply_status(idle_again).is_empty(),
+            "idle-after-idle must not re-emit remeasure edits",
+        );
     }
 }

@@ -19,6 +19,23 @@ impl OutputTail {
     pub fn append(&mut self, text: &str) {
         self.bytes_seen = self.bytes_seen.saturating_add(text.len());
         self.text.push_str(text);
+        self.enforce_bounds();
+    }
+
+    /// Overwrite the visible tail text WITHOUT touching `bytes_seen`. Used
+    /// by the `ToolEnd` handler for streamed tools: the streamed byte
+    /// count is authoritative, but the final payload may reshape the
+    /// visible text (bash wraps the streamed stdout in
+    /// `"stdout:\n…\nstderr:\n…"` sections per
+    /// `src/zeta/tools/bash.py:194`). A suffix check misses that
+    /// duplicate and appending would double-count the same bytes.
+    pub fn replace_visible(&mut self, text: &str) {
+        self.text.clear();
+        self.text.push_str(text);
+        self.enforce_bounds();
+    }
+
+    fn enforce_bounds(&mut self) {
         let lines: Vec<_> = self.text.split_inclusive('\n').collect();
         if lines.len() > TAIL_LINES {
             self.text = lines[lines.len() - TAIL_LINES..].concat();
