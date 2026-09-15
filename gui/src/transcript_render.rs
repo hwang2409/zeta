@@ -194,18 +194,7 @@ impl ZetaView {
                     .min_w_0()
                     .max_w(max_width)
                     .px_4()
-                    // Safety layer for the fractional-glyph off-by-one:
-                    // even after flooring the wrap budget above, a
-                    // future refactor that widens the row without
-                    // updating the budget would let a glyph land past
-                    // the column content edge. Wrapping `inner` in an
-                    // unpadded `overflow_hidden` div INSIDE the
-                    // padded column puts the clip exactly at the
-                    // padding-inner edge — the same coordinate the
-                    // guard's `content_right` scans — so any future
-                    // stray column-crossing pixel is clipped before
-                    // it can reach the gutter.
-                    .child(div().w_full().min_w_0().overflow_hidden().child(inner)),
+                    .child(inner),
             )
             .into_any_element()
     }
