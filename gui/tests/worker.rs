@@ -1190,7 +1190,9 @@ fn branch_history_failure(command: CommandMessage, method: &'static str, rpc: bo
     let mut state = AppState::default();
     loop {
         match harness.next() {
-            WorkerMessage::Status(status) => state.apply_status(status),
+            WorkerMessage::Status(status) => {
+                let _ = state.apply_status(status);
+            }
             WorkerMessage::History(history, replace) => state.apply_history(history, replace),
             WorkerMessage::Connected => break,
             WorkerMessage::Extensions(_) | WorkerMessage::Sessions(_) | WorkerMessage::Tree(_) => {}
