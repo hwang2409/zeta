@@ -179,7 +179,7 @@ impl ZetaView {
                     .px(theme::MODAL_PADDING_X)
                     .gap_3()
                     .bg(cx.theme().sidebar)
-                    .child(modal_title(title))
+                    .child(modal_title(title, cx))
                     .child(content)
                     .when_some(self.command_error.clone(), |view, error| {
                         view.child(

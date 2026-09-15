@@ -200,6 +200,22 @@ struct ZetaView {
     /// focused at open time (e.g. Cmd-shortcut path); `close_settings` then
     /// falls back to the composer, which stays the primary work area.
     pub(crate) settings_return_focus: Option<gpui::FocusHandle>,
+    /// Scroll handle for the Settings modal's three-section body. Anchored
+    /// so that when Tab lands on a control inside a section that has
+    /// scrolled off the top or bottom of the wrapper (18px picker on a
+    /// 760px viewport), the render pass calls `scroll_to_item(section_ix)`
+    /// and the focused control's parent section swings back into view.
+    /// The visible focus ring stays painted inside the viewport — the
+    /// safety net paired with cutting Appearance from nine tab stops to
+    /// two.
+    pub(crate) settings_sections_scroll: gpui::ScrollHandle,
+    /// One persistent focus handle per Settings section container ("model",
+    /// "behavior", "appearance"). Each container carries `.track_focus`,
+    /// and the render pass uses `contains_focused` to route
+    /// `settings_sections_scroll.scroll_to_item` to whichever section holds
+    /// the current focus.
+    pub(crate) settings_section_focus:
+        std::cell::RefCell<std::collections::HashMap<&'static str, gpui::FocusHandle>>,
     // One persistent focus handle per sidebar row id — a session id or a
     // branch id. Populated lazily in the sidebar render and reused across
     // paints so tab focus survives redraws and tests can look a row's
@@ -288,6 +304,8 @@ impl ZetaView {
             session_edit_focus: cx.focus_handle(),
             settings_focus: cx.focus_handle(),
             settings_return_focus: None,
+            settings_sections_scroll: gpui::ScrollHandle::new(),
+            settings_section_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             sidebar_row_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             tool_group_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             login_providers: Vec::new(),
@@ -393,6 +411,13 @@ impl ZetaView {
                     .iter()
                     .position(|mode| *mode == settings.approval_mode)
                     .unwrap_or(0);
+                // Capture whoever had focus at the moment settings actually
+                // opens, BEFORE we hand focus to the overlay. `close_settings`
+                // restores this handle so keyboard users land back on the
+                // control that invoked the modal (a11y precedent set by
+                // ZETA-108/123). A click-invoked open often has no focused
+                // handle; `close_settings` then falls back to the composer.
+                self.settings_return_focus = window.focused(cx);
                 self.settings_open = true;
                 window.focus(&self.settings_focus, cx);
             }
@@ -708,7 +733,7 @@ impl ZetaView {
         }
     }
 
-    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
         if !self.can_change_session()
             || !self.state.session_view.available
             || self.state.active_session.is_none()
@@ -716,11 +741,12 @@ impl ZetaView {
         {
             return;
         }
-        // Capture whoever had focus so `close_settings` can restore it. A
-        // click-invoked open often has no focused handle (buttons decline
-        // focus on mouse down); a keyboard-invoked open captures the
-        // sidebar button that was focused when Enter fired.
-        self.settings_return_focus = window.focused(cx);
+        // Focus capture happens later — inside `apply_worker_message` when
+        // the `Settings` reply lands. That is the moment we actually flip
+        // `settings_open` and hand keyboard focus to the overlay, so it is
+        // the correct capture point. Keeping the capture inside the
+        // settings path means callers on other surfaces (sidebar,
+        // transcript error-hint) do not need to thread a `Window` through.
         self.pending_command = true;
         self.settings_error = None;
         self.queue(CommandMessage::LoadSettings);
@@ -807,6 +833,38 @@ impl ZetaView {
         appearance.font_family = gpui::SharedString::new_static(family);
         prefs::commit(cx, appearance);
         cx.notify();
+    }
+
+    /// Advance the current theme by `delta` positions through the shipped
+    /// `ThemeId::ALL` list. Cycles wrap so a keyboard cycler never dead-ends
+    /// on either edge. Used by the compact single-value theme cycler in
+    /// Settings; the previous button-wall exposed FIVE tab-stops offscreen
+    /// at 18px — one focusable cycler paints one visible ring instead.
+    fn cycle_theme(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let all = theme::ThemeId::ALL;
+        if all.is_empty() {
+            return;
+        }
+        let current = self.app_appearance(cx).theme;
+        let ix = all.iter().position(|id| *id == current).unwrap_or(0) as isize;
+        let next = (ix + delta).rem_euclid(all.len() as isize) as usize;
+        self.set_theme(all[next], cx);
+    }
+
+    /// Advance the current font family by `delta` through `FONT_FAMILIES`.
+    /// Same cycler shape as `cycle_theme`; one control, one tab stop.
+    fn cycle_font_family(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let all = theme::FONT_FAMILIES;
+        if all.is_empty() {
+            return;
+        }
+        let current = self.app_appearance(cx).font_family;
+        let ix = all
+            .iter()
+            .position(|family| *family == current.as_ref())
+            .unwrap_or(0) as isize;
+        let next = (ix + delta).rem_euclid(all.len() as isize) as usize;
+        self.set_font_family(all[next], cx);
     }
 
     fn adjust_font_size(&mut self, delta_px: f32, cx: &mut Context<Self>) {
@@ -1221,6 +1279,20 @@ impl ZetaView {
         cx.notify();
     }
 
+    /// Lazily allocated per-section FocusHandle for the Settings modal.
+    /// Same shape as `sidebar_row_focus` in `sidebar.rs`: create once, reuse
+    /// across paints so `contains_focused` compares against a stable handle.
+    /// Called during render so the borrow scope stays inside one frame.
+    fn settings_section_focus_handle(&self, key: &'static str, cx: &App) -> gpui::FocusHandle {
+        let mut map = self.settings_section_focus.borrow_mut();
+        if let Some(handle) = map.get(key) {
+            return handle.clone();
+        }
+        let handle = cx.focus_handle();
+        map.insert(key, handle.clone());
+        handle
+    }
+
     fn render_settings_overlay(
         &self,
         window: &mut Window,
@@ -1263,7 +1335,7 @@ impl ZetaView {
             // stacked below it. Below this cap the list scrolls; the
             // "current" model is auto-scrolled into view regardless of
             // the visible slice.
-            .max_h(px(160.))
+            .max_h(theme::SETTINGS_MODEL_LIST_MAX_HEIGHT)
             .overflow_y_scroll()
             .track_scroll(&self.model_scroll);
         for (index, model) in view.models.iter().enumerate() {
@@ -1324,50 +1396,25 @@ impl ZetaView {
                     }))
             }));
         let appearance = self.app_appearance(cx);
-        // Segmented pickers for the enumerable choice sets. `flex_wrap()`
-        // is a safety valve for the picker's MAX 18px base — the label
-        // strip fits on one line at every default base.
-        let theme_segmented = div()
-            .debug_selector(|| "settings-theme-segmented".into())
-            .h_flex()
-            .gap_1()
-            .flex_wrap()
-            .justify_end()
-            .children(
-                theme::ThemeId::ALL
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(index, id)| {
-                        Button::new(("theme", index))
-                            .debug_selector(move || format!("theme-row-{}", id.slug()))
-                            .ghost()
-                            .compact()
-                            .selected(appearance.theme == id)
-                            .label(id.label())
-                            .on_click(cx.listener(move |view, _, _, cx| view.set_theme(id, cx)))
-                    }),
-            );
-        let font_segmented =
-            div()
-                .debug_selector(|| "settings-font-segmented".into())
-                .h_flex()
-                .gap_1()
-                .flex_wrap()
-                .justify_end()
-                .children(theme::FONT_FAMILIES.iter().copied().enumerate().map(
-                    |(index, family)| {
-                        Button::new(("font", index))
-                            .debug_selector(move || format!("font-row-{family}"))
-                            .ghost()
-                            .compact()
-                            .selected(appearance.font_family.as_ref() == family)
-                            .label(family)
-                            .on_click(
-                                cx.listener(move |view, _, _, cx| view.set_font_family(family, cx)),
-                            )
-                    },
-                ));
+        // Compact single-value cyclers replace the pre-round-2 button
+        // walls (five theme buttons + four font buttons). Each cycler is
+        // ONE focusable button showing the current selection; clicking it
+        // advances to the next value, wrapping at the ends. The row
+        // description below explains the interaction. Result: two tab
+        // stops in the Appearance section instead of nine, so every focus
+        // ring paints inside the viewport at 18px.
+        let theme_cycler = Button::new("settings-theme-cycler")
+            .debug_selector(|| "settings-theme-cycler".into())
+            .ghost()
+            .compact()
+            .label(appearance.theme.label())
+            .on_click(cx.listener(|view, _, _, cx| view.cycle_theme(1, cx)));
+        let font_cycler = Button::new("settings-font-cycler")
+            .debug_selector(|| "settings-font-cycler".into())
+            .ghost()
+            .compact()
+            .label(gpui::SharedString::from(appearance.font_family.to_string()))
+            .on_click(cx.listener(|view, _, _, cx| view.cycle_font_family(1, cx)));
         let size_px = f32::from(appearance.font_size);
         let font_size_px = size_px.round() as i32;
         let can_shrink = size_px > theme::MIN_FONT_SIZE_PX;
@@ -1425,7 +1472,7 @@ impl ZetaView {
             // windows — measure the height directly and offset in pixels.
             // Contract line 91.
             .pt(window.viewport_size().height * theme::MODAL_TOP_FRACTION)
-            .px(px(16.))
+            .px(theme::MODAL_PADDING_X)
             .child(
                 div()
                     .debug_selector(|| "settings-panel".into())
@@ -1440,14 +1487,15 @@ impl ZetaView {
                     // overflow beyond the cap scrolls through the sections
                     // rather than pushing Close past the viewport bottom.
                     .max_h(
-                        window.viewport_size().height * (1.0 - theme::MODAL_TOP_FRACTION) - px(16.),
+                        window.viewport_size().height * (1.0 - theme::MODAL_TOP_FRACTION)
+                            - theme::MODAL_PADDING_X,
                     )
                     .pt(theme::MODAL_PADDING_TOP)
                     .pb(theme::MODAL_PADDING_BOTTOM)
                     .px(theme::MODAL_PADDING_X)
                     .gap_3()
                     .bg(cx.theme().sidebar)
-                    .child(modal_title("Session settings"))
+                    .child(modal_title("Session settings", cx))
                     // Three sections stacked with the section-gap between
                     // them so Model / Behavior / Appearance read as three
                     // distinct clusters (Law of Proximity), not one long
@@ -1455,48 +1503,92 @@ impl ZetaView {
                     // overflow_y_scroll` lets the sections shrink and
                     // scroll when the panel cap bites (18px picker, tiny
                     // viewport) so Close/Apply stays at the panel bottom.
-                    .child(
+                    .child({
+                        let model_focus = self.settings_section_focus_handle("model", cx);
+                        let behavior_focus = self.settings_section_focus_handle("behavior", cx);
+                        let appearance_focus = self.settings_section_focus_handle("appearance", cx);
+                        // Safety net: if Tab lands on a control inside a
+                        // section that has scrolled past the wrapper edge
+                        // (18px picker on a 760px viewport), reveal that
+                        // section before the frame paints. Each container
+                        // carries a stable focus handle via
+                        // `.track_focus(&focus)` in `settings_section`;
+                        // `scroll_to_item(child_ix)` uses the sibling index
+                        // of the section within the sections wrapper.
+                        let focused_section = if model_focus.contains_focused(window, cx) {
+                            Some(0)
+                        } else if behavior_focus.contains_focused(window, cx) {
+                            Some(1)
+                        } else if appearance_focus.contains_focused(window, cx) {
+                            Some(2)
+                        } else {
+                            None
+                        };
+                        if let Some(ix) = focused_section {
+                            self.settings_sections_scroll.scroll_to_item(ix);
+                        }
                         div()
                             .id("settings-sections")
                             .v_flex()
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
+                            .track_scroll(&self.settings_sections_scroll)
                             .gap(theme::SETTINGS_SECTION_GAP)
                             .child(
-                                settings_section("settings-section-model", "Model", cx).child(list),
+                                settings_section(
+                                    "settings-section-model",
+                                    "Model",
+                                    &model_focus,
+                                    cx,
+                                )
+                                .child(list),
                             )
                             .child(
-                                settings_section("settings-section-behavior", "Behavior", cx)
-                                    .child(settings_row(
-                                        "settings-row-approval",
-                                        "Approval mode",
-                                        mode_segmented,
-                                        cx,
-                                    )),
+                                settings_section(
+                                    "settings-section-behavior",
+                                    "Behavior",
+                                    &behavior_focus,
+                                    cx,
+                                )
+                                .child(settings_row(
+                                    "settings-row-approval",
+                                    "Approval mode",
+                                    Some("How the agent handles risky actions."),
+                                    mode_segmented,
+                                    cx,
+                                )),
                             )
                             .child(
-                                settings_section("settings-section-appearance", "Appearance", cx)
-                                    .child(settings_row(
-                                        "settings-row-theme",
-                                        "Theme",
-                                        theme_segmented,
-                                        cx,
-                                    ))
-                                    .child(settings_row(
-                                        "settings-row-font",
-                                        "Font",
-                                        font_segmented,
-                                        cx,
-                                    ))
-                                    .child(settings_row(
-                                        "settings-row-size",
-                                        "Font size",
-                                        size_stepper,
-                                        cx,
-                                    )),
-                            ),
-                    )
+                                settings_section(
+                                    "settings-section-appearance",
+                                    "Appearance",
+                                    &appearance_focus,
+                                    cx,
+                                )
+                                .child(settings_row(
+                                    "settings-row-theme",
+                                    "Theme",
+                                    Some("Click to cycle themes."),
+                                    theme_cycler,
+                                    cx,
+                                ))
+                                .child(settings_row(
+                                    "settings-row-font",
+                                    "Font",
+                                    Some("Click to cycle monospace families."),
+                                    font_cycler,
+                                    cx,
+                                ))
+                                .child(settings_row(
+                                    "settings-row-size",
+                                    "Font size",
+                                    Some("Whole pixels, 11 to 18."),
+                                    size_stepper,
+                                    cx,
+                                )),
+                            )
+                    })
                     .children(self.login_providers.iter().map(|provider| {
                         self.render_login_provider(
                             provider,
@@ -2437,8 +2529,14 @@ pub(crate) mod text_run_log {
 /// Modal title band: title-tier semibold on the left, a small-label `esc`
 /// hint at the right. Contract line 91 pins this shape for every wiki-run
 /// modal; the title role rides the same +2 step every promoted header takes.
-pub(crate) fn modal_title(title: &'static str) -> gpui::AnyElement {
-    let base = theme::current_font_size();
+///
+/// The `esc` hint routes through the theme's `muted_foreground` role rather
+/// than the `text_faint` palette accessor — `text_faint` sat at 2.92-4.03:1
+/// against the modal panel (WCAG AA needs 4.5:1 for small text) across the
+/// five shipped themes; `muted_foreground` clears AA on every theme (see
+/// the modal-hint contrast row in `settings_panel_paints_on_tokens_...`).
+pub(crate) fn modal_title(title: &'static str, cx: &App) -> gpui::AnyElement {
+    let base = cx.theme().font_size;
     div()
         .debug_selector(|| "modal-title".into())
         .h_flex()
@@ -2453,8 +2551,9 @@ pub(crate) fn modal_title(title: &'static str) -> gpui::AnyElement {
         )
         .child(
             div()
+                .debug_selector(|| "modal-title-esc".into())
                 .text_size(theme::label_small(base))
-                .text_color(theme::palette::text_faint())
+                .text_color(cx.theme().muted_foreground)
                 .child("esc"),
         )
         .into_any_element()
@@ -2465,14 +2564,20 @@ pub(crate) fn modal_title(title: &'static str) -> gpui::AnyElement {
 /// so the section reads as a heading) and a thin separator rule. The caller
 /// appends its rows with `.child(...)`. Every section paints on tokens so
 /// the five themes stay legible.
+///
+/// The container carries `.track_focus(focus)` so `settings_sections_scroll`
+/// can call `scroll_to_item` when Tab lands on a control inside the section
+/// — the safety net that keeps focus rings inside the viewport at 18px.
 pub(crate) fn settings_section(
     selector: &'static str,
     heading: &'static str,
+    focus: &gpui::FocusHandle,
     cx: &App,
 ) -> gpui::Div {
     let base = cx.theme().font_size;
     div()
         .debug_selector(move || selector.into())
+        .track_focus(focus)
         .v_flex()
         .gap(theme::SETTINGS_ROW_GAP)
         .child(
@@ -2488,22 +2593,35 @@ pub(crate) fn settings_section(
                         .text_color(cx.theme().foreground)
                         .child(heading),
                 )
-                .child(div().flex_1().h(px(1.)).bg(cx.theme().border)),
+                .child(
+                    div()
+                        .flex_1()
+                        .h(theme::RAIL_WIDTH_THIN)
+                        .bg(cx.theme().border),
+                ),
         )
 }
 
-/// One labeled Settings row: `label` on the left in a fixed 120px column,
-/// `control` right-aligned. Every row in every section flows through this
-/// so the modal has one row anatomy.
+/// One labeled Settings row. `label` sits in a token-derived left column
+/// that widens with the base font size (so "Approval mode" fits at every
+/// picker base without wrapping); `control` is right-aligned. Every row in
+/// every section flows through this so the modal has ONE row anatomy.
+///
+/// `description` is optional — when present, it paints as a small-label
+/// muted caption on the row below the control, aligned under the label. The
+/// muted-foreground token stays legible on the sidebar panel across all
+/// five themes (the `esc` hint uses the same token — see modal_title).
 pub(crate) fn settings_row(
     selector: &'static str,
     label: &'static str,
+    description: Option<&'static str>,
     control: impl gpui::IntoElement,
     cx: &App,
 ) -> gpui::Div {
     let base = cx.theme().font_size;
-    div()
-        .debug_selector(move || selector.into())
+    let column = theme::settings_label_column(base);
+    let header = div()
+        .debug_selector(move || format!("{selector}-header"))
         .h_flex()
         .items_center()
         .justify_between()
@@ -2511,7 +2629,7 @@ pub(crate) fn settings_row(
         .child(
             div()
                 .debug_selector(move || format!("{selector}-label"))
-                .w(theme::SETTINGS_LABEL_COLUMN)
+                .w(column)
                 .flex_shrink_0()
                 .text_size(theme::body(base))
                 .text_color(cx.theme().foreground)
@@ -2524,7 +2642,23 @@ pub(crate) fn settings_row(
                 .h_flex()
                 .justify_end()
                 .child(control),
-        )
+        );
+    let mut row = div()
+        .debug_selector(move || selector.into())
+        .v_flex()
+        .gap(theme::SETTINGS_ROW_DESCRIPTION_GAP)
+        .child(header);
+    if let Some(text) = description {
+        row = row.child(
+            div()
+                .debug_selector(move || format!("{selector}-description"))
+                .w(column)
+                .text_size(theme::label_small(base))
+                .text_color(cx.theme().muted_foreground)
+                .child(text),
+        );
+    }
+    row
 }
 
 /// Thin vertical separator between status-strip items. One-pixel wide, 14px

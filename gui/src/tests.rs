@@ -1824,27 +1824,29 @@ fn appearance_controls_reapply_theme_font_and_size_live(cx: &mut TestAppContext)
         theme::DEFAULT_FONT_FAMILY
     );
 
-    // Click a non-default theme; the app-local theme moves off opencode.
-    let gruvbox_light = visual
-        .debug_bounds("theme-row-gruvbox-light")
-        .expect("gruvbox-light theme row renders");
-    visual.simulate_click(gruvbox_light.center(), Default::default());
+    // Click the theme cycler — it advances one step through ThemeId::ALL
+    // and wraps at the ends. Starting on Opencode (index 0) lands on the
+    // next entry (GruvboxDark, index 1); the app-local theme moves off
+    // opencode. The pre-round-2 button wall exposed five tab stops; the
+    // cycler collapses them to one focusable control.
+    let theme_cycler = visual
+        .debug_bounds("settings-theme-cycler")
+        .expect("theme cycler renders");
+    visual.simulate_click(theme_cycler.center(), Default::default());
     visual.update(|window, cx| window.draw(cx).clear(cx));
     let after_theme_bg = visual.update(|_, cx| cx.theme().background);
-    assert_eq!(
-        after_theme_bg,
-        theme::ThemeId::GruvboxLight.palette().canvas
-    );
+    assert_eq!(after_theme_bg, theme::ThemeId::GruvboxDark.palette().canvas);
     assert_ne!(after_theme_bg, baseline_bg);
 
-    // Click a non-default font family; theme.font_family follows.
-    let menlo = visual
-        .debug_bounds("font-row-Menlo")
-        .expect("Menlo font row renders");
-    visual.simulate_click(menlo.center(), Default::default());
+    // Click the font cycler — advances one step through FONT_FAMILIES so
+    // theme.font_family flips off the default (JetBrains Mono -> Fira Code).
+    let font_cycler = visual
+        .debug_bounds("settings-font-cycler")
+        .expect("font cycler renders");
+    visual.simulate_click(font_cycler.center(), Default::default());
     visual.update(|window, cx| window.draw(cx).clear(cx));
     let after_font = visual.update(|_, cx| cx.theme().font_family.as_ref().to_string());
-    assert_eq!(after_font, "Menlo");
+    assert_eq!(after_font, "Fira Code");
 
     // Shrink font size by one step; grow it back. Both should land on the
     // whole-px pick window.
@@ -8183,12 +8185,13 @@ fn settings_escape_closes_and_returns_focus_to_the_invoker(cx: &mut TestAppConte
     visual.update(|window, cx| {
         window.focus(&composer_focus, cx);
         view.update(cx, |view, cx| {
-            view.open_settings(window, cx);
+            view.open_settings(cx);
         });
         window.draw(cx).clear(cx);
     });
     // The modal is not yet visible (LoadSettings is queued) — feed the
-    // catalog reply so it appears, then send Escape.
+    // catalog reply so it appears (focus capture fires there, from the
+    // composer we just focused), then send Escape.
     open_settings_with_default_catalog(&view, &mut visual);
     assert!(visual.debug_bounds("settings-overlay").is_some());
     visual.simulate_keystrokes("escape");
@@ -8313,6 +8316,236 @@ fn settings_modal_fits_the_viewport_at_min_and_max_font_size(cx: &mut TestAppCon
         );
     }
     // Restore defaults for peer tests.
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
+}
+
+#[gpui::test]
+fn settings_theme_and_font_render_as_compact_single_value_cyclers(cx: &mut TestAppContext) {
+    // Round 2 collapses the pre-round-1 button walls (five theme buttons +
+    // four font buttons -> nine tab stops in Appearance) into one focusable
+    // cycler each. The row's control slot holds ONE labeled button carrying
+    // the current selection; clicking it advances to the next value. The
+    // pre-round-2 debug selectors `theme-row-<slug>` / `font-row-<family>`
+    // vanish with the walls.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    // One tab stop per row: the cyclers exist under a stable selector.
+    let theme_cycler = visual
+        .debug_bounds("settings-theme-cycler")
+        .expect("theme cycler renders");
+    let font_cycler = visual
+        .debug_bounds("settings-font-cycler")
+        .expect("font cycler renders");
+    // Each cycler lives inside its row's control slot (right of the label).
+    let theme_slot = visual
+        .debug_bounds("settings-row-theme-control")
+        .expect("theme control slot renders");
+    let font_slot = visual
+        .debug_bounds("settings-row-font-control")
+        .expect("font control slot renders");
+    assert!(
+        theme_cycler.left() >= theme_slot.left()
+            && theme_cycler.right() <= theme_slot.right() + px(1.),
+        "theme cycler must live inside the theme row's control slot"
+    );
+    assert!(
+        font_cycler.left() >= font_slot.left() && font_cycler.right() <= font_slot.right() + px(1.),
+        "font cycler must live inside the font row's control slot"
+    );
+    // The pre-round-2 button walls are gone. The specific selectors ZETA-111
+    // shipped for the individual theme/font buttons no longer resolve — if
+    // they do, the wall has crept back.
+    for gone in [
+        "theme-row-opencode",
+        "theme-row-gruvbox-dark",
+        "theme-row-vscode-dark-plus",
+        "theme-row-nord",
+        "theme-row-gruvbox-light",
+        "font-row-JetBrains Mono",
+        "font-row-Fira Code",
+        "font-row-SF Mono",
+        "font-row-Menlo",
+        "font-row-Monaco",
+        "settings-theme-segmented",
+        "settings-font-segmented",
+    ] {
+        assert!(
+            visual.debug_bounds(gone).is_none(),
+            "{gone} must not render — the pre-round-2 button wall crept back"
+        );
+    }
+}
+
+#[gpui::test]
+fn settings_rows_carry_short_muted_descriptions(cx: &mut TestAppContext) {
+    // Round 2 attaches a short muted-foreground caption to each labeled
+    // row (Behavior + Appearance). The caption paints below the label /
+    // control line and reads at label_small — dense enough to sit as a
+    // subordinate line, muted enough to defer to the label. If any of
+    // these description slots stops rendering, a row lost its caption.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    for &(row, description_sel) in &[
+        ("settings-row-approval", "settings-row-approval-description"),
+        ("settings-row-theme", "settings-row-theme-description"),
+        ("settings-row-font", "settings-row-font-description"),
+        ("settings-row-size", "settings-row-size-description"),
+    ] {
+        let row_bounds = visual
+            .debug_bounds(row)
+            .unwrap_or_else(|| panic!("{row} must render"));
+        let description = visual
+            .debug_bounds(description_sel)
+            .unwrap_or_else(|| panic!("{row}: {description_sel} must render"));
+        assert!(
+            description.top() >= row_bounds.top(),
+            "{row}: description must paint below the row's top edge"
+        );
+        assert!(
+            description.bottom() <= row_bounds.bottom() + px(1.),
+            "{row}: description must stay inside the row container"
+        );
+    }
+}
+
+#[gpui::test]
+fn settings_label_column_widens_with_the_base_font_size(cx: &mut TestAppContext) {
+    // Round 2 replaces the fixed 120px label column with a base-derived
+    // width so long labels ("Approval mode") fit at every picker base.
+    // At 18px the label column must widen past the pre-round-2 120px
+    // ceiling or the label wraps into a stacked block again.
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    let base = visual.update(|_, cx| cx.theme().font_size);
+    let baseline_label = visual
+        .debug_bounds("settings-row-approval-label")
+        .expect("baseline approval label renders");
+    let baseline_width = baseline_label.right() - baseline_label.left();
+    // At the MAX 18px picker base the column widens strictly beyond the
+    // shipped-default width.
+    let appearance = theme::Appearance {
+        theme: theme::ThemeId::default(),
+        font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+    };
+    visual.update(|_, cx| theme::apply_with(cx, &appearance));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let wide_label = visual
+        .debug_bounds("settings-row-approval-label")
+        .expect("wide approval label renders at 18px");
+    let wide_width = wide_label.right() - wide_label.left();
+    assert!(
+        wide_width > baseline_width,
+        "label column must widen with base ({base:?} -> 18px): \
+         baseline {baseline_width:?}, wide {wide_width:?}"
+    );
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
+}
+
+#[gpui::test]
+fn settings_modal_esc_hint_paints_on_muted_foreground_token(cx: &mut TestAppContext) {
+    // Round 2 routes the `esc` hint through `muted_foreground` (AA) rather
+    // than the pre-round-2 `text_faint` palette accessor (2.92-4.03:1
+    // against the panel token). This test walks every shipped theme and
+    // asserts the theme's `muted_foreground` clears WCAG AA against the
+    // sidebar token — the palette pair the esc hint rides.
+    fn relative_luminance(color: gpui::Hsla) -> f32 {
+        let rgba = color.to_rgb();
+        let channel = |c: f32| {
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(rgba.r) + 0.7152 * channel(rgba.g) + 0.0722 * channel(rgba.b)
+    }
+    fn contrast_ratio(a: gpui::Hsla, b: gpui::Hsla) -> f32 {
+        let la = relative_luminance(a);
+        let lb = relative_luminance(b);
+        let (lmax, lmin) = if la >= lb { (la, lb) } else { (lb, la) };
+        (lmax + 0.05) / (lmin + 0.05)
+    }
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    for id in theme::ThemeId::ALL.iter().copied() {
+        let appearance = theme::Appearance {
+            theme: id,
+            font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+            font_size: gpui::px(13.),
+        };
+        visual.update(|_, cx| theme::apply_with(cx, &appearance));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            visual.debug_bounds("modal-title-esc").is_some(),
+            "esc hint renders on {id:?}"
+        );
+        let (fg, bg) = visual.update(|_, cx| (cx.theme().muted_foreground, cx.theme().sidebar));
+        let ratio = contrast_ratio(fg, bg);
+        assert!(
+            ratio >= 4.5,
+            "{id:?}: esc hint contrast {ratio:.2}:1 fails WCAG AA on the panel"
+        );
+    }
+    visual.update(|_, cx| theme::apply(cx));
+}
+
+#[gpui::test]
+fn settings_tab_stops_stay_visible_inside_the_viewport_at_18px(cx: &mut TestAppContext) {
+    // Round 2 promise: every focusable control inside the modal paints
+    // inside the viewport at the 18px picker MAX. The pre-round-2 shape
+    // pushed seven Appearance tab stops offscreen (five theme + four font
+    // buttons on top of the stepper). The cycler collapse plus the
+    // section-level scroll-into-view safety net keep every ring visible.
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    let appearance = theme::Appearance {
+        theme: theme::ThemeId::default(),
+        font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+    };
+    visual.update(|_, cx| theme::apply_with(cx, &appearance));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let viewport = visual.update(|window, _| window.viewport_size());
+    // The controls that expose a stable debug selector at the section-body
+    // level. Each is one tab stop (the model list has its own internal
+    // scroll — its focus safety net is subsumed by the sections wrapper's
+    // scroll-into-view mechanism).
+    let checked = [
+        "mode-row-ask",
+        "mode-row-allow",
+        "mode-row-deny",
+        "settings-theme-cycler",
+        "settings-font-cycler",
+        "font-size-shrink",
+        "font-size-grow",
+        "settings-close",
+        "settings-apply",
+    ];
+    for sel in checked {
+        let bounds = visual
+            .debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} must render at 18px"));
+        assert!(
+            bounds.top() >= px(0.) && bounds.bottom() <= viewport.height,
+            "{sel}: bounds {bounds:?} fall outside the viewport height {:?} at 18px",
+            viewport.height
+        );
+        assert!(
+            bounds.left() >= px(0.) && bounds.right() <= viewport.width,
+            "{sel}: bounds {bounds:?} fall outside the viewport width {:?} at 18px",
+            viewport.width
+        );
+    }
     visual.update(|_, cx| theme::apply(cx));
     wipe_scoped_prefs();
 }

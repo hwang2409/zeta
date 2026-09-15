@@ -154,10 +154,21 @@ pub const MODAL_PADDING_BOTTOM: Pixels = px(14.);
 pub const MODAL_BUTTON_HEIGHT: Pixels = px(30.);
 pub const MODAL_TOP_FRACTION: f32 = 0.25;
 
-/// Fixed-width label column for a Settings row so labels stack on a common
-/// left edge and every control aligns on the right side. Wide enough to hold
-/// "Font family" comfortably at the picker's MAX 18px base without wrapping.
-pub const SETTINGS_LABEL_COLUMN: Pixels = px(120.);
+/// Fixed-width label column for a Settings row at the SHIPPED 13px base so
+/// labels stack on a common left edge. Kept as a public token for the
+/// backing test — production callers use `settings_label_column(base)` so
+/// the column widens with the picker's base size and long labels (e.g.
+/// "Approval mode") never shape wider than the column at 18px.
+pub const SETTINGS_LABEL_COLUMN: Pixels = px(140.);
+
+/// Label-column width derived from the current base font size. The column
+/// scales linearly (`base * 10.8`) so at 11px it is 118.8px, at 13px 140px,
+/// at 18px 194px. Wide enough to hold "Approval mode" without wrapping into
+/// a stacked block at any picker base.
+pub fn settings_label_column(base: Pixels) -> Pixels {
+    let scale = f32::from(base) * 10.8;
+    px(scale.round())
+}
 
 /// Vertical gap BETWEEN top-level Settings sections (Model / Behavior /
 /// Appearance). Larger than the intra-section row gap so section boundaries
@@ -168,6 +179,17 @@ pub const SETTINGS_SECTION_GAP: Pixels = px(10.);
 /// Vertical gap between rows within one Settings section — sits tight so a
 /// three-row Appearance block reads as one cluster.
 pub const SETTINGS_ROW_GAP: Pixels = px(6.);
+
+/// Vertical gap between a Settings row's label/control line and its
+/// description caption below. Tight so the caption reads as a subordinate
+/// line to the row, not a separate cluster.
+pub const SETTINGS_ROW_DESCRIPTION_GAP: Pixels = px(2.);
+
+/// Maximum height for the Model list inside the Settings modal. The list
+/// scrolls beyond this so the three-section body (Model + Behavior +
+/// Appearance) plus optional credential alert fits inside the 760px test
+/// viewport across every picker base (11px…18px).
+pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(160.);
 
 /// Clamp a candidate font size to the appearance picker's whole-px window.
 pub fn clamp_font_size(px_value: f32) -> Pixels {
@@ -1762,9 +1784,18 @@ mod tests {
         assert_eq!(MODAL_PADDING_BOTTOM, px(14.));
         assert_eq!(MODAL_BUTTON_HEIGHT, px(30.));
         assert!((MODAL_TOP_FRACTION - 0.25).abs() < f32::EPSILON);
-        assert_eq!(SETTINGS_LABEL_COLUMN, px(120.));
+        assert_eq!(SETTINGS_LABEL_COLUMN, px(140.));
         assert_eq!(SETTINGS_SECTION_GAP, px(10.));
         assert_eq!(SETTINGS_ROW_GAP, px(6.));
+        assert_eq!(SETTINGS_ROW_DESCRIPTION_GAP, px(2.));
+        assert_eq!(SETTINGS_MODEL_LIST_MAX_HEIGHT, px(160.));
+        // Label column scales with base font size so long labels
+        // ("Approval mode") never overflow the column at the picker's
+        // MAX 18px base — the pre-ZETA-128-round-2 fixed 120px column
+        // wrapped the label at 18px, leaving the row shaped wrong.
+        assert_eq!(settings_label_column(px(11.)), px(119.));
+        assert_eq!(settings_label_column(px(13.)), SETTINGS_LABEL_COLUMN);
+        assert_eq!(settings_label_column(px(18.)), px(194.));
 
         let tint = opencode().danger_tint();
         let danger = opencode().danger;
@@ -1978,6 +2009,30 @@ mod tests {
                     id.label(),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn modal_hint_and_row_description_contrast_clears_wcag_aa_on_panel() {
+        // The `esc` hint painted on `modal_title` and the row-description
+        // caption on `settings_row` both route through `muted_foreground`
+        // (== `palette.text_muted`) on top of the modal panel token
+        // (== `palette.panel`, mapped to `theme.sidebar`). WCAG AA needs
+        // 4.5:1 for small text; the pre-round-2 esc hint used `text_faint`,
+        // which measured between 2.92:1 and 4.03:1 across the shipped
+        // palettes and failed the bar. This test locks the fix — any
+        // palette author who dims `text_muted` past the AA line has to
+        // adjust it back before the theme ships.
+        for id in ThemeId::ALL {
+            let p = id.palette();
+            let ratio = contrast_ratio(p.text_muted, p.panel);
+            assert!(
+                ratio >= 4.5,
+                "{}: text_muted/panel contrast {ratio:.2}:1 fails WCAG AA \
+                 (need >=4.5:1) — modal esc hint + row descriptions ride \
+                 this pair; see modal_title + settings_row",
+                id.label(),
+            );
         }
     }
 
