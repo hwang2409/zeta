@@ -2820,7 +2820,7 @@ mod tests {
                 r#"PASSWORD="correct\ horse" psql"#,
                 &["correct", "horse"][..],
             ),
-            (r#"PASSWORD="a"'b' psql"#, &["a", "b"][..]),
+            (r#"PASSWORD="a"'b' psql"#, &["\"a\"", "'b'"][..]),
         ] {
             let excerpt = tool_excerpt(
                 "bash",
