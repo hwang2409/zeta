@@ -154,6 +154,21 @@ pub const MODAL_PADDING_BOTTOM: Pixels = px(14.);
 pub const MODAL_BUTTON_HEIGHT: Pixels = px(30.);
 pub const MODAL_TOP_FRACTION: f32 = 0.25;
 
+/// Fixed-width label column for a Settings row so labels stack on a common
+/// left edge and every control aligns on the right side. Wide enough to hold
+/// "Font family" comfortably at the picker's MAX 18px base without wrapping.
+pub const SETTINGS_LABEL_COLUMN: Pixels = px(120.);
+
+/// Vertical gap BETWEEN top-level Settings sections (Model / Behavior /
+/// Appearance). Larger than the intra-section row gap so section boundaries
+/// read as boundaries without needing a heavy ruled line — the divider under
+/// each section heading carries the visual break; this gap is the whitespace.
+pub const SETTINGS_SECTION_GAP: Pixels = px(10.);
+
+/// Vertical gap between rows within one Settings section — sits tight so a
+/// three-row Appearance block reads as one cluster.
+pub const SETTINGS_ROW_GAP: Pixels = px(6.);
+
 /// Clamp a candidate font size to the appearance picker's whole-px window.
 pub fn clamp_font_size(px_value: f32) -> Pixels {
     let clamped = px_value.round().clamp(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX);
@@ -1747,6 +1762,9 @@ mod tests {
         assert_eq!(MODAL_PADDING_BOTTOM, px(14.));
         assert_eq!(MODAL_BUTTON_HEIGHT, px(30.));
         assert!((MODAL_TOP_FRACTION - 0.25).abs() < f32::EPSILON);
+        assert_eq!(SETTINGS_LABEL_COLUMN, px(120.));
+        assert_eq!(SETTINGS_SECTION_GAP, px(10.));
+        assert_eq!(SETTINGS_ROW_GAP, px(6.));
 
         let tint = opencode().danger_tint();
         let danger = opencode().danger;

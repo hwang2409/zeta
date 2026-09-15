@@ -534,8 +534,8 @@ impl ZetaView {
                     Button::new((sel::ERROR_SETTINGS_TAG, index))
                         .debug_selector(move || sel::error_settings(index))
                         .label(label)
-                        .on_click(move |_, _, cx| {
-                            let _ = view.update(cx, |view, cx| view.open_settings(cx));
+                        .on_click(move |_, window, cx| {
+                            let _ = view.update(cx, |view, cx| view.open_settings(window, cx));
                         }),
                 )
             })

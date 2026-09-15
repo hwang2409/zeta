@@ -235,7 +235,7 @@ impl ZetaView {
                     .compact()
                     .label("Settings")
                     .disabled(!can_open_settings)
-                    .on_click(cx.listener(|view, _, _, cx| view.open_settings(cx))),
+                    .on_click(cx.listener(|view, _, window, cx| view.open_settings(window, cx))),
             )
             .into_any_element()
     }

@@ -194,6 +194,12 @@ struct ZetaView {
     session_edit: Option<session_management::SessionEdit>,
     session_edit_focus: gpui::FocusHandle,
     settings_focus: gpui::FocusHandle,
+    /// Focus handle captured when the Settings modal opens — restored on
+    /// close so keyboard users land back on the control that opened the
+    /// modal (a11y precedent set by ZETA-108/123). `None` when nothing was
+    /// focused at open time (e.g. Cmd-shortcut path); `close_settings` then
+    /// falls back to the composer, which stays the primary work area.
+    pub(crate) settings_return_focus: Option<gpui::FocusHandle>,
     // One persistent focus handle per sidebar row id — a session id or a
     // branch id. Populated lazily in the sidebar render and reused across
     // paints so tab focus survives redraws and tests can look a row's
@@ -281,6 +287,7 @@ impl ZetaView {
             session_edit: None,
             session_edit_focus: cx.focus_handle(),
             settings_focus: cx.focus_handle(),
+            settings_return_focus: None,
             sidebar_row_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             tool_group_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
             login_providers: Vec::new(),
@@ -701,7 +708,7 @@ impl ZetaView {
         }
     }
 
-    fn open_settings(&mut self, cx: &mut Context<Self>) {
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_change_session()
             || !self.state.session_view.available
             || self.state.active_session.is_none()
@@ -709,6 +716,11 @@ impl ZetaView {
         {
             return;
         }
+        // Capture whoever had focus so `close_settings` can restore it. A
+        // click-invoked open often has no focused handle (buttons decline
+        // focus on mouse down); a keyboard-invoked open captures the
+        // sidebar button that was focused when Enter fired.
+        self.settings_return_focus = window.focused(cx);
         self.pending_command = true;
         self.settings_error = None;
         self.queue(CommandMessage::LoadSettings);
@@ -718,7 +730,14 @@ impl ZetaView {
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = false;
         self.settings_error = None;
-        window.focus(&self.composer.focus_handle(cx), cx);
+        // Return focus to the invoker (a11y precedent from ZETA-108/123).
+        // Fall back to the composer when the modal was opened without a
+        // focused element (mouse click), so the caret is never lost.
+        if let Some(handle) = self.settings_return_focus.take() {
+            window.focus(&handle, cx);
+        } else {
+            window.focus(&self.composer.focus_handle(cx), cx);
+        }
         cx.notify();
     }
 
@@ -1169,8 +1188,27 @@ impl ZetaView {
         if !self.settings_open {
             return;
         }
-        if !event.keystroke.modifiers.modified() {
-            match event.keystroke.key.as_str() {
+        // Tab / Shift-Tab walk the modal's tab-stop registry so keyboard
+        // users reach every control (segmented pickers, stepper, Close,
+        // Apply) without touching the mouse. `focus_next` / `focus_prev`
+        // are the same helpers Root's Tab/Shift-Tab bindings call — see
+        // the sidebar row focus tests. Every other key is swallowed so a
+        // typed letter can't fall through to the composer.
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        if key == "tab" && !modifiers.control && !modifiers.alt && !modifiers.platform {
+            if modifiers.shift {
+                window.focus_prev(cx);
+            } else {
+                window.focus_next(cx);
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if !modifiers.modified() {
+            match key {
                 "escape" => self.close_settings(window, cx),
                 "up" => self.move_settings_model(-1, cx),
                 "down" => self.move_settings_model(1, cx),
@@ -1219,7 +1257,13 @@ impl ZetaView {
             .v_flex()
             .flex_1()
             .min_h_0()
-            .max_h(px(220.))
+            // Model list cap keeps the whole panel inside the 760px test
+            // viewport once the three-section body (Model + Behavior +
+            // Appearance) AND an optional credential-error alert are
+            // stacked below it. Below this cap the list scrolls; the
+            // "current" model is auto-scrolled into view regardless of
+            // the visible slice.
+            .max_h(px(160.))
             .overflow_y_scroll()
             .track_scroll(&self.model_scroll);
         for (index, model) in view.models.iter().enumerate() {
@@ -1264,9 +1308,10 @@ impl ZetaView {
                     ),
             );
         }
-        let mode_row = div()
+        let mode_segmented = div()
+            .debug_selector(|| "settings-approval-segmented".into())
             .h_flex()
-            .gap_2()
+            .gap_1()
             .children(APPROVAL_MODES.iter().enumerate().map(|(index, mode)| {
                 Button::new(("mode", index))
                     .debug_selector(move || format!("mode-row-{mode}"))
@@ -1279,51 +1324,63 @@ impl ZetaView {
                     }))
             }));
         let appearance = self.app_appearance(cx);
-        // Single horizontal strip with two-line wrap only when the picker
-        // outgrows the modal width. Padding is tight so each row stays 30px
-        // tall — the extra chrome from adding an Appearance section costs
-        // ~90px, which the modal accommodates without pushing Apply / Close
-        // past the window bottom in the default 760-tall test viewport.
-        let theme_row = div().h_flex().gap_1().flex_wrap().children(
-            theme::ThemeId::ALL
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(index, id)| {
-                    Button::new(("theme", index))
-                        .debug_selector(move || format!("theme-row-{}", id.slug()))
-                        .ghost()
-                        .compact()
-                        .selected(appearance.theme == id)
-                        .label(id.label())
-                        .on_click(cx.listener(move |view, _, _, cx| view.set_theme(id, cx)))
-                }),
-        );
-        let font_row = div().h_flex().gap_1().flex_wrap().children(
-            theme::FONT_FAMILIES
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(index, family)| {
-                    Button::new(("font", index))
-                        .debug_selector(move || format!("font-row-{family}"))
-                        .ghost()
-                        .compact()
-                        .selected(appearance.font_family.as_ref() == family)
-                        .label(family)
-                        .on_click(
-                            cx.listener(move |view, _, _, cx| view.set_font_family(family, cx)),
-                        )
-                }),
-        );
+        // Segmented pickers for the enumerable choice sets. `flex_wrap()`
+        // is a safety valve for the picker's MAX 18px base — the label
+        // strip fits on one line at every default base.
+        let theme_segmented = div()
+            .debug_selector(|| "settings-theme-segmented".into())
+            .h_flex()
+            .gap_1()
+            .flex_wrap()
+            .justify_end()
+            .children(
+                theme::ThemeId::ALL
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, id)| {
+                        Button::new(("theme", index))
+                            .debug_selector(move || format!("theme-row-{}", id.slug()))
+                            .ghost()
+                            .compact()
+                            .selected(appearance.theme == id)
+                            .label(id.label())
+                            .on_click(cx.listener(move |view, _, _, cx| view.set_theme(id, cx)))
+                    }),
+            );
+        let font_segmented =
+            div()
+                .debug_selector(|| "settings-font-segmented".into())
+                .h_flex()
+                .gap_1()
+                .flex_wrap()
+                .justify_end()
+                .children(theme::FONT_FAMILIES.iter().copied().enumerate().map(
+                    |(index, family)| {
+                        Button::new(("font", index))
+                            .debug_selector(move || format!("font-row-{family}"))
+                            .ghost()
+                            .compact()
+                            .selected(appearance.font_family.as_ref() == family)
+                            .label(family)
+                            .on_click(
+                                cx.listener(move |view, _, _, cx| view.set_font_family(family, cx)),
+                            )
+                    },
+                ));
         let size_px = f32::from(appearance.font_size);
         let font_size_px = size_px.round() as i32;
         let can_shrink = size_px > theme::MIN_FONT_SIZE_PX;
         let can_grow = size_px < theme::MAX_FONT_SIZE_PX;
-        let size_row = div()
+        // Stepper: `−` [value] `+` framed as a single cluster on the right
+        // so it reads as ONE control, not three loose buttons. Disabled
+        // `−` at MIN and `+` at MAX carry the picker range without a
+        // "range 11-18px" caption cluttering the row.
+        let size_stepper = div()
+            .debug_selector(|| "settings-font-size-stepper".into())
             .h_flex()
             .items_center()
-            .gap_2()
+            .gap_1()
             .child(
                 Button::new("font-size-shrink")
                     .debug_selector(|| "font-size-shrink".into())
@@ -1338,6 +1395,7 @@ impl ZetaView {
                     .debug_selector(|| "font-size-value".into())
                     .min_w(px(44.))
                     .text_align(gpui::TextAlign::Center)
+                    .text_color(cx.theme().foreground)
                     .child(format!("{font_size_px}px")),
             )
             .child(
@@ -1348,16 +1406,6 @@ impl ZetaView {
                     .label("+")
                     .disabled(!can_grow)
                     .on_click(cx.listener(|view, _, _, cx| view.adjust_font_size(1., cx))),
-            )
-            .child(
-                div()
-                    .text_size(theme::label_small(cx.theme().font_size))
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "range {}-{}px",
-                        theme::MIN_FONT_SIZE_PX as i32,
-                        theme::MAX_FONT_SIZE_PX as i32,
-                    )),
             );
         let pending = self.pending_command;
         let error = self.settings_error.clone();
@@ -1384,26 +1432,70 @@ impl ZetaView {
                     .v_flex()
                     .w(theme::MODAL_WIDTH)
                     .max_w_full()
-                    .max_h(px(560.))
+                    // Panel caps at 75% of viewport height — the same
+                    // budget the 25% modal-top shelf leaves — so at ANY
+                    // font-picker base (11px…18px) the title and the
+                    // Close/Apply action row stay clickable. The sections
+                    // body inside the panel is a scrollable flex slot; any
+                    // overflow beyond the cap scrolls through the sections
+                    // rather than pushing Close past the viewport bottom.
+                    .max_h(
+                        window.viewport_size().height * (1.0 - theme::MODAL_TOP_FRACTION) - px(16.),
+                    )
                     .pt(theme::MODAL_PADDING_TOP)
                     .pb(theme::MODAL_PADDING_BOTTOM)
                     .px(theme::MODAL_PADDING_X)
                     .gap_3()
                     .bg(cx.theme().sidebar)
                     .child(modal_title("Session settings"))
-                    .child(modal_field_label("Model", cx))
-                    .child(list)
-                    .child(modal_field_label("Approval mode", cx))
-                    .child(mode_row)
-                    .child(modal_field_label("Appearance", cx))
+                    // Three sections stacked with the section-gap between
+                    // them so Model / Behavior / Appearance read as three
+                    // distinct clusters (Law of Proximity), not one long
+                    // strip of muted captions. `flex_1 + min_h_0 +
+                    // overflow_y_scroll` lets the sections shrink and
+                    // scroll when the panel cap bites (18px picker, tiny
+                    // viewport) so Close/Apply stays at the panel bottom.
                     .child(
                         div()
-                            .debug_selector(|| "appearance-section".into())
+                            .id("settings-sections")
                             .v_flex()
-                            .gap_1()
-                            .child(theme_row)
-                            .child(font_row)
-                            .child(size_row),
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .gap(theme::SETTINGS_SECTION_GAP)
+                            .child(
+                                settings_section("settings-section-model", "Model", cx).child(list),
+                            )
+                            .child(
+                                settings_section("settings-section-behavior", "Behavior", cx)
+                                    .child(settings_row(
+                                        "settings-row-approval",
+                                        "Approval mode",
+                                        mode_segmented,
+                                        cx,
+                                    )),
+                            )
+                            .child(
+                                settings_section("settings-section-appearance", "Appearance", cx)
+                                    .child(settings_row(
+                                        "settings-row-theme",
+                                        "Theme",
+                                        theme_segmented,
+                                        cx,
+                                    ))
+                                    .child(settings_row(
+                                        "settings-row-font",
+                                        "Font",
+                                        font_segmented,
+                                        cx,
+                                    ))
+                                    .child(settings_row(
+                                        "settings-row-size",
+                                        "Font size",
+                                        size_stepper,
+                                        cx,
+                                    )),
+                            ),
                     )
                     .children(self.login_providers.iter().map(|provider| {
                         self.render_login_provider(
@@ -2368,15 +2460,71 @@ pub(crate) fn modal_title(title: &'static str) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// Modal field caption: muted tier, no uppercase, used to name a control
-/// group (model list, approval mode row). Sits at the small-label role so
-/// it reads as a caption below the modal title without borrowing weight.
-pub(crate) fn modal_field_label(label: &'static str, cx: &App) -> gpui::AnyElement {
+/// Open a Settings section. Returns a `Div` seeded with the section header
+/// (body-tier semibold on the panel foreground, one step above field labels
+/// so the section reads as a heading) and a thin separator rule. The caller
+/// appends its rows with `.child(...)`. Every section paints on tokens so
+/// the five themes stay legible.
+pub(crate) fn settings_section(
+    selector: &'static str,
+    heading: &'static str,
+    cx: &App,
+) -> gpui::Div {
+    let base = cx.theme().font_size;
     div()
-        .text_size(theme::label_small(cx.theme().font_size))
-        .text_color(cx.theme().muted_foreground)
-        .child(label)
-        .into_any_element()
+        .debug_selector(move || selector.into())
+        .v_flex()
+        .gap(theme::SETTINGS_ROW_GAP)
+        .child(
+            div()
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .debug_selector(move || format!("{selector}-heading"))
+                        .text_size(theme::body(base))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(cx.theme().foreground)
+                        .child(heading),
+                )
+                .child(div().flex_1().h(px(1.)).bg(cx.theme().border)),
+        )
+}
+
+/// One labeled Settings row: `label` on the left in a fixed 120px column,
+/// `control` right-aligned. Every row in every section flows through this
+/// so the modal has one row anatomy.
+pub(crate) fn settings_row(
+    selector: &'static str,
+    label: &'static str,
+    control: impl gpui::IntoElement,
+    cx: &App,
+) -> gpui::Div {
+    let base = cx.theme().font_size;
+    div()
+        .debug_selector(move || selector.into())
+        .h_flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(
+            div()
+                .debug_selector(move || format!("{selector}-label"))
+                .w(theme::SETTINGS_LABEL_COLUMN)
+                .flex_shrink_0()
+                .text_size(theme::body(base))
+                .text_color(cx.theme().foreground)
+                .child(label),
+        )
+        .child(
+            div()
+                .debug_selector(move || format!("{selector}-control"))
+                .flex_1()
+                .h_flex()
+                .justify_end()
+                .child(control),
+        )
 }
 
 /// Thin vertical separator between status-strip items. One-pixel wide, 14px
