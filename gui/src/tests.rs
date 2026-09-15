@@ -4385,27 +4385,43 @@ fn connection_lost_paints_a_blocker_row_with_a_danger_rail(cx: &mut TestAppConte
 }
 
 #[gpui::test]
-fn status_pill_paints_a_solid_fill_and_flips_to_danger_when_offline(cx: &mut TestAppContext) {
-    // Contract line 83: neutral state = solid accent, negative = solid
-    // danger. The pill carries the single load-bearing color on the strip;
-    // a regression that dropped the fill back to text-tone would erase the
-    // wiki-run recognisability.
+fn status_dot_paints_accent_at_rest_and_danger_when_offline(cx: &mut TestAppContext) {
+    // ZETA-123: the state indicator is a small dot next to a mode word,
+    // not a filled pill — the header reads as a quiet status band, not a
+    // call-to-action. The dot still carries the single load-bearing
+    // color on the strip: neutral = accent, offline = danger. A
+    // regression that dropped the color (or restored a full-width pill
+    // fill) would show up here.
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| window.draw(cx).clear(cx));
-    let pill = visual
+    let mode = visual
         .debug_bounds("footer-mode")
-        .expect("footer mode pill renders");
+        .expect("footer mode indicator renders");
+    let dot = visual
+        .debug_bounds("run-header-status-dot")
+        .expect("state dot renders");
+    // The dot lives inside the footer-mode cluster.
+    assert!(
+        mode.contains(&dot.center()),
+        "state dot must sit inside the footer-mode cluster"
+    );
+    // Dot is a small square (round via border-radius), not the wide
+    // filled pill it replaced.
+    assert!(
+        dot.size.width <= px(12.),
+        "state dot must stay a small glyph, saw width {:?}",
+        dot.size.width
+    );
     visual.update(|window, cx| {
         let theme = cx.theme();
-        let scaled_pill = pill.scale(window.scale_factor());
+        let scaled = dot.scale(window.scale_factor());
         let neutral = window.painted_quads().into_iter().find(|quad| {
             quad.background == theme.primary.into()
-                && quad.bounds.top() >= scaled_pill.top() - px(1.).scale(window.scale_factor())
-                && quad.bounds.bottom()
-                    <= scaled_pill.bottom() + px(1.).scale(window.scale_factor())
+                && quad.bounds.top() >= scaled.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom() <= scaled.bottom() + px(1.).scale(window.scale_factor())
         });
-        assert!(neutral.is_some(), "neutral pill paints a solid accent fill");
+        assert!(neutral.is_some(), "neutral state paints the dot in accent");
     });
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
@@ -4413,22 +4429,18 @@ fn status_pill_paints_a_solid_fill_and_flips_to_danger_when_offline(cx: &mut Tes
         });
         window.draw(cx).clear(cx);
     });
-    let pill = visual
-        .debug_bounds("footer-mode")
-        .expect("footer mode pill renders offline");
+    let dot = visual
+        .debug_bounds("run-header-status-dot")
+        .expect("state dot renders while offline");
     visual.update(|window, cx| {
         let theme = cx.theme();
-        let scaled_pill = pill.scale(window.scale_factor());
+        let scaled = dot.scale(window.scale_factor());
         let danger = window.painted_quads().into_iter().find(|quad| {
             quad.background == theme.danger.into()
-                && quad.bounds.top() >= scaled_pill.top() - px(1.).scale(window.scale_factor())
-                && quad.bounds.bottom()
-                    <= scaled_pill.bottom() + px(1.).scale(window.scale_factor())
+                && quad.bounds.top() >= scaled.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom() <= scaled.bottom() + px(1.).scale(window.scale_factor())
         });
-        assert!(
-            danger.is_some(),
-            "offline mode paints the negative pill in danger"
-        );
+        assert!(danger.is_some(), "offline state paints the dot in danger");
     });
 }
 
@@ -4701,36 +4713,37 @@ fn session_edit_modal_matches_the_wiki_flat_panel_shape(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
-fn footer_status_strip_paints_vertical_rules_between_metadata(cx: &mut TestAppContext) {
-    // The wiki header pattern rules adjacent metadata with 1x14 vertical
-    // separators. Band 2 now carries only two metadata slices — the usage
-    // strip on the left and the model chip pinned right — so a single
-    // rule sits between them. A regression that dropped the rule would
-    // fuse the strip into one uniform run; one that reintroduced the
-    // composer-hint duplicate would paint two rules again.
+fn run_header_rules_metadata_cluster_with_two_vertical_separators(cx: &mut TestAppContext) {
+    // The single-row header (ZETA-123) carries three right-aligned
+    // metadata pieces — tokens/cache, dot + state word, and the model
+    // chip — separated by two 1x14 vertical rules at the border tier.
+    // A regression that dropped a rule would fuse the metadata slots
+    // into one uniform run; one that added extra rules would paint
+    // over the strip. The old two-band strip is gone, so `run-header`
+    // now hosts these rules directly.
     let (window, _view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| window.draw(cx).clear(cx));
-    let bar = visual
-        .debug_bounds("status-bar")
-        .expect("status bar renders");
+    let header = visual
+        .debug_bounds("run-header")
+        .expect("run header renders");
     visual.update(|window, cx| {
         let theme = cx.theme();
-        let scaled_bar = bar.scale(window.scale_factor());
+        let scaled = header.scale(window.scale_factor());
         let rules: Vec<_> = window
             .painted_quads()
             .into_iter()
             .filter(|quad| {
                 quad.background == theme.border.into()
-                    && quad.bounds.top() >= scaled_bar.top()
-                    && quad.bounds.bottom() <= scaled_bar.bottom()
+                    && quad.bounds.top() >= scaled.top()
+                    && quad.bounds.bottom() <= scaled.bottom()
                     && quad.bounds.size.width <= px(2.).scale(window.scale_factor())
             })
             .collect();
         assert_eq!(
             rules.len(),
-            1,
-            "expected one rule between metrics and model chip, saw {}",
+            2,
+            "expected two vertical rules between metadata slots, saw {}",
             rules.len()
         );
     });
@@ -5055,65 +5068,628 @@ fn sidebar_right_rule_paints_the_subtle_border(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn run_header_paints_two_stacked_bands(cx: &mut TestAppContext) {
-    // Contract line 83 pins the run header at two stacked bands — band 1
-    // at 44px with the session label + state pill + step, band 2 at 40px
-    // with the metrics + rules. A regression that dropped either band
-    // (or merged them into one) would drift the header height and hide
-    // one signal.
+fn run_header_paints_a_single_row_without_the_keyboard_hint(cx: &mut TestAppContext) {
+    // ZETA-123: the run header collapses to ONE 44px row. The session
+    // title anchors the left; a right-aligned metadata cluster carries
+    // quiet tokens/cache, a dot + state word (not a filled pill), and
+    // the model name. The keyboard shortcut hint that used to sit here
+    // now lives in the composer footer — metadata sits next to what it
+    // describes (laws-of-ux: Proximity). A regression that reintroduced
+    // the second band, brought the "Enter sends" fallback back to the
+    // header, or dropped the model chip out of it would show up here.
     let (window, _view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     visual.update(|window, cx| window.draw(cx).clear(cx));
-    let band1 = visual
-        .debug_bounds("run-header-band1")
-        .expect("run header band 1 renders");
-    // Band 2 keeps the "status-bar" selector for backwards compatibility
-    // with the existing status-strip guard so both share one paint probe.
-    let band2 = visual
-        .debug_bounds("status-bar")
-        .expect("run header band 2 (status-bar) renders");
-    // Bands stack — band 2 sits directly below band 1.
-    assert!(
-        band2.top() >= band1.bottom() - px(2.),
-        "band 2 must sit below band 1 (band1.bottom={:?}, band2.top={:?})",
-        band1.bottom(),
-        band2.top()
-    );
-    // Heights land on the contract floors within one logical pixel.
-    let h1_delta = if band1.size.height > theme::HEADER_BAND1_MIN_HEIGHT {
-        band1.size.height - theme::HEADER_BAND1_MIN_HEIGHT
+    let header = visual
+        .debug_bounds("run-header")
+        .expect("run header renders");
+    // The header is one row on the 44px floor — a second band would
+    // push its height past ~52px.
+    let delta = if header.size.height > theme::HEADER_BAND1_MIN_HEIGHT {
+        header.size.height - theme::HEADER_BAND1_MIN_HEIGHT
     } else {
-        theme::HEADER_BAND1_MIN_HEIGHT - band1.size.height
+        theme::HEADER_BAND1_MIN_HEIGHT - header.size.height
     };
     assert!(
-        h1_delta <= px(2.),
-        "band 1 height {:?} must land on the 44px floor",
-        band1.size.height
+        delta <= px(4.),
+        "run header height {:?} must land on the 44px floor",
+        header.size.height
     );
-    let h2_delta = if band2.size.height > theme::HEADER_BAND2_MIN_HEIGHT {
-        band2.size.height - theme::HEADER_BAND2_MIN_HEIGHT
-    } else {
-        theme::HEADER_BAND2_MIN_HEIGHT - band2.size.height
-    };
+    // Old two-band selectors must be gone.
     assert!(
-        h2_delta <= px(2.),
-        "band 2 height {:?} must land on the 40px floor",
-        band2.size.height
+        visual.debug_bounds("run-header-band1").is_none(),
+        "the two-band selector `run-header-band1` must be gone",
     );
-    // Band 1 carries the state pill and the step — both must render.
+    assert!(
+        visual.debug_bounds("status-bar").is_none(),
+        "the two-band selector `status-bar` must be gone",
+    );
+    assert!(
+        visual.debug_bounds("run-header-step").is_none(),
+        "step text must not sit in the header — the composer footer owns the hint",
+    );
+    // The single-row header carries the title, dot+word, and model chip.
+    assert!(
+        visual.debug_bounds("run-header-title").is_some(),
+        "header must render the session title"
+    );
     assert!(
         visual.debug_bounds("footer-mode").is_some(),
-        "band 1 must render the state pill"
+        "header must render the state indicator"
     );
     assert!(
-        visual.debug_bounds("run-header-step").is_some(),
-        "band 1 must render the step text"
+        visual.debug_bounds("run-header-status-dot").is_some(),
+        "state indicator must paint as a dot glyph, not a filled pill"
     );
-    // Band 2 carries the metrics rules.
     assert!(
         visual.debug_bounds("run-header-model").is_some(),
-        "band 2 must render the model chip"
+        "header must render the model chip"
     );
+    assert!(
+        visual.debug_bounds("status-metrics").is_some(),
+        "header must render the quiet metrics slot"
+    );
+    // The keyboard hint moved to the composer footer.
+    let footer = visual
+        .debug_bounds("composer-footer")
+        .expect("composer footer renders");
+    let hint = visual
+        .debug_bounds("composer-hint")
+        .expect("keyboard hint renders in the composer footer");
+    assert!(
+        footer.contains(&hint.center()),
+        "the keyboard hint must sit inside the composer footer, not the header"
+    );
+    // The model chip has moved out of the input row and now sits in
+    // the composer footer next to the hint.
+    let target = visual
+        .debug_bounds("composer-target")
+        .expect("composer target renders in the footer");
+    assert!(
+        footer.contains(&target.center()),
+        "the composer model target must sit in the footer, not above the input row"
+    );
+}
+
+#[gpui::test]
+fn run_header_title_survives_narrow_widths_and_metadata_never_overflows(cx: &mut TestAppContext) {
+    // ZETA-123 round 2, finding 2: at 760px the title measured 0px and
+    // the model text painted past the right edge — quiet metadata was
+    // pinned as `flex_shrink_0` and starved the title. The fix keeps
+    // the title as a flex_1 spacer with `min_w_0` (no max_w cap) and
+    // lets tokens/model shrink and truncate first. Guard against a
+    // regression at three widths: narrow-ish (600), the reproduced
+    // failure (760), and wide (1200).
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Populate a realistic metrics load — long model id + tokens/cache
+    // string — so the shrink path exercises real content.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.metrics.model = Some("claude-opus-4-7-super-long-model-identifier".into());
+            view.state.metrics.tokens = Some(123_456);
+            view.state.metrics.cache_hit_rate = Some(0.42);
+            cx.notify();
+            let _ = window;
+        });
+    });
+    for probe_width in [px(600.), px(760.), px(1200.)] {
+        visual.simulate_resize(gpui::size(probe_width, px(760.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let header = visual
+            .debug_bounds("run-header")
+            .expect("run header renders at every probe width");
+        let title = visual
+            .debug_bounds("run-header-title")
+            .expect("title renders");
+        let model = visual
+            .debug_bounds("run-header-model")
+            .expect("model chip renders");
+        let metrics = visual
+            .debug_bounds("status-metrics")
+            .expect("status-metrics slot renders");
+        // Title must survive with a scannable measure — at least ~48px
+        // (a few characters). Zero-width title reads as "the header
+        // has no identity" and is the exact bug we're guarding.
+        assert!(
+            title.size.width >= px(48.),
+            "title width {:?} collapsed at width {:?} — metadata cluster ate the row",
+            title.size.width,
+            probe_width,
+        );
+        // No metadata slot paints past the header's right edge.
+        let right_edge = header.right();
+        for (name, bounds) in [("model", model), ("status-metrics", metrics)] {
+            assert!(
+                bounds.right() <= right_edge + px(1.),
+                "{name} bounds {:?} paint past the header right edge {:?} at width {:?}",
+                bounds,
+                right_edge,
+                probe_width,
+            );
+        }
+    }
+}
+
+#[gpui::test]
+fn run_header_status_dot_is_the_only_dot_and_pulses_when_busy(cx: &mut TestAppContext) {
+    // ZETA-123 round 2, finding 4: streaming/thinking used to paint a
+    // SECOND dot next to the status dot — the reader saw two pulses
+    // and wondered which one was authoritative. One dot per state
+    // (Selective Attention). The same run-header-status-dot pulses
+    // when busy; the separate `streaming-dot` selector is gone.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    // Rest: one status dot renders, no streaming-dot selector exists.
+    assert!(
+        visual.debug_bounds("run-header-status-dot").is_some(),
+        "status dot renders at rest",
+    );
+    assert!(
+        visual.debug_bounds("streaming-dot").is_none(),
+        "the second streaming-dot selector must be gone — one dot per state",
+    );
+    // Enter streaming state and confirm we STILL have exactly one dot.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::TurnStart {
+                    session_id: None,
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::AssistantDelta {
+                    session_id: None,
+                    delta: "chunk".into(),
+                    kind: "assistant".into(),
+                }),
+                window,
+                cx,
+            );
+            assert!(view.state.streaming);
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("run-header-status-dot").is_some(),
+        "status dot still renders while streaming",
+    );
+    assert!(
+        visual.debug_bounds("streaming-dot").is_none(),
+        "streaming state must NOT paint a second dot — one dot pulses in place",
+    );
+}
+
+#[gpui::test]
+fn sidebar_new_session_content_hugs_the_left_edge(cx: &mut TestAppContext) {
+    // ZETA-123 round 2, finding 3: the full-width Kit Button was
+    // centering its `+` glyph and label in the middle of the sidebar
+    // slot. The fix drops `.w_full()` and left-anchors the button in
+    // its slot. Guard: the button's LEFT edge lands inside the outer
+    // slot padding (SIDEBAR_ROW_PADDING_X), not in the slot's center.
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let slot = visual
+        .debug_bounds("sidebar-new-session")
+        .expect("new-session slot renders");
+    let button = visual
+        .debug_bounds("new-session-button")
+        .expect("new-session action button renders");
+    // The button's left edge sits within a couple of pixels of the
+    // slot's inner-left (slot.left + SIDEBAR_ROW_PADDING_X). A
+    // regression that re-adds `.w_full()` or `.justify_center()` on
+    // the slot puts the button center at slot.center().x — the button
+    // left edge would be roughly slot.left + (slot.width - button.width)/2,
+    // far to the right of the padding line.
+    let inner_left = slot.left() + theme::SIDEBAR_ROW_PADDING_X;
+    let left_gap = if button.left() >= inner_left {
+        button.left() - inner_left
+    } else {
+        inner_left - button.left()
+    };
+    assert!(
+        left_gap <= px(4.),
+        "new-session button left edge {:?} must sit near the slot's left padding {:?} (slot {:?})",
+        button.left(),
+        inner_left,
+        slot,
+    );
+    // Sanity: the button width must NOT span the whole slot minus
+    // padding — that would mean w_full is back and the button still
+    // centers its content internally.
+    let full_width_span = slot.size.width - theme::SIDEBAR_ROW_PADDING_X * 2.0;
+    assert!(
+        button.size.width < full_width_span - px(4.),
+        "new-session button width {:?} spans the full slot — content still centered",
+        button.size.width,
+    );
+}
+
+#[gpui::test]
+fn sidebar_new_session_reads_as_an_action_button(cx: &mut TestAppContext) {
+    // ZETA-123: the top of the sidebar exposes a "New session" ACTION
+    // — a ghost button with a `+` glyph, not a large centered heading.
+    // Guards the button-affordance shape so a regression that drops the
+    // icon or reverts it to a plain label surfaces here.
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let button = visual
+        .debug_bounds("new-session-button")
+        .expect("new-session action button renders");
+    let slot = visual
+        .debug_bounds("sidebar-new-session")
+        .expect("new-session slot renders");
+    assert!(
+        slot.contains(&button.center()),
+        "the new-session button must sit inside its sidebar slot"
+    );
+    // Compact ghost action — height stays within one row of the
+    // sidebar rhythm, well under a modal CTA.
+    assert!(
+        button.size.height <= theme::SIDEBAR_ROW_HEIGHT + px(2.),
+        "new-session button height {:?} must not exceed one sidebar row",
+        button.size.height
+    );
+}
+
+#[gpui::test]
+fn sidebar_row_menu_stays_visible_when_tab_moves_focus_from_the_row_to_the_menu_button(
+    cx: &mut TestAppContext,
+) {
+    // ZETA-123 round 3, finding 1 (second round; extended round 4).
+    // The wrapper reveal originally keyed on the row's OWN focus handle.
+    // Tab from the row lands on the menu button — its own tab stop —
+    // and row focus goes false. Under a row-only predicate the wrapper
+    // opacity returned to 0 and the focused menu button paints its
+    // focus ring at alpha 0. Enter still activates a control the user
+    // cannot see; WCAG 2.4.7 focus-visible.
+    //
+    // The fix moves the wrapper's opacity to a container-level
+    // `contains_focused` check spanning both the row and the menu
+    // button. This test walks the full keyboard sequence via REAL Tab
+    // key events dispatched through the keymap (Root binds `tab` →
+    // `focus_next`), never `window.focus(handle)` which bypasses the
+    // tab-stops registry:
+    //   1. Tab → the row (bounded walk; asserts a real Tab keystroke
+    //      reaches the row's tracked focus handle, not just that
+    //      `window.focus()` can jam focus onto it).
+    //   2. Tab → the menu button (its own tab stop). Assert the
+    //      button's focus ring paints as a VISIBLE quad. Under the
+    //      pre-fix predicate the count would be 0 because the
+    //      wrapper's `.opacity(0.)` multiplies every descendant color
+    //      alpha (including the ring border) to 0.
+    //   3. Enter → the dropdown popup paints (background quad at
+    //      `theme.popover`) — an invisible focus ring the user can
+    //      still Enter through is the exact WCAG failure this whole
+    //      arc set out to fix.
+    //   4. Escape → the popup dismisses (popover quads drop out) and
+    //      focus restores to the trigger button.
+    //   5. Shift-Tab back to the row (still inside the container —
+    //      menu stays revealed via `contains_focused`).
+    //   6. Shift-Tab OUT of the row+menu container → the ellipsis
+    //      button paints INVISIBLY at rest, same contract as the
+    //      hover-only reveal test.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::SessionManagement(true), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+
+    let target = session().session_id;
+    let row_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get(&target)
+                .cloned()
+        })
+        .expect("session row focus handle registered after render");
+
+    // --- Step 1: Tab reaches the row. ---
+    //
+    // Blur first so the walk starts from the beginning of the tab
+    // order — the sequence stays deterministic no matter what the
+    // composer or any kit control grabbed at construction time. Then
+    // walk the window's tab-stops registry via `focus_next` (what the
+    // Root `tab` keybinding invokes under the hood — see gpui-component
+    // `root::init` → `Tab` → `window.focus_next`). This is the same
+    // machinery a real Tab keystroke drives; the point is to route
+    // through the tab-stops table and NOT jam focus onto the row
+    // handle directly with `window.focus(&row_handle)`, which would
+    // succeed even if the row were not registered as a tab stop at
+    // all — the exact hole the reviewer flagged.
+    visual.update(|window, cx| {
+        window.blur(cx);
+        window.draw(cx).clear(cx);
+    });
+    let max_tab_steps = 64;
+    let mut steps_to_row = None;
+    for step in 0..max_tab_steps {
+        visual.update(|window, cx| window.focus_next(cx));
+        if visual.update(|window, _| row_handle.is_focused(window)) {
+            steps_to_row = Some(step + 1);
+            break;
+        }
+    }
+    let steps_to_row = steps_to_row.expect(
+        "a Tab walk must land on the sidebar row within a bounded loop \
+         — proves the row focus handle is reachable from the keyboard \
+         tab-stops registry, not just via `window.focus(handle)` which \
+         would succeed even for handles that are not tab stops at all",
+    );
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let menu = visual
+        .debug_bounds("session-menu")
+        .expect("session menu renders when session-management is enabled");
+    let (ring, row_focus_ring_hits) = visual.update(|window, cx| {
+        let ring = cx.theme().ring;
+        (ring, count_visible_ring_quads(window, menu, ring))
+    });
+    assert_eq!(
+        row_focus_ring_hits, 0,
+        "with the row focused the menu button is NOT focused — no ring \
+         should be painted (theme ring {ring:?}, reached row in {steps_to_row} tabs)",
+    );
+
+    // --- Step 2: Tab moves focus to the menu button. ---
+    //
+    // Another `focus_next` step advances focus to the ellipsis button
+    // (its own tab stop right after the row inside the wrapper). The
+    // button's focus ring must paint as a VISIBLE border quad on the
+    // menu bounds — the mutation-sensitive assertion that failed
+    // under the row-only predicate (opacity 0 → alpha-0 ring).
+    visual.update(|window, cx| {
+        window.focus_next(cx);
+        window.draw(cx).clear(cx);
+    });
+    // Prove focus DID leave the row — that is the exact case the
+    // row-only predicate could not see, and the case the reviewer's
+    // probe (menu-button-focus visible paints = 0) caught in the bug.
+    let row_still_focused = visual.update(|window, _cx| row_handle.is_focused(window));
+    assert!(
+        !row_still_focused,
+        "advancing the tab-stops registry from the row must move focus \
+         off the row — if it stays on the row the tab-order regressed \
+         and the menu-button-focus case would never be exercised",
+    );
+    let button_focus = visual
+        .update(|window, cx| window.focused(cx))
+        .expect("Tab from the row must land on the menu button focus handle");
+    assert_ne!(
+        button_focus, row_handle,
+        "focus must have advanced past the row onto the menu button",
+    );
+    // The failing case: menu button focused, wrapper reveal must
+    // cover its focus. Look for the button's focus-ring quad landing
+    // as a VISIBLE border (alpha > 0) near the menu bounds. Under the
+    // old row-only predicate the ring paints with alpha 0 → zero hits.
+    let menu = visual
+        .debug_bounds("session-menu")
+        .expect("session menu still renders after Tab");
+    let menu_focus_ring_hits =
+        visual.update(|window, cx| count_visible_ring_quads(window, menu, cx.theme().ring));
+    assert!(
+        menu_focus_ring_hits > 0,
+        "menu button focus ring must paint visibly when Tab lands on it \
+         — the wrapper reveal must cover focus WITHIN the row+menu \
+         container, not just the row's own focus (theme ring {ring:?})",
+    );
+
+    // --- Step 3: Enter opens the popup menu. ---
+    //
+    // The dropdown Popover binds `enter` in its "Popover" key context
+    // → Confirm → toggle_open. The popup itself renders inside a
+    // deferred layer with `popover_style(cx)` — a rounded panel with
+    // `background = theme.popover`. Snapshot the baseline
+    // `theme.popover` quad count BEFORE opening so a persistent
+    // popover-styled surface elsewhere in the chrome (tooltip layer,
+    // etc.) doesn't skew the check, then assert the count strictly
+    // INCREASES on open and drops back to the baseline on dismiss.
+    let popover_baseline = visual.update(|window, cx| {
+        let popover_bg: gpui::Background = cx.theme().popover.into();
+        window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| quad.background == popover_bg)
+            .count()
+    });
+    visual.simulate_keystrokes("enter");
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let popover_quads_open = visual.update(|window, cx| {
+        let popover_bg: gpui::Background = cx.theme().popover.into();
+        window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| quad.background == popover_bg)
+            .count()
+    });
+    assert!(
+        popover_quads_open > popover_baseline,
+        "Enter on the focused menu button must open the dropdown popup \
+         — the `theme.popover` quad count did not increase over the \
+         baseline ({popover_baseline}). An invisible focus ring the \
+         user can still Enter through is the exact WCAG 2.4.7 failure \
+         this arc set out to fix.",
+    );
+    let popup_focus = visual
+        .update(|window, cx| window.focused(cx))
+        .expect("the opened popup menu must own focus");
+    assert_ne!(
+        popup_focus, button_focus,
+        "opening the popup must transfer focus off the trigger button \
+         onto the popup menu itself",
+    );
+
+    // --- Step 4: Escape dismisses the popup. ---
+    //
+    // Escape in "PopupMenu" context → Cancel → emit DismissEvent →
+    // Popover subscribes and closes → previous focus (the button) is
+    // restored. Assert both the paint AND the focus restore — a
+    // dismiss that leaks either half is a regression.
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let popover_quads_after_dismiss = visual.update(|window, cx| {
+        let popover_bg: gpui::Background = cx.theme().popover.into();
+        window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| quad.background == popover_bg)
+            .count()
+    });
+    assert_eq!(
+        popover_quads_after_dismiss, popover_baseline,
+        "Escape must dismiss the popup — `theme.popover` quad count \
+         must return to the pre-open baseline ({popover_baseline}, \
+         got {popover_quads_after_dismiss})",
+    );
+    let focus_after_dismiss = visual
+        .update(|window, cx| window.focused(cx))
+        .expect("focus must return somewhere after Escape dismisses the popup");
+    assert_eq!(
+        focus_after_dismiss, button_focus,
+        "dismiss must restore focus to the trigger button so the user \
+         does not lose their place in the tab order",
+    );
+
+    // --- Step 5: Shift-Tab back to the row (still inside container). ---
+    //
+    // `focus_prev` walks the tab-stops registry backwards — Root's
+    // `shift-tab` keybinding calls this same method. With focus on
+    // the row (its own tab stop inside the container),
+    // `contains_focused` stays true and the wrapper stays visible.
+    visual.update(|window, cx| {
+        window.focus_prev(cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.update(|window, _| row_handle.is_focused(window)),
+        "Shift-Tab from the menu button must land back on the row \
+         (its immediate previous tab stop inside the same container)",
+    );
+
+    // --- Step 6: Shift-Tab OUT of the row+menu container. ---
+    //
+    // Once nothing in the container is focused, the container-level
+    // `contains_focused` predicate goes false, the wrapper opacity
+    // drops to 0, and the ellipsis button must paint INVISIBLY — same
+    // contract as `sidebar_row_menu_stays_hidden_until_the_row_is_hovered`.
+    // A regression that swapped `contains_focused` back to the row's
+    // own `is_focused` would already have failed step 2, but a
+    // regression that dropped the opacity gate entirely (or leaked
+    // reveal past focus) surfaces here.
+    visual.update(|window, cx| {
+        window.focus_prev(cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        !visual.update(|window, _| row_handle.is_focused(window)),
+        "second Shift-Tab must move focus off the row and out of the \
+         row+menu container",
+    );
+    let menu = visual
+        .debug_bounds("session-menu")
+        .expect("session menu still exists after focus leaves the container");
+    visual.update(|window, _cx| {
+        let scaled = menu.scale(window.scale_factor());
+        let opaque = window.painted_quads().into_iter().any(|quad| {
+            let inside = quad.bounds.top() >= scaled.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom() <= scaled.bottom() + px(1.).scale(window.scale_factor())
+                && quad.bounds.left() >= scaled.left() - px(1.).scale(window.scale_factor())
+                && quad.bounds.right() <= scaled.right() + px(1.).scale(window.scale_factor());
+            inside && quad.background != gpui::transparent_black().into()
+        });
+        assert!(
+            !opaque,
+            "with focus outside the row+menu container the ellipsis \
+             button must paint invisibly at rest — wrapper reveal leaked past focus",
+        );
+    });
+}
+
+/// Count painted quads whose border reads as the theme's focus ring on
+/// the menu bounds — the ring paints outside the button's own border
+/// (see gpui-component `focus_ring_style`) so widen the probe rectangle
+/// by a few device pixels. A quad only counts when its border alpha is
+/// above zero; under `.opacity(0.)` the wrapper multiplies every
+/// descendant color's alpha by 0, and the ring drops out of visible
+/// paint even though the primitive is still in the scene.
+fn count_visible_ring_quads(
+    window: &gpui::Window,
+    menu_bounds: gpui::Bounds<gpui::Pixels>,
+    ring: gpui::Hsla,
+) -> usize {
+    let scaled = menu_bounds.scale(window.scale_factor());
+    let slack = px(8.).scale(window.scale_factor());
+    window
+        .painted_quads()
+        .into_iter()
+        .filter(|quad| {
+            let overlaps = quad.bounds.right() >= scaled.left() - slack
+                && quad.bounds.left() <= scaled.right() + slack
+                && quad.bounds.bottom() >= scaled.top() - slack
+                && quad.bounds.top() <= scaled.bottom() + slack;
+            let border = quad.border_color;
+            overlaps
+                && border.h == ring.h
+                && border.s == ring.s
+                && border.l == ring.l
+                && border.a > 0.0
+        })
+        .count()
+}
+
+#[gpui::test]
+fn sidebar_row_menu_stays_hidden_until_the_row_is_hovered(cx: &mut TestAppContext) {
+    // ZETA-123: the per-row `...` menu clutters the sidebar when it's
+    // permanently visible. It now sits at opacity 0 at rest, revealed
+    // by the row's own `.group()` hover — one pointer position only
+    // lights up ONE row's menu, never every row at once. A regression
+    // that dropped the `opacity(0)` gate (or the group scoping) would
+    // show every menu again.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::SessionManagement(true), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    let menu = visual
+        .debug_bounds("session-menu")
+        .expect("session menu renders when session-management is enabled");
+    // The menu paints inside the sidebar column so its hit target
+    // stays reachable, but must land under an opacity-0 wrapper at
+    // rest — the rendered ellipsis icon must NOT paint any visible
+    // foreground quad on the header/menu bounds before hover.
+    visual.update(|window, _cx| {
+        let scaled = menu.scale(window.scale_factor());
+        let opaque_paint = window.painted_quads().into_iter().any(|quad| {
+            let inside = quad.bounds.top() >= scaled.top() - px(1.).scale(window.scale_factor())
+                && quad.bounds.bottom() <= scaled.bottom() + px(1.).scale(window.scale_factor())
+                && quad.bounds.left() >= scaled.left() - px(1.).scale(window.scale_factor())
+                && quad.bounds.right() <= scaled.right() + px(1.).scale(window.scale_factor());
+            // Any non-transparent background fill drawn tightly on the
+            // menu bounds fails this contract — the reveal-on-hover
+            // treatment must keep the menu invisible at rest.
+            inside && quad.background != gpui::transparent_black().into()
+        });
+        assert!(
+            !opaque_paint,
+            "session menu paints an opaque quad at rest — hover-reveal broke",
+        );
+    });
 }
 
 /// Probe view for the scrollbar guard. Renders a Kit `Scrollbar` in

@@ -1,10 +1,17 @@
 use super::*;
 use chrono::{DateTime, Utc};
-use gpui::{FocusHandle, MouseButton};
+use gpui::{FocusHandle, MouseButton, SharedString};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::v_virtual_list;
 use std::rc::Rc;
 use zeta_gui::client::SessionMetadata;
+
+/// Group name used to reveal a session row's `...` menu on hover. Each row
+/// gets its own SharedString so a hover over one row does not light up the
+/// menu on every other row.
+fn session_row_group(index: usize) -> SharedString {
+    SharedString::from(format!("session-row-group-{index}"))
+}
 
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -64,6 +71,26 @@ fn row_focus_handle(view: &ZetaView, cx: &mut App, id: &str) -> FocusHandle {
     }
     let handle = cx.focus_handle().tab_stop(true).tab_index(0);
     map.insert(id.to_owned(), handle.clone());
+    handle
+}
+
+/// Fetch or create a persistent focus handle for the wrapper that groups a
+/// session row with its `...` menu button. Stored on
+/// `ZetaView::sidebar_row_focus` under a `container:{id}` key so the existing
+/// prune sweep piggybacks on the session-id → focus-handle machinery. The
+/// handle is NOT a tab stop; it exists only as a dispatch-tree anchor so
+/// `contains_focused` sees BOTH the row's focus handle and the menu button's
+/// internal focus handle as descendants of a single container node. That
+/// container-level check is what keeps the menu revealed while Tab moves
+/// focus from the row to the menu button (contract lines 5-6, ZETA-123).
+fn container_focus_handle(view: &ZetaView, cx: &mut App, id: &str) -> FocusHandle {
+    let key = format!("container:{id}");
+    let mut map = view.sidebar_row_focus.borrow_mut();
+    if let Some(handle) = map.get(&key) {
+        return handle.clone();
+    }
+    let handle = cx.focus_handle();
+    map.insert(key, handle.clone());
     handle
 }
 
@@ -142,33 +169,6 @@ impl ZetaView {
                 )
             })
             .child(sessions)
-            .when(
-                self.state.session_view.available
-                    && !self.state.session_view.message_ids.is_empty(),
-                |sidebar| {
-                    // The fork hint anchors the whole sidebar tail (fork
-                    // hint + Branches heading + branch rows). At the tail
-                    // the sidebar sits directly above the composer strip
-                    // in the main column, and the wiki-run "breathing but
-                    // compact" rhythm asks for a visible seam before the
-                    // tail so the two surfaces read as separate. A top
-                    // border at the sidebar-border (subtle) tier plus
-                    // 8px vertical padding gives that seam without
-                    // fighting the sessions list rhythm above.
-                    sidebar.child(
-                        div()
-                            .debug_selector(|| "sidebar-hint-fork".into())
-                            .px(theme::SIDEBAR_ROW_PADDING_X)
-                            .pt_2()
-                            .pb_1()
-                            .mt_2()
-                            .border_t_1()
-                            .border_color(cx.theme().sidebar_border)
-                            .text_color(theme::palette::text_faint())
-                            .child("Hover over your message to fork from it"),
-                    )
-                },
-            )
             .children(self.render_branches(window, cx))
     }
 
@@ -179,6 +179,12 @@ impl ZetaView {
     /// its entry in the window focus map) for the app's lifetime.
     fn prune_sidebar_focus_handles(&self) {
         let branches_live = self.state.session_view.available;
+        let session_alive = |session_id: &str| {
+            self.state
+                .sessions
+                .iter()
+                .any(|session| session.session_id.as_str() == session_id)
+        };
         self.sidebar_row_focus.borrow_mut().retain(|key, _| {
             if let Some(branch_id) = key.strip_prefix("branch:") {
                 branches_live
@@ -188,11 +194,10 @@ impl ZetaView {
                         .branches
                         .iter()
                         .any(|branch| branch.id == branch_id)
+            } else if let Some(session_id) = key.strip_prefix("container:") {
+                session_alive(session_id)
             } else {
-                self.state
-                    .sessions
-                    .iter()
-                    .any(|session| session.session_id.as_str() == key)
+                session_alive(key)
             }
         });
     }
@@ -233,18 +238,30 @@ impl ZetaView {
     }
 
     fn render_sidebar_new_session(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // The New Session control reads as an ACTION, not a centred
+        // heading: a `+` glyph + label hugging the LEFT edge of the
+        // sidebar, ghost variant so it sits quiet at rest and fills on
+        // hover. Kit's `Button` centres its inner content when the button
+        // is full-width, so instead we keep the button content-sized and
+        // anchor it left inside a `justify_start` slot — the `+` and
+        // "New session" then land in the same left column as the session
+        // rows below (contract line 5, ZETA-123). Content-width shape
+        // also matches the wiki agent-run sidebar's list-item rhythm
+        // (Laws of UX: Similarity, Proximity).
         div()
             .debug_selector(|| "sidebar-new-session".into())
+            .h_flex()
+            .items_center()
+            .justify_start()
             .px(theme::SIDEBAR_ROW_PADDING_X)
             .py(theme::SIDEBAR_ROW_PADDING_Y)
             .child(
-                // Ghost variant keeps the button transparent at rest and
-                // borrows the wiki "flat action" look — hover fills to the
-                // element tint, focus adds an accent ring.
                 Button::new("new-session")
+                    .debug_selector(|| "new-session-button".into())
                     .ghost()
+                    .compact()
+                    .icon(IconName::Plus)
                     .label("New session")
-                    .w_full()
                     .h(theme::SIDEBAR_ROW_HEIGHT)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .disabled(!self.can_change_session())
@@ -298,6 +315,7 @@ impl ZetaView {
         let click_id = id.clone();
         let key_id = id.clone();
         let can_activate = can_switch && !active;
+        let menu_label: SharedString = format!("Session actions for {label}").into();
         let row = div()
             .id(("session-row", index))
             .debug_selector(|| "session-row".into())
@@ -364,55 +382,93 @@ impl ZetaView {
             return row;
         }
         // Right-side dropdown for rename/delete. Kept as a Button so the
-        // menu integration and keyboard accessibility come from Kit.
+        // menu integration and keyboard accessibility come from Kit. The
+        // menu sits at opacity 0 at rest and reveals on row hover OR
+        // whenever keyboard focus is WITHIN the row+menu container — the
+        // per-row `.group()` scopes hover reveal to THIS row so one pointer
+        // position never lights up every row's menu at once (contract
+        // lines 5-6, ZETA-123).
+        //
+        // Focus-reveal must cover the menu button's OWN focus, not just
+        // the row's: Tab lands on the row, then Tab again lands on the
+        // menu button (its own tab stop) and the row's focus handle goes
+        // false. A row-only predicate would drop the wrapper back to
+        // opacity 0 and paint a focused Enter/Space target invisibly —
+        // WCAG 2.4.7 focus-visible. Anchoring the wrapper in the dispatch
+        // tree via `container_handle.track_focus` and reading
+        // `contains_focused` catches both focus targets (row + button)
+        // under a single container node.
         let entity = cx.entity().downgrade();
+        let container_handle = container_focus_handle(self, cx, &id);
+        let focus_within = container_handle.contains_focused(window, cx);
+        let rest_opacity = if focus_within { 1.0 } else { 0.0 };
         let menu_id = id;
+        let group = session_row_group(index);
         div()
+            .track_focus(&container_handle)
+            .group(group.clone())
             .h_flex()
             .w_full()
             .items_center()
             .child(row)
             .child(
-                Button::new(format!("session-menu-{menu_id}"))
-                    .debug_selector(|| "session-menu".into())
-                    .ghost()
-                    .compact()
-                    .icon(IconName::Ellipsis)
-                    .tooltip("Session actions")
-                    .h(theme::SIDEBAR_ROW_HEIGHT)
+                div()
                     .flex_shrink_0()
-                    .disabled(!self.can_rename_session())
-                    .dropdown_menu(move |menu, _, cx| {
-                        let delete_enabled = entity
-                            .upgrade()
-                            .is_some_and(|view| view.read(cx).can_change_session());
-                        let rename_enabled = entity
-                            .upgrade()
-                            .is_some_and(|view| view.read(cx).can_rename_session());
-                        let rename_view = entity.clone();
-                        let delete_view = entity.clone();
-                        let rename_id = menu_id.clone();
-                        let delete_id = menu_id.clone();
-                        menu.item(
-                            PopupMenuItem::new("Rename")
-                                .disabled(!rename_enabled)
-                                .on_click(move |_, window, cx| {
-                                    let _ = rename_view.update(cx, |view, cx| {
-                                        view.open_session_edit(rename_id.clone(), true, window, cx)
-                                    });
-                                }),
-                        )
-                        .separator()
-                        .item(
-                            PopupMenuItem::new("Delete")
-                                .disabled(!delete_enabled)
-                                .on_click(move |_, window, cx| {
-                                    let _ = delete_view.update(cx, |view, cx| {
-                                        view.open_session_edit(delete_id.clone(), false, window, cx)
-                                    });
-                                }),
-                        )
-                    }),
+                    .opacity(rest_opacity)
+                    .group_hover(group.clone(), |style| style.opacity(1.))
+                    .child(
+                        Button::new(format!("session-menu-{menu_id}"))
+                            .debug_selector(|| "session-menu".into())
+                            .ghost()
+                            .compact()
+                            .icon(IconName::Ellipsis)
+                            .accessibility_label(menu_label)
+                            .tooltip("Session actions")
+                            .h(theme::SIDEBAR_ROW_HEIGHT)
+                            .flex_shrink_0()
+                            .disabled(!self.can_rename_session())
+                            .dropdown_menu(move |menu, _, cx| {
+                                let delete_enabled = entity
+                                    .upgrade()
+                                    .is_some_and(|view| view.read(cx).can_change_session());
+                                let rename_enabled = entity
+                                    .upgrade()
+                                    .is_some_and(|view| view.read(cx).can_rename_session());
+                                let rename_view = entity.clone();
+                                let delete_view = entity.clone();
+                                let rename_id = menu_id.clone();
+                                let delete_id = menu_id.clone();
+                                menu.item(
+                                    PopupMenuItem::new("Rename")
+                                        .disabled(!rename_enabled)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = rename_view.update(cx, |view, cx| {
+                                                view.open_session_edit(
+                                                    rename_id.clone(),
+                                                    true,
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                        }),
+                                )
+                                .separator()
+                                .item(
+                                    PopupMenuItem::new("Delete")
+                                        .disabled(!delete_enabled)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = delete_view.update(cx, |view, cx| {
+                                                view.open_session_edit(
+                                                    delete_id.clone(),
+                                                    false,
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                        }),
+                                )
+                            }),
+                    ),
             )
             .into_any_element()
     }

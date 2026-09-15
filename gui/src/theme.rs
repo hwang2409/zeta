@@ -109,20 +109,40 @@ pub const ATTENTION_RAIL_WIDTH: Pixels = px(2.);
 /// 8px lane so the transcript column keeps its readable measure.
 pub const SCROLLBAR_THUMB_WIDTH: Pixels = px(8.);
 
-/// Two-band header/status strip heights. Band 1 (title + state pill) sits at
-/// 44px; band 2 (metadata) sits at 40px so the strip is a compact 84px
-/// column rather than a fluid banner.
+/// Single-row run header height. Session title on the left, quiet metadata
+/// cluster (tokens/cache, dot + state word, model) pinned right. Contract
+/// line 83 (ZETA-123): one 44px row, not two stacked bands.
 pub const HEADER_BAND1_MIN_HEIGHT: Pixels = px(44.);
-pub const HEADER_BAND2_MIN_HEIGHT: Pixels = px(40.);
-
-/// State pill padding — near-square shape the wiki agent-run uses to carry a
-/// one-word state label ("ready", "streaming", "offline").
-pub const STATE_PILL_PADDING_X: Pixels = px(9.);
-pub const STATE_PILL_PADDING_Y: Pixels = px(3.);
 
 /// Vertical separator ruled between header/status metadata items. The rule
 /// is a 1x14px line, drawn as a thin div with a border color.
 pub const STATUS_RULE_HEIGHT: Pixels = px(14.);
+
+/// Ceiling for the tokens/cache slot in the run header. Truncates a very
+/// long metrics string before it steals room from the title. Named so a
+/// palette / density refactor can widen or shrink it in one place.
+pub const HEADER_STATUS_METRICS_MAX_WIDTH: Pixels = px(240.);
+
+/// Floor for the run-header title. Below this the identity of the run
+/// becomes unscannable and the cluster wins the row. Wide enough to seat
+/// roughly six mono characters of a session name; narrow enough that
+/// the metadata cluster still gets meaningful room at 600–760px.
+pub const HEADER_TITLE_MIN_WIDTH: Pixels = px(80.);
+
+/// Ceiling for the model-name slot in the run header. Long model ids
+/// (`claude-opus-4-7-us-east`) truncate before the chip pushes the
+/// cluster past the header's right edge.
+pub const HEADER_MODEL_MAX_WIDTH: Pixels = px(200.);
+
+/// Gap between the status dot and its state word in the header's mode
+/// cluster. Tight enough that the dot reads as a leading glyph on the
+/// word rather than two independent chips.
+pub const HEADER_MODE_GAP: Pixels = px(6.);
+
+/// Ceiling for the composer target line ("→ model") above the input.
+/// Long model ids truncate before the target row overruns the composer
+/// column.
+pub const COMPOSER_TARGET_MAX_WIDTH: Pixels = px(260.);
 
 /// Flat-panel modal shape. Width caps at 480px, padding is 12px on top / 16px
 /// horizontally / 14px on bottom, and the panel sits below a scrim at 25% of
@@ -1625,9 +1645,6 @@ mod tests {
         assert_eq!(SCROLLBAR_THUMB_WIDTH, px(8.));
         assert_eq!(ATTENTION_RAIL_WIDTH, px(2.));
         assert_eq!(HEADER_BAND1_MIN_HEIGHT, px(44.));
-        assert_eq!(HEADER_BAND2_MIN_HEIGHT, px(40.));
-        assert_eq!(STATE_PILL_PADDING_X, px(9.));
-        assert_eq!(STATE_PILL_PADDING_Y, px(3.));
         assert_eq!(STATUS_RULE_HEIGHT, px(14.));
         assert_eq!(MODAL_WIDTH, px(480.));
         assert_eq!(MODAL_PADDING_TOP, px(12.));

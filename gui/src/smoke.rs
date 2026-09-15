@@ -30,6 +30,12 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     // attachment chips visible, before the settings modal covers them. Emits
     // a separate PNG so the primary shot stays comparable with prior tickets.
     let attachment_path = env::var_os("ZETA_GUI_SMOKE_ATTACHMENT_IMAGE");
+    // Optional third capture — the run chrome (header + composer + sidebar)
+    // WITHOUT the settings modal covering it, for review comparisons that
+    // need to read the composer and header cluster directly. Saved after
+    // the attachment/settings seeding but before `view.settings_open`
+    // fires, so the transcript column stays visible.
+    let composer_path = env::var_os("ZETA_GUI_SMOKE_COMPOSER_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -166,6 +172,24 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                     entity.update(cx, |view, cx| {
                                         view.clear_composer_images(cx);
                                     });
+                                }
+                                // Round-2 review: the primary shot below
+                                // opens the settings modal, which occludes
+                                // the composer half of the chrome. If the
+                                // caller wants a clean chrome shot for the
+                                // composer/header comparison, save one HERE
+                                // — connection restored, no chips, no modal.
+                                if let Some(ref composer_path) = composer_path {
+                                    entity.update(cx, |view, cx| {
+                                        view.state.connection = ConnectionState::Connected;
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer capture")
+                                        .save(PathBuf::from(composer_path))
+                                        .expect("save composer screenshot");
                                 }
                                 entity.update(cx, |view, cx| {
                                     view.state.connection = ConnectionState::Connected;
