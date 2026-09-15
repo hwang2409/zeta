@@ -203,31 +203,35 @@ pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(560.);
 /// carry mixed heights — a heading, a stepper, a captioned toggle — and
 /// gpui does not surface per-child measured heights during layout). The
 /// panel instead paints an opaque overlay on the wrapper's bottom edge
-/// that is TALLER than one full row (header + description + inter-row
-/// gap), so the FULL row is the indivisible unit the mask hides: no
-/// partial header sits above the mask edge, and no orphaned description
-/// leaks below it. The mask carries a 1px top edge line (the scroll cue)
-/// so the eye reads "content continues below" without the wrapper ever
-/// exposing a half-row.
+/// that is TALLER than one full row's rendered pixels, so the caption
+/// (row description) is the indivisible unit the mask never slices — a
+/// caption is either wholly above the mask top edge or wholly at/below
+/// it. The mask carries a 1px top edge line (the scroll cue) so the eye
+/// reads "content continues below" without the wrapper ever exposing a
+/// half-caption.
 ///
-/// Header height is floored at `MODAL_BUTTON_HEIGHT` because every
-/// Settings row's control is a Ghost/compact button (theme cycler, font
-/// cycler, size stepper, mode segmented) whose intrinsic height is
-/// `Size::Medium` (h_8, 32px). The label text at body size (18px MAX)
-/// stays shorter than the button, so the header row measures at the
-/// button height, not the body font. The pre-round-6 formula used the
-/// body font as the header floor and yielded 43px at 18px, which fell
-/// ~8px short of the true 51px Font row — the mask ended INSIDE that
-/// row's "Whole pixels, 11 to 18." caption. Flooring at
-/// `MODAL_BUTTON_HEIGHT` sizes the mask to the true row height at
-/// every picker base.
+/// Sizing accounts for two shapes the pre-round-6 formula missed:
+/// 1. Header height floors at `MODAL_BUTTON_HEIGHT` because every
+///    Settings-row control is a Ghost/compact button whose intrinsic
+///    height (`Size::Medium`, ~32px) dominates the body-font label at
+///    every picker base.
+/// 2. Description RENDERED height (not font size) drives the caption
+///    contribution. gpui's line box adds ~55% padding for descender
+///    breathing room, so a 17px font renders at ~26px — the exact shape
+///    the round-6 CI proved with `18px straddles the mask` failing on a
+///    26px-tall description bounds. `LINE_HEIGHT_SCALE = 1.75` sits a
+///    safe margin above the observed 1.53 ratio (11 / 13 / 18px all
+///    tested) and turns the label-small font into its rendered height so
+///    the mask always covers a full caption.
 pub fn settings_scroll_cue_height(base: Pixels) -> Pixels {
+    const LINE_HEIGHT_SCALE: f32 = 1.75;
     let body = f32::from(base);
     let label_small_val = (body - 1.).max(MIN_LABEL_PX);
     let row_gap = f32::from(SETTINGS_ROW_GAP);
     let desc_gap = f32::from(SETTINGS_ROW_DESCRIPTION_GAP);
     let header = body.max(f32::from(MODAL_BUTTON_HEIGHT));
-    px((header + desc_gap + label_small_val + row_gap).ceil())
+    let description_rendered = (label_small_val * LINE_HEIGHT_SCALE).ceil();
+    px((header + desc_gap + description_rendered + row_gap).ceil())
 }
 
 /// Clamp a candidate font size to the appearance picker's whole-px window.
@@ -1845,9 +1849,9 @@ mod tests {
         // as the header floor and undersized the mask at 18px (43px vs
         // 51px row), which let the Font row's caption end inside the
         // mask.
-        assert_eq!(settings_scroll_cue_height(px(11.)), px(48.));
-        assert_eq!(settings_scroll_cue_height(px(13.)), px(50.));
-        assert_eq!(settings_scroll_cue_height(px(18.)), px(55.));
+        assert_eq!(settings_scroll_cue_height(px(11.)), px(56.));
+        assert_eq!(settings_scroll_cue_height(px(13.)), px(59.));
+        assert_eq!(settings_scroll_cue_height(px(18.)), px(68.));
 
         let tint = opencode().danger_tint();
         let danger = opencode().danger;
