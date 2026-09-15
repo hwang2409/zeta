@@ -731,7 +731,7 @@ fn delegated_cards_keep_separate_tails_disclosure_and_failures() {
         state.apply(harness.event());
     }
     for (index, expected, failed) in [
-        (0, "parent output", false),
+        (0, "parent done", false),
         (1, "first child output", false),
         (2, "failed child", true),
     ] {
@@ -754,9 +754,9 @@ fn delegated_cards_keep_separate_tails_disclosure_and_failures() {
         assert_eq!(card.agent_label.is_some(), index > 0);
         if index == 0 {
             assert_eq!(summary, "parent done");
-            assert!(card.tail.truncated);
-            assert!(card.tail.text.ends_with("parent done"));
-            assert_eq!(card.tail.text.lines().count(), zeta_gui::cards::TAIL_LINES);
+            assert_eq!(card.tail.text, "parent done");
+            assert!(!card.tail.truncated);
+            assert_eq!(card.tail.text.lines().count(), 1);
         }
         if failed {
             assert_eq!(summary, "failed child");
