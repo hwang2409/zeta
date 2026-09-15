@@ -311,7 +311,23 @@ impl ZetaView {
             session_management: false,
             session_edit: None,
             session_edit_focus: cx.focus_handle(),
-            settings_focus: cx.focus_handle(),
+            // `.tab_stop(true)` so the overlay handle joins the modal's
+            // tab-stop cycle. gpui-component Button.on_mouse_down calls
+            // `window.prevent_default()` (button.rs:769) to skip
+            // focus-on-click, so a mouse-Apply-click keeps focus on this
+            // overlay handle rather than moving to Apply. Without this
+            // flag the anchor would be a NON-tab-stop and the trap's
+            // wrap-around after the last modal button would return to
+            // Model row 0 (the first real tab stop) — never back to the
+            // anchor — so keyboard users tabbing after a mouse click
+            // could not close the cycle. As a tab stop, the overlay is
+            // itself part of the cycle: forward Tab wraps from Apply to
+            // this handle, and Shift-Tab wraps from Model back through
+            // this handle to Apply. The focus-trap manager keeps every
+            // step inside the modal, and the round-5 tab-cycle test
+            // observes a simple cycle whose set membership is stable
+            // across directions.
+            settings_focus: cx.focus_handle().tab_stop(true),
             settings_return_focus: None,
             settings_sections_scroll: gpui::ScrollHandle::new(),
             settings_section_focus: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1718,47 +1734,15 @@ impl ZetaView {
                                     })),
                             )
                             .child(
-                                // Apply stays a tab stop even while pending: the
-                                // "Applying…" label conveys the busy state, and
-                                // apply_settings early-returns on `pending_command`
-                                // so a second click is a no-op. Disabling the
-                                // Button here drops it from the tab_stops map
-                                // (gpui-base Button.render omits `track_focus`
-                                // when disabled), which broke the modal's Tab
-                                // cycle: the trap's wrap-around after Close
-                                // returned to Model row 0 instead of the click
-                                // anchor, so keyboard users could not return to
-                                // where they clicked.
                                 Button::new("settings-apply")
                                     .debug_selector(|| "settings-apply".into())
                                     .primary()
                                     .label(if pending { "Applying…" } else { "Apply" })
+                                    .disabled(pending)
                                     .h(theme::MODAL_BUTTON_HEIGHT)
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        // Explicitly focus Apply's persistent
-                                        // FocusHandle. gpui-component Button's
-                                        // on_mouse_down calls
-                                        // `window.prevent_default()` to skip
-                                        // focus-on-click; without this override
-                                        // the mouse-click anchor stays on the
-                                        // modal's non-tab-stop overlay
-                                        // (`settings_focus`), which breaks the
-                                        // trap's "cycle returns to anchor"
-                                        // invariant for keyboard users who
-                                        // arrive by mouse. Same use_keyed_state
-                                        // key as the Button, so we get the same
-                                        // shared handle.
-                                        let apply_focus = window
-                                            .use_keyed_state(
-                                                gpui::ElementId::from("settings-apply"),
-                                                cx,
-                                                |_, cx| cx.focus_handle(),
-                                            )
-                                            .read(cx)
-                                            .clone();
-                                        window.focus(&apply_focus, cx);
-                                        view.apply_settings(cx);
-                                    })),
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.apply_settings(cx)),
+                                    ),
                             ),
                     ),
             )
