@@ -198,6 +198,26 @@ pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(160.);
 /// silhouette. Sections still scroll inside the panel when the cap bites.
 pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(560.);
 
+/// Height of the Settings sections' bottom mask. The scrollable sections
+/// wrapper cannot cheaply align its clip edge to a row boundary (rows
+/// carry mixed heights — a heading, a stepper, a captioned toggle — and
+/// gpui does not surface per-child measured heights during layout). The
+/// panel instead paints an opaque overlay on the wrapper's bottom edge
+/// that is TALLER than any single row's caption line, so any partial row
+/// the clip would otherwise slice sits entirely INSIDE the mask. The mask
+/// carries a 1px top edge line (the scroll cue) so the eye reads "content
+/// continues below" without the wrapper ever exposing a half-row. Scales
+/// with the base font size so the mask still hides a whole caption at the
+/// picker's MAX 18px base: 2 body rows + gap + description row cover the
+/// worst-case Font-size row (label + "Whole pixels, 11 to 18." caption).
+pub fn settings_scroll_cue_height(base: Pixels) -> Pixels {
+    let body = f32::from(base);
+    let label_small_val = (body - 1.).max(MIN_LABEL_PX);
+    let row_gap = f32::from(SETTINGS_ROW_GAP);
+    let desc_gap = f32::from(SETTINGS_ROW_DESCRIPTION_GAP);
+    px((body + desc_gap + label_small_val + row_gap).ceil())
+}
+
 /// Clamp a candidate font size to the appearance picker's whole-px window.
 pub fn clamp_font_size(px_value: f32) -> Pixels {
     let clamped = px_value.round().clamp(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX);
@@ -1803,6 +1823,14 @@ mod tests {
         assert_eq!(settings_label_column(px(11.)), px(119.));
         assert_eq!(settings_label_column(px(13.)), px(140.));
         assert_eq!(settings_label_column(px(18.)), px(194.));
+        // The scroll-cue mask hides a whole row (header + description +
+        // row gap) so the sections wrapper's clip never exposes a
+        // half-caption. Grows linearly with the picker: 29px at 11px,
+        // 33px at 13px (shipped default), and 43px at 18px MAX — the
+        // captioned Font-size row that the pre-round-5 clip sliced.
+        assert_eq!(settings_scroll_cue_height(px(11.)), px(29.));
+        assert_eq!(settings_scroll_cue_height(px(13.)), px(33.));
+        assert_eq!(settings_scroll_cue_height(px(18.)), px(43.));
 
         let tint = opencode().danger_tint();
         let danger = opencode().danger;

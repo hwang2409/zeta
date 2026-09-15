@@ -1560,7 +1560,13 @@ impl ZetaView {
                     // overflow_y_scroll` lets the sections shrink and
                     // scroll when the panel cap bites (18px picker, tiny
                     // viewport) so Close/Apply stays at the panel bottom.
+                    // A `relative` wrapper hosts an absolute-positioned
+                    // bottom mask that hides any partial row the scroll
+                    // clip would otherwise slice mid-caption AND carries
+                    // the "content continues" edge line (scroll cue).
                     .child({
+                        let base = cx.theme().font_size;
+                        let cue_h = theme::settings_scroll_cue_height(base);
                         let model_focus = self.settings_section_focus_handle("model", cx);
                         let behavior_focus = self.settings_section_focus_handle("behavior", cx);
                         let appearance_focus = self.settings_section_focus_handle("appearance", cx);
@@ -1585,65 +1591,104 @@ impl ZetaView {
                             self.settings_sections_scroll.scroll_to_item(ix);
                         }
                         div()
-                            .id("settings-sections")
-                            .v_flex()
+                            .relative()
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.settings_sections_scroll)
-                            .gap(theme::SETTINGS_SECTION_GAP)
                             .child(
-                                settings_section(
-                                    "settings-section-model",
-                                    "Model",
-                                    &model_focus,
-                                    cx,
-                                )
-                                .child(list),
+                                div()
+                                    .id("settings-sections")
+                                    .v_flex()
+                                    .size_full()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.settings_sections_scroll)
+                                    .gap(theme::SETTINGS_SECTION_GAP)
+                                    .child(
+                                        settings_section(
+                                            "settings-section-model",
+                                            "Model",
+                                            &model_focus,
+                                            cx,
+                                        )
+                                        .child(list),
+                                    )
+                                    .child(
+                                        settings_section(
+                                            "settings-section-behavior",
+                                            "Behavior",
+                                            &behavior_focus,
+                                            cx,
+                                        )
+                                        .child(settings_row(
+                                            "settings-row-approval",
+                                            "Approval mode",
+                                            Some("How the agent handles risky actions."),
+                                            mode_segmented,
+                                            cx,
+                                        )),
+                                    )
+                                    .child(
+                                        settings_section(
+                                            "settings-section-appearance",
+                                            "Appearance",
+                                            &appearance_focus,
+                                            cx,
+                                        )
+                                        .child(settings_row(
+                                            "settings-row-theme",
+                                            "Theme",
+                                            Some("Click to cycle themes."),
+                                            theme_cycler,
+                                            cx,
+                                        ))
+                                        .child(settings_row(
+                                            "settings-row-font",
+                                            "Font",
+                                            Some("Click to cycle monospace families."),
+                                            font_cycler,
+                                            cx,
+                                        ))
+                                        .child(settings_row(
+                                            "settings-row-size",
+                                            "Font size",
+                                            Some("Whole pixels, 11 to 18."),
+                                            size_stepper,
+                                            cx,
+                                        )),
+                                    )
+                                    // Trailing spacer: reserves a full
+                                    // scroll-cue-height's worth of blank
+                                    // room after the last section so a
+                                    // user scrolled to the end never sees
+                                    // the bottom mask paint over real
+                                    // content — it always paints over
+                                    // this spacer.
+                                    .child(
+                                        div()
+                                            .h(cue_h)
+                                            .flex_shrink_0(),
+                                    ),
                             )
                             .child(
-                                settings_section(
-                                    "settings-section-behavior",
-                                    "Behavior",
-                                    &behavior_focus,
-                                    cx,
-                                )
-                                .child(settings_row(
-                                    "settings-row-approval",
-                                    "Approval mode",
-                                    Some("How the agent handles risky actions."),
-                                    mode_segmented,
-                                    cx,
-                                )),
-                            )
-                            .child(
-                                settings_section(
-                                    "settings-section-appearance",
-                                    "Appearance",
-                                    &appearance_focus,
-                                    cx,
-                                )
-                                .child(settings_row(
-                                    "settings-row-theme",
-                                    "Theme",
-                                    Some("Click to cycle themes."),
-                                    theme_cycler,
-                                    cx,
-                                ))
-                                .child(settings_row(
-                                    "settings-row-font",
-                                    "Font",
-                                    Some("Click to cycle monospace families."),
-                                    font_cycler,
-                                    cx,
-                                ))
-                                .child(settings_row(
-                                    "settings-row-size",
-                                    "Font size",
-                                    Some("Whole pixels, 11 to 18."),
-                                    size_stepper,
-                                    cx,
-                                )),
+                                // Bottom mask + scroll cue. Paints on top
+                                // of the scroll wrapper's clip edge with
+                                // the panel's sidebar token so any partial
+                                // row the clip would otherwise slice sits
+                                // entirely INSIDE this mask (no half
+                                // captions). The 1px top edge line reads
+                                // as "content continues below" so the
+                                // user knows the panel scrolls — the
+                                // reviewer's requested cue in ZETA-128
+                                // round 5.
+                                div()
+                                    .debug_selector(|| "settings-scroll-cue".into())
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(cue_h)
+                                    .bg(cx.theme().sidebar)
+                                    .border_t_1()
+                                    .border_color(cx.theme().border),
                             )
                     })
                     .children(self.login_providers.iter().map(|provider| {

@@ -8263,15 +8263,16 @@ fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     open_settings_with_default_catalog(&view, &mut visual);
     let overlay_focus = view.read_with(&visual, |view, _| view.settings_focus.clone());
-    // Round-4: exercise the REAL Apply path — a mouse click on the Apply
+    // Round-5: exercise the REAL Apply path — a mouse click on the Apply
     // button (the ZETA-111 click-flow API) — so the intermediate action
-    // rides through the same handler a user's hand would trip. Then walk
-    // the forward Tab cycle and reverse Shift-Tab cycle from wherever
-    // the click leaves focus, with NO manual focus resets. Every step in
-    // both directions must keep focus inside the modal — that IS the
-    // trap. Also require the cycle to eventually revisit at least one
-    // previously-focused control (proving the trap wraps rather than
-    // just gluing focus to the last stop and staying there).
+    // rides through the same handler a user's hand would trip. Then
+    // capture the ANCHOR: the first tab-stop focus handle Apply leaves
+    // focus on. Drive real Tab keystrokes until focus RETURNS to that
+    // exact handle. Every intermediate stop must be unique (a simple
+    // cycle, not a ping-pong between two controls) and stay inside the
+    // modal (the full set). Then drive Shift-Tab in reverse from the
+    // same anchor and assert the SAME set is visited — with NO manual
+    // focus resets anywhere in the walk.
     let apply = visual
         .debug_bounds("settings-apply")
         .expect("apply button renders");
@@ -8281,13 +8282,14 @@ fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
         visual.update(|window, cx| overlay_focus.contains_focused(window, cx)),
         "Apply click must land focus on an in-modal control"
     );
-    // Forward cycle: dispatch 40 Tab keystrokes (comfortably more than the
-    // ~10 modal tab stops). Every step stays inside the modal, and the
-    // set of unique focused handles saturates well before the 40th tab —
-    // saturation is what proves the cycle wraps.
-    let mut forward_seen: Vec<gpui::FocusHandle> = Vec::new();
-    let mut forward_revisited = false;
-    for step in 0..40 {
+    let anchor = visual
+        .update(|window, cx| window.focused(cx))
+        .expect("Apply must leave focus on a live control");
+    // Forward walk: Tab until focus returns to the anchor. Bound at 64
+    // steps so a broken trap never hangs the suite.
+    let mut forward: Vec<gpui::FocusHandle> = Vec::new();
+    let mut wrapped_forward = false;
+    for step in 0..64 {
         visual.simulate_keystrokes("tab");
         visual.update(|window, cx| window.draw(cx).clear(cx));
         assert!(
@@ -8297,21 +8299,32 @@ fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
         let now = visual
             .update(|window, cx| window.focused(cx))
             .expect("tab step must keep focus on some control");
-        if forward_seen.iter().any(|prev| prev == &now) {
-            forward_revisited = true;
+        if now == anchor {
+            wrapped_forward = true;
+            break;
         }
-        forward_seen.push(now);
+        assert!(
+            !forward.iter().any(|prev| prev == &now),
+            "forward Tab step {step} revisited an intermediate control before \
+             wrapping back to the anchor — the cycle is not simple"
+        );
+        forward.push(now);
     }
     assert!(
-        forward_revisited,
-        "forward Tab cycle must wrap and revisit a previously-focused control \
-         (visited {} steps)",
-        forward_seen.len()
+        wrapped_forward,
+        "forward Tab cycle never wrapped back to the anchor within 64 steps \
+         (visited {} intermediates)",
+        forward.len()
     );
-    // Reverse cycle from the SAME position — no manual focus reset.
-    let mut reverse_seen: Vec<gpui::FocusHandle> = Vec::new();
-    let mut reverse_revisited = false;
-    for step in 0..40 {
+    assert!(
+        !forward.is_empty(),
+        "modal must expose at least one non-anchor tab stop"
+    );
+    // Reverse walk from the SAME position (the anchor, where the forward
+    // walk ended). Shift-Tab until focus returns to the anchor again.
+    let mut reverse: Vec<gpui::FocusHandle> = Vec::new();
+    let mut wrapped_reverse = false;
+    for step in 0..64 {
         visual.simulate_keystrokes("shift-tab");
         visual.update(|window, cx| window.draw(cx).clear(cx));
         assert!(
@@ -8321,15 +8334,36 @@ fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
         let now = visual
             .update(|window, cx| window.focused(cx))
             .expect("shift-tab step must keep focus on some control");
-        if reverse_seen.iter().any(|prev| prev == &now) {
-            reverse_revisited = true;
+        if now == anchor {
+            wrapped_reverse = true;
+            break;
         }
-        reverse_seen.push(now);
+        assert!(
+            !reverse.iter().any(|prev| prev == &now),
+            "reverse Shift-Tab step {step} revisited an intermediate before \
+             wrapping back to the anchor"
+        );
+        reverse.push(now);
     }
     assert!(
-        reverse_revisited,
-        "reverse Shift-Tab cycle must wrap and revisit a previously-focused control"
+        wrapped_reverse,
+        "reverse Shift-Tab cycle never wrapped back to the anchor within 64 steps"
     );
+    // Same tab-stop SET in both directions. A cycle reverses its visit
+    // ORDER but keeps its MEMBERSHIP — every forward stop appears in the
+    // reverse walk, and every reverse stop appears in the forward walk.
+    for handle in &forward {
+        assert!(
+            reverse.iter().any(|r| r == handle),
+            "reverse Shift-Tab cycle omitted a stop that forward Tab visited"
+        );
+    }
+    for handle in &reverse {
+        assert!(
+            forward.iter().any(|f| f == handle),
+            "forward Tab cycle omitted a stop that reverse Shift-Tab visited"
+        );
+    }
 }
 
 #[gpui::test]
@@ -8782,4 +8816,46 @@ fn settings_panel_height_is_capped_on_tall_viewports(cx: &mut TestAppContext) {
         "short viewport close-button bottom {:?} must stay inside the 760px viewport",
         close.bottom()
     );
+}
+
+#[gpui::test]
+fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
+    // Round-5 major: the sections scroll wrapper cannot cheaply snap its
+    // clip to a row boundary (mixed row heights), so the panel paints an
+    // opaque mask at the wrapper's bottom edge that hides any partial row
+    // the clip would otherwise slice mid-caption. The mask carries a 1px
+    // top edge line as the scroll cue. This test proves at the picker's
+    // MAX 18px base — where the pre-round-5 shot sliced the Font-size
+    // row's caption — the mask renders inside the panel, has the
+    // documented height, and sits flush with the panel bottom padding.
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    let appearance = theme::Appearance {
+        theme: theme::ThemeId::default(),
+        font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+    };
+    visual.update(|_, cx| theme::apply_with(cx, &appearance));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let panel = visual
+        .debug_bounds("settings-panel")
+        .expect("panel renders at 18px");
+    let cue = visual
+        .debug_bounds("settings-scroll-cue")
+        .expect("scroll-cue mask renders at 18px");
+    let cue_height = cue.bottom() - cue.top();
+    let expected = theme::settings_scroll_cue_height(px(18.));
+    assert!(
+        (cue_height - expected).abs() <= px(1.),
+        "scroll-cue height {cue_height:?} must match the token {expected:?}"
+    );
+    assert!(
+        cue.left() >= panel.left() - px(1.) && cue.right() <= panel.right() + px(1.),
+        "scroll-cue {cue:?} must sit inside the panel {panel:?}"
+    );
+    // Reset for peer tests.
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
 }
