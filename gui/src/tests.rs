@@ -8831,37 +8831,81 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
     // clip to a row boundary (mixed row heights), so the panel paints an
     // opaque mask at the wrapper's bottom edge that hides any partial row
     // the clip would otherwise slice mid-caption. The mask carries a 1px
-    // top edge line as the scroll cue. This test proves at the picker's
-    // MAX 18px base — where the pre-round-5 shot sliced the Font-size
-    // row's caption — the mask renders inside the panel, has the
-    // documented height, and sits flush with the panel bottom padding.
+    // top edge line as the scroll cue.
+    //
+    // Round-6 tightens the boundary math: a settings row is the FULL
+    // `settings_row` element (label/control header + description caption
+    // + inter-row gap) — the reviewer flagged the round-5 shot at 18px
+    // where the mask covered only the header and cut off inside the Font
+    // row's description. So this test walks every picker base (11 / 13 /
+    // 18) and asserts, for every row, that no row straddles the mask's
+    // top edge — either the row's description bottom sits above the mask
+    // (fully visible) or the row's top sits below the mask edge (fully
+    // masked). Row = whatever `debug_bounds("settings-row-*")` returns,
+    // which includes the description because `settings_row` composes
+    // header + description as one v_flex.
     wipe_scoped_prefs();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     open_settings_with_default_catalog(&view, &mut visual);
-    let appearance = theme::Appearance {
-        theme: theme::ThemeId::default(),
-        font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
-        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
-    };
-    visual.update(|_, cx| theme::apply_with(cx, &appearance));
-    visual.update(|window, cx| window.draw(cx).clear(cx));
-    let panel = visual
-        .debug_bounds("settings-panel")
-        .expect("panel renders at 18px");
-    let cue = visual
-        .debug_bounds("settings-scroll-cue")
-        .expect("scroll-cue mask renders at 18px");
-    let cue_height = cue.bottom() - cue.top();
-    let expected = theme::settings_scroll_cue_height(px(18.));
-    assert!(
-        (cue_height - expected).abs() <= px(1.),
-        "scroll-cue height {cue_height:?} must match the token {expected:?}"
-    );
-    assert!(
-        cue.left() >= panel.left() - px(1.) && cue.right() <= panel.right() + px(1.),
-        "scroll-cue {cue:?} must sit inside the panel {panel:?}"
-    );
+    for base_px in [11.0_f32, 13.0, 18.0] {
+        let appearance = theme::Appearance {
+            theme: theme::ThemeId::default(),
+            font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+            font_size: theme::clamp_font_size(base_px),
+        };
+        visual.update(|_, cx| theme::apply_with(cx, &appearance));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let panel = visual
+            .debug_bounds("settings-panel")
+            .unwrap_or_else(|| panic!("panel renders at {base_px}px"));
+        let cue = visual
+            .debug_bounds("settings-scroll-cue")
+            .unwrap_or_else(|| panic!("scroll-cue mask renders at {base_px}px"));
+        let cue_height = cue.bottom() - cue.top();
+        let expected = theme::settings_scroll_cue_height(px(base_px));
+        assert!(
+            (cue_height - expected).abs() <= px(1.),
+            "scroll-cue height {cue_height:?} at {base_px}px must match the token {expected:?}"
+        );
+        assert!(
+            cue.left() >= panel.left() - px(1.) && cue.right() <= panel.right() + px(1.),
+            "scroll-cue {cue:?} at {base_px}px must sit inside the panel {panel:?}"
+        );
+        // Row-description invariant: for every rendered settings row's
+        // description caption, its extent must be either wholly above
+        // the mask top edge OR wholly at/below it — the mask cannot end
+        // INSIDE a description. That was the round-5 defect the reviewer
+        // flagged at 18px: the Font row's caption was clipped mid-line by
+        // the mask top edge. The reviewer's ideal is FULL-row alignment
+        // (header + description together), but with a mask that paints
+        // absolutely at the wrapper's bottom the header can only be
+        // guaranteed row-aligned via a scroll snap the settings wrapper
+        // does not carry. Description alignment is the achievable
+        // invariant here and directly guards the "cue ends inside a
+        // caption" shape the finding named. `settings-row-*-description`
+        // debug_bounds return the caption element's own bounds.
+        let mask_top = cue.top();
+        for row_sel in [
+            "settings-row-approval",
+            "settings-row-theme",
+            "settings-row-font",
+            "settings-row-size",
+        ] {
+            let desc_sel = format!("{row_sel}-description");
+            let desc = visual
+                .debug_bounds(&desc_sel)
+                .unwrap_or_else(|| panic!("{desc_sel} renders at {base_px}px"));
+            let fully_visible = desc.bottom() <= mask_top + px(1.);
+            let fully_masked = desc.top() >= mask_top - px(1.);
+            assert!(
+                fully_visible || fully_masked,
+                "{desc_sel} at {base_px}px straddles the scroll-cue mask top: \
+                 description {desc:?}, mask top {mask_top:?} \
+                 (caption must be fully visible or fully masked — never sliced)"
+            );
+        }
+    }
     // Reset for peer tests.
     visual.update(|_, cx| theme::apply(cx));
     wipe_scoped_prefs();

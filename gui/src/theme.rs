@@ -203,19 +203,31 @@ pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(560.);
 /// carry mixed heights — a heading, a stepper, a captioned toggle — and
 /// gpui does not surface per-child measured heights during layout). The
 /// panel instead paints an opaque overlay on the wrapper's bottom edge
-/// that is TALLER than any single row's caption line, so any partial row
-/// the clip would otherwise slice sits entirely INSIDE the mask. The mask
-/// carries a 1px top edge line (the scroll cue) so the eye reads "content
-/// continues below" without the wrapper ever exposing a half-row. Scales
-/// with the base font size so the mask still hides a whole caption at the
-/// picker's MAX 18px base: 2 body rows + gap + description row cover the
-/// worst-case Font-size row (label + "Whole pixels, 11 to 18." caption).
+/// that is TALLER than one full row (header + description + inter-row
+/// gap), so the FULL row is the indivisible unit the mask hides: no
+/// partial header sits above the mask edge, and no orphaned description
+/// leaks below it. The mask carries a 1px top edge line (the scroll cue)
+/// so the eye reads "content continues below" without the wrapper ever
+/// exposing a half-row.
+///
+/// Header height is floored at `MODAL_BUTTON_HEIGHT` because every
+/// Settings row's control is a Ghost/compact button (theme cycler, font
+/// cycler, size stepper, mode segmented) whose intrinsic height is
+/// `Size::Medium` (h_8, 32px). The label text at body size (18px MAX)
+/// stays shorter than the button, so the header row measures at the
+/// button height, not the body font. The pre-round-6 formula used the
+/// body font as the header floor and yielded 43px at 18px, which fell
+/// ~8px short of the true 51px Font row — the mask ended INSIDE that
+/// row's "Whole pixels, 11 to 18." caption. Flooring at
+/// `MODAL_BUTTON_HEIGHT` sizes the mask to the true row height at
+/// every picker base.
 pub fn settings_scroll_cue_height(base: Pixels) -> Pixels {
     let body = f32::from(base);
     let label_small_val = (body - 1.).max(MIN_LABEL_PX);
     let row_gap = f32::from(SETTINGS_ROW_GAP);
     let desc_gap = f32::from(SETTINGS_ROW_DESCRIPTION_GAP);
-    px((body + desc_gap + label_small_val + row_gap).ceil())
+    let header = body.max(f32::from(MODAL_BUTTON_HEIGHT));
+    px((header + desc_gap + label_small_val + row_gap).ceil())
 }
 
 /// Clamp a candidate font size to the appearance picker's whole-px window.
@@ -1823,14 +1835,19 @@ mod tests {
         assert_eq!(settings_label_column(px(11.)), px(119.));
         assert_eq!(settings_label_column(px(13.)), px(140.));
         assert_eq!(settings_label_column(px(18.)), px(194.));
-        // The scroll-cue mask hides a whole row (header + description +
-        // row gap) so the sections wrapper's clip never exposes a
-        // half-caption. Grows linearly with the picker: 29px at 11px,
-        // 33px at 13px (shipped default), and 43px at 18px MAX — the
-        // captioned Font-size row that the pre-round-5 clip sliced.
-        assert_eq!(settings_scroll_cue_height(px(11.)), px(29.));
-        assert_eq!(settings_scroll_cue_height(px(13.)), px(33.));
-        assert_eq!(settings_scroll_cue_height(px(18.)), px(43.));
+        // The scroll-cue mask hides a full row (button-height header +
+        // description + row gap) so the sections wrapper's clip never
+        // slices a row anywhere — no partial header above the mask edge,
+        // no orphaned description below it. Header is floored at
+        // `MODAL_BUTTON_HEIGHT` because every Settings-row control is a
+        // Ghost/compact button whose intrinsic height dominates the
+        // body-font label. The pre-round-6 formula used the body font
+        // as the header floor and undersized the mask at 18px (43px vs
+        // 51px row), which let the Font row's caption end inside the
+        // mask.
+        assert_eq!(settings_scroll_cue_height(px(11.)), px(48.));
+        assert_eq!(settings_scroll_cue_height(px(13.)), px(50.));
+        assert_eq!(settings_scroll_cue_height(px(18.)), px(55.));
 
         let tint = opencode().danger_tint();
         let danger = opencode().danger;
