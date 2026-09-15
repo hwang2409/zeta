@@ -7708,9 +7708,19 @@ fn zeta125_group_header_persists_when_expanded_and_toggles_via_real_keystrokes(
                 .cloned()
         })
         .expect("group focus handle registered on first paint");
-    // Blur first so the walk starts from the beginning of the tab order.
+    // Seed focus on the current session's known tab stop. The group header
+    // is still discovered only through real Tab dispatch.
+    let session_handle = visual
+        .update(|_, cx| {
+            view.read(cx)
+                .sidebar_row_focus
+                .borrow()
+                .get(&session().session_id)
+                .cloned()
+        })
+        .expect("current session focus handle registered on first paint");
     visual.update(|window, cx| {
-        window.blur(cx);
+        window.focus(&session_handle, cx);
         window.draw(cx).clear(cx);
     });
     let max_tab_steps = 512;
