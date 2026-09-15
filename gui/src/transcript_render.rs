@@ -539,6 +539,12 @@ impl ZetaView {
             .relative()
             .w_full()
             .min_w_0()
+            // Clip at the row's own edge — a child glyph that a
+            // `truncate()` cell measured as "fits" can still stroke
+            // one or two subpixels past its box on shaped fonts at
+            // 18px, which the r3 pixel-gutter guard reads as content
+            // in the column's padding zone.
+            .overflow_hidden()
             .cursor_pointer()
             .hover(|style| style.bg(cx.theme().list_hover))
             .on_click(move |_, _, cx| {
@@ -582,20 +588,27 @@ impl ZetaView {
                         // Excerpt + metadata + hover-hint sit in ONE inner
                         // cluster so metadata paints DIRECTLY after the
                         // excerpt's painted glyph end (laws-of-ux
-                        // proximity). The cluster gets `flex_1 min_w_0` to
-                        // consume the leftover row width; the excerpt
+                        // proximity). The cluster gets `flex_1 min_w_0
+                        // overflow_hidden` to consume the leftover row
+                        // width AND clip any glyph that would paint past
+                        // the cluster's right edge — the r3 native
+                        // pixel-gutter guard flagged a ~5px overshoot at
+                        // the 18px picker step where the excerpt's
+                        // shaped glyph tail crept past the truncation
+                        // box into the row's padding zone. The excerpt
                         // inside is `flex_shrink min_w_0 truncate` (NO
-                        // flex_1) so it sizes to its content and metadata
-                        // sits immediately after it — the pre-r2 fix
-                        // routed `flex_1` onto the excerpt itself, which
-                        // pushed the metadata to the row's right edge
-                        // ~1409px away.
+                        // flex_1) so it sizes to its content and
+                        // metadata sits immediately after it — the
+                        // pre-r2 fix routed `flex_1` onto the excerpt
+                        // itself, which pushed the metadata to the row's
+                        // right edge ~1409px away.
                         div()
                             .h_flex()
                             .gap_2()
                             .items_center()
                             .min_w_0()
                             .flex_1()
+                            .overflow_hidden()
                             .child(
                                 // Excerpt — the row's PRIMARY text. State
                                 // color routes through the recorder so a
@@ -705,6 +718,12 @@ impl ZetaView {
             .relative()
             .w_full()
             .min_w_0()
+            // Clip at the row's own edge — the preview cluster's
+            // `truncate()` cell can leave a shaped-glyph tail one or
+            // two subpixels past its measured width at 18px, which
+            // the r3 pixel-gutter guard reads as content in the
+            // column's padding zone.
+            .overflow_hidden()
             .cursor_pointer()
             .hover(|style| style.bg(cx.theme().list_hover))
             .on_click(move |_, _, cx| {
@@ -768,6 +787,7 @@ impl ZetaView {
                             .min_w_0()
                             .flex_1()
                             .truncate()
+                            .overflow_hidden()
                             .text_size(theme::label_small(cx.theme().font_size))
                             .text_color(cx.theme().muted_foreground)
                             .children(preview_excerpts.into_iter().map(|excerpt| {
