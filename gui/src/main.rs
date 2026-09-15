@@ -1718,15 +1718,47 @@ impl ZetaView {
                                     })),
                             )
                             .child(
+                                // Apply stays a tab stop even while pending: the
+                                // "Applying…" label conveys the busy state, and
+                                // apply_settings early-returns on `pending_command`
+                                // so a second click is a no-op. Disabling the
+                                // Button here drops it from the tab_stops map
+                                // (gpui-base Button.render omits `track_focus`
+                                // when disabled), which broke the modal's Tab
+                                // cycle: the trap's wrap-around after Close
+                                // returned to Model row 0 instead of the click
+                                // anchor, so keyboard users could not return to
+                                // where they clicked.
                                 Button::new("settings-apply")
                                     .debug_selector(|| "settings-apply".into())
                                     .primary()
                                     .label(if pending { "Applying…" } else { "Apply" })
-                                    .disabled(pending)
                                     .h(theme::MODAL_BUTTON_HEIGHT)
-                                    .on_click(
-                                        cx.listener(|view, _, _, cx| view.apply_settings(cx)),
-                                    ),
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        // Explicitly focus Apply's persistent
+                                        // FocusHandle. gpui-component Button's
+                                        // on_mouse_down calls
+                                        // `window.prevent_default()` to skip
+                                        // focus-on-click; without this override
+                                        // the mouse-click anchor stays on the
+                                        // modal's non-tab-stop overlay
+                                        // (`settings_focus`), which breaks the
+                                        // trap's "cycle returns to anchor"
+                                        // invariant for keyboard users who
+                                        // arrive by mouse. Same use_keyed_state
+                                        // key as the Button, so we get the same
+                                        // shared handle.
+                                        let apply_focus = window
+                                            .use_keyed_state(
+                                                gpui::ElementId::from("settings-apply"),
+                                                cx,
+                                                |_, cx| cx.focus_handle(),
+                                            )
+                                            .read(cx)
+                                            .clone();
+                                        window.focus(&apply_focus, cx);
+                                        view.apply_settings(cx);
+                                    })),
                             ),
                     ),
             )

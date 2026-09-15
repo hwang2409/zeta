@@ -8303,10 +8303,14 @@ fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
             wrapped_forward = true;
             break;
         }
+        let revisit_ix = forward.iter().position(|prev| prev == &now);
         assert!(
-            !forward.iter().any(|prev| prev == &now),
-            "forward Tab step {step} revisited an intermediate control before \
-             wrapping back to the anchor — the cycle is not simple"
+            revisit_ix.is_none(),
+            "forward Tab step {step} revisited intermediate at index {} \
+             (forward walk visited {} unique stops before revisit) — \
+             the cycle is not simple",
+            revisit_ix.map(|i| i.to_string()).unwrap_or_default(),
+            forward.len()
         );
         forward.push(now);
     }
@@ -8338,10 +8342,13 @@ fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
             wrapped_reverse = true;
             break;
         }
+        let revisit_ix = reverse.iter().position(|prev| prev == &now);
         assert!(
-            !reverse.iter().any(|prev| prev == &now),
-            "reverse Shift-Tab step {step} revisited an intermediate before \
-             wrapping back to the anchor"
+            revisit_ix.is_none(),
+            "reverse Shift-Tab step {step} revisited intermediate at index {} \
+             (reverse walk visited {} unique stops before revisit)",
+            revisit_ix.map(|i| i.to_string()).unwrap_or_default(),
+            reverse.len()
         );
         reverse.push(now);
     }
