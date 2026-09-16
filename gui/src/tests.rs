@@ -1824,27 +1824,29 @@ fn appearance_controls_reapply_theme_font_and_size_live(cx: &mut TestAppContext)
         theme::DEFAULT_FONT_FAMILY
     );
 
-    // Click a non-default theme; the app-local theme moves off opencode.
-    let gruvbox_light = visual
-        .debug_bounds("theme-row-gruvbox-light")
-        .expect("gruvbox-light theme row renders");
-    visual.simulate_click(gruvbox_light.center(), Default::default());
+    // Click the theme cycler — it advances one step through ThemeId::ALL
+    // and wraps at the ends. Starting on Opencode (index 0) lands on the
+    // next entry (GruvboxDark, index 1); the app-local theme moves off
+    // opencode. The pre-round-2 button wall exposed five tab stops; the
+    // cycler collapses them to one focusable control.
+    let theme_cycler = visual
+        .debug_bounds("settings-theme-cycler")
+        .expect("theme cycler renders");
+    visual.simulate_click(theme_cycler.center(), Default::default());
     visual.update(|window, cx| window.draw(cx).clear(cx));
     let after_theme_bg = visual.update(|_, cx| cx.theme().background);
-    assert_eq!(
-        after_theme_bg,
-        theme::ThemeId::GruvboxLight.palette().canvas
-    );
+    assert_eq!(after_theme_bg, theme::ThemeId::GruvboxDark.palette().canvas);
     assert_ne!(after_theme_bg, baseline_bg);
 
-    // Click a non-default font family; theme.font_family follows.
-    let menlo = visual
-        .debug_bounds("font-row-Menlo")
-        .expect("Menlo font row renders");
-    visual.simulate_click(menlo.center(), Default::default());
+    // Click the font cycler — advances one step through FONT_FAMILIES so
+    // theme.font_family flips off the default (JetBrains Mono -> Fira Code).
+    let font_cycler = visual
+        .debug_bounds("settings-font-cycler")
+        .expect("font cycler renders");
+    visual.simulate_click(font_cycler.center(), Default::default());
     visual.update(|window, cx| window.draw(cx).clear(cx));
     let after_font = visual.update(|_, cx| cx.theme().font_family.as_ref().to_string());
-    assert_eq!(after_font, "Menlo");
+    assert_eq!(after_font, "Fira Code");
 
     // Shrink font size by one step; grow it back. Both should land on the
     // whole-px pick window.
@@ -8025,4 +8027,910 @@ fn zeta125_receipt_layout_holds_at_11px_and_18px(cx: &mut TestAppContext) {
     );
     // Reset back to the default so downstream tests see the baseline theme.
     visual.update(|_, cx| theme::apply(cx));
+}
+
+// ---------------------------------------------------------------------------
+// ZETA-128: Settings surface — grouped sections, universal row anatomy,
+// keyboard traversal. Kept in one region at file end so sibling refactors
+// (ZETA-125 transcript receipts / ZETA-127 test infra) rebase cleanly.
+// ---------------------------------------------------------------------------
+
+fn open_settings_with_default_catalog(view: &Entity<ZetaView>, visual: &mut VisualTestContext) {
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.session_view.available = true;
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: "claude-sonnet-4-6".into(),
+                        approval_mode: "ask".into(),
+                    },
+                    ModelCatalog {
+                        models: vec!["claude-sonnet-4-6".into()],
+                        providers: [("claude-sonnet-4-6".into(), "claude".into())]
+                            .into_iter()
+                            .collect(),
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+}
+
+/// Open Settings with a multi-model catalog so tab-through-model-rows tests
+/// have more than one row to focus. Every model belongs to the same group
+/// so the child-index math stays trivial.
+fn open_settings_with_multi_model_catalog(
+    view: &Entity<ZetaView>,
+    visual: &mut VisualTestContext,
+    models: &[&str],
+) {
+    let owned: Vec<String> = models.iter().map(|s| (*s).to_owned()).collect();
+    let providers: std::collections::BTreeMap<String, String> = owned
+        .iter()
+        .map(|m| (m.clone(), "claude".to_owned()))
+        .collect();
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.session_view.available = true;
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: owned[0].clone(),
+                        approval_mode: "ask".into(),
+                    },
+                    ModelCatalog {
+                        models: owned.clone(),
+                        providers,
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+}
+
+#[gpui::test]
+fn settings_render_three_grouped_sections_with_headings(cx: &mut TestAppContext) {
+    // The Settings modal must present three anchored sections — Model,
+    // Behavior, Appearance — each with a title-weight heading. A regression
+    // that collapsed them back into a flat strip of muted captions would
+    // drop the -heading debug selectors this asserts on.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    for &(section, heading) in &[
+        ("settings-section-model", "settings-section-model-heading"),
+        (
+            "settings-section-behavior",
+            "settings-section-behavior-heading",
+        ),
+        (
+            "settings-section-appearance",
+            "settings-section-appearance-heading",
+        ),
+    ] {
+        assert!(
+            visual.debug_bounds(section).is_some(),
+            "{section} must render its own section container"
+        );
+        assert!(
+            visual.debug_bounds(heading).is_some(),
+            "{section} must render its own heading node"
+        );
+    }
+}
+
+#[gpui::test]
+fn settings_rows_use_label_left_control_right_anatomy(cx: &mut TestAppContext) {
+    // Every labeled row in Behavior + Appearance follows the same anatomy:
+    // fixed-width label column on the left, control anchored on the right.
+    // Regressions that revert to a stacked "caption above buttons" layout
+    // (the pre-ZETA-128 shape) would break this bounds check.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    for &(row, label_sel, control_sel) in &[
+        (
+            "settings-row-approval",
+            "settings-row-approval-label",
+            "settings-row-approval-control",
+        ),
+        (
+            "settings-row-theme",
+            "settings-row-theme-label",
+            "settings-row-theme-control",
+        ),
+        (
+            "settings-row-font",
+            "settings-row-font-label",
+            "settings-row-font-control",
+        ),
+        (
+            "settings-row-size",
+            "settings-row-size-label",
+            "settings-row-size-control",
+        ),
+    ] {
+        let label = visual
+            .debug_bounds(label_sel)
+            .unwrap_or_else(|| panic!("{row}: {label_sel} must render"));
+        let control = visual
+            .debug_bounds(control_sel)
+            .unwrap_or_else(|| panic!("{row}: {control_sel} must render"));
+        assert!(
+            label.right() <= control.left(),
+            "{row}: label {label:?} must sit left of control {control:?}"
+        );
+        assert!(
+            (label.top() - control.top()).abs() <= px(20.),
+            "{row}: label and control must share the same row (labels {:?}, controls {:?})",
+            label.top(),
+            control.top(),
+        );
+    }
+}
+
+#[gpui::test]
+fn settings_font_size_stepper_drops_the_range_caption(cx: &mut TestAppContext) {
+    // The stepper no longer paints a "range 11-18px" clutter caption —
+    // the disabled `−` at MIN and `+` at MAX carry the picker range on
+    // their own. Guards against a re-add of the numeric hint.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    let stepper = visual
+        .debug_bounds("settings-font-size-stepper")
+        .expect("stepper renders");
+    // The row's control container must be the stepper's parent slot.
+    let control = visual
+        .debug_bounds("settings-row-size-control")
+        .expect("font size control slot renders");
+    assert!(
+        stepper.left() >= control.left() && stepper.right() <= control.right() + px(1.),
+        "stepper must live inside the row's control slot"
+    );
+    // Three stepper primitives — shrink, value, grow — and nothing else.
+    for id in ["font-size-shrink", "font-size-value", "font-size-grow"] {
+        assert!(
+            visual.debug_bounds(id).is_some(),
+            "{id} must render inside the stepper"
+        );
+    }
+}
+
+#[gpui::test]
+fn settings_escape_closes_and_returns_focus_to_the_invoker(cx: &mut TestAppContext) {
+    // Escape dismisses the modal and returns focus to whoever opened it
+    // (a11y precedent from ZETA-108/123). When nothing had keyboard focus
+    // at open time, the fallback lands on the composer so no user is ever
+    // left without a caret.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Give the composer keyboard focus, then open Settings — the composer
+    // handle is captured as the return target. This mirrors the keyboard
+    // path where a user tabs into a control, invokes settings, and expects
+    // to land back on the same control on close.
+    let composer_focus = view.read_with(&visual, |view, cx| view.composer.focus_handle(cx));
+    visual.update(|window, cx| {
+        window.focus(&composer_focus, cx);
+        view.update(cx, |view, cx| {
+            view.open_settings(cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    // The modal is not yet visible (LoadSettings is queued) — feed the
+    // catalog reply so it appears (focus capture fires there, from the
+    // composer we just focused), then send Escape.
+    open_settings_with_default_catalog(&view, &mut visual);
+    assert!(visual.debug_bounds("settings-overlay").is_some());
+    visual.simulate_keystrokes("escape");
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        visual.debug_bounds("settings-overlay").is_none(),
+        "escape must dismiss the modal"
+    );
+    view.read_with(&visual, |view, _| {
+        assert!(!view.settings_open, "settings_open must clear on escape");
+    });
+    // Focus lands on the captured invoker.
+    let focused_composer = visual.update(|window, _| composer_focus.is_focused(window));
+    assert!(
+        focused_composer,
+        "escape must restore focus to the invoker captured at open time"
+    );
+}
+
+#[gpui::test]
+fn settings_tab_cycle_stays_trapped_inside_the_modal(cx: &mut TestAppContext) {
+    // Tab and Shift-Tab traverse the modal's tab-stop registry AND wrap
+    // inside it: every forward step from any modal control must land on a
+    // control that `settings_focus.contains_focused` accepts, and the
+    // reverse cycle must land on the same set. The pre-round-3 trap called
+    // `window.focus_next` bare; the last modal control's Tab wrapped to a
+    // BACKGROUND control (composer, sidebar) behind the scrim. This test
+    // walks the full forward cycle, then the full reverse cycle, and
+    // asserts every step stays inside the modal — a re-visited focused
+    // control proves the cycle closed on itself. An Apply click in the
+    // middle guards the reviewer's specific worry that focus survives an
+    // intermediate action.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    let overlay_focus = view.read_with(&visual, |view, _| view.settings_focus.clone());
+    // Round-5: exercise the REAL Apply path — a mouse click on the Apply
+    // button (the ZETA-111 click-flow API) — so the intermediate action
+    // rides through the same handler a user's hand would trip. Then
+    // capture the ANCHOR: the first tab-stop focus handle Apply leaves
+    // focus on. Drive real Tab keystrokes until focus RETURNS to that
+    // exact handle. Every intermediate stop must be unique (a simple
+    // cycle, not a ping-pong between two controls) and stay inside the
+    // modal (the full set). Then drive Shift-Tab in reverse from the
+    // same anchor and assert the SAME set is visited — with NO manual
+    // focus resets anywhere in the walk.
+    let apply = visual
+        .debug_bounds("settings-apply")
+        .expect("apply button renders");
+    visual.simulate_click(apply.center(), Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        visual.update(|window, cx| overlay_focus.contains_focused(window, cx)),
+        "Apply click must land focus on an in-modal control"
+    );
+    let anchor = visual
+        .update(|window, cx| window.focused(cx))
+        .expect("Apply must leave focus on a live control");
+    // Forward walk: Tab until focus returns to the anchor. Bound at 64
+    // steps so a broken trap never hangs the suite.
+    let mut forward: Vec<gpui::FocusHandle> = Vec::new();
+    let mut wrapped_forward = false;
+    for step in 0..64 {
+        visual.simulate_keystrokes("tab");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            visual.update(|window, cx| overlay_focus.contains_focused(window, cx)),
+            "forward Tab step {step} escaped the modal"
+        );
+        let now = visual
+            .update(|window, cx| window.focused(cx))
+            .expect("tab step must keep focus on some control");
+        if now == anchor {
+            wrapped_forward = true;
+            break;
+        }
+        let revisit_ix = forward.iter().position(|prev| prev == &now);
+        assert!(
+            revisit_ix.is_none(),
+            "forward Tab step {step} revisited intermediate at index {} \
+             (forward walk visited {} unique stops before revisit) — \
+             the cycle is not simple",
+            revisit_ix.map(|i| i.to_string()).unwrap_or_default(),
+            forward.len()
+        );
+        forward.push(now);
+    }
+    assert!(
+        wrapped_forward,
+        "forward Tab cycle never wrapped back to the anchor within 64 steps \
+         (visited {} intermediates)",
+        forward.len()
+    );
+    assert!(
+        !forward.is_empty(),
+        "modal must expose at least one non-anchor tab stop"
+    );
+    // Reverse walk from the SAME position (the anchor, where the forward
+    // walk ended). Shift-Tab until focus returns to the anchor again.
+    let mut reverse: Vec<gpui::FocusHandle> = Vec::new();
+    let mut wrapped_reverse = false;
+    for step in 0..64 {
+        visual.simulate_keystrokes("shift-tab");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            visual.update(|window, cx| overlay_focus.contains_focused(window, cx)),
+            "reverse Shift-Tab step {step} escaped the modal"
+        );
+        let now = visual
+            .update(|window, cx| window.focused(cx))
+            .expect("shift-tab step must keep focus on some control");
+        if now == anchor {
+            wrapped_reverse = true;
+            break;
+        }
+        let revisit_ix = reverse.iter().position(|prev| prev == &now);
+        assert!(
+            revisit_ix.is_none(),
+            "reverse Shift-Tab step {step} revisited intermediate at index {} \
+             (reverse walk visited {} unique stops before revisit)",
+            revisit_ix.map(|i| i.to_string()).unwrap_or_default(),
+            reverse.len()
+        );
+        reverse.push(now);
+    }
+    assert!(
+        wrapped_reverse,
+        "reverse Shift-Tab cycle never wrapped back to the anchor within 64 steps"
+    );
+    // Same tab-stop SET in both directions. A cycle reverses its visit
+    // ORDER but keeps its MEMBERSHIP — every forward stop appears in the
+    // reverse walk, and every reverse stop appears in the forward walk.
+    for handle in &forward {
+        assert!(
+            reverse.iter().any(|r| r == handle),
+            "reverse Shift-Tab cycle omitted a stop that forward Tab visited"
+        );
+    }
+    for handle in &reverse {
+        assert!(
+            forward.iter().any(|f| f == handle),
+            "forward Tab cycle omitted a stop that reverse Shift-Tab visited"
+        );
+    }
+}
+
+#[gpui::test]
+fn settings_panel_paints_on_tokens_across_every_theme(cx: &mut TestAppContext) {
+    // Section headings, row labels, and dividers must ride semantic tokens
+    // so all five themes stay legible without per-palette overrides. The
+    // check walks every ThemeId, applies it, redraws the modal, and asserts
+    // the panel paints on the sidebar token (not a raw hex).
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    for id in theme::ThemeId::ALL.iter().copied() {
+        let appearance = theme::Appearance {
+            theme: id,
+            font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+            font_size: gpui::px(13.),
+        };
+        visual.update(|_, cx| theme::apply_with(cx, &appearance));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let panel_token = visual.update(|_, cx| cx.theme().sidebar);
+        let panel = visual
+            .debug_bounds("settings-panel")
+            .unwrap_or_else(|| panic!("panel renders on {id:?}"));
+        let scaled = visual.update(|window, _| panel.scale(window.scale_factor()));
+        let paints_on_token = visual.update(|window, _| {
+            let token_bg: gpui::Background = panel_token.into();
+            window.painted_quads().into_iter().any(|quad| {
+                let overlaps = quad.bounds.right() >= scaled.left()
+                    && quad.bounds.left() <= scaled.right()
+                    && quad.bounds.bottom() >= scaled.top()
+                    && quad.bounds.top() <= scaled.bottom();
+                overlaps && quad.background == token_bg
+            })
+        });
+        assert!(
+            paints_on_token,
+            "settings panel must paint on the sidebar token on theme {id:?}"
+        );
+    }
+    // Reset for peer tests.
+    visual.update(|_, cx| theme::apply(cx));
+}
+
+#[gpui::test]
+fn settings_modal_fits_the_viewport_at_min_and_max_font_size(cx: &mut TestAppContext) {
+    // At 11px and 18px picker extremes the panel must still fit inside the
+    // 760px test viewport so Close/Apply stay clickable. Locks the
+    // section-gap / row-gap budget derived in ZETA-128; regressing to a
+    // looser rhythm would push the action row below the fold.
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    let viewport = visual.update(|window, _| window.viewport_size());
+    for base_px in [theme::MIN_FONT_SIZE_PX, theme::MAX_FONT_SIZE_PX] {
+        let appearance = theme::Appearance {
+            theme: theme::ThemeId::default(),
+            font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+            font_size: theme::clamp_font_size(base_px),
+        };
+        visual.update(|_, cx| theme::apply_with(cx, &appearance));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let close = visual
+            .debug_bounds("settings-close")
+            .expect("close button renders");
+        let apply = visual
+            .debug_bounds("settings-apply")
+            .expect("apply button renders");
+        assert!(
+            close.bottom() <= viewport.height,
+            "close button bottom {:?} must stay inside viewport height {:?} at {base_px}px",
+            close.bottom(),
+            viewport.height,
+        );
+        assert!(
+            apply.bottom() <= viewport.height,
+            "apply button bottom {:?} must stay inside viewport height {:?} at {base_px}px",
+            apply.bottom(),
+            viewport.height,
+        );
+    }
+    // Restore defaults for peer tests.
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
+}
+
+#[gpui::test]
+fn settings_theme_and_font_render_as_compact_single_value_cyclers(cx: &mut TestAppContext) {
+    // Round 2 collapses the pre-round-1 button walls (five theme buttons +
+    // four font buttons -> nine tab stops in Appearance) into one focusable
+    // cycler each. The row's control slot holds ONE labeled button carrying
+    // the current selection; clicking it advances to the next value. The
+    // pre-round-2 debug selectors `theme-row-<slug>` / `font-row-<family>`
+    // vanish with the walls.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    // One tab stop per row: the cyclers exist under a stable selector.
+    let theme_cycler = visual
+        .debug_bounds("settings-theme-cycler")
+        .expect("theme cycler renders");
+    let font_cycler = visual
+        .debug_bounds("settings-font-cycler")
+        .expect("font cycler renders");
+    // Each cycler lives inside its row's control slot (right of the label).
+    let theme_slot = visual
+        .debug_bounds("settings-row-theme-control")
+        .expect("theme control slot renders");
+    let font_slot = visual
+        .debug_bounds("settings-row-font-control")
+        .expect("font control slot renders");
+    assert!(
+        theme_cycler.left() >= theme_slot.left()
+            && theme_cycler.right() <= theme_slot.right() + px(1.),
+        "theme cycler must live inside the theme row's control slot"
+    );
+    assert!(
+        font_cycler.left() >= font_slot.left() && font_cycler.right() <= font_slot.right() + px(1.),
+        "font cycler must live inside the font row's control slot"
+    );
+    // The pre-round-2 button walls are gone. The specific selectors ZETA-111
+    // shipped for the individual theme/font buttons no longer resolve — if
+    // they do, the wall has crept back.
+    for gone in [
+        "theme-row-opencode",
+        "theme-row-gruvbox-dark",
+        "theme-row-vscode-dark-plus",
+        "theme-row-nord",
+        "theme-row-gruvbox-light",
+        "font-row-JetBrains Mono",
+        "font-row-Fira Code",
+        "font-row-SF Mono",
+        "font-row-Menlo",
+        "font-row-Monaco",
+        "settings-theme-segmented",
+        "settings-font-segmented",
+    ] {
+        assert!(
+            visual.debug_bounds(gone).is_none(),
+            "{gone} must not render — the pre-round-2 button wall crept back"
+        );
+    }
+}
+
+#[gpui::test]
+fn settings_rows_carry_short_muted_descriptions(cx: &mut TestAppContext) {
+    // Round 2 attaches a short muted-foreground caption to each labeled
+    // row (Behavior + Appearance). The caption paints below the label /
+    // control line and reads at label_small — dense enough to sit as a
+    // subordinate line, muted enough to defer to the label. If any of
+    // these description slots stops rendering, a row lost its caption.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    for &(row, description_sel) in &[
+        ("settings-row-approval", "settings-row-approval-description"),
+        ("settings-row-theme", "settings-row-theme-description"),
+        ("settings-row-font", "settings-row-font-description"),
+        ("settings-row-size", "settings-row-size-description"),
+    ] {
+        let row_bounds = visual
+            .debug_bounds(row)
+            .unwrap_or_else(|| panic!("{row} must render"));
+        let description = visual
+            .debug_bounds(description_sel)
+            .unwrap_or_else(|| panic!("{row}: {description_sel} must render"));
+        assert!(
+            description.top() >= row_bounds.top(),
+            "{row}: description must paint below the row's top edge"
+        );
+        assert!(
+            description.bottom() <= row_bounds.bottom() + px(1.),
+            "{row}: description must stay inside the row container"
+        );
+    }
+}
+
+#[gpui::test]
+fn settings_label_column_widens_with_the_base_font_size(cx: &mut TestAppContext) {
+    // Round 2 replaces the fixed 120px label column with a base-derived
+    // width so long labels ("Approval mode") fit at every picker base.
+    // At 18px the label column must widen past the pre-round-2 120px
+    // ceiling or the label wraps into a stacked block again.
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    let base = visual.update(|_, cx| cx.theme().font_size);
+    let baseline_label = visual
+        .debug_bounds("settings-row-approval-label")
+        .expect("baseline approval label renders");
+    let baseline_width = baseline_label.right() - baseline_label.left();
+    // At the MAX 18px picker base the column widens strictly beyond the
+    // shipped-default width.
+    let appearance = theme::Appearance {
+        theme: theme::ThemeId::default(),
+        font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+    };
+    visual.update(|_, cx| theme::apply_with(cx, &appearance));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let wide_label = visual
+        .debug_bounds("settings-row-approval-label")
+        .expect("wide approval label renders at 18px");
+    let wide_width = wide_label.right() - wide_label.left();
+    assert!(
+        wide_width > baseline_width,
+        "label column must widen with base ({base:?} -> 18px): \
+         baseline {baseline_width:?}, wide {wide_width:?}"
+    );
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
+}
+
+#[gpui::test]
+fn settings_modal_esc_hint_paints_on_muted_foreground_token(cx: &mut TestAppContext) {
+    // Round 2 routes the `esc` hint through `muted_foreground` (AA) rather
+    // than the pre-round-2 `text_faint` palette accessor (2.92-4.03:1
+    // against the panel token). This test walks every shipped theme and
+    // asserts the theme's `muted_foreground` clears WCAG AA against the
+    // sidebar token — the palette pair the esc hint rides.
+    fn relative_luminance(color: gpui::Hsla) -> f32 {
+        let rgba = color.to_rgb();
+        let channel = |c: f32| {
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(rgba.r) + 0.7152 * channel(rgba.g) + 0.0722 * channel(rgba.b)
+    }
+    fn contrast_ratio(a: gpui::Hsla, b: gpui::Hsla) -> f32 {
+        let la = relative_luminance(a);
+        let lb = relative_luminance(b);
+        let (lmax, lmin) = if la >= lb { (la, lb) } else { (lb, la) };
+        (lmax + 0.05) / (lmin + 0.05)
+    }
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    for id in theme::ThemeId::ALL.iter().copied() {
+        let appearance = theme::Appearance {
+            theme: id,
+            font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+            font_size: gpui::px(13.),
+        };
+        visual.update(|_, cx| theme::apply_with(cx, &appearance));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            visual.debug_bounds("modal-title-esc").is_some(),
+            "esc hint renders on {id:?}"
+        );
+        let (fg, bg) = visual.update(|_, cx| (cx.theme().muted_foreground, cx.theme().sidebar));
+        let ratio = contrast_ratio(fg, bg);
+        assert!(
+            ratio >= 4.5,
+            "{id:?}: esc hint contrast {ratio:.2}:1 fails WCAG AA on the panel"
+        );
+    }
+    visual.update(|_, cx| theme::apply(cx));
+}
+
+#[gpui::test]
+fn settings_tab_stops_stay_visible_inside_the_viewport_at_18px(cx: &mut TestAppContext) {
+    // Round 2 promise: every focusable control inside the modal paints
+    // inside the viewport at the 18px picker MAX. The pre-round-2 shape
+    // pushed seven Appearance tab stops offscreen (five theme + four font
+    // buttons on top of the stepper). The cycler collapse plus the
+    // section-level scroll-into-view safety net keep every ring visible.
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    let appearance = theme::Appearance {
+        theme: theme::ThemeId::default(),
+        font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+    };
+    visual.update(|_, cx| theme::apply_with(cx, &appearance));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let viewport = visual.update(|window, _| window.viewport_size());
+    // Each labeled control below is one tab stop. For every stop, focus
+    // the section that owns it (Behavior for approval-mode buttons,
+    // Appearance for cyclers + stepper primitives) so the modal's
+    // scroll-into-view safety net fires, then assert the resulting
+    // rendered bounds sit inside the viewport. Close / Apply live outside
+    // the sections wrapper and are always at the panel bottom.
+    let checked: &[(&str, Option<&str>)] = &[
+        ("mode-row-ask", Some("behavior")),
+        ("mode-row-allow", Some("behavior")),
+        ("mode-row-deny", Some("behavior")),
+        ("settings-theme-cycler", Some("appearance")),
+        ("settings-font-cycler", Some("appearance")),
+        ("font-size-shrink", Some("appearance")),
+        ("font-size-grow", Some("appearance")),
+        ("settings-close", None),
+        ("settings-apply", None),
+    ];
+    for (sel, section) in checked.iter().copied() {
+        if let Some(section) = section {
+            visual.update(|window, cx| {
+                let handle = view.read_with(cx, |view, _| {
+                    view.settings_section_focus.borrow().get(section).cloned()
+                });
+                if let Some(handle) = handle {
+                    window.focus(&handle, cx);
+                }
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let bounds = visual
+            .debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} must render at 18px"));
+        assert!(
+            bounds.top() >= px(0.) && bounds.bottom() <= viewport.height,
+            "{sel}: bounds {bounds:?} fall outside the viewport height {:?} at 18px",
+            viewport.height
+        );
+        assert!(
+            bounds.left() >= px(0.) && bounds.right() <= viewport.width,
+            "{sel}: bounds {bounds:?} fall outside the viewport width {:?} at 18px",
+            viewport.width
+        );
+    }
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
+}
+
+#[gpui::test]
+fn settings_model_list_scrolls_focused_row_into_view_at_18px(cx: &mut TestAppContext) {
+    // Round-3 promise: the inner model list scrolls whichever row is
+    // KEYBOARD-focused into view, not just the SELECTED row. Round-4
+    // rewrite exercises REAL Tab keystrokes (the same `dispatch_keystroke`
+    // path Enter/Space activations use) instead of the pre-round-4 shortcut
+    // that focused each row's wrapper handle directly. Each Tab from the
+    // overlay lands on the next model-row Button; the wrapper div's tracked
+    // focus contains that Button's focus, drives `scroll_to_item(child_ix)`,
+    // and the CLIPPED `model-list` bounds must contain the row's painted
+    // ring — not the whole panel (the panel is wider than the list's cap
+    // so a leaked ring outside the list still fits inside the panel).
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let models = [
+        "claude-opus-4-7",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-haiku-4-5",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-6",
+        "claude-opus-4-6",
+    ];
+    let selectors: [&'static str; 8] = [
+        "model-row-0",
+        "model-row-1",
+        "model-row-2",
+        "model-row-3",
+        "model-row-4",
+        "model-row-5",
+        "model-row-6",
+        "model-row-7",
+    ];
+    open_settings_with_multi_model_catalog(&view, &mut visual, &models);
+    let appearance = theme::Appearance {
+        theme: theme::ThemeId::default(),
+        font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+    };
+    visual.update(|_, cx| theme::apply_with(cx, &appearance));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    // Seed focus on the overlay handle so the first Tab lands on the
+    // first modal tab stop — the model-row-0 Button. Each subsequent Tab
+    // walks one row down the list.
+    let overlay_focus = view.read_with(&visual, |v, _| v.settings_focus.clone());
+    visual.update(|window, cx| window.focus(&overlay_focus, cx));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    for (index, sel) in selectors.iter().copied().enumerate() {
+        visual.simulate_keystrokes("tab");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let row_focus = view.read_with(&visual, |v, _| {
+            v.settings_model_row_focus
+                .borrow()
+                .get(&index)
+                .cloned()
+                .expect("row focus handle allocated")
+        });
+        assert!(
+            visual.update(|window, cx| row_focus.contains_focused(window, cx)),
+            "Tab step {} must land on model-row-{index}",
+            index + 1,
+        );
+        let row_bounds = visual
+            .debug_bounds(sel)
+            .unwrap_or_else(|| panic!("row {index} must render at 18px"));
+        let list_bounds = visual
+            .debug_bounds("model-list")
+            .expect("model list renders while a row is focused");
+        assert!(
+            row_bounds.top() >= list_bounds.top() - px(1.)
+                && row_bounds.bottom() <= list_bounds.bottom() + px(1.),
+            "row {index}: focused bounds {row_bounds:?} leaked outside the clipped \
+             model-list viewport {list_bounds:?}"
+        );
+    }
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
+}
+
+#[gpui::test]
+fn settings_panel_height_is_capped_on_tall_viewports(cx: &mut TestAppContext) {
+    // Round-3 blocker: the panel used to bind `.h(shelf)`, which at a 1200px
+    // viewport grew the flat modal to 884px (former ceiling: 560px). The
+    // panel must cap at `SETTINGS_PANEL_MAX_HEIGHT` so a tall window keeps
+    // the wiki-modal silhouette. Also proves the short-viewport path still
+    // shrinks below the cap so `flex_1 + min_h_0` on the sections wrapper
+    // still has a definite height to resolve against.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    visual.simulate_resize(gpui::size(px(1100.), px(1200.)));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let panel = visual
+        .debug_bounds("settings-panel")
+        .expect("panel renders on the tall viewport");
+    let panel_height = panel.bottom() - panel.top();
+    assert!(
+        panel_height <= theme::SETTINGS_PANEL_MAX_HEIGHT + px(1.),
+        "tall viewport panel height {panel_height:?} must respect the cap {:?}",
+        theme::SETTINGS_PANEL_MAX_HEIGHT
+    );
+    // Now shrink to a short viewport (below the cap) and prove the panel
+    // packs to the shelf so the sections wrapper has a bounded height.
+    visual.simulate_resize(gpui::size(px(1100.), px(760.)));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let short_panel = visual
+        .debug_bounds("settings-panel")
+        .expect("panel renders on the short viewport");
+    let short_height = short_panel.bottom() - short_panel.top();
+    assert!(
+        short_height < theme::SETTINGS_PANEL_MAX_HEIGHT + px(1.),
+        "short viewport panel height {short_height:?} must fit under the cap"
+    );
+    let close = visual
+        .debug_bounds("settings-close")
+        .expect("close renders on the short viewport");
+    assert!(
+        close.bottom() <= px(760.),
+        "short viewport close-button bottom {:?} must stay inside the 760px viewport",
+        close.bottom()
+    );
+}
+
+#[gpui::test]
+fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
+    // Round-5 major: the sections scroll wrapper cannot cheaply snap its
+    // clip to a row boundary (mixed row heights), so the panel paints an
+    // opaque mask at the wrapper's bottom edge that hides any partial row
+    // the clip would otherwise slice mid-caption. The mask carries a 1px
+    // top edge line as the scroll cue.
+    //
+    // Round-7 tightens the boundary math to the FULL `settings_row`
+    // element (label/control header + description caption + inter-row
+    // gap): round-6 flagged the round-5 shot at 18px where the mask
+    // covered only the header and cut off inside the Font row's
+    // description. A vertical mask offset could still slice a row
+    // HEADER while every description stayed clear, so this test walks
+    // every picker base (11 / 13 / 18) and asserts, for every row,
+    // that no row straddles the mask's top edge — either the row's
+    // bottom sits above the mask (fully visible) or the row's top sits
+    // at/below the mask edge (fully masked). Row =
+    // `debug_bounds("settings-row-*")`, which spans header +
+    // description because `settings_row` composes them as one v_flex.
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    open_settings_with_default_catalog(&view, &mut visual);
+    for base_px in [11.0_f32, 13.0, 18.0] {
+        let appearance = theme::Appearance {
+            theme: theme::ThemeId::default(),
+            font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+            font_size: theme::clamp_font_size(base_px),
+        };
+        visual.update(|_, cx| theme::apply_with(cx, &appearance));
+        // One external draw is all a real client provides: prepaint
+        // measures the rows, computes the row-snapped mask height, and
+        // when it changes schedules a follow-up frame via
+        // `on_next_frame` (Window::refresh is a no-op during a draw, so
+        // the previous in-draw refresh() silently dropped until an
+        // unrelated event dirtied the window). Tests have no platform
+        // frame loop, so `simulate_next_frame` delivers the queued
+        // callback exactly the way the platform would — the second
+        // draw below stands in for the redraw the platform performs
+        // once the callback marks the window dirty.
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let scheduled = visual.update(|window, cx| window.simulate_next_frame(cx));
+        assert!(
+            scheduled > 0,
+            "prepaint should schedule a follow-up frame at {base_px}px \
+             so the row-snapped mask converges without a second external draw"
+        );
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let panel = visual
+            .debug_bounds("settings-panel")
+            .unwrap_or_else(|| panic!("panel renders at {base_px}px"));
+        let cue = visual
+            .debug_bounds("settings-scroll-cue")
+            .unwrap_or_else(|| panic!("scroll-cue mask renders at {base_px}px"));
+        let cue_height = cue.bottom() - cue.top();
+        let expected = theme::settings_scroll_cue_height(px(base_px));
+        assert!(
+            cue_height + px(1.) >= expected,
+            "scroll-cue height {cue_height:?} at {base_px}px must be at least the token \
+             {expected:?} (the runtime snap may extend it upward to a row boundary)"
+        );
+        assert!(
+            cue.left() >= panel.left() - px(1.) && cue.right() <= panel.right() + px(1.),
+            "scroll-cue {cue:?} at {base_px}px must sit inside the panel {panel:?}"
+        );
+        // Whole-row invariant: for every rendered settings row, its FULL
+        // `settings-row-*` bounds (header + description composed as one
+        // v_flex) must be either wholly above the mask top edge OR
+        // wholly at/below it — the mask cannot end INSIDE a row. This
+        // guarantees (a) the last visible row's bottom sits above the
+        // mask edge and (b) the first masked row's top sits at/below
+        // it. Round-6 checked descriptions only; a vertical mask offset
+        // could still slice a row header while every description
+        // stayed clear, so round-7 upgrades to the full-row bounds
+        // (which include the header) directly.
+        let mask_top = cue.top();
+        for row_sel in [
+            "settings-row-approval",
+            "settings-row-theme",
+            "settings-row-font",
+            "settings-row-size",
+        ] {
+            let row = visual
+                .debug_bounds(row_sel)
+                .unwrap_or_else(|| panic!("{row_sel} renders at {base_px}px"));
+            let fully_visible = row.bottom() <= mask_top + px(1.);
+            let fully_masked = row.top() >= mask_top - px(1.);
+            assert!(
+                fully_visible || fully_masked,
+                "{row_sel} at {base_px}px straddles the scroll-cue mask top: \
+                 row {row:?}, mask top {mask_top:?} \
+                 (row must be fully visible or fully masked — never sliced)"
+            );
+        }
+        // Settled-state property: with the snapped value now equal to
+        // the prepaint measurement, the equality guard must stop
+        // scheduling frames — otherwise every draw would queue a
+        // follow-up, spinning the frame loop forever.
+        let extra = visual.update(|window, cx| window.simulate_next_frame(cx));
+        assert_eq!(
+            extra, 0,
+            "settled snap value at {base_px}px must not schedule extra frames"
+        );
+    }
+    // Reset for peer tests.
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
 }

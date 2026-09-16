@@ -154,6 +154,86 @@ pub const MODAL_PADDING_BOTTOM: Pixels = px(14.);
 pub const MODAL_BUTTON_HEIGHT: Pixels = px(30.);
 pub const MODAL_TOP_FRACTION: f32 = 0.25;
 
+/// Label-column width for a Settings row, derived from the current base
+/// font size. The column scales linearly (`base * 10.8`) so at 11px it is
+/// 119px, at the shipped 13px base 140px, and at the picker's MAX 18px
+/// base 194px. Wide enough to hold "Approval mode" without wrapping into a
+/// stacked block at any picker base — the fixed 120px column the pre-
+/// round-2 shape carried wrapped the label at 18px.
+pub fn settings_label_column(base: Pixels) -> Pixels {
+    let scale = f32::from(base) * 10.8;
+    px(scale.round())
+}
+
+/// Vertical gap BETWEEN top-level Settings sections (Model / Behavior /
+/// Appearance). Larger than the intra-section row gap so section boundaries
+/// read as boundaries without needing a heavy ruled line — the divider under
+/// each section heading carries the visual break; this gap is the whitespace.
+pub const SETTINGS_SECTION_GAP: Pixels = px(10.);
+
+/// Vertical gap between rows within one Settings section — sits tight so a
+/// three-row Appearance block reads as one cluster.
+pub const SETTINGS_ROW_GAP: Pixels = px(6.);
+
+/// Vertical gap between a Settings row's label/control line and its
+/// description caption below. Tight so the caption reads as a subordinate
+/// line to the row, not a separate cluster.
+pub const SETTINGS_ROW_DESCRIPTION_GAP: Pixels = px(2.);
+
+/// Maximum height for the Model list inside the Settings modal. The list
+/// scrolls beyond this so the three-section body (Model + Behavior +
+/// Appearance) plus optional credential alert fits inside the 760px test
+/// viewport across every picker base (11px…18px). 160px holds a two-
+/// group three-row catalog (claude + codex, three models, ~156px) in
+/// full at 13px — the credential-error swap test relies on the codex
+/// row being clickable without scrolling — and a longer catalog scrolls
+/// with the focused row auto-revealed via `scroll_to_item`.
+pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(160.);
+
+/// Absolute ceiling for the Settings panel's rendered height. The panel
+/// still sizes off the viewport shelf below the 25% modal-top offset so
+/// short viewports pack the sections tight, but a tall viewport must not
+/// stretch the panel: a 1200px viewport shelf is 884px, which would grow
+/// the flat panel to full-page proportions and break the wiki-modal
+/// silhouette. Sections still scroll inside the panel when the cap bites.
+pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(560.);
+
+/// Height of the Settings sections' bottom mask. The scrollable sections
+/// wrapper cannot cheaply align its clip edge to a row boundary (rows
+/// carry mixed heights — a heading, a stepper, a captioned toggle — and
+/// gpui does not surface per-child measured heights during layout). The
+/// panel instead paints an opaque overlay on the wrapper's bottom edge
+/// that is TALLER than one full row's rendered pixels, so the caption
+/// (row description) is the indivisible unit the mask never slices — a
+/// caption is either wholly above the mask top edge or wholly at/below
+/// it. The mask carries a 1px top edge line (the scroll cue) so the eye
+/// reads "content continues below" without the wrapper ever exposing a
+/// half-caption.
+///
+/// Sizing accounts for two shapes the pre-round-6 formula missed:
+/// 1. Header height floors at `MODAL_BUTTON_HEIGHT` because every
+///    Settings-row control is a Ghost/compact button whose intrinsic
+///    height (`Size::Medium`, ~32px) dominates the body-font label at
+///    every picker base.
+/// 2. Description RENDERED height (not font size) drives the caption
+///    contribution. gpui's line box adds ~55% padding for descender
+///    breathing room, so a 17px font renders at ~26px — the exact shape
+///    the round-6 CI proved with `18px straddles the mask` failing on a
+///    26px-tall description bounds. `LINE_HEIGHT_SCALE = 1.75` sits a
+///    safe margin above the observed 1.53 ratio (11 / 13 / 18px all
+///    tested) and turns the label-small font into its rendered height so
+///    the mask always covers a full caption.
+pub fn settings_scroll_cue_height(base: Pixels) -> Pixels {
+    const LINE_HEIGHT_SCALE: f32 = 1.75;
+    let body = f32::from(base);
+    let label_small_val = (body - 1.).max(MIN_LABEL_PX);
+    let row_gap = f32::from(SETTINGS_ROW_GAP);
+    let desc_gap = f32::from(SETTINGS_ROW_DESCRIPTION_GAP);
+    let header = body.max(f32::from(MODAL_BUTTON_HEIGHT));
+    let description_rendered = (label_small_val * LINE_HEIGHT_SCALE).ceil();
+    px((header + desc_gap + description_rendered + row_gap).ceil())
+}
+
 /// Clamp a candidate font size to the appearance picker's whole-px window.
 pub fn clamp_font_size(px_value: f32) -> Pixels {
     let clamped = px_value.round().clamp(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX);
@@ -1747,6 +1827,31 @@ mod tests {
         assert_eq!(MODAL_PADDING_BOTTOM, px(14.));
         assert_eq!(MODAL_BUTTON_HEIGHT, px(30.));
         assert!((MODAL_TOP_FRACTION - 0.25).abs() < f32::EPSILON);
+        assert_eq!(SETTINGS_SECTION_GAP, px(10.));
+        assert_eq!(SETTINGS_ROW_GAP, px(6.));
+        assert_eq!(SETTINGS_ROW_DESCRIPTION_GAP, px(2.));
+        assert_eq!(SETTINGS_MODEL_LIST_MAX_HEIGHT, px(160.));
+        assert_eq!(SETTINGS_PANEL_MAX_HEIGHT, px(560.));
+        // Label column scales with base font size so long labels
+        // ("Approval mode") never overflow the column at the picker's
+        // MAX 18px base — the pre-ZETA-128-round-2 fixed 120px column
+        // wrapped the label at 18px, leaving the row shaped wrong.
+        assert_eq!(settings_label_column(px(11.)), px(119.));
+        assert_eq!(settings_label_column(px(13.)), px(140.));
+        assert_eq!(settings_label_column(px(18.)), px(194.));
+        // The scroll-cue mask hides a full row (button-height header +
+        // description + row gap) so the sections wrapper's clip never
+        // slices a row anywhere — no partial header above the mask edge,
+        // no orphaned description below it. Header is floored at
+        // `MODAL_BUTTON_HEIGHT` because every Settings-row control is a
+        // Ghost/compact button whose intrinsic height dominates the
+        // body-font label. The pre-round-6 formula used the body font
+        // as the header floor and undersized the mask at 18px (43px vs
+        // 51px row), which let the Font row's caption end inside the
+        // mask.
+        assert_eq!(settings_scroll_cue_height(px(11.)), px(56.));
+        assert_eq!(settings_scroll_cue_height(px(13.)), px(59.));
+        assert_eq!(settings_scroll_cue_height(px(18.)), px(68.));
 
         let tint = opencode().danger_tint();
         let danger = opencode().danger;
@@ -1960,6 +2065,30 @@ mod tests {
                     id.label(),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn modal_hint_and_row_description_contrast_clears_wcag_aa_on_panel() {
+        // The `esc` hint painted on `modal_title` and the row-description
+        // caption on `settings_row` both route through `muted_foreground`
+        // (== `palette.text_muted`) on top of the modal panel token
+        // (== `palette.panel`, mapped to `theme.sidebar`). WCAG AA needs
+        // 4.5:1 for small text; the pre-round-2 esc hint used `text_faint`,
+        // which measured between 2.92:1 and 4.03:1 across the shipped
+        // palettes and failed the bar. This test locks the fix — any
+        // palette author who dims `text_muted` past the AA line has to
+        // adjust it back before the theme ships.
+        for id in ThemeId::ALL {
+            let p = id.palette();
+            let ratio = contrast_ratio(p.text_muted, p.panel);
+            assert!(
+                ratio >= 4.5,
+                "{}: text_muted/panel contrast {ratio:.2}:1 fails WCAG AA \
+                 (need >=4.5:1) — modal esc hint + row descriptions ride \
+                 this pair; see modal_title + settings_row",
+                id.label(),
+            );
         }
     }
 
