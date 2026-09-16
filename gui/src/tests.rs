@@ -9855,19 +9855,41 @@ fn zeta132_scroll_resets_to_top_on_every_open(cx: &mut TestAppContext) {
     // picker reaches its MAX. Every click updates prefs and re-applies
     // the theme, which reflows the modal in place — the panel stays
     // open, the sections wrapper grows past its clip at the picker's
-    // upper bases, and overflow becomes real.
-    let steps = (theme::MAX_FONT_SIZE_PX - f32::from(theme::DEFAULT_FONT_SIZE)).round() as usize;
-    for _ in 0..steps {
+    // upper bases, and overflow becomes real. Loop-until-value with a
+    // bounded iteration cap: a fixed click count (5 for 13 -> 18)
+    // dropped clicks on the round-2 CI matrix because a rapid loop of
+    // identical-position `simulate_click` calls falls into gpui's
+    // "same position, no motion" path and only the first click fires
+    // the button's `on_click`. A `simulate_mouse_move` off the button
+    // between clicks parks the pointer elsewhere so every subsequent
+    // click enters the hitbox fresh; the loop-until-value guard makes
+    // the test tolerant of any one-off flake by retrying up to the
+    // cap rather than trusting a raw click count.
+    let target = theme::clamp_font_size(theme::MAX_FONT_SIZE_PX);
+    let park = gpui::point(px(0.), px(0.));
+    let click_cap = 32usize;
+    let mut clicks = 0usize;
+    loop {
+        let current = visual.update(|_, cx| cx.theme().font_size);
+        if current == target {
+            break;
+        }
+        assert!(
+            clicks < click_cap,
+            "test premise: {click_cap} stepper clicks must reach MAX \
+             ({target:?}); got {current:?} after {clicks} clicks",
+        );
         let grow = visual
             .debug_bounds("font-size-grow")
             .expect("grow button renders while modal is open");
-        visual.simulate_click(grow.center(), Default::default());
+        visual.simulate_mouse_move(park, None, gpui::Modifiers::default());
+        visual.simulate_click(grow.center(), gpui::Modifiers::default());
         visual.update(|window, cx| window.draw(cx).clear(cx));
+        clicks += 1;
     }
     let grown_size = visual.update(|_, cx| cx.theme().font_size);
     assert_eq!(
-        grown_size,
-        theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+        grown_size, target,
         "test premise: stepper clicks must reach the MAX font size \
          mid-session — got {grown_size:?}",
     );
