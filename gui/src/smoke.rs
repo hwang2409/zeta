@@ -19,39 +19,64 @@ const NATIVE_GUARD_COMPOSER_HEIGHT: Pixels = px(80.);
 /// inside its own fragment (`scan_inline_flow_recorder`).
 const OVER_WIDE_CODE_TOKEN_LEN: usize = 192;
 
-fn native_guard_shapes() -> Vec<(&'static str, String)> {
+/// One entry in the native guard matrix. `prose_only` selects between
+/// two transcript layouts and two scan gutters:
+///
+/// * `prose_only = false` — the mixed transcript with tool receipts and
+///   a scrollbar-triggering row set (see `native_guard_transcript`).
+///   The pixel scan starts at the wider `TRANSCRIPT_MAX_WIDTH` content
+///   edge because tool rows legitimately paint out to that cap. Prose
+///   overshoots between the prose edge and the tool edge are
+///   under-scanned here — the round-3 pixel-gutter finding.
+/// * `prose_only = true` — an assistant-only transcript (see
+///   `native_guard_prose_only_transcript`). The scan starts at the
+///   prose column's own content edge derived from
+///   `theme::prose_max_width(font_size)` (the ZETA-124 renderer
+///   formula), closing the 36.92px unscanned strip a prose glyph
+///   escape would otherwise land in at 922×610 / 11px.
+struct GuardShape {
+    name: &'static str,
+    source: String,
+    prose_only: bool,
+}
+
+fn native_guard_shapes() -> Vec<GuardShape> {
     let over_wide_ident = "a".repeat(OVER_WIDE_CODE_TOKEN_LEN);
     vec![
-    (
-        "wedge",
-        "2. `zeta serve` session hardening — half-written session dirs \
+    GuardShape {
+        name: "wedge",
+        source: "2. `zeta serve` session hardening — half-written session dirs \
          (`conversation.jsonl` without `meta.json`) wedge status/list. Atomic dir \
          creation via `meta.json` tmp+rename.\n3. Follow-up work with additional \
          wrapping to exercise the hanging indent so the paragraph reliably breaks \
          onto a continuation line even at 2204px.".into(),
-    ),
-    (
-        "adjacent",
-        "1. Outer numbered item with plenty of prose to force wrapping onto multiple \
+        prose_only: false,
+    },
+    GuardShape {
+        name: "adjacent",
+        source: "1. Outer numbered item with plenty of prose to force wrapping onto multiple \
          continuation lines at every picker step.\n2. Second outer numbered item \
          to prove the second sibling wraps in the same column geometry as the first \
          with more filler prose here now.".into(),
-    ),
-    (
-        "nested",
-        "1. Outer item with room to spare.\n   - Nested bullet A that itself carries \
+        prose_only: false,
+    },
+    GuardShape {
+        name: "nested",
+        source: "1. Outer item with room to spare.\n   - Nested bullet A that itself carries \
          enough hanging-indent text to force wrap boundaries near the prose cap at \
          every base picker step.\n   - Nested bullet B with more prose — deeper \
          nesting stays inside the same column even when the marker indent has \
          consumed a few characters.".into(),
-    ),
-    (
-        "long_token",
-        "Prose leading up to a very long unbroken token that the wrap engine cannot \
+        prose_only: false,
+    },
+    GuardShape {
+        name: "long_token",
+        source: "Prose leading up to a very long unbroken token that the wrap engine cannot \
          break: \
          supercalifragilisticexpialidocious_but_much_longer_than_any_column_should_ever_be_aaaaaaaaaaaaaaaaaaaa \
          and then some trailing prose after it.".into(),
-    ),
+        prose_only: false,
+    },
     // ZETA-129: exercise inline-code chips of length 1..16 in a bullet list.
     // The upstream `InlineFlow::prepaint` bug drops the last glyph of any
     // 9-char chip (locally) and paints overflow glyphs onto the next line
@@ -65,19 +90,19 @@ fn native_guard_shapes() -> Vec<(&'static str, String)> {
     // `zeta129_inline_code_chip_ladder_structure` in `tests.rs` is a
     // chip-structure regression cover only — it inspects background
     // quads and cannot see the phantom-glyph paint (which is a text
-    // sprite). This native shape stays because it exercises the full
-    // rendering pipeline (font loading, viewport sizing, scrollbar
-    // chrome) as a regression cover; a future defect that manifests in
-    // the gutter (a widened chip that grazes `content_right`) still
-    // trips here.
-    (
-        "code_ladder",
-        "- `a` len=1\n- `ab` len=2\n- `abc` len=3\n- `abcd` len=4\n- `abcde` len=5\n\
+    // sprite). Prose-only so the pixel scan runs against the prose
+    // content edge — a phantom glyph escaping the chip lands on prose
+    // rows, and only the narrower gutter can catch it (the wider tool
+    // gutter leaves a ~37px unscanned strip at 922×610 / 11px).
+    GuardShape {
+        name: "code_ladder",
+        source: "- `a` len=1\n- `ab` len=2\n- `abc` len=3\n- `abcd` len=4\n- `abcde` len=5\n\
          - `abcdef` len=6\n- `abcdefg` len=7\n- `abcdefgh` len=8\n- `abcdefghi` len=9\n\
          - `abcdefghij` len=10\n- `abcdefghijk` len=11\n- `abcdefghijkl` len=12\n\
          - `abcdefghijklm` len=13\n- `abcdefghijklmn` len=14\n\
          - `abcdefghijklmno` len=15\n- `abcdefghijklmnop` len=16".into(),
-    ),
+        prose_only: true,
+    },
     // ZETA-129 round 2: a backticked identifier wider than
     // `TRANSCRIPT_MAX_WIDTH` at every picker font size (see
     // `OVER_WIDE_CODE_TOKEN_LEN`). The MaxContent fix's main regression
@@ -85,18 +110,21 @@ fn native_guard_shapes() -> Vec<(&'static str, String)> {
     // grapheme boundaries: the outer `push_text_wrap_fragments` splits
     // the identifier into multiple `Inline` fragments; each fragment's
     // inner `StyledText` must NOT re-wrap. `scan_native_gutter` asserts
-    // no split fragment paints past `content_right`;
+    // no split fragment paints past the prose content edge (round-3
+    // finding: the wider tool-edge gutter left a 36.92px strip at
+    // 922×610 / 11px where a prose grapheme could escape unseen);
     // `scan_inline_flow_recorder` asserts each inner fragment records
     // zero wrap boundaries. Under `ZETA_GUI_INLINE_FLOW_DEFINITE=1` the
     // Definite width axis re-enters shape_text and CoreText drift can
     // trip either scan depending on the fragment landing.
-    (
-        "code_wide_token",
-        format!(
+    GuardShape {
+        name: "code_wide_token",
+        source: format!(
             "Prose leading up to a code span wider than every tested column: \
              `{over_wide_ident}` and then trailing prose after it."
         ),
-    ),
+        prose_only: true,
+    },
     ]
 }
 
@@ -237,6 +265,7 @@ fn scan_native_gutter(
     window: &Window,
     font_size: Pixels,
     shape: &str,
+    prose_only: bool,
     achieved_width: u32,
     achieved_height: u32,
 ) {
@@ -244,25 +273,34 @@ fn scan_native_gutter(
     let window_width = f32::from(window.bounds().size.width);
     let main_left = f32::from(theme::SIDEBAR_WIDTH);
     let main_width = (window_width - main_left).max(0.);
-    // Content_right is derived from the TRANSCRIPT_MAX_WIDTH column, not
-    // the narrower prose cap. Per ZETA-#165 the prose measure cap
-    // centers assistant/user/thinking text at a comfortable ~88ch
-    // measure, but tool receipts and fenced code blocks are ALLOWED
-    // wider — up to `TRANSCRIPT_MAX_WIDTH`. Scanning against the prose
-    // cap would flag every receipt paint at wide centered viewports as
-    // a glyph escape; scanning against the wider receipt/code cap
-    // matches the design's contract that a legal wider row paints
-    // inside that column.
+    // `content_right` is derived from the same width the renderer caps
+    // the transcript row at:
     //
-    // Tradeoff (documented, not a defect): at wide centered viewports
-    // where the receipt column is strictly wider than the prose
-    // column, PROSE-specific overshoots into the receipt-only strip
-    // (between prose_content_right and content_right) are under-scanned
-    // here. At narrow viewports the prose column and the receipt
-    // column coincide (both capped by main_width), so the original
-    // orphan-glyph defect class stays covered — the ZETA-127 bug and
-    // r3 acceptance mutation both trip at the narrow viewport.
-    let column_width = f32::from(theme::TRANSCRIPT_MAX_WIDTH).min(main_width);
+    // * MIXED transcript rows (tool receipts + assistant prose) — the
+    //   scan uses `TRANSCRIPT_MAX_WIDTH`. Tool receipts and fenced
+    //   error blocks legitimately paint out to that wider cap; a
+    //   narrower gutter would flag every receipt paint at a wide
+    //   centered viewport as a glyph escape.
+    // * PROSE-ONLY transcript rows (the two code shapes) — the scan
+    //   uses `theme::prose_max_width(font_size)`, the same width
+    //   `transcript_render::render_row` gives assistant rows via
+    //   `.max_w(prose_max_width(base))`. At 922×610 / 11px the mixed
+    //   gutter leaves a 36.92px strip (prose_content_right=869.08 vs.
+    //   mixed content_right=906) unscanned where an escaped prose
+    //   glyph would land — the round-3 pixel-gutter finding. Pairing
+    //   prose-only shapes with the narrower gutter here closes it,
+    //   without narrowing the mixed pass and over-flagging legitimate
+    //   receipt paints.
+    //
+    // Both branches derive their column width from a single renderer
+    // token so a picker-scale change (ZETA-124) lands in the scan
+    // automatically.
+    let column_cap = if prose_only {
+        f32::from(theme::prose_max_width(font_size))
+    } else {
+        f32::from(theme::TRANSCRIPT_MAX_WIDTH)
+    };
+    let column_width = column_cap.min(main_width);
     let content_right =
         main_left + (main_width - column_width) / 2. + column_width - theme::PROSE_ROW_PADDING_X;
     let x_start = (content_right * scale).ceil() as u32;
@@ -291,14 +329,15 @@ fn scan_native_gutter(
     ) {
         panic!(
             "native pixel gutter guard failed: shape={shape} size={font_size:?} \
-             x_range={escape_start}..={escape_end} gutter={x_start}..{x_end} \
-             window_width={window_width} scale={scale} column_width={column_width} \
-             content_right={content_right} y_range={y_start}..{y_end} background={background:?} \
+             prose_only={prose_only} x_range={escape_start}..={escape_end} \
+             gutter={x_start}..{x_end} window_width={window_width} scale={scale} \
+             column_width={column_width} content_right={content_right} \
+             y_range={y_start}..{y_end} background={background:?} \
              masked={scrollbar_masks:?}"
         );
     }
     println!(
-        "NATIVE-GUARD-PASS: shape={shape} size={font_size:?} \
+        "NATIVE-GUARD-PASS: shape={shape} size={font_size:?} prose_only={prose_only} \
          viewport={achieved_width}x{achieved_height} gutter={x_start}..{x_end} \
          scrollbar_masks={} rects={scrollbar_masks:?}",
         scrollbar_masks.len()
@@ -320,8 +359,10 @@ fn scan_native_gutter(
 /// through. The paired `gui-native-guards-inline-flow-mutation`
 /// Makefile target invokes `make gui-native-guards` with
 /// `ZETA_GUI_INLINE_FLOW_DEFINITE=1` and inverts the exit code — the
-/// mutation MUST trip this scan (18px on the `code_ladder` shape is
-/// the demonstrated CoreText trip on this host and on macOS-latest CI).
+/// mutation MUST trip this scan. Pinned CI trip evidence:
+/// shape=`wedge`, size=13px, sample text=`meta.json`, wrap_boundaries=1
+/// — the audit's length-9 code chip on the 13px × 0.875 mono metrics
+/// crossing the sub-pixel `shape_line.width()` boundary.
 fn scan_inline_flow_recorder(shape: &str, font_size: Pixels, achieved: (u32, u32)) {
     let samples = gpui_kit::base::zeta129_wrap_recorder::samples();
     for sample in &samples {
@@ -421,9 +462,10 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
             appearance.font_size = font_size;
             cx.update(|_, cx| theme::apply_with(cx, &appearance))
                 .expect("native guard window remains open");
-            for (shape, source) in &shapes {
-                let shape = *shape;
-                let source = source.as_str();
+            for entry in &shapes {
+                let shape = entry.name;
+                let source = entry.source.as_str();
+                let prose_only = entry.prose_only;
                 // ZETA-129: clear the wrap recorder before each shape so
                 // the post-paint scan reads samples from THIS render only.
                 // The recorder is populated by the vendored
@@ -444,7 +486,18 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
                         // scan band, so a real overshoot adjacent to
                         // the scrollbar (or on any other row) still
                         // trips the guard cleanly.
-                        view.state.transcript = native_guard_transcript(source);
+                        //
+                        // Prose-only shapes render an assistant-only
+                        // transcript so the whole content area is prose;
+                        // the pixel scan then uses the narrower prose
+                        // content edge, catching escapes in the 36.92px
+                        // strip the mixed transcript's wider gutter
+                        // would leave unscanned (round-3 finding 1).
+                        view.state.transcript = if prose_only {
+                            native_guard_prose_only_transcript(source)
+                        } else {
+                            native_guard_transcript(source)
+                        };
                         let count = view.state.transcript.len();
                         view.transcript
                             .update(cx, |scroll, cx| scroll.reset(count, cx));
@@ -469,7 +522,9 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
                         ));
                         image.save(path).expect("save native guard capture");
                     }
-                    scan_native_gutter(&image, window, font_size, shape, achieved.0, achieved.1);
+                    scan_native_gutter(
+                        &image, window, font_size, shape, prose_only, achieved.0, achieved.1,
+                    );
                     scan_inline_flow_recorder(shape, font_size, achieved);
                 })
                 .expect("native guard window remains open");
@@ -494,17 +549,29 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
     println!("NATIVE-GUARD-PASS: matrix={matrix_entries} achieved_viewports={achieved_list}");
 }
 
-/// Build the transcript the native pixel-gutter guard renders for one
-/// shape entry. The assistant row carries the wrapping prose the guard
-/// was originally designed to stress. Alongside it we seed a 3-receipt
-/// grouped run AND a solo receipt so glyph escapes in the tool-receipt
-/// paint paths ride the same pixel gutter — the r3 review flagged that
-/// receipt rows were previously invisible to the guard. The transcript
-/// is deliberately tall enough to trigger the scrollbar at 18px on the
-/// smaller viewport (717x474), so the scrollbar-mask code path stays
-/// exercised — a future change that regresses scrollbar geometry (moves
-/// its thumb OUT of the mask zone, or paints extra chrome next to it)
-/// still shows up in CI here rather than passing silently.
+/// Prose-only transcript for shapes that need to be pixel-scanned
+/// against the narrower prose content edge (see the round-3 pixel
+/// gutter finding). Contains ONLY the assistant row so no tool receipt
+/// (which legitimately paints out to `TRANSCRIPT_MAX_WIDTH`) lands in
+/// the y-band the prose gutter scans. The mixed transcript below stays
+/// the default for non-prose shapes.
+fn native_guard_prose_only_transcript(source: &str) -> Vec<TranscriptEntry> {
+    use zeta_gui::state::TranscriptEntry;
+    vec![TranscriptEntry::Assistant(source.into())]
+}
+
+/// Mixed transcript for shapes whose escapes we want to trip against
+/// the wider tool-receipt gutter. The assistant row carries the
+/// wrapping prose the guard was originally designed to stress. Alongside
+/// it we seed a 3-receipt grouped run AND a solo receipt so glyph
+/// escapes in the tool-receipt paint paths ride the same pixel gutter —
+/// the r3 review flagged that receipt rows were previously invisible to
+/// the guard. The transcript is deliberately tall enough to trigger the
+/// scrollbar at 18px on the smaller viewport (717x474), so the
+/// scrollbar-mask code path stays exercised — a future change that
+/// regresses scrollbar geometry (moves its thumb OUT of the mask zone,
+/// or paints extra chrome next to it) still shows up in CI here rather
+/// than passing silently.
 fn native_guard_transcript(source: &str) -> Vec<TranscriptEntry> {
     use zeta_gui::cards::{Card, OutputTail};
     use zeta_gui::state::{tool_excerpt, ToolReceiptKey, TranscriptEntry};
