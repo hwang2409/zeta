@@ -7,21 +7,35 @@ const NATIVE_GUARD_COLOR_THRESHOLD: u8 = 10;
 const NATIVE_GUARD_MIN_CONSECUTIVE: usize = 2;
 const NATIVE_GUARD_SCROLLBAR_WIDTH: Pixels = px(8.);
 const NATIVE_GUARD_COMPOSER_HEIGHT: Pixels = px(80.);
-const NATIVE_GUARD_SHAPES: &[(&str, &str)] = &[
+/// Backticked identifier length that exceeds every tested column at every
+/// tested base font size. `TRANSCRIPT_MAX_WIDTH` caps the widest column at
+/// 1024px; at 11px the mono advance is roughly `11 * MONO_CH_ADVANCE`
+/// (~6.82px), so 192 chars renders ~1310px — comfortably wider than the
+/// cap. At 18px the same token renders ~2143px, well past even the
+/// narrower 0.7-viewport column. The outer flow's
+/// `push_text_wrap_fragments` grapheme-splits the token onto multiple
+/// lines; the guard's job is to confirm no split fragment paints past
+/// `content_right` (`scan_native_gutter`) and no inner `Inline` re-wraps
+/// inside its own fragment (`scan_inline_flow_recorder`).
+const OVER_WIDE_CODE_TOKEN_LEN: usize = 192;
+
+fn native_guard_shapes() -> Vec<(&'static str, String)> {
+    let over_wide_ident = "a".repeat(OVER_WIDE_CODE_TOKEN_LEN);
+    vec![
     (
         "wedge",
         "2. `zeta serve` session hardening — half-written session dirs \
          (`conversation.jsonl` without `meta.json`) wedge status/list. Atomic dir \
          creation via `meta.json` tmp+rename.\n3. Follow-up work with additional \
          wrapping to exercise the hanging indent so the paragraph reliably breaks \
-         onto a continuation line even at 2204px.",
+         onto a continuation line even at 2204px.".into(),
     ),
     (
         "adjacent",
         "1. Outer numbered item with plenty of prose to force wrapping onto multiple \
          continuation lines at every picker step.\n2. Second outer numbered item \
          to prove the second sibling wraps in the same column geometry as the first \
-         with more filler prose here now.",
+         with more filler prose here now.".into(),
     ),
     (
         "nested",
@@ -29,14 +43,14 @@ const NATIVE_GUARD_SHAPES: &[(&str, &str)] = &[
          enough hanging-indent text to force wrap boundaries near the prose cap at \
          every base picker step.\n   - Nested bullet B with more prose — deeper \
          nesting stays inside the same column even when the marker indent has \
-         consumed a few characters.",
+         consumed a few characters.".into(),
     ),
     (
         "long_token",
         "Prose leading up to a very long unbroken token that the wrap engine cannot \
          break: \
          supercalifragilisticexpialidocious_but_much_longer_than_any_column_should_ever_be_aaaaaaaaaaaaaaaaaaaa \
-         and then some trailing prose after it.",
+         and then some trailing prose after it.".into(),
     ),
     // ZETA-129: exercise inline-code chips of length 1..16 in a bullet list.
     // The upstream `InlineFlow::prepaint` bug drops the last glyph of any
@@ -44,24 +58,47 @@ const NATIVE_GUARD_SHAPES: &[(&str, &str)] = &[
     // at a stale x-position — the drift threshold is CoreText-metric
     // dependent, so the ladder runs past 12 to guarantee the mutation
     // crosses it on every CI font resolution. A1 / A2 detection is owned
-    // by the headless painted_quads guard
-    // (`zeta129_inline_code_chip_ladder_paints_one_widening_chip_per_length`
-    // in `tests.rs`) — the phantom glyphs land inside the content column
-    // and coincide with the scrollbar x-band at ladder positions, both of
-    // which the native pixel-gutter scan cannot resolve. This native shape
-    // stays because it exercises the full rendering pipeline (font
-    // loading, viewport sizing, scrollbar chrome) as a regression cover;
-    // a future defect that manifests in the gutter (a widened chip that
-    // grazes `content_right`) still trips here.
+    // by `scan_inline_flow_recorder` below (see the vendored
+    // `zeta129_wrap_recorder` in `gui/vendor/gpui-base/`), which runs
+    // AFTER this shape's native paint and asserts every inner text
+    // fragment recorded zero wrap boundaries. The headless
+    // `zeta129_inline_code_chip_ladder_structure` in `tests.rs` is a
+    // chip-structure regression cover only — it inspects background
+    // quads and cannot see the phantom-glyph paint (which is a text
+    // sprite). This native shape stays because it exercises the full
+    // rendering pipeline (font loading, viewport sizing, scrollbar
+    // chrome) as a regression cover; a future defect that manifests in
+    // the gutter (a widened chip that grazes `content_right`) still
+    // trips here.
     (
         "code_ladder",
         "- `a` len=1\n- `ab` len=2\n- `abc` len=3\n- `abcd` len=4\n- `abcde` len=5\n\
          - `abcdef` len=6\n- `abcdefg` len=7\n- `abcdefgh` len=8\n- `abcdefghi` len=9\n\
          - `abcdefghij` len=10\n- `abcdefghijk` len=11\n- `abcdefghijkl` len=12\n\
          - `abcdefghijklm` len=13\n- `abcdefghijklmn` len=14\n\
-         - `abcdefghijklmno` len=15\n- `abcdefghijklmnop` len=16",
+         - `abcdefghijklmno` len=15\n- `abcdefghijklmnop` len=16".into(),
     ),
-];
+    // ZETA-129 round 2: a backticked identifier wider than
+    // `TRANSCRIPT_MAX_WIDTH` at every picker font size (see
+    // `OVER_WIDE_CODE_TOKEN_LEN`). The MaxContent fix's main regression
+    // condition is a code span that the outer flow must break at
+    // grapheme boundaries: the outer `push_text_wrap_fragments` splits
+    // the identifier into multiple `Inline` fragments; each fragment's
+    // inner `StyledText` must NOT re-wrap. `scan_native_gutter` asserts
+    // no split fragment paints past `content_right`;
+    // `scan_inline_flow_recorder` asserts each inner fragment records
+    // zero wrap boundaries. Under `ZETA_GUI_INLINE_FLOW_DEFINITE=1` the
+    // Definite width axis re-enters shape_text and CoreText drift can
+    // trip either scan depending on the fragment landing.
+    (
+        "code_wide_token",
+        format!(
+            "Prose leading up to a code span wider than every tested column: \
+             `{over_wide_ident}` and then trailing prose after it."
+        ),
+    ),
+    ]
+}
 
 fn native_guard_enabled() -> bool {
     env::var_os("ZETA_GUI_NATIVE_GUARDS").as_deref() == Some(std::ffi::OsStr::new("1"))
@@ -330,6 +367,7 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
         theme::DEFAULT_FONT_SIZE,
         px(theme::MAX_FONT_SIZE_PX),
     ];
+    let shapes = native_guard_shapes();
     let mut achieved_viewports: Vec<(u32, u32)> = Vec::new();
     let mut matrix_entries = 0;
     let mut appearance = theme::Appearance::default();
@@ -383,7 +421,9 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
             appearance.font_size = font_size;
             cx.update(|_, cx| theme::apply_with(cx, &appearance))
                 .expect("native guard window remains open");
-            for &(shape, source) in NATIVE_GUARD_SHAPES {
+            for (shape, source) in &shapes {
+                let shape = *shape;
+                let source = source.as_str();
                 // ZETA-129: clear the wrap recorder before each shape so
                 // the post-paint scan reads samples from THIS render only.
                 // The recorder is populated by the vendored
