@@ -9297,7 +9297,7 @@ fn zeta129_inline_code_chip_ladder_paints_one_widening_chip_per_length(cx: &mut 
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let mut lines: Vec<String> = Vec::with_capacity(16);
     for len in 1..=16 {
-        let body: String = std::iter::repeat('a').take(len).collect();
+        let body = "a".repeat(len);
         lines.push(format!("- `{body}` len={len}"));
     }
     let source = lines.join("\n");
@@ -9419,7 +9419,7 @@ fn zeta129_inline_flow_never_wraps_a_text_fragment_inside_its_own_fragment(
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let mut lines: Vec<String> = Vec::with_capacity(16);
     for len in 1..=16 {
-        let body: String = std::iter::repeat('a').take(len).collect();
+        let body = "a".repeat(len);
         lines.push(format!("- `{body}` len={len}"));
     }
     let source = lines.join("\n");
