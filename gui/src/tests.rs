@@ -10702,7 +10702,7 @@ fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut Te
             "the new session is inserted alongside the previous one",
         );
         assert_eq!(
-            view.state.sessions[0].session_id.as_ref(),
+            view.state.sessions[0].session_id.as_str(),
             session_c.as_str(),
             "the new session lands at index 0 (above the previous row)",
         );
