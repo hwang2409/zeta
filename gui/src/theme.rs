@@ -202,15 +202,16 @@ pub const SETTINGS_ROW_DESCRIPTION_GAP: Pixels = px(2.);
 /// Maximum height for the Model list inside the Settings modal. The list
 /// scrolls beyond this so the three-section body (Model + Behavior +
 /// Appearance) plus optional credential alert fits inside the 760px test
-/// viewport across every picker base (11px…18px). 132px holds a two-
-/// group three-row catalog (claude + codex, three models, ~130px) in
+/// viewport across every picker base (11px…18px). 160px holds a two-
+/// group three-row catalog (claude + codex, three models, ~156px) in
 /// full at 13px — the credential-error swap test relies on the codex
 /// row being clickable without scrolling — and a longer catalog scrolls
 /// with the focused row auto-revealed via `scroll_to_item`. ZETA-132
-/// trimmed this from 160 so the Model section no longer dominates the
-/// panel, leaving Behavior + Appearance visible on open at every common
-/// window size.
-pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(132.);
+/// tried trimming this to 132 to slim the Model section on open; that
+/// clipped the codex row inside the swap test and buttoned it off from
+/// simulated clicks, so the fix now leans on the raised panel cap +
+/// lowered top offset alone for the C3 miss.
+pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(160.);
 
 /// Absolute ceiling for the Settings panel's rendered height. The panel
 /// still sizes off the viewport shelf below the 15% modal-top offset so
@@ -1868,7 +1869,7 @@ mod tests {
         assert_eq!(SETTINGS_SECTION_GAP, px(10.));
         assert_eq!(SETTINGS_ROW_GAP, px(6.));
         assert_eq!(SETTINGS_ROW_DESCRIPTION_GAP, px(2.));
-        assert_eq!(SETTINGS_MODEL_LIST_MAX_HEIGHT, px(132.));
+        assert_eq!(SETTINGS_MODEL_LIST_MAX_HEIGHT, px(160.));
         assert_eq!(SETTINGS_PANEL_MAX_HEIGHT, px(680.));
         // Slash-menu chrome tokens ride here rather than a raw
         // `px(6.)` / `px(4.)` sprinkled across `render_slash_menu` —
