@@ -218,8 +218,8 @@ pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(132.);
 /// stretch the panel: a 1200px viewport shelf is ~1004px, which would grow
 /// the flat panel to full-page proportions and break the wiki-modal
 /// silhouette. Sections still scroll inside the panel when the cap bites.
-/// ZETA-132 raised this from 560 so all three sections (Model + Behavior
-/// + Appearance) fit on open at common window heights (900px+) without
+/// ZETA-132 raised this from 560 so all three sections (Model, Behavior,
+/// Appearance) fit on open at common window heights (900px+) without
 /// forcing the user to discover the hidden scroll surface.
 pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(680.);
 
