@@ -5,7 +5,9 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::sync::LazyLock;
-use zeta_gui::client::{ModelCatalog, ServerEvent, SessionMetadata, StatusResult, ToolCall};
+use zeta_gui::client::{
+    ModelCatalog, ServerEvent, SessionMetadata, SlashCommandInfo, SlashList, StatusResult, ToolCall,
+};
 use zeta_gui::session::{self, Branch, ImageAttachment, SessionSettings};
 
 /// Isolated `ZETA_HOME` shared by every test in this file. Set once on first
@@ -9363,3 +9365,633 @@ fn zeta129_inline_code_chip_ladder_structure(cx: &mut TestAppContext) {
 // under `ZETA_GUI_INLINE_FLOW_DEFINITE=1`). Pinned CI trip evidence:
 // shape=`wedge`, size=13px, sample text=`meta.json`, wrap_boundaries=1
 // — the audit's length-9 code chip on the 13px × 0.875 mono metrics.
+
+/// A short catalog for the slash menu tests below. Every entry names a
+/// server-side builtin so the shape matches what `slash_list` returns in
+/// production; the menu never has to guess a `client_only` from a name.
+fn slash_catalog(names: &[&str]) -> SlashList {
+    SlashList {
+        commands: names
+            .iter()
+            .map(|name| SlashCommandInfo {
+                name: (*name).to_owned(),
+                description: format!("{name} description"),
+                kind: "builtin".to_owned(),
+                source: "builtin".to_owned(),
+                client_only: false,
+                unavailable: None,
+            })
+            .collect(),
+        notices: Vec::new(),
+    }
+}
+
+fn enable_slash_extensions(
+    visual: &mut VisualTestContext,
+    view: &Entity<ZetaView>,
+    receiver: &Receiver<CommandMessage>,
+    catalog: SlashList,
+) {
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::SlashExtensions(true), window, cx);
+            view.apply_worker_message(WorkerMessage::SlashCommands(catalog), window, cx);
+        });
+    });
+    // SlashExtensions(true) queues a SlashList against the active session
+    // (round-3 F2 wired the request to fire from the shared active-session
+    // block instead of only from `Session`). Drain it here so tests can
+    // assert on the next command they trigger, not on this housekeeping.
+    let queued = receiver.try_recv();
+    assert!(
+        matches!(&queued, Ok(CommandMessage::SlashList)),
+        "enable_slash_extensions must queue exactly one SlashList, got {queued:?}"
+    );
+}
+
+#[gpui::test]
+fn slash_multiline_draft_dispatches_through_slash_run(cx: &mut TestAppContext) {
+    // ZETA-130 round 2 F1: a `/status\nfoo` draft MUST route through
+    // `slash_run`; the previous submit path silently sent it as a chat
+    // message to the model because `leading_slash_token` returned None
+    // when the value contained a newline. Any regression here breaks the
+    // lane's invariant that slash-prefixed drafts never reach the model.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    enable_slash_extensions(&mut visual, &view, &receiver, slash_catalog(&["status"]));
+
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |input, cx| input.set_value("/status\nfoo", window, cx));
+        });
+    });
+    visual.simulate_keystrokes("enter");
+    let dispatched = receiver.try_recv();
+    assert!(
+        matches!(&dispatched, Ok(CommandMessage::SlashRun(text)) if text == "/status\nfoo"),
+        "multiline slash draft must dispatch via slash_run, got {dispatched:?}"
+    );
+    assert!(
+        !matches!(receiver.try_recv(), Ok(CommandMessage::Send(_))),
+        "no Send RPC may fire for a `/`-prefixed multiline draft"
+    );
+    view.read_with(&visual, |view, _| {
+        assert!(view.pending_command, "SlashRun sets pending until reply");
+    });
+}
+
+#[gpui::test]
+fn slash_first_enter_completes_and_second_enter_submits(cx: &mut TestAppContext) {
+    // ZETA-130 round 2 F2. Contract: the first Enter completes the draft
+    // to the highlighted command's canonical form (`/<name> ` when no
+    // arguments are typed yet); a subsequent Enter dispatches through
+    // `send_composer`. Enter never surprise-submits on the first press —
+    // the user always sees the completed form before it leaves the
+    // composer. The earlier implementation left Enter in selection mode
+    // forever, so a second Enter on `/status ` was a silent no-op.
+    //
+    // Real characters are typed through `simulate_input` so the composer's
+    // Change subscription fires and the menu opens the way it does in
+    // production — `TextareaState::set_value` explicitly suppresses
+    // Change (gpui-base state.rs `emit_events = false`) and never opens
+    // the menu, so a set_value-based seed would test a different path
+    // than what a user actually walks through.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    enable_slash_extensions(
+        &mut visual,
+        &view,
+        &receiver,
+        slash_catalog(&["status", "stop", "model"]),
+    );
+
+    // Path A: partial `/st` → Enter completes to `/status ` → Enter dispatches.
+    visual.simulate_input("/st");
+    view.read_with(&visual, |view, cx| {
+        assert_eq!(view.composer.read(cx).value().as_ref(), "/st");
+        assert!(
+            view.slash_menu.open,
+            "typing `/` opens the menu via the Change subscription"
+        );
+    });
+    visual.simulate_keystrokes("enter");
+    view.read_with(&visual, |view, cx| {
+        assert_eq!(view.composer.read(cx).value().as_ref(), "/status ");
+    });
+    assert!(
+        receiver.try_recv().is_err(),
+        "first Enter completes the draft; nothing dispatches yet"
+    );
+    visual.simulate_keystrokes("enter");
+    let dispatched = receiver.try_recv();
+    assert!(
+        matches!(&dispatched, Ok(CommandMessage::SlashRun(text)) if text == "/status "),
+        "second Enter on the completed draft dispatches, got {dispatched:?}"
+    );
+
+    // Path B: fully-typed `/model` still completes first (adds trailing
+    // space). Enter must never surprise-submit on the first press even
+    // when the token already equals the highlighted command name.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.pending_command = false;
+            view.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            view.slash_menu.dismiss();
+        });
+    });
+    visual.simulate_input("/model");
+    visual.simulate_keystrokes("enter");
+    view.read_with(&visual, |view, cx| {
+        assert_eq!(view.composer.read(cx).value().as_ref(), "/model ");
+    });
+    assert!(
+        receiver.try_recv().is_err(),
+        "fully-typed command completes first; Enter must not surprise-dispatch"
+    );
+    visual.simulate_keystrokes("enter");
+    let dispatched = receiver.try_recv();
+    assert!(
+        matches!(&dispatched, Ok(CommandMessage::SlashRun(text)) if text == "/model "),
+        "second Enter dispatches the completed draft, got {dispatched:?}"
+    );
+}
+
+#[gpui::test]
+fn slash_run_capability_gate_refuses_submit_on_legacy_server(cx: &mut TestAppContext) {
+    // ZETA-130 round 2 F3: an older 1.1 server that never learned about
+    // `slash_run` must not receive one, and the composer must refuse to
+    // leak the `/`-prefixed draft to the model as chat.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // No SlashExtensions(true) — the view starts with slash_extensions=false.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |input, cx| input.set_value("/status", window, cx));
+        });
+    });
+    visual.simulate_keystrokes("enter");
+    assert!(
+        receiver.try_recv().is_err(),
+        "legacy server: composer must NOT dispatch Send or SlashRun for /status"
+    );
+    view.read_with(&visual, |view, _| {
+        assert!(
+            view.slash_output_notice
+                .as_ref()
+                .is_some_and(|notice| notice.error),
+            "the output strip must surface the unavailable notice"
+        );
+    });
+}
+
+#[gpui::test]
+fn slash_model_input_carries_pending_attachments_and_retains_draft_on_rejection(
+    cx: &mut TestAppContext,
+) {
+    // ZETA-130 round 3 F1. A slash command that resolves to `model_input`
+    // (a prompt macro like `/hi Henry`) must ship any pending image
+    // attachments alongside the composed turn — silently dropping them
+    // would be worse than the leak the round-2 gate closed. And when the
+    // resulting send is rejected, the composer must still carry the user's
+    // original slash draft so they can retry, matching the rejected-chat
+    // pattern.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    enable_slash_extensions(&mut visual, &view, &receiver, slash_catalog(&["hi"]));
+
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let good = ImageAttachment::from_bytes("hero.png".into(), &valid_png_bytes())
+                .expect("valid PNG parses");
+            view.add_pending_attachments(vec![Ok(good)], cx);
+            view.composer
+                .update(cx, |input, cx| input.set_value("/hi Henry", window, cx));
+        });
+    });
+    view.read_with(&visual, |view, _| {
+        assert_eq!(view.valid_attachment_count(), 1, "chip landed");
+    });
+
+    // Server resolves the slash macro to a model-input turn.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::SlashResult(
+                    "/hi Henry".into(),
+                    SlashRunResult::ModelInput {
+                        text: "Hi Henry".into(),
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+    });
+
+    // The composed turn MUST dispatch via SendImages so the pending
+    // attachment rides with it — plain Send here would silently drop it.
+    let dispatched = receiver.try_recv();
+    match dispatched {
+        Ok(CommandMessage::SendImages(text, images)) => {
+            assert_eq!(text, "Hi Henry");
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].name, "hero.png");
+        }
+        other => {
+            panic!("expected SendImages for a slash ModelInput with attachments, got {other:?}")
+        }
+    }
+    view.read_with(&visual, |view, cx| {
+        assert!(view.pending_command, "ModelInput seeds pending_command");
+        assert_eq!(
+            view.composer.read(cx).value().as_ref(),
+            "/hi Henry",
+            "composer keeps the original draft until the server acks — same as normal chat"
+        );
+        assert_eq!(
+            view.valid_attachment_count(),
+            1,
+            "chip stays put until Sent/ImagesSent clears it"
+        );
+        assert!(!view.slash_menu.open, "menu dismisses after dispatch");
+    });
+
+    // Server rejects. The draft must remain in place so the user can retry;
+    // clearing the composer on ModelInput (the pre-fix behavior) lost the
+    // original slash text and left the user with nothing to edit.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Rejected("model refused this turn".into()),
+                window,
+                cx,
+            );
+        });
+    });
+    view.read_with(&visual, |view, cx| {
+        assert_eq!(
+            view.composer.read(cx).value().as_ref(),
+            "/hi Henry",
+            "rejected slash send must retain the composer draft for retry"
+        );
+        assert!(
+            view.pending_user_turn
+                .as_ref()
+                .is_some_and(|turn| turn.failed),
+            "rejection flips the danger rail on the queued strip"
+        );
+        assert_eq!(
+            view.valid_attachment_count(),
+            1,
+            "chip still available for retry"
+        );
+    });
+}
+
+#[gpui::test]
+fn slash_catalog_loads_on_status_when_session_never_arrives(cx: &mut TestAppContext) {
+    // ZETA-130 round 3 F2. Initially-active sessions surface via
+    // `WorkerMessage::Status`, not `Session`. Before the fix, the catalog
+    // request was wired only to the Session handler, so an app restart on
+    // a live session showed no slash menu at all. The request now fires
+    // from the shared post-match block whenever an active session becomes
+    // visible AND slash extensions are advertised.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Clear the pre-seeded active_session so we can watch it become
+    // active via Status, matching a cold-start restore.
+    visual.update(|_, cx| {
+        view.update(cx, |view, _cx| {
+            view.state.active_session = None;
+        });
+    });
+    // Advertise slash extensions BEFORE any active session — no
+    // catalog request should fire yet (there is nothing to enumerate).
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::SlashExtensions(true), window, cx);
+        });
+    });
+    assert!(
+        receiver.try_recv().is_err(),
+        "SlashExtensions with no active session must not request the catalog"
+    );
+
+    // Cold-start Status frame carries the resumed session. The active
+    // transition + slash extensions must together trigger SlashList.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Status(StatusResult {
+                    session: Some(session()),
+                    state: "idle".into(),
+                    pending_approvals: vec![],
+                    usage: json!({}),
+                    compaction_markers: 0,
+                }),
+                window,
+                cx,
+            );
+        });
+    });
+    let dispatched = receiver.try_recv();
+    assert!(
+        matches!(&dispatched, Ok(CommandMessage::SlashList)),
+        "cold-start Status with slash extensions on must request the catalog, got {dispatched:?}"
+    );
+    // And only once per session — a second Status on the same session
+    // must not re-request.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Status(StatusResult {
+                    session: Some(session()),
+                    state: "idle".into(),
+                    pending_approvals: vec![],
+                    usage: json!({}),
+                    compaction_markers: 0,
+                }),
+                window,
+                cx,
+            );
+        });
+    });
+    assert!(
+        receiver.try_recv().is_err(),
+        "repeat Status on the same session must not re-request the catalog"
+    );
+}
+
+#[gpui::test]
+fn slash_run_trims_leading_whitespace_and_multiline_draft(cx: &mut TestAppContext) {
+    // ZETA-130 round 3 F3. `is_slash_draft` accepts a padded draft
+    // (`  /status\nfoo`); the server's `run_command` rejects it with
+    // `-32602` because its first check is a bare `text.startswith("/")`.
+    // GUI owns the normalization: trim the leading whitespace before
+    // handing the value to `slash_run` so the two sides agree.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    enable_slash_extensions(&mut visual, &view, &receiver, slash_catalog(&["status"]));
+
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.composer.update(cx, |input, cx| {
+                input.set_value("  /status\nfoo", window, cx)
+            });
+        });
+    });
+    visual.simulate_keystrokes("enter");
+    let dispatched = receiver.try_recv();
+    assert!(
+        matches!(&dispatched, Ok(CommandMessage::SlashRun(text)) if text == "/status\nfoo"),
+        "leading whitespace must be trimmed before SlashRun, got {dispatched:?}"
+    );
+    assert!(
+        !matches!(receiver.try_recv(), Ok(CommandMessage::Send(_))),
+        "a whitespace-padded `/`-prefixed value must never leak to the model as chat"
+    );
+}
+
+#[gpui::test]
+fn slash_catalog_refreshes_on_reconnect_and_capability_flap(cx: &mut TestAppContext) {
+    // ZETA-130 round 4 F1. The active session survives a connection drop,
+    // so `slash_catalog_requested` cannot latch across reconnect
+    // generations. Two flows must refresh the catalog:
+    //   (a) Lost → Connected + SlashExtensions(true) on the SAME session.
+    //   (b) Capable → legacy (SlashExtensions(false) clears commands) →
+    //       capable (SlashExtensions(true)) without disconnect.
+    // Before the fix, (a) skipped the SlashList and (b) left the menu
+    // permanently empty because the legacy handshake cleared commands but
+    // never released the request latch.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    enable_slash_extensions(&mut visual, &view, &receiver, slash_catalog(&["status"]));
+
+    // (a) Same-session reconnect must re-request the catalog.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::Lost("socket closed".into()), window, cx);
+            view.apply_worker_message(WorkerMessage::Connected, window, cx);
+            view.apply_worker_message(WorkerMessage::SlashExtensions(true), window, cx);
+        });
+    });
+    let dispatched = receiver.try_recv();
+    assert!(
+        matches!(&dispatched, Ok(CommandMessage::SlashList)),
+        "same-session reconnect must re-request the slash catalog, got {dispatched:?}"
+    );
+
+    // (b) Capable → legacy → capable without a Lost between them.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::SlashExtensions(false), window, cx);
+            view.apply_worker_message(WorkerMessage::SlashExtensions(true), window, cx);
+        });
+    });
+    let dispatched = receiver.try_recv();
+    assert!(
+        matches!(&dispatched, Ok(CommandMessage::SlashList)),
+        "capable→legacy→capable must re-request the slash catalog, got {dispatched:?}"
+    );
+}
+
+#[gpui::test]
+fn slash_notice_falls_through_to_output_strip_when_menu_is_closed(cx: &mut TestAppContext) {
+    // ZETA-130 round 4 F2. `slash_menu.set_notice` renders only while the
+    // menu is open. A user who Escapes the menu (or submits a multiline
+    // slash draft — the menu closes on newline) and hits Send must still
+    // see the reason a `/`-prefixed value was refused. Route the notice
+    // to `slash_output_notice` when the menu is closed so the message is
+    // never swallowed.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    enable_slash_extensions(&mut visual, &view, &receiver, slash_catalog(&["mcp"]));
+
+    // Unknown command with the menu closed lands on the output strip.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            assert!(
+                !view.slash_menu.open,
+                "menu is closed at the start of the test"
+            );
+            view.apply_worker_message(
+                WorkerMessage::SlashResult(
+                    "/nope".into(),
+                    SlashRunResult::Unknown {
+                        name: "nope".into(),
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+    });
+    view.read_with(&visual, |view, _| {
+        let notice = view
+            .slash_output_notice
+            .as_ref()
+            .expect("unknown with menu closed must paint the output strip");
+        assert!(notice.error, "unknown command paints as error");
+        assert!(
+            notice.text.contains("nope"),
+            "notice mentions the offending command, got {:?}",
+            notice.text
+        );
+        assert!(
+            view.slash_menu.notice.is_none(),
+            "no menu notice when the menu itself is closed"
+        );
+    });
+
+    // Unwired client-only with the menu closed also lands on the strip.
+    // `mcp` is client-only and the GUI has no dedicated dispatcher for it,
+    // so the fallback arm fires.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.slash_output_notice = None;
+            view.apply_worker_message(
+                WorkerMessage::SlashResult(
+                    "/mcp".into(),
+                    SlashRunResult::ClientOnly { name: "mcp".into() },
+                ),
+                window,
+                cx,
+            );
+        });
+    });
+    view.read_with(&visual, |view, _| {
+        let notice = view
+            .slash_output_notice
+            .as_ref()
+            .expect("unwired client-only with menu closed must paint the output strip");
+        assert!(notice.error, "unwired client-only paints as error");
+        assert!(
+            notice.text.contains("mcp"),
+            "notice mentions the command, got {:?}",
+            notice.text
+        );
+    });
+
+    // Sanity: when the menu IS open, notices still render inline on the
+    // menu (existing round-2 contract) — the strip must NOT double-up.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.slash_output_notice = None;
+            view.slash_menu.open = true;
+            view.apply_worker_message(
+                WorkerMessage::SlashResult(
+                    "/nope".into(),
+                    SlashRunResult::Unknown {
+                        name: "nope".into(),
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+    });
+    view.read_with(&visual, |view, _| {
+        assert!(
+            view.slash_output_notice.is_none(),
+            "menu-open path must not spill onto the output strip"
+        );
+        assert!(
+            view.slash_menu.notice.is_some(),
+            "menu-open path paints the inline notice"
+        );
+    });
+}
+
+#[gpui::test]
+fn slash_literal_escape_normalises_before_send(cx: &mut TestAppContext) {
+    // ZETA-130 round 4 F3. `//status` is the literal-slash escape: the
+    // shared `input_for_model` contract turns it into `/status` before
+    // the model sees the turn. The GUI submits chat directly (no slash
+    // dispatch), so it must apply the same strip before Send/SendImages.
+    // Without this the model receives the raw `//status` and answers as
+    // if the user typed the escape character on purpose.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // No slash extensions needed — this is the escape lane, not slash_run.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |input, cx| input.set_value("//status", window, cx));
+        });
+    });
+    visual.simulate_keystrokes("enter");
+    let dispatched = receiver.try_recv();
+    assert!(
+        matches!(&dispatched, Ok(CommandMessage::Send(text)) if text == "/status"),
+        "`//status` must send as literal `/status`, got {dispatched:?}"
+    );
+
+    // A `//` escape on a body with a trailing paragraph also strips ONE
+    // slash from the head — the entire chat body still ships to the model.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.pending_command = false;
+            view.composer.update(cx, |input, cx| {
+                input.set_value("//status still counts", window, cx)
+            });
+        });
+    });
+    visual.simulate_keystrokes("enter");
+    let dispatched = receiver.try_recv();
+    assert!(
+        matches!(&dispatched, Ok(CommandMessage::Send(text)) if text == "/status still counts"),
+        "`//` escape strips one slash from the head, keeping the body intact, got {dispatched:?}"
+    );
+}
+
+#[gpui::test]
+fn slash_argless_model_opens_settings(cx: &mut TestAppContext) {
+    // ZETA-130 round 4 F4. Argless `/model` opts out server-side to
+    // `client_only` so the GUI can hand off to the settings picker rather
+    // than paint a bare notice a user cannot act on. Matches the doc
+    // contract at docs/serve-protocol.md.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    enable_slash_extensions(&mut visual, &view, &receiver, slash_catalog(&["model"]));
+
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            // The Settings overlay needs the session-view capability from
+            // the server; the shipped default is false, so tests that ask
+            // to open Settings must flip it explicitly.
+            view.state.session_view.available = true;
+            view.composer
+                .update(cx, |input, cx| input.set_value("/model ", window, cx));
+            view.apply_worker_message(
+                WorkerMessage::SlashResult(
+                    "/model ".into(),
+                    SlashRunResult::ClientOnly {
+                        name: "model".into(),
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+    });
+    // open_settings queues LoadSettings and flips `settings_open` only
+    // when the reply lands — assert the RPC intent rather than the state.
+    let dispatched = receiver.try_recv();
+    assert!(
+        matches!(&dispatched, Ok(CommandMessage::LoadSettings)),
+        "argless /model must ask the server to open Settings, got {dispatched:?}"
+    );
+    view.read_with(&visual, |view, cx| {
+        assert!(
+            view.composer.read(cx).value().is_empty(),
+            "handoff clears the composer so the slash draft never re-fires"
+        );
+        assert!(
+            !view.slash_menu.open,
+            "menu dismisses after the client-only handoff"
+        );
+    });
+}

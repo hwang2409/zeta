@@ -17,7 +17,7 @@ from uuid import uuid4
 from ..core.approval import ApprovalDecision
 from ..core.session import SessionError
 from ..types import StreamEvent, StreamEventType, TextContent
-from . import ergonomics, login, model_selection
+from . import ergonomics, login, model_selection, slash_commands
 from .protocol import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
@@ -405,7 +405,13 @@ class _Client:
             return ergonomics.catalog(runtime)
         if method == "session_settings":
             return ergonomics.settings(runtime)
+        if method == "slash_list":
+            return slash_commands.list_commands(runtime)
         await self._require_idle()
+        if method == "slash_run":
+            return await slash_commands.run_command(
+                runtime, _required_string(params, "text")
+            )
         ergonomics.require_mutable(runtime)
         if method == "send_images":
             message = ergonomics.image_message(runtime, params)

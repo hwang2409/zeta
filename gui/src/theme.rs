@@ -151,6 +151,16 @@ pub const HEADER_MODE_GAP: Pixels = px(6.);
 /// column.
 pub const COMPOSER_TARGET_MAX_WIDTH: Pixels = px(260.);
 
+/// Slash-command menu chrome: container padding, container radius, and
+/// per-row radius. Named so the composer's slash surface rides the same
+/// tokens as the rest of the composer chrome rather than raw pixel
+/// literals scattered across `render_slash_menu` and `render_slash_output`.
+/// The output-notice strip reuses `SLASH_MENU_ROW_RADIUS` so both
+/// composer-attached surfaces read as one family.
+pub const SLASH_MENU_PADDING: Pixels = px(6.);
+pub const SLASH_MENU_RADIUS: Pixels = px(6.);
+pub const SLASH_MENU_ROW_RADIUS: Pixels = px(4.);
+
 /// Flat-panel modal shape. Width caps at 480px, padding is 12px on top / 16px
 /// horizontally / 14px on bottom, and the panel sits below a scrim at 25% of
 /// the viewport height.
@@ -1839,6 +1849,12 @@ mod tests {
         assert_eq!(SETTINGS_ROW_DESCRIPTION_GAP, px(2.));
         assert_eq!(SETTINGS_MODEL_LIST_MAX_HEIGHT, px(160.));
         assert_eq!(SETTINGS_PANEL_MAX_HEIGHT, px(560.));
+        // Slash-menu chrome tokens ride here rather than a raw
+        // `px(6.)` / `px(4.)` sprinkled across `render_slash_menu` —
+        // one place, one mutation-sensitive contract.
+        assert_eq!(SLASH_MENU_PADDING, px(6.));
+        assert_eq!(SLASH_MENU_RADIUS, px(6.));
+        assert_eq!(SLASH_MENU_ROW_RADIUS, px(4.));
         // Label column scales with base font size so long labels
         // ("Approval mode") never overflow the column at the picker's
         // MAX 18px base — the pre-ZETA-128-round-2 fixed 120px column

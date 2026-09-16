@@ -33,6 +33,8 @@ EXTENSION_REQUESTS = [
     "session_settings",
     "set_settings",
     "send_images",
+    "slash_list",
+    "slash_run",
 ]
 MAX_IMAGE_BYTES = 512 * 1024
 IMAGE_EXTENSIONS = {

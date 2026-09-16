@@ -451,6 +451,7 @@ pub struct ProtocolClient {
     pub session_extensions: bool,
     pub session_management: bool,
     pub login_extensions: bool,
+    pub slash_extensions: bool,
 }
 
 impl ProtocolClient {
@@ -484,6 +485,7 @@ impl ProtocolClient {
             session_extensions: false,
             session_management: false,
             login_extensions: false,
+            slash_extensions: false,
         })
     }
 
@@ -527,6 +529,19 @@ impl ProtocolClient {
             ]
             .iter()
             .all(|method| {
+                hello.capabilities["requests"]
+                    .as_array()
+                    .is_some_and(|requests| {
+                        requests
+                            .iter()
+                            .any(|request| request.as_str() == Some(method))
+                    })
+            });
+        // Older 1.1 servers pre-ZETA-130 don't advertise slash_list / slash_run.
+        // Gate on the advertised methods themselves so a new GUI against such
+        // a server never issues an RPC the server will just -32601.
+        self.slash_extensions = self.session_extensions
+            && ["slash_list", "slash_run"].iter().all(|method| {
                 hello.capabilities["requests"]
                     .as_array()
                     .is_some_and(|requests| {
@@ -757,6 +772,35 @@ impl ProtocolClient {
         self.extension("set_settings", serde_json::json!({"session_id": session_id, "model": settings.model, "approval_mode": settings.approval_mode}))
     }
 
+    pub fn slash_list(&mut self, session_id: &str) -> Result<SlashList, ClientError> {
+        self.require_slash_extensions()?;
+        self.extension("slash_list", serde_json::json!({"session_id": session_id}))
+    }
+
+    pub fn slash_run(
+        &mut self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<SlashRunResult, ClientError> {
+        self.require_slash_extensions()?;
+        self.extension(
+            "slash_run",
+            serde_json::json!({"session_id": session_id, "text": text}),
+        )
+    }
+
+    fn require_slash_extensions(&self) -> Result<(), ClientError> {
+        if self.slash_extensions {
+            Ok(())
+        } else {
+            Err(ClientError::Rpc {
+                code: -32601,
+                message: "slash commands unavailable on this server".into(),
+                data: None,
+            })
+        }
+    }
+
     pub fn send_images(
         &mut self,
         session_id: &str,
@@ -893,6 +937,51 @@ impl ProtocolClient {
 #[derive(Debug, Deserialize)]
 pub struct TreeResult {
     pub branches: Vec<Branch>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SlashCommandInfo {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub client_only: bool,
+    #[serde(default)]
+    pub unavailable: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlashList {
+    pub commands: Vec<SlashCommandInfo>,
+    #[serde(default)]
+    pub notices: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SlashRunResult {
+    Output {
+        text: String,
+    },
+    ModelInput {
+        text: String,
+    },
+    ClientOnly {
+        #[serde(default)]
+        name: String,
+    },
+    Unknown {
+        #[serde(default)]
+        name: String,
+    },
+    Error {
+        #[serde(default)]
+        text: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1087,6 +1176,46 @@ mod tests {
                 ));
                 assert!(matches!(
                     client.delete_session("id"),
+                    Err(ClientError::Rpc { code: -32601, .. })
+                ));
+            }
+            server.join().unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn slash_extensions_require_version_and_both_requests() {
+        for (index, (version, methods, expected)) in [
+            ("1.0", vec!["slash_list", "slash_run"], false),
+            ("1.1", vec![], false),
+            ("1.1", vec!["slash_list"], false),
+            ("1.1", vec!["slash_list", "slash_run"], true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path =
+                std::env::temp_dir().join(format!("zg-slash-gate-{}-{index}", std::process::id()));
+            let server = fake_server(
+                &path,
+                serde_json::json!({"id":1,"result":{"protocol_version":version,"server":"zeta","capabilities":{"requests":methods}}}),
+                None,
+            );
+            let mut client = ProtocolClient::connect_socket(&path).unwrap();
+            client.handshake().unwrap();
+            assert_eq!(client.slash_extensions, expected);
+            if !expected {
+                // A legacy server that never learned slash_list / slash_run
+                // must NEVER receive them, even if the client tries. The
+                // capability gate short-circuits with -32601 so no bogus
+                // request lands on the wire.
+                assert!(matches!(
+                    client.slash_list("id"),
+                    Err(ClientError::Rpc { code: -32601, .. })
+                ));
+                assert!(matches!(
+                    client.slash_run("id", "/status"),
                     Err(ClientError::Rpc { code: -32601, .. })
                 ));
             }

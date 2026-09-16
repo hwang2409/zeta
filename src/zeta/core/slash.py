@@ -602,6 +602,24 @@ class SlashCommandRegistry:
         return tuple(self._custom_commands[name] for name in sorted(self._custom_commands))
 
     @property
+    def builtin_commands(self) -> tuple[SlashCommand, ...]:
+        """Return built-in commands in registration order."""
+
+        return tuple(self._commands.values())
+
+    @property
+    def skill_entries(self) -> tuple[SkillMeta, ...]:
+        """Return registered skills in stable insertion order."""
+
+        return tuple(self._skills.values())
+
+    @property
+    def mcp_prompt_entries(self) -> tuple[tuple[str, str, str], ...]:
+        """Return live MCP prompt commands as ``(name, description, server)``."""
+
+        return self._mcp_prompts.completion_entries()
+
+    @property
     def notices(self) -> tuple[str, ...]:
         """Return non-fatal load notices for the session-start display."""
 
@@ -744,6 +762,11 @@ class SlashCommandRegistry:
         """Return whether model resolution can wait for shell approval."""
 
         return needs_inline_shell_resolution(value, self._custom_commands)
+
+    def custom_command_for(self, name: str) -> CustomCommand | None:
+        """Return the loaded custom command named ``name``, or None."""
+
+        return self._custom_commands.get(name)
 
     def exec_command_for(self, value: str) -> CustomCommand | None:
         """Return the custom execution command named by one input value."""

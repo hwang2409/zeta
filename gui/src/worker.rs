@@ -1,7 +1,7 @@
 //! The connection actor owns the socket, session identity, and command ordering.
 use crate::client::{
     ClientError, ModelCatalog, ProtocolClient, ServerEvent, SessionList, SessionMetadata,
-    StatusResult,
+    SlashList, SlashRunResult, StatusResult,
 };
 use crate::client::{HistoryMessage, TreeResult};
 use crate::login::{LoginProgress, LoginProvider};
@@ -30,6 +30,8 @@ pub enum CommandMessage {
     Approve(String),
     Deny(String),
     Abort,
+    SlashList,
+    SlashRun(String),
     Reconnect,
 }
 
@@ -42,6 +44,7 @@ pub enum WorkerMessage {
     Connected,
     Extensions(bool),
     SessionManagement(bool),
+    SlashExtensions(bool),
     Renamed(SessionMetadata),
     Deleted(String),
     LoginProviders(Vec<LoginProvider>),
@@ -52,6 +55,8 @@ pub enum WorkerMessage {
     SettingsApplied(SessionSettings),
     ImagesSent(String, Vec<ImageAttachment>),
     Event(ServerEvent),
+    SlashCommands(SlashList),
+    SlashResult(String, SlashRunResult),
     Rejected(String),
     Lost(String),
 }
@@ -180,6 +185,9 @@ impl ConnectionWorker {
         let _ = self
             .messages
             .send(WorkerMessage::SessionManagement(client.session_management));
+        let _ = self
+            .messages
+            .send(WorkerMessage::SlashExtensions(client.slash_extensions));
         if client.login_extensions {
             let providers = client.login_providers()?.providers;
             let _ = self.messages.send(WorkerMessage::LoginProviders(providers));
@@ -335,6 +343,19 @@ impl ConnectionWorker {
                             })
                         }
                         CommandMessage::Abort => client.abort().map(|_| ()),
+                        CommandMessage::SlashList => {
+                            let id = selected.as_deref().unwrap_or("");
+                            client.slash_list(id).map(|list| {
+                                let _ = self.messages.send(WorkerMessage::SlashCommands(list));
+                            })
+                        }
+                        CommandMessage::SlashRun(text) => {
+                            let id = selected.as_deref().unwrap_or("");
+                            client.slash_run(id, &text).map(|result| {
+                                let _ =
+                                    self.messages.send(WorkerMessage::SlashResult(text, result));
+                            })
+                        }
                     };
                     match result {
                         Err(error @ (ClientError::Rpc { .. } | ClientError::RequestTooLarge)) => {
