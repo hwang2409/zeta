@@ -76,8 +76,21 @@ pub struct SessionMetadata {
     pub name: String,
     #[serde(default)]
     pub first_message_preview: String,
-    #[serde(default)]
+    // The server emits `null` for a session with no explicit default (a
+    // fresh session on a real-provider server, or any session stored by a
+    // release that predates the field). `#[serde(default)]` alone accepts a
+    // MISSING key but rejects an explicit `null`, so we thread the value
+    // through a custom deserializer that maps null → empty string. Callers
+    // gate on `is_empty()` and fall back to their configured default there.
+    #[serde(default, deserialize_with = "deserialize_string_or_null")]
     pub approval_mode: String,
+}
+
+fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

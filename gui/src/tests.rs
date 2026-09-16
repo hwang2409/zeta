@@ -38,6 +38,36 @@ fn session() -> SessionMetadata {
     .unwrap()
 }
 
+/// The Python server writes `approval_mode: null` for any session whose
+/// default has never been set, and `#[serde(default)]` alone rejects an
+/// explicit `null` — the initial `status`/`new_session` decode then errors
+/// out and the worker never sends `Connected`. The native smoke driver
+/// hangs to its 30-second timeout when that happens (r2 CI run
+/// 35148088874). This case pins the wire shape the driver actually sees.
+#[test]
+fn session_metadata_deserializes_null_approval_mode_as_empty() {
+    let with_null: SessionMetadata = serde_json::from_value(json!({
+        "session_id":"ab12deadbeef",
+        "updated_at":"2026-09-09T12:00:00Z",
+        "approval_mode": null,
+    }))
+    .expect("SessionMetadata must accept approval_mode: null");
+    assert!(with_null.approval_mode.is_empty());
+    let missing: SessionMetadata = serde_json::from_value(json!({
+        "session_id":"ab12deadbeef",
+        "updated_at":"2026-09-09T12:00:00Z",
+    }))
+    .expect("missing approval_mode falls back to default");
+    assert!(missing.approval_mode.is_empty());
+    let set: SessionMetadata = serde_json::from_value(json!({
+        "session_id":"ab12deadbeef",
+        "updated_at":"2026-09-09T12:00:00Z",
+        "approval_mode": "allow",
+    }))
+    .expect("string approval_mode still deserializes");
+    assert_eq!(set.approval_mode, "allow");
+}
+
 fn setup(
     cx: &mut TestAppContext,
 ) -> (

@@ -56,9 +56,11 @@ Params: none. The result contains `sessions`, an array of session metadata.
 Each metadata object has `version`, `session_id`, `created_at`, `updated_at`,
 `provider`, `model`, `cwd`, `retained_tail`, `compaction_budget`,
 `override_audit`, `system_prompt`, `context_files`, `vim_mode`, `budget_pinned`,
-`plan_mode`, `name`, and `approval_mode` (`ask`, `allow`, or `deny`; the
-effective session default the server will apply on the next approval, and
-what the GUI reads to decide whether to paint the auto-approve indicator).
+`plan_mode`, `name`, and `approval_mode` (`"ask"`, `"allow"`, `"deny"`, or
+`null`; the effective session default the server will apply on the next
+approval, and what the GUI reads to decide whether to paint the auto-approve
+indicator; `null` when the session has never had a default set, and clients
+must fall back to their own configured default in that case).
 
 Server mode uses the effective launch provider after CLI and settings resolution.
 Without either override, `zeta serve` uses fake mode.
@@ -312,9 +314,8 @@ SessionMetadata = {
     retained_tail: integer, compaction_budget: integer,
     override_audit: array[object], system_prompt: string,
     context_files: array[string], vim_mode: boolean, budget_pinned: boolean,
-    plan_mode: boolean, name: string
-  },
-  optional: { approval_mode: string }
+    plan_mode: boolean, name: string, approval_mode: string or null
+  }
 }
 ToolCall = { required: { id: string, name: string, arguments: object } }
 ContentBlock = one of:
@@ -484,8 +485,10 @@ error code and message. Provider status and origin remain internal.
 
 The generic 1 MiB frame bound applies to all requests and responses.
 `approval_mode` on `SessionMetadata` reflects the effective session default;
-older 1.0 servers omit the key and clients must fall back to their configured
-default when it is missing or empty.
+it is `null` when the session has never had a default set (a fresh session,
+or one stored by a release that predates the field), and older 1.0 servers
+omit the key entirely. Clients must fall back to their configured default in
+both cases.
 
 ### Slash commands (ZETA-130)
 
