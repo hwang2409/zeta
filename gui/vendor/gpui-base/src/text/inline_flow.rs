@@ -345,33 +345,58 @@ impl Element for InlineFlow {
                         .line_height(fragment_size.height)
                         .child(inline)
                         .into_any_element();
+                    // ZETA-129 (see ../../../../README.md): pass
+                    // `MaxContent` on the width axis so the inner
+                    // `StyledText` never re-wraps a text fragment whose
+                    // shape already fits inside `fragment_size`.
+                    // Upstream `Definite(fragment_size.width - padding *
+                    // 2.)` re-enters `compute_wrap_boundaries` with
+                    // wrap_width == shape_line.width(); real CoreText
+                    // metrics drift one glyph past that boundary and
+                    // drop the last glyph of a chip (`task_kill` →
+                    // `task_kil`). `ZETA_GUI_INLINE_FLOW_DEFINITE`
+                    // reinstates the upstream shape so the paired
+                    // `gui-native-guards-inline-flow-mutation` target
+                    // proves the recorder-based ladder test in
+                    // `gui/src/tests.rs` catches the bug when the fix
+                    // is silenced. See `gui/vendor/README.md`
+                    // "Poison-canary" section.
+                    let width_available =
+                        if std::env::var_os("ZETA_GUI_INLINE_FLOW_DEFINITE").is_some() {
+                            AvailableSpace::Definite(fragment_size.width - padding * 2.)
+                        } else {
+                            AvailableSpace::MaxContent
+                        };
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        let probe_wrap_width = match width_available {
+                            AvailableSpace::Definite(x) => Some(x),
+                            _ => None,
+                        };
+                        let text_style_local = window.text_style();
+                        let probe_runs =
+                            text_runs(text.len(), &text_style_local, &highlights);
+                        if let Ok(lines) = window.text_system().shape_text(
+                            text.clone(),
+                            font_size,
+                            &probe_runs,
+                            probe_wrap_width,
+                            None,
+                        ) {
+                            let wrap_boundaries: usize =
+                                lines.iter().map(|l| l.wrap_boundaries().len()).sum();
+                            crate::zeta129_wrap_recorder::record(
+                                crate::zeta129_wrap_recorder::Sample {
+                                    text: text.clone(),
+                                    wrap_boundaries,
+                                    font_size,
+                                },
+                            );
+                        }
+                    }
                     element.prepaint_as_root(
                         bounds.origin + origin + point(padding, Pixels::ZERO),
-                        size(
-                            // ZETA-129 (see ../../../../README.md): pass
-                            // `MaxContent` on the width axis so the inner
-                            // `StyledText` never re-wraps a text fragment
-                            // whose shape already fits inside `fragment_size`.
-                            // Upstream `Definite(fragment_size.width - padding
-                            // * 2.)` re-enters `compute_wrap_boundaries` with
-                            // wrap_width == shape_line.width(); real
-                            // CoreText metrics drift one glyph past that
-                            // boundary and drop the last glyph of a chip
-                            // (`task_kill` → `task_kil`).
-                            //
-                            // `ZETA_GUI_INLINE_FLOW_DEFINITE` reinstates the
-                            // upstream shape so the paired
-                            // `gui-native-guards-inline-flow-mutation` target
-                            // proves the pixel-gutter guard catches the bug
-                            // when the fix is silenced. See
-                            // `gui/vendor/README.md` "Poison-canary" section.
-                            if std::env::var_os("ZETA_GUI_INLINE_FLOW_DEFINITE").is_some() {
-                                AvailableSpace::Definite(fragment_size.width - padding * 2.)
-                            } else {
-                                AvailableSpace::MaxContent
-                            },
-                            AvailableSpace::Definite(fragment_size.height),
-                        ),
+                        size(width_available, AvailableSpace::Definite(fragment_size.height)),
                         window,
                         cx,
                     );

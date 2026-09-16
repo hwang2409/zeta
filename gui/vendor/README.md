@@ -44,7 +44,7 @@ inner `Inline` a portion that fits inside its fragment. The inner
 `StyledText` has no legitimate reason to re-wrap. Removing the inner
 `wrap_width` constraint is the minimum-surface fix.
 
-## The diff
+## Edit 1 — functional `MaxContent` swap in `InlineFlow::prepaint`
 
 ```diff
 --- a/src/text/inline_flow.rs
@@ -68,24 +68,108 @@ The height axis stays `Definite`, so line-height and vertical
 positioning are unchanged. Every text fragment (code chip and regular
 text alike) now returns its intrinsic shaped width to Taffy; the outer
 flow already carries the wrap decisions those fragments need.
+`ZETA_GUI_INLINE_FLOW_DEFINITE` reinstates the upstream shape so the
+paired mutation arm (see below) can prove the CI guard catches the bug
+when the fix is silenced.
+
+## Edit 2 — test-only recorder in `InlineFlow::prepaint`
+
+Immediately before `element.prepaint_as_root(...)` in the Text arm,
+gated on `#[cfg(any(test, feature = "test-support"))]`:
+
+```diff
++                    let width_available =
++                        if std::env::var_os("ZETA_GUI_INLINE_FLOW_DEFINITE").is_some() {
++                            AvailableSpace::Definite(fragment_size.width - padding * 2.)
++                        } else {
++                            AvailableSpace::MaxContent
++                        };
++                    #[cfg(any(test, feature = "test-support"))]
++                    {
++                        let probe_wrap_width = match width_available {
++                            AvailableSpace::Definite(x) => Some(x),
++                            _ => None,
++                        };
++                        let text_style_local = window.text_style();
++                        let probe_runs =
++                            text_runs(text.len(), &text_style_local, &highlights);
++                        if let Ok(lines) = window.text_system().shape_text(
++                            text.clone(), font_size, &probe_runs, probe_wrap_width, None,
++                        ) {
++                            let wrap_boundaries: usize =
++                                lines.iter().map(|l| l.wrap_boundaries().len()).sum();
++                            crate::zeta129_wrap_recorder::record(
++                                crate::zeta129_wrap_recorder::Sample {
++                                    text: text.clone(),
++                                    wrap_boundaries,
++                                    font_size,
++                                },
++                            );
++                        }
++                    }
+                     element.prepaint_as_root(
+                         bounds.origin + origin + point(padding, Pixels::ZERO),
+-                        size(
+-                            ...
+-                            AvailableSpace::Definite(fragment_size.height),
+-                        ),
++                        size(width_available, AvailableSpace::Definite(fragment_size.height)),
+                         window, cx,
+                     );
+```
+
+The recorder module lives at `src/zeta129_wrap_recorder.rs`, also
+`#[cfg]`-gated so a release build compiles it out entirely. It exposes
+`clear()`, `samples()`, and a private `record(...)`. Downstream tests
+read the recorder via `gpui_kit::base::zeta129_wrap_recorder`.
+
+The recorder is the mutation-killer. The invariant the fix establishes
+is "an inline text fragment NEVER wraps inside its own fragment"; the
+probe uses the SAME wrap_width the actual `prepaint_as_root` call uses
+(via the env-gated `width_available`), so:
+
+* Under the fix (env unset): `probe_wrap_width = None` → `shape_text`
+  never inserts a wrap boundary → every recorded sample carries
+  `wrap_boundaries == 0`.
+* Under mutation (env set): `probe_wrap_width = Some(shape_line.width())`
+  → `compute_wrap_boundaries` re-enters the sub-pixel drift path and
+  drops a boundary onto the last glyph of the tripping ladder length.
+  At least one sample carries `wrap_boundaries >= 1`.
+
+The paired downstream test is
+`zeta129_inline_flow_never_wraps_a_text_fragment_inside_its_own_fragment`
+in `gui/src/tests.rs`; the Makefile target
+`gui-native-guards-inline-flow-mutation` invokes `cargo test` on that
+test with `ZETA_GUI_INLINE_FLOW_DEFINITE=1` and expects a non-zero exit
+(the mutation must fail the guard). CI's `cargo (macos-latest)` job
+runs both `gui-native-guards-inline-flow-mutation` and the regular
+`gui-native-guards` step.
 
 ## Poison-canary (`ZETA_GUI_INLINE_FLOW_DEFINITE`)
 
-Per ZETA-129 kickoff constraint 5, guard proof must be CI-visible. The
-env check above reinstates the upstream `Definite(...)` shape when
-`ZETA_GUI_INLINE_FLOW_DEFINITE` is set — the `Makefile` target
-`gui-native-guards-inline-flow-mutation` runs the smoke driver with
-that env active and expects the native pixel-gutter guard (or the
-`code_ladder` shape scan) to panic, mirroring the shape of the
-existing `gui-native-guards-mutation` poison-canary. The default
-(env unset) path stays clean and CI runs the standard
-`gui-native-guards` target.
+The env is checked in TWO places:
+1. `InlineFlow::prepaint`'s `width_available` binding — chooses between
+   `MaxContent` (fix) and the upstream `Definite(...)` (mutation).
+2. The test-only recorder probe — mirrors the same choice so the sample
+   captures what actually happens in `prepaint_as_root`.
 
-The env-mutation arm is a second, deliberately-scoped deviation from
-byte-identical crates.io content. The functional fix is the
-`MaxContent` swap; the env branch exists solely so a peer refactor that
-silently reverts the swap (a stray `git checkout`, a merge conflict
-resolved the wrong way) is caught by CI rather than shipped.
+Both checks read the same env; setting `ZETA_GUI_INLINE_FLOW_DEFINITE=1`
+silences the fix and reproduces the bug end-to-end — the CI mutation
+target inverts the exit code so a green run FAILS CI, catching a
+silent revert (a stray `git checkout`, a merge conflict resolved the
+wrong way) rather than letting it ship.
+
+## Deviation from byte-identical crates.io content
+
+Two deliberately-scoped deviations from the crates.io 0.6.1 release:
+1. The `MaxContent` swap (the functional fix).
+2. The `#[cfg]`-gated recorder + probe (test-only, compiles out of
+   release builds; needed to make the mutation arm CI-visible per
+   ZETA-129 kickoff constraint 5).
+
+Every other file, including `Cargo.toml`, `Cargo.toml.orig`,
+`Cargo.lock`, `LICENSE-APACHE`, and the entire `src/` and `tests/`
+trees, is byte-identical to the crates.io content.
 
 ## Unfork condition
 

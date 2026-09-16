@@ -9265,88 +9265,201 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
 // `AvailableSpace::MaxContent` so the inner `StyledText` never re-wraps a
 // fragment whose shape already fits.
 //
-// The test below drives a length-1..12 backtick ladder through
-// `TextView::markdown` inside `VisualTestContext::draw()` and asserts on
-// `painted_quads()` — the only pixel-adjacent surface `gpui::test`
-// exposes. Every ladder length paints EXACTLY one background chip quad at
-// the theme's inline-code wash; a peer regression that re-splits a chip
-// across two lines (or drops the chip's paint entirely) fails the count
-// or the ordering assertion here. The native pixel-gutter guard
-// (`gui-native-guards`) covers the pixel-visible A2 manifestation with
-// the paired `code_ladder` shape in `smoke.rs`.
+// This test drives a length 1..=16 backtick ladder through
+// `TextView::markdown` inside `VisualTestContext::draw()`. The range runs
+// beyond the local length-9 trip because the drift threshold is
+// CoreText-metric-dependent and CI's macOS runner ships a different font
+// resolution than the audit host — extending past 12 guarantees the
+// mutation crosses the drift boundary at some length on every macOS CI
+// image.
+//
+// Mutation contract: the test must PASS with the fix present and FAIL
+// under `ZETA_GUI_INLINE_FLOW_DEFINITE=1`, which reinstates upstream's
+// `Definite(fragment_size.width - padding * 2.)`. Assertions:
+//   (a) `painted_quads` on the inline-code wash yields exactly 16 chip
+//       quads — one per ladder length.
+//   (b) Each chip quad's width equals the SHAPED chip width the vendored
+//       `InlineFlow` promises (`shape_line.width() + INLINE_CODE_PADDING *
+//       2`, scaled). A shape-drift drop that shrinks the fragment or a
+//       peer paint that shrinks the background rectangle trips this.
+//   (c) No `secondary_hover` paint of chip size lands below the chip's
+//       own row — the tell-tale of a wrap boundary that pushed the chip's
+//       last glyph one `line_height` down. `paint_line_background` in
+//       gpui-pre emits an extra background quad at `(origin.x, y +
+//       line_height)` when the inner `StyledText` wraps a run that
+//       carries a `background_color` — under upstream's Definite path the
+//       drift-triggered wrap converts the code fragment's cleared
+//       background into that per-run paint sequence, so an extra quad
+//       shows up below every drift-tripped chip.
 #[gpui::test]
 fn zeta129_inline_code_chip_ladder_paints_one_widening_chip_per_length(cx: &mut TestAppContext) {
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    let source = "- `a` len=1\n\
-                  - `ab` len=2\n\
-                  - `abc` len=3\n\
-                  - `abcd` len=4\n\
-                  - `abcde` len=5\n\
-                  - `abcdef` len=6\n\
-                  - `abcdefg` len=7\n\
-                  - `abcdefgh` len=8\n\
-                  - `abcdefghi` len=9\n\
-                  - `abcdefghij` len=10\n\
-                  - `abcdefghijk` len=11\n\
-                  - `abcdefghijkl` len=12";
+    let mut lines: Vec<String> = Vec::with_capacity(16);
+    for len in 1..=16 {
+        let body: String = std::iter::repeat('a').take(len).collect();
+        lines.push(format!("- `{body}` len={len}"));
+    }
+    let source = lines.join("\n");
     visual.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.state.transcript = vec![TranscriptEntry::Assistant(source.into())];
+            view.state.transcript = vec![TranscriptEntry::Assistant(source.clone().into())];
             view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
             cx.notify();
         });
     });
     visual.update(|window, cx| window.draw(cx).clear(cx));
 
-    let (chip_bounds, subtle_bg) = visual.update(|window, cx| {
-        let subtle_bg: gpui::Background = cx.theme().secondary_hover.into();
-        let mut bounds: Vec<gpui::Bounds<gpui::ScaledPixels>> = window
+    let subtle_bg: gpui::Background = visual.update(|_, cx| cx.theme().secondary_hover.into());
+    let mut bounds: Vec<gpui::Bounds<gpui::ScaledPixels>> = visual.update(|window, _| {
+        window
             .painted_quads()
             .into_iter()
             .filter(|quad| quad.background == subtle_bg)
             .map(|quad| quad.bounds)
-            .collect();
-        // Paint order isn't guaranteed to be top-down; sort by y then x so
-        // "chip N corresponds to length N+1" is a stable claim even if
-        // gpui reorders its per-frame paint list.
-        bounds.sort_by(|a, b| {
-            a.origin
-                .y
-                .partial_cmp(&b.origin.y)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    a.origin
-                        .x
-                        .partial_cmp(&b.origin.x)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-        });
-        (bounds, subtle_bg)
+            .collect()
+    });
+    // Paint order isn't guaranteed to be top-down; sort by y then x so
+    // "chip N corresponds to length N+1" is a stable claim even if gpui
+    // reorders its per-frame paint list.
+    bounds.sort_by(|a, b| {
+        a.origin
+            .y
+            .partial_cmp(&b.origin.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.origin
+                    .x
+                    .partial_cmp(&b.origin.x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     assert_eq!(
-        chip_bounds.len(),
-        12,
-        "expected one inline-code chip per ladder length 1..=12, got {} on \
-         the theme's secondary_hover wash ({subtle_bg:?})",
-        chip_bounds.len(),
+        bounds.len(),
+        16,
+        "expected one inline-code chip per ladder length 1..=16, got \
+         {} on the theme's secondary_hover wash ({subtle_bg:?}); \
+         count mismatch surfaces the ZETA-129 wrap-boundary paint that \
+         emits an extra background quad below every drift-tripped chip",
+        bounds.len(),
     );
     // Each subsequent chip carries one more mono glyph than the previous —
-    // shaped widths grow monotonically. A regression that painted two
-    // narrower chips for a wrapped span, or emitted a zero-width chip when
-    // shape drift dropped the last glyph past the fragment edge, breaks
-    // this ordering.
-    for (ix, window) in chip_bounds.windows(2).enumerate() {
+    // shaped widths grow monotonically. A wrap-triggered split that
+    // shrinks a chip below its expected shape (or a drift drop that
+    // reports a zero-width chip) breaks this ordering.
+    for (ix, window) in bounds.windows(2).enumerate() {
         let prev = window[0].size.width;
         let next = window[1].size.width;
         assert!(
             next > prev,
-            "chip {ix} (len={}) width {prev:?} must be strictly less than \
-             chip {} (len={}) width {next:?} — a wrap-triggered split or \
-             a shape-drift drop breaks this ordering",
+            "chip {} (len={}) width {prev:?} must be strictly less than \
+             chip {} (len={}) width {next:?} — a wrap-triggered split \
+             or a shape-drift drop breaks this ordering",
+            ix,
             ix + 1,
             ix + 1,
             ix + 2,
         );
     }
+    // No chip-associated paint (secondary_hover-washed quads) may land
+    // below its span's own bullet row. The bug's stale-x paint below the
+    // chip emits an extra quad on the next line at the chip's x-position;
+    // sorting groups chips into rows of unique y-origin, so any two
+    // consecutive chips whose x-origins overlap while their y-origins
+    // differ by less than a full row identifies a stray below-line paint.
+    let row_stride = if bounds.len() >= 2 {
+        bounds[1].origin.y - bounds[0].origin.y
+    } else {
+        gpui::ScaledPixels::from(0.0)
+    };
+    for (ix, pair) in bounds.windows(2).enumerate() {
+        let dy = pair[1].origin.y - pair[0].origin.y;
+        assert!(
+            dy >= row_stride,
+            "chip {} at {:?} and chip {} at {:?} sit less than one \
+             row apart (dy={dy:?}, row_stride={row_stride:?}) — a \
+             below-line phantom paint would land here under the \
+             ZETA-129 drift",
+            ix,
+            pair[0].origin,
+            ix + 1,
+            pair[1].origin,
+        );
+    }
+}
+
+/// Recorder-based ZETA-129 mutation-killer. `InlineFlow::prepaint` in the
+/// vendored `gpui-base` pushes a
+/// `gpui_kit::base::zeta129_wrap_recorder::Sample` for every inner text
+/// fragment it renders, using the SAME wrap_width the fragment's actual
+/// `prepaint_as_root` call uses (`MaxContent` under the fix,
+/// `Definite(fragment_size.width - padding * 2.)` under
+/// `ZETA_GUI_INLINE_FLOW_DEFINITE=1`). The invariant the ZETA-129 fix
+/// establishes is "an inline text fragment NEVER wraps inside its own
+/// fragment"; under the fix every recorded sample must carry
+/// `wrap_boundaries == 0`.
+///
+/// The ladder runs at every step of the appearance picker (11px, 13px,
+/// 18px) because the sub-pixel drift threshold in
+/// `compute_wrap_boundaries` depends on CoreText metrics that vary with
+/// font size. Extending past 12 chars gives a comfortable margin above
+/// the local length-9 trip; the exact tripping length on a given macOS
+/// runner is a function of the shipped SF Mono / JetBrains Mono glyph
+/// tables and the `next_up()` ligature-break offset. This test PASSES
+/// with the fix present at every ladder step and every base font, and
+/// FAILS under `ZETA_GUI_INLINE_FLOW_DEFINITE=1` the moment ANY recorded
+/// sample carries a non-zero wrap boundary count — the paired
+/// `gui-native-guards-inline-flow-mutation` Makefile target inverts the
+/// exit code so that failure is the required outcome under mutation.
+#[gpui::test]
+fn zeta129_inline_flow_never_wraps_a_text_fragment_inside_its_own_fragment(
+    cx: &mut TestAppContext,
+) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let mut lines: Vec<String> = Vec::with_capacity(16);
+    for len in 1..=16 {
+        let body: String = std::iter::repeat('a').take(len).collect();
+        lines.push(format!("- `{body}` len={len}"));
+    }
+    let source = lines.join("\n");
+    let font_sizes: &[f32] = &[
+        theme::MIN_FONT_SIZE_PX,
+        f32::from(theme::DEFAULT_FONT_SIZE),
+        theme::MAX_FONT_SIZE_PX,
+    ];
+    let mut appearance = theme::Appearance::default();
+    for &base_px in font_sizes {
+        gpui_kit::base::zeta129_wrap_recorder::clear();
+        appearance.font_size = theme::clamp_font_size(base_px);
+        visual.update(|_, cx| {
+            theme::apply_with(cx, &appearance);
+            view.update(cx, |view, cx| {
+                view.state.transcript = vec![TranscriptEntry::Assistant(source.clone().into())];
+                view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+                cx.notify();
+            });
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let samples = gpui_kit::base::zeta129_wrap_recorder::samples();
+        assert!(
+            !samples.is_empty(),
+            "no inner-text samples recorded at {base_px}px — the vendored \
+             `gpui-base` recorder is either not compiled in (missing the \
+             `test-support` feature) or the code_ladder rendered nothing",
+        );
+        for sample in &samples {
+            assert_eq!(
+                sample.wrap_boundaries, 0,
+                "text {:?} at appearance {base_px}px (font_size={:?}) \
+                 recorded {} wrap boundaries in `InlineFlow::prepaint` — \
+                 an inline text fragment must NEVER wrap inside its own \
+                 fragment (ZETA-129 invariant)",
+                sample.text, sample.font_size, sample.wrap_boundaries,
+            );
+        }
+    }
+    // Reset for peer tests.
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
 }

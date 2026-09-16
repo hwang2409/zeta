@@ -213,3 +213,8 @@ pub fn init(cx: &mut App) {
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
+
+// ZETA-129 test-only recorder — see the module docs and
+// `gui/vendor/README.md`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod zeta129_wrap_recorder;

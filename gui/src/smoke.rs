@@ -38,18 +38,28 @@ const NATIVE_GUARD_SHAPES: &[(&str, &str)] = &[
          supercalifragilisticexpialidocious_but_much_longer_than_any_column_should_ever_be_aaaaaaaaaaaaaaaaaaaa \
          and then some trailing prose after it.",
     ),
-    // ZETA-129: exercise inline-code chips of length 1..12 in a bullet list.
+    // ZETA-129: exercise inline-code chips of length 1..16 in a bullet list.
     // The upstream `InlineFlow::prepaint` bug drops the last glyph of any
-    // 9-char chip and paints overflow glyphs onto the next line at a stale
-    // x-position — either lands in the pixel-gutter scan (A2 form when the
-    // chip sits near `content_right`) or corrupts the following bullet's
-    // prose. Every length rides the same code path so a future regression
-    // that reintroduces inner wrapping trips this shape at multiple sizes.
+    // 9-char chip (locally) and paints overflow glyphs onto the next line
+    // at a stale x-position — the drift threshold is CoreText-metric
+    // dependent, so the ladder runs past 12 to guarantee the mutation
+    // crosses it on every CI font resolution. A1 / A2 detection is owned
+    // by the headless painted_quads guard
+    // (`zeta129_inline_code_chip_ladder_paints_one_widening_chip_per_length`
+    // in `tests.rs`) — the phantom glyphs land inside the content column
+    // and coincide with the scrollbar x-band at ladder positions, both of
+    // which the native pixel-gutter scan cannot resolve. This native shape
+    // stays because it exercises the full rendering pipeline (font
+    // loading, viewport sizing, scrollbar chrome) as a regression cover;
+    // a future defect that manifests in the gutter (a widened chip that
+    // grazes `content_right`) still trips here.
     (
         "code_ladder",
         "- `a` len=1\n- `ab` len=2\n- `abc` len=3\n- `abcd` len=4\n- `abcde` len=5\n\
          - `abcdef` len=6\n- `abcdefg` len=7\n- `abcdefgh` len=8\n- `abcdefghi` len=9\n\
-         - `abcdefghij` len=10\n- `abcdefghijk` len=11\n- `abcdefghijkl` len=12",
+         - `abcdefghij` len=10\n- `abcdefghijk` len=11\n- `abcdefghijkl` len=12\n\
+         - `abcdefghijklm` len=13\n- `abcdefghijklmn` len=14\n\
+         - `abcdefghijklmno` len=15\n- `abcdefghijklmnop` len=16",
     ),
 ];
 
