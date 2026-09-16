@@ -383,7 +383,7 @@ fn approval_mode_segmented_paints_a_filled_selected_state(cx: &mut TestAppContex
         });
         window.draw(cx).clear(cx);
     });
-    let bounds_by_selector: Vec<(&str, gpui::Bounds<Pixels>)> =
+    let bounds_by_selector: Vec<(&str, gpui::Bounds<gpui::Pixels>)> =
         ["mode-row-ask", "mode-row-allow", "mode-row-deny"]
             .into_iter()
             .map(|selector| {
@@ -421,7 +421,7 @@ fn approval_mode_segmented_paints_a_filled_selected_state(cx: &mut TestAppContex
     let deny = visual.debug_bounds("mode-row-deny").expect("deny segment");
     visual.simulate_click(deny.center(), Default::default());
     visual.update(|window, cx| window.draw(cx).clear(cx));
-    let bounds_by_selector: Vec<(&str, gpui::Bounds<Pixels>)> =
+    let bounds_by_selector: Vec<(&str, gpui::Bounds<gpui::Pixels>)> =
         ["mode-row-ask", "mode-row-allow", "mode-row-deny"]
             .into_iter()
             .map(|selector| {
