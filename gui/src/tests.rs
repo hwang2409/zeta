@@ -10600,34 +10600,45 @@ fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut Te
     // Count painted primary-accent quads inside the sidebar column,
     // split by height: row-sized quads are the focused row's fill,
     // dot-sized quads are the current-session dot. Returns their y
-    // coordinates in unscaled pixels so we can prove co-location.
-    let count_sidebar_fills = |visual: &mut VisualTestContext| -> (Vec<f32>, Vec<f32>) {
-        visual.update(|window, cx| {
-            let primary: gpui::Background = cx.theme().primary.into();
-            let scale = window.scale_factor();
-            let row_h = theme::SIDEBAR_ROW_HEIGHT.scale(scale);
-            let dot_h = theme::SIDEBAR_CURRENT_DOT_SIZE.scale(scale);
-            let sidebar_right = theme::SIDEBAR_WIDTH.scale(scale);
-            let slack = px(1.).scale(scale);
-            let mut rows = Vec::new();
-            let mut dots = Vec::new();
-            for quad in window.painted_quads() {
-                if quad.background != primary {
-                    continue;
+    // origins in ScaledPixels so we can prove co-location without any
+    // unsupported `f32::from(ScaledPixels)` conversion.
+    let count_sidebar_fills =
+        |visual: &mut VisualTestContext| -> (Vec<gpui::ScaledPixels>, Vec<gpui::ScaledPixels>) {
+            visual.update(|window, cx| {
+                let primary: gpui::Background = cx.theme().primary.into();
+                let scale = window.scale_factor();
+                let row_h = theme::SIDEBAR_ROW_HEIGHT.scale(scale);
+                let dot_h = theme::SIDEBAR_CURRENT_DOT_SIZE.scale(scale);
+                let sidebar_right = theme::SIDEBAR_WIDTH.scale(scale);
+                let slack = gpui::ScaledPixels::from(1.0);
+                let mut rows = Vec::new();
+                let mut dots = Vec::new();
+                for quad in window.painted_quads() {
+                    if quad.background != primary {
+                        continue;
+                    }
+                    if quad.bounds.right() > sidebar_right {
+                        continue;
+                    }
+                    let h = quad.bounds.size.height;
+                    if h + slack >= row_h && h <= row_h + slack {
+                        rows.push(quad.bounds.origin.y);
+                    } else if h + slack >= dot_h && h <= dot_h + slack {
+                        dots.push(quad.bounds.origin.y);
+                    }
                 }
-                if quad.bounds.right() > sidebar_right {
-                    continue;
-                }
-                let height = quad.bounds.size.height;
-                let y = f32::from(quad.bounds.origin.y) / f32::from(scale);
-                if (f32::from(height) - f32::from(row_h)).abs() <= f32::from(slack) {
-                    rows.push(y);
-                } else if (f32::from(height) - f32::from(dot_h)).abs() <= f32::from(slack) {
-                    dots.push(y);
-                }
-            }
-            (rows, dots)
-        })
+                (rows, dots)
+            })
+        };
+    // Two ScaledPixels within `tolerance` of one another read as the
+    // same row. ScaledPixels does not implement `.abs()`, so branch
+    // instead of chaining `.abs()`.
+    let within = |a: gpui::ScaledPixels, b: gpui::ScaledPixels, tolerance: gpui::ScaledPixels| {
+        if a >= b {
+            a - b <= tolerance
+        } else {
+            b - a <= tolerance
+        }
     };
 
     // BEFORE Cmd-N: row_a is focused (row fill) AND current (dot).
@@ -10643,9 +10654,11 @@ fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut Te
         1,
         "row_a is current → exactly one dot: {dots_before:?}",
     );
+    let row_h_scaled =
+        visual.update(|window, _| theme::SIDEBAR_ROW_HEIGHT.scale(window.scale_factor()));
     assert!(
-        (rows_before[0] - dots_before[0]).abs() <= f32::from(theme::SIDEBAR_ROW_HEIGHT),
-        "focus fill (y={}) and dot (y={}) must sit on the same row before Cmd-N",
+        within(rows_before[0], dots_before[0], row_h_scaled),
+        "focus fill (y={:?}) and dot (y={:?}) must sit on the same row before Cmd-N",
         rows_before[0],
         dots_before[0],
     );
@@ -10719,7 +10732,7 @@ fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut Te
     );
     assert!(
         dots_after[0] < dots_before[0],
-        "dot y after ({}) must be above the pre-Cmd-N y ({}) — row_c inserted at index 0",
+        "dot y after ({:?}) must be above the pre-Cmd-N y ({:?}) — row_c inserted at index 0",
         dots_after[0],
         dots_before[0],
     );
