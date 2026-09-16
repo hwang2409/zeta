@@ -9851,47 +9851,62 @@ fn zeta132_scroll_resets_to_top_on_every_open(cx: &mut TestAppContext) {
         "test premise: modal must open at the shipped {:?} default",
         theme::DEFAULT_FONT_SIZE,
     );
-    // Mid-session: click `font-size-grow` on the stepper until the
-    // picker reaches its MAX. Every click updates prefs and re-applies
-    // the theme, which reflows the modal in place — the panel stays
-    // open, the sections wrapper grows past its clip at the picker's
-    // upper bases, and overflow becomes real. Loop-until-value with a
-    // bounded iteration cap: a fixed click count (5 for 13 -> 18)
-    // dropped clicks on the round-2 CI matrix because a rapid loop of
-    // identical-position `simulate_click` calls falls into gpui's
-    // "same position, no motion" path and only the first click fires
-    // the button's `on_click`. A `simulate_mouse_move` off the button
-    // between clicks parks the pointer elsewhere so every subsequent
-    // click enters the hitbox fresh; the loop-until-value guard makes
-    // the test tolerant of any one-off flake by retrying up to the
-    // cap rather than trusting a raw click count.
+    // Prove the stepper's click path fires ONE mid-session font-size
+    // change from the shipped default (the reviewer's "through the
+    // stepper" requirement — a real `simulate_click` on the visible
+    // `+` control, not a synthetic set_offset shortcut). Bounds are
+    // re-queried after the reflow so `debug_bounds` reflects the
+    // current-frame layout.
+    let grow = visual
+        .debug_bounds("font-size-grow")
+        .expect("grow button renders while modal is open");
+    visual.simulate_click(grow.center(), gpui::Modifiers::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let after_first_click = visual.update(|_, cx| cx.theme().font_size);
+    assert_eq!(
+        f32::from(after_first_click),
+        f32::from(theme::DEFAULT_FONT_SIZE) + 1.,
+        "test premise: one stepper click must raise the picker one \
+         whole-px step from the shipped {:?} default; got \
+         {after_first_click:?}",
+        theme::DEFAULT_FONT_SIZE,
+    );
+    // Ladder the rest of the way to MAX via the stepper's OWN handler.
+    // `adjust_font_size(1., cx)` is the exact call
+    // `.on_click(cx.listener(|view, _, _, cx| view.adjust_font_size(1., cx)))`
+    // wires on the `+` button — same clamp, same `prefs::commit`, same
+    // theme reflow. Direct invocation rather than a `simulate_click`
+    // loop: back-to-back same-position clicks on the same stateful
+    // button drop after the first in the gpui test harness (round-2 CI
+    // pinned 14px after 32 clicks with a pointer-park between each),
+    // and this test is about the reopen-after-mid-session-resize path,
+    // not the stepper's click-routing (which the click above proves
+    // once, and which `settings_theme_and_font_render_as_compact_single_value_cyclers`
+    // guards for one-shot cases). Loop-until-value with a bounded
+    // iteration cap so a future step-size change or clamp tweak lands
+    // on the premise assertion rather than an infinite loop.
     let target = theme::clamp_font_size(theme::MAX_FONT_SIZE_PX);
-    let park = gpui::point(px(0.), px(0.));
-    let click_cap = 32usize;
-    let mut clicks = 0usize;
+    let step_cap = 32usize;
+    let mut steps = 0usize;
     loop {
         let current = visual.update(|_, cx| cx.theme().font_size);
         if current == target {
             break;
         }
         assert!(
-            clicks < click_cap,
-            "test premise: {click_cap} stepper clicks must reach MAX \
-             ({target:?}); got {current:?} after {clicks} clicks",
+            steps < step_cap,
+            "test premise: {step_cap} adjust_font_size steps must reach \
+             MAX ({target:?}); got {current:?} after {steps} steps",
         );
-        let grow = visual
-            .debug_bounds("font-size-grow")
-            .expect("grow button renders while modal is open");
-        visual.simulate_mouse_move(park, None, gpui::Modifiers::default());
-        visual.simulate_click(grow.center(), gpui::Modifiers::default());
+        view.update(&mut visual, |view, cx| view.adjust_font_size(1., cx));
         visual.update(|window, cx| window.draw(cx).clear(cx));
-        clicks += 1;
+        steps += 1;
     }
     let grown_size = visual.update(|_, cx| cx.theme().font_size);
     assert_eq!(
         grown_size, target,
-        "test premise: stepper clicks must reach the MAX font size \
-         mid-session — got {grown_size:?}",
+        "test premise: mid-session ladder must reach the MAX font size \
+         — got {grown_size:?}",
     );
     // Real wheel input on the sections wrapper. The wrapper is
     // `overflow_y_scroll` + `.track_scroll(&self.settings_sections_scroll)`,
