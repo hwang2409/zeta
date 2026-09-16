@@ -5196,8 +5196,9 @@ fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and
             window.draw(cx).clear(cx);
         });
         // Bound the walk generously so a slow-cycling sidebar (extra
-        // sessions or branch rows) still resolves. Matches the peer
-        // group-header test's 512 ceiling (tests.rs:8045).
+        // sessions + branch rows + the composer) still resolves.
+        // Matches the peer group-header test's 512 ceiling
+        // (tests.rs:8045).
         let max_steps = 512;
         for _ in 0..max_steps {
             visual.simulate_keystrokes("tab");
@@ -5206,33 +5207,11 @@ fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and
                 return;
             }
         }
-        // Fell off the bounded loop — print which handles are actually
-        // in focus rotation so the reason surfaces cleanly. Compares
-        // against every named handle the test tracks.
-        let focused_kind = visual.update(|window, cx| {
-            let focused = window.focused(cx);
-            if focused.as_ref() == Some(&current_session_handle) {
-                "current_session_handle"
-            } else if focused.as_ref() == Some(&session_handle) {
-                "session_handle"
-            } else if focused.as_ref() == Some(&current_branch_handle) {
-                "current_branch_handle"
-            } else if focused.as_ref() == Some(&branch_handle) {
-                "branch_handle"
-            } else if focused.is_some() {
-                "other-focus"
-            } else {
-                "no-focus"
-            }
-        });
         panic!(
             "a bounded `Tab` walk did not land on the target focus \
-             handle within {max_steps} steps — final focus was on \
-             `{focused_kind}`. Either the row's focus handle is not \
-             registered as a tab stop or Tab dispatch stalls at some \
-             other tab stop (e.g. the composer input's context binds \
-             Tab to IndentInline instead of routing through Root's \
-             Tab)."
+             handle within {max_steps} steps — the row's focus handle \
+             is not registered as a tab stop, or the `Tab` keybinding \
+             does not route through the row"
         );
     };
 

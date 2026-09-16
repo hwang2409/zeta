@@ -3127,6 +3127,11 @@ impl Render for ZetaView {
             .font_family(theme::current_font_family())
             .text_size(theme::body(theme::current_font_size()))
             .on_action(cx.listener(|view, _: &polish::NewSession, _, cx| view.new_session(cx)))
+            // Composer participates in keyboard traversal like every
+            // other primary chat composer (Slack / Discord). The
+            // matching keybindings live in `polish::init_menus`.
+            .on_action(|_: &polish::ComposerFocusNext, window, cx| window.focus_next(cx))
+            .on_action(|_: &polish::ComposerFocusPrev, window, cx| window.focus_prev(cx))
             .on_action(|_: &polish::About, window, cx| {
                 drop(window.prompt(
                     gpui::PromptLevel::Info,

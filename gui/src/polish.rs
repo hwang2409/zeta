@@ -9,15 +9,35 @@ use zeta_gui::{client::ToolCall, session::ImageAttachment, state::StatusMetrics}
 
 use crate::theme;
 
-gpui::actions!(zeta, [NewSession, About, Quit]);
+gpui::actions!(
+    zeta,
+    [
+        NewSession,
+        About,
+        Quit,
+        ComposerFocusNext,
+        ComposerFocusPrev
+    ]
+);
 
 pub const SENT_IMAGE_LIMIT: usize = 64;
 
 pub fn init_menus(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
+    // Override gpui-base's `Input` Tab / Shift-Tab bindings so the
+    // composer participates in keyboard traversal like every other
+    // primary chat composer (Slack / Discord / prompt boxes). The
+    // upstream default binds Tab to `IndentInline`, which traps
+    // keyboard-only users inside the composer and silently breaks
+    // app-wide tab traversal (a real WCAG 2.1.2 no-keyboard-trap
+    // violation). Block indent / outdent stays reachable through
+    // `cmd-]` / `cmd-[` (gpui-base already binds those). Registered
+    // AFTER `gpui_kit::init(cx)` so ours wins by keymap order.
     cx.bind_keys([
         gpui::KeyBinding::new("cmd-n", NewSession, None),
         gpui::KeyBinding::new("cmd-q", Quit, None),
+        gpui::KeyBinding::new("tab", ComposerFocusNext, Some("Input")),
+        gpui::KeyBinding::new("shift-tab", ComposerFocusPrev, Some("Input")),
     ]);
     cx.set_menus([
         Menu::new("zeta").items([
