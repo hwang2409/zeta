@@ -338,7 +338,18 @@ class _Client:
         if method == "steer":
             return self._steer(_required_string(params, "text"))
         if method in {"approve", "deny"}:
-            return await self._approval(method, _required_string(params, "request_id"))
+            scope = params.get("scope", "once")
+            if scope not in {"once", "always_tool"}:
+                raise ProtocolError(
+                    -32602, "scope must be 'once' or 'always_tool'"
+                )
+            if scope == "always_tool" and method != "approve":
+                raise ProtocolError(
+                    -32602, "scope 'always_tool' requires approve"
+                )
+            return await self._approval(
+                method, _required_string(params, "request_id"), scope
+            )
         if method == "abort":
             return await self._abort()
         if method == "status":
@@ -455,12 +466,18 @@ class _Client:
         loop.steer(Message(MessageRole.USER, [TextContent(text)]))
         return {"accepted": True}
 
-    async def _approval(self, method: str, request_id: str) -> dict[str, object]:
+    async def _approval(
+        self, method: str, request_id: str, scope: str = "once"
+    ) -> dict[str, object]:
         policy = self.server.runtime.policy
         loop = self.server.runtime.loop
         if policy is None or loop is None:
             raise ProtocolError(-32003, "no active session")
         core_key = self._approval_keys.get(request_id, request_id)
+        pending = next(
+            (item for item in policy.pending_requests() if item.key == core_key),
+            None,
+        )
         resolved = policy.resolve(
             core_key,
             ApprovalDecision.ALLOW if method == "approve" else ApprovalDecision.DENY,
@@ -469,6 +486,8 @@ class _Client:
             raise ProtocolError(
                 -32006, f"approval request not found or already resolved: {request_id}"
             )
+        if scope == "always_tool" and pending is not None:
+            policy.always_allow = policy.always_allow | {pending.tool_call.name}
         active = self._turn_task is not None and not self._turn_task.done()
         if (
             not active
@@ -479,7 +498,14 @@ class _Client:
                 self.server.runtime.state.tool_started()
             task = asyncio.create_task(self._resume_tool(core_key))
             self._turn_task = task
-        return {"accepted": True, "request_id": request_id, "decision": method}
+        result: dict[str, object] = {
+            "accepted": True,
+            "request_id": request_id,
+            "decision": method,
+        }
+        if scope != "once":
+            result["scope"] = scope
+        return result
 
     async def _abort(self) -> dict[str, object]:
         if self._turn_task is None or self._turn_task.done():

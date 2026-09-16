@@ -661,16 +661,33 @@ impl ProtocolClient {
     }
 
     pub fn approve(&mut self, request_id: &str) -> Result<bool, ClientError> {
-        self.decision("approve", request_id)
+        self.decision("approve", request_id, None)
+    }
+
+    /// Approve with `scope: "always_tool"` (ZETA-131 B3). The server also
+    /// adds the pending tool's name to the session's `always_allow` list.
+    /// Servers that pre-date the extension ignore the extra param and
+    /// resolve the request per-call, so behavior degrades to `approve`.
+    pub fn approve_always_tool(&mut self, request_id: &str) -> Result<bool, ClientError> {
+        self.decision("approve", request_id, Some("always_tool"))
     }
 
     pub fn deny(&mut self, request_id: &str) -> Result<bool, ClientError> {
-        self.decision("deny", request_id)
+        self.decision("deny", request_id, None)
     }
 
-    fn decision(&mut self, method: &str, request_id: &str) -> Result<bool, ClientError> {
-        let result: Value =
-            self.request(method, serde_json::json!({ "request_id": request_id }))?;
+    fn decision(
+        &mut self,
+        method: &str,
+        request_id: &str,
+        scope: Option<&str>,
+    ) -> Result<bool, ClientError> {
+        let mut params = serde_json::Map::new();
+        params.insert("request_id".into(), request_id.into());
+        if let Some(scope) = scope {
+            params.insert("scope".into(), scope.into());
+        }
+        let result: Value = self.request(method, Value::Object(params))?;
         Ok(result
             .get("accepted")
             .and_then(Value::as_bool)

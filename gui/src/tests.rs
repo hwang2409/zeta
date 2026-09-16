@@ -284,6 +284,289 @@ fn approval_dialog_dispatches_approve_and_deny_once(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn approval_dialog_dispatches_always_allow_via_click_and_keyboard(cx: &mut TestAppContext) {
+    // ZETA-131 B3: the approval dialog exposes a session-scoped memory
+    // choice as well as approve/deny. Verify BOTH activation paths — the
+    // "Always allow" button click AND the bare `a` shortcut — dispatch
+    // `ApproveAlwaysTool` exactly once and carry the pending request id.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for (variant, activate) in [("click", None::<&str>), ("key", Some("a"))] {
+        let id = format!("always-{variant}");
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_worker_message(
+                    WorkerMessage::Event(ServerEvent::ApprovalRequest {
+                        session_id: view.state.active_session.clone(),
+                        approval: Approval {
+                            request_id: id.clone(),
+                            tool_call: ToolCall {
+                                id: id.clone(),
+                                name: "bash".into(),
+                                arguments: serde_json::from_value(json!({"command":"pwd"}))
+                                    .unwrap(),
+                            },
+                        },
+                    }),
+                    window,
+                    cx,
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            visual.debug_bounds("approval-always").is_some(),
+            "always-allow button paints inside the approval dialog"
+        );
+        if let Some(keys) = activate {
+            visual.simulate_keystrokes(keys);
+        } else {
+            let button = visual
+                .debug_bounds("approval-always")
+                .expect("always-allow button bounds");
+            visual.simulate_click(button.center(), Default::default());
+        }
+        match receiver.try_recv().unwrap() {
+            CommandMessage::ApproveAlwaysTool(recv) => assert_eq!(recv, id),
+            other => panic!("expected ApproveAlwaysTool, got {other:?}"),
+        }
+        // Debounce: a second key or click must not re-fire until the server
+        // resolves the request. `decide_always_tool` sets `approval_pending`.
+        if let Some(keys) = activate {
+            visual.simulate_keystrokes(keys);
+        }
+        assert!(receiver.try_recv().is_err(), "no duplicate dispatch");
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_worker_message(
+                    WorkerMessage::Status(StatusResult {
+                        session: Some(session()),
+                        state: "idle".into(),
+                        pending_approvals: vec![],
+                        usage: json!({}),
+                        compaction_markers: 0,
+                    }),
+                    window,
+                    cx,
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(visual.debug_bounds("dialog-layer").is_none());
+    }
+}
+
+#[gpui::test]
+fn approval_mode_segmented_paints_a_filled_selected_state(cx: &mut TestAppContext) {
+    // ZETA-131 C1: `ask/allow/deny` in Settings must expose a clearly
+    // filled selected state — the shipped `.ghost().selected(true)` was
+    // invisible on every theme (audit). Assert that exactly one of the
+    // three segment buttons paints a row-sized `primary` fill.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: "one".into(),
+                        approval_mode: "allow".into(),
+                    },
+                    ModelCatalog {
+                        models: vec!["one".into()],
+                        providers: Default::default(),
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    let bounds_by_selector: Vec<(&str, gpui::Bounds<Pixels>)> =
+        ["mode-row-ask", "mode-row-allow", "mode-row-deny"]
+            .into_iter()
+            .map(|selector| {
+                let bounds = visual
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{selector} must render"));
+                (selector, bounds)
+            })
+            .collect();
+    let hits = visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scale = window.scale_factor();
+        let quads = window.painted_quads();
+        bounds_by_selector
+            .iter()
+            .filter(|(_, bounds)| {
+                let scaled = bounds.scale(scale);
+                quads.iter().any(|quad| {
+                    let inside = quad.bounds.top() >= scaled.top()
+                        && quad.bounds.bottom() <= scaled.bottom()
+                        && quad.bounds.left() >= scaled.left()
+                        && quad.bounds.right() <= scaled.right();
+                    inside && quad.background == theme.primary.into()
+                })
+            })
+            .map(|(selector, _)| *selector)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        hits,
+        vec!["mode-row-allow"],
+        "exactly one segment paints the primary fill — the selected mode"
+    );
+    // A click on `deny` must move the fill.
+    let deny = visual.debug_bounds("mode-row-deny").expect("deny segment");
+    visual.simulate_click(deny.center(), Default::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let bounds_by_selector: Vec<(&str, gpui::Bounds<Pixels>)> =
+        ["mode-row-ask", "mode-row-allow", "mode-row-deny"]
+            .into_iter()
+            .map(|selector| {
+                let bounds = visual
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{selector} must render after click"));
+                (selector, bounds)
+            })
+            .collect();
+    let hits = visual.update(|window, cx| {
+        let theme = cx.theme();
+        let scale = window.scale_factor();
+        let quads = window.painted_quads();
+        bounds_by_selector
+            .iter()
+            .filter(|(_, bounds)| {
+                let scaled = bounds.scale(scale);
+                quads.iter().any(|quad| {
+                    let inside = quad.bounds.top() >= scaled.top()
+                        && quad.bounds.bottom() <= scaled.bottom()
+                        && quad.bounds.left() >= scaled.left()
+                        && quad.bounds.right() <= scaled.right();
+                    inside && quad.background == theme.primary.into()
+                })
+            })
+            .map(|(selector, _)| *selector)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(hits, vec!["mode-row-deny"], "selection tracks the click");
+}
+
+#[gpui::test]
+fn header_paints_auto_approve_indicator_only_when_allow_mode_is_applied(cx: &mut TestAppContext) {
+    // ZETA-131 C2: whenever the server-applied session mode is `allow`, a
+    // warning-tinted "auto-approve" chip lives in the run-header metadata
+    // cluster. `ask` and `deny` show nothing. Chip survives a reconnect
+    // (status snapshot resets the session view; SettingsApplied then
+    // restores `applied_mode`). Verify draft-only selections do NOT paint
+    // — a user clicking `allow` in Settings without Apply must not spoof
+    // the indicator.
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for mode in ["ask", "deny"] {
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.state.session_view.applied_mode = mode.into();
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            visual.debug_bounds("header-auto-approve").is_none(),
+            "no auto-approve chip in mode {mode}"
+        );
+    }
+    // Apply `allow`.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::SettingsApplied(SessionSettings {
+                    model: "one".into(),
+                    approval_mode: "allow".into(),
+                }),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    let chip = visual
+        .debug_bounds("header-auto-approve")
+        .expect("chip paints when applied_mode is allow");
+    let header = visual
+        .debug_bounds("run-header")
+        .expect("run header renders");
+    assert!(
+        header.contains(&chip.center()),
+        "chip sits inside the run header"
+    );
+    let dot = visual
+        .debug_bounds("header-auto-approve-dot")
+        .expect("chip has a color dot");
+    visual.update(|window, cx| {
+        let scale = window.scale_factor();
+        let scaled = chip.scale(scale);
+        let quads = window.painted_quads();
+        let tint = quads.iter().find(|quad| {
+            quad.background == theme::palette::warning_tint().into()
+                && quad.bounds.top() >= scaled.top() - px(1.).scale(scale)
+                && quad.bounds.bottom() <= scaled.bottom() + px(1.).scale(scale)
+        });
+        assert!(tint.is_some(), "auto-approve chip paints its warning tint");
+        let scaled_dot = dot.scale(scale);
+        let dot_fill = quads.iter().find(|quad| {
+            quad.background == theme::palette::warning().into()
+                && quad.bounds.top() >= scaled_dot.top() - px(1.).scale(scale)
+                && quad.bounds.bottom() <= scaled_dot.bottom() + px(1.).scale(scale)
+        });
+        assert!(dot_fill.is_some(), "warning dot carries the color signal");
+    });
+    // A draft-only selection through the Settings modal must NOT paint the
+    // chip. Bump `selected_mode` (the draft) to `allow` but leave
+    // `applied_mode` on `deny` — the indicator stays away.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.session_view.applied_mode = "deny".into();
+            view.state.session_view.selected_mode = session::APPROVAL_MODES
+                .iter()
+                .position(|m| *m == "allow")
+                .unwrap();
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("header-auto-approve").is_none(),
+        "draft-only allow selection must not paint the header chip"
+    );
+    // Reconnect flow: a fresh Settings arrives with allow — chip repaints.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: "one".into(),
+                        approval_mode: "allow".into(),
+                    },
+                    ModelCatalog {
+                        models: vec!["one".into()],
+                        providers: Default::default(),
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("header-auto-approve").is_some(),
+        "reconnect into an allow session repaints the chip"
+    );
+}
+
+#[gpui::test]
 fn virtual_transcript_and_session_rows_fit_their_viewports(cx: &mut TestAppContext) {
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);

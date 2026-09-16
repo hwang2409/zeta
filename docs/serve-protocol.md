@@ -137,9 +137,20 @@ message at the next safe provider boundary. A turn must be running.
 
 ### `approve` and `deny`
 
-Params: required `request_id`, a non-empty string matching an approval request.
+Params: required `request_id`, a non-empty string matching an approval request,
+and optional `scope`. `scope` defaults to `"once"` (this request only).
+`"always_tool"` on `approve` also adds the tool's name to the session's
+`always_allow` list, so every later call to the same tool auto-approves for
+the rest of the session. `"always_tool"` on `deny` is a `-32602`. Legacy
+clients omitting `scope` see the same behavior as before.
+
+Session-scoped memory is deliberate: per-command and per-directory scopes and
+cross-session persistence are out of scope for this RPC. A restart discards
+the extra rules.
+
 The result contains `accepted`, `request_id`, and `decision` (`"approve"` or
-`"deny"`). The decision wakes an active turn. For a resumed session, the
+`"deny"`). It also carries `scope` when the caller passed one other than
+`"once"`. The decision wakes an active turn. For a resumed session, the
 server executes the pending tool through the existing loop seam.
 
 ```json
@@ -148,6 +159,14 @@ server executes the pending tool through the existing loop seam.
 
 ```json
 {"jsonrpc":"2.0","id":7,"result":{"accepted":true,"request_id":"tool-call-1","decision":"approve"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":8,"method":"approve","params":{"request_id":"tool-call-2","scope":"always_tool"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":8,"result":{"accepted":true,"request_id":"tool-call-2","decision":"approve","scope":"always_tool"}}
 ```
 
 ### `abort`
