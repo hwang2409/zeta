@@ -9328,36 +9328,32 @@ fn zeta129_inline_code_chip_ladder_structure(cx: &mut TestAppContext) {
     assert_eq!(
         bounds.len(),
         16,
-        "expected one inline-code chip per ladder length 1..=16, got \
-         {} on the theme's secondary_hover wash ({subtle_bg:?}); \
-         count mismatch surfaces the ZETA-129 wrap-boundary paint that \
-         emits an extra background quad below every drift-tripped chip",
+        "expected one inline-code chip background quad per ladder length \
+         1..=16, got {} on the theme's secondary_hover wash ({subtle_bg:?})",
         bounds.len(),
     );
     // Each subsequent chip carries one more mono glyph than the previous —
-    // shaped widths grow monotonically. A wrap-triggered split that
-    // shrinks a chip below its expected shape (or a drift drop that
-    // reports a zero-width chip) breaks this ordering.
+    // shaped widths must grow monotonically. Structural regression cover:
+    // a change to the chip renderer that reshapes a shorter chip wider
+    // than a longer one lands here rather than as a silent visual defect.
     for (ix, window) in bounds.windows(2).enumerate() {
         let prev = window[0].size.width;
         let next = window[1].size.width;
         assert!(
             next > prev,
             "chip {} (len={}) width {prev:?} must be strictly less than \
-             chip {} (len={}) width {next:?} — a wrap-triggered split \
-             or a shape-drift drop breaks this ordering",
+             chip {} (len={}) width {next:?} — the ladder shapes widths \
+             monotonically by construction",
             ix,
             ix + 1,
             ix + 1,
             ix + 2,
         );
     }
-    // No chip-associated paint (secondary_hover-washed quads) may land
-    // below its span's own bullet row. The bug's stale-x paint below the
-    // chip emits an extra quad on the next line at the chip's x-position;
-    // sorting groups chips into rows of unique y-origin, so any two
-    // consecutive chips whose x-origins overlap while their y-origins
-    // differ by less than a full row identifies a stray below-line paint.
+    // Sorting places chips into rows of unique y-origin. Structural
+    // regression cover: two consecutive chip background quads must never
+    // sit less than one row-stride apart, so a future change that emits
+    // a chip quad off-row lands here.
     let row_stride = if bounds.len() >= 2 {
         bounds[1].origin.y - bounds[0].origin.y
     } else {
@@ -9367,10 +9363,9 @@ fn zeta129_inline_code_chip_ladder_structure(cx: &mut TestAppContext) {
         let dy = pair[1].origin.y - pair[0].origin.y;
         assert!(
             dy >= row_stride,
-            "chip {} at {:?} and chip {} at {:?} sit less than one \
-             row apart (dy={dy:?}, row_stride={row_stride:?}) — a \
-             below-line phantom paint would land here under the \
-             ZETA-129 drift",
+            "chip {} at {:?} and chip {} at {:?} sit less than one row \
+             apart (dy={dy:?}, row_stride={row_stride:?}) — chip background \
+             quads must be aligned in row-strides",
             ix,
             pair[0].origin,
             ix + 1,
@@ -9387,5 +9382,6 @@ fn zeta129_inline_code_chip_ladder_structure(cx: &mut TestAppContext) {
 // `gui/src/smoke.rs::scan_inline_flow_recorder`, guarded by
 // `gui-native-guards` (fail on any recorded wrap boundary) and paired
 // with `gui-native-guards-inline-flow-mutation` (must fail the guard
-// under `ZETA_GUI_INLINE_FLOW_DEFINITE=1`, where the real CoreText
-// drift trips 18px on the ladder).
+// under `ZETA_GUI_INLINE_FLOW_DEFINITE=1`). Pinned CI trip evidence:
+// shape=`wedge`, size=13px, sample text=`meta.json`, wrap_boundaries=1
+// — the audit's length-9 code chip on the 13px × 0.875 mono metrics.
