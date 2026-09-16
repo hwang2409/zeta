@@ -10429,7 +10429,7 @@ fn tool_row_dedupes_when_excerpt_falls_back_to_the_tool_name() {
         complete: false,
         error: false,
         canceled: false,
-        card: Card {
+        card: zeta_gui::cards::Card {
             expanded: true,
             ..Default::default()
         },
@@ -10452,7 +10452,7 @@ fn tool_row_dedupes_when_excerpt_falls_back_to_the_tool_name() {
         complete: false,
         error: false,
         canceled: false,
-        card: Card {
+        card: zeta_gui::cards::Card {
             expanded: true,
             ..Default::default()
         },
