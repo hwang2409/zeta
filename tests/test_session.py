@@ -205,6 +205,50 @@ def test_legacy_resume_hydrates_without_bumping_updated_at(
     )
 
 
+def test_first_legacy_resume_with_explicit_prompt_bumps_updated_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The FIRST legacy resume with --system-prompt must bump updated_at.
+
+    An explicit prompt on the very first resume of a legacy session (no
+    snapshot yet) is user activity, so it must reorder the sidebar. A
+    previous gate required an existing snapshot before honoring the
+    override, so the first-resume path silently persisted without bumping.
+    """
+
+    home = tmp_path / "zeta-home"
+    (tmp_path / "AGENTS.md").write_text("legacy rules", encoding="utf-8")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    opened = SessionManager(home).create(provider="fake", model="offline", cwd=tmp_path)
+    session_id = opened.store.session_id
+    metadata_path = home / "sessions" / session_id / "meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("system_prompt")
+    metadata.pop("context_files")
+    pinned = "2020-01-01T00:00:00+00:00"
+    metadata["updated_at"] = pinned
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    create_app(
+        build_parser().parse_args(
+            [
+                "--resume",
+                session_id,
+                "--provider",
+                "fake",
+                "--system-prompt",
+                "operator override",
+            ]
+        )
+    )
+    overridden = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert overridden["system_prompt"] == "operator override"
+    assert overridden["updated_at"] != pinned, (
+        "first legacy resume with --system-prompt must bump updated_at"
+    )
+
+
 def test_legacy_resume_migrates_prompt_index_with_skill_catalog(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
