@@ -8,6 +8,7 @@ import os
 import signal
 import socket
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -2345,3 +2346,270 @@ async def test_attachment_symlink_cannot_write_outside_session(tmp_path):
         assert list(outside.iterdir()) == []
     finally:
         await runtime.close()
+
+
+def _seed_slash_fixtures(tmp_path: Path) -> Path:
+    """Seed a home + project layout with one macro and one skill.
+
+    Home holds a skill (`/greet`) so ``slash_list`` and ``slash_run`` observe
+    the full builtin + macro + skill triple that the shared registry stitches
+    together. Every scope-floor test uses this so the tests fail loudly if
+    any tier stops loading. The project is git-initialised so ``/init``
+    resolves a project root and returns its model prompt.
+    """
+
+    project = tmp_path / "project"
+    (project / ".zeta" / "commands").mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "--quiet", str(project)],
+        check=True,
+        capture_output=True,
+    )
+    (project / ".zeta" / "commands" / "review.md").write_text(
+        "---\ndescription: skim the current diff\n---\nDo a review: $ARGUMENTS\n",
+        encoding="utf-8",
+    )
+    (project / ".zeta" / "commands" / "hi.md").write_text(
+        "---\ndescription: greet\n---\nSay hi to $ARGUMENTS\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    skill_dir = home / "skills" / "greet"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: greet\ndescription: greet the user\nkeywords: [greet]\n---\n\n"
+        "Say hi like you mean it.\n",
+        encoding="utf-8",
+    )
+    return project
+
+
+@pytest.mark.asyncio
+async def test_slash_list_reports_builtins_macros_and_named_skill(tmp_path: Path) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        result = (
+            await _request(
+                reader, writer, 5, "slash_list", {"session_id": sid}
+            )
+        )[-1]["result"]
+        commands = {entry["name"]: entry for entry in result["commands"]}
+        # Runnable built-ins the server drives directly. `/init` and `/help`
+        # live at the scope floor — the menu depends on them appearing here
+        # or the ZETA-130 lane loses two anchor commands.
+        for name in ("status", "compact", "model", "help", "init"):
+            assert name in commands
+            assert commands[name]["client_only"] is False
+        # Client-only built-ins still appear so the menu can render them.
+        for name in ("vim", "theme", "fork"):
+            assert commands[name]["client_only"] is True
+        # Prompt macros advertise their source directory.
+        assert commands["review"]["kind"] == "macro-prompt"
+        assert commands["review"]["source"] == "project"
+        # The named skill from `~/.zeta/skills/greet/` must be present and
+        # tagged as a skill so a GUI can source-badge it.
+        assert commands["greet"]["kind"] == "skill"
+        assert commands["greet"]["client_only"] is False
+        # session_id must match the active session.
+        error = (
+            await _request(
+                reader, writer, 6, "slash_list", {"session_id": "other"}
+            )
+        )[-1]["error"]
+        assert error["code"] == -32003
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="fake")
+    reader, writer, sid = await _ready_extensions(server)
+
+    async def run(text: str) -> dict:
+        return (
+            await _request(
+                reader,
+                writer,
+                text,
+                "slash_run",
+                {"session_id": sid, "text": text},
+            )
+        )[-1]
+
+    try:
+        # /status returns a composed notice.
+        result = (await run("/status"))["result"]
+        assert result["kind"] == "output"
+        assert "session_id:" in result["text"]
+
+        # /help enumerates commands so a GUI can show the same catalog inline.
+        result = (await run("/help"))["result"]
+        assert result["kind"] == "output"
+        assert "/status" in result["text"]
+
+        # /init inside a project returns a model prompt (no args allowed).
+        result = (await run("/init"))["result"]
+        assert result["kind"] == "model_input"
+        assert result["text"]
+
+        # /model without arguments hands off to the client's picker
+        # surface (Settings on the GUI); it never returns a bare text
+        # notice a user cannot act on.
+        result = (await run("/model"))["result"]
+        assert result == {"kind": "client_only", "name": "model"}
+
+        # /model switching applies through the shared settings path.
+        result = (await run("/model faster"))["result"]
+        assert result == {"kind": "output", "text": "model: faster"}
+        assert server.runtime.model == "faster"
+
+        # /compact is safe on an empty conversation; it reports nothing to compact.
+        result = (await run("/compact"))["result"]
+        assert result["kind"] == "output"
+
+        # Prompt macros return model input, not chat text.
+        result = (await run("/hi Henry"))["result"]
+        assert result == {"kind": "model_input", "text": "Say hi to Henry"}
+
+        # A named skill loads and returns its prompt body as model input so a
+        # GUI can send it up the shared send path. The test seeds a
+        # `~/.zeta/skills/greet` skill in `_seed_slash_fixtures` — this is
+        # the real skill seam the earlier version of the test never touched.
+        result = (await run("/greet"))["result"]
+        assert result["kind"] == "model_input"
+        assert "Say hi like you mean it" in result["text"]
+
+        # Client-only commands report themselves so the GUI can dispatch locally.
+        result = (await run("/theme"))["result"]
+        assert result == {"kind": "client_only", "name": "theme"}
+
+        # Unknown commands are rejected structurally, never posted to the model.
+        result = (await run("/nosuchcommand"))["result"]
+        assert result == {"kind": "unknown", "name": "nosuchcommand"}
+
+        # Text that does not start with `/` is a shape error, not a passthrough.
+        error = (await run("hello"))["error"]
+        assert error["code"] == -32602
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_extensions_reject_legacy_clients(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+        for method in ("slash_list", "slash_run"):
+            error = (
+                await _request(
+                    reader,
+                    writer,
+                    method,
+                    method,
+                    {"session_id": "any", "text": "/status"},
+                )
+            )[-1]["error"]
+            assert error["code"] == -32601
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_run_guards_mutations_while_approvals_pending(tmp_path: Path) -> None:
+    """`/compact` and `/model <name>` must fire ``require_mutable`` before
+    dispatching. Otherwise a mutation lands while the loop is idle but the
+    store still holds an outstanding tool call — the same seam every other
+    mutation RPC guards with the exact same check."""
+
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    # Seed one outstanding tool call so ``pending_requests()`` returns it
+    # even though no turn task is running — this is the scenario the fix
+    # closes: _require_idle passes, require_mutable must not.
+    call = ToolCall("guarded-call", "read", {"path": str(tmp_path / "input")})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        provider="fake",
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        await _request(reader, writer, 2, "resume", {"session_id": opened.metadata.session_id})
+        sid = opened.metadata.session_id
+
+        async def run(rid: object, text: str) -> dict:
+            return (
+                await _request(
+                    reader, writer, rid, "slash_run", {"session_id": sid, "text": text}
+                )
+            )[-1]
+
+        # Read-only commands remain dispatchable — the guard only trips
+        # mutating built-ins so `/status` still returns while an approval
+        # is pending.
+        assert (await run(3, "/status"))["result"]["kind"] == "output"
+        # `/compact` mutates the context store — must reject.
+        assert (await run(4, "/compact"))["error"]["code"] == -32004
+        # `/model` with args mutates settings — must reject.
+        assert (await run(5, "/model faster"))["error"]["code"] == -32004
+        # `/model` with no args is read-only — must still hand off to the
+        # client's picker (never the mutation guard).
+        assert (await run(6, "/model"))["result"] == {
+            "kind": "client_only",
+            "name": "model",
+        }
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_run_rejects_during_running_turn(tmp_path: Path) -> None:
+    from zeta.server.fake_backend import ServerFakeBackend
+    from zeta.types import StreamEventType
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class PausedBackend(ServerFakeBackend):
+        async def complete(self, messages, tool_schemas):
+            async for event in super().complete(messages, tool_schemas):
+                yield event
+                if event.type == StreamEventType.MESSAGE_UPDATE:
+                    started.set()
+                    await release.wait()
+
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=tmp_path,
+        port=0,
+        provider="fake",
+        backend_factory=lambda *_args: (PausedBackend(delay=0), "offline"),
+    )
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "slow"})
+        await asyncio.wait_for(started.wait(), TIMEOUT)
+        error = (
+            await _request(
+                reader,
+                writer,
+                4,
+                "slash_run",
+                {"session_id": sid, "text": "/status"},
+            )
+        )[-1]["error"]
+        assert error["code"] == -32004
+    finally:
+        release.set()
+        await _close(server, writer)

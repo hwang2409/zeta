@@ -138,7 +138,9 @@ impl Harness {
             .expect("worker must make progress");
         if matches!(
             message,
-            WorkerMessage::Extensions(false) | WorkerMessage::SessionManagement(false)
+            WorkerMessage::Extensions(false)
+                | WorkerMessage::SessionManagement(false)
+                | WorkerMessage::SlashExtensions(_)
         ) {
             self.next()
         } else {

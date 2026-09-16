@@ -454,6 +454,45 @@ error code and message. Provider status and origin remain internal.
 The generic 1 MiB frame bound applies to all requests and responses. Session
 metadata adds nullable `approval_mode`; absent or null uses configured defaults.
 
+### Slash commands (ZETA-130)
+
+Protocol 1.1 exposes the shared slash dispatcher without forking a second
+implementation for the GUI. Two RPCs cover the surface.
+
+- `slash_list`: params `session_id`. Returns `commands` and `notices`.
+  Each command entry has `name`, `description`, `kind` (`builtin`,
+  `macro-prompt`, `macro-exec`, `skill`, or `mcp-prompt`), `source`
+  (`builtin`, `home`, `project`, or `mcp:<server>`), `client_only`
+  (`true` when the command needs a client-side surface — for example a
+  picker or workspace mutation), and `unavailable` (a bounded reason
+  string, or `null` when the command runs cleanly). The GUI renders every
+  entry so users see what is available, then routes runs by the flags.
+- `slash_run`: params `session_id` and `text` (the raw composer value
+  starting with `/`). Rejects the request when a turn is running with
+  `-32004`. Returns a `kind` discriminator:
+  - `output`: `text` is the composed notice to render as a quiet receipt.
+  - `model_input`: `text` is the resolved prompt to send with `send`. The
+    server does not enqueue it; the client sends normally so the composer
+    stays authoritative.
+  - `client_only`: the command exists but must run in the client (name is
+    echoed back for the client's dispatch table).
+  - `unknown`: no command matched the leading token.
+  - `error`: the shared dispatcher reported a bounded failure `text`.
+
+The scope floor served over `slash_run` is `/status`, `/compact`, `/model`,
+`/init`, `/help`, and user prompt macros (`.zeta/commands/*.md` with
+`kind: prompt`) plus skills. `/model` splits by argument shape: argless
+`/model` returns `client_only` so the GUI can open Settings for the
+picker surface, while `/model <name>` dispatches server-side through the
+shared settings-apply path. Exec macros and every command in the
+`client_only` set report themselves as client-only rather than
+half-executing here.
+
+Legacy clients receive `-32601` for both requests, matching every other
+1.1 extension. A protocol-1.1 GUI talking to a 1.0 server hides the menu
+entirely: without `slash_list`, the composer keeps every `/`-prefixed
+value in the composer and never posts it to the model as chat.
+
 ### Session preview metadata
 
 `list_sessions` includes an optional `first_message_preview` string on each

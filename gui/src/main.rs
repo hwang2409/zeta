@@ -4,6 +4,7 @@ mod polish;
 mod prefs;
 mod session_management;
 mod sidebar;
+mod slash_menu;
 #[cfg(feature = "smoke-test")]
 mod smoke;
 mod theme;
@@ -32,13 +33,23 @@ use std::{
     time::Duration,
 };
 use zeta_gui::{
-    client::Approval,
+    client::{Approval, SlashRunResult},
     login::{LoginProgress, LoginProvider},
     row_text,
     session::{ImageAttachment, SessionSettings, APPROVAL_MODES},
     state::{AppState, ConnectionState, TranscriptEdit, TranscriptEntry},
     worker::{CommandMessage, ConnectionWorker, WorkerMessage},
 };
+
+/// One line of feedback from `slash_run`: the composed notice (or bounded
+/// error) and whether the row should paint on the danger token. Kept in
+/// `ZetaView` so the strip renders alongside the composer without touching
+/// the transcript row model.
+#[derive(Debug, Clone)]
+struct SlashOutputNotice {
+    text: String,
+    error: bool,
+}
 
 /// Composer chip / drop-target chrome literals. Lives at module scope so the
 /// composer renderer references named consts rather than bare strings, and a
@@ -277,6 +288,25 @@ struct ZetaView {
     /// from GPUI's event listeners without a `Context<Self>` handle.
     drag_over_composer: std::rc::Rc<std::cell::Cell<bool>>,
     sent_images: std::collections::BTreeMap<(usize, usize), std::sync::Arc<gpui::Image>>,
+    /// Slash command menu state (ZETA-130). The menu opens when the composer
+    /// starts with `/`; its filter and selection track the composer directly
+    /// so `send_composer` routes the composed value through `slash_run` and
+    /// no `/`-prefixed text ever leaves the composer as chat.
+    slash_menu: slash_menu::SlashMenu,
+    /// True once the current session's slash catalog has been requested. The
+    /// worker seeds this on the first `Session` message; a legacy 1.0 server
+    /// keeps the menu empty and the composer never opens the overlay.
+    slash_catalog_requested: bool,
+    /// True once the server advertised `slash_list` and `slash_run`. Gated
+    /// on the methods themselves (not just protocol 1.1) so an older 1.1
+    /// server that never learned about ZETA-130 degrades cleanly: the
+    /// composer refuses to submit a slash draft and paints a notice
+    /// instead of shipping the text to the model as chat.
+    slash_extensions: bool,
+    /// Text of the last slash-run reply, rendered as a quiet strip beside the
+    /// composer. Full transcript-row integration is deferred as a followup;
+    /// this bar keeps the receipt visible without adding a new row variant.
+    slash_output_notice: Option<SlashOutputNotice>,
     commands: Sender<CommandMessage>,
     _poll_task: Option<Task<()>>,
 }
@@ -294,21 +324,38 @@ impl ZetaView {
                 .placeholder("Message zeta")
                 .submit_on_enter(true)
         });
-        cx.subscribe_in(&composer, window, |view, _, event: &InputEvent, _, cx| {
-            if matches!(event, InputEvent::Change) {
-                view.composer_empty_hint = false;
-                cx.notify();
-            }
-            if matches!(
-                event,
-                InputEvent::PressEnter {
-                    secondary: false,
-                    shift: false
+        cx.subscribe_in(
+            &composer,
+            window,
+            |view, composer, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    view.composer_empty_hint = false;
+                    let value = composer.read(cx).value().to_string();
+                    view.slash_menu.sync(&value);
+                    cx.notify();
                 }
-            ) {
-                view.send_composer(cx);
-            }
-        })
+                if matches!(
+                    event,
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        shift: false
+                    }
+                ) {
+                    // The menu forwards Enter to `select_slash_menu` when it
+                    // has a match — that helper either completes the draft to
+                    // the highlighted command name or, when the draft already
+                    // matches that name (a completed selection or exact
+                    // typing), submits through `send_composer`. Without the
+                    // dual behaviour a second Enter on a completed selection
+                    // was a silent no-op.
+                    if view.slash_menu.open && view.slash_menu.current().is_some() {
+                        view.select_slash_menu(window, cx);
+                    } else {
+                        view.send_composer(cx);
+                    }
+                }
+            },
+        )
         .detach();
         window.focus(&composer.focus_handle(cx), cx);
         Self {
@@ -359,6 +406,10 @@ impl ZetaView {
             composer_empty_hint: false,
             drag_over_composer: std::rc::Rc::new(std::cell::Cell::new(false)),
             sent_images: Default::default(),
+            slash_menu: slash_menu::SlashMenu::default(),
+            slash_catalog_requested: false,
+            slash_extensions: false,
+            slash_output_notice: None,
             commands,
             _poll_task: None,
         }
@@ -521,6 +572,19 @@ impl ZetaView {
                 self.state.sessions_truncated = list.truncated;
             }
             WorkerMessage::SessionManagement(available) => self.session_management = available,
+            WorkerMessage::SlashExtensions(available) => {
+                self.slash_extensions = available;
+                if !available {
+                    self.slash_menu.set_commands(Vec::new());
+                    self.slash_menu.dismiss();
+                    // Clearing the catalog on a legacy handshake without
+                    // also releasing the request latch would leave the menu
+                    // permanently empty on a capable → legacy → capable
+                    // sequence: the second capable Status finds
+                    // `slash_catalog_requested = true` and skips SlashList.
+                    self.slash_catalog_requested = false;
+                }
+            }
             WorkerMessage::Renamed(session) => {
                 self.pending_command = false;
                 if let Some(row) = self
@@ -554,6 +618,13 @@ impl ZetaView {
                     self.state.sessions.insert(0, session);
                 }
             }
+            WorkerMessage::SlashCommands(list) => {
+                self.slash_menu.set_commands(list.commands);
+            }
+            WorkerMessage::SlashResult(text, result) => {
+                self.pending_command = false;
+                self.handle_slash_result(text, result, window, cx);
+            }
             WorkerMessage::Status(status) => {
                 if let Some(session) = &status.session {
                     if let Some(row) = self
@@ -581,7 +652,18 @@ impl ZetaView {
                     self.command_error = Some(error);
                 }
             }
-            WorkerMessage::Connected => self.state.connection = ConnectionState::Connected,
+            WorkerMessage::Connected => {
+                self.state.connection = ConnectionState::Connected;
+                // Release the slash-catalog latch so the shared active-
+                // session block below re-requests the catalog on the new
+                // connection. The active session survives a reconnect —
+                // without releasing here, `slash_catalog_requested`
+                // stays true across generations and the menu never
+                // refreshes. Resetting on Connected rather than Lost
+                // keeps the request from firing while the socket is
+                // still down.
+                self.slash_catalog_requested = false;
+            }
             WorkerMessage::Event(event) => edits = self.state.apply(event),
             WorkerMessage::Lost(error) => {
                 if self.session_edit.is_some() {
@@ -609,7 +691,23 @@ impl ZetaView {
                 self.close_settings(window, cx);
             }
             self.settings_error = None;
+            self.slash_menu.dismiss();
+            self.slash_output_notice = None;
+            self.slash_catalog_requested = false;
             replace = true;
+        }
+        // Slash catalog is per-session; request it for whichever message
+        // (Session, Status, SlashExtensions) first surfaces an active
+        // session on a slash-capable server. Firing here rather than inside
+        // `WorkerMessage::Session` also covers cold-start Status frames,
+        // which the previous code missed — an app restart with a live
+        // session showed no command menu at all.
+        if self.slash_extensions
+            && self.state.active_session.is_some()
+            && !self.slash_catalog_requested
+        {
+            self.slash_catalog_requested = true;
+            self.queue(CommandMessage::SlashList);
         }
         if replace {
             for image in std::mem::take(&mut self.sent_images).into_values() {
@@ -674,6 +772,37 @@ impl ZetaView {
             return;
         }
         let text = self.composer.read(cx).value().to_string();
+        // Any leading `/` is a slash command — route through the shared
+        // server dispatcher instead of shipping the raw value to the model
+        // as chat. `is_slash_draft` also catches multiline drafts like
+        // `/status\nfoo` that the menu itself dismisses; the dispatcher
+        // parses the first line and returns a bounded notice for unknown
+        // commands so the composer stays populated for the user to fix.
+        if slash_menu::is_slash_draft(&text) {
+            if !self.slash_extensions {
+                // An older serve that never learned about slash_run cannot
+                // dispatch this draft. Refusing here preserves the lane's
+                // invariant that a `/`-prefixed value never leaks to the
+                // model as chat; the output strip renders the bounded
+                // reason so the user knows why nothing was sent.
+                self.slash_output_notice = Some(SlashOutputNotice {
+                    text: slash_menu::copy::UNAVAILABLE.into(),
+                    error: true,
+                });
+                cx.notify();
+                return;
+            }
+            // GUI owns leading-whitespace normalisation: `is_slash_draft`
+            // accepts a padded draft (`  /status`) but the server's
+            // `run_command` rejects it with -32602 because its first check
+            // is a bare `text.startswith("/")`. Trim here so the two sides
+            // agree — a single owner keeps the invariant testable.
+            let normalised = text.trim_start().to_string();
+            self.queue(CommandMessage::SlashRun(normalised));
+            self.pending_command = true;
+            cx.notify();
+            return;
+        }
         let valid: Vec<ImageAttachment> = self
             .composer_attachments
             .iter()
@@ -686,6 +815,12 @@ impl ZetaView {
         }
         self.composer_empty_hint = false;
         self.pending_command = true;
+        // Strip the `//` literal escape to `/` so the model receives what
+        // the user typed after the guard, matching the shared
+        // `input_for_model` contract the TUI already uses. Without this
+        // the composer would ship `//status` verbatim and the model would
+        // see the escape character rather than the intended literal.
+        let text = slash_menu::unescape_literal_slash(text);
         // Record the queued text so a dashed strip renders under the composer
         // while the server has not yet echoed the turn. `WorkerMessage::Sent`
         // clears it; `Rejected` flips `failed` for the danger rail.
@@ -698,6 +833,155 @@ impl ZetaView {
         } else {
             self.queue(CommandMessage::SendImages(text, valid));
         }
+        cx.notify();
+    }
+
+    /// Enter-in-menu handler. Contract: the first Enter completes the
+    /// draft to the highlighted command's canonical form (`/<name> ` for
+    /// name-only, or `/<name><tail>` when the user has already started
+    /// typing arguments); a subsequent Enter dispatches through
+    /// `send_composer`. That means Enter never submits silently on the
+    /// first press — the user always sees the completed form before it
+    /// leaves the composer. When the draft already equals the canonical
+    /// form there is nothing to complete, so Enter submits immediately.
+    fn select_slash_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.composer.read(cx).value().to_string();
+        let Some(command) = self.slash_menu.current().cloned() else {
+            return;
+        };
+        let next = slash_menu::compose_selection(&current, &command);
+        if next == current {
+            self.send_composer(cx);
+            return;
+        }
+        self.composer
+            .update(cx, |input, cx| input.set_value(&next, window, cx));
+        self.slash_menu.clear_notice();
+        cx.notify();
+    }
+
+    /// Route one `slash_run` reply through the composer and menu. The
+    /// dispatcher already composed every visible string; the client only
+    /// decides where each `kind` lands in the UI.
+    fn handle_slash_result(
+        &mut self,
+        original: String,
+        result: SlashRunResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            SlashRunResult::Output { text } => {
+                self.reset_composer_after_slash(window, cx);
+                self.slash_output_notice = Some(SlashOutputNotice { text, error: false });
+            }
+            SlashRunResult::ModelInput { text } => {
+                // Dismiss the menu but keep the composer draft AND any
+                // attached images until the server acknowledges the send.
+                // Two invariants: attachments must ride with a slash-produced
+                // turn instead of being silently dropped, and a rejected
+                // send must leave the original slash draft in place so the
+                // user can retry — same pattern as a rejected chat send.
+                // `Sent` / `ImagesSent` clear both the composer and chips.
+                let _ = original;
+                self.slash_menu.dismiss();
+                let valid: Vec<ImageAttachment> = self
+                    .composer_attachments
+                    .iter()
+                    .filter_map(|item| item.valid_ref().cloned())
+                    .collect();
+                self.pending_command = true;
+                self.pending_user_turn = Some(PendingUserTurn {
+                    text: text.clone(),
+                    failed: false,
+                });
+                if valid.is_empty() {
+                    self.queue(CommandMessage::Send(text));
+                } else {
+                    self.queue(CommandMessage::SendImages(text, valid));
+                }
+            }
+            SlashRunResult::ClientOnly { name } => {
+                // Client-side dispatch for the few commands the GUI drives
+                // directly. Every other client-only command surfaces a
+                // bounded notice so the user knows the composer has not
+                // silently swallowed the request.
+                match name.as_str() {
+                    "new" => {
+                        self.reset_composer_after_slash(window, cx);
+                        self.new_session(cx);
+                    }
+                    "theme" | "model" => {
+                        // Argless `/model` opts out server-side to route
+                        // through the settings picker — the doc contract.
+                        self.reset_composer_after_slash(window, cx);
+                        self.open_settings(cx);
+                    }
+                    _ => {
+                        self.surface_slash_notice(slash_menu::copy::client_only(&name));
+                        // Keep the composer populated so the user can adjust.
+                        let _ = original;
+                    }
+                }
+            }
+            SlashRunResult::Unknown { name } => {
+                // Keep the composer populated so the user can fix the
+                // command name. The menu (or the output strip, when the
+                // menu was already dismissed) paints the notice inline so
+                // no `/`-prefixed value quietly submits.
+                self.surface_slash_notice(slash_menu::copy::unknown(&name));
+                let _ = original;
+            }
+            SlashRunResult::Error { text } => {
+                self.slash_output_notice = Some(SlashOutputNotice { text, error: true });
+                let _ = original;
+            }
+        }
+    }
+
+    /// Paint a slash-command notice in whichever surface the user can see.
+    /// When the menu is open it renders the inline menu strip; when the
+    /// draft has already been sent (Escape-then-Send, or a multiline draft
+    /// that closes the menu on newline) it falls through to the output
+    /// notice so the message is not swallowed.
+    fn surface_slash_notice(&mut self, text: String) {
+        if self.slash_menu.open {
+            self.slash_menu.set_notice(text);
+            self.slash_output_notice = None;
+        } else {
+            self.slash_output_notice = Some(SlashOutputNotice { text, error: true });
+        }
+    }
+
+    /// Clear the composer and dismiss the slash menu after a successful
+    /// dispatch. Mirrors the `Sent` branch of `apply_worker_message` so a
+    /// slash reply and a normal send leave the composer in the same state.
+    fn reset_composer_after_slash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.slash_menu.dismiss();
+    }
+
+    /// Root-level key handler for the slash menu. Runs on every key so up /
+    /// down / escape reach the menu before the composer's own bindings —
+    /// prevent_default keeps the textarea from moving the cursor.
+    fn slash_menu_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.slash_menu.open {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "up" => self.slash_menu.select_prev(),
+            "down" => self.slash_menu.select_next(),
+            "escape" => self.slash_menu.dismiss(),
+            _ => return,
+        }
+        window.prevent_default();
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -1988,6 +2272,12 @@ impl ZetaView {
                         style.border_color(cx.theme().drag_border)
                     })
             })
+            .when(self.slash_menu.open, |composer| {
+                composer.child(self.render_slash_menu(cx))
+            })
+            .when_some(self.slash_output_notice.clone(), |composer, notice| {
+                composer.child(self.render_slash_output(notice, cx))
+            })
             .when(!self.composer_attachments.is_empty(), |composer| {
                 composer.child(self.render_attachment_chips(cx))
             })
@@ -2128,6 +2418,123 @@ impl ZetaView {
     /// a remove button; invalid entries paint an error icon, name, and the
     /// inline error message. Every dimension routes through theme tokens so
     /// the whole row scales with the appearance picker.
+    fn render_slash_menu(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme();
+        let base = theme.font_size;
+        let window = self.slash_menu.visible_window();
+        let mut container = div()
+            .id("slash-menu")
+            .debug_selector(|| "slash-menu".into())
+            .v_flex()
+            .flex_shrink_0()
+            .mb_2()
+            .p(theme::SLASH_MENU_PADDING)
+            .bg(theme.sidebar)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(theme::SLASH_MENU_RADIUS)
+            .text_size(theme::label_small(base));
+        if window.rows.is_empty() {
+            container = container.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_color(theme.muted_foreground)
+                    .child(slash_menu::copy::EMPTY),
+            );
+        } else {
+            for (offset, command) in window.rows.iter().enumerate() {
+                let is_selected = offset == window.selected;
+                let name = command.name.clone();
+                let description = command.description.clone();
+                let source = command.source.clone();
+                let element_id: gpui::ElementId = format!("slash-row-{name}").into();
+                let filled = if is_selected {
+                    theme.list_active
+                } else {
+                    gpui::transparent_black()
+                };
+                let target_name = name.clone();
+                let row = div()
+                    .id(element_id)
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded(theme::SLASH_MENU_ROW_RADIUS)
+                    .cursor_pointer()
+                    .bg(filled)
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |view, _event, window, cx| {
+                            view.select_slash_menu_row(&target_name, window, cx);
+                        }),
+                    )
+                    .child(div().text_color(theme.foreground).child(format!("/{name}")))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(theme.muted_foreground)
+                            .child(description),
+                    )
+                    .when(!source.is_empty() && source != "builtin", |row| {
+                        row.child(
+                            div()
+                                .text_color(theme.muted_foreground)
+                                .text_size(theme::label_micro(base))
+                                .child(source.clone()),
+                        )
+                    });
+                container = container.child(row);
+            }
+        }
+        if let Some(notice) = self.slash_menu.notice.clone() {
+            container = container.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_color(theme.muted_foreground)
+                    .child(notice),
+            );
+        }
+        container.into_any_element()
+    }
+
+    fn render_slash_output(
+        &self,
+        notice: SlashOutputNotice,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme();
+        let color = if notice.error {
+            theme.danger
+        } else {
+            theme.muted_foreground
+        };
+        div()
+            .id("slash-output")
+            .debug_selector(|| "slash-output".into())
+            .mb_2()
+            .px_2()
+            .py_1()
+            .rounded(theme::SLASH_MENU_ROW_RADIUS)
+            .text_size(theme::label_small(theme.font_size))
+            .text_color(color)
+            .whitespace_normal()
+            .child(notice.text)
+            .into_any_element()
+    }
+
+    fn select_slash_menu_row(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(offset) = self.slash_menu.filtered().position(|c| c.name == name) else {
+            return;
+        };
+        self.slash_menu.selected = offset;
+        self.select_slash_menu(window, cx);
+    }
+
     fn render_attachment_chips(&self, cx: &Context<Self>) -> gpui::AnyElement {
         div()
             .mb_1()
@@ -3141,6 +3548,7 @@ impl Render for ZetaView {
                     cx,
                 ));
             })
+            .capture_key_down(cx.listener(Self::slash_menu_key))
             .on_key_down(cx.listener(Self::control_key))
             .capture_key_down(cx.listener(Self::settings_key))
             .capture_action(
