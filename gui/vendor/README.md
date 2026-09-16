@@ -136,14 +136,18 @@ probe uses the SAME wrap_width the actual `prepaint_as_root` call uses
   drops a boundary onto the last glyph of the tripping ladder length.
   At least one sample carries `wrap_boundaries >= 1`.
 
-The paired downstream test is
-`zeta129_inline_flow_never_wraps_a_text_fragment_inside_its_own_fragment`
-in `gui/src/tests.rs`; the Makefile target
-`gui-native-guards-inline-flow-mutation` invokes `cargo test` on that
-test with `ZETA_GUI_INLINE_FLOW_DEFINITE=1` and expects a non-zero exit
-(the mutation must fail the guard). CI's `cargo (macos-latest)` job
-runs both `gui-native-guards-inline-flow-mutation` and the regular
-`gui-native-guards` step.
+The paired downstream check is `scan_inline_flow_recorder` in
+`gui/src/smoke.rs`. It runs INSIDE the native smoke driver (real macOS
+window, real CoreText metrics — the only place the sub-pixel drift
+shows through headlessly-deterministic text shaping never reproduces
+it) and panics if any recorded sample carries a non-zero wrap boundary
+count. `gui-native-guards` invokes the smoke driver directly and thus
+runs the recorder scan as a durable guard on every CI run.
+`gui-native-guards-inline-flow-mutation` invokes the same smoke driver
+with `ZETA_GUI_INLINE_FLOW_DEFINITE=1` and inverts the exit code — the
+mutation MUST panic the recorder scan on the ladder shape (18px is the
+demonstrated CoreText trip on macOS-latest CI). CI's `cargo
+(macos-latest)` job runs both targets.
 
 ## Poison-canary (`ZETA_GUI_INLINE_FLOW_DEFINITE`)
 

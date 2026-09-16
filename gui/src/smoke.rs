@@ -268,6 +268,44 @@ fn scan_native_gutter(
     );
 }
 
+/// ZETA-129 recorder scan. `InlineFlow::prepaint` in the vendored
+/// `gpui-base` pushes a
+/// `gpui_kit::base::zeta129_wrap_recorder::Sample` per inner text
+/// fragment it renders, using the SAME `wrap_width` its actual
+/// `prepaint_as_root` call uses (`MaxContent` under the fix,
+/// `Definite(fragment_size.width - padding * 2.)` under
+/// `ZETA_GUI_INLINE_FLOW_DEFINITE=1`). The fix's invariant is "an
+/// inline text fragment NEVER wraps inside its own fragment"; this
+/// scan reads the recorder after each native render and panics if any
+/// sample carries a non-zero wrap boundary count.
+///
+/// Runs on the NATIVE macOS text system so CoreText's real drift shows
+/// through. The paired `gui-native-guards-inline-flow-mutation`
+/// Makefile target invokes `make gui-native-guards` with
+/// `ZETA_GUI_INLINE_FLOW_DEFINITE=1` and inverts the exit code — the
+/// mutation MUST trip this scan (18px on the `code_ladder` shape is
+/// the demonstrated CoreText trip on this host and on macOS-latest CI).
+fn scan_inline_flow_recorder(shape: &str, font_size: Pixels, achieved: (u32, u32)) {
+    let samples = gpui_kit::base::zeta129_wrap_recorder::samples();
+    for sample in &samples {
+        if sample.wrap_boundaries > 0 {
+            panic!(
+                "ZETA-129 recorder guard tripped: shape={shape} size={font_size:?} \
+                 viewport={}x{} text={:?} font_size={:?} wrap_boundaries={} — the \
+                 inner `Inline`'s `shape_text` inserted a wrap boundary at this text \
+                 span, violating the ZETA-129 invariant that an inline text fragment \
+                 never wraps inside its own fragment. If this fired under \
+                 `ZETA_GUI_INLINE_FLOW_DEFINITE=1` (the poison-canary mutation), it \
+                 is the expected failure — the paired \
+                 `gui-native-guards-inline-flow-mutation` Makefile target inverts \
+                 the exit code. If it fired without the env var, the vendored \
+                 `MaxContent` fix has silently regressed.",
+                achieved.0, achieved.1, sample.text, sample.font_size, sample.wrap_boundaries,
+            );
+        }
+    }
+}
+
 fn native_guard_viewports(window: &Window, cx: &App) -> [gpui::Size<Pixels>; 2] {
     let display_size = window
         .display(cx)
@@ -346,6 +384,13 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
             cx.update(|_, cx| theme::apply_with(cx, &appearance))
                 .expect("native guard window remains open");
             for &(shape, source) in NATIVE_GUARD_SHAPES {
+                // ZETA-129: clear the wrap recorder before each shape so
+                // the post-paint scan reads samples from THIS render only.
+                // The recorder is populated by the vendored
+                // `InlineFlow::prepaint` for every inner text fragment;
+                // `scan_inline_flow_recorder` fails the guard if any
+                // sample carries a non-zero wrap boundary count.
+                gpui_kit::base::zeta129_wrap_recorder::clear();
                 cx.update(|window, cx| {
                     view.update(cx, |view, cx| {
                         view.state.connection = ConnectionState::Connected;
@@ -385,6 +430,7 @@ async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWind
                         image.save(path).expect("save native guard capture");
                     }
                     scan_native_gutter(&image, window, font_size, shape, achieved.0, achieved.1);
+                    scan_inline_flow_recorder(shape, font_size, achieved);
                 })
                 .expect("native guard window remains open");
                 matrix_entries += 1;

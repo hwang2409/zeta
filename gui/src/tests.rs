@@ -9388,78 +9388,13 @@ fn zeta129_inline_code_chip_ladder_paints_one_widening_chip_per_length(cx: &mut 
     }
 }
 
-/// Recorder-based ZETA-129 mutation-killer. `InlineFlow::prepaint` in the
-/// vendored `gpui-base` pushes a
-/// `gpui_kit::base::zeta129_wrap_recorder::Sample` for every inner text
-/// fragment it renders, using the SAME wrap_width the fragment's actual
-/// `prepaint_as_root` call uses (`MaxContent` under the fix,
-/// `Definite(fragment_size.width - padding * 2.)` under
-/// `ZETA_GUI_INLINE_FLOW_DEFINITE=1`). The invariant the ZETA-129 fix
-/// establishes is "an inline text fragment NEVER wraps inside its own
-/// fragment"; under the fix every recorded sample must carry
-/// `wrap_boundaries == 0`.
-///
-/// The ladder runs at every step of the appearance picker (11px, 13px,
-/// 18px) because the sub-pixel drift threshold in
-/// `compute_wrap_boundaries` depends on CoreText metrics that vary with
-/// font size. Extending past 12 chars gives a comfortable margin above
-/// the local length-9 trip; the exact tripping length on a given macOS
-/// runner is a function of the shipped SF Mono / JetBrains Mono glyph
-/// tables and the `next_up()` ligature-break offset. This test PASSES
-/// with the fix present at every ladder step and every base font, and
-/// FAILS under `ZETA_GUI_INLINE_FLOW_DEFINITE=1` the moment ANY recorded
-/// sample carries a non-zero wrap boundary count — the paired
-/// `gui-native-guards-inline-flow-mutation` Makefile target inverts the
-/// exit code so that failure is the required outcome under mutation.
-#[gpui::test]
-fn zeta129_inline_flow_never_wraps_a_text_fragment_inside_its_own_fragment(
-    cx: &mut TestAppContext,
-) {
-    let (window, view, _) = setup(cx);
-    let mut visual = VisualTestContext::from_window(window.into(), cx);
-    let mut lines: Vec<String> = Vec::with_capacity(16);
-    for len in 1..=16 {
-        let body = "a".repeat(len);
-        lines.push(format!("- `{body}` len={len}"));
-    }
-    let source = lines.join("\n");
-    let font_sizes: &[f32] = &[
-        theme::MIN_FONT_SIZE_PX,
-        f32::from(theme::DEFAULT_FONT_SIZE),
-        theme::MAX_FONT_SIZE_PX,
-    ];
-    let mut appearance = theme::Appearance::default();
-    for &base_px in font_sizes {
-        gpui_kit::base::zeta129_wrap_recorder::clear();
-        appearance.font_size = theme::clamp_font_size(base_px);
-        visual.update(|_, cx| {
-            theme::apply_with(cx, &appearance);
-            view.update(cx, |view, cx| {
-                view.state.transcript = vec![TranscriptEntry::Assistant(source.clone().into())];
-                view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
-                cx.notify();
-            });
-        });
-        visual.update(|window, cx| window.draw(cx).clear(cx));
-        let samples = gpui_kit::base::zeta129_wrap_recorder::samples();
-        assert!(
-            !samples.is_empty(),
-            "no inner-text samples recorded at {base_px}px — the vendored \
-             `gpui-base` recorder is either not compiled in (missing the \
-             `test-support` feature) or the code_ladder rendered nothing",
-        );
-        for sample in &samples {
-            assert_eq!(
-                sample.wrap_boundaries, 0,
-                "text {:?} at appearance {base_px}px (font_size={:?}) \
-                 recorded {} wrap boundaries in `InlineFlow::prepaint` — \
-                 an inline text fragment must NEVER wrap inside its own \
-                 fragment (ZETA-129 invariant)",
-                sample.text, sample.font_size, sample.wrap_boundaries,
-            );
-        }
-    }
-    // Reset for peer tests.
-    visual.update(|_, cx| theme::apply(cx));
-    wipe_scoped_prefs();
-}
+// The recorder-based mutation-killer runs in the NATIVE smoke driver,
+// not headlessly. `gpui::test`'s test platform shapes text
+// deterministically, so shape drift never fires and the recorder
+// assertion never trips in a headless run — the class of never-failing
+// tests the ZETA-129 arc exists to kill. The equivalent check lives in
+// `gui/src/smoke.rs::scan_inline_flow_recorder`, guarded by
+// `gui-native-guards` (fail on any recorded wrap boundary) and paired
+// with `gui-native-guards-inline-flow-mutation` (must fail the guard
+// under `ZETA_GUI_INLINE_FLOW_DEFINITE=1`, where the real CoreText
+// drift trips 18px on the ladder).
