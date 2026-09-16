@@ -137,3 +137,6 @@ jobs:
       - name: Guard acceptance mutation (must fail the guard)
         working-directory: .
         run: make gui-native-guards-mutation
+      - name: ZETA-129 InlineFlow mutation (must fail the guard)
+        working-directory: .
+        run: make gui-native-guards-inline-flow-mutation

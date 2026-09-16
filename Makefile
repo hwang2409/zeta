@@ -26,6 +26,43 @@ gui-native-guards:
 	grep -q '^ready$$' "$$server_log" || { cat "$$server_log"; exit 1; }; \
 	ZETA_HOME="$$tmp_dir/home" ZETA_GUI_NATIVE_GUARDS=1 cargo run --manifest-path gui/Cargo.toml --features smoke-test -- --socket "$$socket"
 
+# ZETA-129 poison-canary: silences the `InlineFlow::prepaint` MaxContent
+# fix from `gui/vendor/gpui-base/` by setting `ZETA_GUI_INLINE_FLOW_DEFINITE=1`,
+# reinstating the upstream `Definite(...)` shape that drops the last
+# glyph of any 9-char code chip and paints its overflow onto the next
+# line at a stale x-position. Runs the SAME native smoke driver as
+# `gui-native-guards` (real macOS window, real CoreText metrics — the
+# only place the sub-pixel drift shows through), with the env var set
+# so the recorder scan in `scan_inline_flow_recorder` (`gui/src/smoke.rs`)
+# reads a non-zero wrap boundary count on the tripping ladder length
+# and panics the guard. This target inverts the exit code — a green
+# run here means the fix silently reverted (a rebase picked the wrong
+# side, a peer refactor threw the env branch away) or the recorder
+# scan loosened past the mutation.
+.PHONY: gui-native-guards-inline-flow-mutation
+gui-native-guards-inline-flow-mutation:
+	@set -eu; \
+	tmp_dir=$$(mktemp -d); \
+	mkdir "$$tmp_dir/home"; \
+	socket="$$tmp_dir/smoke.sock"; \
+	server_log="$$tmp_dir/server.log"; \
+	ZETA_HOME="$$tmp_dir/home" uv run --frozen python gui/tests/smoke_server.py --socket "$$socket" >"$$server_log" 2>&1 & \
+	server_pid=$$!; \
+	trap 'kill "$$server_pid" 2>/dev/null || true; wait "$$server_pid" 2>/dev/null || true; rm -rf "$$tmp_dir"' EXIT INT TERM; \
+	for attempt in $$(seq 1 100); do \
+		if grep -q '^ready$$' "$$server_log"; then break; fi; \
+		if ! kill -0 "$$server_pid" 2>/dev/null; then cat "$$server_log"; exit 1; fi; \
+		sleep 0.1; \
+	done; \
+	grep -q '^ready$$' "$$server_log" || { cat "$$server_log"; exit 1; }; \
+	if ZETA_HOME="$$tmp_dir/home" ZETA_GUI_NATIVE_GUARDS=1 ZETA_GUI_INLINE_FLOW_DEFINITE=1 \
+	  cargo run --manifest-path gui/Cargo.toml --features smoke-test -- --socket "$$socket"; then \
+		echo "FAIL: recorder guard PASSED with ZETA_GUI_INLINE_FLOW_DEFINITE=1 (fix silenced)"; \
+		exit 1; \
+	else \
+		echo "OK: recorder guard FAILED under the mutation as required"; \
+	fi
+
 # Poison-canary: the native pixel-gutter guard MUST still fail when a
 # real prose-column overflow is introduced. The `NATIVE_GUARD_FORCE_TEXT_WIDTH`
 # knob widens the assistant TextView beyond its prose column so glyphs

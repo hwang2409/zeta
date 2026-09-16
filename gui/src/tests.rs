@@ -9250,3 +9250,116 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
     visual.update(|_, cx| theme::apply(cx));
     wipe_scoped_prefs();
 }
+
+// ---------------------------------------------------------------------------
+// ZETA-129 — inline-code chip ladder STRUCTURE guard.
+// ---------------------------------------------------------------------------
+//
+// The 2026-09-16 audit hit two classes of code-span corruption in the run
+// GUI: length-9 backtick spans lose their last glyph (`task_kill` painted
+// as `task_kil`), and a code chip pushed to a wrap boundary paints its
+// overflow onto the next line at a stale x-position. Root cause is
+// upstream in `gpui_base::text::inline_flow::InlineFlow::prepaint`; the
+// vendored copy in `gui/vendor/gpui-base/` swaps its inner
+// `Definite(fragment_size.width - padding * 2.)` for
+// `AvailableSpace::MaxContent` so the inner `StyledText` never re-wraps a
+// fragment whose shape already fits.
+//
+// This test drives a length 1..=16 backtick ladder through the markdown
+// renderer inside `VisualTestContext::draw()` and inspects the chip
+// BACKGROUND quads. It is NOT a mutation-sensitive check for A1/A2 — the
+// phantom-glyph paints under the Definite drift are text SPRITES, not
+// background quads, so this test's assertions on `secondary_hover`-washed
+// quads pass even with the fix disabled. Mutation coverage for A1/A2
+// lives in the native smoke driver: `smoke::scan_inline_flow_recorder`
+// reads `gpui_kit::base::zeta129_wrap_recorder::samples()` after every
+// native render and panics on any non-zero wrap-boundary count; the
+// paired `gui-native-guards-inline-flow-mutation` Makefile target
+// reinstates the upstream `Definite(...)` shape and requires the scan to
+// trip.
+//
+// What this test DOES cover: chip-structure regressions unrelated to the
+// vendored InlineFlow patch — a future change that reshapes the chip
+// background paint would surface here as a count mismatch or a
+// non-monotonic width sequence.
+#[gpui::test]
+fn zeta129_inline_code_chip_ladder_structure(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let mut lines: Vec<String> = Vec::with_capacity(16);
+    for len in 1..=16 {
+        let body = "a".repeat(len);
+        lines.push(format!("- `{body}` len={len}"));
+    }
+    let source = lines.join("\n");
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::Assistant(source.clone().into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+    });
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let subtle_bg: gpui::Background = visual.update(|_, cx| cx.theme().secondary_hover.into());
+    let mut bounds: Vec<gpui::Bounds<gpui::ScaledPixels>> = visual.update(|window, _| {
+        window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| quad.background == subtle_bg)
+            .map(|quad| quad.bounds)
+            .collect()
+    });
+    // Paint order isn't guaranteed to be top-down; sort by y then x so
+    // "chip N corresponds to length N+1" is a stable claim even if gpui
+    // reorders its per-frame paint list.
+    bounds.sort_by(|a, b| {
+        a.origin
+            .y
+            .partial_cmp(&b.origin.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.origin
+                    .x
+                    .partial_cmp(&b.origin.x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    assert_eq!(
+        bounds.len(),
+        16,
+        "expected one inline-code chip background quad per ladder length \
+         1..=16, got {} on the theme's secondary_hover wash ({subtle_bg:?})",
+        bounds.len(),
+    );
+    // Each subsequent chip carries one more mono glyph than the previous —
+    // shaped widths must grow monotonically. Structural regression cover:
+    // a change to the chip renderer that reshapes a shorter chip wider
+    // than a longer one lands here rather than as a silent visual defect.
+    for (ix, window) in bounds.windows(2).enumerate() {
+        let prev = window[0].size.width;
+        let next = window[1].size.width;
+        assert!(
+            next > prev,
+            "chip {} (len={}) width {prev:?} must be strictly less than \
+             chip {} (len={}) width {next:?} — the ladder shapes widths \
+             monotonically by construction",
+            ix,
+            ix + 1,
+            ix + 1,
+            ix + 2,
+        );
+    }
+}
+
+// The recorder-based mutation-killer runs in the NATIVE smoke driver,
+// not headlessly. `gpui::test`'s test platform shapes text
+// deterministically, so shape drift never fires and the recorder
+// assertion never trips in a headless run — the class of never-failing
+// tests the ZETA-129 arc exists to kill. The equivalent check lives in
+// `gui/src/smoke.rs::scan_inline_flow_recorder`, guarded by
+// `gui-native-guards` (fail on any recorded wrap boundary) and paired
+// with `gui-native-guards-inline-flow-mutation` (must fail the guard
+// under `ZETA_GUI_INLINE_FLOW_DEFINITE=1`). Pinned CI trip evidence:
+// shape=`wedge`, size=13px, sample text=`meta.json`, wrap_boundaries=1
+// — the audit's length-9 code chip on the 13px × 0.875 mono metrics.

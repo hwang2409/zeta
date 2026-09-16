@@ -39,3 +39,11 @@ required-features = ["gui"]
 gpui-kit = { version = "0.6", features = ["test-support"] }
 proc-macro2 = "1"
 syn = { version = "2", features = ["full", "visit"] }
+
+# ZETA-129: temporary fork of gpui-base 0.6.1 with two authorised edits
+# in `InlineFlow::prepaint` — the functional `MaxContent` swap on the
+# width axis, and a `#[cfg]`-gated recorder probe used by the native
+# mutation arm (see `vendor/gpui-base/src/text/inline_flow.rs` and
+# `vendor/README.md`). Unfork when a Kit release ships the fix.
+[patch.crates-io]
+gpui-base = { path = "vendor/gpui-base" }
