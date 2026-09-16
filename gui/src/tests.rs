@@ -10406,3 +10406,198 @@ fn slash_argless_model_opens_settings(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// ZETA-134 A3: an argument-less tool_start leaves `excerpt == name`
+/// (fallback in `tool_excerpt`), which paints as `read read` / `bash bash`
+/// on both the collapsed AND the expanded receipt. The row_text model drops
+/// the redundant excerpt so only the tool label paints; a real path/command
+/// still surfaces because it never equals the tool name.
+#[test]
+fn tool_row_dedupes_when_excerpt_falls_back_to_the_tool_name() {
+    use zeta_gui::row_text::{self, RowText};
+    use zeta_gui::state::ToolReceiptKey;
+    let session_view = zeta_gui::session::SessionView::default();
+    let stale_read = TranscriptEntry::Tool {
+        key: ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: "a".into(),
+        },
+        name: "read".into(),
+        excerpt: "read".into(),
+        summary: String::new(),
+        complete: false,
+        error: false,
+        canceled: false,
+        card: Card {
+            expanded: true,
+            ..Default::default()
+        },
+    };
+    let RowText::Tool(text) = row_text::build(&stale_read, 0, &session_view, true) else {
+        panic!("tool entry must build a Tool row");
+    };
+    assert_eq!(text.tool_label, "read", "label carries the tool identity");
+    assert_eq!(text.excerpt, "", "duplicate fallback excerpt is dropped");
+
+    let real_read = TranscriptEntry::Tool {
+        key: ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: "b".into(),
+        },
+        name: "read".into(),
+        excerpt: "src/main.rs".into(),
+        summary: String::new(),
+        complete: false,
+        error: false,
+        canceled: false,
+        card: Card {
+            expanded: true,
+            ..Default::default()
+        },
+    };
+    let RowText::Tool(text) = row_text::build(&real_read, 0, &session_view, true) else {
+        panic!("tool entry must build a Tool row");
+    };
+    assert_eq!(text.tool_label, "read");
+    assert_eq!(
+        text.excerpt, "src/main.rs",
+        "the real path survives both collapsed and expanded rendering",
+    );
+}
+
+/// ZETA-134 A6: after Cmd-N, keyboard focus that had been sitting on the
+/// previously-active sidebar row is retargeted to the composer. Without
+/// this, the old row keeps its focus-fill highlight while the green
+/// active-dot moves to the new row — two rows read as current.
+#[gpui::test]
+fn cmd_n_moves_focus_off_the_previous_sidebar_row(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let session_a = session().session_id.clone();
+    let session_b = "cd34deadbeef".to_owned();
+    let (focus_a, focus_composer) = visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            // Ensure the row has a stored focus handle by rendering once,
+            // then focus it as if the user had tabbed there.
+            let handle = view
+                .sidebar_row_focus
+                .borrow_mut()
+                .entry(session_a.clone())
+                .or_insert_with(|| cx.focus_handle().tab_stop(true).tab_index(0))
+                .clone();
+            window.focus(&handle, cx);
+            let composer_handle = view.composer.focus_handle(cx);
+            (handle, composer_handle)
+        })
+    });
+    assert!(
+        visual.update(|window, _| focus_a.is_focused(window)),
+        "sanity: the previous session row starts with keyboard focus",
+    );
+    // Simulate the NewSession worker reply landing after Cmd-N.
+    let new_session: SessionMetadata = serde_json::from_value(
+        json!({"session_id": session_b, "updated_at": "2026-09-16T12:00:00Z"}),
+    )
+    .unwrap();
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(WorkerMessage::Session(new_session), window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        !visual.update(|window, _| focus_a.is_focused(window)),
+        "focus lifts off the previous row so only one row reads as current",
+    );
+    assert!(
+        visual.update(|window, _| focus_composer.is_focused(window)),
+        "focus lands on the composer so the next keystroke types a message",
+    );
+}
+
+/// ZETA-134 C7: an empty composer disables Send. `gui/README.md` promises
+/// "the composer explains why sending is disabled" — the button follows
+/// suit. Attach stays live so a drag can start from an empty composer.
+#[gpui::test]
+fn send_button_disables_when_the_composer_is_empty(cx: &mut TestAppContext) {
+    let (window, view, _receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        });
+        window.draw(cx).clear(cx);
+    });
+    let disabled_bounds = visual
+        .debug_bounds("send-button")
+        .expect("send button paints in the composer");
+    // The disabled paint is a plain div, not a Kit Button — a click on it
+    // must NOT queue a Send. `receiver.try_recv()` after the click returns
+    // an error because nothing was dispatched.
+    visual.simulate_click(disabled_bounds.center(), Default::default());
+    assert!(
+        _receiver.try_recv().is_err(),
+        "click on a disabled Send must not queue a command",
+    );
+    // Now type something — Send re-enables and click dispatches.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |input, cx| input.set_value("hello", window, cx));
+        });
+        window.draw(cx).clear(cx);
+    });
+    let enabled_bounds = visual
+        .debug_bounds("send-button")
+        .expect("send button still paints");
+    visual.simulate_click(enabled_bounds.center(), Default::default());
+    let dispatched = _receiver.try_recv().expect("send dispatched after typing");
+    assert!(
+        matches!(&dispatched, CommandMessage::Send(text) if text == "hello"),
+        "typed text reaches the worker as Send, got {dispatched:?}",
+    );
+}
+
+/// ZETA-134 D6: expanded bash receipts drop the empty `stderr:` label and
+/// append the exit code from `structured_content`. A legacy server without
+/// `structured_content` keeps the raw payload untouched so the receipt is
+/// never blank.
+#[test]
+fn bash_expanded_tail_omits_empty_stderr_and_shows_exit_code() {
+    use zeta_gui::state::reshape_bash_content;
+    let raw = "stdout:\nhello\nstderr:\n";
+    let structured = json!({
+        "stdout": "hello\n",
+        "stderr": "",
+        "exit_code": 0,
+    });
+    let out = reshape_bash_content(raw, Some(&structured));
+    assert!(
+        out.contains("stdout:\nhello"),
+        "stdout section retained: {out:?}"
+    );
+    assert!(
+        !out.contains("stderr:"),
+        "empty stderr label is stripped: {out:?}"
+    );
+    assert!(out.ends_with("exit: 0"), "exit code appended: {out:?}");
+
+    let with_stderr = json!({
+        "stdout": "line one\n",
+        "stderr": "warning\n",
+        "exit_code": 2,
+    });
+    let out = reshape_bash_content("ignored", Some(&with_stderr));
+    assert!(out.contains("stdout:\nline one"));
+    assert!(out.contains("stderr:\nwarning"));
+    assert!(out.ends_with("exit: 2"));
+
+    // Missing structured_content — legacy shape falls back to raw so the
+    // expanded receipt never blanks out.
+    let raw = "stdout:\nfoo\nstderr:\nbar";
+    let out = reshape_bash_content(raw, None);
+    assert_eq!(out, raw);
+}

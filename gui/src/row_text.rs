@@ -517,6 +517,19 @@ pub fn build<'a>(
             let output_size = card.tail.bytes_seen;
             let has_output = output_size > 0;
             let collapsed_with_output = !card.expanded && has_output;
+            // Dedupe a tool_excerpt fallback that returned the tool name (an
+            // argument-less tool_start leaves excerpt == name, which paints
+            // as "read read" / "bash bash"). The label carries the tool
+            // identity; drop the redundant excerpt so nothing reads twice
+            // (ZETA-134 A3). When the excerpt IS the real payload (a path,
+            // command, URL) it stays visible collapsed AND expanded — the
+            // renderer paints the excerpt div unconditionally as long as
+            // this field is non-empty.
+            let excerpt: &str = if excerpt.eq_ignore_ascii_case(name) {
+                ""
+            } else {
+                excerpt
+            };
             RowText::Tool(ToolRowText {
                 tool_label: name,
                 excerpt,

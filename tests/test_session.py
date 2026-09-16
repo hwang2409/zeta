@@ -945,6 +945,24 @@ def test_session_preview_keeps_combining_and_emoji_text_safe(tmp_path: Path) -> 
     assert "\u2069" not in preview
 
 
+def test_session_preview_with_no_user_message_returns_empty_string(
+    tmp_path: Path,
+) -> None:
+    """ZETA-134 A4: server emits an empty preview, not a literal placeholder,
+    so every client's own empty-state label (New conversation / (no user
+    message)) can take over without string-matching the server text."""
+
+    manager = SessionManager(tmp_path / "zeta-home")
+    opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
+    opened.store.close()
+
+    previews = manager.list_session_previews()
+
+    assert len(previews) == 1
+    assert previews[0].preview == ""
+    assert previews[0].session_id == opened.store.session_id
+
+
 def test_session_preview_picker_limits_recent_sessions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -46,7 +46,8 @@ def format_picker_row(index: int, preview: SessionPreview) -> str:
 
     age = format_relative_age(preview.updated_at).rjust(8)
     label = f" [{preview.name}]" if preview.name else ""
-    return f"{index}. {age}  {preview.session_id[:8]}{label}  {preview.preview}"
+    text = preview.preview or "(no user message)"
+    return f"{index}. {age}  {preview.session_id[:8]}{label}  {text}"
 
 
 def create_app(args: argparse.Namespace) -> TUIApp:

@@ -620,6 +620,22 @@ impl AppState {
                     }
                     *error = failed;
                     if let Some(result) = tool_result.filter(|result| !result.content.is_empty()) {
+                        // The bash tool wire shape is section-wrapped
+                        // `stdout:\n<stdout>\nstderr:\n<stderr>`. Empty
+                        // stderr leaves a trailing bare `stderr:\n` label
+                        // in the expanded receipt, and the exit code sits
+                        // in structured_content instead of the visible
+                        // text (ZETA-134 D6). Reshape the payload once,
+                        // here, so every downstream consumer (tail,
+                        // summary) reads the friendlier form.
+                        let display_content = if name.eq_ignore_ascii_case("bash") {
+                            reshape_bash_content(
+                                &result.content,
+                                result.structured_content.as_ref(),
+                            )
+                        } else {
+                            result.content.clone()
+                        };
                         if card.streamed {
                             // Streamed tools already fed `bytes_seen` from
                             // ToolOutput. NEVER count the final payload's
@@ -627,8 +643,8 @@ impl AppState {
                             // (r4 finding 1). The final payload always
                             // replaces the visible tail, whether it wraps
                             // the streamed output or is a distinct summary.
-                            card.tail.replace_visible(&result.content);
-                        } else if card.tail.text != result.content {
+                            card.tail.replace_visible(&display_content);
+                        } else if card.tail.text != display_content {
                             // Non-streamed tools (delegated agents that
                             // only emit ToolEnd) count the final content
                             // once. Newline-separate so a follow-up final
@@ -636,11 +652,10 @@ impl AppState {
                             if !card.tail.text.is_empty() && !card.tail.text.ends_with('\n') {
                                 card.tail.append("\n");
                             }
-                            card.tail.append(&result.content);
+                            card.tail.append(&display_content);
                         }
                         *summary = bounded_summary(
-                            result
-                                .content
+                            display_content
                                 .lines()
                                 .find(|line| !line.trim().is_empty())
                                 .unwrap_or(""),
@@ -1070,6 +1085,48 @@ const SUMMARY_CHARS: usize = 240;
 /// truncates with a single-character ellipsis so a wide command still fits
 /// on one row at the transcript's reading measure.
 pub const EXCERPT_CHARS: usize = 160;
+
+/// Reshape a bash tool result's payload for the expanded receipt (ZETA-134
+/// D6). Drops an empty `stderr:` section and appends the exit code pulled
+/// from `structured_content`. Falls back to the raw content when
+/// `structured_content` is absent or malformed so a legacy server or an
+/// unexpected shape never loses the underlying text.
+pub fn reshape_bash_content(raw: &str, structured: Option<&serde_json::Value>) -> String {
+    let stdout = structured.and_then(|v| v["stdout"].as_str());
+    let stderr = structured.and_then(|v| v["stderr"].as_str());
+    let exit_code = structured.and_then(|v| v["exit_code"].as_i64());
+    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+        return raw.to_owned();
+    };
+    let mut out = String::new();
+    if !stdout.is_empty() {
+        out.push_str("stdout:\n");
+        out.push_str(stdout);
+        if !stdout.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !stderr.is_empty() {
+        out.push_str("stderr:\n");
+        out.push_str(stderr);
+        if !stderr.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if let Some(code) = exit_code {
+        out.push_str(&format!("exit: {code}"));
+    } else {
+        // Nothing else to trim; strip the trailing newline we added above.
+        while out.ends_with('\n') {
+            out.pop();
+        }
+    }
+    if out.is_empty() {
+        raw.to_owned()
+    } else {
+        out
+    }
+}
 
 fn bounded_summary(text: &str) -> String {
     text.chars()

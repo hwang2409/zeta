@@ -2427,6 +2427,28 @@ async def test_session_delete_rpc_rejects_unsafe_ids(tmp_path, session_id):
 
 
 @pytest.mark.asyncio
+async def test_resume_does_not_bump_updated_at(tmp_path):
+    """ZETA-134 A5: selecting a session must not rewrite its updated_at.
+
+    A read-only session select would otherwise reorder the sidebar with the
+    selected row jumping to "now" even though nothing user-visible changed.
+    """
+    from zeta.server.runtime import ServerRuntime
+
+    runtime = ServerRuntime(tmp_path, cwd=tmp_path, provider="fake")
+    try:
+        first = await runtime.create_session()
+        first_id = first.session_id
+        await runtime.create_session()
+        before = runtime.manager.read_metadata(first_id).updated_at
+        await runtime.resume_session(first_id)
+        after = runtime.manager.read_metadata(first_id).updated_at
+        assert before == after
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["close", "replace-close", "activate", "resume-compose"])
 async def test_runtime_failure_releases_all_session_leases(tmp_path, monkeypatch, failure):
     from zeta.server.runtime import ServerRuntime

@@ -95,7 +95,10 @@ def compose_runtime(
                 or budget_pinned != opened.metadata.budget_pinned
             ):
                 manager.record_budget(
-                    opened.metadata, budget=effective_budget, pinned=budget_pinned
+                    opened.metadata,
+                    budget=effective_budget,
+                    pinned=budget_pinned,
+                    touch=False,
                 )
 
         metadata = opened.metadata
