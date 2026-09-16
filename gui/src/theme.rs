@@ -105,6 +105,13 @@ pub const SIDEBAR_CURRENT_DOT_SIZE: Pixels = px(9.);
 /// signalling a failure or the connection is lost.
 pub const ATTENTION_RAIL_WIDTH: Pixels = px(2.);
 
+/// Fast motion duration (milliseconds) — small enter/exit fades that must
+/// read as a soft ease-in but never a wait. Applied through
+/// `Duration::from_millis(MOTION_FAST_MS)`. Named so every "short fade"
+/// site rides the same token; a mutation that swaps this constant flips
+/// every fast animation in one place.
+pub const MOTION_FAST_MS: u64 = 120;
+
 /// Width of every scrollbar thumb. Contract line 93 pins the strip to a thin
 /// 8px lane so the transcript column keeps its readable measure.
 pub const SCROLLBAR_THUMB_WIDTH: Pixels = px(8.);

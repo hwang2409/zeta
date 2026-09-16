@@ -84,7 +84,13 @@ impl ZetaView {
             .w_full()
             .min_w_0()
             .cursor_pointer()
+            // Hover → list_hover rest wash, pressed → list_active one
+            // tint step stronger so a click on a receipt reads as
+            // tactile (ZETA-126). Toggle fires on click; the pressed
+            // style paints for the frame(s) the mouse is held down so
+            // the receipt does not feel dead on activation.
             .hover(|style| style.bg(cx.theme().list_hover))
+            .active(|style| style.bg(cx.theme().list_active))
             .on_click(move |_, _, cx| {
                 let _ = view.update(cx, |view, cx| {
                     view.state.toggle_card(index);
@@ -250,7 +256,11 @@ impl ZetaView {
             .w_full()
             .min_w_0()
             .cursor_pointer()
+            // Same hover → pressed staircase as an individual tool
+            // receipt (ZETA-126): group headers are the same kind of
+            // list-row control and should read as a single family.
             .hover(|style| style.bg(cx.theme().list_hover))
+            .active(|style| style.bg(cx.theme().list_active))
             .on_click(move |_, _, cx| {
                 let id = first_id_click.clone();
                 let range = range_click.clone();

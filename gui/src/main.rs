@@ -2326,6 +2326,14 @@ impl ZetaView {
     /// underneath still stops the drag from falling through to the
     /// transcript, and the whole layer reads as one flat drop zone rather
     /// than a per-cell border flicker.
+    ///
+    /// Enters via a 120ms `ease_out_quint` opacity fade (ZETA-126) so the
+    /// overlay does not pop in when a drag first crosses the composer
+    /// bounds. `.with_animation` respects `App::reduce_motion` — under
+    /// the OS "reduce motion" setting the overlay renders at its end
+    /// state (opacity 1.0) with no scheduled frames. Debug bounds pick
+    /// up the overlay's layout at any opacity so the drop-target paint
+    /// probes stay green regardless of animation phase.
     fn render_drop_target(&self, cx: &Context<Self>) -> gpui::AnyElement {
         let base_size = cx.theme().font_size;
         div()
@@ -2353,6 +2361,12 @@ impl ZetaView {
                     .text_size(theme::label_small(base_size))
                     .text_color(cx.theme().muted_foreground)
                     .child(chrome::DROP_TARGET_HINT),
+            )
+            .with_animation(
+                "composer-drop-target-fade-in",
+                Animation::new(Duration::from_millis(theme::MOTION_FAST_MS))
+                    .with_easing(gpui::ease_out_quint()),
+                |el, delta| el.opacity(delta),
             )
             .into_any_element()
     }
@@ -3113,6 +3127,11 @@ impl Render for ZetaView {
             .font_family(theme::current_font_family())
             .text_size(theme::body(theme::current_font_size()))
             .on_action(cx.listener(|view, _: &polish::NewSession, _, cx| view.new_session(cx)))
+            // Composer participates in keyboard traversal like every
+            // other primary chat composer (Slack / Discord). The
+            // matching keybindings live in `polish::init_menus`.
+            .on_action(|_: &polish::ComposerFocusNext, window, cx| window.focus_next(cx))
+            .on_action(|_: &polish::ComposerFocusPrev, window, cx| window.focus_prev(cx))
             .on_action(|_: &polish::About, window, cx| {
                 drop(window.prompt(
                     gpui::PromptLevel::Info,

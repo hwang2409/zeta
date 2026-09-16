@@ -3004,6 +3004,247 @@ fn tool_receipts_expand_collapse_and_show_failures(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn interactive_list_rows_paint_hover_and_pressed_across_themes(cx: &mut TestAppContext) {
+    // ZETA-126 interaction feel: every clickable list row family must
+    // paint a token-derived {hover, pressed} staircase, verified on
+    // TWO palettes so a regression that hardcodes a color instead of
+    // reading `theme.list_hover` / `theme.list_active` fails on the
+    // theme where the hardcoded value diverges from the token.
+    //
+    // Matrix: {tool receipt row, tool-group header row, sidebar
+    // session row} x {hover, pressed} x {Opencode, GruvboxLight}.
+    // The tool-receipt render path (`tool_receipts.rs::render_tool_row`)
+    // and the tool-group render path (`tool_receipts.rs::
+    // render_tool_group_row`) are SEPARATE code sites; a mutation in
+    // either must fail here. Sidebar session rows share the third
+    // render path (`sidebar.rs::render_session_row`) with its own
+    // pressed/hover staircase.
+    //
+    // Contract:
+    //  - hover: `.hover(theme.list_hover)` on receipt / group;
+    //    `.hover(theme.muted)` on sidebar rows.
+    //  - pressed: `.active(theme.list_active)` on receipt / group;
+    //    `.active(theme.list_active)` on sidebar rows.
+    // `.active(...)` layers on top of `.hover(...)`; gpui's
+    // interactivity holds `pressed_button = Some(Left)` between
+    // mouse-down and mouse-up so a probe that simulates mouse-down
+    // WITHOUT the following mouse-up must observe the pressed quad.
+
+    let tool_entry = |id: &str| TranscriptEntry::Tool {
+        key: zeta_gui::state::ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: id.into(),
+        },
+        name: "bash".into(),
+        excerpt: format!("cmd-{id}"),
+        summary: String::new(),
+        complete: true,
+        error: false,
+        canceled: false,
+        card: zeta_gui::cards::Card::default(),
+    };
+
+    for theme_id in [theme::ThemeId::Opencode, theme::ThemeId::GruvboxLight] {
+        let (window, view, _) = setup(cx);
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|_, cx| {
+            theme::apply_with(
+                cx,
+                &theme::Appearance {
+                    theme: theme_id,
+                    font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+                    font_size: theme::DEFAULT_FONT_SIZE,
+                },
+            );
+        });
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                // A second, non-current session gives the sidebar a
+                // switchable row. `session()` (index 0) is the active
+                // session; index 1 renders below it, and its
+                // `session-row` debug_selector overwrites the map so
+                // `debug_bounds("session-row")` returns the non-current
+                // row's rectangle.
+                let mut other = session();
+                other.session_id = "another-session".into();
+                other.name = "another".into();
+                view.state.sessions.push(other);
+                view.state.session_view.available = true;
+
+                // Three same-tool receipts fold into a group at the
+                // TOOL_GROUP_MIN_LEN=3 floor (state.rs).
+                view.state.transcript = vec![tool_entry("a"), tool_entry("b"), tool_entry("c")];
+                view.transcript.update(cx, |scroll, cx| scroll.reset(3, cx));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        // Snapshot theme tokens after the first rest draw so we know
+        // the values we're asserting against match the CURRENT
+        // palette (peer tests that ran before could have flipped it).
+        let (list_hover, list_active, sidebar_hover, sidebar_pressed) = visual.update(|_, cx| {
+            let t = cx.theme();
+            (t.list_hover, t.list_active, t.muted, t.list_active)
+        });
+
+        // Count painted quads matching `bg` inside `row` (1px slack
+        // for scale rounding). Isolates the row's own fill from
+        // wrapper quads that overlap partially.
+        let hits_at = |visual: &mut VisualTestContext,
+                       row: gpui::Bounds<gpui::Pixels>,
+                       bg: gpui::Hsla|
+         -> usize {
+            visual.update(|window, _cx| {
+                let scale = window.scale_factor();
+                let scaled = row.scale(scale);
+                let slack = px(1.).scale(scale);
+                let bg: gpui::Background = bg.into();
+                window
+                    .painted_quads()
+                    .into_iter()
+                    .filter(|quad| {
+                        quad.background == bg
+                            && quad.bounds.top() >= scaled.top() - slack
+                            && quad.bounds.bottom() <= scaled.bottom() + slack
+                            && quad.bounds.left() >= scaled.left() - slack
+                            && quad.bounds.right() <= scaled.right() + slack
+                    })
+                    .count()
+            })
+        };
+
+        // Drive one row through {hover, pressed, release}. Sample
+        // inside the row (~50px, ~half-height) so a scale-factor
+        // rounding never lands on the edge outside the hitbox.
+        let sweep = |visual: &mut VisualTestContext,
+                     bounds: gpui::Bounds<gpui::Pixels>,
+                     hover_bg: gpui::Hsla,
+                     pressed_bg: gpui::Hsla,
+                     what: &str| {
+            // Sample ~50px in / ~20px down from the row origin — the
+            // same offset the expand/collapse test uses. Every row
+            // family in the matrix is wider than 100px, so the point
+            // lands safely inside the hitbox at any scale factor.
+            let sample = bounds.origin + gpui::point(px(50.), px(20.));
+
+            // Rest: no pressed fill.
+            assert_eq!(
+                hits_at(visual, bounds, pressed_bg),
+                0,
+                "{what} on theme {theme_id:?}: pressed fill must not paint at rest"
+            );
+
+            // Hover: mouse-move over the row paints `hover_bg`.
+            visual.simulate_mouse_move(sample, None, gpui::Modifiers::default());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(
+                hits_at(visual, bounds, hover_bg) >= 1,
+                "{what} on theme {theme_id:?}: hover must paint the hover \
+                 fill inside the row bounds"
+            );
+
+            // Pressed: mouse-down without mouse-up paints `pressed_bg`
+            // layered on top of the hover fill.
+            visual.simulate_mouse_down(sample, gpui::MouseButton::Left, Default::default());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(
+                hits_at(visual, bounds, pressed_bg) >= 1,
+                "{what} on theme {theme_id:?}: held mouse-down must \
+                 paint the pressed fill (no-dead-click contract)"
+            );
+
+            // Release clears the pressed fill.
+            visual.simulate_mouse_up(sample, gpui::MouseButton::Left, Default::default());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        };
+
+        // --- Tool-group HEADER row (group is collapsed at seed). ---
+        let group = visual
+            .debug_bounds("tool-group-0")
+            .expect("collapsed group header renders");
+        sweep(&mut visual, group, list_hover, list_active, "group header");
+
+        // `sweep`'s mouse-up fires `on_click` on the group header,
+        // which toggles the group's expansion state. Force-set the
+        // expanded state to `true` so the interior receipts render
+        // for the next sweep regardless of what the initial toggle
+        // resolved to (a peer test that seeds `tool_group_expanded`
+        // differently would otherwise land here in the opposite
+        // state). `remeasure_items` mirrors the on_click handler so
+        // the virtual list picks up the new heights on the next draw.
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.state.tool_group_expanded.insert("a".into(), true);
+                view.transcript.update(cx, |scroll, cx| {
+                    scroll.remeasure_items(0..3, cx);
+                });
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        // --- Tool RECEIPT row. ---
+        let receipt = visual
+            .debug_bounds("tool-receipt-0")
+            .expect("expanded receipt renders");
+        sweep(
+            &mut visual,
+            receipt,
+            list_hover,
+            list_active,
+            "tool receipt",
+        );
+
+        // --- Sidebar SESSION row (non-current). The last-rendered
+        // row wins the shared `session-row` debug key, so this
+        // rectangle is the second session (the non-current one we
+        // pushed above) — the only row that can accept hover/press.
+        // ---
+        let sidebar_row = visual
+            .debug_bounds("session-row")
+            .expect("sidebar session row renders");
+        sweep(
+            &mut visual,
+            sidebar_row,
+            sidebar_hover,
+            sidebar_pressed,
+            "sidebar session row",
+        );
+
+        // The pressed-during-pending-command regression the r2 review
+        // named: after mouse-down, `activate_session` sets
+        // `pending_command = true`; the next render must KEEP the
+        // pressed fill painted while the mouse is still held. This
+        // block simulates that sequence explicitly on the sidebar row.
+        let mid = sidebar_row.origin + gpui::point(px(40.), px(20.));
+        visual.simulate_mouse_move(mid, None, gpui::Modifiers::default());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.simulate_mouse_down(mid, gpui::MouseButton::Left, Default::default());
+        // Two redraws while the mouse stays down: pending_command
+        // flipped true on the first frame; the pressed fill must
+        // survive into the second.
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let held_hits = hits_at(&mut visual, sidebar_row, sidebar_pressed);
+        assert!(
+            held_hits >= 1,
+            "sidebar row must KEEP the pressed fill through the \
+             `pending_command=true` re-render on theme {theme_id:?}: \
+             mouse-down set pending_command and cleared can_switch, \
+             but the pressed refinement must stay attached until \
+             mouse-up (found {held_hits})"
+        );
+        visual.simulate_mouse_up(mid, gpui::MouseButton::Left, Default::default());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    // Restore the default theme so peer tests do not inherit
+    // GruvboxLight.
+    cx.update(theme::apply);
+}
+
+#[gpui::test]
 fn error_block_keeps_full_text_wraps_and_opens_settings(cx: &mut TestAppContext) {
     for detail in ["provider detail ".repeat(80), "x".repeat(1200)] {
         let (window, view, receiver) = setup(cx);
@@ -4821,18 +5062,30 @@ fn run_header_rules_metadata_cluster_with_two_vertical_separators(cx: &mut TestA
 fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and_space(
     cx: &mut TestAppContext,
 ) {
-    // A11y regression guard (finding #2 — expanded round 3). Sidebar rows
-    // must be:
-    //   1. reachable by Tab (`.tab_index(0)` populates the window's tab
-    //      stops that `window.focus_next` walks),
+    // A11y regression guard (finding #2 — expanded round 3; ZETA-126
+    // round 2 converted this to REAL Tab / Shift-Tab keystroke dispatch
+    // through `simulate_keystrokes("tab")` and `simulate_keystrokes(
+    // "shift-tab")` — the same path Root's keybindings route a real
+    // keyboard-user's keys through). Direct `focus_next` /
+    // `focus_prev` / `window.focus(handle)` calls would paper over a
+    // missing tab_stop flag OR a broken Tab keybinding; keystroke
+    // dispatch exercises both.
+    //
+    // Sidebar rows must be:
+    //   1. reachable by Tab (`.tab_index(0)` + `tab_stop(true)` on the
+    //      focus handle register the row in the tab-stops walk that
+    //      Tab dispatches through),
     //   2. paint the solid-accent keyboard cursor on the FOCUSED row so a
     //      keyboard-only user sees which row Enter/Space would activate —
     //      the current row must show the cursor too; the "no fill"
     //      contract only applies to the UNFOCUSED current row,
     //   3. activate on Enter AND Space (button-role keyboard contract).
+    //
     // Both session and branch rows share this contract. Mutations that
     // must fail: dropping the focus-cursor branch, dropping a key
-    // handler, or dropping `.tab_index(0)` from either row type.
+    // handler, or dropping `.tab_index(0)` / `tab_stop(true)` from either
+    // row type — the last one surfaces under a bounded Tab-keystroke
+    // walk that never reaches the target.
     let (window, view, receiver) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let session_target = "cd34beef1234";
@@ -4920,30 +5173,72 @@ fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and
         })
     };
 
+    // Walk REAL `Tab` keystrokes until the tab-stops registry lands on
+    // `target`. Wrapped in a bounded loop so a regression that drops the
+    // target from the registry surfaces as a clear panic (not an
+    // infinite hang). `simulate_keystrokes("tab")` routes through
+    // Root's `Tab` binding — the same dispatch path a keyboard-only
+    // user drives — so this catches a missing `tab_stop` flag OR a
+    // gap in the Tab keybinding itself. `window.focus(&handle)` would
+    // silently paper over both.
+    let tab_to = |visual: &mut VisualTestContext, target: &gpui::FocusHandle| {
+        // Enter the walk with focus on `current_session_handle` — a
+        // stable, always-present sidebar row. Root's `Tab` action
+        // requires a "Root" context in the dispatch path; a blurred
+        // window's `dispatch_path` is just [root_node_id] and does
+        // NOT include the Root-wrapping div, so `simulate_keystrokes`
+        // wouldn't route through Root's binding at all. Peer tests
+        // do the same (tests.rs:7912) — the seed is real setup, and
+        // every step below IS an honest `simulate_keystrokes("tab")`
+        // dispatch a keyboard user would drive.
+        visual.update(|window, cx| {
+            window.focus(&current_session_handle, cx);
+            window.draw(cx).clear(cx);
+        });
+        // Bound the walk generously so a slow-cycling sidebar (extra
+        // sessions + branch rows + the composer) still resolves.
+        // Matches the peer group-header test's 512 ceiling
+        // (tests.rs:8045).
+        let max_steps = 512;
+        for _ in 0..max_steps {
+            visual.simulate_keystrokes("tab");
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            if visual.update(|window, _| target.is_focused(window)) {
+                return;
+            }
+        }
+        panic!(
+            "a bounded `Tab` walk did not land on the target focus \
+             handle within {max_steps} steps — the row's focus handle \
+             is not registered as a tab stop, or the `Tab` keybinding \
+             does not route through the row"
+        );
+    };
+
     // --- The CURRENT session row (active) MUST paint the accent cursor
-    // when focused. Contract: the current-item "no fill" rule applies to
-    // the UNFOCUSED state only; a focused row overrides it. A mutation
-    // that reintroduces the old `focused && !active` guard would leave
-    // the current row with no visible focus cursor, and this check
-    // fails. ---
-    visual.update(|window, cx| {
-        window.focus(&current_session_handle, cx);
-        window.draw(cx).clear(cx);
-    });
+    // when reached via Tab. Contract: the current-item "no fill" rule
+    // applies to the UNFOCUSED state only; a focused row overrides it.
+    // A mutation that reintroduces the old `focused && !active` guard
+    // would leave the current row with no visible focus cursor. Row
+    // paint IS the focus trigger's own paint — this line proves both
+    // reachability (Tab lands on the row) and repaint (the accent quad
+    // is present in the following frame). ---
+    tab_to(&mut visual, &current_session_handle);
     assert!(
         row_sized_accent(&mut visual, theme::SIDEBAR_ROW_HEIGHT),
         "the CURRENT session row must still paint the accent cursor \
-         when focused (no-fill rule applies only to the unfocused state)"
+         when focused via Tab (no-fill rule applies only to the \
+         unfocused state; a Tab walk that reaches the row must trigger \
+         a repaint that includes the row-sized accent quad)"
     );
 
-    // --- Non-active session row also paints the cursor on focus. ---
-    visual.update(|window, cx| {
-        window.focus(&session_handle, cx);
-        window.draw(cx).clear(cx);
-    });
+    // --- Non-active session row also paints the cursor on Tab focus. ---
+    tab_to(&mut visual, &session_handle);
     assert!(
         row_sized_accent(&mut visual, theme::SIDEBAR_ROW_HEIGHT),
-        "focused session row must paint the accent focus cursor"
+        "focused session row (reached via Tab) must paint the accent \
+         focus cursor — the row's focus trigger must repaint the row \
+         with the accent fill on the following frame"
     );
 
     // --- Enter activates the focused session row. ---
@@ -4961,12 +5256,15 @@ fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and
         "Enter on a focused session row must dispatch Resume for that id"
     );
 
-    // --- Space activates the focused session row. ---
+    // --- Space activates the focused session row. Re-reach the row via
+    // a fresh Tab walk (session activation sets `pending_command` and
+    // captures fresh `can_activate` state; the walk restarts from a
+    // blurred window so a stale focus does not skip the trigger). ---
     visual.update(|window, cx| {
         view.update(cx, |view, _| view.pending_command = false);
-        window.focus(&session_handle, cx);
         window.draw(cx).clear(cx);
     });
+    tab_to(&mut visual, &session_handle);
     visual.simulate_keystrokes("space");
     let mut resumed_space = None;
     while let Ok(msg) = receiver.try_recv() {
@@ -4982,29 +5280,48 @@ fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and
     );
 
     // --- The CURRENT branch row (trunk) must also paint the accent
-    // cursor when focused. Same contract as sessions — focused wins
-    // over the unfocused "no fill" rule. Reset `pending_command` first
-    // (session activation set it, and the branch row captures
-    // `can_activate` at render time). ---
-    visual.update(|window, cx| {
+    // cursor when reached via Tab. Same contract as sessions — focused
+    // wins over the unfocused "no fill" rule. ---
+    visual.update(|_, cx| {
         view.update(cx, |view, _| view.pending_command = false);
-        window.focus(&current_branch_handle, cx);
-        window.draw(cx).clear(cx);
     });
+    tab_to(&mut visual, &current_branch_handle);
     assert!(
         row_sized_accent(&mut visual, theme::SIDEBAR_NESTED_ROW_HEIGHT),
         "the CURRENT branch row must still paint the accent cursor \
-         when focused (no-fill rule applies only to the unfocused state)"
+         when focused via Tab (no-fill rule applies only to the \
+         unfocused state)"
     );
 
-    // --- Non-current branch row (alt) also paints on focus. ---
-    visual.update(|window, cx| {
-        window.focus(&branch_handle, cx);
-        window.draw(cx).clear(cx);
-    });
+    // --- Shift-Tab from trunk lands on the last session row (Tab
+    // order runs session rows → branch rows). Prove the reverse walk
+    // reaches the previous tab stop and repaints its accent, so a
+    // regression that drops Shift-Tab handling from either row type
+    // fails here. `simulate_keystrokes("shift-tab")` dispatches through
+    // Root's shift-tab binding — the real keyboard-user path. ---
+    visual.simulate_keystrokes("shift-tab");
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let landed_on_session = visual.update(|window, _| session_handle.is_focused(window))
+        || visual.update(|window, _| current_session_handle.is_focused(window));
+    assert!(
+        landed_on_session,
+        "Shift-Tab from the trunk branch row must land on a session row \
+         — the tab-stops registry must include session rows AS THE \
+         previous stops from the branches strip"
+    );
+    assert!(
+        row_sized_accent(&mut visual, theme::SIDEBAR_ROW_HEIGHT),
+        "the session row Shift-Tab landed on must paint its accent \
+         cursor — Shift-Tab is a real focus transition and must trigger \
+         a repaint"
+    );
+
+    // --- Non-current branch row (alt) paints on Tab focus. ---
+    tab_to(&mut visual, &branch_handle);
     assert!(
         row_sized_accent(&mut visual, theme::SIDEBAR_NESTED_ROW_HEIGHT),
-        "focused branch row must paint the accent focus cursor"
+        "focused branch row (reached via Tab) must paint the accent \
+         focus cursor"
     );
 
     // --- Enter on a focused branch row dispatches SwitchBranch. ---
@@ -5023,11 +5340,10 @@ fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and
     );
 
     // --- Space on a focused branch row dispatches SwitchBranch. ---
-    visual.update(|window, cx| {
+    visual.update(|_, cx| {
         view.update(cx, |view, _| view.pending_command = false);
-        window.focus(&branch_handle, cx);
-        window.draw(cx).clear(cx);
     });
+    tab_to(&mut visual, &branch_handle);
     visual.simulate_keystrokes("space");
     let mut switched_space = None;
     while let Ok(msg) = receiver.try_recv() {
