@@ -331,20 +331,6 @@ impl Element for InlineFlow {
                     } else {
                         None
                     };
-                    let inline = Inline::new(
-                        elements.len(),
-                        state,
-                        links,
-                        highlights,
-                        self.link_click_handler.clone(),
-                    )
-                    .selection_source(source_state.clone(), source_range)
-                    .paint_origin(bounds.origin + origin + point(padding, Pixels::ZERO));
-                    let mut element = div()
-                        .text_size(font_size)
-                        .line_height(fragment_size.height)
-                        .child(inline)
-                        .into_any_element();
                     // ZETA-129 (see ../../../../README.md): pass
                     // `MaxContent` on the width axis so the inner
                     // `StyledText` never re-wraps a text fragment whose
@@ -367,6 +353,14 @@ impl Element for InlineFlow {
                         } else {
                             AvailableSpace::MaxContent
                         };
+                    // Record the inner-text wrap outcome BEFORE moving
+                    // `highlights` into `Inline::new` below. The probe
+                    // uses the SAME wrap_width the actual
+                    // `prepaint_as_root` call uses (via `width_available`
+                    // above), so a downstream test can assert every
+                    // recorded sample carries `wrap_boundaries == 0` —
+                    // the fix's invariant. Gated on test-support so a
+                    // release build compiles it out.
                     #[cfg(any(test, feature = "test-support"))]
                     {
                         let probe_wrap_width = match width_available {
@@ -394,6 +388,20 @@ impl Element for InlineFlow {
                             );
                         }
                     }
+                    let inline = Inline::new(
+                        elements.len(),
+                        state,
+                        links,
+                        highlights,
+                        self.link_click_handler.clone(),
+                    )
+                    .selection_source(source_state.clone(), source_range)
+                    .paint_origin(bounds.origin + origin + point(padding, Pixels::ZERO));
+                    let mut element = div()
+                        .text_size(font_size)
+                        .line_height(fragment_size.height)
+                        .child(inline)
+                        .into_any_element();
                     element.prepaint_as_root(
                         bounds.origin + origin + point(padding, Pixels::ZERO),
                         size(width_available, AvailableSpace::Definite(fragment_size.height)),
