@@ -10560,12 +10560,17 @@ fn tool_row_uses_option_none_for_missing_argument_state(cx: &mut TestAppContext)
 /// as current — the row fill (focus accent) and the active dot may not
 /// disagree. Drives the REAL keyboard path (`cmd-n` keystroke → queued
 /// `CommandMessage::NewSession` → worker `Session` reply → paint) and
-/// counts painted quads to pin the single-selection invariant:
+/// counts painted quads to pin the single-selection invariant. Row_c
+/// is pre-seeded at index 1 in the sidebar so that when
+/// `apply_worker_message::Session` updates it in place the dot's y
+/// SHIFTS to a distinct row (row_a stays at index 0). The prior
+/// single-session seed left both dots at the same y (index 0
+/// re-ordering conflated them), which masked the "dot moved" invariant.
 ///   • BEFORE Cmd-N: row_a is focused AND current — exactly one focus
-///     fill and exactly one dot paint, on the same row.
+///     fill and exactly one dot paint, on the same row (index 0).
 ///   • AFTER Cmd-N: focus retargets to the composer, so zero sidebar
-///     rows paint a focus fill; the dot moves to the row for the new
-///     active session and paints exactly once.
+///     rows paint a focus fill; the dot moves down to row_c at index 1
+///     and paints exactly once, at a y strictly greater than before.
 /// A synthetic-selector count (`debug_bounds`) alone can't catch a
 /// second stale fill or a second stale dot bleeding through — the
 /// painted-quad probe does.
@@ -10575,6 +10580,25 @@ fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut Te
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let session_a = session().session_id.clone();
     let session_c = "cd34deadbeef".to_owned();
+    // Seed row_c BELOW row_a in the sidebar. `apply_worker_message::Session`
+    // updates the row in place when the session id already exists (see
+    // main.rs:610), so the row_c reply keeps row_c at index 1 — a
+    // different y from row_a at index 0. That makes the "dot moved from
+    // row_a to row_c" invariant observable as a real y shift; the earlier
+    // single-session seed left both dots at position 0's y because
+    // apply_worker_message would otherwise insert row_c at index 0 and
+    // conflate them.
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let mut existing_c: SessionMetadata = serde_json::from_value(
+                json!({"session_id": session_c, "updated_at": "2026-09-08T12:00:00Z"}),
+            )
+            .unwrap();
+            existing_c.name = "row c".into();
+            view.state.sessions.push(existing_c);
+            cx.notify();
+        });
+    });
     // Focus row A as if the user tabbed there. `sidebar_row_focus` stores
     // the tab-stop handle keyed by session id — grabbing it here mirrors
     // what the sidebar renderer would do on the next paint.
@@ -10699,12 +10723,12 @@ fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut Te
         assert_eq!(
             view.state.sessions.len(),
             2,
-            "the new session is inserted alongside the previous one",
+            "the seeded session_c is updated in place, not duplicated",
         );
         assert_eq!(
-            view.state.sessions[0].session_id.as_str(),
+            view.state.sessions[1].session_id.as_str(),
             session_c.as_str(),
-            "the new session lands at index 0 (above the previous row)",
+            "session_c stays at index 1 — apply_worker_message updated it in place",
         );
     });
     assert!(
@@ -10717,10 +10741,11 @@ fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut Te
     );
 
     // AFTER Cmd-N: composer holds focus → zero row focus fills. The dot
-    // paints exactly once — on row_c, which apply_worker_message inserted
-    // at index 0. Row_a is now at index 1 and carries neither the dot nor
-    // any focus fill (a stale dot on row_a or a stale fill anywhere is
-    // exactly the r2 finding this test guards).
+    // paints exactly once — on row_c (index 1, below row_a). Because row_c
+    // sits BELOW row_a, its dot's y is strictly greater than the pre-Cmd-N
+    // dot y that sat on row_a at index 0. A regression where a stale dot
+    // lingers on row_a would show up as two dots; a regression where the
+    // dot never moved would show up as an equal-or-lesser y.
     let (rows_after, dots_after) = count_sidebar_fills(&mut visual);
     assert_eq!(
         rows_after.len(),
@@ -10731,6 +10756,12 @@ fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut Te
         dots_after.len(),
         1,
         "single-selection invariant: exactly one dot paints on the new current row: {dots_after:?}",
+    );
+    assert!(
+        dots_after[0] > dots_before[0],
+        "dot y after ({:?}) must be BELOW the pre-Cmd-N y ({:?}) — row_c sits at index 1 under row_a",
+        dots_after[0],
+        dots_before[0],
     );
 }
 
