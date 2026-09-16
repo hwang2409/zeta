@@ -338,16 +338,31 @@ impl ZetaView {
             .bg(row_bg)
             .text_color(row_fg)
             .when(can_switch && !active && !focused, |row| {
-                // Hover reads as a light rest wash; pressed lands one
-                // tint step stronger (`list_active`) so click-and-hold
-                // paints a distinguishable tactile state instead of
-                // reusing the hover fill — the "no dead-feeling clicks"
-                // contract from ZETA-126. Activation still fires on
-                // mouse-down, but the pressed style paints in the same
-                // frame so a held click reads as pressed briefly.
+                // Rest affordances (pointer cursor + hover wash) sit
+                // behind `can_switch` — a busy sidebar reads its rows
+                // as non-interactive at rest.
                 row.cursor_pointer()
                     .hover(|style| style.bg(cx.theme().muted))
-                    .active(|style| style.bg(cx.theme().list_active))
+            })
+            .when(!active, |row| {
+                // Pressed refinement stays attached whenever the row is
+                // a structural click target (not the current / active
+                // row). Gating this on `can_switch` too would drop the
+                // pressed paint the moment the mouse-down handler
+                // flipped `pending_command = true` — the next frame
+                // re-renders with `can_switch = false` and the pressed
+                // fill would vanish WHILE the mouse is still held,
+                // exactly the dead-click feel the ZETA-126 contract
+                // ("no dead-feeling clicks") forbids. `!focused` is
+                // also OFF the guard because a mouse-down on the row
+                // moves focus to it BEFORE the next paint; a focus-
+                // gated guard would drop pressed the same way.
+                // `.active(...)` is driven by gpui's press interaction,
+                // so it only paints while the mouse actually is down —
+                // during a held press on a focused row, the pressed
+                // fill briefly overrides the focus accent, which is
+                // the intended tactile feedback.
+                row.active(|style| style.bg(cx.theme().list_active))
             })
             .child(self.render_row_gutter(active, cx))
             .child(
@@ -598,13 +613,23 @@ impl ZetaView {
                     .bg(row_bg)
                     .text_color(row_fg)
                     .when(can_switch && !current && !focused, |row| {
-                        // Branch rows share the sidebar row contract:
-                        // hover → muted rest wash, pressed → `list_active`
-                        // one step stronger so click-and-hold paints a
-                        // distinguishable tactile state (ZETA-126).
+                        // Rest affordances only — pointer + hover wash.
+                        // See the session row above for why `.active(...)`
+                        // is split off and gated on structural state.
                         row.cursor_pointer()
                             .hover(|style| style.bg(cx.theme().muted))
-                            .active(|style| style.bg(cx.theme().list_active))
+                    })
+                    .when(!current, |row| {
+                        // Pressed refinement stays attached whenever the
+                        // row is a structural click target. Mirrors the
+                        // session-row split so `switch_branch` flipping
+                        // `pending_command = true` mid-press does not
+                        // drop the pressed fill before the mouse-up.
+                        // `!focused` is also off the guard because
+                        // mouse-down moves focus onto the row before
+                        // the next paint (see session-row for the same
+                        // reason).
+                        row.active(|style| style.bg(cx.theme().list_active))
                     })
                     // Depth indent stands independent of the fixed dot
                     // gutter — contract line 81 pins the dot to `left 4px`

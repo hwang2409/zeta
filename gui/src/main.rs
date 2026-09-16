@@ -2364,7 +2364,8 @@ impl ZetaView {
             )
             .with_animation(
                 "composer-drop-target-fade-in",
-                Animation::new(Duration::from_millis(120)).with_easing(gpui::ease_out_quint()),
+                Animation::new(Duration::from_millis(theme::MOTION_FAST_MS))
+                    .with_easing(gpui::ease_out_quint()),
                 |el, delta| el.opacity(delta),
             )
             .into_any_element()
