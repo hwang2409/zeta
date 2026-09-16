@@ -343,10 +343,12 @@ impl Element for InlineFlow {
                     // `task_kil`). `ZETA_GUI_INLINE_FLOW_DEFINITE`
                     // reinstates the upstream shape so the paired
                     // `gui-native-guards-inline-flow-mutation` target
-                    // proves the recorder-based ladder test in
-                    // `gui/src/tests.rs` catches the bug when the fix
-                    // is silenced. See `gui/vendor/README.md`
-                    // "Poison-canary" section.
+                    // proves the native recorder scan
+                    // (`gui/src/smoke.rs::scan_inline_flow_recorder`)
+                    // catches the bug when the fix is silenced — the
+                    // headless test in `gui/src/tests.rs` shapes
+                    // deterministically and cannot see the drift. See
+                    // `gui/vendor/README.md` "Poison-canary" section.
                     let width_available =
                         if std::env::var_os("ZETA_GUI_INLINE_FLOW_DEFINITE").is_some() {
                             AvailableSpace::Definite(fragment_size.width - padding * 2.)

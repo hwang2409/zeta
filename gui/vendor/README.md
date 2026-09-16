@@ -146,11 +146,12 @@ runs the recorder scan as a durable guard on every CI run.
 `gui-native-guards-inline-flow-mutation` invokes the same smoke driver
 with `ZETA_GUI_INLINE_FLOW_DEFINITE=1` and inverts the exit code — the
 mutation MUST panic the recorder scan on at least one shape in the
-matrix. Final CI trip evidence on the shipped head (`1b705b4`):
-shape=`wedge`, size=13px, sample text=`meta.json`, wrap_boundaries=1 —
-the exact audit repro (a length-9 code chip on the 13px × 0.875 mono
-metrics drifting past `shape_line.width()`). CI's `cargo (macos-latest)`
-job runs both targets.
+matrix. Pinned CI trip evidence (first observed on CI head `1b705b4`,
+which moved the recorder scan into the native smoke driver): shape=`wedge`,
+size=13px, sample text=`meta.json`, wrap_boundaries=1 — the exact
+audit repro (a length-9 code chip on the 13px × 0.875 mono metrics
+drifting past `shape_line.width()`). CI's `cargo (macos-latest)` job
+runs both targets on every head of this PR, including the final head.
 
 ## Poison-canary (`ZETA_GUI_INLINE_FLOW_DEFINITE`)
 
