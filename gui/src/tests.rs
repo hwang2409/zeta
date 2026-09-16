@@ -1849,6 +1849,22 @@ fn composer_focus_promotes_the_rail_and_lightens_the_fill(cx: &mut TestAppContex
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
 
+    // Seed a message so the Send button paints its enabled variant
+    // (Kit Button — no outline). ZETA-134 C7 disables Send when the
+    // composer is empty AND paints the disabled outline via `.border_1()`
+    // — that outline sits INSIDE the composer wrapper's bounds and would
+    // trip the frame's "no top/right/bottom border" invariant this test
+    // asserts. Typing anything flips Send back to the borderless enabled
+    // variant so the assertion stays scoped to the composer FRAME's
+    // chrome, which is what the wiki contract cares about.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |input, cx| input.set_value("hi", window, cx));
+        });
+        window.draw(cx).clear(cx);
+    });
+
     // Blurred: force focus off the composer via a fresh focus handle.
     visual.update(|window, cx| {
         let handle = cx.focus_handle();
