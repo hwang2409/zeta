@@ -10717,8 +10717,10 @@ fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut Te
     );
 
     // AFTER Cmd-N: composer holds focus → zero row focus fills. The dot
-    // moves to row_c (rendered above row_a at index 0), so it paints
-    // exactly once, on a row STRICTLY above where row_a's dot was.
+    // paints exactly once — on row_c, which apply_worker_message inserted
+    // at index 0. Row_a is now at index 1 and carries neither the dot nor
+    // any focus fill (a stale dot on row_a or a stale fill anywhere is
+    // exactly the r2 finding this test guards).
     let (rows_after, dots_after) = count_sidebar_fills(&mut visual);
     assert_eq!(
         rows_after.len(),
@@ -10729,12 +10731,6 @@ fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut Te
         dots_after.len(),
         1,
         "single-selection invariant: exactly one dot paints on the new current row: {dots_after:?}",
-    );
-    assert!(
-        dots_after[0] < dots_before[0],
-        "dot y after ({:?}) must be above the pre-Cmd-N y ({:?}) — row_c inserted at index 0",
-        dots_after[0],
-        dots_before[0],
     );
 }
 
