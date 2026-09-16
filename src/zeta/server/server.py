@@ -339,7 +339,7 @@ class _Client:
             return self._steer(_required_string(params, "text"))
         if method in {"approve", "deny"}:
             scope = params.get("scope", "once")
-            if scope not in {"once", "always_tool"}:
+            if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
                 raise ProtocolError(
                     -32602, "scope must be 'once' or 'always_tool'"
                 )

@@ -612,6 +612,13 @@ impl ZetaView {
             WorkerMessage::Session(session) => {
                 self.pending_command = false;
                 self.state.select_session(Some(session.session_id.clone()));
+                // Session metadata carries the effective approval mode; keep
+                // the header indicator in sync on session switch and cold
+                // start. `applied_mode` (not `selected_mode`) so a Settings
+                // draft the user has typed but not applied survives.
+                if !session.approval_mode.is_empty() {
+                    self.state.session_view.applied_mode = session.approval_mode.clone();
+                }
                 if let Some(item) = self
                     .state
                     .sessions
@@ -631,6 +638,11 @@ impl ZetaView {
                 self.handle_slash_result(text, result, window, cx);
             }
             WorkerMessage::Status(status) => {
+                let approval_mode = status
+                    .session
+                    .as_ref()
+                    .map(|session| session.approval_mode.clone())
+                    .unwrap_or_default();
                 if let Some(session) = &status.session {
                     if let Some(row) = self
                         .state
@@ -644,6 +656,13 @@ impl ZetaView {
                     }
                 }
                 edits = self.state.apply_status(status);
+                // `apply_status` calls `select_session`, which resets
+                // `session_view` on a session change. Sync `applied_mode`
+                // AFTER so the header indicator repaints on reconnect and
+                // cold start, when no explicit SettingsApplied fires.
+                if !approval_mode.is_empty() {
+                    self.state.session_view.applied_mode = approval_mode;
+                }
             }
             WorkerMessage::Rejected(error) => {
                 self.pending_command = false;

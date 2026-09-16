@@ -76,6 +76,8 @@ pub struct SessionMetadata {
     pub name: String,
     #[serde(default)]
     pub first_message_preview: String,
+    #[serde(default)]
+    pub approval_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

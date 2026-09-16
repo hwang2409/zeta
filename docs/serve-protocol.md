@@ -56,7 +56,9 @@ Params: none. The result contains `sessions`, an array of session metadata.
 Each metadata object has `version`, `session_id`, `created_at`, `updated_at`,
 `provider`, `model`, `cwd`, `retained_tail`, `compaction_budget`,
 `override_audit`, `system_prompt`, `context_files`, `vim_mode`, `budget_pinned`,
-`plan_mode`, and `name`.
+`plan_mode`, `name`, and `approval_mode` (`ask`, `allow`, or `deny`; the
+effective session default the server will apply on the next approval, and
+what the GUI reads to decide whether to paint the auto-approve indicator).
 
 Server mode uses the effective launch provider after CLI and settings resolution.
 Without either override, `zeta serve` uses fake mode.
@@ -141,8 +143,17 @@ Params: required `request_id`, a non-empty string matching an approval request,
 and optional `scope`. `scope` defaults to `"once"` (this request only).
 `"always_tool"` on `approve` also adds the tool's name to the session's
 `always_allow` list, so every later call to the same tool auto-approves for
-the rest of the session. `"always_tool"` on `deny` is a `-32602`. Legacy
-clients omitting `scope` see the same behavior as before.
+the rest of the session. `"always_tool"` on `deny` is a `-32602`. `scope`
+must be a string; arrays, objects, `null`, numbers, and booleans return
+`-32602`. Legacy clients omitting `scope` see the same behavior as before.
+
+Compatibility runs both ways. Old clients that never send `scope` reach a new
+server as a one-time approval — the server treats a missing key as `"once"`.
+A new client on an old server sends `scope: "always_tool"` and the server
+ignores the extra key: the request approves once, the tool runs, and the
+memory rule does not persist because the old server has no `always_allow`
+list. The client sees the same accepted response shape either way. Clients
+that need per-tool memory must degrade quietly on protocol `1.0` and re-ask.
 
 Session-scoped memory is deliberate: per-command and per-directory scopes and
 cross-session persistence are out of scope for this RPC. A restart discards
@@ -302,7 +313,8 @@ SessionMetadata = {
     override_audit: array[object], system_prompt: string,
     context_files: array[string], vim_mode: boolean, budget_pinned: boolean,
     plan_mode: boolean, name: string
-  }
+  },
+  optional: { approval_mode: string }
 }
 ToolCall = { required: { id: string, name: string, arguments: object } }
 ContentBlock = one of:
@@ -470,8 +482,10 @@ error code and message. Provider status and origin remain internal.
   blocks with path and size for `AgentLoop.run_turn(user_message=...)`.
   The response matches `send`: `accepted` and `session_id`.
 
-The generic 1 MiB frame bound applies to all requests and responses. Session
-metadata adds nullable `approval_mode`; absent or null uses configured defaults.
+The generic 1 MiB frame bound applies to all requests and responses.
+`approval_mode` on `SessionMetadata` reflects the effective session default;
+older 1.0 servers omit the key and clients must fall back to their configured
+default when it is missing or empty.
 
 ### Slash commands (ZETA-130)
 

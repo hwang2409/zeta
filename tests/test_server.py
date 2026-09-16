@@ -328,7 +328,23 @@ async def test_approval_scope_rejects_invalid_values(tmp_path: Path) -> None:
             {"request_id": "call-1", "scope": "always_tool"},
         )
         assert rejected_deny[-1]["error"]["code"] == -32602
-        await _request(reader, writer, 6, "deny", {"request_id": "call-1"})
+        # Non-string scope shapes (array, object, null, integer, boolean)
+        # must return -32602, not the -32000 the set-membership check raised
+        # before the type guard landed.
+        next_id = 6
+        for bad_scope in ([], {}, None, 1, True):
+            rejected_shape = await _request(
+                reader,
+                writer,
+                next_id,
+                "approve",
+                {"request_id": "call-1", "scope": bad_scope},
+            )
+            error = rejected_shape[-1]["error"]
+            assert error["code"] == -32602, f"scope={bad_scope!r} error {error!r}"
+            assert error["message"] == "scope must be 'once' or 'always_tool'"
+            next_id += 1
+        await _request(reader, writer, next_id, "deny", {"request_id": "call-1"})
         await _event(reader, "turn_end")
     finally:
         await _close(server, writer)

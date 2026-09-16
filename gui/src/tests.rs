@@ -457,18 +457,30 @@ fn approval_mode_segmented_paints_a_filled_selected_state(cx: &mut TestAppContex
 fn header_paints_auto_approve_indicator_only_when_allow_mode_is_applied(cx: &mut TestAppContext) {
     // ZETA-131 C2: whenever the server-applied session mode is `allow`, a
     // warning-tinted "auto-approve" chip lives in the run-header metadata
-    // cluster. `ask` and `deny` show nothing. Chip survives a reconnect
-    // (status snapshot resets the session view; SettingsApplied then
-    // restores `applied_mode`). Verify draft-only selections do NOT paint
-    // — a user clicking `allow` in Settings without Apply must not spoof
-    // the indicator.
+    // cluster. `ask` and `deny` show nothing. The indicator must key off
+    // messages production actually emits — session switches send `Session`
+    // and cold-start / reconnect / periodic refresh sends `Status`, both
+    // with `approval_mode` inside the session metadata. Verify a draft-only
+    // selection in the Settings modal does NOT paint the chip.
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     for mode in ["ask", "deny"] {
         visual.update(|window, cx| {
             view.update(cx, |view, cx| {
-                view.state.session_view.applied_mode = mode.into();
-                cx.notify();
+                view.apply_worker_message(
+                    WorkerMessage::Status(StatusResult {
+                        session: Some(SessionMetadata {
+                            approval_mode: mode.into(),
+                            ..session()
+                        }),
+                        state: "idle".into(),
+                        pending_approvals: vec![],
+                        usage: json!({}),
+                        compaction_markers: 0,
+                    }),
+                    window,
+                    cx,
+                );
             });
             window.draw(cx).clear(cx);
         });
@@ -477,13 +489,14 @@ fn header_paints_auto_approve_indicator_only_when_allow_mode_is_applied(cx: &mut
             "no auto-approve chip in mode {mode}"
         );
     }
-    // Apply `allow`.
+    // A Session frame with `approval_mode: "allow"` — the shape `resume` /
+    // `new_session` sends when the user switches sessions.
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.apply_worker_message(
-                WorkerMessage::SettingsApplied(SessionSettings {
-                    model: "one".into(),
+                WorkerMessage::Session(SessionMetadata {
                     approval_mode: "allow".into(),
+                    ..session()
                 }),
                 window,
                 cx,
@@ -493,7 +506,7 @@ fn header_paints_auto_approve_indicator_only_when_allow_mode_is_applied(cx: &mut
     });
     let chip = visual
         .debug_bounds("header-auto-approve")
-        .expect("chip paints when applied_mode is allow");
+        .expect("chip paints after a Session frame with allow");
     let header = visual
         .debug_bounds("run-header")
         .expect("run header renders");
@@ -523,11 +536,25 @@ fn header_paints_auto_approve_indicator_only_when_allow_mode_is_applied(cx: &mut
         assert!(dot_fill.is_some(), "warning dot carries the color signal");
     });
     // A draft-only selection through the Settings modal must NOT paint the
-    // chip. Bump `selected_mode` (the draft) to `allow` but leave
-    // `applied_mode` on `deny` — the indicator stays away.
+    // chip. Bump `selected_mode` (the draft) to `allow` but reset
+    // `applied_mode` to `deny` via a real Status frame — the indicator
+    // must clear because the SERVER never applied it.
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
-            view.state.session_view.applied_mode = "deny".into();
+            view.apply_worker_message(
+                WorkerMessage::Status(StatusResult {
+                    session: Some(SessionMetadata {
+                        approval_mode: "deny".into(),
+                        ..session()
+                    }),
+                    state: "idle".into(),
+                    pending_approvals: vec![],
+                    usage: json!({}),
+                    compaction_markers: 0,
+                }),
+                window,
+                cx,
+            );
             view.state.session_view.selected_mode = session::APPROVAL_MODES
                 .iter()
                 .position(|m| *m == "allow")
@@ -540,20 +567,22 @@ fn header_paints_auto_approve_indicator_only_when_allow_mode_is_applied(cx: &mut
         visual.debug_bounds("header-auto-approve").is_none(),
         "draft-only allow selection must not paint the header chip"
     );
-    // Reconnect flow: a fresh Settings arrives with allow — chip repaints.
+    // Reconnect flow: a fresh Status frame arrives with `allow` in the
+    // session metadata (the shape the worker sends on Connected and on
+    // every refresh). The chip repaints without a Settings modal open.
     visual.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.apply_worker_message(
-                WorkerMessage::Settings(
-                    SessionSettings {
-                        model: "one".into(),
+                WorkerMessage::Status(StatusResult {
+                    session: Some(SessionMetadata {
                         approval_mode: "allow".into(),
-                    },
-                    ModelCatalog {
-                        models: vec!["one".into()],
-                        providers: Default::default(),
-                    },
-                ),
+                        ..session()
+                    }),
+                    state: "idle".into(),
+                    pending_approvals: vec![],
+                    usage: json!({}),
+                    compaction_markers: 0,
+                }),
                 window,
                 cx,
             );
@@ -562,7 +591,7 @@ fn header_paints_auto_approve_indicator_only_when_allow_mode_is_applied(cx: &mut
     });
     assert!(
         visual.debug_bounds("header-auto-approve").is_some(),
-        "reconnect into an allow session repaints the chip"
+        "reconnect Status frame with allow repaints the chip"
     );
 }
 
@@ -7427,6 +7456,21 @@ fn every_role_clears_wcag_aa_against_canvas_on_every_theme() {
         let (lmax, lmin) = if la >= lb { (la, lb) } else { (lb, la) };
         (lmax + 0.05) / (lmin + 0.05)
     }
+    /// Straight source-over composite of a translucent `over` onto opaque
+    /// `under`, in sRGB (matching what the painter blends). Used to derive
+    /// the effective background under tint chips (`warning_tint`,
+    /// `danger_tint`) whose visible fill is the mix of the tint alpha and
+    /// the canvas beneath — a WCAG check that reads `warning_tint()` alone
+    /// misses that mix.
+    fn composite_over(over: gpui::Hsla, under: gpui::Hsla) -> gpui::Hsla {
+        let a = over.a.clamp(0.0, 1.0);
+        let o = over.to_rgb();
+        let u = under.to_rgb();
+        let r = o.r * a + u.r * (1.0 - a);
+        let g = o.g * a + u.g * (1.0 - a);
+        let b = o.b * a + u.b * (1.0 - a);
+        gpui::Rgba { r, g, b, a: 1.0 }.into()
+    }
     for id in theme::ThemeId::ALL {
         let p = id.palette();
         // Roles below title are all "normal" text under WCAG, so the AA bar
@@ -7449,6 +7493,20 @@ fn every_role_clears_wcag_aa_against_canvas_on_every_theme() {
             muted_ratio >= 4.5,
             "{}: muted foreground/canvas contrast {muted_ratio:.2}:1 fails \
              WCAG AA at label_small hint sites",
+            id.label()
+        );
+        // ZETA-131 audit B7 / round-2 finding 3: the auto-approve chip
+        // paints `theme.foreground` over `warning_tint()` (warning at 15%
+        // alpha) which itself sits on `canvas` in the run header. The
+        // "auto-approve" label is `label_small`-tier text under WCAG, so
+        // its effective background — canvas mixed with 15% warning — must
+        // clear the 4.5:1 bar against `foreground` on every shipped theme.
+        let chip_bg = composite_over(p.warning_tint(), p.canvas);
+        let chip_ratio = contrast_ratio(p.text, chip_bg);
+        assert!(
+            chip_ratio >= 4.5,
+            "{}: auto-approve chip text/warning_tint-on-canvas contrast \
+             {chip_ratio:.2}:1 fails WCAG AA (need >=4.5:1)",
             id.label()
         );
     }
