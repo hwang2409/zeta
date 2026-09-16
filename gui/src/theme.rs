@@ -162,14 +162,16 @@ pub const SLASH_MENU_RADIUS: Pixels = px(6.);
 pub const SLASH_MENU_ROW_RADIUS: Pixels = px(4.);
 
 /// Flat-panel modal shape. Width caps at 480px, padding is 12px on top / 16px
-/// horizontally / 14px on bottom, and the panel sits below a scrim at 25% of
-/// the viewport height.
+/// horizontally / 14px on bottom, and the panel sits below a scrim at 15% of
+/// the viewport height. ZETA-132 lowered the top fraction from 0.25 so the
+/// available shelf is tall enough for the Settings surface to render all three
+/// sections at common window sizes (900px+ heights) without scrolling.
 pub const MODAL_WIDTH: Pixels = px(480.);
 pub const MODAL_PADDING_TOP: Pixels = px(12.);
 pub const MODAL_PADDING_X: Pixels = px(16.);
 pub const MODAL_PADDING_BOTTOM: Pixels = px(14.);
 pub const MODAL_BUTTON_HEIGHT: Pixels = px(30.);
-pub const MODAL_TOP_FRACTION: f32 = 0.25;
+pub const MODAL_TOP_FRACTION: f32 = 0.15;
 
 /// Label-column width for a Settings row, derived from the current base
 /// font size. The column scales linearly (`base * 10.8`) so at 11px it is
@@ -200,20 +202,26 @@ pub const SETTINGS_ROW_DESCRIPTION_GAP: Pixels = px(2.);
 /// Maximum height for the Model list inside the Settings modal. The list
 /// scrolls beyond this so the three-section body (Model + Behavior +
 /// Appearance) plus optional credential alert fits inside the 760px test
-/// viewport across every picker base (11px…18px). 160px holds a two-
-/// group three-row catalog (claude + codex, three models, ~156px) in
+/// viewport across every picker base (11px…18px). 132px holds a two-
+/// group three-row catalog (claude + codex, three models, ~130px) in
 /// full at 13px — the credential-error swap test relies on the codex
 /// row being clickable without scrolling — and a longer catalog scrolls
-/// with the focused row auto-revealed via `scroll_to_item`.
-pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(160.);
+/// with the focused row auto-revealed via `scroll_to_item`. ZETA-132
+/// trimmed this from 160 so the Model section no longer dominates the
+/// panel, leaving Behavior + Appearance visible on open at every common
+/// window size.
+pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(132.);
 
 /// Absolute ceiling for the Settings panel's rendered height. The panel
-/// still sizes off the viewport shelf below the 25% modal-top offset so
+/// still sizes off the viewport shelf below the 15% modal-top offset so
 /// short viewports pack the sections tight, but a tall viewport must not
-/// stretch the panel: a 1200px viewport shelf is 884px, which would grow
+/// stretch the panel: a 1200px viewport shelf is ~1004px, which would grow
 /// the flat panel to full-page proportions and break the wiki-modal
 /// silhouette. Sections still scroll inside the panel when the cap bites.
-pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(560.);
+/// ZETA-132 raised this from 560 so all three sections (Model + Behavior
+/// + Appearance) fit on open at common window heights (900px+) without
+/// forcing the user to discover the hidden scroll surface.
+pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(680.);
 
 /// Height of the Settings sections' bottom mask. The scrollable sections
 /// wrapper cannot cheaply align its clip edge to a row boundary (rows
@@ -1856,12 +1864,12 @@ mod tests {
         assert_eq!(MODAL_PADDING_X, px(16.));
         assert_eq!(MODAL_PADDING_BOTTOM, px(14.));
         assert_eq!(MODAL_BUTTON_HEIGHT, px(30.));
-        assert!((MODAL_TOP_FRACTION - 0.25).abs() < f32::EPSILON);
+        assert!((MODAL_TOP_FRACTION - 0.15).abs() < f32::EPSILON);
         assert_eq!(SETTINGS_SECTION_GAP, px(10.));
         assert_eq!(SETTINGS_ROW_GAP, px(6.));
         assert_eq!(SETTINGS_ROW_DESCRIPTION_GAP, px(2.));
-        assert_eq!(SETTINGS_MODEL_LIST_MAX_HEIGHT, px(160.));
-        assert_eq!(SETTINGS_PANEL_MAX_HEIGHT, px(560.));
+        assert_eq!(SETTINGS_MODEL_LIST_MAX_HEIGHT, px(132.));
+        assert_eq!(SETTINGS_PANEL_MAX_HEIGHT, px(680.));
         // Slash-menu chrome tokens ride here rather than a raw
         // `px(6.)` / `px(4.)` sprinkled across `render_slash_menu` —
         // one place, one mutation-sensitive contract.

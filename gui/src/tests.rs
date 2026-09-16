@@ -9665,6 +9665,212 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
 }
 
 // ---------------------------------------------------------------------------
+// ZETA-132 — Settings shows its sections on open.
+// ---------------------------------------------------------------------------
+//
+// The 2026-09-16 audit (C3) caught the Settings modal opening with its
+// scroll viewport cut exactly at the `Behavior` section header on common
+// window sizes: approval mode, theme, font, and font size all read as
+// absent, with no scrollbar visible and only the ZETA-128 hairline cue
+// hinting at the hidden content. Fix: raise `SETTINGS_PANEL_MAX_HEIGHT`
+// so the shelf-capped panel is tall enough to render every section on
+// open at 900px+ viewport heights, trim `SETTINGS_MODEL_LIST_MAX_HEIGHT`
+// so the Model list stops dominating the panel, and lower
+// `MODAL_TOP_FRACTION` so smaller shelves gain vertical room too. Where
+// overflow still bites (760px test viewport, 18px picker), a real Kit
+// `Scrollbar` overlay paints its 8px thumb on the wrapper's right edge
+// so the panel is discoverably scrollable instead of relying on the
+// mask cue alone. C4 pairs the resize with a scroll-to-top reset on
+// every open so a reopen never lands mid-list.
+
+#[gpui::test]
+fn zeta132_behavior_section_header_paints_inside_the_visible_slice_on_open(
+    cx: &mut TestAppContext,
+) {
+    // C3: opening Settings must expose the Behavior heading at every
+    // picker base on the default 1100x760 test viewport. Pre-ZETA-132 the
+    // Model list + section header pushed the Behavior heading to (or
+    // past) the mask top edge; the audit screenshot captured that shape
+    // exactly. This test pins the fix by asserting the Behavior heading
+    // bounds sit strictly inside the sections wrapper AND strictly above
+    // the scroll-cue mask top edge across 11/13/18 px picker bases.
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for base_px in [11.0_f32, 13.0, 18.0] {
+        let appearance = theme::Appearance {
+            theme: theme::ThemeId::default(),
+            font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+            font_size: theme::clamp_font_size(base_px),
+        };
+        visual.update(|_, cx| theme::apply_with(cx, &appearance));
+        open_settings_with_default_catalog(&view, &mut visual);
+        // Snap the mask to its row-aligned height (same two-frame dance
+        // the ZETA-128 cue test uses — the prepaint measurement lands
+        // one frame after the first draw).
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let heading = visual
+            .debug_bounds("settings-section-behavior-heading")
+            .unwrap_or_else(|| panic!("behavior heading must render on open at {base_px}px"));
+        let cue = visual
+            .debug_bounds("settings-scroll-cue")
+            .unwrap_or_else(|| panic!("scroll-cue mask renders at {base_px}px"));
+        let panel = visual
+            .debug_bounds("settings-panel")
+            .unwrap_or_else(|| panic!("panel renders at {base_px}px"));
+        assert!(
+            heading.top() >= panel.top(),
+            "behavior heading top {:?} at {base_px}px must sit inside the \
+             panel (panel top {:?})",
+            heading.top(),
+            panel.top(),
+        );
+        assert!(
+            heading.bottom() <= cue.top(),
+            "behavior heading bottom {:?} at {base_px}px must sit above the \
+             scroll-cue mask (mask top {:?}) so opening the modal exposes \
+             the Behavior section rather than resurfacing the audit's C3 \
+             empty-header shape",
+            heading.bottom(),
+            cue.top(),
+        );
+        // The full Behavior row (label + approval segmented + caption)
+        // must also render inside the visible slice — the heading alone
+        // is not enough. If the row falls under the mask on open, the
+        // user still sees the same "empty section" shape the audit
+        // caught.
+        let approval_row = visual
+            .debug_bounds("settings-row-approval")
+            .unwrap_or_else(|| panic!("approval row must render on open at {base_px}px"));
+        assert!(
+            approval_row.bottom() <= cue.top(),
+            "approval row bottom {:?} at {base_px}px must sit above the \
+             scroll-cue mask (mask top {:?})",
+            approval_row.bottom(),
+            cue.top(),
+        );
+        // Reset for the next base by closing the modal — otherwise the
+        // second `open_settings_with_default_catalog` no-ops on the
+        // already-open state.
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
+}
+
+#[gpui::test]
+fn zeta132_scroll_resets_to_top_on_every_open(cx: &mut TestAppContext) {
+    // C4: the sections `ScrollHandle` persists across close/reopen. Without
+    // a reset the second open lands wherever the last scroll left off,
+    // hiding the top-of-panel sections the user just came to check. This
+    // test scrolls to a non-zero offset, closes, reopens, and asserts the
+    // handle is back at (0, 0).
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // 18px so the sections overflow the wrapper — otherwise a set_offset
+    // at 13px could be clamped back to zero by the scroll handle when it
+    // rebounds against the (small) max offset.
+    let appearance = theme::Appearance {
+        theme: theme::ThemeId::default(),
+        font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+    };
+    visual.update(|_, cx| theme::apply_with(cx, &appearance));
+    open_settings_with_default_catalog(&view, &mut visual);
+    // Force the handle to a non-zero offset (simulating the user having
+    // scrolled to the bottom on a previous open).
+    view.update(&mut visual, |view, _| {
+        view.settings_sections_scroll
+            .set_offset(gpui::point(px(0.), px(-200.)));
+    });
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let scrolled_y = view.read_with(&visual, |view, _| view.settings_sections_scroll.offset().y);
+    assert!(
+        scrolled_y < px(0.),
+        "test premise: the sections handle must actually take a negative \
+         offset (scrolled toward the bottom); got {scrolled_y:?}"
+    );
+    // Close via Escape, then reopen with the same catalog helper —
+    // triggers the `WorkerMessage::Settings` handler that ZETA-132 wires
+    // the reset into.
+    visual.simulate_keystrokes("escape");
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    open_settings_with_default_catalog(&view, &mut visual);
+    let reopened_y = view.read_with(&visual, |view, _| view.settings_sections_scroll.offset().y);
+    assert_eq!(
+        reopened_y,
+        px(0.),
+        "reopening Settings must reset the sections scroll to the top \
+         (offset.y was {reopened_y:?})"
+    );
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
+}
+
+#[gpui::test]
+fn zeta132_scrollbar_paints_a_thumb_when_sections_overflow(cx: &mut TestAppContext) {
+    // Layer (b) of the fix: when the sections wrapper does overflow (18px
+    // picker on the 760px test viewport), a real scrollbar overlay must
+    // paint its thumb on the wrapper's right edge so the surface is
+    // discoverably scrollable — the audit's C3 miss when only the mask
+    // + hairline cue signalled overflow. Kit's `Scrollbar` in `Always`
+    // mode paints the thumb continuously while content exceeds the
+    // container; `style_for_normal` uses the theme's `scrollbar_thumb`
+    // token (text-normal at 20% alpha), so a matching painted quad
+    // proves the overlay is live.
+    wipe_scoped_prefs();
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let appearance = theme::Appearance {
+        theme: theme::ThemeId::default(),
+        font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
+        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+    };
+    visual.update(|_, cx| theme::apply_with(cx, &appearance));
+    open_settings_with_default_catalog(&view, &mut visual);
+    // Two draws: first sizes the wrapper, second lets Kit's scrollbar
+    // pick up the layout bounds via `viewport_from_layout` and paint the
+    // thumb.
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let overlay = visual
+        .debug_bounds("settings-sections-scrollbar")
+        .expect("scrollbar overlay renders while Settings is open");
+    let thumb_bg: gpui::Background = theme::palette::scrollbar_thumb().into();
+    let thumb_quads: Vec<_> = visual.update(|window, _| {
+        window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| quad.background == thumb_bg)
+            .collect()
+    });
+    assert!(
+        !thumb_quads.is_empty(),
+        "scrollbar thumb must paint at 18px on the 760px test viewport — \
+         the sections overflow the wrapper and Kit's `Always` mode should \
+         hold the thumb steady on the right edge"
+    );
+    let scale = visual.update(|window, _| window.scale_factor());
+    for quad in &thumb_quads {
+        let left = gpui::px(quad.bounds.origin.x.as_f32() / scale);
+        let right =
+            gpui::px((quad.bounds.origin.x.as_f32() + quad.bounds.size.width.as_f32()) / scale);
+        assert!(
+            right >= overlay.left() && left <= overlay.right() + px(1.),
+            "thumb quad bounds {:?} must sit inside the scrollbar overlay \
+             {overlay:?}",
+            quad.bounds,
+        );
+    }
+    visual.update(|_, cx| theme::apply(cx));
+    wipe_scoped_prefs();
+}
+
+// ---------------------------------------------------------------------------
 // ZETA-129 — inline-code chip ladder STRUCTURE guard.
 // ---------------------------------------------------------------------------
 //
