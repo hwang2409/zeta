@@ -67,7 +67,17 @@ pub fn relative_age(timestamp: &str, now: DateTime<Utc>) -> String {
 fn row_focus_handle(view: &ZetaView, cx: &mut App, id: &str) -> FocusHandle {
     let mut map = view.sidebar_row_focus.borrow_mut();
     if let Some(handle) = map.get(id) {
-        return handle.clone();
+        // Re-apply `.tab_stop(true).tab_index(0)` on every render.
+        // `FocusHandle::tab_stop` / `tab_index` write through to the
+        // shared window focus map (see gpui `window.rs`), so an early
+        // render that created the handle before the row's paint site
+        // saw a live tab_index — or any peer flow that ever created a
+        // handle-with-the-same-id at `tab_stop=false` first — would
+        // leave the shared entry with `tab_stop=false` and Tab walks
+        // would silently skip the row. Mirrors ZETA-108's row focus
+        // pattern (tool_receipts.rs::tool_group_focus_handle) exactly
+        // — the group header pushes the same flags on every render.
+        return handle.clone().tab_stop(true).tab_index(0);
     }
     let handle = cx.focus_handle().tab_stop(true).tab_index(0);
     map.insert(id.to_owned(), handle.clone());

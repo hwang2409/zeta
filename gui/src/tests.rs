@@ -5182,22 +5182,13 @@ fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and
     // gap in the Tab keybinding itself. `window.focus(&handle)` would
     // silently paper over both.
     let tab_to = |visual: &mut VisualTestContext, target: &gpui::FocusHandle| {
-        // Seed focus on the current session row so the dispatch path
-        // matches Root's `Tab` context. The composer input's own
-        // context binds Tab to `IndentInline` and would swallow every
-        // keystroke; a blurred window leaves no dispatch path either
-        // (Root's binding requires the "Root" context in the chain).
-        // Seeding on a known-registered sidebar row is the same setup
-        // pattern #167's tool-group-header a11y test uses
-        // (tests.rs:7912) and does not shortcut the honest walk —
-        // every step below IS a real `simulate_keystrokes("tab")`
-        // dispatch, the path a keyboard-only user drives. The seed
-        // is `current_session_handle` — a stable anchor at the top
-        // of the sidebar's tab order. If `target` happens to equal
-        // the seed the bounded loop pumps Tab off it and cycles back
-        // to it, still exercising real dispatch.
+        // Blur so Tab dispatch starts from a clean state. Root's
+        // `Tab` action fires from `root_node_id()` when the window
+        // has no focus, so a bounded walk from a blurred window
+        // reaches every tab stop. Blur is a reset primitive, not a
+        // focus move.
         visual.update(|window, cx| {
-            window.focus(&current_session_handle, cx);
+            window.blur(cx);
             window.draw(cx).clear(cx);
         });
         let max_steps = 128;
