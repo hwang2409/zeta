@@ -155,13 +155,13 @@ runs both targets on every head of this PR, including the final head.
 
 ## Poison-canary (`ZETA_GUI_INLINE_FLOW_DEFINITE`)
 
-The env is checked in TWO places:
-1. `InlineFlow::prepaint`'s `width_available` binding — chooses between
-   `MaxContent` (fix) and the upstream `Definite(...)` (mutation).
-2. The test-only recorder probe — mirrors the same choice so the sample
-   captures what actually happens in `prepaint_as_root`.
+The env is read ONCE, at `InlineFlow::prepaint`'s `width_available`
+binding — it chooses between `MaxContent` (fix) and the upstream
+`Definite(...)` (mutation). The test-only recorder probe shares that
+binding rather than re-reading the env, so its samples capture exactly
+what `prepaint_as_root` receives.
 
-Both checks read the same env; setting `ZETA_GUI_INLINE_FLOW_DEFINITE=1`
+Setting `ZETA_GUI_INLINE_FLOW_DEFINITE=1`
 silences the fix and reproduces the bug end-to-end — the CI mutation
 target inverts the exit code so a green run FAILS CI, catching a
 silent revert (a stray `git checkout`, a merge conflict resolved the

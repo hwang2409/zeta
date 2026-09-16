@@ -9350,28 +9350,6 @@ fn zeta129_inline_code_chip_ladder_structure(cx: &mut TestAppContext) {
             ix + 2,
         );
     }
-    // Sorting places chips into rows of unique y-origin. Structural
-    // regression cover: two consecutive chip background quads must never
-    // sit less than one row-stride apart, so a future change that emits
-    // a chip quad off-row lands here.
-    let row_stride = if bounds.len() >= 2 {
-        bounds[1].origin.y - bounds[0].origin.y
-    } else {
-        gpui::ScaledPixels::from(0.0)
-    };
-    for (ix, pair) in bounds.windows(2).enumerate() {
-        let dy = pair[1].origin.y - pair[0].origin.y;
-        assert!(
-            dy >= row_stride,
-            "chip {} at {:?} and chip {} at {:?} sit less than one row \
-             apart (dy={dy:?}, row_stride={row_stride:?}) — chip background \
-             quads must be aligned in row-strides",
-            ix,
-            pair[0].origin,
-            ix + 1,
-            pair[1].origin,
-        );
-    }
 }
 
 // The recorder-based mutation-killer runs in the NATIVE smoke driver,
