@@ -9252,7 +9252,7 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
 }
 
 // ---------------------------------------------------------------------------
-// ZETA-129 — inline-code chip ladder guard.
+// ZETA-129 — inline-code chip ladder STRUCTURE guard.
 // ---------------------------------------------------------------------------
 //
 // The 2026-09-16 audit hit two classes of code-span corruption in the run
@@ -9265,34 +9265,25 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
 // `AvailableSpace::MaxContent` so the inner `StyledText` never re-wraps a
 // fragment whose shape already fits.
 //
-// This test drives a length 1..=16 backtick ladder through
-// `TextView::markdown` inside `VisualTestContext::draw()`. The range runs
-// beyond the local length-9 trip because the drift threshold is
-// CoreText-metric-dependent and CI's macOS runner ships a different font
-// resolution than the audit host — extending past 12 guarantees the
-// mutation crosses the drift boundary at some length on every macOS CI
-// image.
+// This test drives a length 1..=16 backtick ladder through the markdown
+// renderer inside `VisualTestContext::draw()` and inspects the chip
+// BACKGROUND quads. It is NOT a mutation-sensitive check for A1/A2 — the
+// phantom-glyph paints under the Definite drift are text SPRITES, not
+// background quads, so this test's assertions on `secondary_hover`-washed
+// quads pass even with the fix disabled. Mutation coverage for A1/A2
+// lives in the native smoke driver: `smoke::scan_inline_flow_recorder`
+// reads `gpui_kit::base::zeta129_wrap_recorder::samples()` after every
+// native render and panics on any non-zero wrap-boundary count; the
+// paired `gui-native-guards-inline-flow-mutation` Makefile target
+// reinstates the upstream `Definite(...)` shape and requires the scan to
+// trip.
 //
-// Mutation contract: the test must PASS with the fix present and FAIL
-// under `ZETA_GUI_INLINE_FLOW_DEFINITE=1`, which reinstates upstream's
-// `Definite(fragment_size.width - padding * 2.)`. Assertions:
-//   (a) `painted_quads` on the inline-code wash yields exactly 16 chip
-//       quads — one per ladder length.
-//   (b) Each chip quad's width equals the SHAPED chip width the vendored
-//       `InlineFlow` promises (`shape_line.width() + INLINE_CODE_PADDING *
-//       2`, scaled). A shape-drift drop that shrinks the fragment or a
-//       peer paint that shrinks the background rectangle trips this.
-//   (c) No `secondary_hover` paint of chip size lands below the chip's
-//       own row — the tell-tale of a wrap boundary that pushed the chip's
-//       last glyph one `line_height` down. `paint_line_background` in
-//       gpui-pre emits an extra background quad at `(origin.x, y +
-//       line_height)` when the inner `StyledText` wraps a run that
-//       carries a `background_color` — under upstream's Definite path the
-//       drift-triggered wrap converts the code fragment's cleared
-//       background into that per-run paint sequence, so an extra quad
-//       shows up below every drift-tripped chip.
+// What this test DOES cover: chip-structure regressions unrelated to the
+// vendored InlineFlow patch — a future change that reshapes the chip
+// background paint would surface here as a count mismatch, a non-monotonic
+// width sequence, or an out-of-row background quad.
 #[gpui::test]
-fn zeta129_inline_code_chip_ladder_paints_one_widening_chip_per_length(cx: &mut TestAppContext) {
+fn zeta129_inline_code_chip_ladder_structure(cx: &mut TestAppContext) {
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let mut lines: Vec<String> = Vec::with_capacity(16);
