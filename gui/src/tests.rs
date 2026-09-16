@@ -8181,10 +8181,11 @@ and then some trailing prose after it.";
 // ---------------------------------------------------------------------------
 
 /// Excerpt extraction routes bash/read/write/edit/fetch through the
-/// argument key the tool actually reads, and falls back to the tool name
-/// for tools whose arguments carry nothing useful. A pathological command
-/// longer than the character cap truncates with a single-character
-/// ellipsis so a wide argument still fits on one row.
+/// argument key the tool actually reads, returns `None` for a tool call
+/// whose arguments carry nothing nameable (the typed missing-argument
+/// state — ZETA-134 review r2), and truncates a pathological argument
+/// with a single-character ellipsis so a wide argument still fits on one
+/// row.
 #[test]
 fn zeta125_excerpts_route_by_kind_and_truncate() {
     use serde_json::json;
@@ -8194,36 +8195,43 @@ fn zeta125_excerpts_route_by_kind_and_truncate() {
     };
     // Bash-family tools read the "command" argument's first line.
     assert_eq!(
-        excerpt("bash", json!({"command": "grep -rn TODO src/"})),
-        "grep -rn TODO src/"
+        excerpt("bash", json!({"command": "grep -rn TODO src/"})).as_deref(),
+        Some("grep -rn TODO src/"),
     );
     assert_eq!(
-        excerpt("exec", json!({"command": "ls -la\nsecond line"})),
-        "ls -la"
+        excerpt("exec", json!({"command": "ls -la\nsecond line"})).as_deref(),
+        Some("ls -la"),
     );
     // Read/write/edit route through "path".
     assert_eq!(
-        excerpt("read", json!({"path": "src/main.rs"})),
-        "src/main.rs"
+        excerpt("read", json!({"path": "src/main.rs"})).as_deref(),
+        Some("src/main.rs"),
     );
-    assert_eq!(excerpt("write", json!({"path": "notes.txt"})), "notes.txt");
     assert_eq!(
-        excerpt("edit", json!({"path": "docs/design.md"})),
-        "docs/design.md"
+        excerpt("write", json!({"path": "notes.txt"})).as_deref(),
+        Some("notes.txt"),
+    );
+    assert_eq!(
+        excerpt("edit", json!({"path": "docs/design.md"})).as_deref(),
+        Some("docs/design.md"),
     );
     // Fetch reads "url" and keeps the whole URL under the cap.
     assert_eq!(
-        excerpt("fetch", json!({"url": "https://example.com/api/v1/data"})),
-        "https://example.com/api/v1/data"
+        excerpt("fetch", json!({"url": "https://example.com/api/v1/data"})).as_deref(),
+        Some("https://example.com/api/v1/data"),
     );
     // Unknown tools fall back to the first primitive argument.
-    assert_eq!(excerpt("weather", json!({"city": "Paris"})), "Paris");
-    // With no primitive argument, fall back to the tool name.
-    assert_eq!(excerpt("noop", json!({})), "noop");
+    assert_eq!(
+        excerpt("weather", json!({"city": "Paris"})).as_deref(),
+        Some("Paris"),
+    );
+    // With no primitive argument, the missing state is `None` — the row
+    // builder reads that as "paint the tool label alone" (ZETA-134 A3).
+    assert_eq!(excerpt("noop", json!({})), None);
     // Truncation trims to `EXCERPT_CHARS` and appends a single-character
     // ellipsis marker. The output length is at most cap + 1 char.
     let long = "a".repeat(zeta_gui::state::EXCERPT_CHARS * 2);
-    let truncated = excerpt("bash", json!({"command": long}));
+    let truncated = excerpt("bash", json!({"command": long})).expect("long excerpt");
     assert!(truncated.ends_with('…'));
     assert_eq!(
         truncated.chars().count(),
