@@ -9280,8 +9280,8 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
 //
 // What this test DOES cover: chip-structure regressions unrelated to the
 // vendored InlineFlow patch — a future change that reshapes the chip
-// background paint would surface here as a count mismatch, a non-monotonic
-// width sequence, or an out-of-row background quad.
+// background paint would surface here as a count mismatch or a
+// non-monotonic width sequence.
 #[gpui::test]
 fn zeta129_inline_code_chip_ladder_structure(cx: &mut TestAppContext) {
     let (window, view, _) = setup(cx);
