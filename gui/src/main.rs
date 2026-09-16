@@ -2326,6 +2326,14 @@ impl ZetaView {
     /// underneath still stops the drag from falling through to the
     /// transcript, and the whole layer reads as one flat drop zone rather
     /// than a per-cell border flicker.
+    ///
+    /// Enters via a 120ms `ease_out_quint` opacity fade (ZETA-126) so the
+    /// overlay does not pop in when a drag first crosses the composer
+    /// bounds. `.with_animation` respects `App::reduce_motion` — under
+    /// the OS "reduce motion" setting the overlay renders at its end
+    /// state (opacity 1.0) with no scheduled frames. Debug bounds pick
+    /// up the overlay's layout at any opacity so the drop-target paint
+    /// probes stay green regardless of animation phase.
     fn render_drop_target(&self, cx: &Context<Self>) -> gpui::AnyElement {
         let base_size = cx.theme().font_size;
         div()
@@ -2353,6 +2361,11 @@ impl ZetaView {
                     .text_size(theme::label_small(base_size))
                     .text_color(cx.theme().muted_foreground)
                     .child(chrome::DROP_TARGET_HINT),
+            )
+            .with_animation(
+                "composer-drop-target-fade-in",
+                Animation::new(Duration::from_millis(120)).with_easing(gpui::ease_out_quint()),
+                |el, delta| el.opacity(delta),
             )
             .into_any_element()
     }

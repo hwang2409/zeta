@@ -338,8 +338,16 @@ impl ZetaView {
             .bg(row_bg)
             .text_color(row_fg)
             .when(can_switch && !active && !focused, |row| {
+                // Hover reads as a light rest wash; pressed lands one
+                // tint step stronger (`list_active`) so click-and-hold
+                // paints a distinguishable tactile state instead of
+                // reusing the hover fill — the "no dead-feeling clicks"
+                // contract from ZETA-126. Activation still fires on
+                // mouse-down, but the pressed style paints in the same
+                // frame so a held click reads as pressed briefly.
                 row.cursor_pointer()
                     .hover(|style| style.bg(cx.theme().muted))
+                    .active(|style| style.bg(cx.theme().list_active))
             })
             .child(self.render_row_gutter(active, cx))
             .child(
@@ -590,8 +598,13 @@ impl ZetaView {
                     .bg(row_bg)
                     .text_color(row_fg)
                     .when(can_switch && !current && !focused, |row| {
+                        // Branch rows share the sidebar row contract:
+                        // hover → muted rest wash, pressed → `list_active`
+                        // one step stronger so click-and-hold paints a
+                        // distinguishable tactile state (ZETA-126).
                         row.cursor_pointer()
                             .hover(|style| style.bg(cx.theme().muted))
+                            .active(|style| style.bg(cx.theme().list_active))
                     })
                     // Depth indent stands independent of the fixed dot
                     // gutter — contract line 81 pins the dot to `left 4px`
