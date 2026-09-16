@@ -162,16 +162,24 @@ pub const SLASH_MENU_RADIUS: Pixels = px(6.);
 pub const SLASH_MENU_ROW_RADIUS: Pixels = px(4.);
 
 /// Flat-panel modal shape. Width caps at 480px, padding is 12px on top / 16px
-/// horizontally / 14px on bottom, and the panel sits below a scrim at 15% of
-/// the viewport height. ZETA-132 lowered the top fraction from 0.25 so the
-/// available shelf is tall enough for the Settings surface to render all three
-/// sections at common window sizes (900px+ heights) without scrolling.
+/// horizontally / 14px on bottom, and the panel sits below a scrim at 25% of
+/// the viewport height (the ZETA-108 shelf shared by rename / delete /
+/// settings dialogs).
 pub const MODAL_WIDTH: Pixels = px(480.);
 pub const MODAL_PADDING_TOP: Pixels = px(12.);
 pub const MODAL_PADDING_X: Pixels = px(16.);
 pub const MODAL_PADDING_BOTTOM: Pixels = px(14.);
 pub const MODAL_BUTTON_HEIGHT: Pixels = px(30.);
-pub const MODAL_TOP_FRACTION: f32 = 0.15;
+pub const MODAL_TOP_FRACTION: f32 = 0.25;
+
+/// Settings-only top-offset fraction. The Settings surface stacks three
+/// grouped sections plus an optional credential-error alert; at the shared
+/// 25% shelf the panel's shelf-derived height cannot hold every section on
+/// open at common window heights (900px+), so ZETA-132 gives Settings its
+/// own token at 15% and the shelf math (`h(min(shelf, cap))`) reads it.
+/// Rename / delete dialogs keep the ZETA-108 25% shelf via
+/// `MODAL_TOP_FRACTION`.
+pub const SETTINGS_MODAL_TOP_FRACTION: f32 = 0.15;
 
 /// Label-column width for a Settings row, derived from the current base
 /// font size. The column scales linearly (`base * 10.8`) so at 11px it is
@@ -1865,7 +1873,11 @@ mod tests {
         assert_eq!(MODAL_PADDING_X, px(16.));
         assert_eq!(MODAL_PADDING_BOTTOM, px(14.));
         assert_eq!(MODAL_BUTTON_HEIGHT, px(30.));
-        assert!((MODAL_TOP_FRACTION - 0.15).abs() < f32::EPSILON);
+        // The shared modal offset stays on the ZETA-108 25% shelf so
+        // rename / delete dialogs (session_management.rs) keep their
+        // pinned position; Settings gets its own token below.
+        assert!((MODAL_TOP_FRACTION - 0.25).abs() < f32::EPSILON);
+        assert!((SETTINGS_MODAL_TOP_FRACTION - 0.15).abs() < f32::EPSILON);
         assert_eq!(SETTINGS_SECTION_GAP, px(10.));
         assert_eq!(SETTINGS_ROW_GAP, px(6.));
         assert_eq!(SETTINGS_ROW_DESCRIPTION_GAP, px(2.));

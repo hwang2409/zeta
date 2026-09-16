@@ -1932,13 +1932,18 @@ impl ZetaView {
             .bg(cx.theme().overlay)
             .v_flex()
             .items_center()
-            // Flat panel on scrim: sits at 25% of the viewport HEIGHT rather
+            // Flat panel on scrim: sits at 15% of the viewport HEIGHT rather
             // than centred, matching the wiki modal shape. GPUI's
-            // `pt(relative(0.25))` computes a fraction of parent WIDTH
+            // `pt(relative(0.15))` computes a fraction of parent WIDTH
             // (CSS-quirk), which drifts the modal off the shelf on wide
             // windows — measure the height directly and offset in pixels.
-            // Contract line 91.
-            .pt(window.viewport_size().height * theme::MODAL_TOP_FRACTION)
+            // Contract line 91. The Settings surface reads its OWN offset
+            // token (`SETTINGS_MODAL_TOP_FRACTION`, 15%) rather than the
+            // shared `MODAL_TOP_FRACTION` (25%) so the three-section body
+            // plus an optional credential-error alert fits on open at
+            // 900px+ viewport heights — rename / delete dialogs
+            // (session_management.rs) still ride the 25% ZETA-108 shelf.
+            .pt(window.viewport_size().height * theme::SETTINGS_MODAL_TOP_FRACTION)
             .px(theme::MODAL_PADDING_X)
             .child(
                 div()
@@ -1947,13 +1952,13 @@ impl ZetaView {
                     .w(theme::MODAL_WIDTH)
                     .max_w_full()
                     // Panel size is `min(shelf, cap)`:
-                    //  - `shelf` = viewport height below the 25% modal-top
-                    //    offset (minus one MODAL_PADDING_X so it never
-                    //    kisses the viewport bottom). Small viewports
+                    //  - `shelf` = viewport height below the 15% Settings
+                    //    modal-top offset (minus one MODAL_PADDING_X so it
+                    //    never kisses the viewport bottom). Small viewports
                     //    (760px test window at 18px picker) leave the panel
                     //    shelf-sized so `flex_1 + min_h_0` on the sections
                     //    wrapper can resolve against a definite height.
-                    //  - `cap` = SETTINGS_PANEL_MAX_HEIGHT (560px). Tall
+                    //  - `cap` = SETTINGS_PANEL_MAX_HEIGHT (680px). Tall
                     //    viewports (1200px+) would otherwise stretch the
                     //    flat panel to 884px+ and break the wiki-modal
                     //    silhouette — cap the growth here so the panel
@@ -1967,7 +1972,7 @@ impl ZetaView {
                     // still cannot leak past the panel edge.
                     .h({
                         let shelf = window.viewport_size().height
-                            * (1.0 - theme::MODAL_TOP_FRACTION)
+                            * (1.0 - theme::SETTINGS_MODAL_TOP_FRACTION)
                             - theme::MODAL_PADDING_X;
                         std::cmp::min(shelf, theme::SETTINGS_PANEL_MAX_HEIGHT)
                     })

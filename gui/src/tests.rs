@@ -5203,14 +5203,18 @@ fn modals_paint_a_flat_panel_on_the_scrim_at_the_wiki_top_offset(cx: &mut TestAp
             bordered.len()
         );
     });
-    // Sits at 25% of the viewport height — the exact wiki `top` offset.
-    // A 25% mark lands cleanly on a pixel grid, so drift beyond layout
-    // rounding (~1 logical px) means someone shifted the offset itself,
-    // not a fractional-pixel rounding wobble.
+    // Sits at 15% of the viewport height — the Settings-only offset that
+    // ZETA-132 introduced so the three-section body fits on open at
+    // 900px+ viewport heights. Rename / delete dialogs still ride the
+    // shared 25% shelf; that pair is guarded in
+    // `session_edit_modal_matches_the_wiki_flat_panel_shape` against
+    // `theme::MODAL_TOP_FRACTION`. Drift beyond layout rounding (~1
+    // logical px) means someone shifted the offset itself, not a
+    // fractional-pixel rounding wobble.
     let overlay = visual
         .debug_bounds("settings-overlay")
         .expect("settings overlay renders");
-    let target = overlay.top() + overlay.size.height * theme::MODAL_TOP_FRACTION;
+    let target = overlay.top() + overlay.size.height * theme::SETTINGS_MODAL_TOP_FRACTION;
     let drift = if panel.top() > target {
         panel.top() - target
     } else {
@@ -5219,7 +5223,7 @@ fn modals_paint_a_flat_panel_on_the_scrim_at_the_wiki_top_offset(cx: &mut TestAp
     assert!(
         drift <= px(1.),
         "settings panel top {:?} must land within 1px (layout rounding) \
-         of the 25% mark ({:?})",
+         of the 15% Settings offset ({:?})",
         panel.top(),
         target,
     );
@@ -9674,14 +9678,64 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
 // absent, with no scrollbar visible and only the ZETA-128 hairline cue
 // hinting at the hidden content. Fix: raise `SETTINGS_PANEL_MAX_HEIGHT`
 // so the shelf-capped panel is tall enough to render every section on
-// open at 900px+ viewport heights, trim `SETTINGS_MODEL_LIST_MAX_HEIGHT`
-// so the Model list stops dominating the panel, and lower
-// `MODAL_TOP_FRACTION` so smaller shelves gain vertical room too. Where
+// open at 900px+ viewport heights, keep `SETTINGS_MODEL_LIST_MAX_HEIGHT`
+// at 160 (the credential-error swap test relies on the codex row being
+// clickable without scrolling), and give the Settings surface its own
+// top-offset token (`SETTINGS_MODAL_TOP_FRACTION`) at 15% so the
+// shelf-derived height is tall enough while the shared 25%
+// `MODAL_TOP_FRACTION` still pins rename / delete dialogs. Where
 // overflow still bites (760px test viewport, 18px picker), a real Kit
 // `Scrollbar` overlay paints its 8px thumb on the wrapper's right edge
 // so the panel is discoverably scrollable instead of relying on the
 // mask cue alone. C4 pairs the resize with a scroll-to-top reset on
 // every open so a reopen never lands mid-list.
+
+/// Two-group model catalog that matches the audit shape — claude + codex,
+/// enough rows to reach the 160px model-list cap so the Model section
+/// pushes its natural weight on the sections wrapper. A single-model
+/// fixture (the default helper) fits the Model list in ~32px and the
+/// old, pre-round-1 sizing (`SETTINGS_PANEL_MAX_HEIGHT=560`,
+/// `MODAL_TOP_FRACTION=0.25`) passes with plenty of room to spare;
+/// the C3 test needs the audit-weight list to expose the miss.
+fn open_settings_with_audit_shape_catalog(view: &Entity<ZetaView>, visual: &mut VisualTestContext) {
+    let models: Vec<String> = vec![
+        "claude-opus-4-7".into(),
+        "claude-sonnet-4-6".into(),
+        "claude-fable-5".into(),
+        "claude-haiku-4-5".into(),
+        "gpt-5.6-luna".into(),
+        "gpt-5.6-sol".into(),
+    ];
+    let mut providers = std::collections::BTreeMap::new();
+    for model in &models {
+        let group = if model.starts_with("claude-") {
+            "claude"
+        } else {
+            "codex"
+        };
+        providers.insert(model.clone(), group.to_owned());
+    }
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.session_view.available = true;
+            view.apply_worker_message(
+                WorkerMessage::Settings(
+                    SessionSettings {
+                        model: models[0].clone(),
+                        approval_mode: "ask".into(),
+                    },
+                    ModelCatalog {
+                        models: models.clone(),
+                        providers,
+                    },
+                ),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+}
 
 #[gpui::test]
 fn zeta132_behavior_section_header_paints_inside_the_visible_slice_on_open(
@@ -9694,6 +9748,13 @@ fn zeta132_behavior_section_header_paints_inside_the_visible_slice_on_open(
     // exactly. This test pins the fix by asserting the Behavior heading
     // bounds sit strictly inside the sections wrapper AND strictly above
     // the scroll-cue mask top edge across 11/13/18 px picker bases.
+    //
+    // The fixture is the two-group audit-shape catalog rather than the
+    // single-model default helper: a one-row Model list fits inside the
+    // pre-round-1 sizing without pushing on the Behavior heading, so a
+    // fixture that undersells the audit weight would pass even with the
+    // old `SETTINGS_PANEL_MAX_HEIGHT=560` and shared 25% modal-top offset
+    // — masking the very miss this test exists to catch.
     wipe_scoped_prefs();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
@@ -9704,7 +9765,7 @@ fn zeta132_behavior_section_header_paints_inside_the_visible_slice_on_open(
             font_size: theme::clamp_font_size(base_px),
         };
         visual.update(|_, cx| theme::apply_with(cx, &appearance));
-        open_settings_with_default_catalog(&view, &mut visual);
+        open_settings_with_audit_shape_catalog(&view, &mut visual);
         // Snap the mask to its row-aligned height (same two-frame dance
         // the ZETA-128 cue test uses — the prepaint measurement lands
         // one frame after the first draw).
@@ -9753,7 +9814,7 @@ fn zeta132_behavior_section_header_paints_inside_the_visible_slice_on_open(
             cue.top(),
         );
         // Reset for the next base by closing the modal — otherwise the
-        // second `open_settings_with_default_catalog` no-ops on the
+        // second `open_settings_with_audit_shape_catalog` no-ops on the
         // already-open state.
         visual.simulate_keystrokes("escape");
         visual.update(|window, cx| window.draw(cx).clear(cx));
@@ -9765,48 +9826,90 @@ fn zeta132_behavior_section_header_paints_inside_the_visible_slice_on_open(
 #[gpui::test]
 fn zeta132_scroll_resets_to_top_on_every_open(cx: &mut TestAppContext) {
     // C4: the sections `ScrollHandle` persists across close/reopen. Without
-    // a reset the second open lands wherever the last scroll left off,
-    // hiding the top-of-panel sections the user just came to check. This
-    // test scrolls to a non-zero offset, closes, reopens, and asserts the
-    // handle is back at (0, 0).
+    // a reset the second open lands wherever the last wheel/drag left it,
+    // hiding the top-of-panel sections the user just came to check.
+    //
+    // Drives the real user path rather than a synthetic `set_offset`:
+    // open at the shipped 13px default (sections fit), click the
+    // Appearance font-size stepper in place until the picker reaches its
+    // MAX so the sections start to overflow mid-session, then dispatch a
+    // real wheel event on the sections wrapper to move the offset. Close
+    // via Escape, reopen, and assert the handle is back at (0, 0). The
+    // pre-round-1 shortcut (`set_offset` + font size set BEFORE the first
+    // open) sidestepped both the reopen-after-mid-session-resize path
+    // AND the wheel-listener wiring that actually carries a real user's
+    // scroll.
     wipe_scoped_prefs();
     let (window, view, _) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    // 18px so the sections overflow the wrapper — otherwise a set_offset
-    // at 13px could be clamped back to zero by the scroll handle when it
-    // rebounds against the (small) max offset.
-    let appearance = theme::Appearance {
-        theme: theme::ThemeId::default(),
-        font_family: gpui::SharedString::new_static(theme::DEFAULT_FONT_FAMILY),
-        font_size: theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
-    };
-    visual.update(|_, cx| theme::apply_with(cx, &appearance));
-    open_settings_with_default_catalog(&view, &mut visual);
-    // Force the handle to a non-zero offset (simulating the user having
-    // scrolled to the bottom on a previous open).
-    view.update(&mut visual, |view, _| {
-        view.settings_sections_scroll
-            .set_offset(gpui::point(px(0.), px(-200.)));
+    // Open at the shipped 13px default; no synthetic size set beforehand.
+    open_settings_with_audit_shape_catalog(&view, &mut visual);
+    let baseline_size = visual.update(|_, cx| cx.theme().font_size);
+    assert_eq!(
+        baseline_size,
+        theme::DEFAULT_FONT_SIZE,
+        "test premise: modal must open at the shipped {:?} default",
+        theme::DEFAULT_FONT_SIZE,
+    );
+    // Mid-session: click `font-size-grow` on the stepper until the
+    // picker reaches its MAX. Every click updates prefs and re-applies
+    // the theme, which reflows the modal in place — the panel stays
+    // open, the sections wrapper grows past its clip at the picker's
+    // upper bases, and overflow becomes real.
+    let steps = (theme::MAX_FONT_SIZE_PX - f32::from(theme::DEFAULT_FONT_SIZE)).round() as usize;
+    for _ in 0..steps {
+        let grow = visual
+            .debug_bounds("font-size-grow")
+            .expect("grow button renders while modal is open");
+        visual.simulate_click(grow.center(), Default::default());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let grown_size = visual.update(|_, cx| cx.theme().font_size);
+    assert_eq!(
+        grown_size,
+        theme::clamp_font_size(theme::MAX_FONT_SIZE_PX),
+        "test premise: stepper clicks must reach the MAX font size \
+         mid-session — got {grown_size:?}",
+    );
+    // Real wheel input on the sections wrapper. The wrapper is
+    // `overflow_y_scroll` + `.track_scroll(&self.settings_sections_scroll)`,
+    // so a wheel routed to its hitbox translates directly into a
+    // negative y offset on the tracked handle — the same path a
+    // trackpad two-finger drag drives at runtime.
+    let sections = visual
+        .debug_bounds("settings-sections")
+        .expect("sections wrapper renders");
+    visual.update(|window, cx| {
+        window.dispatch_event(
+            gpui::ScrollWheelEvent {
+                position: sections.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-300.))),
+                ..Default::default()
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.draw(cx).clear(cx);
     });
-    visual.update(|window, cx| window.draw(cx).clear(cx));
     let scrolled_y = view.read_with(&visual, |view, _| view.settings_sections_scroll.offset().y);
     assert!(
         scrolled_y < px(0.),
-        "test premise: the sections handle must actually take a negative \
-         offset (scrolled toward the bottom); got {scrolled_y:?}"
+        "test premise: a real wheel scroll must move the sections \
+         handle to a negative offset (got {scrolled_y:?}) — otherwise \
+         the reopen-reset guard has nothing to reset",
     );
     // Close via Escape, then reopen with the same catalog helper —
     // triggers the `WorkerMessage::Settings` handler that ZETA-132 wires
     // the reset into.
     visual.simulate_keystrokes("escape");
     visual.update(|window, cx| window.draw(cx).clear(cx));
-    open_settings_with_default_catalog(&view, &mut visual);
+    open_settings_with_audit_shape_catalog(&view, &mut visual);
     let reopened_y = view.read_with(&visual, |view, _| view.settings_sections_scroll.offset().y);
     assert_eq!(
         reopened_y,
         px(0.),
         "reopening Settings must reset the sections scroll to the top \
-         (offset.y was {reopened_y:?})"
+         (offset.y was {reopened_y:?})",
     );
     visual.update(|_, cx| theme::apply(cx));
     wipe_scoped_prefs();
