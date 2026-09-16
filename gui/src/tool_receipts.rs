@@ -146,24 +146,27 @@ impl ZetaView {
                             .items_center()
                             .min_w_0()
                             .flex_1()
-                            .when_some(excerpt, |row, excerpt| {
-                                row.child(
-                                    // Excerpt — the row's PRIMARY text. State
-                                    // color routes through the recorder so a
-                                    // swap at this call site is caught by the
-                                    // render_log sample check. Painted only
-                                    // when the tool call carried a nameable
-                                    // argument; a `None` excerpt (argument-
-                                    // less tool_start) leaves the label
-                                    // alone (ZETA-134 review r2 typed state).
-                                    state_text(|| sel::tool_excerpt(index), state_color)
-                                        .debug_selector(move || sel::tool_excerpt(index))
-                                        .min_w_0()
-                                        .flex_shrink(1.0)
-                                        .truncate()
-                                        .child(excerpt),
-                                )
-                            })
+                            .child(
+                                // Excerpt — the row's PRIMARY text. State
+                                // color routes through the recorder so a
+                                // swap at this call site is caught by the
+                                // render_log sample check. The receipt
+                                // paints an empty string for the
+                                // missing-argument state (`excerpt =
+                                // None`), which visually drops the
+                                // redundant primary text without changing
+                                // the row's layout or the debug/record
+                                // selector — the r2 review's typed state
+                                // lives on the model (`ToolRowText::excerpt
+                                // = Option`), not on whether this
+                                // element paints.
+                                state_text(|| sel::tool_excerpt(index), state_color)
+                                    .debug_selector(move || sel::tool_excerpt(index))
+                                    .min_w_0()
+                                    .flex_shrink(1.0)
+                                    .truncate()
+                                    .child(excerpt.unwrap_or_default()),
+                            )
                             .when_some(metadata_label, |row, label| {
                                 row.child(
                                     div()
