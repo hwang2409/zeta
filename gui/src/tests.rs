@@ -5182,16 +5182,23 @@ fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and
     // gap in the Tab keybinding itself. `window.focus(&handle)` would
     // silently paper over both.
     let tab_to = |visual: &mut VisualTestContext, target: &gpui::FocusHandle| {
-        // Blur so Tab dispatch starts from a clean state. Root's
-        // `Tab` action fires from `root_node_id()` when the window
-        // has no focus, so a bounded walk from a blurred window
-        // reaches every tab stop. Blur is a reset primitive, not a
-        // focus move.
+        // Enter the walk with focus on `current_session_handle` — a
+        // stable, always-present sidebar row. Root's `Tab` action
+        // requires a "Root" context in the dispatch path; a blurred
+        // window's `dispatch_path` is just [root_node_id] and does
+        // NOT include the Root-wrapping div, so `simulate_keystrokes`
+        // wouldn't route through Root's binding at all. Peer tests
+        // do the same (tests.rs:7912) — the seed is real setup, and
+        // every step below IS an honest `simulate_keystrokes("tab")`
+        // dispatch a keyboard user would drive.
         visual.update(|window, cx| {
-            window.blur(cx);
+            window.focus(&current_session_handle, cx);
             window.draw(cx).clear(cx);
         });
-        let max_steps = 128;
+        // Bound the walk generously so a slow-cycling sidebar (extra
+        // sessions or branch rows) still resolves. Matches the peer
+        // group-header test's 512 ceiling (tests.rs:8045).
+        let max_steps = 512;
         for _ in 0..max_steps {
             visual.simulate_keystrokes("tab");
             visual.update(|window, cx| window.draw(cx).clear(cx));
@@ -5199,11 +5206,33 @@ fn sidebar_rows_are_tab_focusable_paint_a_focus_cursor_and_activate_on_enter_and
                 return;
             }
         }
+        // Fell off the bounded loop — print which handles are actually
+        // in focus rotation so the reason surfaces cleanly. Compares
+        // against every named handle the test tracks.
+        let focused_kind = visual.update(|window, cx| {
+            let focused = window.focused(cx);
+            if focused.as_ref() == Some(&current_session_handle) {
+                "current_session_handle"
+            } else if focused.as_ref() == Some(&session_handle) {
+                "session_handle"
+            } else if focused.as_ref() == Some(&current_branch_handle) {
+                "current_branch_handle"
+            } else if focused.as_ref() == Some(&branch_handle) {
+                "branch_handle"
+            } else if focused.is_some() {
+                "other-focus"
+            } else {
+                "no-focus"
+            }
+        });
         panic!(
             "a bounded `Tab` walk did not land on the target focus \
-             handle within {max_steps} steps — the row's focus handle \
-             is not registered as a tab stop, or the `Tab` keybinding \
-             does not route through the row"
+             handle within {max_steps} steps — final focus was on \
+             `{focused_kind}`. Either the row's focus handle is not \
+             registered as a tab stop or Tab dispatch stalls at some \
+             other tab stop (e.g. the composer input's context binds \
+             Tab to IndentInline instead of routing through Root's \
+             Tab)."
         );
     };
 
