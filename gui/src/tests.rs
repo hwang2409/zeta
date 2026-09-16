@@ -504,7 +504,7 @@ fn header_paints_auto_approve_indicator_only_when_allow_mode_is_applied(cx: &mut
     let dot = visual
         .debug_bounds("header-auto-approve-dot")
         .expect("chip has a color dot");
-    visual.update(|window, cx| {
+    visual.update(|window, _cx| {
         let scale = window.scale_factor();
         let scaled = chip.scale(scale);
         let quads = window.painted_quads();
