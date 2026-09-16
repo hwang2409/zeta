@@ -1328,6 +1328,53 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_new_session_resume_and_status_report_effective_yolo_mode(tmp_path):
+    # ZETA-131 round 3: with settings.toml yolo=true, composition wires
+    # the live policy default to `allow`, but the stored session metadata
+    # keeps `approval_mode = None` until an explicit `set_settings`
+    # writes it. The wire responses for `new_session`, `resume`, and
+    # `status` must project the RUNNING policy default so the GUI header
+    # indicator can paint the auto-approve state — a raw `to_dict()`
+    # emits `approval_mode: null`, which the GUI treats as "no update"
+    # and the indicator stays hidden.
+    (tmp_path / "settings.toml").write_text("yolo = true\n", encoding="utf-8")
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+        first = (await _request(reader, writer, 2, "new_session", {"provider": "fake"}))[-1]["result"]["session"]
+        sid_a = first["session_id"]
+        assert first["approval_mode"] == "allow"
+        # A first `status` right after new_session — the production order.
+        status_a = (await _request(reader, writer, 3, "status"))[-1]["result"]
+        assert status_a["session"]["session_id"] == sid_a
+        assert status_a["session"]["approval_mode"] == "allow"
+        # Switch: a second `new_session` returns a distinct id, same mode.
+        second = (await _request(reader, writer, 4, "new_session", {"provider": "fake"}))[-1]["result"]["session"]
+        sid_b = second["session_id"]
+        assert sid_b != sid_a
+        assert second["approval_mode"] == "allow"
+        # Resume the ORIGINAL session — its stored metadata still has
+        # `approval_mode: null` on disk (we never called `set_settings`).
+        # The resume response must surface the effective policy anyway.
+        stored = SessionManager(tmp_path).read_metadata(sid_a)
+        assert stored.approval_mode is None
+        resumed = (await _request(reader, writer, 5, "resume", {"session_id": sid_a}))[-1]["result"]["session"]
+        assert resumed["session_id"] == sid_a
+        assert resumed["approval_mode"] == "allow"
+        # A trailing `status` (the periodic poll after switch/reconnect)
+        # also carries the effective mode.
+        status_final = (await _request(reader, writer, 6, "status"))[-1]["result"]
+        assert status_final["session"]["session_id"] == sid_a
+        assert status_final["session"]["approval_mode"] == "allow"
+        # And the disk metadata is UNCHANGED — the projection is a
+        # read-side transform, not a write-through.
+        assert SessionManager(tmp_path).read_metadata(sid_a).approval_mode is None
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
     import base64
 

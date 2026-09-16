@@ -323,16 +323,16 @@ class _Client:
             return self._list_sessions(request_id)
         if method == "new_session":
             await self._require_idle()
-            metadata = await self.server.runtime.create_session(
+            await self.server.runtime.create_session(
                 provider=_optional_string(params, "provider"),
                 model=_optional_string(params, "model"),
             )
-            return {"session": metadata.to_dict()}
+            return {"session": self._session_snapshot()}
         if method == "resume":
             await self._require_idle()
             session_id = _required_string(params, "session_id")
-            metadata = await self.server.runtime.resume_session(session_id)
-            return {"session": metadata.to_dict()}
+            await self.server.runtime.resume_session(session_id)
+            return {"session": self._session_snapshot()}
         if method == "send":
             return await self._send(_required_string(params, "text"))
         if method == "steer":
@@ -521,9 +521,23 @@ class _Client:
         await self._notify("turn_aborted", self.server.runtime.session_id)
         return {"aborted": True}
 
+    def _session_snapshot(self) -> dict[str, object] | None:
+        # Stored `approval_mode` is None until an explicit `set_settings`
+        # writes it. Under `yolo` composition sets the live policy to
+        # `allow` without touching disk, so raw metadata emits null and
+        # the GUI header indicator stays hidden — project the live default
+        # onto the wire snapshot instead.
+        runtime = self.server.runtime
+        if runtime.opened is None:
+            return None
+        snapshot = runtime.metadata.to_dict()
+        if runtime.policy is not None:
+            snapshot["approval_mode"] = runtime.policy.default.value
+        return snapshot
+
     def _status(self) -> dict[str, object]:
         runtime = self.server.runtime
-        session = runtime.metadata.to_dict() if runtime.opened is not None else None
+        session = self._session_snapshot()
         pending = []
         if runtime.policy is not None:
             pending = [

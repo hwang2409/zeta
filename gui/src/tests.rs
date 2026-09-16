@@ -313,77 +313,117 @@ fn approval_dialog_dispatches_approve_and_deny_once(cx: &mut TestAppContext) {
     }
 }
 
+/// Open the approval dialog and draw so `debug_bounds` sees the button.
+fn open_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>, request_id: &str) {
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::ApprovalRequest {
+                    session_id: view.state.active_session.clone(),
+                    approval: Approval {
+                        request_id: request_id.into(),
+                        tool_call: ToolCall {
+                            id: request_id.into(),
+                            name: "bash".into(),
+                            arguments: serde_json::from_value(json!({"command":"pwd"})).unwrap(),
+                        },
+                    },
+                }),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        visual.debug_bounds("approval-always").is_some(),
+        "always-allow button paints inside the approval dialog"
+    );
+}
+
+/// Ack an idle status from the server — production's dialog-close path.
+fn close_approval_dialog(visual: &mut VisualTestContext, view: &Entity<ZetaView>) {
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.apply_worker_message(
+                WorkerMessage::Status(StatusResult {
+                    session: Some(session()),
+                    state: "idle".into(),
+                    pending_approvals: vec![],
+                    usage: json!({}),
+                    compaction_markers: 0,
+                }),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("dialog-layer").is_none());
+}
+
+/// Bounded receive that names the activation route in its failure text.
+fn expect_command(receiver: &Receiver<CommandMessage>, route: &str) -> CommandMessage {
+    receiver.try_recv().unwrap_or_else(|err| {
+        panic!("expected a queued CommandMessage after {route} activation, got {err:?}")
+    })
+}
+
 #[gpui::test]
-fn approval_dialog_dispatches_always_allow_via_click_and_keyboard(cx: &mut TestAppContext) {
-    // ZETA-131 B3: the approval dialog exposes a session-scoped memory
-    // choice as well as approve/deny. Verify BOTH activation paths — the
-    // "Always allow" button click AND the bare `a` shortcut — dispatch
-    // `ApproveAlwaysTool` exactly once and carry the pending request id.
+fn approval_dialog_dispatches_always_allow_via_click(cx: &mut TestAppContext) {
+    // ZETA-131 B3 (click): the "Always allow" button dispatches
+    // `ApproveAlwaysTool` exactly once. Split from the keyboard case so a
+    // single flake names the offending route in the CI log.
     let (window, view, receiver) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    for (variant, activate) in [("click", None::<&str>), ("key", Some("a"))] {
-        let id = format!("always-{variant}");
-        visual.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.apply_worker_message(
-                    WorkerMessage::Event(ServerEvent::ApprovalRequest {
-                        session_id: view.state.active_session.clone(),
-                        approval: Approval {
-                            request_id: id.clone(),
-                            tool_call: ToolCall {
-                                id: id.clone(),
-                                name: "bash".into(),
-                                arguments: serde_json::from_value(json!({"command":"pwd"}))
-                                    .unwrap(),
-                            },
-                        },
-                    }),
-                    window,
-                    cx,
-                );
-            });
-            window.draw(cx).clear(cx);
-        });
-        assert!(
-            visual.debug_bounds("approval-always").is_some(),
-            "always-allow button paints inside the approval dialog"
-        );
-        if let Some(keys) = activate {
-            visual.simulate_keystrokes(keys);
-        } else {
-            let button = visual
-                .debug_bounds("approval-always")
-                .expect("always-allow button bounds");
-            visual.simulate_click(button.center(), Default::default());
-        }
-        match receiver.try_recv().unwrap() {
-            CommandMessage::ApproveAlwaysTool(recv) => assert_eq!(recv, id),
-            other => panic!("expected ApproveAlwaysTool, got {other:?}"),
-        }
-        // Debounce: a second key or click must not re-fire until the server
-        // resolves the request. `decide_always_tool` sets `approval_pending`.
-        if let Some(keys) = activate {
-            visual.simulate_keystrokes(keys);
-        }
-        assert!(receiver.try_recv().is_err(), "no duplicate dispatch");
-        visual.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                view.apply_worker_message(
-                    WorkerMessage::Status(StatusResult {
-                        session: Some(session()),
-                        state: "idle".into(),
-                        pending_approvals: vec![],
-                        usage: json!({}),
-                        compaction_markers: 0,
-                    }),
-                    window,
-                    cx,
-                );
-            });
-            window.draw(cx).clear(cx);
-        });
-        assert!(visual.debug_bounds("dialog-layer").is_none());
+    let id = "always-click";
+    open_approval_dialog(&mut visual, &view, id);
+    let button = visual
+        .debug_bounds("approval-always")
+        .expect("always-allow button bounds");
+    visual.simulate_click(button.center(), Default::default());
+    // Drain the async queue so the click handler's `view.update` closure
+    // has landed before we probe the mpsc receiver — the round-2 CI
+    // attempt-1 flake was a read one tick too early.
+    visual.run_until_parked();
+    match expect_command(&receiver, "click") {
+        CommandMessage::ApproveAlwaysTool(recv) => assert_eq!(recv, id),
+        other => panic!("expected ApproveAlwaysTool via click, got {other:?}"),
     }
+    // `decide_always_tool` latches `approval_pending`, so a second click
+    // must not re-fire until the server resolves the request.
+    visual.simulate_click(button.center(), Default::default());
+    visual.run_until_parked();
+    assert!(
+        receiver.try_recv().is_err(),
+        "no duplicate dispatch on repeated click"
+    );
+    close_approval_dialog(&mut visual, &view);
+}
+
+#[gpui::test]
+fn approval_dialog_dispatches_always_allow_via_keyboard(cx: &mut TestAppContext) {
+    // ZETA-131 B3 (keyboard): the bare `a` shortcut inside the open
+    // approval dialog dispatches `ApproveAlwaysTool` exactly once.
+    let (window, view, receiver) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let id = "always-key";
+    open_approval_dialog(&mut visual, &view, id);
+    visual.simulate_keystrokes("a");
+    visual.run_until_parked();
+    match expect_command(&receiver, "keyboard") {
+        CommandMessage::ApproveAlwaysTool(recv) => assert_eq!(recv, id),
+        other => panic!("expected ApproveAlwaysTool via keyboard, got {other:?}"),
+    }
+    // `decide_always_tool` latches `approval_pending`, so a second `a`
+    // must not re-fire until the server resolves the request.
+    visual.simulate_keystrokes("a");
+    visual.run_until_parked();
+    assert!(
+        receiver.try_recv().is_err(),
+        "no duplicate dispatch on repeated keystroke"
+    );
+    close_approval_dialog(&mut visual, &view);
 }
 
 #[gpui::test]
