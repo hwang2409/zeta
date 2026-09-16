@@ -9250,3 +9250,103 @@ fn settings_sections_carry_a_bottom_scroll_cue_mask(cx: &mut TestAppContext) {
     visual.update(|_, cx| theme::apply(cx));
     wipe_scoped_prefs();
 }
+
+// ---------------------------------------------------------------------------
+// ZETA-129 — inline-code chip ladder guard.
+// ---------------------------------------------------------------------------
+//
+// The 2026-09-16 audit hit two classes of code-span corruption in the run
+// GUI: length-9 backtick spans lose their last glyph (`task_kill` painted
+// as `task_kil`), and a code chip pushed to a wrap boundary paints its
+// overflow onto the next line at a stale x-position. Root cause is
+// upstream in `gpui_base::text::inline_flow::InlineFlow::prepaint`; the
+// vendored copy in `gui/vendor/gpui-base/` swaps its inner
+// `Definite(fragment_size.width - padding * 2.)` for
+// `AvailableSpace::MaxContent` so the inner `StyledText` never re-wraps a
+// fragment whose shape already fits.
+//
+// The test below drives a length-1..12 backtick ladder through
+// `TextView::markdown` inside `VisualTestContext::draw()` and asserts on
+// `painted_quads()` — the only pixel-adjacent surface `gpui::test`
+// exposes. Every ladder length paints EXACTLY one background chip quad at
+// the theme's inline-code wash; a peer regression that re-splits a chip
+// across two lines (or drops the chip's paint entirely) fails the count
+// or the ordering assertion here. The native pixel-gutter guard
+// (`gui-native-guards`) covers the pixel-visible A2 manifestation with
+// the paired `code_ladder` shape in `smoke.rs`.
+#[gpui::test]
+fn zeta129_inline_code_chip_ladder_paints_one_widening_chip_per_length(cx: &mut TestAppContext) {
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let source = "- `a` len=1\n\
+                  - `ab` len=2\n\
+                  - `abc` len=3\n\
+                  - `abcd` len=4\n\
+                  - `abcde` len=5\n\
+                  - `abcdef` len=6\n\
+                  - `abcdefg` len=7\n\
+                  - `abcdefgh` len=8\n\
+                  - `abcdefghi` len=9\n\
+                  - `abcdefghij` len=10\n\
+                  - `abcdefghijk` len=11\n\
+                  - `abcdefghijkl` len=12";
+    visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript = vec![TranscriptEntry::Assistant(source.into())];
+            view.transcript.update(cx, |scroll, cx| scroll.reset(1, cx));
+            cx.notify();
+        });
+    });
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let (chip_bounds, subtle_bg) = visual.update(|window, cx| {
+        let subtle_bg: gpui::Background = cx.theme().secondary_hover.into();
+        let mut bounds: Vec<gpui::Bounds<gpui::ScaledPixels>> = window
+            .painted_quads()
+            .into_iter()
+            .filter(|quad| quad.background == subtle_bg)
+            .map(|quad| quad.bounds)
+            .collect();
+        // Paint order isn't guaranteed to be top-down; sort by y then x so
+        // "chip N corresponds to length N+1" is a stable claim even if
+        // gpui reorders its per-frame paint list.
+        bounds.sort_by(|a, b| {
+            a.origin
+                .y
+                .partial_cmp(&b.origin.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.origin
+                        .x
+                        .partial_cmp(&b.origin.x)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        (bounds, subtle_bg)
+    });
+    assert_eq!(
+        chip_bounds.len(),
+        12,
+        "expected one inline-code chip per ladder length 1..=12, got {} on \
+         the theme's secondary_hover wash ({subtle_bg:?})",
+        chip_bounds.len(),
+    );
+    // Each subsequent chip carries one more mono glyph than the previous —
+    // shaped widths grow monotonically. A regression that painted two
+    // narrower chips for a wrapped span, or emitted a zero-width chip when
+    // shape drift dropped the last glyph past the fragment edge, breaks
+    // this ordering.
+    for (ix, window) in chip_bounds.windows(2).enumerate() {
+        let prev = window[0].size.width;
+        let next = window[1].size.width;
+        assert!(
+            next > prev,
+            "chip {ix} (len={}) width {prev:?} must be strictly less than \
+             chip {} (len={}) width {next:?} — a wrap-triggered split or \
+             a shape-drift drop breaks this ordering",
+            ix + 1,
+            ix + 1,
+            ix + 2,
+        );
+    }
+}

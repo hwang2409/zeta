@@ -38,6 +38,19 @@ const NATIVE_GUARD_SHAPES: &[(&str, &str)] = &[
          supercalifragilisticexpialidocious_but_much_longer_than_any_column_should_ever_be_aaaaaaaaaaaaaaaaaaaa \
          and then some trailing prose after it.",
     ),
+    // ZETA-129: exercise inline-code chips of length 1..12 in a bullet list.
+    // The upstream `InlineFlow::prepaint` bug drops the last glyph of any
+    // 9-char chip and paints overflow glyphs onto the next line at a stale
+    // x-position — either lands in the pixel-gutter scan (A2 form when the
+    // chip sits near `content_right`) or corrupts the following bullet's
+    // prose. Every length rides the same code path so a future regression
+    // that reintroduces inner wrapping trips this shape at multiple sizes.
+    (
+        "code_ladder",
+        "- `a` len=1\n- `ab` len=2\n- `abc` len=3\n- `abcd` len=4\n- `abcde` len=5\n\
+         - `abcdef` len=6\n- `abcdefg` len=7\n- `abcdefgh` len=8\n- `abcdefghi` len=9\n\
+         - `abcdefghij` len=10\n- `abcdefghijk` len=11\n- `abcdefghijkl` len=12",
+    ),
 ];
 
 fn native_guard_enabled() -> bool {
