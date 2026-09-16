@@ -746,6 +746,14 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     // layout holds at both extremes of the appearance picker. Saved
     // AFTER the primary capture, then the driver quits.
     let modal_18px_path = env::var_os("ZETA_GUI_SMOKE_MODAL_18PX_IMAGE");
+    // ZETA-131 captures. Each targets one lane of the approval-UX arc.
+    // Rendered via `render_to_image()` so no screen-recording permission
+    // is needed. Saved BEFORE the primary settings-modal capture so the
+    // driver's later mutations (modal open, connection-lost banner) do
+    // not overwrite the state the approval shots need.
+    let zeta131_mode_path = env::var_os("ZETA_GUI_SMOKE_ZETA131_MODE_IMAGE");
+    let zeta131_indicator_path = env::var_os("ZETA_GUI_SMOKE_ZETA131_INDICATOR_IMAGE");
+    let zeta131_approval_path = env::var_os("ZETA_GUI_SMOKE_ZETA131_APPROVAL_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -938,6 +946,82 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         .save(PathBuf::from(tools_path))
                                         .expect("save tools screenshot");
                                 }
+                                // ZETA-131 C2: header run-band with the
+                                // `auto-approve` chip painted. Server-applied
+                                // mode set to `allow` so `render_run_header`
+                                // shows the chip; banner cleared so the
+                                // header owns the frame. Metrics carry a
+                                // model name so the header cluster reads.
+                                if let Some(ref indicator_path) = zeta131_indicator_path {
+                                    entity.update(cx, |view, cx| {
+                                        view.state.connection = ConnectionState::Connected;
+                                        view.state.session_view.applied_mode = "allow".into();
+                                        view.state.metrics.model = Some("claude-opus-4-7".into());
+                                        view.settings_open = false;
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer zeta-131 indicator capture")
+                                        .save(PathBuf::from(indicator_path))
+                                        .expect("save zeta-131 indicator screenshot");
+                                }
+                                // ZETA-131 B3: an approval dialog with the
+                                // "Always allow <tool>" button visible and
+                                // the shortcut hint in the footer. Seed a
+                                // pending approval through the same seam
+                                // `sync_approval` watches; two frames so
+                                // the dialog paints AFTER
+                                // `sync_approval` reads state.
+                                if let Some(ref approval_path) = zeta131_approval_path {
+                                    entity.update(cx, |view, cx| {
+                                        use zeta_gui::client::{Approval, ServerEvent, ToolCall};
+                                        view.state.connection = ConnectionState::Connected;
+                                        view.state.session_view.applied_mode = "allow".into();
+                                        view.settings_open = false;
+                                        let session_id = view.state.active_session.clone();
+                                        view.apply_worker_message(
+                                            WorkerMessage::Event(ServerEvent::ApprovalRequest {
+                                                session_id,
+                                                approval: Approval {
+                                                    request_id: "zeta131-demo".into(),
+                                                    tool_call: ToolCall {
+                                                        id: "zeta131-demo".into(),
+                                                        name: "bash".into(),
+                                                        arguments: serde_json::from_value(
+                                                            serde_json::json!({
+                                                                "command":
+                                                                    "rg zeta ~/src"
+                                                            }),
+                                                        )
+                                                        .unwrap(),
+                                                    },
+                                                },
+                                            }),
+                                            window,
+                                            cx,
+                                        );
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer zeta-131 approval capture")
+                                        .save(PathBuf::from(approval_path))
+                                        .expect("save zeta-131 approval screenshot");
+                                    // Reset: close the dialog before the
+                                    // primary settings capture opens the
+                                    // modal — the dialog occludes the
+                                    // approval-mode section otherwise.
+                                    entity.update(cx, |view, cx| {
+                                        view.state.approvals.clear();
+                                        view.dialog_request = None;
+                                        window.close_dialog(cx);
+                                    });
+                                    window.render_frame(cx);
+                                }
                                 entity.update(cx, |view, cx| {
                                     view.state.connection = ConnectionState::Connected;
                                     view.settings_open = true;
@@ -979,6 +1063,30 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         .save(PathBuf::from(path))
                                         .expect("save smoke screenshot");
                                     println!("SMOKE-PASS: {}", PathBuf::from(path).display());
+                                }
+                                // ZETA-131 C1: same modal, `selected_mode`
+                                // moved off the default `ask` (index 0) to
+                                // `allow` (index 1) so the after-screenshot
+                                // shows the FILLED primary variant on the
+                                // selected segment — the shipped
+                                // ghost().selected(true) fill was invisible.
+                                if let Some(mode_path) = &zeta131_mode_path {
+                                    entity.update(cx, |view, cx| {
+                                        view.state.session_view.selected_mode = 1;
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer zeta-131 mode capture")
+                                        .save(PathBuf::from(mode_path))
+                                        .expect("save zeta-131 mode screenshot");
+                                    entity.update(cx, |view, cx| {
+                                        view.state.session_view.selected_mode = 0;
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
                                 }
                                 // Optional second modal capture at the 18px
                                 // picker MAX. Same panel, larger type — a

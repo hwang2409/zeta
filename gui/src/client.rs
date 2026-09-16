@@ -76,6 +76,21 @@ pub struct SessionMetadata {
     pub name: String,
     #[serde(default)]
     pub first_message_preview: String,
+    // The server emits `null` for a session with no explicit default (a
+    // fresh session on a real-provider server, or any session stored by a
+    // release that predates the field). `#[serde(default)]` alone accepts a
+    // MISSING key but rejects an explicit `null`, so we thread the value
+    // through a custom deserializer that maps null → empty string. Callers
+    // gate on `is_empty()` and fall back to their configured default there.
+    #[serde(default, deserialize_with = "deserialize_string_or_null")]
+    pub approval_mode: String,
+}
+
+fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -661,16 +676,33 @@ impl ProtocolClient {
     }
 
     pub fn approve(&mut self, request_id: &str) -> Result<bool, ClientError> {
-        self.decision("approve", request_id)
+        self.decision("approve", request_id, None)
+    }
+
+    /// Approve with `scope: "always_tool"` (ZETA-131 B3). The server also
+    /// adds the pending tool's name to the session's `always_allow` list.
+    /// Servers that pre-date the extension ignore the extra param and
+    /// resolve the request per-call, so behavior degrades to `approve`.
+    pub fn approve_always_tool(&mut self, request_id: &str) -> Result<bool, ClientError> {
+        self.decision("approve", request_id, Some("always_tool"))
     }
 
     pub fn deny(&mut self, request_id: &str) -> Result<bool, ClientError> {
-        self.decision("deny", request_id)
+        self.decision("deny", request_id, None)
     }
 
-    fn decision(&mut self, method: &str, request_id: &str) -> Result<bool, ClientError> {
-        let result: Value =
-            self.request(method, serde_json::json!({ "request_id": request_id }))?;
+    fn decision(
+        &mut self,
+        method: &str,
+        request_id: &str,
+        scope: Option<&str>,
+    ) -> Result<bool, ClientError> {
+        let mut params = serde_json::Map::new();
+        params.insert("request_id".into(), request_id.into());
+        if let Some(scope) = scope {
+            params.insert("scope".into(), scope.into());
+        }
+        let result: Value = self.request(method, Value::Object(params))?;
         Ok(result
             .get("accepted")
             .and_then(Value::as_bool)

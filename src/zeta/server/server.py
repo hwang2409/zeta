@@ -323,22 +323,33 @@ class _Client:
             return self._list_sessions(request_id)
         if method == "new_session":
             await self._require_idle()
-            metadata = await self.server.runtime.create_session(
+            await self.server.runtime.create_session(
                 provider=_optional_string(params, "provider"),
                 model=_optional_string(params, "model"),
             )
-            return {"session": metadata.to_dict()}
+            return {"session": self._session_snapshot()}
         if method == "resume":
             await self._require_idle()
             session_id = _required_string(params, "session_id")
-            metadata = await self.server.runtime.resume_session(session_id)
-            return {"session": metadata.to_dict()}
+            await self.server.runtime.resume_session(session_id)
+            return {"session": self._session_snapshot()}
         if method == "send":
             return await self._send(_required_string(params, "text"))
         if method == "steer":
             return self._steer(_required_string(params, "text"))
         if method in {"approve", "deny"}:
-            return await self._approval(method, _required_string(params, "request_id"))
+            scope = params.get("scope", "once")
+            if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
+                raise ProtocolError(
+                    -32602, "scope must be 'once' or 'always_tool'"
+                )
+            if scope == "always_tool" and method != "approve":
+                raise ProtocolError(
+                    -32602, "scope 'always_tool' requires approve"
+                )
+            return await self._approval(
+                method, _required_string(params, "request_id"), scope
+            )
         if method == "abort":
             return await self._abort()
         if method == "status":
@@ -455,12 +466,18 @@ class _Client:
         loop.steer(Message(MessageRole.USER, [TextContent(text)]))
         return {"accepted": True}
 
-    async def _approval(self, method: str, request_id: str) -> dict[str, object]:
+    async def _approval(
+        self, method: str, request_id: str, scope: str = "once"
+    ) -> dict[str, object]:
         policy = self.server.runtime.policy
         loop = self.server.runtime.loop
         if policy is None or loop is None:
             raise ProtocolError(-32003, "no active session")
         core_key = self._approval_keys.get(request_id, request_id)
+        pending = next(
+            (item for item in policy.pending_requests() if item.key == core_key),
+            None,
+        )
         resolved = policy.resolve(
             core_key,
             ApprovalDecision.ALLOW if method == "approve" else ApprovalDecision.DENY,
@@ -469,6 +486,8 @@ class _Client:
             raise ProtocolError(
                 -32006, f"approval request not found or already resolved: {request_id}"
             )
+        if scope == "always_tool" and pending is not None:
+            policy.always_allow = policy.always_allow | {pending.tool_call.name}
         active = self._turn_task is not None and not self._turn_task.done()
         if (
             not active
@@ -479,7 +498,14 @@ class _Client:
                 self.server.runtime.state.tool_started()
             task = asyncio.create_task(self._resume_tool(core_key))
             self._turn_task = task
-        return {"accepted": True, "request_id": request_id, "decision": method}
+        result: dict[str, object] = {
+            "accepted": True,
+            "request_id": request_id,
+            "decision": method,
+        }
+        if scope != "once":
+            result["scope"] = scope
+        return result
 
     async def _abort(self) -> dict[str, object]:
         if self._turn_task is None or self._turn_task.done():
@@ -495,9 +521,23 @@ class _Client:
         await self._notify("turn_aborted", self.server.runtime.session_id)
         return {"aborted": True}
 
+    def _session_snapshot(self) -> dict[str, object] | None:
+        # Stored `approval_mode` is None until an explicit `set_settings`
+        # writes it. Under `yolo` composition sets the live policy to
+        # `allow` without touching disk, so raw metadata emits null and
+        # the GUI header indicator stays hidden — project the live default
+        # onto the wire snapshot instead.
+        runtime = self.server.runtime
+        if runtime.opened is None:
+            return None
+        snapshot = runtime.metadata.to_dict()
+        if runtime.policy is not None:
+            snapshot["approval_mode"] = runtime.policy.default.value
+        return snapshot
+
     def _status(self) -> dict[str, object]:
         runtime = self.server.runtime
-        session = runtime.metadata.to_dict() if runtime.opened is not None else None
+        session = self._session_snapshot()
         pending = []
         if runtime.policy is not None:
             pending = [

@@ -606,6 +606,12 @@ impl Palette {
     pub fn danger_tint(&self) -> Hsla {
         with_alpha(self.danger, 0.10)
     }
+    /// Warning chip bg — warning color at ~15% opacity. Sits under an
+    /// unmissable-but-quiet header indicator (ZETA-131 C2: session in
+    /// auto-approve mode).
+    pub fn warning_tint(&self) -> Hsla {
+        with_alpha(self.warning, 0.15)
+    }
 }
 
 /// Copy `base` with a new alpha channel. Keeps h/s/l untouched so an
@@ -783,6 +789,13 @@ pub mod palette {
     /// without a full solid-red panel.
     pub fn danger_tint() -> Hsla {
         active_palette().danger_tint()
+    }
+    /// Warning 15% tint — the fill under the auto-approve indicator chip.
+    /// A hair stronger than `danger_tint`'s 10% because the warning hue is
+    /// less saturated on the shipped palettes and would drop below AA
+    /// contrast with the warning-fg label at 10%.
+    pub fn warning_tint() -> Hsla {
+        active_palette().warning_tint()
     }
     /// Text painted over the solid accent / primary surface. Opencode paints
     /// canvas here; light themes typically use a near-black so accent state

@@ -201,6 +201,156 @@ async def test_approval_and_steer_continue_the_same_turn(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_approval_scope_always_tool_records_session_policy_and_skips_next_turn(
+    tmp_path: Path,
+) -> None:
+    """always_tool approval mutates always_allow, so the next turn's same-tool
+    call auto-runs without prompting. Other tools still ask, and the effect
+    lasts the session only — a legacy client that omits `scope` sees the old
+    per-request behavior."""
+
+    first = tmp_path / "one.txt"
+    first.write_text("first")
+    second = tmp_path / "two.txt"
+    second.write_text("second")
+    first_call = ToolCall("call-1", "read", {"path": str(first)})
+    second_call = ToolCall("call-2", "read", {"path": str(second)})
+    bash_call = ToolCall("call-3", "bash", {"command": "true"})
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[first_call]),
+            ScriptedTurn(tool_calls=[second_call, bash_call]),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "read them"})
+        first_ask = await _event(reader, "approval_request")
+        assert first_ask["request_id"] == "call-1"
+        allowed = await _request(
+            reader,
+            writer,
+            4,
+            "approve",
+            {"request_id": "call-1", "scope": "always_tool"},
+        )
+        assert allowed[-1]["result"]["scope"] == "always_tool"
+        assert allowed[-1]["result"]["decision"] == "approve"
+        assert server.runtime.policy is not None
+        assert any(
+            rule.tool == "read" and rule.pattern is None
+            for rule in server.runtime.policy.always_allow
+        )
+        # The next turn's read auto-approves (no fresh approval_request for
+        # call-2). The bash call in the same turn still asks.
+        next_ask = await _event(reader, "approval_request")
+        assert next_ask["request_id"] == "call-3", (
+            "read must auto-approve after always_tool, so the next ask is bash"
+        )
+        await _request(reader, writer, 5, "deny", {"request_id": "call-3"})
+        await _event(reader, "turn_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_approval_without_scope_keeps_legacy_shape(tmp_path: Path) -> None:
+    """Omitting `scope` preserves the pre-ZETA-131 wire shape: no `scope` key
+    in the result and no policy mutation. Legacy clients keep working."""
+
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call = ToolCall("call-1", "read", {"path": str(target)})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        await _event(reader, "approval_request")
+        frames = await _request(
+            reader, writer, 4, "approve", {"request_id": "call-1"}
+        )
+        result = frames[-1]["result"]
+        assert result == {
+            "accepted": True,
+            "request_id": "call-1",
+            "decision": "approve",
+        }
+        assert server.runtime.policy is not None
+        assert not server.runtime.policy.always_allow
+        await _event(reader, "turn_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_approval_scope_rejects_invalid_values(tmp_path: Path) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call = ToolCall("call-1", "read", {"path": str(target)})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        await _event(reader, "approval_request")
+        rejected = await _request(
+            reader,
+            writer,
+            4,
+            "approve",
+            {"request_id": "call-1", "scope": "session"},
+        )
+        assert rejected[-1]["error"]["code"] == -32602
+        rejected_deny = await _request(
+            reader,
+            writer,
+            5,
+            "deny",
+            {"request_id": "call-1", "scope": "always_tool"},
+        )
+        assert rejected_deny[-1]["error"]["code"] == -32602
+        # Non-string scope shapes (array, object, null, integer, boolean)
+        # must return -32602, not the -32000 the set-membership check raised
+        # before the type guard landed.
+        next_id = 6
+        for bad_scope in ([], {}, None, 1, True):
+            rejected_shape = await _request(
+                reader,
+                writer,
+                next_id,
+                "approve",
+                {"request_id": "call-1", "scope": bad_scope},
+            )
+            error = rejected_shape[-1]["error"]
+            assert error["code"] == -32602, f"scope={bad_scope!r} error {error!r}"
+            assert error["message"] == "scope must be 'once' or 'always_tool'"
+            next_id += 1
+        await _request(reader, writer, next_id, "deny", {"request_id": "call-1"})
+        await _event(reader, "turn_end")
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_resumed_approval_finishes_idle_after_terminal_event(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     opened = manager.create(provider="fake", model="offline", cwd=tmp_path)
@@ -1173,6 +1323,53 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
         await _request(reader, writer, "resume", "resume", {"session_id": sid})
         assert (await rpc("session_settings"))["result"] == settings
         assert not (tmp_path / "settings.json").exists()
+    finally:
+        await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_new_session_resume_and_status_report_effective_yolo_mode(tmp_path):
+    # ZETA-131 round 3: with settings.toml yolo=true, composition wires
+    # the live policy default to `allow`, but the stored session metadata
+    # keeps `approval_mode = None` until an explicit `set_settings`
+    # writes it. The wire responses for `new_session`, `resume`, and
+    # `status` must project the RUNNING policy default so the GUI header
+    # indicator can paint the auto-approve state — a raw `to_dict()`
+    # emits `approval_mode: null`, which the GUI treats as "no update"
+    # and the indicator stays hidden.
+    (tmp_path / "settings.toml").write_text("yolo = true\n", encoding="utf-8")
+    server = ZetaServer(home=tmp_path, port=0, provider="fake")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+        first = (await _request(reader, writer, 2, "new_session", {"provider": "fake"}))[-1]["result"]["session"]
+        sid_a = first["session_id"]
+        assert first["approval_mode"] == "allow"
+        # A first `status` right after new_session — the production order.
+        status_a = (await _request(reader, writer, 3, "status"))[-1]["result"]
+        assert status_a["session"]["session_id"] == sid_a
+        assert status_a["session"]["approval_mode"] == "allow"
+        # Switch: a second `new_session` returns a distinct id, same mode.
+        second = (await _request(reader, writer, 4, "new_session", {"provider": "fake"}))[-1]["result"]["session"]
+        sid_b = second["session_id"]
+        assert sid_b != sid_a
+        assert second["approval_mode"] == "allow"
+        # Resume the ORIGINAL session — its stored metadata still has
+        # `approval_mode: null` on disk (we never called `set_settings`).
+        # The resume response must surface the effective policy anyway.
+        stored = SessionManager(tmp_path).read_metadata(sid_a)
+        assert stored.approval_mode is None
+        resumed = (await _request(reader, writer, 5, "resume", {"session_id": sid_a}))[-1]["result"]["session"]
+        assert resumed["session_id"] == sid_a
+        assert resumed["approval_mode"] == "allow"
+        # A trailing `status` (the periodic poll after switch/reconnect)
+        # also carries the effective mode.
+        status_final = (await _request(reader, writer, 6, "status"))[-1]["result"]
+        assert status_final["session"]["session_id"] == sid_a
+        assert status_final["session"]["approval_mode"] == "allow"
+        # And the disk metadata is UNCHANGED — the projection is a
+        # read-side transform, not a write-through.
+        assert SessionManager(tmp_path).read_metadata(sid_a).approval_mode is None
     finally:
         await _close(server, writer)
 

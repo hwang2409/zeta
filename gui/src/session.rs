@@ -108,6 +108,12 @@ pub struct SessionView {
     pub current_model: String,
     pub selected_model: usize,
     pub selected_mode: usize,
+    /// Server-applied approval mode. `selected_mode` is the draft the user
+    /// has clicked in the Settings modal; `applied_mode` is what the session
+    /// is actually running under. The run-header allow-mode indicator reads
+    /// this; a draft `allow` selection that has not been applied yet must
+    /// not paint the indicator.
+    pub applied_mode: String,
 }
 
 impl SessionView {

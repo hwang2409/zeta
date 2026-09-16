@@ -28,6 +28,10 @@ pub enum CommandMessage {
     LoginCancel(String),
     SetSettings(SessionSettings),
     Approve(String),
+    /// Approve this request AND add the pending tool to the session's
+    /// `always_allow` list. Same wire signature as `Approve` except the
+    /// server RPC carries `scope: "always_tool"`.
+    ApproveAlwaysTool(String),
     Deny(String),
     Abort,
     SlashList,
@@ -223,7 +227,11 @@ impl ConnectionWorker {
             match self.commands.try_recv() {
                 Ok(command) => {
                     let login_start = matches!(&command, CommandMessage::LoginStart(_));
-                    let approve = matches!(&command, CommandMessage::Approve(_));
+                    let approve = matches!(
+                        &command,
+                        CommandMessage::Approve(_) | CommandMessage::ApproveAlwaysTool(_),
+                    );
+                    let approve_always = matches!(&command, CommandMessage::ApproveAlwaysTool(_));
                     let result = match command {
                         CommandMessage::NewSession
                         | CommandMessage::Resume(_)
@@ -327,9 +335,13 @@ impl ConnectionWorker {
                                 self.status(&mut client, selected, None)?;
                                 Ok(())
                             }),
-                        CommandMessage::Approve(id) | CommandMessage::Deny(id) => {
+                        CommandMessage::Approve(id)
+                        | CommandMessage::ApproveAlwaysTool(id)
+                        | CommandMessage::Deny(id) => {
                             let was_idle = !busy;
-                            let result = if approve {
+                            let result = if approve_always {
+                                client.approve_always_tool(&id)
+                            } else if approve {
                                 client.approve(&id)
                             } else {
                                 client.deny(&id)

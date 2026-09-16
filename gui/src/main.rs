@@ -506,6 +506,10 @@ impl ZetaView {
                     .iter()
                     .position(|mode| *mode == settings.approval_mode)
                     .unwrap_or(0);
+                self.state
+                    .session_view
+                    .applied_mode
+                    .clone_from(&settings.approval_mode);
                 // Capture whoever had focus at the moment settings actually
                 // opens, BEFORE we hand focus to the overlay. `close_settings`
                 // restores this handle so keyboard users land back on the
@@ -519,6 +523,7 @@ impl ZetaView {
             WorkerMessage::SettingsApplied(settings) => {
                 self.pending_command = false;
                 self.state.session_view.current_model = settings.model;
+                self.state.session_view.applied_mode = settings.approval_mode;
                 self.close_settings(window, cx);
             }
             WorkerMessage::ImagesSent(text, images) => {
@@ -607,6 +612,13 @@ impl ZetaView {
             WorkerMessage::Session(session) => {
                 self.pending_command = false;
                 self.state.select_session(Some(session.session_id.clone()));
+                // Session metadata carries the effective approval mode; keep
+                // the header indicator in sync on session switch and cold
+                // start. `applied_mode` (not `selected_mode`) so a Settings
+                // draft the user has typed but not applied survives.
+                if !session.approval_mode.is_empty() {
+                    self.state.session_view.applied_mode = session.approval_mode.clone();
+                }
                 if let Some(item) = self
                     .state
                     .sessions
@@ -626,6 +638,11 @@ impl ZetaView {
                 self.handle_slash_result(text, result, window, cx);
             }
             WorkerMessage::Status(status) => {
+                let approval_mode = status
+                    .session
+                    .as_ref()
+                    .map(|session| session.approval_mode.clone())
+                    .unwrap_or_default();
                 if let Some(session) = &status.session {
                     if let Some(row) = self
                         .state
@@ -639,6 +656,13 @@ impl ZetaView {
                     }
                 }
                 edits = self.state.apply_status(status);
+                // `apply_status` calls `select_session`, which resets
+                // `session_view` on a session change. Sync `applied_mode`
+                // AFTER so the header indicator repaints on reconnect and
+                // cold start, when no explicit SettingsApplied fires.
+                if !approval_mode.is_empty() {
+                    self.state.session_view.applied_mode = approval_mode;
+                }
             }
             WorkerMessage::Rejected(error) => {
                 self.pending_command = false;
@@ -1450,6 +1474,24 @@ impl ZetaView {
         cx.notify();
     }
 
+    /// ZETA-131 B3: approve THIS request AND add the tool to the session's
+    /// always-allow list on the server. Same guard rails as [`decide`]: the
+    /// request must still be pending and no other decision may be in flight.
+    fn decide_always_tool(&mut self, request: String, cx: &mut Context<Self>) {
+        if self.approval_pending
+            || !self
+                .state
+                .approvals
+                .iter()
+                .any(|item| item.request_id == request)
+        {
+            return;
+        }
+        self.approval_pending = true;
+        self.queue(CommandMessage::ApproveAlwaysTool(request));
+        cx.notify();
+    }
+
     fn sync_approval(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let approval = self.state.approvals.first().cloned();
         let request = approval.as_ref().map(|item| item.request_id.clone());
@@ -1467,6 +1509,7 @@ impl ZetaView {
         }) = approval
         {
             let view = cx.entity().downgrade();
+            let tool_name = tool_call.name.clone();
             window.open_dialog(cx, move |dialog, _, cx| {
                 let (pending, error) = view
                     .upgrade()
@@ -1477,8 +1520,10 @@ impl ZetaView {
                     .unwrap_or_default();
                 let approve_view = view.clone();
                 let deny_view = view.clone();
+                let always_view = view.clone();
                 let approve_id = request_id.clone();
                 let deny_id = request_id.clone();
+                let always_id = request_id.clone();
                 dialog
                     .title(format!("Allow {}?", tool_call.name))
                     .when_some(polish::approval_summary(&tool_call), |dialog, summary| {
@@ -1499,10 +1544,41 @@ impl ZetaView {
                                     .unwrap_or_default(),
                             ),
                     )
+                    // Session-scoped memory (ZETA-131 B3). Separate row so
+                    // the choice reads distinctly from the terminal
+                    // Approve/Deny footer buttons — a click here approves
+                    // the request AND tells the server to auto-approve
+                    // every later call of this tool for the rest of the
+                    // session. Keyboard: bare `a`, hinted in the footer
+                    // line below.
+                    .child(
+                        div()
+                            .debug_selector(|| "approval-always-row".into())
+                            .h_flex()
+                            .items_center()
+                            .justify_end()
+                            .child(
+                                Button::new("approval-always")
+                                    .debug_selector(|| "approval-always".into())
+                                    .ghost()
+                                    .compact()
+                                    .disabled(pending)
+                                    .label(format!("Always allow {tool_name} (this session)"))
+                                    .on_click({
+                                        let always_view = always_view.clone();
+                                        let always_id = always_id.clone();
+                                        move |_, _, cx| {
+                                            let _ = always_view.update(cx, |view, cx| {
+                                                view.decide_always_tool(always_id.clone(), cx)
+                                            });
+                                        }
+                                    }),
+                            ),
+                    )
                     .child(if pending {
                         "Waiting for the server…"
                     } else {
-                        "Enter approves · Esc denies"
+                        "Enter approves · A always allows · Esc denies"
                     })
                     .when_some(error, |dialog, error| {
                         dialog.child(Alert::error("approval-error", error))
@@ -1537,6 +1613,18 @@ impl ZetaView {
             self.queue(CommandMessage::Abort);
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        // ZETA-131 B3: bare `a` inside an open approval dialog resolves the
+        // request with the always-tool scope. Modifiers off so the letter
+        // still types normally in text fields; the dialog focus trap keeps
+        // the composer out of the picture while the approval is open.
+        if event.keystroke.key == "a" && !event.keystroke.modifiers.modified() {
+            if let Some(request) = self.dialog_request.clone() {
+                self.decide_always_tool(request, cx);
+                cx.stop_propagation();
+                cx.notify();
+            }
         }
     }
 
@@ -1737,20 +1825,28 @@ impl ZetaView {
                     ),
             );
         }
+        // Segmented control: the selected mode paints the filled `Primary`
+        // variant so `ask/allow/deny` reads as a clear single choice, while
+        // the other two stay `Ghost`. ZETA-131 C1: `.ghost().selected(true)`
+        // sat on `secondary_active` and was invisible on shipped themes.
         let mode_segmented = div()
             .debug_selector(|| "settings-approval-segmented".into())
             .h_flex()
             .gap_1()
             .children(APPROVAL_MODES.iter().enumerate().map(|(index, mode)| {
-                Button::new(("mode", index))
+                let selected = view.selected_mode == index;
+                let button = Button::new(("mode", index))
                     .debug_selector(move || format!("mode-row-{mode}"))
-                    .ghost()
-                    .selected(view.selected_mode == index)
                     .label(mode.to_string())
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.state.session_view.selected_mode = index;
                         cx.notify();
-                    }))
+                    }));
+                if selected {
+                    button.primary().selected(true)
+                } else {
+                    button.ghost()
+                }
             }));
         let appearance = self.app_appearance(cx);
         // Compact single-value cyclers replace the pre-round-2 button
@@ -2800,6 +2896,7 @@ impl ZetaView {
         let dot_color = self.status_dot_color(cx);
         let mode_word = self.footer_mode_word();
         let busy = self.state.streaming || self.state.thinking;
+        let allow_mode_active = self.state.session_view.applied_mode == "allow";
         let model_name = self
             .state
             .metrics
@@ -2873,6 +2970,40 @@ impl ZetaView {
                             .debug_selector(|| "status-metrics".into())
                             .child(polish::status_label(&self.state.metrics)),
                     )
+                    .when(allow_mode_active, |row| {
+                        // Auto-approve indicator (ZETA-131 C2). Paints
+                        // ONLY when the server-applied session mode is
+                        // `allow`, so the operator always sees WHEN the
+                        // agent is skipping approvals. Warning-class
+                        // tokens carry the color signal via a warning
+                        // dot AND the "auto-approve" label — text plus
+                        // color, never color alone (audit B7).
+                        // `flex_shrink_0` so it never collapses under
+                        // narrow widths: this is the load-bearing bit
+                        // the header must not hide.
+                        row.child(status_rule(cx)).child(
+                            div()
+                                .debug_selector(|| "header-auto-approve".into())
+                                .flex_shrink_0()
+                                .h_flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .bg(theme::palette::warning_tint())
+                                .text_color(cx.theme().foreground)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(
+                                    div()
+                                        .debug_selector(|| "header-auto-approve-dot".into())
+                                        .size(px(6.))
+                                        .rounded_full()
+                                        .bg(theme::palette::warning()),
+                                )
+                                .child("auto-approve"),
+                        )
+                    })
                     .child(status_rule(cx))
                     .child(
                         // Compact state indicator: dot + word. Neutral
