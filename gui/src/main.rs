@@ -2094,6 +2094,7 @@ impl ZetaView {
                             .child(
                                 div()
                                     .id("settings-sections")
+                                    .debug_selector(|| "settings-sections".into())
                                     .v_flex()
                                     .size_full()
                                     .overflow_y_scroll()
