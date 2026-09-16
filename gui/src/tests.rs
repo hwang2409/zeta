@@ -1800,7 +1800,7 @@ fn every_row_text_flows_through_the_typed_row_text_model() {
                 tool_call_id: "id".into(),
             },
             name: "bash".into(),
-            excerpt: "echo hello".into(),
+            excerpt: Some("echo hello".into()),
             summary: "echo".into(),
             complete: true,
             error: false,
@@ -2010,7 +2010,7 @@ fn adjacent_tool_rows_have_zero_gap_between_them(cx: &mut TestAppContext) {
             tool_call_id: id.into(),
         },
         name: "bash".into(),
-        excerpt: id.into(),
+        excerpt: Some(id.into()),
         summary: id.into(),
         complete: true,
         error: false,
@@ -3437,7 +3437,7 @@ fn interactive_list_rows_paint_hover_and_pressed_across_themes(cx: &mut TestAppC
             tool_call_id: id.into(),
         },
         name: "bash".into(),
-        excerpt: format!("cmd-{id}"),
+        excerpt: Some(format!("cmd-{id}")),
         summary: String::new(),
         complete: true,
         error: false,
@@ -7616,7 +7616,7 @@ fn tool_rows_keep_the_wide_transcript_column(cx: &mut TestAppContext) {
                     tool_call_id: "wide-tool".into(),
                 },
                 name: "bash".into(),
-                excerpt: "run a very long command line ".repeat(30),
+                excerpt: Some("run a very long command line ".repeat(30)),
                 summary: "run a very long command line ".repeat(30),
                 complete: true,
                 error: false,
@@ -8250,7 +8250,7 @@ fn zeta125_metadata_paints_directly_after_the_excerpt(cx: &mut TestAppContext) {
                     tool_call_id: "solo".into(),
                 },
                 name: "bash".into(),
-                excerpt: "cargo check".into(),
+                excerpt: Some("cargo check".into()),
                 summary: String::new(),
                 complete: true,
                 error: false,
@@ -8308,7 +8308,7 @@ fn zeta125_grouping_at_three_or_more_receipts(cx: &mut TestAppContext) {
             tool_call_id: id.into(),
         },
         name: "bash".into(),
-        excerpt: format!("cargo test {id}"),
+        excerpt: Some(format!("cargo test {id}")),
         summary: String::new(),
         complete: true,
         error: false,
@@ -8376,7 +8376,7 @@ fn zeta125_grouping_at_three_or_more_receipts(cx: &mut TestAppContext) {
         assert_eq!(bytes, 600);
         let excerpts: Vec<&str> = (group.first_index..=group.last_index)
             .filter_map(|i| match &view.state.transcript[i] {
-                TranscriptEntry::Tool { excerpt, .. } => Some(excerpt.as_str()),
+                TranscriptEntry::Tool { excerpt, .. } => excerpt.as_deref(),
                 _ => None,
             })
             .collect();
@@ -8418,7 +8418,7 @@ fn zeta125_group_header_persists_when_expanded_and_toggles_via_real_keystrokes(
             tool_call_id: id.into(),
         },
         name: "read".into(),
-        excerpt: format!("src/{id}.rs"),
+        excerpt: Some(format!("src/{id}.rs")),
         summary: String::new(),
         complete: true,
         error: false,
@@ -8555,7 +8555,7 @@ fn zeta125_group_toggles_on_mouse_and_keyboard(cx: &mut TestAppContext) {
             tool_call_id: id.into(),
         },
         name: "read".into(),
-        excerpt: format!("src/{id}.rs"),
+        excerpt: Some(format!("src/{id}.rs")),
         summary: String::new(),
         complete: true,
         error: false,
@@ -8612,7 +8612,7 @@ fn zeta125_group_toggles_on_mouse_and_keyboard(cx: &mut TestAppContext) {
         let group = view.state.tool_group_position(0).expect("group position");
         let excerpts: Vec<&str> = (group.first_index..=group.last_index)
             .filter_map(|i| match &view.state.transcript[i] {
-                TranscriptEntry::Tool { excerpt, .. } => Some(excerpt.as_str()),
+                TranscriptEntry::Tool { excerpt, .. } => excerpt.as_deref(),
                 _ => None,
             })
             .collect();
@@ -8648,7 +8648,7 @@ fn zeta125_streaming_forces_current_turn_groups_expanded(cx: &mut TestAppContext
             tool_call_id: id.into(),
         },
         name: "bash".into(),
-        excerpt: format!("cmd {id}"),
+        excerpt: Some(format!("cmd {id}")),
         summary: String::new(),
         complete: true,
         error: false,
@@ -8706,7 +8706,7 @@ fn zeta125_receipt_layout_holds_at_11px_and_18px(cx: &mut TestAppContext) {
                     tool_call_id: "solo".into(),
                 },
                 name: "bash".into(),
-                excerpt: "cargo test --lib".into(),
+                excerpt: Some("cargo test --lib".into()),
                 summary: String::new(),
                 complete: true,
                 error: false,
@@ -10423,24 +10423,25 @@ fn slash_argless_model_opens_settings(cx: &mut TestAppContext) {
     });
 }
 
-/// ZETA-134 A3: an argument-less tool_start leaves `excerpt == name`
-/// (fallback in `tool_excerpt`), which paints as `read read` / `bash bash`
-/// on both the collapsed AND the expanded receipt. The row_text model drops
-/// the redundant excerpt so only the tool label paints; a real path/command
-/// still surfaces because it never equals the tool name.
+/// ZETA-134 A3: an argument-less tool_start stores `excerpt: None` so the
+/// row builder paints the tool label alone — no primary text. A file
+/// literally named `read` (or a bash command named `bash`) carries its own
+/// `Some(...)` value and paints as itself. The pre-r2 implementation used
+/// string equality with the tool name as a sentinel, which collapsed a
+/// legitimate `read` path into the label.
 #[test]
-fn tool_row_dedupes_when_excerpt_falls_back_to_the_tool_name() {
+fn tool_row_uses_option_none_for_missing_argument_state() {
     use zeta_gui::row_text::{self, RowText};
     use zeta_gui::state::ToolReceiptKey;
     let session_view = zeta_gui::session::SessionView::default();
-    let stale_read = TranscriptEntry::Tool {
+    let argless_read = TranscriptEntry::Tool {
         key: ToolReceiptKey {
             session_id: None,
             agent_instance_id: None,
             tool_call_id: "a".into(),
         },
         name: "read".into(),
-        excerpt: "read".into(),
+        excerpt: None,
         summary: String::new(),
         complete: false,
         error: false,
@@ -10450,20 +10451,50 @@ fn tool_row_dedupes_when_excerpt_falls_back_to_the_tool_name() {
             ..Default::default()
         },
     };
-    let RowText::Tool(text) = row_text::build(&stale_read, 0, &session_view, true) else {
+    let RowText::Tool(text) = row_text::build(&argless_read, 0, &session_view, true) else {
         panic!("tool entry must build a Tool row");
     };
     assert_eq!(text.tool_label, "read", "label carries the tool identity");
-    assert_eq!(text.excerpt, "", "duplicate fallback excerpt is dropped");
+    assert!(
+        text.excerpt.is_none(),
+        "an argument-less tool_start must not paint primary text",
+    );
 
-    let real_read = TranscriptEntry::Tool {
+    let read_named_read = TranscriptEntry::Tool {
         key: ToolReceiptKey {
             session_id: None,
             agent_instance_id: None,
             tool_call_id: "b".into(),
         },
         name: "read".into(),
-        excerpt: "src/main.rs".into(),
+        excerpt: Some("read".into()),
+        summary: String::new(),
+        complete: false,
+        error: false,
+        canceled: false,
+        card: zeta_gui::cards::Card {
+            expanded: true,
+            ..Default::default()
+        },
+    };
+    let RowText::Tool(text) = row_text::build(&read_named_read, 0, &session_view, true) else {
+        panic!("tool entry must build a Tool row");
+    };
+    assert_eq!(text.tool_label, "read");
+    assert_eq!(
+        text.excerpt,
+        Some("read"),
+        "a real path that happens to equal the tool name must still paint",
+    );
+
+    let real_read = TranscriptEntry::Tool {
+        key: ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: "c".into(),
+        },
+        name: "read".into(),
+        excerpt: Some("src/main.rs".into()),
         summary: String::new(),
         complete: false,
         error: false,
@@ -10478,25 +10509,31 @@ fn tool_row_dedupes_when_excerpt_falls_back_to_the_tool_name() {
     };
     assert_eq!(text.tool_label, "read");
     assert_eq!(
-        text.excerpt, "src/main.rs",
+        text.excerpt,
+        Some("src/main.rs"),
         "the real path survives both collapsed and expanded rendering",
     );
 }
 
-/// ZETA-134 A6: after Cmd-N, keyboard focus that had been sitting on the
-/// previously-active sidebar row is retargeted to the composer. Without
-/// this, the old row keeps its focus-fill highlight while the green
-/// active-dot moves to the new row — two rows read as current.
+/// ZETA-134 A6: after Cmd-N, the sidebar must show exactly one row reading
+/// as current — the row fill (focus accent) and the active dot may not
+/// disagree. This drives the REAL keyboard path (`cmd-n` keystroke →
+/// queued `CommandMessage::NewSession` → worker `Session` reply → paint)
+/// and then verifies the painted single-selection invariant: the dot is
+/// painted, focus lifts off the previously-focused sidebar row (no stale
+/// focus fill), and lands on the composer (the row's focus fill only
+/// paints while the row is focused, so a released handle = no fill).
 #[gpui::test]
-fn cmd_n_moves_focus_off_the_previous_sidebar_row(cx: &mut TestAppContext) {
-    let (window, view, _) = setup(cx);
+fn cmd_n_paints_a_single_current_row_and_moves_focus_to_the_composer(cx: &mut TestAppContext) {
+    let (window, view, receiver) = setup(cx);
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let session_a = session().session_id.clone();
-    let session_b = "cd34deadbeef".to_owned();
+    let session_c = "cd34deadbeef".to_owned();
+    // Focus row A as if the user tabbed there. `sidebar_row_focus` stores
+    // the tab-stop handle keyed by session id — grabbing it here mirrors
+    // what the sidebar renderer would do on the next paint.
     let (focus_a, focus_composer) = visual.update(|window, cx| {
         view.update(cx, |view, cx| {
-            // Ensure the row has a stored focus handle by rendering once,
-            // then focus it as if the user had tabbed there.
             let handle = view
                 .sidebar_row_focus
                 .borrow_mut()
@@ -10508,13 +10545,33 @@ fn cmd_n_moves_focus_off_the_previous_sidebar_row(cx: &mut TestAppContext) {
             (handle, composer_handle)
         })
     });
+    visual.update(|window, cx| window.draw(cx).clear(cx));
     assert!(
         visual.update(|window, _| focus_a.is_focused(window)),
         "sanity: the previous session row starts with keyboard focus",
     );
-    // Simulate the NewSession worker reply landing after Cmd-N.
+    assert!(
+        visual.debug_bounds("session-current-dot").is_some(),
+        "sanity: the current-session dot paints before Cmd-N",
+    );
+
+    // Drive the REAL Cmd-N path: keystroke → action → queued command.
+    visual.simulate_keystrokes("cmd-n");
+    assert!(
+        matches!(receiver.try_recv(), Ok(CommandMessage::NewSession)),
+        "Cmd-N must queue NewSession on the command channel",
+    );
+    view.read_with(&visual, |view, _| {
+        assert!(
+            view.pending_command,
+            "Cmd-N flips pending_command until the worker replies",
+        );
+    });
+
+    // Worker reply. `apply_worker_message` swaps the active session and
+    // must retarget stale sidebar focus to the composer.
     let new_session: SessionMetadata = serde_json::from_value(
-        json!({"session_id": session_b, "updated_at": "2026-09-16T12:00:00Z"}),
+        json!({"session_id": session_c, "updated_at": "2026-09-16T12:00:00Z"}),
     )
     .unwrap();
     visual.update(|window, cx| {
@@ -10523,13 +10580,32 @@ fn cmd_n_moves_focus_off_the_previous_sidebar_row(cx: &mut TestAppContext) {
         });
         window.draw(cx).clear(cx);
     });
+
+    // Paint invariant: state carries one active session id, so exactly one
+    // row asks the gutter for a dot; and the dot IS painted.
+    view.read_with(&visual, |view, _| {
+        assert_eq!(
+            view.state.active_session.as_deref(),
+            Some(session_c.as_str()),
+            "active_session must swap to the new id so the dot follows",
+        );
+    });
+    assert!(
+        visual.debug_bounds("session-current-dot").is_some(),
+        "the current-session dot paints on the row for the new active id",
+    );
+
+    // Row fill agreement: the only row that would paint with the focus
+    // accent is a row whose focus handle IS focused. Row A must have
+    // released its handle so it no longer paints with the accent fill;
+    // the composer holds focus instead.
     assert!(
         !visual.update(|window, _| focus_a.is_focused(window)),
-        "focus lifts off the previous row so only one row reads as current",
+        "focus lifts off the previous row so it stops painting the accent fill",
     );
     assert!(
         visual.update(|window, _| focus_composer.is_focused(window)),
-        "focus lands on the composer so the next keystroke types a message",
+        "focus lands on the composer so no sidebar row reads as focused",
     );
 }
 

@@ -51,9 +51,14 @@ pub enum TranscriptEntry {
         /// `tool_call.arguments` at construction and stable for the lifetime
         /// of the receipt. Bash/exec → first line of the command; read/write
         /// /edit → the file path; fetch → the URL; anything else → the first
-        /// primitive argument, else the tool name. This becomes the row's
-        /// primary text; the tool name becomes a small leading label.
-        excerpt: String,
+        /// primitive argument. `None` means no argument was extracted
+        /// (argument-less tool_start), which the row builder reads as "paint
+        /// the tool label alone, no primary text" — a typed missing-arg state
+        /// so a file literally named `read` (or a bash command named `bash`)
+        /// still renders as itself and does not collapse into the label.
+        /// This becomes the row's primary text; the tool name becomes a
+        /// small leading label.
+        excerpt: Option<String>,
         summary: String,
         complete: bool,
         error: bool,
@@ -865,7 +870,7 @@ impl AppState {
                         tool_call_id: String::new(),
                     },
                     name: "agent".into(),
-                    excerpt: "agent".into(),
+                    excerpt: Some("agent".into()),
                     summary: String::new(),
                     complete: false,
                     error: false,
@@ -1145,7 +1150,10 @@ fn bounded_summary(text: &str) -> String {
 /// empty. Redaction happens BEFORE truncation so a secret that would sit
 /// beyond the cap is still masked in the retained prefix rather than
 /// preserved in whatever ends up displayed.
-pub fn tool_excerpt(name: &str, arguments: &serde_json::Map<String, serde_json::Value>) -> String {
+pub fn tool_excerpt(
+    name: &str,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
     let key = match name.to_ascii_lowercase().as_str() {
         "bash" | "exec" | "shell" => Some("command"),
         "read" | "write" | "edit" | "list" => Some("path"),
@@ -1158,17 +1166,13 @@ pub fn tool_excerpt(name: &str, arguments: &serde_json::Map<String, serde_json::
         .or_else(|| arguments.values().find_map(argument_text));
     let first_line = raw
         .as_deref()
-        .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
-        .unwrap_or("");
-    if first_line.is_empty() {
-        return name.to_owned();
-    }
+        .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))?;
     let cleaned: String = first_line
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect();
     let redacted = redact_secrets(&cleaned);
-    truncate_excerpt(&redacted)
+    Some(truncate_excerpt(&redacted))
 }
 
 /// Placeholder that replaces a redacted secret in a stored excerpt. Not a
@@ -2687,7 +2691,8 @@ mod tests {
                 &[("command".to_owned(), json!(command))]
                     .into_iter()
                     .collect(),
-            );
+            )
+            .expect("bash command excerpt");
             assert!(
                 excerpt.contains(REDACTED_MARKER),
                 "excerpt for {command:?} did not redact: {excerpt:?}"
@@ -2721,7 +2726,8 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-        );
+        )
+        .expect("bash command excerpt");
         assert!(
             !excerpt.contains(REDACTED_MARKER),
             "false positive: {excerpt:?}"
@@ -2744,7 +2750,8 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-        );
+        )
+        .expect("fetch url excerpt");
         assert!(
             !excerpt.contains("alice") && !excerpt.contains("hunter2"),
             "userinfo leaked: {excerpt:?}"
@@ -2762,7 +2769,8 @@ mod tests {
         let excerpt = tool_excerpt(
             "fetch",
             &[("url".to_owned(), json!(url))].into_iter().collect(),
-        );
+        )
+        .expect("fetch url excerpt");
         assert!(!excerpt.contains("secret123"), "token leaked: {excerpt:?}");
         assert!(!excerpt.contains("=xyz"), "api_key leaked: {excerpt:?}");
         assert!(excerpt.contains("filter=all"));
@@ -2780,7 +2788,8 @@ mod tests {
         let excerpt = tool_excerpt(
             "bash",
             &[("command".to_owned(), json!(cmd))].into_iter().collect(),
-        );
+        )
+        .expect("bash command excerpt");
         for leak in ["ghp_secret", "alice", "hunter2", "token=abc"] {
             assert!(
                 !excerpt.contains(leak),
@@ -2812,7 +2821,8 @@ mod tests {
             let excerpt = tool_excerpt(
                 "bash",
                 &[("command".to_owned(), json!(cmd))].into_iter().collect(),
-            );
+            )
+            .expect("bash command excerpt");
             assert!(
                 excerpt.contains(REDACTED_MARKER),
                 "excerpt for {cmd:?} did not redact: {excerpt:?}"
@@ -2849,7 +2859,8 @@ mod tests {
             let excerpt = tool_excerpt(
                 "bash",
                 &[("command".to_owned(), json!(cmd))].into_iter().collect(),
-            );
+            )
+            .expect("bash command excerpt");
             assert!(
                 excerpt.contains(REDACTED_MARKER),
                 "excerpt for {cmd:?} did not redact: {excerpt:?}"
@@ -2882,7 +2893,8 @@ mod tests {
             let excerpt = tool_excerpt(
                 "bash",
                 &[("command".to_owned(), json!(cmd))].into_iter().collect(),
-            );
+            )
+            .expect("bash command excerpt");
             assert!(
                 excerpt.contains(REDACTED_MARKER),
                 "excerpt for {cmd:?} did not redact: {excerpt:?}"
@@ -2912,7 +2924,8 @@ mod tests {
             let excerpt = tool_excerpt(
                 "bash",
                 &[("command".to_owned(), json!(cmd))].into_iter().collect(),
-            );
+            )
+            .expect("bash command excerpt");
             assert!(
                 !excerpt.contains(REDACTED_MARKER),
                 "false-positive redaction for {cmd:?}: {excerpt:?}"
@@ -2933,7 +2946,8 @@ mod tests {
             let excerpt = tool_excerpt(
                 "bash",
                 &[("command".to_owned(), json!(cmd))].into_iter().collect(),
-            );
+            )
+            .expect("bash command excerpt");
             assert!(
                 excerpt.contains(REDACTED_MARKER),
                 "excerpt for {cmd:?} failed to redact: {excerpt:?}"

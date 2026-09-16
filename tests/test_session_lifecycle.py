@@ -41,6 +41,7 @@ def test_normalize_session_name_accepts_and_rejects() -> None:
 
 def test_format_relative_age_covers_ranges() -> None:
     now = datetime(2030, 6, 15, 12, 0, 0, tzinfo=UTC)
+
     def at(delta: timedelta) -> str:
         return format_relative_age((now - delta).isoformat(), now=now)
 
@@ -71,15 +72,23 @@ def test_slash_name_persists_label_and_shows_current(
     monkeypatch.setenv("ZETA_HOME", str(home))
     app = create_app(_args())
 
-    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/name") == "session name: (unnamed)"
     assert (
-        create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/name  planning  ")
+        create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/name")
+        == "session name: (unnamed)"
+    )
+    assert (
+        create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+            app, "/name  planning  "
+        )
         == "session name: planning"
     )
     assert SessionManager(home).open(app.loop.store.session_id).metadata.name == (
         "planning"
     )
-    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/name") == "session name: planning"
+    assert (
+        create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/name")
+        == "session name: planning"
+    )
 
 
 def test_slash_name_rejects_empty_or_control_only(
@@ -89,7 +98,9 @@ def test_slash_name_rejects_empty_or_control_only(
     monkeypatch.setenv("ZETA_HOME", str(home))
     app = create_app(_args())
 
-    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/name \x1b[31m\x1b[0m")
+    output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        app, "/name \x1b[31m\x1b[0m"
+    )
     assert output.startswith("session name unchanged")
 
 
@@ -100,12 +111,14 @@ def test_slash_new_requests_restart_only_when_idle(
     monkeypatch.setenv("ZETA_HOME", str(home))
     app = create_app(_args())
 
-    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/new arg") == (
-        "new unchanged: /new does not accept arguments"
-    )
+    assert create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        app, "/new arg"
+    ) == ("new unchanged: /new does not accept arguments")
     assert app.new_session_requested is False
 
-    result = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/new")
+    result = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+        app, "/new"
+    )
     assert result == "starting a fresh session..."
     assert app.new_session_requested is True
     assert app._exit_requested is True
@@ -119,13 +132,19 @@ def test_slash_new_rejected_during_active_turn(tmp_path: Path) -> None:
         from zeta.tui.app import TUIApp
 
         app = TUIApp(
-            AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+            AgentLoop(
+                FakeBackend([]),
+                ConversationStore(tmp_path / "sessions"),
+                skill_catalog=SkillCatalog.empty(),
+            ),
             provider="fake",
             model="offline",
         )
         app._active_task = asyncio.create_task(asyncio.sleep(1))
         try:
-            output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/new")
+            output = create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(
+                app, "/new"
+            )
         finally:
             app._active_task.cancel()
             await asyncio.gather(app._active_task, return_exceptions=True)
@@ -201,6 +220,27 @@ def test_session_list_shows_id_name_age_preview(
     assert "first prompt" in output
 
 
+def test_session_list_shows_placeholder_for_empty_preview(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A session with no user turn yet must render a readable placeholder,
+    not a blank preview column. Mirrors the TUI/GUI empty-state label.
+    """
+
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    create_app(_args())
+
+    exit_code = main(["session", "list"])
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "(no user message)" in output
+
+
 def test_session_delete_confirms_unless_forced(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -246,9 +286,7 @@ def test_session_export_writes_portable_jsonl(
 
     app = create_app(_args())
     session_id = app.loop.store.session_id
-    app.loop.store.append_message(
-        Message(MessageRole.USER, [TextContent("hi world")])
-    )
+    app.loop.store.append_message(Message(MessageRole.USER, [TextContent("hi world")]))
 
     exit_code = main(["session", "export", session_id])
     output = capsys.readouterr().out

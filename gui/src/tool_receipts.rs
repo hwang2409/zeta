@@ -60,7 +60,7 @@ impl ZetaView {
             body,
         } = text;
         let tool_label = tool_label.to_owned();
-        let excerpt = excerpt.to_owned();
+        let excerpt = excerpt.map(str::to_owned);
         let body = body.map(str::to_owned);
         let is_error = entry.unsuccessful();
         // State is signalled by COLOR ONLY. Running sits at normal text tier;
@@ -146,18 +146,24 @@ impl ZetaView {
                             .items_center()
                             .min_w_0()
                             .flex_1()
-                            .child(
-                                // Excerpt — the row's PRIMARY text. State
-                                // color routes through the recorder so a
-                                // swap at this call site is caught by the
-                                // render_log sample check.
-                                state_text(|| sel::tool_excerpt(index), state_color)
-                                    .debug_selector(move || sel::tool_excerpt(index))
-                                    .min_w_0()
-                                    .flex_shrink(1.0)
-                                    .truncate()
-                                    .child(excerpt),
-                            )
+                            .when_some(excerpt, |row, excerpt| {
+                                row.child(
+                                    // Excerpt — the row's PRIMARY text. State
+                                    // color routes through the recorder so a
+                                    // swap at this call site is caught by the
+                                    // render_log sample check. Painted only
+                                    // when the tool call carried a nameable
+                                    // argument; a `None` excerpt (argument-
+                                    // less tool_start) leaves the label
+                                    // alone (ZETA-134 review r2 typed state).
+                                    state_text(|| sel::tool_excerpt(index), state_color)
+                                        .debug_selector(move || sel::tool_excerpt(index))
+                                        .min_w_0()
+                                        .flex_shrink(1.0)
+                                        .truncate()
+                                        .child(excerpt),
+                                )
+                            })
                             .when_some(metadata_label, |row, label| {
                                 row.child(
                                     div()

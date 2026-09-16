@@ -24,7 +24,15 @@ from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
 from .store import ConversationStore
-from .session_files import SessionError, SessionInUseError, open_session_file, session_directory, session_root, child_directory, write_session_json
+from .session_files import (
+    SessionError,
+    SessionInUseError,
+    open_session_file,
+    session_directory,
+    session_root,
+    child_directory,
+    write_session_json,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -228,7 +236,10 @@ class SessionMetadata:
             "model",
             "cwd",
         )
-        if any(type(value.get(key)) is not str or not value[key] for key in required_strings):
+        if any(
+            type(value.get(key)) is not str or not value[key]
+            for key in required_strings
+        ):
             raise SessionError(f"session metadata is incomplete: {path}")
         retained_tail = value.get("retained_tail")
         compaction_budget = value.get("compaction_budget")
@@ -244,10 +255,14 @@ class SessionMetadata:
             raise SessionError(f"session metadata override audit is invalid: {path}")
         fallback = value.get("model_fallback")
         if fallback is not None and (
-            type(fallback) is not list or len(fallback) != 3
-            or type(fallback[0]) is not str or fallback[0] not in {"claude", "codex"}
-            or type(fallback[1]) is not str or not fallback[1].strip()
-            or type(fallback[2]) is not int or fallback[2] <= 0
+            type(fallback) is not list
+            or len(fallback) != 3
+            or type(fallback[0]) is not str
+            or fallback[0] not in {"claude", "codex"}
+            or type(fallback[1]) is not str
+            or not fallback[1].strip()
+            or type(fallback[2]) is not int
+            or fallback[2] <= 0
         ):
             raise SessionError(f"session model fallback is invalid: {path}")
         has_context_snapshot = "system_prompt" in value and "context_files" in value
@@ -288,12 +303,16 @@ class SessionMetadata:
             try:
                 SkillCatalog.from_snapshot(skill_catalog)
             except ValueError as exc:
-                raise SessionError(f"session metadata skill catalog is invalid: {path}") from exc
+                raise SessionError(
+                    f"session metadata skill catalog is invalid: {path}"
+                ) from exc
         if agent_catalog is not None:
             try:
                 AgentCatalog.from_snapshot(agent_catalog)
             except ValueError as exc:
-                raise SessionError(f"session metadata agent catalog is invalid: {path}") from exc
+                raise SessionError(
+                    f"session metadata agent catalog is invalid: {path}"
+                ) from exc
         return cls(
             version=value["version"],
             session_id=value["session_id"],
@@ -347,7 +366,9 @@ class SessionMetadata:
     def to_storage_dict(self) -> dict[str, Any]:
         return {
             **self.to_dict(),
-            "model_fallback": list(self.model_fallback) if self.model_fallback else None,
+            "model_fallback": list(self.model_fallback)
+            if self.model_fallback
+            else None,
         }
 
 
@@ -416,11 +437,24 @@ class SessionManager:
                         os.mkdir(session_id, mode=0o700, dir_fd=root_fd)
                     except FileExistsError:
                         continue
-                    with child_directory(root_fd, session_id) as destination_fd, session_directory(staged.sessions_dir, session_id) as (_, source_fd):
+                    with (
+                        child_directory(root_fd, session_id) as destination_fd,
+                        session_directory(staged.sessions_dir, session_id) as (
+                            _,
+                            source_fd,
+                        ),
+                    ):
                         names = os.listdir(source_fd)
                         # Publish metadata last so discovery skips incomplete sessions.
-                        for filename in sorted(names, key=lambda item: item == "meta.json"):
-                            os.replace(filename, filename, src_dir_fd=source_fd, dst_dir_fd=destination_fd)
+                        for filename in sorted(
+                            names, key=lambda item: item == "meta.json"
+                        ):
+                            os.replace(
+                                filename,
+                                filename,
+                                src_dir_fd=source_fd,
+                                dst_dir_fd=destination_fd,
+                            )
             return self.open(session_id)
         raise SessionError("could not allocate a unique session id")
 
@@ -433,7 +467,9 @@ class SessionManager:
         metadata = self.read_metadata(session_id)
         try:
             store = ConversationStore(
-                self.sessions_dir, session_id=session_id, _read_only=_read_only,
+                self.sessions_dir,
+                session_id=session_id,
+                _read_only=_read_only,
                 _must_exist=True,
             )
         except (OSError, ValueError) as exc:
@@ -503,7 +539,9 @@ class SessionManager:
                     )
                 )
             except (SessionError, ConversationIntegrityError) as exc:
-                logger.warning("Skipping session preview %s: %s", metadata.session_id, exc)
+                logger.warning(
+                    "Skipping session preview %s: %s", metadata.session_id, exc
+                )
         return previews
 
     def find_most_recent(self, *, cwd: str | Path | None = None) -> SessionMetadata:
@@ -533,6 +571,11 @@ class SessionManager:
         resume-with-``--system-prompt``/``--append-system-prompt`` path
         so the new prompt replaces the snapshot; the caller is
         responsible for warning the user that the prompt cache rebuilds.
+
+        ``updated_at`` only advances on ``overwrite=True`` (explicit user
+        action). Automatic legacy hydration — filling the snapshot in
+        first-write-wins style during resume — must not bump ``updated_at``,
+        or the sidebar reorders a session the user did not touch.
         """
 
         def update(item: SessionMetadata) -> SessionMetadata:
@@ -540,7 +583,9 @@ class SessionManager:
                 return item
             item.system_prompt = system_prompt
             item.context_files = list(context_files)
-            return self._touch(item)
+            if overwrite:
+                return self._touch(item)
+            return item
 
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
@@ -627,22 +672,54 @@ class SessionManager:
         current = self._mutate(metadata.session_id, update)
         self._copy_metadata(metadata, current)
 
-    def record_session_settings(self, metadata: SessionMetadata, *, model: str, approval_mode: str, budget: int, provider: str, model_fallback: tuple[str, str, int] | None = None) -> None:
+    def record_session_settings(
+        self,
+        metadata: SessionMetadata,
+        *,
+        model: str,
+        approval_mode: str,
+        budget: int,
+        provider: str,
+        model_fallback: tuple[str, str, int] | None = None,
+    ) -> None:
         """Persist active-session settings together, without changing global config."""
-        if approval_mode not in {"ask", "allow", "deny"} or not model.strip() or budget <= 0:
+        if (
+            approval_mode not in {"ask", "allow", "deny"}
+            or not model.strip()
+            or budget <= 0
+        ):
             raise SessionError("invalid session settings")
-        expected = (metadata.provider, metadata.model, metadata.approval_mode, metadata.compaction_budget, metadata.budget_pinned, metadata.model_fallback)
+        expected = (
+            metadata.provider,
+            metadata.model,
+            metadata.approval_mode,
+            metadata.compaction_budget,
+            metadata.budget_pinned,
+            metadata.model_fallback,
+        )
 
         def update(item: SessionMetadata) -> SessionMetadata:
-            if (item.provider, item.model, item.approval_mode, item.compaction_budget, item.budget_pinned, item.model_fallback) != expected:
+            if (
+                item.provider,
+                item.model,
+                item.approval_mode,
+                item.compaction_budget,
+                item.budget_pinned,
+                item.model_fallback,
+            ) != expected:
                 raise SessionError("session settings changed before commit")
             if item.model != model or item.provider != provider:
-                item.override_audit.append({
-                    "at": _now(),
-                    "provider": {"from": item.provider, "to": provider}
-                    if item.provider != provider else None,
-                    "model": {"from": item.model, "to": model} if item.model != model else None,
-                })
+                item.override_audit.append(
+                    {
+                        "at": _now(),
+                        "provider": {"from": item.provider, "to": provider}
+                        if item.provider != provider
+                        else None,
+                        "model": {"from": item.model, "to": model}
+                        if item.model != model
+                        else None,
+                    }
+                )
             item.provider = provider
             item.model = model
             item.approval_mode = approval_mode
@@ -694,8 +771,7 @@ class SessionManager:
         def update(item: SessionMetadata) -> SessionMetadata:
             if item.name != expected:
                 raise SessionError(
-                    "session name changed before commit; winner: "
-                    f"name={item.name!r}"
+                    f"session name changed before commit; winner: name={item.name!r}"
                 )
             item.name = name
             return self._touch(item)
@@ -707,7 +783,9 @@ class SessionManager:
         """Set a display name; whitespace clears it to the derived preview."""
         full_id = self.resolve_id(session_id)
         metadata = self.read_metadata(full_id)
-        self.record_name(metadata, name=normalize_session_name(name) if name.strip() else "")
+        self.record_name(
+            metadata, name=normalize_session_name(name) if name.strip() else ""
+        )
         return metadata
 
     def resolve_id(self, session_id: str) -> str:
@@ -715,9 +793,13 @@ class SessionManager:
 
         self._validate_id(session_id)
         try:
-            with session_root(self.sessions_dir) as root_fd, os.scandir(root_fd) as entries:
+            with (
+                session_root(self.sessions_dir) as root_fd,
+                os.scandir(root_fd) as entries,
+            ):
                 candidates = [
-                    entry.name for entry in entries
+                    entry.name
+                    for entry in entries
                     if entry.is_dir(follow_symlinks=False) or entry.is_symlink()
                 ]
             if session_id in candidates:
@@ -726,13 +808,14 @@ class SessionManager:
         except FileNotFoundError as exc:
             raise SessionError(f"session {session_id} was not found") from exc
         except OSError as exc:
-            raise SessionError(f"session {session_id} could not be resolved: {exc.strerror}") from exc
+            raise SessionError(
+                f"session {session_id} could not be resolved: {exc.strerror}"
+            ) from exc
         if not matches:
             raise SessionError(f"session {session_id} was not found")
         if len(matches) > 1:
             raise SessionError(
-                f"session id {session_id!r} is ambiguous "
-                f"({len(matches)} matches)"
+                f"session id {session_id!r} is ambiguous ({len(matches)} matches)"
             )
         return matches[0]
 
@@ -744,13 +827,18 @@ class SessionManager:
         full_id = session_id
         try:
             full_id = self.resolve_id(session_id)
-            with session_directory(self.sessions_dir, full_id, exclusive=True) as (root_fd, session_fd):
+            with session_directory(self.sessions_dir, full_id, exclusive=True) as (
+                root_fd,
+                session_fd,
+            ):
                 lock_fd = open_session_file(session_fd, ".lock", os.O_RDWR | os.O_CREAT)
                 try:
                     try:
                         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError as exc:
-                        raise SessionInUseError("session is currently open or in use") from exc
+                        raise SessionInUseError(
+                            "session is currently open or in use"
+                        ) from exc
                     # fd-based rmtree unlinks nested symlinks without following them.
                     shutil.rmtree(full_id, dir_fd=root_fd)
                 finally:
@@ -758,7 +846,9 @@ class SessionManager:
         except SessionInUseError:
             raise
         except (OSError, SessionError) as exc:
-            raise SessionError(f"session {full_id} could not be deleted: {exc}") from exc
+            raise SessionError(
+                f"session {full_id} could not be deleted: {exc}"
+            ) from exc
 
     def export(self, session_id: str) -> str:
         """Return the session as portable JSONL (metadata header + entries)."""
@@ -768,7 +858,13 @@ class SessionManager:
         header = {"type": "session_export", "metadata": metadata.to_dict()}
         lines = [json.dumps(header, separators=(",", ":"), sort_keys=True)]
         try:
-            with session_directory(self.sessions_dir, full_id) as (_, directory_fd), os.fdopen(open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb") as handle:
+            with (
+                session_directory(self.sessions_dir, full_id) as (_, directory_fd),
+                os.fdopen(
+                    open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY),
+                    "rb",
+                ) as handle,
+            ):
                 for line in handle:
                     if line.strip():
                         row = load_session_json(line)
@@ -854,13 +950,17 @@ class SessionManager:
         target.approval_mode = source.approval_mode
         target.model_fallback = source.model_fallback
 
-    def _read(self, session_id: str, *, directory_fd: int | None = None) -> SessionMetadata:
+    def _read(
+        self, session_id: str, *, directory_fd: int | None = None
+    ) -> SessionMetadata:
         if directory_fd is None:
             with session_directory(self.sessions_dir, session_id) as (_, opened_fd):
                 return self._read(session_id, directory_fd=opened_fd)
         path = self.sessions_dir / session_id / "meta.json"
         try:
-            with os.fdopen(open_session_file(directory_fd, "meta.json", os.O_RDONLY), "rb") as handle:
+            with os.fdopen(
+                open_session_file(directory_fd, "meta.json", os.O_RDONLY), "rb"
+            ) as handle:
                 value = load_session_json(handle.read())
         except FileNotFoundError as exc:
             raise SessionError(f"session {session_id} has no meta.json") from exc
@@ -870,7 +970,9 @@ class SessionManager:
             raise SessionError(f"session metadata is not an object: {path}")
         metadata = SessionMetadata.from_dict(value, path=path)
         if metadata.session_id != session_id:
-            raise SessionError(f"session metadata id mismatch for {session_id}: {metadata.session_id}")
+            raise SessionError(
+                f"session metadata id mismatch for {session_id}: {metadata.session_id}"
+            )
         return metadata
 
     def _write(self, metadata: SessionMetadata) -> None:
@@ -885,7 +987,9 @@ class SessionManager:
         self._validate_id(session_id)
         with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
             try:
-                lock_fd = open_session_file(directory_fd, ".meta.lock", os.O_RDWR | os.O_CREAT)
+                lock_fd = open_session_file(
+                    directory_fd, ".meta.lock", os.O_RDWR | os.O_CREAT
+                )
             except OSError as exc:
                 raise SessionError("session metadata lock could not be opened") from exc
             try:
