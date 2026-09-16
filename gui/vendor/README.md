@@ -2,7 +2,7 @@
 
 This directory holds a temporary in-repo fork of the `gpui-base` crate at
 version `0.6.1`, byte-identical to the crates.io release except for the
-one change described below. `gui/Cargo.toml` points `[patch.crates-io.gpui-base]`
+two authorised edits described below. `gui/Cargo.toml` points `[patch.crates-io.gpui-base]`
 at `vendor/gpui-base` so both `zeta-gui` and its transitive `gpui-kit`
 dependency compile against the patched crate.
 
@@ -145,9 +145,12 @@ count. `gui-native-guards` invokes the smoke driver directly and thus
 runs the recorder scan as a durable guard on every CI run.
 `gui-native-guards-inline-flow-mutation` invokes the same smoke driver
 with `ZETA_GUI_INLINE_FLOW_DEFINITE=1` and inverts the exit code — the
-mutation MUST panic the recorder scan on the ladder shape (18px is the
-demonstrated CoreText trip on macOS-latest CI). CI's `cargo
-(macos-latest)` job runs both targets.
+mutation MUST panic the recorder scan on at least one shape in the
+matrix. Final CI trip evidence on the shipped head (`1b705b4`):
+shape=`wedge`, size=13px, sample text=`meta.json`, wrap_boundaries=1 —
+the exact audit repro (a length-9 code chip on the 13px × 0.875 mono
+metrics drifting past `shape_line.width()`). CI's `cargo (macos-latest)`
+job runs both targets.
 
 ## Poison-canary (`ZETA_GUI_INLINE_FLOW_DEFINITE`)
 
