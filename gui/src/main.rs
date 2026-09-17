@@ -517,6 +517,13 @@ impl ZetaView {
                 // ZETA-108/123). A click-invoked open often has no focused
                 // handle; `close_settings` then falls back to the composer.
                 self.settings_return_focus = window.focused(cx);
+                // ZETA-132 C4: every open lands at the top of the sections
+                // wrapper. The ScrollHandle persists across close/reopen,
+                // so without this reset the modal reopens wherever the last
+                // wheel/drag left it — always resurfacing the Model list's
+                // tail on the second open, never Model's header.
+                self.settings_sections_scroll
+                    .set_offset(gpui::point(px(0.), px(0.)));
                 self.settings_open = true;
                 window.focus(&self.settings_focus, cx);
             }
@@ -1925,13 +1932,18 @@ impl ZetaView {
             .bg(cx.theme().overlay)
             .v_flex()
             .items_center()
-            // Flat panel on scrim: sits at 25% of the viewport HEIGHT rather
+            // Flat panel on scrim: sits at 15% of the viewport HEIGHT rather
             // than centred, matching the wiki modal shape. GPUI's
-            // `pt(relative(0.25))` computes a fraction of parent WIDTH
+            // `pt(relative(0.15))` computes a fraction of parent WIDTH
             // (CSS-quirk), which drifts the modal off the shelf on wide
             // windows — measure the height directly and offset in pixels.
-            // Contract line 91.
-            .pt(window.viewport_size().height * theme::MODAL_TOP_FRACTION)
+            // Contract line 91. The Settings surface reads its OWN offset
+            // token (`SETTINGS_MODAL_TOP_FRACTION`, 15%) rather than the
+            // shared `MODAL_TOP_FRACTION` (25%) so the three-section body
+            // plus an optional credential-error alert fits on open at
+            // 900px+ viewport heights — rename / delete dialogs
+            // (session_management.rs) still ride the 25% ZETA-108 shelf.
+            .pt(window.viewport_size().height * theme::SETTINGS_MODAL_TOP_FRACTION)
             .px(theme::MODAL_PADDING_X)
             .child(
                 div()
@@ -1940,13 +1952,13 @@ impl ZetaView {
                     .w(theme::MODAL_WIDTH)
                     .max_w_full()
                     // Panel size is `min(shelf, cap)`:
-                    //  - `shelf` = viewport height below the 25% modal-top
-                    //    offset (minus one MODAL_PADDING_X so it never
-                    //    kisses the viewport bottom). Small viewports
+                    //  - `shelf` = viewport height below the 15% Settings
+                    //    modal-top offset (minus one MODAL_PADDING_X so it
+                    //    never kisses the viewport bottom). Small viewports
                     //    (760px test window at 18px picker) leave the panel
                     //    shelf-sized so `flex_1 + min_h_0` on the sections
                     //    wrapper can resolve against a definite height.
-                    //  - `cap` = SETTINGS_PANEL_MAX_HEIGHT (560px). Tall
+                    //  - `cap` = SETTINGS_PANEL_MAX_HEIGHT (680px). Tall
                     //    viewports (1200px+) would otherwise stretch the
                     //    flat panel to 884px+ and break the wiki-modal
                     //    silhouette — cap the growth here so the panel
@@ -1960,7 +1972,7 @@ impl ZetaView {
                     // still cannot leak past the panel edge.
                     .h({
                         let shelf = window.viewport_size().height
-                            * (1.0 - theme::MODAL_TOP_FRACTION)
+                            * (1.0 - theme::SETTINGS_MODAL_TOP_FRACTION)
                             - theme::MODAL_PADDING_X;
                         std::cmp::min(shelf, theme::SETTINGS_PANEL_MAX_HEIGHT)
                     })
@@ -2082,6 +2094,7 @@ impl ZetaView {
                             .child(
                                 div()
                                     .id("settings-sections")
+                                    .debug_selector(|| "settings-sections".into())
                                     .v_flex()
                                     .size_full()
                                     .overflow_y_scroll()
@@ -2178,6 +2191,43 @@ impl ZetaView {
                                     .bg(cx.theme().sidebar)
                                     .border_t_1()
                                     .border_color(cx.theme().border),
+                            )
+                            .child(
+                                // ZETA-132: real scrollbar overlay on the
+                                // sections wrapper. Kit's `Scrollbar` only
+                                // paints its thumb when content overflows
+                                // (thumb ratio = viewport / content), so
+                                // the shipped no-scroll case at common
+                                // window heights paints nothing here.
+                                // When overflow does bite (small viewport,
+                                // 18px picker), the 8px thumb painted in
+                                // the text-normal alpha mix rides the
+                                // wrapper's right edge and gives the user
+                                // a real scroll affordance — the audit's
+                                // C3 miss ("no scrollbar visible") that
+                                // the ZETA-128 cue mask alone did not
+                                // resolve. `Always` mode holds the thumb
+                                // steady while a Settings surface is open
+                                // (Kit's default `Scrolling` fades to
+                                // zero after 2s idle, defeating the
+                                // "always know the panel scrolls" cue).
+                                // The mask + cue stay: the mask hides
+                                // partial rows the clip would otherwise
+                                // slice mid-caption, and the cue's top
+                                // edge line still reads "content
+                                // continues" for users who never look at
+                                // scrollbars.
+                                div()
+                                    .debug_selector(|| "settings-sections-scrollbar".into())
+                                    .absolute()
+                                    .inset_0()
+                                    .child(
+                                        gpui_kit::base::Scrollbar::vertical(
+                                            &self.settings_sections_scroll,
+                                        )
+                                        .mode(gpui_kit::base::ScrollbarMode::Always)
+                                        .viewport_from_layout(),
+                                    ),
                             )
                     })
                     .children(self.login_providers.iter().map(|provider| {

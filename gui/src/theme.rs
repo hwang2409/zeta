@@ -162,14 +162,24 @@ pub const SLASH_MENU_RADIUS: Pixels = px(6.);
 pub const SLASH_MENU_ROW_RADIUS: Pixels = px(4.);
 
 /// Flat-panel modal shape. Width caps at 480px, padding is 12px on top / 16px
-/// horizontally / 14px on bottom, and the panel sits below a scrim at 25% of
-/// the viewport height.
+/// horizontally / 14px on bottom. Rename / delete dialogs use the shared
+/// `MODAL_TOP_FRACTION` shelf at 25% of the viewport height. Settings uses the
+/// `SETTINGS_MODAL_TOP_FRACTION` shelf at 15%.
 pub const MODAL_WIDTH: Pixels = px(480.);
 pub const MODAL_PADDING_TOP: Pixels = px(12.);
 pub const MODAL_PADDING_X: Pixels = px(16.);
 pub const MODAL_PADDING_BOTTOM: Pixels = px(14.);
 pub const MODAL_BUTTON_HEIGHT: Pixels = px(30.);
 pub const MODAL_TOP_FRACTION: f32 = 0.25;
+
+/// Settings-only top-offset fraction. The Settings surface stacks three
+/// grouped sections plus an optional credential-error alert; at the shared
+/// 25% shelf the panel's shelf-derived height cannot hold every section on
+/// open at common window heights (900px+), so ZETA-132 gives Settings its
+/// own token at 15% and the shelf math (`h(min(shelf, cap))`) reads it.
+/// Rename / delete dialogs keep the ZETA-108 25% shelf via
+/// `MODAL_TOP_FRACTION`.
+pub const SETTINGS_MODAL_TOP_FRACTION: f32 = 0.15;
 
 /// Label-column width for a Settings row, derived from the current base
 /// font size. The column scales linearly (`base * 10.8`) so at 11px it is
@@ -204,16 +214,23 @@ pub const SETTINGS_ROW_DESCRIPTION_GAP: Pixels = px(2.);
 /// group three-row catalog (claude + codex, three models, ~156px) in
 /// full at 13px — the credential-error swap test relies on the codex
 /// row being clickable without scrolling — and a longer catalog scrolls
-/// with the focused row auto-revealed via `scroll_to_item`.
+/// with the focused row auto-revealed via `scroll_to_item`. ZETA-132
+/// tried trimming this to 132 to slim the Model section on open; that
+/// clipped the codex row inside the swap test and buttoned it off from
+/// simulated clicks, so the fix now leans on the raised panel cap +
+/// lowered top offset alone for the C3 miss.
 pub const SETTINGS_MODEL_LIST_MAX_HEIGHT: Pixels = px(160.);
 
 /// Absolute ceiling for the Settings panel's rendered height. The panel
-/// still sizes off the viewport shelf below the 25% modal-top offset so
+/// still sizes off the viewport shelf below the 15% modal-top offset so
 /// short viewports pack the sections tight, but a tall viewport must not
-/// stretch the panel: a 1200px viewport shelf is 884px, which would grow
+/// stretch the panel: a 1200px viewport shelf is ~1004px, which would grow
 /// the flat panel to full-page proportions and break the wiki-modal
 /// silhouette. Sections still scroll inside the panel when the cap bites.
-pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(560.);
+/// ZETA-132 raised this from 560 so all three sections (Model, Behavior,
+/// Appearance) fit on open at common window heights (900px+) without
+/// forcing the user to discover the hidden scroll surface.
+pub const SETTINGS_PANEL_MAX_HEIGHT: Pixels = px(680.);
 
 /// Height of the Settings sections' bottom mask. The scrollable sections
 /// wrapper cannot cheaply align its clip edge to a row boundary (rows
@@ -1856,12 +1873,16 @@ mod tests {
         assert_eq!(MODAL_PADDING_X, px(16.));
         assert_eq!(MODAL_PADDING_BOTTOM, px(14.));
         assert_eq!(MODAL_BUTTON_HEIGHT, px(30.));
+        // The shared modal offset stays on the ZETA-108 25% shelf so
+        // rename / delete dialogs (session_management.rs) keep their
+        // pinned position; Settings gets its own token below.
         assert!((MODAL_TOP_FRACTION - 0.25).abs() < f32::EPSILON);
+        assert!((SETTINGS_MODAL_TOP_FRACTION - 0.15).abs() < f32::EPSILON);
         assert_eq!(SETTINGS_SECTION_GAP, px(10.));
         assert_eq!(SETTINGS_ROW_GAP, px(6.));
         assert_eq!(SETTINGS_ROW_DESCRIPTION_GAP, px(2.));
         assert_eq!(SETTINGS_MODEL_LIST_MAX_HEIGHT, px(160.));
-        assert_eq!(SETTINGS_PANEL_MAX_HEIGHT, px(560.));
+        assert_eq!(SETTINGS_PANEL_MAX_HEIGHT, px(680.));
         // Slash-menu chrome tokens ride here rather than a raw
         // `px(6.)` / `px(4.)` sprinkled across `render_slash_menu` —
         // one place, one mutation-sensitive contract.
