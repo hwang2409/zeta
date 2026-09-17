@@ -938,6 +938,16 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     // panel header, expanded EDIT receipt with diff card) so the
     // reviewer can diff the three states against the reference.
     let zeta135_diff_path = env::var_os("ZETA_GUI_SMOKE_ZETA135_DIFF_IMAGE");
+    // ZETA-133 captures. `AFTER` seeds a mixed transcript (prose + tools
+    // + turn footer) so the after-shot shows every row kind sharing ONE
+    // body left edge under the wiki-look shell. `AFTER_SHORT` seeds a
+    // 4-row prose transcript so the after-short-shot shows the last row
+    // sitting adjacent to the composer instead of pinned to the viewport
+    // top with dead space below. Both captures share the same window
+    // size so the shared-edge / bottom-anchor claims are directly
+    // comparable to reviewers.
+    let zeta133_after_path = env::var_os("ZETA_GUI_SMOKE_ZETA133_AFTER_IMAGE");
+    let zeta133_after_short_path = env::var_os("ZETA_GUI_SMOKE_ZETA133_AFTER_SHORT_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -1289,6 +1299,97 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         .expect("native renderer zeta-135 diff capture")
                                         .save(PathBuf::from(diff_path))
                                         .expect("save zeta-135 diff screenshot");
+                                }
+                                // ZETA-133 (D1): mixed transcript — prose +
+                                // tool receipts (bash + read + edit) +
+                                // assistant reply — so the after-shot shows
+                                // every row kind sharing ONE body left edge
+                                // under the wiki-look shell. Session
+                                // metadata seeds the turn footer.
+                                if let Some(after_path) = &zeta133_after_path {
+                                    entity.update(cx, |view, cx| {
+                                        view.state.connection = ConnectionState::Connected;
+                                        view.state.transcript.clear();
+                                        seed_zeta_125_tool_run(&mut view.state);
+                                        view.state.sessions.clear();
+                                        view.state.sessions.push(
+                                            zeta_gui::client::SessionMetadata {
+                                                version: 1,
+                                                session_id: "z133".into(),
+                                                created_at: "2026-09-17T12:00:00Z".into(),
+                                                updated_at: "2026-09-17T12:00:42Z".into(),
+                                                provider: "cc".into(),
+                                                model: "claude-fable-5".into(),
+                                                cwd: String::new(),
+                                                retained_tail: 0,
+                                                compaction_budget: 0,
+                                                override_audit: Vec::new(),
+                                                system_prompt: String::new(),
+                                                context_files: Vec::new(),
+                                                vim_mode: false,
+                                                budget_pinned: false,
+                                                plan_mode: false,
+                                                name: String::new(),
+                                                first_message_preview: String::new(),
+                                                approval_mode: String::new(),
+                                            },
+                                        );
+                                        view.state.active_session = Some("z133".into());
+                                        view.state.metrics.model = Some("claude-fable-5".into());
+                                        let count = view.state.transcript.len();
+                                        view.transcript.update(cx, |scroll, cx| {
+                                            scroll.reset(count, cx);
+                                        });
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer zeta-133 after capture")
+                                        .save(PathBuf::from(after_path))
+                                        .expect("save zeta-133 after screenshot");
+                                }
+                                // ZETA-133 (D3): 4-row prose-only transcript
+                                // so the after-short-shot shows the last row
+                                // sitting adjacent to the composer instead
+                                // of pinned to the viewport top with dead
+                                // space below.
+                                if let Some(after_short_path) = &zeta133_after_short_path {
+                                    entity.update(cx, |view, cx| {
+                                        view.state.connection = ConnectionState::Connected;
+                                        view.state.transcript.clear();
+                                        view.state.transcript.push(TranscriptEntry::User(
+                                            "What does the harness own end to end?".into(),
+                                        ));
+                                        view.state.transcript.push(TranscriptEntry::Assistant(
+                                            "It owns the agent loop, conversation store, \
+                                             context assembly + compaction, tool registry, \
+                                             approval policy, and the TUI — no subprocesses \
+                                             for claude/codex."
+                                                .into(),
+                                        ));
+                                        view.state.transcript.push(TranscriptEntry::User(
+                                            "Which pieces stayed from the Wiki plan?".into(),
+                                        ));
+                                        view.state.transcript.push(TranscriptEntry::Assistant(
+                                            "ApprovalPolicy's durable pending requests. \
+                                             Everything else went harness-native."
+                                                .into(),
+                                        ));
+                                        let count = view.state.transcript.len();
+                                        view.transcript.update(cx, |scroll, cx| {
+                                            scroll.reset(count, cx);
+                                        });
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer zeta-133 after-short capture")
+                                        .save(PathBuf::from(after_short_path))
+                                        .expect("save zeta-133 after-short screenshot");
                                 }
                                 // ZETA-134 D6: expanded bash receipt with
                                 // the reshaped tail. Card.expanded=true so

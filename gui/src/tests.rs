@@ -836,34 +836,34 @@ fn transcript_prose_column_caps_at_reading_measure_and_centers(cx: &mut TestAppC
         // viewport reflects the shared frame + gutter geometry rather
         // than a per-kind centering that no longer exists.
         let tolerance = px(8.).scale(scale);
-        for quad in user_quads {
-            let width = quad.bounds.size.width;
-            assert!(
-                width <= scaled_body_cap + tolerance,
-                "user rectangle width {:?} must land inside the prose body \
-                 cap {:?} (prose_cap {prose_cap:?})",
-                width,
-                scaled_body_cap,
-            );
-            // Frame-level centering: the outer `transcript-row` (which
-            // wraps the fixed-width column) still centers inside the
-            // transcript viewport. Prove that by checking the row's own
-            // asymmetry, not the individual rectangle's.
-            let left_gap = scaled_row.left() - scaled_viewport.left();
-            let right_gap = scaled_viewport.right() - scaled_row.right();
-            let asymmetry = if left_gap > right_gap {
-                left_gap - right_gap
-            } else {
-                right_gap - left_gap
-            };
-            let _ = quad; // silence unused after we moved the check to `row`
-            assert!(
-                asymmetry <= tolerance,
-                "transcript row not centered inside viewport: left \
-                 {left_gap:?}, right {right_gap:?}"
-            );
-            break;
-        }
+        // ONE user rail quad per row — the check applies to the first
+        // matched quad, not every filter hit (a shipped row paints one
+        // border-box quad for the rail).
+        let quad = user_quads.into_iter().next().expect("user rail quad");
+        assert!(
+            quad.bounds.size.width <= scaled_body_cap + tolerance,
+            "user rectangle width {:?} must land inside the prose body \
+             cap {:?} (prose_cap {prose_cap:?})",
+            quad.bounds.size.width,
+            scaled_body_cap,
+        );
+        // Frame-level centering: the outer `transcript-row` (which
+        // wraps the fixed-width column) still centers inside the
+        // transcript viewport. Prove that by checking the row's own
+        // asymmetry, not the individual rectangle's — under ZETA-133 the
+        // rectangle sits at gutter-right, not centered per-kind.
+        let left_gap = scaled_row.left() - scaled_viewport.left();
+        let right_gap = scaled_viewport.right() - scaled_row.right();
+        let asymmetry = if left_gap > right_gap {
+            left_gap - right_gap
+        } else {
+            right_gap - left_gap
+        };
+        assert!(
+            asymmetry <= tolerance,
+            "transcript row not centered inside viewport: left \
+             {left_gap:?}, right {right_gap:?}"
+        );
     });
 }
 
@@ -12389,7 +12389,7 @@ fn zeta133_short_transcript_bottom_anchors_at_two_heights(cx: &mut TestAppContex
 /// and create a wide virtual "empty" strip above item[0] on a long
 /// transcript.
 #[gpui::test]
-fn zeta133_long_transcript_bottom_anchor_pad_collapses_to_zero(cx: &mut TestAppContext) {
+fn zeta133_long_transcript_bottom_anchor_pad_collapses_to_zero(_cx: &mut TestAppContext) {
     // The pad is a pure function of viewport height + item count, so the
     // clamp check is expressed unit-style: a small item_count at a large
     // viewport yields a positive pad; a large item_count at the same

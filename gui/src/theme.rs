@@ -48,16 +48,17 @@ pub const TRANSCRIPT_MAX_WIDTH: Pixels = px(1024.);
 /// this gap to zero so a run of receipts reads as one column.
 pub const TRANSCRIPT_ROW_GAP: Pixels = px(14.);
 
-/// Fixed leading gutter reserved on every transcript row (ZETA-133). Chevron
-/// + kind glyph on tool rows hang here; prose / thinking / error / footer
-/// rows leave it empty. The body column sits at gutter-right, so every row
-/// kind — receipts' TEXT (tool name onward), prose, block elements,
-/// expanded panels, and the turn footer — shares ONE left edge. Wide enough
-/// to seat the ChevronRight/Down icon plus the ZETA-135 kind glyph with an
-/// 8px gap and a 2px breathing margin at the shipped base (13px). Fixed in
-/// pixels so the shared edge stays deterministic across the 11px → 18px
-/// picker range; the glyphs scale with `label_small(base)` but sit inside
-/// the fixed gutter and stay left-aligned to the row.
+/// Fixed leading gutter reserved on every transcript row (ZETA-133). Tool
+/// rows hang the chevron and the ZETA-135 kind glyph here; prose, thinking,
+/// error, and turn-footer rows leave it empty. The body column sits at
+/// gutter-right, so every row kind — collapsed receipts' TEXT (tool name
+/// onward), prose, block elements, expanded panels, and the turn footer —
+/// shares ONE left edge. Wide enough to seat the ChevronRight or
+/// ChevronDown icon plus the kind glyph with an 8px gap and a 2px
+/// breathing margin at the shipped 13px base. Fixed in pixels so the
+/// shared edge stays deterministic across the 11px to 18px picker range;
+/// the glyphs scale with `label_small(base)` but still sit inside the
+/// fixed gutter and stay left-aligned to the row.
 pub const LEADING_GUTTER_WIDTH: Pixels = px(30.);
 
 /// Baseline padding for the composer strip (padding 8 x 10 from the contract).
@@ -847,13 +848,16 @@ pub fn viewport_height() -> Pixels {
 }
 
 /// Average row-height estimate used by the ZETA-133 bottom-anchor pad. Rows
-/// vary from ~24px (thinking header) to ~200px (long assistant markdown),
-/// so a mid-range estimate keeps SHORT transcripts (few rows, whatever
-/// their length) firmly bottom-anchored while a longer transcript's
-/// estimate exceeds the viewport and the pad drops to zero. Kept as a
-/// named constant so the ladder / a peer refactor lands here rather than
-/// in scattered numbers.
-pub const BOTTOM_ANCHOR_ROW_ESTIMATE: f32 = 80.0;
+/// vary from ~24px (thinking header, collapsed receipt, one-line prose) to
+/// ~200px (long assistant markdown, expanded receipt with tail). Chosen at
+/// the LOWER end so a mixed short transcript — user + assistant + a run of
+/// wiki-look receipts (each ~24-30px) + a turn footer — still qualifies
+/// for the pad and bottom-anchors against the composer; a tall transcript
+/// still zeroes the pad because item_count × estimate overshoots the
+/// viewport before actual glyph rendering does. Kept as a named constant
+/// so the ladder / a peer refactor lands here rather than in scattered
+/// numbers.
+pub const BOTTOM_ANCHOR_ROW_ESTIMATE: f32 = 40.0;
 
 /// Vertical chrome the transcript viewport pays to the run-header / banner
 /// / composer. Fixed number rather than a live measurement — the composer
