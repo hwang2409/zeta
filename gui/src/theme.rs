@@ -52,8 +52,13 @@ pub const TRANSCRIPT_ROW_GAP: Pixels = px(14.);
 pub const COMPOSER_PADDING_Y: Pixels = px(8.);
 pub const COMPOSER_PADDING_X: Pixels = px(10.);
 
-/// Composer minimum height (contract: min-height 64px).
-pub const COMPOSER_MIN_HEIGHT: Pixels = px(64.);
+// COMPOSER_MIN_HEIGHT (px(64.), pre-ZETA-135) is superseded by
+// `composer_chrome_reserve()` below — the composer's actual chrome floor
+// is 102px on the shipped shape, so a 64px min was already dominated by
+// content on every render. The new function is the single source of
+// truth (Finding 5); the render layer's `.min_h(...)` reads it, and the
+// smoke driver's pixel-gutter guard reads the same function for its
+// scan y-range.
 
 /// Send button minimum width. Kept square, mono 600, and just wide enough for
 /// the word "Send" plus breathing room per the contract.
@@ -102,13 +107,6 @@ pub const COMPOSER_FOOTER_GAP: Pixels = px(4.);
 /// bump to any single composer chrome constant propagates without a
 /// paired smoke-side edit. Fields in top-to-bottom paint order.
 ///
-/// `#[allow(dead_code)]` because the production binary never calls
-/// this function — its consumer is the smoke driver in `smoke.rs`,
-/// gated behind `#[cfg(feature = "smoke-test")]`. Under the default
-/// binary build the compiler sees the guard's call site drop out
-/// and the crate's `-D warnings` flag would otherwise refuse to
-/// compile.
-#[allow(dead_code)]
 pub fn composer_chrome_reserve() -> Pixels {
     COMPOSER_PADDING_Y
         + COMPOSER_LABEL_HEIGHT
@@ -2005,7 +2003,11 @@ mod tests {
     fn transcript_and_composer_tokens_land_on_the_wiki_contract() {
         assert_eq!(TRANSCRIPT_MAX_WIDTH, px(1024.));
         assert_eq!(TRANSCRIPT_ROW_GAP, px(14.));
-        assert_eq!(COMPOSER_MIN_HEIGHT, px(64.));
+        // COMPOSER_MIN_HEIGHT (px(64.)) was superseded by
+        // `composer_chrome_reserve()` (Finding 5). Verify the reserve
+        // clears the pre-ZETA-135 64px floor so no theme consumer that
+        // used to gate on the 64px minimum silently loses room.
+        assert!(composer_chrome_reserve() >= px(64.));
         assert_eq!(COMPOSER_PADDING_Y, px(8.));
         assert_eq!(COMPOSER_PADDING_X, px(10.));
         // ZETA-135: label chip row height. The smoke driver's
@@ -2283,7 +2285,7 @@ mod tests {
                 );
             });
         }
-        cx.update(|cx| apply(cx));
+        cx.update(apply);
         reset_active_default();
     }
 
@@ -2317,7 +2319,7 @@ mod tests {
                 );
             });
         }
-        cx.update(|cx| apply(cx));
+        cx.update(apply);
         reset_active_default();
     }
 
@@ -2368,7 +2370,7 @@ mod tests {
                 );
             });
         }
-        cx.update(|cx| apply(cx));
+        cx.update(apply);
         reset_active_default();
     }
 

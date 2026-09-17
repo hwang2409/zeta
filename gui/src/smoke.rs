@@ -754,6 +754,77 @@ fn seed_zeta_134_sidebar_sessions(state: &mut zeta_gui::state::AppState) {
 /// message + assistant preamble so the row reads in context, and the
 /// smoke shot proves both invariants: card body paints (expanded) and
 /// the tail includes the exit code.
+/// ZETA-135 (Trait 2 — diff card). Seed an expanded edit receipt whose
+/// `Card::edit_data` carries a small old/new pair so the after-shot proves
+/// the side-by-side diff card renders end-to-end (path header + two
+/// tinted panes + line-numbered gutters). Also seeds an assistant preamble
+/// so the transcript reads like a real turn. Requires the caller to also
+/// seed a session with wire timestamps + provider + model if they want
+/// the turn footer to paint below the last row.
+fn seed_zeta_135_edit_diff(state: &mut zeta_gui::state::AppState) {
+    use zeta_gui::cards::{Card, EditData, OutputTail};
+    use zeta_gui::state::{extract_edit_data, tool_excerpt, ToolReceiptKey, TranscriptEntry};
+    state.transcript.push(TranscriptEntry::User(
+        "Bring hot.md up to date with the ZETA arc.".into(),
+    ));
+    state.transcript.push(TranscriptEntry::Assistant(
+        "Updating the zeta line in `hot.md` to reflect the current arc state.".into(),
+    ));
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        "path".into(),
+        serde_json::Value::String("/Users/henry/me/fun/wiki/vault/hot.md".into()),
+    );
+    arguments.insert(
+        "old_string".into(),
+        serde_json::Value::String(
+            "- **Zeta UI-POLISH-2 arc RESUMED post-reset (zeta orch, 09-16 ~20:40Z).**\n\
+             MERGED: ZETA-129 (#172, codespan glyph fixes) and ZETA-130\n\
+             (#171, GUI slash commands) — main at `49ca130`. LIVE:\n\
+             ZETA-131-PR2 (cc opus-4.7, worktree `zeta-131-approvals`) fixing REVI…"
+                .into(),
+        ),
+    );
+    arguments.insert(
+        "new_string".into(),
+        serde_json::Value::String(
+            "- **Zeta UI-POLISH-2 arc (zeta orch): 4 of 6 lanes MERGED.**\n\
+             ZETA-129 (#172), ZETA-130 (#171), ZETA-131 (#173, merged\n\
+             22:09Z after 4 review rounds — allow indicator now projects\n\
+             the EFFECTIVE policy mode into new_session/resume/status;\n\
+             stored-null metadata…"
+                .into(),
+        ),
+    );
+    let edit_data = extract_edit_data("edit", &arguments).unwrap_or(EditData {
+        old_text: String::new(),
+        new_text: String::new(),
+    });
+    state.transcript.push(TranscriptEntry::Tool {
+        key: ToolReceiptKey {
+            session_id: None,
+            agent_instance_id: None,
+            tool_call_id: "z135-edit-hot".into(),
+        },
+        name: "edit".into(),
+        excerpt: tool_excerpt("edit", &arguments),
+        summary: String::new(),
+        complete: true,
+        error: false,
+        canceled: false,
+        card: Card {
+            expanded: true,
+            edit_data: Some(edit_data),
+            tail: OutputTail {
+                text: "hot.md updated (1 hunk)".into(),
+                truncated: false,
+                bytes_seen: 24,
+            },
+            ..Default::default()
+        },
+    });
+}
+
 fn seed_zeta_134_expanded_bash_receipt(state: &mut zeta_gui::state::AppState) {
     use zeta_gui::cards::{Card, OutputTail};
     use zeta_gui::state::{tool_excerpt, ToolReceiptKey, TranscriptEntry};
@@ -860,6 +931,13 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     // collapsed-group shot showed neither.
     let zeta134_sidebar_path = env::var_os("ZETA_GUI_SMOKE_ZETA134_SIDEBAR_IMAGE");
     let zeta134_receipt_path = env::var_os("ZETA_GUI_SMOKE_ZETA134_RECEIPT_IMAGE");
+    // ZETA-135 captures. Round 2 finding 2 required real screenshots
+    // of the wiki-look states; the round-1 shot was a byte-identical
+    // copy of the reference PNG. Each env var here seeds a specific
+    // state (default with restyle, expanded receipt with kind glyph +
+    // panel header, expanded EDIT receipt with diff card) so the
+    // reviewer can diff the three states against the reference.
+    let zeta135_diff_path = env::var_os("ZETA_GUI_SMOKE_ZETA135_DIFF_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -1158,6 +1236,59 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         cx.notify();
                                     });
                                     window.render_frame(cx);
+                                }
+                                // ZETA-135 (Trait 2 — diff card): expanded
+                                // edit receipt with typed old/new strings so
+                                // the after-shot proves the side-by-side
+                                // diff card renders end-to-end. Also seeds
+                                // wire session data so the turn footer
+                                // paints below the last row.
+                                if let Some(diff_path) = &zeta135_diff_path {
+                                    entity.update(cx, |view, cx| {
+                                        view.state.connection = ConnectionState::Connected;
+                                        view.state.transcript.clear();
+                                        seed_zeta_135_edit_diff(&mut view.state);
+                                        // Session metadata drives the turn
+                                        // footer — provider · model ·
+                                        // duration below the last row.
+                                        view.state.sessions.clear();
+                                        view.state.sessions.push(
+                                            zeta_gui::client::SessionMetadata {
+                                                version: 1,
+                                                session_id: "z135".into(),
+                                                created_at: "2026-09-17T12:00:00Z".into(),
+                                                updated_at: "2026-09-17T12:06:32Z".into(),
+                                                provider: "cc".into(),
+                                                model: "claude-fable-5".into(),
+                                                cwd: String::new(),
+                                                retained_tail: 0,
+                                                compaction_budget: 0,
+                                                override_audit: Vec::new(),
+                                                system_prompt: String::new(),
+                                                context_files: Vec::new(),
+                                                vim_mode: false,
+                                                budget_pinned: false,
+                                                plan_mode: false,
+                                                name: String::new(),
+                                                first_message_preview: String::new(),
+                                                approval_mode: String::new(),
+                                            },
+                                        );
+                                        view.state.active_session = Some("z135".into());
+                                        view.state.metrics.model = Some("claude-fable-5".into());
+                                        let count = view.state.transcript.len();
+                                        view.transcript.update(cx, |scroll, cx| {
+                                            scroll.reset(count, cx);
+                                        });
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer zeta-135 diff capture")
+                                        .save(PathBuf::from(diff_path))
+                                        .expect("save zeta-135 diff screenshot");
                                 }
                                 // ZETA-134 D6: expanded bash receipt with
                                 // the reshaped tail. Card.expanded=true so

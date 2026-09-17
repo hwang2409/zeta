@@ -2426,7 +2426,7 @@ impl ZetaView {
             .relative()
             .py(theme::COMPOSER_PADDING_Y)
             .px(theme::COMPOSER_PADDING_X)
-            .min_h(theme::COMPOSER_MIN_HEIGHT)
+            .min_h(theme::composer_chrome_reserve())
             .bg(fill_color)
             .border_l(theme::RAIL_WIDTH_THICK)
             .border_color(rail_color)

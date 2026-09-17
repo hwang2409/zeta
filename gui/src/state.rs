@@ -1477,7 +1477,7 @@ fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey, turn: u64) -> Transcrip
 /// lights up the diff card. Returns `None` for non-edit tool names AND
 /// for edit calls whose arguments carry neither pair — a bare `write`
 /// that only names a path keeps the pre-r2 body-only expanded shape.
-pub(crate) fn extract_edit_data(
+pub fn extract_edit_data(
     name: &str,
     arguments: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<EditData> {
