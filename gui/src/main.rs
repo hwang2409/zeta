@@ -64,6 +64,15 @@ mod chrome {
     pub const CHIP_REMOVE_LABEL: &str = "Remove attachment";
     pub const ATTACH_LIMIT_ERROR: &str = "Attach up to 4 images, 512 KiB total.";
     pub const ATTACH_DECODE_ERROR: &str = "could not decode this image";
+    /// Composer label chip (ZETA-135): sits at the top of the composer
+    /// border, tells the user what the input line is for. Direction verb
+    /// ("ask or steer") + the agent's name mirror the wiki session-view
+    /// composer.
+    pub const COMPOSER_LABEL: &str = "ask or steer zeta";
+    /// Placeholder for the composer textarea (ZETA-135): a full-sentence
+    /// prompt that reads as an invitation rather than the pre-ZETA-135
+    /// two-word "Message zeta" imperative. Matches the wiki look.
+    pub const COMPOSER_PLACEHOLDER: &str = "Ask a question or give zeta a new direction…";
 }
 
 /// Cap on pending attachments before a batch trips the size-limit error.
@@ -321,7 +330,7 @@ impl ZetaView {
         // fixture.
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Message zeta")
+                .placeholder(chrome::COMPOSER_PLACEHOLDER)
                 .submit_on_enter(true)
         });
         cx.subscribe_in(
@@ -2452,6 +2461,20 @@ impl ZetaView {
                         style.border_color(cx.theme().drag_border)
                     })
             })
+            // ZETA-135: composer label chip. A quiet header line above the
+            // input row that reads "ask or steer <agent>" — the wiki
+            // session-view composer's most distinctive chrome cue. It rides
+            // the muted foreground tier so it does not fight the input row
+            // for weight; the input row + Send stay the primary control.
+            .child(
+                div()
+                    .debug_selector(|| "composer-label".into())
+                    .flex_shrink_0()
+                    .mb_1()
+                    .text_size(theme::label_small(cx.theme().font_size))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(chrome::COMPOSER_LABEL),
+            )
             .when(self.slash_menu.open, |composer| {
                 composer.child(self.render_slash_menu(cx))
             })
