@@ -952,6 +952,14 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
     // pushing single-row content off the visible list viewport), which
     // the hard constraint forbids. See the ladder row and PR body.
     let zeta133_after_path = env::var_os("ZETA_GUI_SMOKE_ZETA133_AFTER_IMAGE");
+    // ZETA-133-D3 captures. Two short-transcript scenes — one anchored on
+    // the top (pre-D3 shipped state) and one anchored on the bottom (this
+    // PR). Both replace `view.transcript` with a scroller built at the
+    // requested alignment so the ONE smoke cycle produces both PNGs; every
+    // other state (session metadata, connection banner, sidebar rows) is
+    // seeded identically so the pair reads as a controlled comparison.
+    let zeta133_d3_before_path = env::var_os("ZETA_GUI_SMOKE_ZETA133_D3_BEFORE_IMAGE");
+    let zeta133_d3_after_path = env::var_os("ZETA_GUI_SMOKE_ZETA133_D3_AFTER_IMAGE");
     view.update(cx, |_, cx| {
         cx.spawn_in(window, async move |view, cx| {
             let mut phase = 0;
@@ -1353,6 +1361,52 @@ pub fn start(view: &Entity<ZetaView>, window: &mut Window, cx: &mut App) {
                                         .expect("native renderer zeta-133 after capture")
                                         .save(PathBuf::from(after_path))
                                         .expect("save zeta-133 after screenshot");
+                                }
+                                // ZETA-133-D3 short-transcript pair. The
+                                // trait ONLY manifests with content
+                                // shorter than the viewport, so the
+                                // before/after scene here is a single
+                                // user-plus-assistant turn on the
+                                // shipped 1100×760 window. `before`
+                                // rebuilds the scroller with
+                                // `ListAlignment::Top` (pre-D3 shipped
+                                // state); `after` rebuilds with
+                                // `ListAlignment::Bottom` (this PR).
+                                for (out, alignment) in [
+                                    (&zeta133_d3_before_path, gpui::ListAlignment::Top),
+                                    (&zeta133_d3_after_path, gpui::ListAlignment::Bottom),
+                                ] {
+                                    let Some(out) = out else { continue };
+                                    entity.update(cx, |view, cx| {
+                                        view.state.connection = ConnectionState::Connected;
+                                        view.state.transcript = vec![
+                                            TranscriptEntry::User(
+                                                "hi zeta — quick question about bottom \
+                                                 anchoring."
+                                                    .into(),
+                                            ),
+                                            TranscriptEntry::Assistant(
+                                                "short transcripts rest on the viewport \
+                                                 bottom under the wiki session-view \
+                                                 convention."
+                                                    .into(),
+                                            ),
+                                        ];
+                                        let count = view.state.transcript.len();
+                                        view.transcript = cx.new(|cx| {
+                                            MessageScrollerState::new_with_alignment(
+                                                count, alignment, cx,
+                                            )
+                                        });
+                                        cx.notify();
+                                    });
+                                    window.render_frame(cx);
+                                    window.render_frame(cx);
+                                    window
+                                        .render_to_image()
+                                        .expect("native renderer zeta-133-d3 capture")
+                                        .save(PathBuf::from(out))
+                                        .expect("save zeta-133-d3 screenshot");
                                 }
                                 // ZETA-134 D6: expanded bash receipt with
                                 // the reshaped tail. Card.expanded=true so
