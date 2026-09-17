@@ -284,36 +284,27 @@ fn scan_native_gutter(
 ) {
     let scale = window.scale_factor();
     let window_width = f32::from(window.bounds().size.width);
-    let main_left = f32::from(theme::SIDEBAR_WIDTH);
-    let main_width = (window_width - main_left).max(0.);
-    // `content_right` is derived from the same unified frame, gutter, and
-    // body cap the renderer uses:
+    let main_left = theme::SIDEBAR_WIDTH;
+    let main_width = px((window_width - f32::from(main_left)).max(0.));
+    // `body_right` comes from the same geometry helper used by
+    // `transcript_body_pair`, so this scan has no second copy of the frame,
+    // padding, gutter, or body-edge math:
     //
     // * MIXED transcript rows (tool receipts + assistant prose) — the
-    //   scan uses `TRANSCRIPT_MAX_WIDTH`. Tool receipts and fenced
-    //   error blocks legitimately paint out to that wider cap; a
-    //   narrower gutter would flag every receipt paint at a wide
-    //   centered viewport as a glyph escape.
+    //   scan uses `wide_body_max_width()`, the body residue inside the
+    //   `TRANSCRIPT_MAX_WIDTH` frame. Tool receipts and fenced error blocks
+    //   legitimately paint out to that wider body cap.
     // * PROSE-ONLY transcript rows — the scan starts at the prose body edge
     //   inside the centered unified frame. This catches a prose glyph that
     //   escapes the body but stays inside the frame's right padding.
     //
-    let frame_width = f32::from(theme::TRANSCRIPT_MAX_WIDTH).min(main_width);
-    let frame_left = main_left + (main_width - frame_width) / 2.;
     let body_cap = if prose_only {
-        f32::from(theme::prose_body_max_width(font_size))
+        theme::prose_body_max_width(font_size)
     } else {
-        f32::from(theme::wide_body_max_width())
+        theme::wide_body_max_width()
     };
-    let available_body =
-        (frame_width - 2. * theme::PROSE_ROW_PADDING_X - f32::from(theme::LEADING_GUTTER_WIDTH))
-            .max(0.);
-    let body_width = body_cap.min(available_body);
-    let content_right = frame_left
-        + theme::PROSE_ROW_PADDING_X
-        + f32::from(theme::LEADING_GUTTER_WIDTH)
-        + body_width;
-    let x_start = (content_right * scale).ceil() as u32;
+    let geometry = theme::transcript_body_geometry(main_left, main_width, body_cap);
+    let x_start = (f32::from(geometry.body_right) * scale).ceil() as u32;
     let x_end = image
         .width()
         .saturating_sub((f32::from(NATIVE_GUARD_SCROLLBAR_WIDTH) * scale).ceil() as u32);
@@ -342,9 +333,10 @@ fn scan_native_gutter(
             "native pixel gutter guard failed: shape={shape} size={font_size:?} \
              prose_only={prose_only} x_range={escape_start}..={escape_end} \
              gutter={x_start}..{x_end} window_width={window_width} scale={scale} \
-             frame_width={frame_width} body_width={body_width} content_right={content_right} \
+             frame_width={} body_width={} content_right={} \
              y_range={y_start}..{y_end} background={background:?} \
-             masked={scrollbar_masks:?}"
+             masked={scrollbar_masks:?}",
+            geometry.frame_width, geometry.body_width, geometry.body_right,
         );
     }
     println!(
@@ -395,7 +387,7 @@ fn scan_inline_flow_recorder(shape: &str, font_size: Pixels, achieved: (u32, u32
     }
 }
 
-fn native_guard_viewports(window: &Window, cx: &App) -> [gpui::Size<Pixels>; 2] {
+fn native_guard_viewports(window: &Window, cx: &App, mutation: bool) -> [gpui::Size<Pixels>; 2] {
     let display_size = window
         .display(cx)
         .map(|display| display.visible_bounds().size)
@@ -404,17 +396,29 @@ fn native_guard_viewports(window: &Window, cx: &App) -> [gpui::Size<Pixels>; 2] 
         display_size.width.min(px(2204.)),
         display_size.height.min(px(1608.)),
     );
-    [
-        gpui::size(maximum.width * 0.7, maximum.height * 0.7),
-        gpui::size(maximum.width * 0.9, maximum.height * 0.9),
-    ]
+    if mutation {
+        // At the default 13px font, the old edge is later than the new edge
+        // above 1030.88px. At 1100px, the old pre-ZETA-133 edge is
+        // 216 + (884 - 738.88) / 2 + 738.88 - 16 = 1011.44px, while the
+        // shared body edge is 216 + 16 + 38 + min(706.88, 884 - 32 - 38)
+        // = 976.88px. The forced +8px text width lands between them.
+        [
+            gpui::size(maximum.width.min(px(1100.)), maximum.height * 0.7),
+            gpui::size(maximum.width * 0.9, maximum.height * 0.9),
+        ]
+    } else {
+        [
+            gpui::size(maximum.width * 0.7, maximum.height * 0.7),
+            gpui::size(maximum.width * 0.9, maximum.height * 0.9),
+        ]
+    }
 }
 
 async fn run_native_wrap_guards(view: Entity<ZetaView>, cx: &mut gpui::AsyncWindowContext) {
-    let viewports = cx
-        .update(|window, cx| native_guard_viewports(window, cx))
-        .expect("native guard window remains open");
     let mutation = env::var_os(row_text::sel::NATIVE_GUARD_FORCE_TEXT_WIDTH_ENV).is_some();
+    let viewports = cx
+        .update(|window, cx| native_guard_viewports(window, cx, mutation))
+        .expect("native guard window remains open");
     let font_sizes = if mutation {
         vec![theme::DEFAULT_FONT_SIZE]
     } else {

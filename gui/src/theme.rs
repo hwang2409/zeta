@@ -441,6 +441,37 @@ pub fn wide_body_max_width() -> Pixels {
         - f32::from(LEADING_GUTTER_WIDTH))
 }
 
+/// Geometry shared by the transcript renderer and the native pixel guard.
+/// Keeping this calculation here makes frame, padding, and gutter changes
+/// update both consumers together.
+#[derive(Debug, Clone, Copy)]
+pub struct TranscriptBodyGeometry {
+    pub frame_width: Pixels,
+    pub body_width: Pixels,
+    pub body_right: Pixels,
+}
+
+pub fn transcript_body_geometry(
+    main_left: Pixels,
+    main_width: Pixels,
+    body_cap: Pixels,
+) -> TranscriptBodyGeometry {
+    let main_width = f32::from(main_width).max(0.);
+    let frame_width = f32::from(TRANSCRIPT_MAX_WIDTH).min(main_width);
+    let frame_left = f32::from(main_left) + (main_width - frame_width) / 2.;
+    let available_body =
+        (frame_width - 2. * PROSE_ROW_PADDING_X - f32::from(LEADING_GUTTER_WIDTH)).max(0.);
+    let body_width = f32::from(body_cap).min(available_body);
+    TranscriptBodyGeometry {
+        frame_width: px(frame_width),
+        body_width: px(body_width),
+        body_right: px(frame_left
+            + PROSE_ROW_PADDING_X
+            + f32::from(LEADING_GUTTER_WIDTH)
+            + body_width),
+    }
+}
+
 /// Effective text measure INSIDE the prose row's horizontal padding —
 /// `prose_max_width(base)` minus 2× `PROSE_ROW_PADDING_X`. Tests and the
 /// render-time text-run recorder both route through this so a padding

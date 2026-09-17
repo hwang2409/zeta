@@ -705,6 +705,9 @@ pub(crate) fn transcript_body_pair(
     body: AnyElement,
     body_max_width: gpui::Pixels,
 ) -> gpui::Div {
+    let body_width =
+        theme::transcript_body_geometry(px(0.), theme::TRANSCRIPT_MAX_WIDTH, body_max_width)
+            .body_width;
     div()
         .flex()
         .items_start()
@@ -722,7 +725,7 @@ pub(crate) fn transcript_body_pair(
                 .debug_selector(|| sel::TRANSCRIPT_BODY.into())
                 .min_w_0()
                 .flex_1()
-                .max_w(body_max_width)
+                .max_w(body_width)
                 .child(body),
         )
 }
