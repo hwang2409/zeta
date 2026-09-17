@@ -3395,7 +3395,6 @@ pub(crate) fn record_text_geometry<F>(
 /// (shaped-wrap geometry) — it captures WHAT reached the paint call, not
 /// the rebuilt model, so a broken renderer that still constructs the model
 /// no longer looks green.
-#[cfg_attr(not(any(test, feature = "smoke-test")), allow(unused_variables))]
 #[must_use = "record_text_child returns the text so callers must pass it to .child(...)"]
 pub(crate) fn record_text_child<F, T>(row_id: F, text: T) -> T
 where
@@ -3404,6 +3403,8 @@ where
 {
     #[cfg(any(test, feature = "smoke-test"))]
     paint_text_log::record(&row_id(), text.as_ref());
+    #[cfg(not(any(test, feature = "smoke-test")))]
+    let _ = row_id;
     text
 }
 
