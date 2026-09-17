@@ -10,7 +10,7 @@
 //! active palette out of a lazily initialised global.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     sync::{Arc, LazyLock},
 };
 
@@ -52,8 +52,13 @@ pub const TRANSCRIPT_ROW_GAP: Pixels = px(14.);
 pub const COMPOSER_PADDING_Y: Pixels = px(8.);
 pub const COMPOSER_PADDING_X: Pixels = px(10.);
 
-/// Composer minimum height (contract: min-height 64px).
-pub const COMPOSER_MIN_HEIGHT: Pixels = px(64.);
+// COMPOSER_MIN_HEIGHT (px(64.), pre-ZETA-135) is superseded by
+// `composer_chrome_reserve()` below — the composer's actual chrome floor
+// is 102px on the shipped shape, so a 64px min was already dominated by
+// content on every render. The new function is the single source of
+// truth (Finding 5); the render layer's `.min_h(...)` reads it, and the
+// smoke driver's pixel-gutter guard reads the same function for its
+// scan y-range.
 
 /// Send button minimum width. Kept square, mono 600, and just wide enough for
 /// the word "Send" plus breathing room per the contract.
@@ -72,6 +77,45 @@ pub const STREAM_DOT_SIZE: Pixels = px(7.);
 /// Composer target-line row height — the muted "→ model" label above the
 /// textarea. Kept tight so the 64px composer floor stays honest.
 pub const COMPOSER_TARGET_HEIGHT: Pixels = px(16.);
+
+/// Composer label chip row height (ZETA-135). Fixed so the composer's
+/// overall chrome height stays deterministic across the 11px → 18px
+/// appearance range — the native pixel-gutter guard's shared
+/// `composer_chrome_reserve()` reads the composer's fixed chrome
+/// height to size the transcript scan y-range; a font-size-varying
+/// chip would leak composer fill into the scanned transcript area at
+/// large font sizes. 18px accommodates `label_small(MAX_FONT_SIZE_PX)`
+/// (17px at the 18px picker step) with a 1px baseline slack.
+pub const COMPOSER_LABEL_HEIGHT: Pixels = px(18.);
+
+/// Vertical gap the composer label chip carries below itself (`mb_1`
+/// in Tailwind spacing = 4px). Named so the shared height reserve
+/// can sum it without a magic number.
+pub const COMPOSER_LABEL_GAP: Pixels = px(4.);
+
+/// Composer input row height (the textarea's `.h(...)`). Named so the
+/// shared height reserve can sum it without a magic number.
+pub const COMPOSER_INPUT_HEIGHT: Pixels = px(44.);
+
+/// Vertical gap between the composer input row and the footer strip
+/// (`mt_1`). Named so the shared height reserve can sum it.
+pub const COMPOSER_FOOTER_GAP: Pixels = px(4.);
+
+/// Total fixed vertical chrome the composer paints, summed from the
+/// named children ONCE (Finding 5): the smoke driver's pixel-gutter
+/// guard reads THIS function instead of a hardcoded literal, so a
+/// bump to any single composer chrome constant propagates without a
+/// paired smoke-side edit. Fields in top-to-bottom paint order.
+///
+pub fn composer_chrome_reserve() -> Pixels {
+    COMPOSER_PADDING_Y
+        + COMPOSER_LABEL_HEIGHT
+        + COMPOSER_LABEL_GAP
+        + COMPOSER_INPUT_HEIGHT
+        + COMPOSER_FOOTER_GAP
+        + COMPOSER_TARGET_HEIGHT
+        + COMPOSER_PADDING_Y
+}
 
 /// Sidebar container width — the wiki agent-run column pins this at 216px so
 /// the panel reads as a fixed column rather than a fluid drawer.
@@ -650,6 +694,14 @@ pub struct ComposerRoles {
     pub target_label: Hsla,
     pub target_value: Hsla,
     pub send_disabled_outline: Hsla,
+    /// Foreground for chrome text painted DIRECTLY on the composer's fill —
+    /// the "ask or steer" label chip and any other quiet-but-legible cue
+    /// (ZETA-135 review r1 finding 3). Muted foreground fails WCAG AA on
+    /// Gruvbox Dark's `composer_focus_fill` (~4.31:1); this role routes
+    /// through `theme.foreground` so every palette clears 4.5:1 on BOTH
+    /// `fill_rest` and `fill_focus`. Contract line pinned by
+    /// `composer_chrome_text_clears_wcag_aa_across_every_palette`.
+    pub chrome_text: Hsla,
 }
 
 /// Semantic composer tokens routed through `cx.theme()`. Consumers read here
@@ -665,6 +717,35 @@ pub fn composer_roles(cx: &App) -> ComposerRoles {
         target_label: theme.muted_foreground,
         target_value: theme.primary,
         send_disabled_outline: palette::border_active(),
+        chrome_text: theme.foreground,
+    }
+}
+
+/// Semantic tokens for the tool-receipt diff card (ZETA-135). The card
+/// paints two side-by-side panes — removed (left, danger-tinted) and added
+/// (right, success-tinted) — so an edit receipt reads as a real diff, not a
+/// dumped blob. Colors come from the palette's `danger`/`success` at ~14%
+/// opacity so the tints sit under readable text without turning the pane
+/// into a solid slab. Gutter line-number bg is the sidebar surface so a
+/// pane's numeric column reads as a companion strip. Contrast is verified by
+/// `diff_pane_text_clears_wcag_aa_across_every_palette`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DiffRoles {
+    pub add_bg: Hsla,
+    pub remove_bg: Hsla,
+    pub gutter_bg: Hsla,
+    pub gutter_fg: Hsla,
+    pub text: Hsla,
+}
+
+pub fn diff_roles(cx: &App) -> DiffRoles {
+    let theme = cx.theme();
+    DiffRoles {
+        add_bg: with_alpha(theme.success, 0.14),
+        remove_bg: with_alpha(theme.danger, 0.14),
+        gutter_bg: theme.sidebar,
+        gutter_fg: theme.muted_foreground,
+        text: theme.foreground,
     }
 }
 
@@ -681,6 +762,34 @@ fn hex(rgb: u32) -> Hsla {
 // accessor invoked during `sync_base` sees the new palette.
 thread_local! {
     static ACTIVE: RefCell<Appearance> = RefCell::new(Appearance::default());
+    // Latest observed viewport width, refreshed at the top of every
+    // `ZetaView::render`. The virtual-scroller row closure runs with only
+    // `&App` (no `&Window`), so a renderer that needs to switch layout on
+    // viewport width reads this instead. Same rationale as `ACTIVE` — one
+    // thread per gpui worker.
+    static VIEWPORT_WIDTH: Cell<Pixels> = const { Cell::new(px(0.)) };
+}
+
+/// Breakpoint at which the diff card stacks its panes vertically (each
+/// full-width) instead of splitting horizontally. Below this width the
+/// side-by-side layout truncates so aggressively that the removed and
+/// added lines lose their identity — stacking keeps both panes readable.
+pub const NARROW_DIFF_STACK_WIDTH: Pixels = px(640.);
+
+/// Update the thread-local viewport width from a Window. Called once per
+/// frame from `ZetaView::render`.
+pub fn set_viewport_width(width: Pixels) {
+    VIEWPORT_WIDTH.with(|slot| slot.set(width));
+}
+
+/// Read the thread-local viewport width. Returns the last value set by
+/// `set_viewport_width`, or `px(0.)` on a worker that has not rendered
+/// yet — a caller that wants "assume wide by default" should compare
+/// against a threshold with a `>` so an unset zero reads as narrow only
+/// when narrow-mode fallback is safe (the diff card's stacked layout is
+/// safe, so `<` against the threshold is correct).
+pub fn viewport_width() -> Pixels {
+    VIEWPORT_WIDTH.with(|slot| slot.get())
 }
 
 fn active_palette() -> &'static Palette {
@@ -1922,9 +2031,32 @@ mod tests {
     fn transcript_and_composer_tokens_land_on_the_wiki_contract() {
         assert_eq!(TRANSCRIPT_MAX_WIDTH, px(1024.));
         assert_eq!(TRANSCRIPT_ROW_GAP, px(14.));
-        assert_eq!(COMPOSER_MIN_HEIGHT, px(64.));
+        // COMPOSER_MIN_HEIGHT (px(64.)) was superseded by
+        // `composer_chrome_reserve()` (Finding 5). Verify the reserve
+        // clears the pre-ZETA-135 64px floor so no theme consumer that
+        // used to gate on the 64px minimum silently loses room.
+        assert!(composer_chrome_reserve() >= px(64.));
         assert_eq!(COMPOSER_PADDING_Y, px(8.));
         assert_eq!(COMPOSER_PADDING_X, px(10.));
+        // ZETA-135: label chip row height. The smoke driver's
+        // pixel-gutter guard reads `composer_chrome_reserve()` — a
+        // single shared summation of every fixed composer child — so
+        // a bump here propagates without the paired smoke-side edit
+        // that the round-1 shape required (review r1 finding 5).
+        assert_eq!(COMPOSER_LABEL_HEIGHT, px(18.));
+        assert_eq!(COMPOSER_LABEL_GAP, px(4.));
+        assert_eq!(COMPOSER_INPUT_HEIGHT, px(44.));
+        assert_eq!(COMPOSER_FOOTER_GAP, px(4.));
+        assert_eq!(
+            composer_chrome_reserve(),
+            COMPOSER_PADDING_Y
+                + COMPOSER_LABEL_HEIGHT
+                + COMPOSER_LABEL_GAP
+                + COMPOSER_INPUT_HEIGHT
+                + COMPOSER_FOOTER_GAP
+                + COMPOSER_TARGET_HEIGHT
+                + COMPOSER_PADDING_Y,
+        );
         assert_eq!(SEND_BUTTON_MIN_WIDTH, px(82.));
         assert_eq!(RAIL_WIDTH_THICK, px(3.));
         assert_eq!(RAIL_WIDTH_THIN, px(1.));
@@ -2144,6 +2276,143 @@ mod tests {
                 "{}: text_muted/panel contrast {ratio:.2}:1 fails WCAG AA \
                  (need >=4.5:1) — modal esc hint + row descriptions ride \
                  this pair; see modal_title + settings_row",
+                id.label(),
+            );
+        }
+    }
+
+    /// ZETA-135 review r1 finding 3: the composer's "ask or steer" chip is
+    /// painted on the composer's fill — `theme.muted` at rest and
+    /// `composer_focus_fill` when focused. `muted_foreground` fails WCAG AA
+    /// on Gruvbox Dark's `composer_focus_fill` (~4.31:1). `chrome_text`
+    /// routes through `theme.foreground` instead; this test locks the
+    /// contract across every palette AND both fill states, so a future
+    /// palette author who dims `text` past 4.5:1 on either fill trips here.
+    #[gpui::test]
+    fn composer_chrome_text_clears_wcag_aa_across_every_palette(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        for id in ThemeId::ALL {
+            let appearance = Appearance {
+                theme: *id,
+                ..Appearance::default()
+            };
+            cx.update(|cx| apply_with(cx, &appearance));
+            cx.update(|cx| {
+                let roles = composer_roles(cx);
+                let rest = contrast_ratio(roles.chrome_text, roles.fill_rest);
+                let focus = contrast_ratio(roles.chrome_text, roles.fill_focus);
+                assert!(
+                    rest >= 4.5,
+                    "{}: composer chrome_text on fill_rest {rest:.2}:1 fails WCAG AA (need >=4.5:1)",
+                    id.label(),
+                );
+                assert!(
+                    focus >= 4.5,
+                    "{}: composer chrome_text on fill_focus {focus:.2}:1 fails WCAG AA (need >=4.5:1)",
+                    id.label(),
+                );
+            });
+        }
+        cx.update(apply);
+        reset_active_default();
+    }
+
+    /// ZETA-135 review r1 finding 3: the expanded receipt paints as an
+    /// inset panel with `theme.sidebar` bg and `theme.foreground` header
+    /// text; the body sits at `theme.muted_foreground`. Both pairs must
+    /// clear AA on every palette so the wiki-look restyle does not smuggle
+    /// an illegible surface into a shipped theme.
+    #[gpui::test]
+    fn inset_panel_text_clears_wcag_aa_across_every_palette(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        for id in ThemeId::ALL {
+            let appearance = Appearance {
+                theme: *id,
+                ..Appearance::default()
+            };
+            cx.update(|cx| apply_with(cx, &appearance));
+            cx.update(|cx| {
+                let theme = cx.theme();
+                let header = contrast_ratio(theme.foreground, theme.sidebar);
+                let body = contrast_ratio(theme.muted_foreground, theme.sidebar);
+                assert!(
+                    header >= 4.5,
+                    "{}: inset panel header (foreground/sidebar) {header:.2}:1 fails AA",
+                    id.label(),
+                );
+                assert!(
+                    body >= 4.5,
+                    "{}: inset panel body (muted_foreground/sidebar) {body:.2}:1 fails AA",
+                    id.label(),
+                );
+            });
+        }
+        cx.update(apply);
+        reset_active_default();
+    }
+
+    /// ZETA-135 review r1 finding 3: the diff card paints readable text on
+    /// tinted add/remove panes composited over the sidebar surface. The
+    /// contrast bar reads against the COMPOSITED background (tint over
+    /// sidebar), matching what the eye actually sees.
+    #[gpui::test]
+    fn diff_pane_text_clears_wcag_aa_across_every_palette(cx: &mut TestAppContext) {
+        fn composite(fg: Hsla, bg: Hsla) -> Hsla {
+            let a = fg.a.clamp(0.0, 1.0);
+            let f_rgb = fg.to_rgb();
+            let b_rgb = bg.to_rgb();
+            let r = a * f_rgb.r + (1.0 - a) * b_rgb.r;
+            let g = a * f_rgb.g + (1.0 - a) * b_rgb.g;
+            let b = a * f_rgb.b + (1.0 - a) * b_rgb.b;
+            Hsla::from(gpui::Rgba { r, g, b, a: 1.0 })
+        }
+        cx.update(gpui_kit::init);
+        for id in ThemeId::ALL {
+            let appearance = Appearance {
+                theme: *id,
+                ..Appearance::default()
+            };
+            cx.update(|cx| apply_with(cx, &appearance));
+            cx.update(|cx| {
+                let roles = diff_roles(cx);
+                let sidebar = cx.theme().sidebar;
+                let over_add = composite(roles.add_bg, sidebar);
+                let over_remove = composite(roles.remove_bg, sidebar);
+                let add_ratio = contrast_ratio(roles.text, over_add);
+                let remove_ratio = contrast_ratio(roles.text, over_remove);
+                assert!(
+                    add_ratio >= 4.5,
+                    "{}: diff add text on tint {add_ratio:.2}:1 fails AA",
+                    id.label(),
+                );
+                assert!(
+                    remove_ratio >= 4.5,
+                    "{}: diff remove text on tint {remove_ratio:.2}:1 fails AA",
+                    id.label(),
+                );
+                let gutter_ratio = contrast_ratio(roles.gutter_fg, roles.gutter_bg);
+                assert!(
+                    gutter_ratio >= 4.5,
+                    "{}: diff gutter fg/bg {gutter_ratio:.2}:1 fails AA",
+                    id.label(),
+                );
+            });
+        }
+        cx.update(apply);
+        reset_active_default();
+    }
+
+    /// ZETA-135 turn-metadata footer text sits on the canvas at
+    /// muted-foreground. Verify AA across palettes so a future palette drift
+    /// cannot make the footer illegible.
+    #[test]
+    fn turn_footer_text_clears_wcag_aa_across_every_palette() {
+        for id in ThemeId::ALL {
+            let p = id.palette();
+            let ratio = contrast_ratio(p.text_muted, p.canvas);
+            assert!(
+                ratio >= 4.5,
+                "{}: turn-footer text_muted/canvas {ratio:.2}:1 fails AA",
                 id.label(),
             );
         }

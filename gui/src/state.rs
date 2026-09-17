@@ -1,5 +1,5 @@
 use crate::{
-    cards::{Card, OutputTail},
+    cards::{Card, EditData, OutputTail},
     markdown::Markdown,
 };
 use std::collections::HashMap;
@@ -1156,16 +1156,23 @@ pub fn tool_excerpt(
     name: &str,
     arguments: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
-    let key = match name.to_ascii_lowercase().as_str() {
-        "bash" | "exec" | "shell" => Some("command"),
-        "read" | "write" | "edit" | "list" => Some("path"),
-        "fetch" | "webfetch" => Some("url"),
-        _ => None,
-    };
-    let raw = key
-        .and_then(|k| arguments.get(k))
-        .and_then(argument_text)
-        .or_else(|| arguments.values().find_map(argument_text));
+    let kind = crate::row_text::ToolKind::classify(name);
+    // Priority: try every keyed lookup for this kind, then fall back to the
+    // first primitive value ONLY for Generic. A classified kind that misses
+    // its keys returns None so the panel header stays empty — a
+    // `str_replace` without a `path` argument never surfaces its
+    // replacement text as the header (round-2 finding).
+    let keyed = kind
+        .excerpt_keys()
+        .iter()
+        .find_map(|k| arguments.get(*k).and_then(argument_text));
+    let raw = keyed.or_else(|| {
+        if matches!(kind, crate::row_text::ToolKind::Generic) {
+            arguments.values().find_map(argument_text)
+        } else {
+            None
+        }
+    });
     let first_line = raw
         .as_deref()
         .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))?;
@@ -1448,10 +1455,12 @@ fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey, turn: u64) -> Transcrip
         key.agent_instance_id.clone()
     };
     let agent_label = agent_label.map(|label| bounded_summary(&label));
+    let edit_data = extract_edit_data(&tool_call.name, &tool_call.arguments);
     TranscriptEntry::Tool {
         card: Card {
             agent_label,
             turn,
+            edit_data,
             ..Default::default()
         },
         key,
@@ -1467,11 +1476,130 @@ fn tool_entry(tool_call: &ToolCall, key: ToolReceiptKey, turn: u64) -> Transcrip
     }
 }
 
+/// ZETA-135 (Trait 2 — diff card). Extract the `old_string`/`new_string`
+/// pair from an edit-shaped tool call at construction time so the render
+/// layer paints a real diff instead of a dumped blob. Accepts both the
+/// full-name (`old_string`/`new_string`) and the shorthand
+/// (`old_str`/`new_str`) shapes so a server that uses either convention
+/// lights up the diff card. Returns `None` for non-edit tool names AND
+/// for edit calls whose arguments carry neither pair — a bare `write`
+/// that only names a path keeps the pre-r2 body-only expanded shape.
+pub fn extract_edit_data(
+    name: &str,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Option<EditData> {
+    if !crate::row_text::ToolKind::classify(name).is_diff_capable() {
+        return None;
+    }
+    let old_text = arguments
+        .get("old_string")
+        .or_else(|| arguments.get("old_str"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let new_text = arguments
+        .get("new_string")
+        .or_else(|| arguments.get("new_str"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if old_text.is_empty() && new_text.is_empty() {
+        return None;
+    }
+    Some(EditData {
+        old_text: old_text.to_owned(),
+        new_text: new_text.to_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::{EventError, ToolResult};
     use serde_json::json;
+
+    #[test]
+    fn tool_excerpt_never_returns_replacement_text_for_classified_kinds() {
+        // Round-2 finding 2: the pre-fix excerpt picker fell back to
+        // `arguments.values().find_map(argument_text)` whenever the tool
+        // name did not match a hardcoded key, so a `str_replace` without
+        // a `path` argument could surface its `new_string` replacement
+        // text as the panel header — order depended on JSON map
+        // iteration.
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "new_string".into(),
+            json!("REPLACEMENT TEXT MUST NOT LEAK INTO HEADER"),
+        );
+        args.insert(
+            "old_string".into(),
+            json!("ORIGINAL TEXT MUST NOT LEAK INTO HEADER"),
+        );
+        // No `path` argument — the classified Edit kind must NOT fall back.
+        assert_eq!(
+            tool_excerpt("str_replace", &args),
+            None,
+            "a classified Edit tool without a path key must return None, \
+             not any arbitrary argument value"
+        );
+        // With a path present, the excerpt IS the path — not the
+        // replacement text — regardless of the arguments map's iteration
+        // order.
+        args.insert("path".into(), json!("hot.md"));
+        assert_eq!(
+            tool_excerpt("str_replace", &args).as_deref(),
+            Some("hot.md"),
+        );
+        // `websearch` (classified as Search) picks `query` over any other
+        // primitive argument.
+        let mut search_args = serde_json::Map::new();
+        search_args.insert("extra".into(), json!("noise"));
+        search_args.insert("query".into(), json!("rust chrono rfc3339"));
+        assert_eq!(
+            tool_excerpt("websearch", &search_args).as_deref(),
+            Some("rust chrono rfc3339"),
+        );
+        // A truly-unknown tool still falls back to the first primitive
+        // (Generic kind — no keyed lookup, so the fallback stays live).
+        let mut unknown = serde_json::Map::new();
+        unknown.insert("solo".into(), json!("only value"));
+        assert_eq!(
+            tool_excerpt("nonexistent", &unknown).as_deref(),
+            Some("only value"),
+        );
+    }
+
+    #[test]
+    fn extract_edit_data_covers_str_replace_and_multi_edit() {
+        // The pre-fix `extract_edit_data` enumerated
+        // `edit|write|str_replace|multi_edit`, matching the diff-card
+        // gate, but the shared ToolKind model now drives all three sites
+        // (glyph + excerpt + diff). Pin the diff-capable set through the
+        // model so a drift here fails the same assertion the glyph and
+        // excerpt tests do.
+        for name in [
+            "edit",
+            "write",
+            "str_replace",
+            "str_replace_editor",
+            "multi_edit",
+        ] {
+            let mut args = serde_json::Map::new();
+            args.insert("old_string".into(), json!("a"));
+            args.insert("new_string".into(), json!("b"));
+            let data = extract_edit_data(name, &args)
+                .unwrap_or_else(|| panic!("{name} must build EditData when old/new are present"));
+            assert_eq!(data.old_text, "a");
+            assert_eq!(data.new_text, "b");
+        }
+        for name in ["bash", "read", "list", "fetch", "unknown"] {
+            let mut args = serde_json::Map::new();
+            args.insert("old_string".into(), json!("a"));
+            args.insert("new_string".into(), json!("b"));
+            assert!(
+                extract_edit_data(name, &args).is_none(),
+                "{name} must NOT build EditData — not a diff-capable tool"
+            );
+        }
+    }
 
     #[test]
     fn canceled_server_results_never_show_success() {

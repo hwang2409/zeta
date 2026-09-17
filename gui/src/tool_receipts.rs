@@ -16,7 +16,9 @@ use gpui::{div, prelude::*, px, AnyElement, App, WeakEntity};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, StyledExt};
 
 use super::{record_state, state_text, theme, tool_state_color, ZetaView};
-use zeta_gui::row_text::{self, sel, RowText, ToolGroupRowText, ToolRowText};
+use zeta_gui::row_text::{
+    self, sel, DiffPaneText, EditDiffText, RowText, ToolGroupRowText, ToolRowText,
+};
 use zeta_gui::state::TranscriptEntry;
 
 impl ZetaView {
@@ -52,16 +54,20 @@ impl ZetaView {
         cx: &App,
     ) -> AnyElement {
         let ToolRowText {
+            kind_glyph,
             tool_label,
             excerpt,
             metadata_label,
             hover_hint,
             tail_omitted_hint,
             body,
+            panel_header,
+            edit_diff,
         } = text;
         let tool_label = tool_label.to_owned();
         let excerpt = excerpt.map(str::to_owned);
         let body = body.map(str::to_owned);
+        let panel_header = panel_header.map(str::to_owned);
         let is_error = entry.unsuccessful();
         // State is signalled by COLOR ONLY. Running sits at normal text tier;
         // done fades to muted; failed/canceled land on danger. The wiki
@@ -114,6 +120,21 @@ impl ZetaView {
                         })
                         .size(theme::label_small(cx.theme().font_size))
                         .text_color(record_state(|| sel::tool_chevron(index), state_color)),
+                    )
+                    .child(
+                        // ZETA-135 (Trait 1 — kind glyph). Painted BEFORE
+                        // the tool label so scanning the transcript reads
+                        // the row's KIND before its identity — shell/edit/
+                        // fetch/gear (laws-of-ux Selective Attention +
+                        // Chunking). Same tier as the tool label so the
+                        // pair reads as one leading cluster.
+                        div()
+                            .debug_selector(move || sel::tool_kind_glyph(index))
+                            .flex_shrink_0()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_size(theme::label_small(cx.theme().font_size))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(kind_glyph),
                     )
                     .child(
                         // Tool name label — SMALL and DIM. Sits to the LEFT
@@ -193,32 +214,126 @@ impl ZetaView {
                     ),
             )
             .when_some(body, |row, body| {
+                // ZETA-135: the expanded body reads as an inset panel with a
+                // file-path / command header bar at the top, matching the
+                // wiki session-view look. The outer container carries a full
+                // 1px border (all sides — thin_rail on `.left` keeps the
+                // pre-ZETA-135 error-vs-neutral rail paint test happy) and
+                // a subtle panel fill; the header row shows what ran (file
+                // path for edit/read/write, command for bash, tool name for
+                // MCP) at the foreground tier with a dim border-bottom
+                // separator; the body sits below at the muted tier. Error
+                // state still tints the whole panel's border in danger.
+                let panel_border = if is_error {
+                    cx.theme().danger
+                } else {
+                    cx.theme().border
+                };
                 row.child(
                     div()
                         .debug_selector(move || sel::tool_output(index))
-                        // Indent rail: margin 3/0/5, padding-left 8, 1px rail,
-                        // panel fill — reads as a subordinate body without
-                        // fighting the row's leading verb. Vertical padding sits
-                        // at 2px per the wiki contract, not the 4px `.py_1()`.
-                        .mt(px(3.))
-                        .mb(px(5.))
-                        .pl_2()
-                        .py(px(2.))
-                        .border_l(theme::RAIL_WIDTH_THIN)
-                        .border_color(if is_error {
-                            cx.theme().danger
-                        } else {
-                            cx.theme().border
-                        })
+                        .w_full()
+                        .min_w_0()
+                        .mt(px(4.))
+                        .mb(px(6.))
+                        .border_1()
+                        .border_color(panel_border)
                         .bg(cx.theme().sidebar)
-                        .text_color(cx.theme().muted_foreground)
-                        .when_some(tail_omitted_hint, |output, hint| {
-                            output.child(div().opacity(0.7).child(hint))
+                        .when_some(panel_header, |panel, header| {
+                            // ZETA-135 review r1 finding 4: a long
+                            // command/path had wrapped across multiple
+                            // lines here (`whitespace_normal()`) and blew
+                            // the panel's top edge out. Constrain to ONE
+                            // truncated row so the header always reads as
+                            // a fixed chrome bar regardless of the
+                            // command's width.
+                            panel.child(
+                                div()
+                                    .debug_selector(move || sel::tool_panel_header(index))
+                                    .w_full()
+                                    .min_w_0()
+                                    .px_2()
+                                    .py(px(4.))
+                                    .border_b_1()
+                                    .border_color(cx.theme().border)
+                                    .text_color(cx.theme().foreground)
+                                    .truncate()
+                                    .child(header),
+                            )
                         })
-                        .child(div().whitespace_normal().child(body)),
+                        .when_some(edit_diff, |panel, diff| {
+                            panel.child(self.render_diff_card(index, diff, cx))
+                        })
+                        .child(
+                            div()
+                                .px_2()
+                                .py(px(4.))
+                                .text_color(cx.theme().muted_foreground)
+                                .when_some(tail_omitted_hint, |output, hint| {
+                                    output.child(div().opacity(0.7).child(hint))
+                                })
+                                .child(div().whitespace_normal().child(body)),
+                        ),
                 )
             })
             .into_any_element()
+    }
+
+    /// ZETA-135 (Trait 2 — diff card). Render the two typed diff panes
+    /// under the panel header for an edit receipt. At wide viewports the
+    /// panes sit side-by-side (`flex_1` split); below
+    /// `theme::NARROW_DIFF_STACK_WIDTH` they stack full-width, remove
+    /// above add, so the shrunk half-width layout does not collapse each
+    /// pane's content to one glyph. Every visible string comes from the
+    /// typed `EditDiffText` model built in `row_text::build`; the render
+    /// body itself carries NO literals so the fence stays strict.
+    fn render_diff_card(&self, index: usize, diff: EditDiffText, cx: &App) -> gpui::AnyElement {
+        let roles = theme::diff_roles(cx);
+        let text_size = theme::label_small(cx.theme().font_size);
+        let EditDiffText {
+            remove_pane,
+            add_pane,
+        } = diff;
+        let stacked = theme::viewport_width() < theme::NARROW_DIFF_STACK_WIDTH;
+        let style = DiffPaneStyle {
+            gutter_bg: roles.gutter_bg,
+            gutter_fg: roles.gutter_fg,
+            text_color: roles.text,
+            text_size,
+            stacked,
+        };
+        let remove = diff_pane(
+            remove_pane,
+            sel::tool_diff_remove_pane(index),
+            roles.remove_bg,
+            style,
+        );
+        let add = diff_pane(
+            add_pane,
+            sel::tool_diff_add_pane(index),
+            roles.add_bg,
+            style,
+        );
+        let container = div()
+            .debug_selector(move || sel::tool_diff_card(index))
+            .w_full()
+            .min_w_0()
+            .items_stretch()
+            .border_b_1()
+            .border_color(cx.theme().border);
+        if stacked {
+            container
+                .v_flex()
+                .child(remove)
+                .child(add)
+                .into_any_element()
+        } else {
+            container
+                .h_flex()
+                .child(remove)
+                .child(add)
+                .into_any_element()
+        }
     }
 
     /// Collapsed tool-group summary row (ZETA-125). Reads as one row
@@ -399,6 +514,95 @@ impl ZetaView {
             .min_w_0()
             .into_any_element()
     }
+}
+
+/// Paint one pane of the ZETA-135 diff card (remove or add). Free function
+/// so both call sites in `render_diff_card` share ONE shape; the pane's
+/// identity (remove vs. add) is carried by the caller-supplied selector +
+/// bg tint. The gutter carries the pre-composed line number from the typed
+/// model — the pane never composes a string here.
+/// Shared style bundle for `diff_pane`. Groups the theme role tokens +
+/// text size + layout mode so both call sites hand the same struct
+/// without the clippy `too_many_arguments` lint firing on the seam.
+#[derive(Clone, Copy)]
+struct DiffPaneStyle {
+    gutter_bg: gpui::Hsla,
+    gutter_fg: gpui::Hsla,
+    text_color: gpui::Hsla,
+    text_size: gpui::Pixels,
+    stacked: bool,
+}
+
+fn diff_pane(
+    pane: DiffPaneText,
+    selector: String,
+    pane_bg: gpui::Hsla,
+    style: DiffPaneStyle,
+) -> gpui::AnyElement {
+    let DiffPaneText { lines } = pane;
+    let DiffPaneStyle {
+        gutter_bg,
+        gutter_fg,
+        text_color,
+        text_size,
+        stacked,
+    } = style;
+    // In the wide layout, each pane takes half the container (`flex_1`)
+    // and truncates row-by-row. In the stacked narrow layout, each pane
+    // takes the full width so lines stay readable — the shrunk half-
+    // width layout was collapsing content to one glyph.
+    // The pane selector is cloned once so both the outer `debug_selector`
+    // closure AND the per-line paint-text recorder ids can derive from it
+    // without racing over ownership.
+    let line_id_base = selector.clone();
+    let base = div()
+        .debug_selector(move || selector.clone())
+        .min_w_0()
+        .bg(pane_bg);
+    let base = if stacked {
+        base.w_full()
+    } else {
+        base.flex_1()
+    };
+    base.flex()
+        .flex_col()
+        .text_color(text_color)
+        .text_size(text_size)
+        .children(
+            lines
+                .into_iter()
+                .enumerate()
+                .map(move |(line_idx, (number, content))| {
+                    // Paint-text recorder ids: one per gutter/content child
+                    // so a renderer that drops the child drops the sample
+                    // and the round-3 model-rebuild loophole cannot recur.
+                    let number_id = sel::tool_diff_line_number(&line_id_base, line_idx);
+                    let content_id = sel::tool_diff_line_content(&line_id_base, line_idx);
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .h_flex()
+                        .items_start()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .min_w(px(28.))
+                                .px_2()
+                                .bg(gutter_bg)
+                                .text_color(gutter_fg)
+                                .child(crate::record_text_child(move || number_id, number)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .px_2()
+                                .whitespace_normal()
+                                .child(crate::record_text_child(move || content_id, content)),
+                        )
+                }),
+        )
+        .into_any_element()
 }
 
 /// Fetch or create a persistent focus handle for a tool-group summary row.

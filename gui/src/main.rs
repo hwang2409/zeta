@@ -64,6 +64,15 @@ mod chrome {
     pub const CHIP_REMOVE_LABEL: &str = "Remove attachment";
     pub const ATTACH_LIMIT_ERROR: &str = "Attach up to 4 images, 512 KiB total.";
     pub const ATTACH_DECODE_ERROR: &str = "could not decode this image";
+    /// Composer label chip (ZETA-135): sits at the top of the composer
+    /// border, tells the user what the input line is for. Direction verb
+    /// ("ask or steer") + the agent's name mirror the wiki session-view
+    /// composer.
+    pub const COMPOSER_LABEL: &str = "ask or steer zeta";
+    /// Placeholder for the composer textarea (ZETA-135): a full-sentence
+    /// prompt that reads as an invitation rather than the pre-ZETA-135
+    /// two-word "Message zeta" imperative. Matches the wiki look.
+    pub const COMPOSER_PLACEHOLDER: &str = "Ask a question or give zeta a new direction…";
 }
 
 /// Cap on pending attachments before a batch trips the size-limit error.
@@ -321,7 +330,7 @@ impl ZetaView {
         // fixture.
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Message zeta")
+                .placeholder(chrome::COMPOSER_PLACEHOLDER)
                 .submit_on_enter(true)
         });
         cx.subscribe_in(
@@ -2417,7 +2426,7 @@ impl ZetaView {
             .relative()
             .py(theme::COMPOSER_PADDING_Y)
             .px(theme::COMPOSER_PADDING_X)
-            .min_h(theme::COMPOSER_MIN_HEIGHT)
+            .min_h(theme::composer_chrome_reserve())
             .bg(fill_color)
             .border_l(theme::RAIL_WIDTH_THICK)
             .border_color(rail_color)
@@ -2452,6 +2461,37 @@ impl ZetaView {
                         style.border_color(cx.theme().drag_border)
                     })
             })
+            // ZETA-135: composer label chip. A quiet header line above the
+            // input row that reads "ask or steer <agent>" — the wiki
+            // session-view composer's most distinctive chrome cue. It rides
+            // the muted foreground tier so it does not fight the input row
+            // for weight; the input row + Send stay the primary control.
+            //
+            // Fixed height (`COMPOSER_LABEL_HEIGHT`) so the composer's
+            // overall chrome stays deterministic across the appearance
+            // picker's 11px → 18px range — the native pixel-gutter guard
+            // (`NATIVE_GUARD_COMPOSER_HEIGHT`) reads the composer's fixed
+            // chrome height to size the transcript scan y-range; a font-
+            // size-varying chip height would leak composer fill into the
+            // scanned transcript area at large font sizes and trip the
+            // guard.
+            .child(
+                // ZETA-135 review r1 finding 3: paint through the
+                // composer-chrome text role, not `muted_foreground`. Muted
+                // fails WCAG AA on Gruvbox Dark's `composer_focus_fill`
+                // (~4.31:1); `roles.chrome_text` routes through
+                // `theme.foreground`, verified >=4.5:1 across every
+                // palette on both fill_rest and fill_focus by
+                // `composer_chrome_text_clears_wcag_aa_across_every_palette`.
+                div()
+                    .debug_selector(|| "composer-label".into())
+                    .flex_shrink_0()
+                    .h(theme::COMPOSER_LABEL_HEIGHT)
+                    .mb(theme::COMPOSER_LABEL_GAP)
+                    .text_size(theme::label_small(cx.theme().font_size))
+                    .text_color(roles.chrome_text)
+                    .child(chrome::COMPOSER_LABEL),
+            )
             .when(self.slash_menu.open, |composer| {
                 composer.child(self.render_slash_menu(cx))
             })
@@ -2469,6 +2509,7 @@ impl ZetaView {
             // the textarea legible without inflating the composer floor.
             .child(
                 div()
+                    .debug_selector(|| "composer-input-row".into())
                     .h_flex()
                     .items_center()
                     .gap_2()
@@ -2476,7 +2517,7 @@ impl ZetaView {
                     .child(
                         div().flex_1().min_w_0().child(
                             Textarea::new(&self.composer)
-                                .h(px(44.))
+                                .h(theme::COMPOSER_INPUT_HEIGHT)
                                 .appearance(false)
                                 .bordered(false)
                                 .disabled(!can_send)
@@ -2557,7 +2598,7 @@ impl ZetaView {
                     .justify_between()
                     .gap_2()
                     .w_full()
-                    .mt_1()
+                    .mt(theme::COMPOSER_FOOTER_GAP)
                     .h(theme::COMPOSER_TARGET_HEIGHT)
                     .text_size(theme::label_small(cx.theme().font_size))
                     .debug_selector(|| "composer-footer".into())
@@ -3342,6 +3383,63 @@ pub(crate) fn record_text_geometry<F>(
     });
 }
 
+/// Paint-text recorder. Every visible-text `.child(...)` call whose text
+/// a test needs to pin routes through `record_text_child`, which writes
+/// `(row_id, text)` to `paint_text_log` under `test` or the `smoke-test`
+/// feature. Tests draw, then assert on the recorded samples per row — a
+/// regression that stops passing the text to `.child(...)` also drops the
+/// recorder call (naturally, since removing `.child(record_text_child(...))`
+/// leaves no reason to build the value), and `#[must_use]` closes the
+/// stray-orphan-call loophole under CI's `cargo clippy -- -D warnings`.
+/// This is the render-time counterpart to `render_log` (colors) and `text_run_log`
+/// (shaped-wrap geometry) — it captures WHAT reached the paint call, not
+/// the rebuilt model, so a broken renderer that still constructs the model
+/// no longer looks green.
+#[must_use = "record_text_child returns the text so callers must pass it to .child(...)"]
+pub(crate) fn record_text_child<F, T>(row_id: F, text: T) -> T
+where
+    F: FnOnce() -> String,
+    T: AsRef<str>,
+{
+    #[cfg(any(test, feature = "smoke-test"))]
+    paint_text_log::record(&row_id(), text.as_ref());
+    #[cfg(not(any(test, feature = "smoke-test")))]
+    let _ = row_id;
+    text
+}
+
+#[cfg(any(test, feature = "smoke-test"))]
+pub(crate) mod paint_text_log {
+    use std::cell::RefCell;
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct Sample {
+        pub(crate) row_id: String,
+        pub(crate) text: String,
+    }
+
+    thread_local! {
+        static SAMPLES: RefCell<Vec<Sample>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn clear() {
+        SAMPLES.with(|slot| slot.borrow_mut().clear());
+    }
+
+    pub(crate) fn record(row_id: &str, text: &str) {
+        SAMPLES.with(|slot| {
+            slot.borrow_mut().push(Sample {
+                row_id: row_id.to_owned(),
+                text: text.to_owned(),
+            })
+        });
+    }
+
+    pub(crate) fn samples() -> Vec<Sample> {
+        SAMPLES.with(|slot| slot.borrow().clone())
+    }
+}
+
 #[cfg(any(test, feature = "smoke-test"))]
 pub(crate) mod text_run_log {
     use gpui::Pixels;
@@ -3596,7 +3694,13 @@ impl Render for ZetaView {
         {
             render_log::clear();
             text_run_log::clear();
+            paint_text_log::clear();
         }
+        // Refresh the thread-local viewport width so the virtual-scroller
+        // row closure (which only receives `&App`) can branch layout on
+        // width — the diff card uses this for its narrow-viewport stacked
+        // fallback (ZETA-135 review r2 finding 1).
+        theme::set_viewport_width(window.viewport_size().width);
         let needs_login = !self.login_providers.is_empty()
             && self
                 .login_providers

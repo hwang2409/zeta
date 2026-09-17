@@ -34,7 +34,7 @@ use super::{state_text, ZetaView};
 use crate::{polish, theme};
 use zeta_gui::row_text::{
     self, sel, AssistantRowText, ErrorRowText, LoginActionText, LoginErrorText, LoginRowText,
-    RowText, ThinkingRowText, UserRowText,
+    RowText, ThinkingRowText, TurnFooterText, UserRowText,
 };
 use zeta_gui::state::TranscriptEntry;
 
@@ -174,6 +174,13 @@ impl ZetaView {
         } else {
             theme::TRANSCRIPT_MAX_WIDTH
         };
+        // ZETA-135 (Trait 3 — turn footer): the LAST transcript row hosts
+        // a quiet "provider · model · duration" strip below its content
+        // so the completed conversation reads with a Peak-End cue (laws-
+        // of-ux Peak-End). Data is sourced from the active session's
+        // wire metadata + status metrics — every token is `Option` and
+        // the footer suppresses itself when nothing survives.
+        let turn_footer = is_last.then(|| self.build_turn_footer()).flatten();
         div()
             .debug_selector(|| sel::TRANSCRIPT_ROW.into())
             .w_full()
@@ -194,8 +201,50 @@ impl ZetaView {
                     .min_w_0()
                     .max_w(max_width)
                     .px_4()
-                    .child(inner),
+                    .child(inner)
+                    .when_some(turn_footer, |column, footer| {
+                        column.child(self.render_turn_footer(footer, cx))
+                    }),
             )
+            .into_any_element()
+    }
+
+    fn build_turn_footer(&self) -> Option<TurnFooterText> {
+        let session = self
+            .state
+            .active_session
+            .as_deref()
+            .and_then(|id| self.state.sessions.iter().find(|s| s.session_id == id));
+        let provider_from_session = session.map(|s| s.provider.as_str());
+        let model = self
+            .state
+            .metrics
+            .model
+            .as_deref()
+            .or_else(|| session.map(|s| s.model.as_str()));
+        let created = session.map(|s| s.created_at.as_str()).unwrap_or_default();
+        let updated = session.map(|s| s.updated_at.as_str()).unwrap_or_default();
+        row_text::build_turn_footer(provider_from_session, model, created, updated)
+    }
+
+    fn render_turn_footer(&self, footer: TurnFooterText, cx: &App) -> AnyElement {
+        let TurnFooterText { display, .. } = footer;
+        // The composed `display` string routes through the paint-text
+        // recorder under `sel::TURN_FOOTER` so tests assert on WHAT
+        // reached `.child(...)` — a renderer that stops painting the
+        // display drops the recorder call and the sample disappears,
+        // where the pre-fix model-rebuild test still passed.
+        div()
+            .debug_selector(|| sel::TURN_FOOTER.into())
+            .w_full()
+            .min_w_0()
+            .pt_2()
+            .text_size(theme::label_small(cx.theme().font_size))
+            .text_color(cx.theme().muted_foreground)
+            .child(crate::record_text_child(
+                || sel::TURN_FOOTER.into(),
+                display,
+            ))
             .into_any_element()
     }
 
