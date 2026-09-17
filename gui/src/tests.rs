@@ -11310,8 +11310,8 @@ fn zeta135_expanded_receipt_paints_inset_panel_with_file_path_header(cx: &mut Te
             .painted_quads()
             .into_iter()
             .find(|quad| {
-                (quad.bounds.top() - scaled.top()).abs() <= gpui::ScaledPixels::from(1.0)
-                    && (quad.bounds.left() - scaled.left()).abs() <= gpui::ScaledPixels::from(1.0)
+                (quad.bounds.top() - scaled.top()).0.abs() <= 1.0
+                    && (quad.bounds.left() - scaled.left()).0.abs() <= 1.0
                     && quad.border_widths.top >= one_px
                     && quad.border_widths.right >= one_px
                     && quad.border_widths.bottom >= one_px
