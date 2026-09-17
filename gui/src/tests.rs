@@ -11202,3 +11202,203 @@ fn bash_expanded_tail_omits_empty_stderr_and_shows_exit_code() {
     let out = reshape_bash_content(raw, None);
     assert_eq!(out, raw);
 }
+
+// ------------------------------------------------------------------------
+// ZETA-135: wiki session-view transcript look.
+// ------------------------------------------------------------------------
+
+/// ZETA-135 (Trait 2 — expanded receipt = inset panel): the expanded body
+/// paints a bordered container with a file-path / command header row at
+/// its top edge, not the pre-ZETA-135 left-rail indent. The header sits at
+/// the foreground tier so the reader answers "what ran" before scanning
+/// the output body. A row_text-side model assertion pins the
+/// `panel_header` field's contract (`Some(&excerpt)` when expanded AND
+/// excerpt exists; `None` for argument-less receipts) so a regression that
+/// paints a chromeless header bar for an argument-less receipt fails at
+/// the typed seam, and a paint assertion pins the debug selector so a
+/// rename regresses at the render layer.
+#[gpui::test]
+fn zeta135_expanded_receipt_paints_inset_panel_with_file_path_header(cx: &mut TestAppContext) {
+    use zeta_gui::row_text::{self, RowText};
+    let (window, view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript.clear();
+            view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
+            let mut arguments = serde_json::Map::new();
+            arguments.insert("command".into(), json!("bash scripts/warmup.sh --verbose"));
+            let call = ToolCall {
+                id: "receipt".into(),
+                name: "bash".into(),
+                arguments,
+            };
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::ToolStart {
+                    session_id: view.state.active_session.clone(),
+                    tool_call: call.clone(),
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::ToolEnd {
+                    session_id: view.state.active_session.clone(),
+                    tool_call: call,
+                    tool_result: Some(zeta_gui::client::ToolResult {
+                        tool_call_id: "receipt".into(),
+                        content: "output line\n".into(),
+                        is_error: false,
+                        is_canceled: false,
+                        structured_content: None,
+                        content_blocks: Vec::new(),
+                    }),
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+            // Success rows collapse by default — expand so the inset panel
+            // paints.
+            view.state.toggle_card(0);
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+
+    // (a) Typed-seam contract: `ToolRowText::panel_header` is `Some(...)`
+    //     mirroring the excerpt whenever the row is expanded AND the tool
+    //     call carried a nameable argument. An argument-less tool_start
+    //     still stores `None` so the render layer paints the tool label
+    //     alone (ZETA-134 review r2 invariant).
+    view.read_with(&visual, |view, _| {
+        let entry = &view.state.transcript[0];
+        let row = row_text::build(entry, 0, &view.state.session_view, true);
+        let RowText::Tool(text) = row else {
+            panic!("bash entry must build a Tool row")
+        };
+        assert_eq!(
+            text.panel_header,
+            Some("bash scripts/warmup.sh --verbose"),
+            "expanded receipt with a nameable excerpt must expose it as \
+             the panel header"
+        );
+    });
+
+    // (b) Paint contract: the panel header element paints with the
+    //     documented debug selector. A rename or a missing element in the
+    //     render path trips here.
+    let panel_header = visual.debug_bounds("tool-panel-header-0");
+    assert!(
+        panel_header.is_some(),
+        "ZETA-135 inset panel header row must paint for expanded receipts"
+    );
+
+    // (c) Container contract: the expanded body's outer container carries
+    //     a 1px border on top AND right AND bottom (not just left) — the
+    //     wiki inset panel shape. The pre-ZETA-135 receipt only painted a
+    //     left rail; a regression to `border_l` would leave top/right/
+    //     bottom at zero here.
+    let body = visual
+        .debug_bounds("tool-output-0")
+        .expect("expanded body renders");
+    visual.update(|window, _| {
+        let scaled = body.scale(window.scale_factor());
+        let one_px = px(1.).scale(window.scale_factor());
+        let outer = window
+            .painted_quads()
+            .into_iter()
+            .find(|quad| {
+                (quad.bounds.top() - scaled.top()).abs() <= gpui::ScaledPixels::from(1.0)
+                    && (quad.bounds.left() - scaled.left()).abs() <= gpui::ScaledPixels::from(1.0)
+                    && quad.border_widths.top >= one_px
+                    && quad.border_widths.right >= one_px
+                    && quad.border_widths.bottom >= one_px
+            })
+            .expect(
+                "ZETA-135 inset panel must paint a 1px border on top/right/bottom, \
+                 not just the pre-ZETA-135 left rail",
+            );
+        assert!(
+            outer.border_widths.top >= one_px
+                && outer.border_widths.right >= one_px
+                && outer.border_widths.bottom >= one_px
+                && outer.border_widths.left >= one_px,
+            "ZETA-135 inset panel border must sit on all four sides — got {:?}",
+            outer.border_widths,
+        );
+    });
+
+    // (d) Argument-less tool_start: `panel_header` stays `None` so an
+    //     expanded receipt without a nameable excerpt does not paint a
+    //     chromeless header bar. Drives the model-side contract only —
+    //     the render layer's `when_some(panel_header, ...)` guard reads
+    //     directly from this field.
+    visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.state.transcript.clear();
+            view.transcript.update(cx, |scroll, cx| scroll.reset(0, cx));
+            let bare_call = ToolCall {
+                id: "bare".into(),
+                name: "bash".into(),
+                arguments: serde_json::Map::new(),
+            };
+            view.apply_worker_message(
+                WorkerMessage::Event(ServerEvent::ToolStart {
+                    session_id: view.state.active_session.clone(),
+                    tool_call: bare_call,
+                    data: json!({}),
+                }),
+                window,
+                cx,
+            );
+            if let Some(TranscriptEntry::Tool { card, .. }) = view.state.transcript.get_mut(0) {
+                card.expanded = true;
+            }
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(&visual, |view, _| {
+        let entry = &view.state.transcript[0];
+        let row = row_text::build(entry, 0, &view.state.session_view, true);
+        let RowText::Tool(text) = row else {
+            panic!("bash entry must build a Tool row")
+        };
+        assert_eq!(
+            text.panel_header, None,
+            "an argument-less tool_start must NOT populate the panel \
+             header (ZETA-134 review r2)"
+        );
+    });
+}
+
+/// ZETA-135 (Trait 6 — composer chrome): the composer paints a quiet
+/// label chip above the input row that reads "ask or steer zeta" — the
+/// wiki session-view composer's most distinctive header cue. The chip
+/// rides above the textarea so its bottom sits at or above the textarea's
+/// top edge.
+#[gpui::test]
+fn zeta135_composer_paints_a_label_chip_above_the_input_row(cx: &mut TestAppContext) {
+    let (window, _view, _) = setup(cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let label = visual
+        .debug_bounds("composer-label")
+        .expect("composer label chip must paint");
+    let footer = visual
+        .debug_bounds("composer-footer")
+        .expect("composer footer must paint");
+    assert!(
+        label.bottom() <= footer.top(),
+        "composer label chip must sit ABOVE the footer/input row — got \
+         label.bottom={:?}, footer.top={:?}",
+        label.bottom(),
+        footer.top(),
+    );
+    assert!(
+        label.size.height > px(0.),
+        "composer label chip must paint with non-zero height"
+    );
+}
