@@ -295,25 +295,24 @@ impl ZetaView {
             add_pane,
         } = diff;
         let stacked = theme::viewport_width() < theme::NARROW_DIFF_STACK_WIDTH;
+        let style = DiffPaneStyle {
+            gutter_bg: roles.gutter_bg,
+            gutter_fg: roles.gutter_fg,
+            text_color: roles.text,
+            text_size,
+            stacked,
+        };
         let remove = diff_pane(
             remove_pane,
             sel::tool_diff_remove_pane(index),
             roles.remove_bg,
-            roles.gutter_bg,
-            roles.gutter_fg,
-            roles.text,
-            text_size,
-            stacked,
+            style,
         );
         let add = diff_pane(
             add_pane,
             sel::tool_diff_add_pane(index),
             roles.add_bg,
-            roles.gutter_bg,
-            roles.gutter_fg,
-            roles.text,
-            text_size,
-            stacked,
+            style,
         );
         let container = div()
             .debug_selector(move || sel::tool_diff_card(index))
@@ -522,17 +521,32 @@ impl ZetaView {
 /// identity (remove vs. add) is carried by the caller-supplied selector +
 /// bg tint. The gutter carries the pre-composed line number from the typed
 /// model — the pane never composes a string here.
-fn diff_pane(
-    pane: DiffPaneText,
-    selector: String,
-    pane_bg: gpui::Hsla,
+/// Shared style bundle for `diff_pane`. Groups the theme role tokens +
+/// text size + layout mode so both call sites hand the same struct
+/// without the clippy `too_many_arguments` lint firing on the seam.
+#[derive(Clone, Copy)]
+struct DiffPaneStyle {
     gutter_bg: gpui::Hsla,
     gutter_fg: gpui::Hsla,
     text_color: gpui::Hsla,
     text_size: gpui::Pixels,
     stacked: bool,
+}
+
+fn diff_pane(
+    pane: DiffPaneText,
+    selector: String,
+    pane_bg: gpui::Hsla,
+    style: DiffPaneStyle,
 ) -> gpui::AnyElement {
     let DiffPaneText { lines } = pane;
+    let DiffPaneStyle {
+        gutter_bg,
+        gutter_fg,
+        text_color,
+        text_size,
+        stacked,
+    } = style;
     // In the wide layout, each pane takes half the container (`flex_1`)
     // and truncates row-by-row. In the stacked narrow layout, each pane
     // takes the full width so lines stay readable — the shrunk half-
